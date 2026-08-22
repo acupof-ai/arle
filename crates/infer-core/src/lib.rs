@@ -255,7 +255,6 @@ pub struct KvSystemMetrics {
     pub resident_pages: usize,
     pub resident_evictable_pages: usize,
     pub host_demoted_pages: usize,
-    pub host_demoted_pending_inflight: usize,
     pub disk_pages: usize,
     pub reuse_hit_resident: u64,
     pub reuse_hit_host_demoted: u64,
@@ -1097,7 +1096,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 ),
             };
         metrics.host_demoted_pages = host_demoted_pages;
-        metrics.host_demoted_pending_inflight = 0;
         metrics.disk_pages = disk_pages;
         metrics.reuse_hit_host_demoted = metrics
             .reuse_hit_host_demoted
@@ -1536,7 +1534,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
     fn admit_waiting(&mut self) -> Result<()> {
         match self.governor.admission_gate() {
-            AdmissionVerdict::Admit | AdmissionVerdict::ShedTo(_) => {}
+            AdmissionVerdict::Admit => {}
             AdmissionVerdict::Hold => return Ok(()),
         }
 

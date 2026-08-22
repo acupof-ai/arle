@@ -300,7 +300,6 @@ pub struct WireStats {
     pub kv_system_resident_pages: usize,
     pub kv_system_resident_evictable_pages: usize,
     pub kv_system_host_demoted_pages: usize,
-    pub kv_system_host_demoted_pending_inflight: usize,
     pub kv_system_disk_pages: usize,
     pub kv_system_reuse_hit_resident: u64,
     pub kv_system_reuse_hit_host_demoted: u64,
@@ -410,7 +409,6 @@ impl WireStats {
                 resident_pages: self.kv_system_resident_pages,
                 resident_evictable_pages: self.kv_system_resident_evictable_pages,
                 host_demoted_pages: self.kv_system_host_demoted_pages,
-                host_demoted_pending_inflight: self.kv_system_host_demoted_pending_inflight,
                 disk_pages: self.kv_system_disk_pages,
                 reuse_hit_resident: self.kv_system_reuse_hit_resident,
                 reuse_hit_host_demoted: self.kv_system_reuse_hit_host_demoted,
@@ -506,7 +504,6 @@ impl WireStats {
             kv_system_resident_pages: c.kv_system.resident_pages,
             kv_system_resident_evictable_pages: c.kv_system.resident_evictable_pages,
             kv_system_host_demoted_pages: c.kv_system.host_demoted_pages,
-            kv_system_host_demoted_pending_inflight: c.kv_system.host_demoted_pending_inflight,
             kv_system_disk_pages: c.kv_system.disk_pages,
             kv_system_reuse_hit_resident: c.kv_system.reuse_hit_resident,
             kv_system_reuse_hit_host_demoted: c.kv_system.reuse_hit_host_demoted,
@@ -565,9 +562,6 @@ pub(crate) fn aggregate_wire_stats(mut ranks: Vec<WireStats>) -> WireStats {
         agg.kv_system_host_demoted_pages = agg
             .kv_system_host_demoted_pages
             .min(r.kv_system_host_demoted_pages);
-        agg.kv_system_host_demoted_pending_inflight = agg
-            .kv_system_host_demoted_pending_inflight
-            .min(r.kv_system_host_demoted_pending_inflight);
         agg.kv_system_disk_pages = agg.kv_system_disk_pages.min(r.kv_system_disk_pages);
     }
     agg
