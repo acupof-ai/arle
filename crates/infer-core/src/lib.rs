@@ -19,7 +19,6 @@ use infer_seam::{
     ResourceGovernor, StepBudget,
 };
 
-/// Stable handle returned to callers when a request is submitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestHandle(u64);
 
@@ -30,7 +29,6 @@ impl RequestHandle {
     }
 }
 
-/// Request priority level. Higher-priority requests are admitted first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RequestPriority {
     Low = 0,
@@ -39,7 +37,6 @@ pub enum RequestPriority {
     High = 2,
 }
 
-/// Scheduler admission knobs used by `infer-core`.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub num_slots: usize,
@@ -51,7 +48,6 @@ pub struct SchedulerConfig {
     pub max_prompt_tokens: usize,
     pub max_total_tokens: usize,
     pub prefix_cache_low_water_pages: usize,
-    /// Per-request prefill chunk size; prompts longer than this span multiple ticks.
     pub chunked_prefill_size: usize,
     /// Cross-request prompt-prefix reuse via the host radix cache.
     pub enable_prefix_cache: bool,
@@ -199,8 +195,6 @@ pub struct StepPhaseStats {
 static ENGINE_FORWARD_BUSY_MICROS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Snapshot the running forward-busy micros (submit→ready wall, summed over
-/// `Engine` steps); the delta over a window is that engine's GPU-busy time.
 #[must_use]
 pub fn engine_forward_busy_micros() -> u64 {
     ENGINE_FORWARD_BUSY_MICROS.load(std::sync::atomic::Ordering::Relaxed)
@@ -280,7 +274,6 @@ pub struct KvSystemMetrics {
     pub tier_io_completion_wait_ns: u64,
 }
 
-/// Prefix-cache counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrefixCacheStats {
     pub lookups: u64,
@@ -310,7 +303,6 @@ pub const DEFAULT_OVERSUBSCRIPTION_MIN_SLICE: usize = 8;
 /// — are dropped to keep `completed` from growing without bound.
 const COMPLETED_CAP: usize = 1 << 16;
 
-/// Result of attempting to admit the front waiter onto one slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmitOutcome {
     /// Admitted onto the slot; the slot is consumed.
@@ -372,9 +364,7 @@ struct RequestState {
     grammar: Option<GrammarHook>,
     submitted_at: std::time::Instant,
     first_token_at: Option<std::time::Instant>,
-    /// Whether the current token stream is inside a thinking block.
     in_thinking: bool,
-    /// Tokens generated in the current thinking block.
     reasoning_token_count: usize,
 }
 
@@ -426,7 +416,6 @@ impl RequestState {
         self.sampling.grammar_bitmask = (g.0)(Some(token));
     }
 
-    /// Track thinking state and force think-end after the reasoning budget.
     /// Called after each generated token is committed.
     fn update_think_state(&mut self, token: u32) {
         let Some(think_end) = self.sampling.think_end_token_id else {
@@ -566,7 +555,6 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// Model-default stop token ids (EOS + configured stops) read once from the
     /// executor. Used as the fallback stop set for requests that supply none.
     model_stop_token_ids: Vec<u32>,
-    /// Prefix-cache accounting exposed to serving telemetry.
     prefix_cache_stats: PrefixCacheStats,
     throughput_stats: ThroughputStats,
     kv_tier_stats: KvTierStats,
@@ -594,25 +582,16 @@ pub type TokenObserver = Box<dyn FnMut(RequestHandle, &SlotToken)>;
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Create an engine with permissive resource governance.
-    ///
-    /// # Errors
-    /// Rejects a config that requests a capability this backend does not have.
     pub fn new(executor: E, kv: K, max_slots: usize) -> Result<Self> {
         Self::with_config(executor, kv, SchedulerConfig::for_slots(max_slots))
     }
 
     /// Create an engine with explicit scheduler config.
-    ///
-    /// # Errors
-    /// Rejects a config that requests a capability this backend does not have.
     pub fn with_config(executor: E, kv: K, config: SchedulerConfig) -> Result<Self> {
         Self::with_config_and_governor(executor, kv, config, Box::new(PermissiveGovernor))
     }
 
     /// Create an engine with explicit scheduler config and resource governor.
-    ///
-    /// # Errors
-    /// Rejects a config that requests a capability this backend does not have.
     pub fn with_config_and_governor(
         mut executor: E,
         kv: K,
@@ -711,9 +690,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Delegates to [`BackendExecutor::warmup`] (default no-op for Metal/mock).
     /// Idempotent: subsequent calls are a no-op so the first [`Engine::step`]
     /// can call it lazily without re-warming.
-    ///
-    /// # Errors
-    /// Propagates any error returned by the backend executor's warmup.
     pub fn warmup(&mut self) -> Result<()> {
         if self.warmed_up {
             return Ok(());
@@ -730,9 +706,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// backends without weight offload). The engine must be idle — no in-flight
     /// step — when this is called; the serving loop drains its work before
     /// dispatching the control request.
-    ///
-    /// # Errors
-    /// Propagates any error returned by the backend executor's offload.
     pub fn offload_engine_weights(&mut self) -> Result<usize> {
         match self.executor.weight_residency() {
             Some(residency) => residency.offload_weights(),
@@ -742,9 +715,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
     /// Restore the backend's device weights from the host snapshot (OPD teacher
     /// time-share). Delegates to [`BackendExecutor::reload_weights`].
-    ///
-    /// # Errors
-    /// Propagates any error returned by the backend executor's reload.
     pub fn reload_engine_weights(&mut self) -> Result<()> {
         match self.executor.weight_residency() {
             Some(residency) => residency.reload_weights(),
@@ -757,9 +727,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// OPD writeback reuses the VRAM. Delegates to
     /// [`BackendExecutor::release_inference_scratch`] (default no-op). The engine
     /// must be idle (no in-flight step); the rollout has synced before this is called.
-    ///
-    /// # Errors
-    /// Propagates any error returned by the backend executor's scratch release.
     pub fn release_inference_scratch(&mut self) -> Result<()> {
         match self.executor.weight_residency() {
             Some(residency) => residency.release_inference_scratch(),
@@ -771,9 +738,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// headroom: the writeback's fresh autograd forward never reads this engine's
     /// KV). Delegates to [`BackendExecutor::release_kv_pool`] (default no-op). The
     /// engine must be idle (all rollouts synced before this is called).
-    ///
-    /// # Errors
-    /// Propagates any error returned by the backend executor's pool release.
     pub fn release_kv_pool(&mut self) -> Result<()> {
         match self.executor.weight_residency() {
             Some(residency) => residency.release_kv_pool(),
@@ -783,9 +747,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
     /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the next
     /// rollout. Delegates to [`BackendExecutor::ensure_kv_pool`] (default no-op).
-    ///
-    /// # Errors
-    /// Propagates any error returned by the backend executor's pool re-acquire.
     pub fn ensure_kv_pool(&mut self) -> Result<()> {
         match self.executor.weight_residency() {
             Some(residency) => residency.ensure_kv_pool(),
@@ -793,7 +754,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Submit a request with full ingress options.
     pub fn submit_request_with_options(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -821,7 +781,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// previous step completes, the CPU side admits requests and builds plan
     /// N+1 while the executor had already run plan N behind the seam.
     pub fn step(&mut self) -> Result<()> {
-        // Lazily warm the backend before the first step does any real work.
         self.warmup()?;
 
         // Cached: `step` runs per decode token and an env read takes a global lock.
@@ -1016,7 +975,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         plan.mode = planner::plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
     }
 
-    /// Run scheduler ticks until there is no waiting, active, or in-flight work.
     pub fn run_to_idle(&mut self) -> Result<()> {
         while !self.is_idle() {
             self.step()?;
@@ -1024,7 +982,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         Ok(())
     }
 
-    /// Return whether the engine has no queued, active, or in-flight work.
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.waiting.is_empty() && self.active.is_empty() && self.inflight.is_none()
@@ -1045,7 +1002,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.kv.free_pages()
     }
 
-    /// Return prefix-cache counters plus the current retained cache size.
     #[must_use]
     pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
         let mut stats = self.prefix_cache_stats;
@@ -1061,7 +1017,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Return KV host-tier counters plus the current tier-resident size.
     #[must_use]
     pub fn kv_tier_stats(&self) -> KvTierStats {
         let mut stats = self.kv_tier_stats;
@@ -1245,7 +1200,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Committed tokens (prefill then decode), forwarded to `on_token` after request loops.
         let mut committed: Vec<(RequestHandle, SlotToken)> = Vec::new();
 
-        // Advance chunked prefill. Non-final chunk only moves progress; final chunk transitions to decode.
         let mut prompt_sealed_slots: Vec<usize> = Vec::new();
         for row in &plan.prefill_rows {
             let Some(request) = self.active.get_mut(&row.slot) else {

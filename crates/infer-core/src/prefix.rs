@@ -40,7 +40,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         token_pages
     }
 
-    /// This rank's CP shard assignment for the replicated radix.
     fn cp_shard_identity(&self) -> infer_seam::ShardSpec {
         self.executor
             .kv_shard_spec()
@@ -87,7 +86,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         .min(blocks.len())
     }
 
-    /// Forward evicted prefix pages to the backend's prefix-reuse mirror drop.
     pub(crate) fn executor_release_prefix_pages(&mut self, pages: &[u32]) {
         if let Some(reuse) = self.executor.prefix_reuse() {
             reuse.release_prefix_pages(pages);
@@ -303,8 +301,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         Ok(restored_len)
     }
-
-    // record_prefix_tier_hits moved into materialize_prefix_blocks.
 
     /// Grow `slot` to at least `target`. A speculative executor already grew it
     /// to draft its chain, so this no-ops instead of double-appending.
@@ -625,7 +621,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 break;
             }
         }
-        // 3. Forward every severed tier key to the backend tier store.
         self.drain_dropped_tier_keys();
     }
 
