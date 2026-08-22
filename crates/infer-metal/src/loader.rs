@@ -1,5 +1,3 @@
-//! Safetensors loading helpers for the Metal executor.
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -48,8 +46,7 @@ pub(crate) fn tensor_get(tensors: &TensorMap, name: &str) -> Result<MlxArray> {
         .with_context(|| format!("missing weight '{name}'"))
 }
 
-/// Fetch a quantized projection's optional biases. Affine checkpoints always
-/// carry them; mxfp4 never does.
+/// Affine checkpoints always carry biases; mxfp4 never does.
 fn biases_for(tensors: &TensorMap, base: &str, qc: &QuantConfig) -> Result<Option<MlxArray>> {
     let biases = tensors.get(&format!("{base}.biases")).cloned();
     if biases.is_none() && qc.mode == QuantMode::Affine {

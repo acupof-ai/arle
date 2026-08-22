@@ -547,8 +547,6 @@ impl MetalPageStore {
     }
 }
 
-// ---- MLX payload codec (opaque bytes handed to the store) ----
-//
 // All-u64 LE framing. Page payload: `[n_arrays][arrays…]`. Prefix payload:
 // `[n_ids][ids…][cache_len][n_arrays][arrays…]` — the ids echo catches a
 // hashed-key collision at decode. Array: `[dtype][ndim][dims…][len][bytes]`.

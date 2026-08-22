@@ -1,5 +1,3 @@
-//! Gemma4 Metal loader and autoregressive model wrapper.
-
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -1,5 +1,3 @@
-//! Qwen3.5/Qwen3.6 C++ compiled-model port for the clean Metal executor.
-
 use std::path::Path;
 
 use anyhow::{Context, Result};

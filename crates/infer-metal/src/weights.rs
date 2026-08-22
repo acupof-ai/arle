@@ -1,5 +1,3 @@
-//! Weight tensor representation for the Qwen3.5/Qwen3.6 Metal port.
-
 use anyhow::{Context, Result};
 
 use crate::config::QuantMode;
@@ -37,8 +35,7 @@ impl WeightTensor {
         }
     }
 
-    /// Quantization bit width, or `None` for a dense weight. Used to detect
-    /// mixed-bit gate/up pairs (OptiQ) that cannot row-merge.
+    /// Detects mixed-bit gate/up pairs (OptiQ) that cannot row-merge.
     pub(crate) fn quant_bits(&self) -> Option<i32> {
         match self {
             WeightTensor::Dense(_) => None,

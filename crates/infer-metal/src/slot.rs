@@ -1,5 +1,3 @@
-//! Per-request slot state for the Metal executor.
-
 use super::*;
 
 #[cfg(feature = "metal")]

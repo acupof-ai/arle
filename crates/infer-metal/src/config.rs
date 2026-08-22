@@ -1,5 +1,3 @@
-//! Qwen3.5/Qwen3.6 config parsing for the Metal executor.
-
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -76,7 +74,6 @@ impl MetalQwen35MoeConfig {
     }
 }
 
-/// Qwen3.5/Qwen3.6 architecture parameters used by the C++ compiled builder.
 #[derive(Debug, Clone)]
 pub(crate) struct MetalQwen35ArchConfig {
     pub(crate) layer_types: Vec<MetalQwen35LayerType>,
@@ -101,8 +98,8 @@ impl MetalQwen35ArchConfig {
     }
 }
 
-/// Qwen3.5/Qwen3.6 model config for the Metal executor. `stop_token_ids` is the
-/// model-default stop set the executor exposes via `model_stop_token_ids`.
+/// `stop_token_ids` is the model-default stop set the executor exposes via
+/// `model_stop_token_ids`.
 #[derive(Debug, Clone)]
 pub(crate) struct MetalModelConfig {
     pub(crate) hidden_size: usize,
@@ -792,8 +789,6 @@ fn architectures_contain(obj: &serde_json::Map<String, serde_json::Value>, needl
         })
 }
 
-/// Parse a JSON array field into `Vec<usize>`, dropping non-integer elements.
-/// Returns `None` when the key is absent or not an array.
 fn parse_usize_array(
     obj: &serde_json::Map<String, serde_json::Value>,
     key: &str,
