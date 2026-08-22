@@ -3,6 +3,7 @@
 //! `ARLE_WORKER_ENGINE_CONFIG`) BEFORE executor/context construction. The
 //! statics are the single truth — no env reads.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 use anyhow::{Result, bail};
@@ -22,23 +23,30 @@ impl Dsv4MoeTransport {
     }
 }
 
+static DSV4_MOE_TRANSPORT: OnceLock<Result<Dsv4MoeTransport, String>> = OnceLock::new();
+
 pub(crate) fn dsv4_moe_transport() -> Result<Dsv4MoeTransport> {
-    let value = std::env::var("ARLE_DSV4_MOE_TRANSPORT")
-        .or_else(|_| std::env::var("ARLE_DSV4_MOE_BACKEND"))
-        .unwrap_or_else(|_| "allreduce".to_string());
-    match value.as_str() {
-        "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => {
-            Ok(Dsv4MoeTransport::AllReduce)
+    match DSV4_MOE_TRANSPORT.get_or_init(|| {
+        let value = std::env::var("ARLE_DSV4_MOE_TRANSPORT")
+            .or_else(|_| std::env::var("ARLE_DSV4_MOE_BACKEND"))
+            .unwrap_or_else(|_| "allreduce".to_string());
+        match value.as_str() {
+            "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => {
+                Ok(Dsv4MoeTransport::AllReduce)
+            }
+            "deepep" | "native-deepep" | "native_deepep" => Ok(Dsv4MoeTransport::DeepEp),
+            "deepep_ll" | "deepep-ll" | "deepep_low_latency" | "native_deepep_ll" => {
+                Ok(Dsv4MoeTransport::DeepEpLowLatency)
+            }
+            "mega_moe" => Ok(Dsv4MoeTransport::MegaMoe),
+            other => Err(format!(
+                "unsupported ARLE_DSV4_MOE_TRANSPORT/ARLE_DSV4_MOE_BACKEND `{other}` \
+                 (expected allreduce, deepep, deepep_ll, or mega_moe)"
+            )),
         }
-        "deepep" | "native-deepep" | "native_deepep" => Ok(Dsv4MoeTransport::DeepEp),
-        "deepep_ll" | "deepep-ll" | "deepep_low_latency" | "native_deepep_ll" => {
-            Ok(Dsv4MoeTransport::DeepEpLowLatency)
-        }
-        "mega_moe" => Ok(Dsv4MoeTransport::MegaMoe),
-        other => bail!(
-            "unsupported ARLE_DSV4_MOE_TRANSPORT/ARLE_DSV4_MOE_BACKEND `{other}` \
-             (expected allreduce, deepep, deepep_ll, or mega_moe)"
-        ),
+    }) {
+        Ok(mode) => Ok(*mode),
+        Err(msg) => bail!("{msg}"),
     }
 }
 
