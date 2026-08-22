@@ -60,7 +60,6 @@ impl Default for Config {
     }
 }
 
-/// One optimizer step, as measured.
 #[derive(Debug, Clone)]
 pub struct StepStats {
     pub loss: f32,
@@ -96,7 +95,6 @@ pub trait Target {
     fn forward(&mut self, input_ids: &[u32]) -> Result<(Vec<f32>, Vec<f32>)>;
 }
 
-/// Everything a chunk needs from the sample it belongs to.
 struct SampleCtx<'a> {
     /// `[seq, taps·hidden]`, the trunk residual stream at the tapped layers,
     /// uploaded ONCE per sample: it is constant across the sample's chunks, and
@@ -115,7 +113,6 @@ struct SampleCtx<'a> {
     denom: f32,
 }
 
-/// One sample's contribution to the step.
 struct SampleOut {
     loss: f32,
     terms: Terms,

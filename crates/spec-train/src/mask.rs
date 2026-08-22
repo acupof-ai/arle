@@ -12,10 +12,10 @@
 
 use crate::block::Block;
 
-/// Context keys row `t` of the block at `anchor` may reach: `[lo, anchor)` with
-/// `lo = (anchor+t) - (window-1)`, clamped. Exclusive because the serve's ring
-/// stops below the anchor, and the window applies to every draft layer there
-/// regardless of `layer_types` — both derived in the tests below.
+/// Context keys row `t` of the block at `anchor` may reach: `[lo, anchor)`,
+/// clamped. Exclusive because the serve's ring stops below the anchor, and the
+/// window applies to every draft layer there regardless of `layer_types` —
+/// both derived in the tests below.
 fn ctx_span(anchor: usize, t: usize, ctx_len: usize, window: Option<usize>) -> (usize, usize) {
     let hi = anchor.min(ctx_len);
     let lo = match window {

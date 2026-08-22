@@ -108,8 +108,6 @@ pub struct DeepSeekV4Config {
     /// Per-layer "full indexer" (recompute topk) flag. `None` ⇒ DSv4.
     #[serde(skip)]
     pub per_layer_full_indexer: Option<Vec<bool>>,
-    /// Safetensors tensor-name dialect. `Dsv4` (default) ⇒ abbreviated DSv4
-    /// names byte-unchanged; `Glm` ⇒ GLM-5.2 HF names.
     #[serde(skip)]
     pub tensor_dialect: TensorDialect,
     // DSpark spec-decode config. `dspark_block_size == 0` ⇒ not a DSpark
@@ -1298,9 +1296,8 @@ impl DeepSeekV4DsparkTensorNames {
         if name == self.attn_norm || name == self.ffn_norm {
             return Some(Shard::Replicated);
         }
-        // Scaffolding: the fp8-block 3-tap fusion, the final norm, and the small
-        // Markov/confidence heads are replicated (no TP shard); the forward
-        // tranche revisits markov/lm_head vocab-sharding. Guard the position-
+        // Scaffolding: markov/lm_head vocab-sharding is deferred to the forward
+        // tranche, so these heads stay replicated for now. Guard the position-
         // dependent `Option` fields before comparing.
         for extra in [
             self.main_proj.as_deref(),

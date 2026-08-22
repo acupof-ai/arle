@@ -11,16 +11,12 @@
 //! and the `label_indices` / `prev_token_ids` construction in
 //! `deepspec/modeling/dspark/qwen3/modeling.py`. Deviations are called out where
 //! they occur; there are none in the supervision itself.
-//!
-//! Everything here is host index math over one sequence. The attention plan is
-//! [`crate::mask`]; the objective is [`crate::loss`].
 
 use anyhow::{Result, ensure};
 
-/// One anchored block's supervision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
-    /// Trunk position the block hangs off. The draft sees the prefix `<= anchor`.
+    /// The draft sees the prefix `<= anchor`.
     pub anchor: usize,
     /// Ground-truth ids at `anchor+1 ..= anchor+block_size`. Indices past the
     /// sequence clamp to the last position, exactly as the reference's
@@ -80,8 +76,6 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// Build the supervision for one anchor.
-///
 /// `input_ids` and `loss_mask` are the whole sequence; `loss_mask[p]` marks `p`
 /// as trainable (the reference's assistant-turn mask).
 pub fn build_block(
@@ -152,8 +146,7 @@ pub fn draft_positions(blocks: &[Block]) -> Vec<usize> {
         .collect()
 }
 
-/// Per-row loss weight `exp(-t / gamma)`, zeroed where `eval` is false.
-/// `gamma = None` weights every live row equally. The reference ships 4.0.
+/// The reference ships `gamma = 4.0`.
 #[must_use]
 pub fn row_weights(block: &Block, gamma: Option<f32>) -> Vec<f32> {
     block

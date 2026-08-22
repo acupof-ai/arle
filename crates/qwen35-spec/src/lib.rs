@@ -16,7 +16,6 @@ pub enum Qwen35ConfigError {
 
 pub type Result<T> = std::result::Result<T, Qwen35ConfigError>;
 
-/// How a tensor's weight should be split across a tensor-parallel group.
 /// Mirrors SGLang `python/sglang/srt/layers/linear.py` parallel-linear classes.
 ///
 /// `dim` follows the HF safetensors layout for nn.Linear: row 0 is the output
@@ -25,23 +24,28 @@ pub type Result<T> = std::result::Result<T, Qwen35ConfigError>;
 /// and `Row { dim: 1 }` matches `RowParallelLinear` (split input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shard {
-    /// Replicated on every rank (norms, biases that aren't per-head, etc).
     Replicated,
-    /// Column-parallel: split along output dim. SGLang `linear.py:289`.
-    Column { dim: usize },
-    /// Row-parallel: split along input dim. SGLang `linear.py:1335`.
-    Row { dim: usize },
-    /// Merged column-parallel: SGLang `linear.py:485`. Used by `gate_up_proj`
-    /// and other fused projections; per-projection sizes come from config at
-    /// runtime (not encoded here, since they're model-dependent).
-    MergedColumn { dim: usize },
-    /// Fused QKV: SGLang `linear.py:889 QKVParallelLinear`. The KV-head
-    /// replication rule (SGLang `models/qwen3.py:84-95`) is applied at
-    /// runtime, not encoded here.
-    QkvFused { dim: usize },
-    /// Vocab-parallel: SGLang `vocab_parallel_embedding.py:161`.
+    Column {
+        dim: usize,
+    },
+    Row {
+        dim: usize,
+    },
+    /// Merged column-parallel: used by `gate_up_proj` and other fused
+    /// projections; per-projection sizes come from config at runtime (not
+    /// encoded here, since they're model-dependent).
+    MergedColumn {
+        dim: usize,
+    },
+    /// Fused QKV. The KV-head replication rule (SGLang `models/qwen3.py:84-95`)
+    /// is applied at runtime, not encoded here.
+    QkvFused {
+        dim: usize,
+    },
     /// Used for `embed_tokens` and (untied) `lm_head`.
-    VocabParallel { dim: usize },
+    VocabParallel {
+        dim: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,17 +153,14 @@ pub struct Qwen35MoeTensorNames {
 }
 
 impl Qwen35MoeTensorNames {
-    /// Per-expert layout: routed expert `i`'s gate projection.
     pub fn expert_gate_proj(&self, expert_idx: usize) -> String {
         format!("{}.experts.{expert_idx}.gate_proj.weight", self.mlp_prefix)
     }
 
-    /// Per-expert layout: routed expert `i`'s up projection.
     pub fn expert_up_proj(&self, expert_idx: usize) -> String {
         format!("{}.experts.{expert_idx}.up_proj.weight", self.mlp_prefix)
     }
 
-    /// Per-expert layout: routed expert `i`'s down projection.
     pub fn expert_down_proj(&self, expert_idx: usize) -> String {
         format!("{}.experts.{expert_idx}.down_proj.weight", self.mlp_prefix)
     }
@@ -185,7 +186,6 @@ impl Qwen35MoeTensorNames {
 }
 
 impl Qwen35CommonLayerTensorNames {
-    /// MoE block tensor names rooted at this layer's `mlp_prefix`.
     pub fn moe_tensor_names(&self) -> Qwen35MoeTensorNames {
         let mlp = &self.mlp_prefix;
         Qwen35MoeTensorNames {
@@ -267,10 +267,9 @@ impl Qwen35AttentionTensorNames {
 }
 
 impl Qwen35LayerTensorNames {
-    /// Returns `Some(Shard)` for tensors this spec knows about; `None` for
-    /// any name not part of a transformer layer (caller falls back to
-    /// `Shard::Replicated`). Per-layer tensors only — global tensors live
-    /// on `Qwen35Config::shard_for_global_tensor`.
+    /// Returns `None` for any name not part of a transformer layer; callers
+    /// fall back to `Shard::Replicated`. Global tensors live on
+    /// `Qwen35Config::shard_for_global_tensor`.
     pub fn shard_for(&self, name: &str) -> Option<Shard> {
         self.common
             .shard_for(name)
@@ -504,18 +503,15 @@ fn default_tie_word_embeddings() -> bool {
     true
 }
 
-/// Long-context RoPE scaling config (HF transformers / SGLang
-/// `rope_scaling` schema). `None` ⇒ vanilla RoPE with `rope_theta` base.
-/// Applied during inv_freq precompute to extend native context window.
+/// Long-context RoPE scaling config (HF `rope_scaling` schema). `None` ⇒
+/// vanilla RoPE with `rope_theta` base.
 ///
-/// Mirror of `qwen3_spec::RopeScalingConfig`; we
-/// duplicate per-crate to avoid a new shared rope-spec crate. Future
-/// refactor when DeepSeek-V4 or other model needs same enum.
+/// Mirror of `qwen3_spec::RopeScalingConfig`; duplicated per-crate to avoid a
+/// new shared rope-spec crate.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RopeScalingConfig {
-    /// YARN scaling (Peng et al. 2023). Used by Qwen3.6 long-ctx,
-    /// DeepSeek V3, Llama 3.1.
+    /// YARN scaling (Peng et al. 2023).
     Yarn {
         factor: f32,
         original_max_position_embeddings: usize,
@@ -544,12 +540,6 @@ fn default_yarn_mscale() -> f32 {
     1.0
 }
 
-/// Compute the per-dimension RoPE inverse frequencies, optionally scaled
-/// by a long-context `RopeScalingConfig` variant.
-///
-/// Mirror of `qwen3_spec::compute_scaled_inv_freq`.
-/// Returns a vector of `head_dim / 2` floats. `scaling = None` reproduces
-/// the standard `inv_freq[i] = 1.0 / base.powf(2*i / head_dim)` formula.
 pub fn compute_scaled_inv_freq(
     head_dim: usize,
     base: f32,
@@ -599,8 +589,7 @@ pub fn compute_scaled_inv_freq(
     }
 }
 
-/// Compute the YARN attention-score scaling factor (Peng et al. 2023 §3.4).
-/// Mirror of `qwen3_spec::compute_attention_factor`.
+/// YARN attention-score scaling factor (Peng et al. 2023 §3.4).
 pub fn compute_attention_factor(scaling: Option<&RopeScalingConfig>) -> f32 {
     match scaling {
         Some(RopeScalingConfig::Yarn {
@@ -676,8 +665,6 @@ fn default_full_attn_gated() -> bool {
 }
 
 impl Qwen35Config {
-    /// Shared train-side contract for scratch pretrain. Dense full-attn and
-    /// dense hybrid linear-attn are both allowed; MoE remains rejected.
     pub fn validate_train_scratch_contract(&self) -> Result<()> {
         self.validate()?;
         if self.is_moe() {
@@ -911,16 +898,12 @@ impl Qwen35Config {
         Ok(config)
     }
 
-    /// Whether this checkpoint uses Mixture-of-Experts MLP blocks.
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0
     }
 
-    /// Whether the given layer index uses a MoE block (sparse) vs a dense MLP.
-    ///
-    /// Mirrors the mlx-lm `qwen3_5_moe.py` selection rule: a layer is MoE iff
-    /// the model has experts, the layer is not in `mlp_only_layers`, and the
-    /// (1-indexed) layer id is a multiple of `decoder_sparse_step`.
+    /// Mirrors the mlx-lm `qwen3_5_moe.py` selection rule; layer ids are
+    /// 1-indexed (`idx + 1`).
     pub fn is_moe_layer(&self, idx: usize) -> bool {
         self.is_moe()
             && !self.mlp_only_layers.contains(&idx)
@@ -1137,7 +1120,6 @@ impl Qwen35Config {
     }
 }
 
-/// Attention reach of one DSpark/DFlash draft layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsparkLayerType {
     Full,
@@ -1341,7 +1323,6 @@ pub fn dspark_verify_lens(survivals: &[&[f32]], sps: DsparkSps) -> Vec<usize> {
         .collect()
 }
 
-/// Tensor names of one DSpark draft decoder layer (standard Qwen3 layer shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DsparkLayerTensorNames {
     pub q_proj: String,

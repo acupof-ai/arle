@@ -36,9 +36,6 @@ fn default_rope_theta() -> f64 {
     10_000.0
 }
 
-/// Faithful parse of a `glm_moe_dsa` checkpoint config.json. Unknown keys are
-/// ignored (serde default), so the full HF config parses without modelling
-/// every field. Mapping into the shared runtime config is a separate adapter.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GlmMoeDsaConfig {
     pub architectures: Vec<String>,
@@ -51,7 +48,7 @@ pub struct GlmMoeDsaConfig {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
 
-    // MLA low-rank. GLM has NO o_lora_rank/o_groups (plain o_proj).
+    // GLM has no o_lora_rank/o_groups (plain o_proj).
     pub q_lora_rank: usize,
     pub kv_lora_rank: usize,
     pub qk_nope_head_dim: usize,
@@ -72,7 +69,7 @@ pub struct GlmMoeDsaConfig {
     #[serde(default)]
     pub indexer_rope_interleave: bool,
 
-    // RoPE. `rope_interleave=true` ⇒ interleaved (GPT-J adjacent-pair), which
+    // `rope_interleave=true` ⇒ interleaved (GPT-J adjacent-pair), which
     // matches the official DSA `freqs_cis` layout the shared runtime already
     // builds (`dsv4_dsa_freqs_cis_real`).
     #[serde(default)]
@@ -82,7 +79,6 @@ pub struct GlmMoeDsaConfig {
     #[serde(default)]
     pub max_position_embeddings: usize,
 
-    // MoE (DeepSeek-style routing).
     pub n_routed_experts: usize,
     pub num_experts_per_tok: usize,
     pub n_shared_experts: usize,
@@ -173,8 +169,6 @@ impl GlmMoeDsaConfig {
         Ok(())
     }
 
-    /// MoE (sparse) vs dense MLP for `layer_idx`. Falls back to the
-    /// `first_k_dense_replace` rule when `mlp_layer_types` is absent.
     pub fn is_sparse_layer(&self, layer_idx: usize) -> bool {
         match self.mlp_layer_types.get(layer_idx) {
             Some(kind) => kind == "sparse",
@@ -182,9 +176,6 @@ impl GlmMoeDsaConfig {
         }
     }
 
-    /// `true` ⇒ this layer recomputes the indexer top-k set; `false` ("shared")
-    /// reuses the cached top-k from the previous "full" layer. Falls back to the
-    /// `index_topk_freq` schedule when `indexer_types` is absent.
     pub fn is_full_indexer_layer(&self, layer_idx: usize) -> bool {
         match self.indexer_types.get(layer_idx) {
             Some(kind) => kind == "full",
@@ -199,13 +190,6 @@ impl GlmMoeDsaConfig {
             .unwrap_or_else(default_rope_theta)
     }
 
-    /// Map this `glm_moe_dsa` config onto the shared [`crate::v4::DeepSeekV4Config`]
-    /// runtime authority at the DeepSeek-V3.2 (V32) MLA shape (`head_dim =
-    /// kv_lora_rank + qk_rope_head_dim = 576`). The result drives the shared
-    /// FlashMLA V32 path with `SparseIndexed` mode on every layer, a plain
-    /// `o_proj`, hyper-connections bypassed (`hc_mult == 1`), and no MTP
-    /// (`num_nextn_predict_layers == 0` — the checkpoint ships no MTP tensors).
-    ///
     /// Does NOT call `DeepSeekV4Config::validate` (that gate is DSv4-strict and
     /// rejects the GLM dialect's `o_lora_rank == 0` / `model_type`).
     pub fn into_deepseek_v4(&self) -> Result<crate::v4::DeepSeekV4Config> {
@@ -280,7 +264,6 @@ impl GlmMoeDsaConfig {
             bos_token_id: None,
             eos_token_id: None,
             pad_token_id: None,
-            // GLM-5.2 dialect extensions.
             kv_lora_rank: self.kv_lora_rank,
             qk_nope_head_dim: self.qk_nope_head_dim,
             v_head_dim: self.v_head_dim,

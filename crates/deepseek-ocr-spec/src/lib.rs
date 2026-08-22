@@ -94,14 +94,11 @@ fn default_one() -> usize {
 }
 
 impl DeepseekOcrTextConfig {
-    /// Per-layer head dim for plain MHA (`hidden_size / num_attention_heads`).
     #[must_use]
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads.max(1)
     }
 
-    /// True for a MoE layer: idx >= first_k_dense_replace and on the MoE
-    /// frequency. Layer 0 (with `first_k_dense_replace=1`) is dense.
     #[must_use]
     pub fn is_moe_layer(&self, idx: usize) -> bool {
         self.n_routed_experts > 0
@@ -109,9 +106,7 @@ impl DeepseekOcrTextConfig {
             && idx.is_multiple_of(self.moe_layer_freq.max(1))
     }
 
-    /// Fused shared-expert intermediate size (`moe_intermediate_size *
-    /// n_shared_experts`); the checkpoint ships the shared experts pre-fused into
-    /// one wide SwiGLU.
+    /// The checkpoint ships the shared experts pre-fused into one wide SwiGLU.
     #[must_use]
     pub fn shared_expert_intermediate_size(&self) -> usize {
         self.moe_intermediate_size * self.n_shared_experts
@@ -225,8 +220,6 @@ fn default_quant_mode() -> String {
     "affine".to_string()
 }
 
-/// Parsed DeepSeek-OCR config: text decoder + vision encoders + projector +
-/// quant + the 2D-tiling layout fields.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeepseekOcrConfig {
     pub text: DeepseekOcrTextConfig,
@@ -256,12 +249,10 @@ impl DeepseekOcrConfig {
                 "config.json root must be a JSON object",
             ))?;
 
-        // Text decoder: prefer the nested `language_config`, fall back to root.
         let text_value = root.get("language_config").unwrap_or(value);
         let text: DeepseekOcrTextConfig = serde_json::from_value(text_value.clone())?;
         text.validate()?;
 
-        // CLIP-large width block lives under vision_config.width["clip-l-14-224"].
         let vision = parse_vision(root)?;
         let sam = parse_sam(root);
 
@@ -301,7 +292,6 @@ impl DeepseekOcrConfig {
         })
     }
 
-    /// True when the checkpoint is MXFP8-quantized.
     #[must_use]
     pub fn is_mxfp8(&self) -> bool {
         self.quantization

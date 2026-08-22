@@ -30,8 +30,6 @@ pub fn shape(path: &Path) -> Result<(usize, usize)> {
     }
 }
 
-/// Read a head as host f32 `(w1, w2)`, ready for
-/// `LoadedInferenceEngine::update_dspark_markov_weights`.
 pub fn load(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
     let bytes =
         std::fs::read(path).with_context(|| format!("read markov head {}", path.display()))?;
@@ -55,7 +53,6 @@ pub fn load(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
     Ok((read(MARKOV_W1)?, read(MARKOV_W2)?))
 }
 
-/// Write `(w1, w2)` as `[rows, rank]` bf16.
 pub fn save(path: &Path, w1: &[f32], w2: &[f32], rank: usize) -> Result<()> {
     ensure!(rank > 0, "markov head rank must be positive");
     ensure!(

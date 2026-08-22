@@ -28,8 +28,6 @@ pub enum DeepSeekConfigError {
 
 pub type Result<T> = std::result::Result<T, DeepSeekConfigError>;
 
-/// How a DeepSeek V4 tensor should be partitioned across distributed ranks.
-///
 /// `dim` follows the HF safetensors `nn.Linear` layout: dim 0 is output
 /// features, dim 1 is input features. `ExpertParallel` means the expert axis is
 /// owned by EP/MoE-EP placement rather than tensor-parallel slicing.
