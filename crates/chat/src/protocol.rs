@@ -15,7 +15,6 @@ pub use stream::*;
 pub mod render;
 pub use render::*;
 
-/// Role tags used by the shared ChatML formatter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum ChatRole {
@@ -62,7 +61,6 @@ impl From<String> for ChatRole {
     }
 }
 
-/// Shared message shape used for prompt construction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
@@ -110,7 +108,6 @@ impl ChatMessage {
     }
 }
 
-/// Parsed assistant output with tool calls stripped from visible content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedAssistantResponse {
     pub content: String,

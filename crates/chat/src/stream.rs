@@ -114,10 +114,8 @@ impl HiddenBlockStream {
     }
 }
 
-/// Incremental text filter for streamed assistant output.
-///
-/// This keeps user-visible text while stripping `<tool_call>...</tool_call>`
-/// and `<think>...</think>` blocks across chunk boundaries.
+/// Keeps user-visible text while stripping `<tool_call>...</tool_call>` and
+/// `<think>...</think>` blocks across chunk boundaries.
 #[derive(Default)]
 pub struct VisibleTextStream {
     stream: HiddenBlockStream,
@@ -133,13 +131,10 @@ impl VisibleTextStream {
     }
 }
 
-/// Incremental filter that mirrors [`VisibleTextStream`]'s hiding of
-/// `<think>...</think>` and `<tool_call>...</tool_call>` blocks, but also
-/// captures the completed tool calls instead of discarding them.
-///
-/// Use this on the streaming path when the request carries tool definitions:
-/// it emits user-visible text exactly as `VisibleTextStream` would while
-/// surfacing each closed `<tool_call>` block as a parsed [`ToolCall`].
+/// Mirrors [`VisibleTextStream`]'s hiding of `<think>...</think>` and
+/// `<tool_call>...</tool_call>` blocks, but captures completed tool calls
+/// instead of discarding them. Use on the streaming path when the request
+/// carries tool definitions.
 pub struct StreamingToolCalls {
     stream: HiddenBlockStream,
 }
