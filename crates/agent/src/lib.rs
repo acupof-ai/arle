@@ -620,7 +620,6 @@ impl AgentSession {
                         if output.prompt_token_ids.len() < prev_prompt_len / 2 {
                             tokens_aborted = true;
                         } else if output.prompt_token_ids.len() >= expected_offset {
-                            // Normal case: prompt grew or stayed same, extract env delta.
                             let env_delta = &output.prompt_token_ids[expected_offset..];
                             if !env_delta.is_empty() {
                                 response_ids.extend_from_slice(env_delta);
@@ -704,15 +703,11 @@ impl AgentSession {
                         // tokens are mask=1.
                         if !tokens_aborted {
                             if let Some(existing_prompt_ids) = prompt_ids.as_ref() {
-                                // For repair, the prompt includes: original prompt + malformed response + repair instruction.
-                                // We need to find where the new content starts relative to what we've already accumulated.
                                 let prev_prompt_len = existing_prompt_ids.len();
                                 let expected_offset = prev_prompt_len + response_ids.len();
-                                // Only abort on extreme shrinkage that suggests broken tokenizer.
                                 if repair_outcome.prompt_token_ids.len() < prev_prompt_len / 2 {
                                     tokens_aborted = true;
                                 } else if repair_outcome.prompt_token_ids.len() >= expected_offset {
-                                    // Normal case: prompt grew or stayed same, extract env delta.
                                     let env_delta =
                                         &repair_outcome.prompt_token_ids[expected_offset..];
                                     if !env_delta.is_empty() {
@@ -721,8 +716,6 @@ impl AgentSession {
                                             .extend(std::iter::repeat_n(0u8, env_delta.len()));
                                     }
                                 }
-                                // If expected_offset > len but len >= prev_prompt_len/2,
-                                // just skip env delta extraction (lossy contract).
                             } else if repair_outcome.prompt_token_ids.is_empty() {
                                 tokens_aborted = true;
                             } else {
@@ -1010,9 +1003,6 @@ fn execute_tool_calls(
     sub_turn_index: usize,
     mut on_trace_event: Option<&mut dyn FnMut(&AgentTraceEvent)>,
 ) -> Vec<String> {
-    // Returns the per-call tool result strings in execution order so
-    // the caller can tokenize them into the trajectory's `response_ids`
-    // (with mask=0 — env tokens RL must mask out of the policy loss).
     let mut results = Vec::with_capacity(tool_calls.len());
     for (call_index, tool_call) in tool_calls.iter().enumerate() {
         *tool_calls_executed += 1;
@@ -1100,7 +1090,6 @@ fn build_tokens_record(
     if prompt_ids.is_empty() {
         return None;
     }
-    // Defensive: enforce the docs invariant `len == len`.
     if response_ids.len() != response_mask.len() {
         return None;
     }
