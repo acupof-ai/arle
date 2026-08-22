@@ -2754,6 +2754,9 @@ fn main() {
             "instantiations/flash_fwd_hdim256_bf16_packgqa_sm90.cu",
             "instantiations/flash_fwd_hdim256_bf16_paged_sm90.cu",
             "instantiations/flash_fwd_hdim256_bf16_paged_split_sm90.cu",
+            // fp8 operands for the quantized-pool prefill shim (paged only).
+            "instantiations/flash_fwd_hdim256_e4m3_paged_sm90.cu",
+            "instantiations/flash_fwd_hdim256_e4m3_paged_split_sm90.cu",
             "instantiations/flash_bwd_hdim256_bf16_sm90.cu",
             "flash_fwd_combine.cu",
             // Defines prepare_varlen_num_blocks — referenced by the launch
