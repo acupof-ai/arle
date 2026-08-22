@@ -52,3 +52,16 @@ once the batched forward has its collectives in place, the single-GPU gate is
 unvalidated caution, and validating it is one A/B away. Match A/B GPU pairs for
 NUMA as well as model — a cross-socket pair cost +60% ITL and masqueraded as a
 treatment effect.
+
+## Follow-up: where the c=32 step time goes (nsys, 2026-08-23)
+
+nsys trace of the batched TP2 serve under the c=32 bench (490 decode steps,
+5.73 s pure decode window): GPU busy 81 % on both ranks. The 19 % idle is the
+upper bound for batched-under-graph, and part of it is non-capturable (per-row
+sampling D2H, host PageMeta build, pointer staging) — realistic gain ~10 %.
+
+GPU-side cost per step (kernel share of the window): MoE/dense Marlin bf16
+GEMV 41 % (8.7 ms of the 20.3 ms step, ~148 launches), linear-attention
+recurrent decode (gdr+conv1d) 11 %, DeepGEMM fp8 10 %, NCCL all-reduce 6.5 %,
+paged attention 4.5 %. The MoE GEMV is the floor; graph capture addresses the
+idle, not the busy.
