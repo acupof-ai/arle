@@ -72,11 +72,7 @@ static QWEN35_MOE_EXPERTS_BF16_RESIDENT: AtomicBool = AtomicBool::new(false);
 // present, and the most a prefill chunk can. `0` = undeclared.
 static DENSE_GEMM_DECODE_ROWS: AtomicUsize = AtomicUsize::new(0);
 static DENSE_GEMM_PREFILL_ROWS: AtomicUsize = AtomicUsize::new(0);
-static MTP_ADAPTIVE: AtomicBool = AtomicBool::new(false);
-static MTP_MIN_ACCEPT_BITS: AtomicU32 = AtomicU32::new(0x3F0C_CCCD); // 0.55f32
 static SPEC_MAX_BATCH: AtomicUsize = AtomicUsize::new(16);
-/// NaN = unset, so an explicit `0` stays distinguishable from no flag at all.
-static DSPARK_CONFIDENCE_THRESHOLD_BITS: AtomicU32 = AtomicU32::new(0x7FC0_0000);
 static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
 
 /// Apply the CLI-resolved flags. Must run before executor construction; the
@@ -90,23 +86,11 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     NUMA_PIN.store(f.numa_pin, Relaxed);
     COMM_NCCL_ONLY.store(f.comm_backend == CommBackend::Nccl, Relaxed);
     DSV4_DSA_INDEXER_SMS.store(f.dsv4_dsa_indexer_sms, Relaxed);
-    MTP_ADAPTIVE.store(f.mtp_adaptive, Relaxed);
-    MTP_MIN_ACCEPT_BITS.store(f.mtp_min_accept.to_bits(), Relaxed);
     SPEC_MAX_BATCH.store(f.spec_max_batch.max(1), Relaxed);
-    DSPARK_CONFIDENCE_THRESHOLD_BITS.store(
-        f.dspark_confidence_threshold.unwrap_or(f32::NAN).to_bits(),
-        Relaxed,
-    );
     DEEPEP_NUM_SMS.store(f.deepep_num_sms, Relaxed);
     DSV4_MOE_TRANSPORT_CLI.get_or_init(|| f.dsv4_moe_transport.clone());
     DEEPEP_MAX_DISPATCH_TOKENS_PER_RANK
         .store(f.deepep_max_dispatch_tokens_per_rank.unwrap_or(0), Relaxed);
-    // `Some(true)` stays compile-gated: forcing FlashMLA on a stub build must
-    // resolve to the scalar fallback, not a missing-kernel error.
-    crate::attention::set_dsv4_flashmla_decode_override(
-        f.dsv4_flashmla_decode
-            .map(|on| on && cuda_kernels::HAS_FLASHMLA),
-    );
     cuda_kernels::tensor::set_mempool_retain(f.mempool_retain);
 }
 
@@ -170,25 +154,10 @@ pub(crate) fn set_dense_gemm_row_envelope(decode_rows: usize, prefill_rows: usiz
     DENSE_GEMM_DECODE_ROWS.fetch_max(decode_rows, Relaxed);
     DENSE_GEMM_PREFILL_ROWS.fetch_max(prefill_rows, Relaxed);
 }
-pub(crate) fn mtp_adaptive() -> bool {
-    MTP_ADAPTIVE.load(Relaxed)
-}
-/// DSv4 decode reuse is unconditional (2026-07-11 license); the accessor stays
-/// because executor/dsv4.rs still names it.
-pub(crate) fn dsv4_decode_reuse_enabled() -> bool {
-    true
-}
-pub(crate) fn mtp_min_accept() -> f32 {
-    f32::from_bits(MTP_MIN_ACCEPT_BITS.load(Relaxed))
-}
 /// Concurrency gate for speculative decode (`--spec-max-batch`): speculate only
 /// when the decode batch is ≤ this, else route to the plain batched path.
 pub(crate) fn spec_max_batch() -> usize {
     SPEC_MAX_BATCH.load(Relaxed)
-}
-pub(crate) fn dspark_confidence_threshold() -> Option<f32> {
-    let t = f32::from_bits(DSPARK_CONFIDENCE_THRESHOLD_BITS.load(Relaxed));
-    (!t.is_nan()).then_some(t)
 }
 #[cfg(feature = "deepep")]
 pub(crate) fn deepep_num_sms() -> u32 {

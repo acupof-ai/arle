@@ -53,34 +53,6 @@ pub(super) fn route_decode(
     }
 }
 
-/// Adaptive MTP gate (B=1), opt-in via `--mtp-adaptive`. MTP only beats
-/// no-spec when it emits more than `t_mtp/t_nospec` tok/step; below the
-/// matching acceptance rate the gate runs a warm no-spec step instead so
-/// typical prompts stop paying the speculation tax.
-///
-/// Minimum running accept-rate EMA to keep speculating. Default 0.55 = the dt=3
-/// break-even on 8xH20 TP4 (t_mtp ~68ms / t_nospec ~26ms => need >2.6 tok/step =>
-/// accept >~0.55). Override with `--mtp-min-accept` for other depths.
-///
-/// Force one real spec step after this many consecutive gated skips, to refresh
-/// the acceptance EMA — else a dip below threshold never recovers (no new accept
-/// data arrives while skipping).
-const MTP_PROBE_INTERVAL: usize = 8;
-
-/// EMA smoothing for the per-step accept rate (accepted/depth): higher reacts
-/// faster to an acceptance shift, noisier.
-const MTP_ACCEPT_EMA_ALPHA: f32 = 0.25;
-
-/// Pure so the money path is unit-tested without a GPU.
-fn mtp_should_speculate(
-    accept_ema: f32,
-    skip_streak: usize,
-    min_accept: f32,
-    probe_interval: usize,
-) -> bool {
-    accept_ema >= min_accept || skip_streak >= probe_interval
-}
-
 struct DraftNode {
     token: u32,
     parent: Option<usize>,
@@ -305,7 +277,6 @@ impl Dsv4CudaExecutor {
         self.mtp_accepts += accepted;
         self.mtp_rejects += depth - accepted;
         self.mtp_chains += 1;
-        self.mtp_note_accept(accepted, depth);
         if self.model.tp.config().rank == 0 {
             log::debug!(
                 "[dsv4-mtp] depth={} topk={} draft_rows={} verify_rows={} accepted={accepted} topk_bonus_hit={topk_bonus_hit} accept_total={} reject_total={} bonus={bonus}",
@@ -524,30 +495,6 @@ impl Dsv4CudaExecutor {
 
     pub(super) fn spec_requested(&self) -> bool {
         self.spec_draft_tokens.is_some() || self.spec_draft_topk.is_some() || self.dspark.is_some()
-    }
-
-    /// Drives the adaptive gate; B=1 only — the batched path is a win and is
-    /// never gated, so it does not perturb this EMA.
-    fn mtp_note_accept(&mut self, accepted: usize, depth: usize) {
-        let rate = if depth > 0 {
-            accepted as f32 / depth as f32
-        } else {
-            1.0
-        };
-        self.mtp_accept_ema =
-            MTP_ACCEPT_EMA_ALPHA * rate + (1.0 - MTP_ACCEPT_EMA_ALPHA) * self.mtp_accept_ema;
-        self.mtp_skip_streak = 0;
-    }
-
-    /// Off unless `--mtp-adaptive` is set.
-    pub(super) fn mtp_adaptive_skip(&self) -> bool {
-        crate::runtime_flags::mtp_adaptive()
-            && !mtp_should_speculate(
-                self.mtp_accept_ema,
-                self.mtp_skip_streak,
-                crate::runtime_flags::mtp_min_accept(),
-                MTP_PROBE_INTERVAL,
-            )
     }
 
     fn draft_chain(

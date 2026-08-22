@@ -695,7 +695,6 @@ impl Qwen35CudaExecutor {
                     qwen35_spec::DsparkSps {
                         bias_ms: dspark_sps_bias_ms,
                         row_ms: dspark_sps_row_ms,
-                        confidence_threshold: crate::runtime_flags::dspark_confidence_threshold(),
                     },
                     markov_head_rank,
                     dspark_block_size,

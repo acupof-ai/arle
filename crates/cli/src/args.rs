@@ -768,17 +768,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) dspark_block_size: Option<usize>,
 
-    /// Confidence-head early stop: a DSpark block is cut at the first position
-    /// whose cumulative survival falls under this. 0 turns the gate off and
-    /// drafts the whole block, which is how the reference evaluates (DeepSpec
-    /// `eval.py --confidence-threshold`, default 0.0) — it measures a drafter
-    /// apart from its head, and a saturated-low head truncates every block to
-    /// nothing. Unset keeps the goodput budget, which is what ships today.
-    /// A positive value cuts earlier than DeepSpec's, which thresholds each
-    /// position's own sigmoid rather than the running product.
-    #[arg(long, value_parser = parse_unit_interval, value_name = "P")]
-    pub(crate) dspark_confidence_threshold: Option<f32>,
-
     /// Install a Markov head from a safetensors file over the draft
     /// checkpoint's. This is the only way to put a trained head into a serve —
     /// copying the file into the draft dir does nothing, since the loader reads
@@ -848,22 +837,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) numa_pin: bool,
 
-    /// DSv4 FlashMLA sparse decode; unset = default (on when compiled in),
-    /// false = eager scalar fallback (A/B lever).
-    #[arg(long, value_name = "BOOL")]
-    pub(crate) dsv4_flashmla_decode: Option<bool>,
-
     /// DSv4 DSA indexer SM budget.
     #[arg(long, default_value_t = 78, value_name = "N")]
     pub(crate) dsv4_dsa_indexer_sms: usize,
-
-    /// Adaptive MTP gate at B=1: skip speculation below the accept break-even.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) mtp_adaptive: bool,
-
-    /// Minimum accept-rate EMA to keep speculating under --mtp-adaptive.
-    #[arg(long, default_value_t = 0.55, value_name = "F")]
-    pub(crate) mtp_min_accept: f32,
 
     /// Speculate (MTP/DSpark) only when the decode batch is ≤ this; above it
     /// decode routes to the plain batched path. Default 16 = the measured
@@ -922,12 +898,8 @@ impl ServeArgs {
                 ServeCommBackendArg::Auto => infer_api::CommBackend::Auto,
                 ServeCommBackendArg::Nccl => infer_api::CommBackend::Nccl,
             },
-            dsv4_flashmla_decode: self.dsv4_flashmla_decode,
             dsv4_dsa_indexer_sms: self.dsv4_dsa_indexer_sms,
-            mtp_adaptive: self.mtp_adaptive,
-            mtp_min_accept: self.mtp_min_accept,
             spec_max_batch: self.spec_max_batch,
-            dspark_confidence_threshold: self.dspark_confidence_threshold,
             deepep_num_sms: self.deepep_num_sms,
             deepep_max_dispatch_tokens_per_rank: self.deepep_max_dispatch_tokens_per_rank,
             dsv4_moe_transport: self.dsv4_moe_transport.clone(),

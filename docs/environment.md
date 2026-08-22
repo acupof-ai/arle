@@ -39,9 +39,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_CUDA_SHARD_CACHE_BYTES` | `arle serve --shard-cache-bytes` |
 | `ARLE_NUMA_PIN` | `arle serve --numa-pin` |
 | `ARLE_COMM_BACKEND` | `arle serve --comm-backend` (already existed; env transport removed) |
-| `ARLE_DSV4_FLASHMLA_DECODE` | `arle serve --dsv4-flashmla-decode` |
 | `ARLE_DSV4_DSA_INDEXER_SMS` | `arle serve --dsv4-dsa-indexer-sms` |
-| `ARLE_DSV4_MTP_ADAPTIVE` / `ARLE_DSV4_MTP_MIN_ACCEPT` | `arle serve --mtp-adaptive` / `--mtp-min-accept` |
 | `ARLE_DSV4_DEEPEP_NUM_SMS` | `arle serve --deepep-num-sms` |
 | `ARLE_DSV4_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `arle serve --deepep-max-dispatch-tokens-per-rank` (SGLANG env still honored when unset) |
 | `INFER_METAL_WARMUP` / `_HOST_SAMPLING` | `arle serve --metal-warmup` / `--metal-host-sampling` |
