@@ -1,6 +1,3 @@
-//! DSv4 MoE policy: device routing, local FP8/W4A16/W4AFP8 expert paths,
-//! decode tails, shared expert, and grouped-weight cache.
-
 use anyhow::{Result, ensure};
 use cuda_kernels::moe;
 use cuda_kernels::prelude::{DeviceContext, HiddenStates};
@@ -96,7 +93,6 @@ impl Dsv4MoeTailScratch {
             + bf16(intermediate, max_rows)
     }
 
-    /// `counts`/`cursors`/`route_out` → 0, `packed_route_slot` → -1.
     fn reinit(&mut self, ctx: &DeviceContext, rows: usize) -> Result<()> {
         use cudarc::driver::DevicePtrMut;
         ensure!(
@@ -492,9 +488,7 @@ pub(crate) struct Dsv4GemvTables {
     up_s: CudaSlice<u64>,
     w2_w: CudaSlice<u64>,
     w2_s: CudaSlice<u64>,
-    /// w13-half scale columns (= H/128), the swiglu kernel's `scale_cols`.
     sc13: usize,
-    /// w2 scale columns (= I/128), the down kernel's `scale_cols`.
     sc2: usize,
 }
 
@@ -629,7 +623,6 @@ fn build_w4a16_gemv_tables(
     let group_size = first.group_size;
     let i_dim = first.rows / 2;
     let h = first.cols;
-    // Byte offsets into the fused w13 packed weight and BF16 scale buffers.
     let up_weight_off = (i_dim * (h / 2)) as u64;
     let up_scale_off = (i_dim * (h / group_size) * std::mem::size_of::<bf16>()) as u64;
 
@@ -714,7 +707,6 @@ fn build_w4afp8_gemv_tables(
     let h = layer.hidden_dim;
     let i_dim = layer.intermediate;
 
-    // Transpose [K//512, N*4] CUTLASS interleaved → [N, K//128] row-major.
     let transpose_plain = |src: &[u8], n: usize, k: usize| -> Vec<u8> {
         let num_groups = k / group_size;
         let mut dst = vec![0u8; n * num_groups * 2];
@@ -731,14 +723,13 @@ fn build_w4afp8_gemv_tables(
         dst
     };
 
-    // w13: [K//512, n13*4] CUTLASS → [n13, K//128] row-major.
     let w13_src = ctx
         .stream
         .clone_dtoh(&w13.scales)
         .map_err(|e| anyhow::anyhow!("W4AFP8 w13 scale download failed: {e}"))?;
-    let n13 = w13.n; // 2 * i_dim
-    let k13 = w13.k; // h
-    let row_bytes = (k13 / group_size) * 2; // bytes per [N, K//128] row
+    let n13 = w13.n;
+    let k13 = w13.k;
+    let row_bytes = (k13 / group_size) * 2;
     let per_expert_13 = n13 * row_bytes;
     let mut w13_gemv = Vec::with_capacity(w13.num_experts * per_expert_13);
     for e in 0..w13.num_experts {
@@ -754,7 +745,6 @@ fn build_w4afp8_gemv_tables(
         .clone_htod(&w13_gemv)
         .map_err(|e| anyhow::anyhow!("W4AFP8 w13 transposed scale upload failed: {e}"))?;
 
-    // w2: plain [K//512, N*4] → [N, K//128].
     let w2_src = ctx
         .stream
         .clone_dtoh(&w2.scales)
@@ -779,12 +769,10 @@ fn build_w4afp8_gemv_tables(
     let w2_weight_ptr = cache_ptr(&w2.weight, ctx).as_ptr() as u64;
     let w2_scale_ptr = cache_ptr(&w2_gemv_scales, ctx).as_ptr() as u64;
 
-    // w13: n = 2*i_dim (w1 over w3), k = h.
     let w13_w_per_expert = (2 * i_dim * (h / 2)) as u64;
-    let w13_s_per_expert = (2 * i_dim * (h / group_size) * 2) as u64; // BF16
+    let w13_s_per_expert = (2 * i_dim * (h / group_size) * 2) as u64;
     let up_weight_off = (i_dim * (h / 2)) as u64;
     let up_scale_off = (i_dim * (h / group_size) * 2) as u64;
-    // w2: n = h, k = i_dim.
     let w2_w_per_expert = (h * (i_dim / 2)) as u64;
     let w2_s_per_expert = (h * (i_dim / group_size) * 2) as u64;
 
@@ -827,16 +815,14 @@ fn build_w4afp8_gemv_tables(
     })
 }
 
-/// W4A16 routed-MoE forward: compact pack, one paired gate/up W4A16 GEMV with
-/// fused clamped SwiGLU (writes `act` directly), one down W4A16 GEMV, then the
-/// shared scatter/combine tail. All intermediates are stream-ordered allocs
-/// (graph-capture safe).
+/// All intermediates are stream-ordered allocs (graph-capture safe).
 #[allow(clippy::too_many_arguments)]
 fn dsv4_moe_forward_w4a16(
     model: &Dsv4Model,
     layer: &Dsv4MoeLayer,
     tables: &Dsv4W4A16GemvTables,
     xor_mask: u32,
+    use_custom_decode: bool,
     route_indices: &CudaSlice<i32>,
     route_weights: &CudaSlice<f32>,
     hidden: &HiddenStates,
@@ -940,28 +926,49 @@ fn dsv4_moe_forward_w4a16(
     // `experts_per_rank` experts; `packed_hidden` is [rows, hidden_dim] and
     // `act` [rows, i_dim], keepalive-held on `ctx.stream`.
     unsafe {
-        moe::moe_w4a16_grouped_gemv_pair_batch(
-            &tables.gate_w,
-            &tables.gate_s,
-            &tables.up_w,
-            &tables.up_s,
-            cache_ptr(&packed_hidden.data, ctx),
-            cache_ptr(&act.data, ctx),
-            None,
-            cache_ptr(&offsets, ctx),
-            cache_ptr(&counts, ctx),
-            cache_ptr(&tables.expert_indices, ctx),
-            experts_per_rank,
-            rows,
-            i_dim,
-            hidden_dim,
-            tables.group_size,
-            xor_mask,
-            true,
-            model.config.swiglu_limit,
-            ctx,
-            ctx.stream.cu_stream(),
-        )?;
+        if use_custom_decode {
+            moe::w4afp8_grouped_swiglu_decode(
+                cache_ptr(&tables.gate_w, ctx),
+                cache_ptr(&tables.gate_s, ctx),
+                cache_ptr(&tables.up_w, ctx),
+                cache_ptr(&tables.up_s, ctx),
+                cache_ptr(&packed_hidden.data, ctx),
+                cache_ptr(&act.data, ctx),
+                cache_ptr(&offsets, ctx),
+                cache_ptr(&counts, ctx),
+                experts_per_rank,
+                rows,
+                i_dim,
+                hidden_dim,
+                tables.group_size,
+                xor_mask,
+                model.config.swiglu_limit,
+                ctx.stream.cu_stream(),
+            )?;
+        } else {
+            moe::moe_w4a16_grouped_gemv_pair_batch(
+                &tables.gate_w,
+                &tables.gate_s,
+                &tables.up_w,
+                &tables.up_s,
+                cache_ptr(&packed_hidden.data, ctx),
+                cache_ptr(&act.data, ctx),
+                None,
+                cache_ptr(&offsets, ctx),
+                cache_ptr(&counts, ctx),
+                cache_ptr(&tables.expert_indices, ctx),
+                experts_per_rank,
+                rows,
+                i_dim,
+                hidden_dim,
+                tables.group_size,
+                xor_mask,
+                true,
+                model.config.swiglu_limit,
+                ctx,
+                ctx.stream.cu_stream(),
+            )?;
+        }
     }
 
     let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
@@ -1015,10 +1022,7 @@ fn dsv4_moe_forward_w4a16(
     Ok(())
 }
 
-/// W4AFP8 routed-MoE forward: compact pack, per-tensor FP8 activation quant,
-/// SGLang CUTLASS grouped GEMM for gate+up, fused clamped SwiGLU, per-tensor
-/// FP8 quant, CUTLASS grouped GEMM for down, then the shared scatter/combine
-/// tail. All intermediates are stream-ordered allocs (graph-capture safe).
+/// All intermediates are stream-ordered allocs (graph-capture safe).
 #[allow(clippy::too_many_arguments)]
 fn dsv4_moe_forward_w4afp8(
     model: &Dsv4Model,
@@ -1043,7 +1047,6 @@ fn dsv4_moe_forward_w4afp8(
     let total_routes = num_tokens * topk;
     let rows = total_routes.max(1);
 
-    // Count + scan + pack (same as W4A16 lane).
     let counts = ctx
         .stream
         .alloc_zeros::<i32>(experts_per_rank)
@@ -1129,7 +1132,6 @@ fn dsv4_moe_forward_w4afp8(
         .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 workspace alloc failed: {e}"))?;
     keepalive.keep_u8(&workspace);
 
-    // Per-tensor FP8 activation scale (single float, written by amax kernel).
     let act_scale = ctx
         .stream
         .alloc_zeros::<f32>(1)
@@ -1143,7 +1145,6 @@ fn dsv4_moe_forward_w4afp8(
         .map_err(|e| anyhow::anyhow!("DSv4 W4AFP8 problem_sizes alloc failed: {e}"))?;
     keepalive.keep_i32(&problem_sizes);
 
-    // --- Gate+up GEMM ---
     let packed_fp8 = ctx
         .stream
         .alloc_zeros::<u8>(rows * hidden_dim)
@@ -1191,7 +1192,6 @@ fn dsv4_moe_forward_w4afp8(
         ensure!(rc == 0, "W4AFP8 gate+up CUTLASS GEMM failed: {rc}");
     }
 
-    // Fused SwiGLU on the CUTLASS [rows, 2*i_dim] output → [rows, i_dim].
     let act = HiddenStates::zeros(ctx, i_dim, rows)?;
     keepalive.keep_hidden(&act);
     // SAFETY: `gateup_out` holds `rows * 2 * i_dim` bf16 and `act` `rows * i_dim`, on `ctx.stream`.
@@ -1206,7 +1206,6 @@ fn dsv4_moe_forward_w4afp8(
         )?;
     }
 
-    // --- Down GEMM ---
     let act_fp8 = ctx
         .stream
         .alloc_zeros::<u8>(rows * i_dim)
@@ -1254,7 +1253,6 @@ fn dsv4_moe_forward_w4afp8(
         ensure!(rc == 0, "W4AFP8 down CUTLASS GEMM failed: {rc}");
     }
 
-    // Scatter + combine (same as W4A16 lane).
     let route_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
     keepalive.keep_hidden(&route_out);
     // SAFETY: `expert_out`/`route_out` are [rows, hidden_dim], `out` is
@@ -1283,9 +1281,8 @@ fn dsv4_moe_forward_w4afp8(
 }
 
 /// Decode-band routed-MoE forward via grouped w8a16 GEMM (warp-per-row):
-/// compact pack, one fused gate/up pass with clamped SwiGLU, one w2 pass,
-/// then the shared scatter/combine tail. Zero pad rows and zero
-/// activation-quantize work, which removes the grouped lane's padding tax.
+/// zero pad rows and zero activation-quantize work, which removes the grouped
+/// lane's padding tax.
 #[allow(clippy::too_many_arguments)]
 fn dsv4_moe_forward_decode_fp8(
     model: &Dsv4Model,
@@ -1461,7 +1458,6 @@ fn dsv4_moe_forward_masked_tail(
     let experts_per_rank = split.experts_per_rank;
     let local_start = split.local_expert_start;
     let total_routes = num_tokens * topk;
-    // W4A16 lane: compact pack + W4A16 grouped GEMV for all batch sizes.
     if layer.w13_w4a16.is_some() {
         let tables = layer.w4a16_gemv_tables.get_or_init(|| {
             build_w4a16_gemv_tables(ctx, layer)
@@ -1477,6 +1473,7 @@ fn dsv4_moe_forward_masked_tail(
                 layer,
                 tables,
                 0,
+                false,
                 route_indices,
                 route_weights,
                 hidden,
@@ -1500,6 +1497,7 @@ fn dsv4_moe_forward_masked_tail(
                 layer,
                 tables,
                 0x08080808,
+                true,
                 route_indices,
                 route_weights,
                 hidden,
@@ -1519,8 +1517,6 @@ fn dsv4_moe_forward_masked_tail(
             keepalive,
         );
     }
-    // Decode-band FP8 grouped GEMM lane: compact (real routed rows only, no
-    // pad), 16-byte vectorized FP8 weight loads.
     if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
         let tables = layer.gemv_tables.get_or_init(|| {
             build_gemv_tables(ctx, layer).map(Some).unwrap_or_else(|e| {
@@ -1897,7 +1893,6 @@ pub(super) fn deepgemm_grouped_experts(
     Ok(out_compact)
 }
 
-/// Dense shared expert: one single-group FP8 DeepGEMM pass, no routing.
 fn dsv4_shared_expert_pooled(
     ctx: &DeviceContext,
     stream: &Arc<CudaStream>,
@@ -2026,7 +2021,6 @@ fn dsv4_shared_expert_pooled(
     Ok(())
 }
 
-/// Dense shared expert: one single-group FP8 DeepGEMM pass, no routing.
 fn dsv4_shared_expert(
     ctx: &DeviceContext,
     stream: &Arc<CudaStream>,
@@ -2103,7 +2097,6 @@ fn dsv4_shared_expert(
     keepalive.keep_f32(&act_scales);
     keepalive.keep_hidden(&out);
 
-    // Single group spanning all tokens: identity expert 0, offset 0, count T.
     let active_experts = if use_ctx_stream {
         ctx.stream.clone_htod(&[0i32])
     } else {
