@@ -92,8 +92,6 @@ impl SlotBudget {
     }
 }
 
-/// Clamp a requested unit count to what is affordable.
-///
 /// Returns `(planned, clamped)` where `planned = min(requested, affordable)`
 /// and `clamped` flags that the request was reduced. Shared by every backend so
 /// the clamp semantics (and the `clamped` reporting) are defined once.
@@ -161,7 +159,6 @@ pub fn profile_kv_pool_tokens(
         return PROFILE_KV_TOKENS_FLOOR;
     }
     let frac = clamp_mem_fraction_static(mem_fraction_static);
-    // reserve = total × (1 − frac); subtract from free, saturating to 0.
     let reserve = (total_bytes as f64 * (1.0 - frac)) as u64;
     let rest = free_bytes.saturating_sub(reserve);
     let tokens = rest / cell_bytes_per_token;
@@ -259,9 +256,6 @@ fn tier_budget_with_reserve(
         .min((total_bytes as f64 * RESERVE_CAP_FRACTION) as usize);
     let ceiling = resource_bytes.saturating_sub(reserve);
     let scaled = (resource_bytes as f64 * fraction) as usize;
-    // Lower-bound by the floor, then upper-bound by the reserve ceiling (the
-    // reserve must win — `.min` last so a floor above the ceiling cannot claim
-    // into the reserve).
     scaled.max(floor_bytes).min(ceiling)
 }
 

@@ -1,8 +1,7 @@
 //! Read-only KV pool queries.
 //!
-//! Host-indexed observation surface: slot lengths, page maps, free capacity,
-//! and occupant epochs. The scheduler reads through this trait without needing
-//! the mutating allocation or prefix-store surfaces.
+//! Split from the mutating allocation and prefix-store surfaces so the
+//! scheduler can read through this trait alone.
 
 /// Read-only host-indexed KV pool queries visible to engine-core.
 ///
