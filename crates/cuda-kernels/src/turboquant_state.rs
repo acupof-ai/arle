@@ -46,7 +46,6 @@ pub struct TurboQuantCodebook {
 }
 
 impl TurboQuantCodebook {
-    /// Compute Lloyd-Max codebook on CPU, upload to GPU.
     pub fn new(ctx: &DeviceContext, head_dim: usize, bits: u8) -> Result<Self> {
         let num_levels = 1usize << bits;
         let max_iters = 200;
@@ -94,7 +93,6 @@ pub enum TurboQuantRotation {
 }
 
 impl TurboQuantRotation {
-    /// Generate a full rotation matrix (QR of Gaussian, O(D²) init).
     pub fn new_full(ctx: &DeviceContext, head_dim: usize, seed: u64) -> Result<Self> {
         let n = head_dim * head_dim;
         let mut pi_host = vec![0.0f32; n];
@@ -113,7 +111,6 @@ impl TurboQuantRotation {
         Ok(Self::Full { matrix })
     }
 
-    /// Generate Hadamard signs (O(D) init, O(D log D) runtime).
     pub fn new_hadamard(ctx: &DeviceContext, head_dim: usize, seed: u64) -> Result<Self> {
         let mut signs_host = vec![0i8; head_dim];
 
@@ -134,18 +131,13 @@ impl TurboQuantRotation {
 
 /// Complete TurboQuant state for one KV type (K or V) across all layers.
 pub struct TurboQuantLayerState {
-    /// Per-layer rotation transforms.
     pub rotations: Vec<TurboQuantRotation>,
-    /// Shared codebook (same for all layers with same head_dim + bits).
     pub codebook: TurboQuantCodebook,
-    /// Packed bytes per head.
     pub packed_per_head: usize,
-    /// Rotation mode.
     pub mode: RotationMode,
 }
 
 impl TurboQuantLayerState {
-    /// Initialize TurboQuant state for all layers.
     ///
     /// Each layer gets a unique rotation derived from `base_seed + layer_idx * 7`.
     /// Default mode is Hadamard (O(D log D)).
@@ -166,7 +158,6 @@ impl TurboQuantLayerState {
         )
     }
 
-    /// Initialize with explicit rotation mode.
     pub fn with_mode(
         ctx: &DeviceContext,
         num_layers: usize,

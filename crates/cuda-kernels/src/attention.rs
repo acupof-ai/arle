@@ -1,13 +1,5 @@
-//! DSv4-Flash attention-side packing/dispatch wrappers.
-//!
-//! This module holds the DSv4-Flash MODEL1 (and V32) FP8 KV pack kernels plus
-//! FlashMLA sparse-decode index builders that feed FlashMLA's sparse-FP8
-//! decode path
-//! (`sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`).
-//!
-//! Runtime wire-up (D-4) is a separate dispatch; this wrapper exposes the
-//! FFI through the established `DeviceContext`-driven idiom that the rest
-//! of the kernel crate uses.
+//! DSv4-Flash FP8 KV pack + FlashMLA sparse-decode index builder wrappers.
+//! Feeds `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel` (vendored).
 
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
@@ -28,7 +20,6 @@ use crate::tensor::{DeviceContext, DeviceVec};
 /// - `token_in_block_row`: i32 `[n_tokens]` — 0..page_block_size-1 per token.
 /// - `page_block_size`: upstream's `page_block_size` (64 for DSv4-Flash MODEL1).
 ///
-/// No-op when `n_tokens == 0`.
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_fp8_kv_pack(
     ctx: &DeviceContext,
@@ -189,8 +180,6 @@ pub fn dsv4_v32_fp8_kv_pack_strided_raw(
     Ok(())
 }
 
-/// Fill the single `[block_id,row]` scratch pair for FlashMLA decode SW pack
-/// from a device-resident `start_pos` scalar.
 pub fn dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
     ctx: &DeviceContext,
     token_block_id_ptr: u64,
@@ -217,9 +206,7 @@ pub fn dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
     Ok(())
 }
 
-/// Pack the just-completed compressor row, if this decode step completes one.
-/// The kernel reads `start_pos_ptr` on device, so a captured CUDA Graph can
-/// replay across decode positions without host-computed row constants.
+/// Reads `start_pos_ptr` on device so a captured CUDA Graph can replay across decode positions.
 pub fn dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
     ctx: &DeviceContext,
     compressed_ptr: u64,
@@ -365,9 +352,7 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
     Ok(())
 }
 
-/// Build FlashMLA decode indices, reading `start_pos` from a single `int32`
-/// device scalar. This is the graph-ready entrypoint for decode paths that
-/// stamp per-step metadata on the stream.
+/// Build FlashMLA decode indices from a device-resident `start_pos` scalar (graph-replay safe).
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
     ctx: &DeviceContext,
@@ -503,13 +488,6 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Qwen3.5/3.6 non-paged prefill attention family: typed launchers over the
-// HD256 prep/gate/attention FFI. Raw u64 device addresses — consumers apply
-// pointer offsets (pool head shifts, per-row columns) before the call and keep
-// every owning buffer alive and stream-ordered on `stream`.
-// ---------------------------------------------------------------------------
-
 fn attn_i32(v: usize, what: &'static str) -> Result<i32> {
     i32::try_from(v).map_err(|_| anyhow!("{what} {v} exceeds i32"))
 }
@@ -635,9 +613,7 @@ pub fn fa2_sm70_attention_raw(
     }
 }
 
-/// Qwen3.6 HD256 non-paged prefill prep: q/k-norm + partial RoPE, q into
-/// `q_out`, K/V appended to the contiguous head-major caches at
-/// `*start_pos_dev_ptr`.
+/// Qwen3.6 HD256 non-paged prefill prep: q/k-norm + partial RoPE; K/V appended at `*start_pos_dev_ptr`.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_hd256_prep_raw(
     stream: &CudaStream,
@@ -746,7 +722,6 @@ pub fn prefill_attention_paged_prep_hd256_raw(
     }
 }
 
-/// Qwen3.6 HD256 paged decode prep, one q row per batch element.
 /// `write_kv`: 0 = skip the K/V pool write (2D non-owner shard); 1 = write.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_prep_paged_hd256_raw(
@@ -1165,8 +1140,6 @@ pub fn attention_gate_batch_hd256_raw(
     }
 }
 
-/// Paged variant of [`attention_gate_batch_hd256_raw`]: iterates
-/// `rows * num_q_heads` over the ragged batch.
 pub fn attention_gate_paged_hd256_raw(
     stream: &CudaStream,
     q_full_ptr: u64,
@@ -1260,15 +1233,6 @@ pub fn fa3_fwd_hd256_quant(
             })
     }
 }
-
-// ---------------------------------------------------------------------------
-// DSv4 MLA/DSA/compressor attention family: typed launchers over the FlashMLA
-// shim, DSA indexer, compressor/window-cache, QK prep, output inverse-RoPE, TP
-// repack/slice, and top-k transform FFI. Pointer args are raw u64
-// device addresses (0 = null where the ABI allows it); scalar args mirror the
-// FFI types so consumers pass identical values. Callers keep every owning
-// buffer alive and stream-ordered on `stream`.
-// ---------------------------------------------------------------------------
 
 /// FlashMLA SM90 sparse bf16 prefill forward (vendored shim; d_qk ∈ {512,576},
 /// d_v = 512).
@@ -1430,9 +1394,6 @@ pub fn flashmla_sm90_sparse_decode_fwd_raw(
     }
 }
 
-/// Host-side decode scheduler tuning meta for a (`h_q`, `s_q`,
-/// `model_type_int`) tuple. Returns `(num_sm_parts,
-/// fixed_overhead_num_blocks, block_size_topk)`.
 pub fn flashmla_sm90_sparse_decode_get_meta(
     h_q: i32,
     s_q: i32,
@@ -1459,8 +1420,7 @@ pub fn flashmla_sm90_sparse_decode_get_meta(
     Ok((num_sm_parts, fixed_overhead_num_blocks, block_size_topk))
 }
 
-/// Populate the decode `tile_scheduler_metadata` + `num_splits` device arrays
-/// from per-batch effective topk lengths. `extra_topk_length_ptr` may be 0.
+/// Populate decode `tile_scheduler_metadata` + `num_splits` from per-batch topk lengths; `extra_topk_length_ptr` may be 0.
 #[allow(clippy::too_many_arguments)]
 pub fn flashmla_sm90_sparse_decode_sched_meta_raw(
     stream: &CudaStream,
@@ -1648,7 +1608,6 @@ pub fn flashmla_csa_pack_kv_raw(
     }
 }
 
-/// DSA fused Q-indexer RoPE + Hadamard + FP8 quant over `batch_size` rows.
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_dsa_fused_q_indexer_rope_hadamard_quant_raw(
     stream: &CudaStream,
@@ -1686,7 +1645,6 @@ pub fn dsv4_dsa_fused_q_indexer_rope_hadamard_quant_raw(
     }
 }
 
-/// DSA Hadamard-128 rotate over `rows` bf16 index-key rows.
 pub fn dsv4_dsa_hadamard128_bf16_raw(
     stream: &CudaStream,
     input_ptr: u64,
@@ -1707,7 +1665,6 @@ pub fn dsv4_dsa_hadamard128_bf16_raw(
     }
 }
 
-/// DSA fused FP8 quant + store of rotated index keys into the paged key cache.
 pub fn dsv4_dsa_fused_store_index_k_cache_raw(
     stream: &CudaStream,
     key_ptr: u64,
@@ -1831,7 +1788,6 @@ pub fn dsv4_dsa_fill_context_lens_positions_start_pos_raw(
     }
 }
 
-/// Compressor sub-block update over `num_tokens` (host `start_pos` variant).
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_compressor_update_raw(
     stream: &CudaStream,
@@ -1963,8 +1919,7 @@ pub fn dsv4_compressor_update_start_pos_ptr_raw(
     }
 }
 
-/// Batched decode compressor update: ONE launch over `n` rows' per-slot ring
-/// state (host-gathered device pointer arrays).
+/// Batched decode compressor update: ONE launch over `n` rows' per-slot ring state (host-gathered device pointer arrays).
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_compressor_update_batched_start_pos_ptr_raw(
     stream: &CudaStream,
@@ -2147,7 +2102,6 @@ pub fn dsv4_compressor_fp32_carry_reseed_raw(
     }
 }
 
-/// Write `num_tokens` new keys into the bf16 SW ring cache (host `start_pos`).
 pub fn dsv4_update_window_cache_raw(
     stream: &CudaStream,
     k_new_ptr: u64,
@@ -2619,7 +2573,6 @@ pub fn dsv4_tp_q_repack_raw(
     }
 }
 
-/// Slice a local column block out of a `[s_q, global_width]` row-major buffer.
 pub fn dsv4_tp_out_slice_raw(
     stream: &CudaStream,
     full_out_ptr: u64,

@@ -84,7 +84,6 @@ pub struct TokenKVPool {
     /// Per-request page tables: `page_indices[slot][i]` = physical page id for
     /// logical page `i` of the request occupying that slot.
     page_indices: Vec<Vec<u32>>,
-    /// Per-request logical token lengths.
     seq_lens: Vec<usize>,
     /// Monotonic slot epoch bumped whenever a slot is released.
     /// Lets decode metadata distinguish "same slot index, different request".
@@ -107,7 +106,6 @@ pub struct TokenKVPool {
     /// both `page_attach_count[p] == 0` and `page_ref_count[p] == 0`.
     page_ref_count: Vec<u32>,
 
-    // Config
     pub format: KVFormat,
     /// Legacy compat — maps to format.
     pub dtype: KVCacheDtype,
@@ -377,7 +375,6 @@ impl TokenKVPool {
         self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
     }
 
-    /// Create a new token-level KV pool.
     ///
     /// `budget_bytes` controls how much GPU memory to allocate for the pool.
     /// `max_total_tokens` is derived from the budget: all memory is allocated
@@ -391,7 +388,6 @@ impl TokenKVPool {
         budget_bytes: usize,
         dtype: KVCacheDtype,
     ) -> Result<Self> {
-        // Map legacy KVCacheDtype to KVFormat.
         let format = match dtype {
             KVCacheDtype::BF16 => KVFormat::BF16,
             KVCacheDtype::INT8 => KVFormat::INT8,
@@ -407,7 +403,6 @@ impl TokenKVPool {
         )
     }
 
-    /// Create a new token-level KV pool with explicit format.
     pub fn with_format(
         ctx: &DeviceContext,
         num_layers: usize,
@@ -481,7 +476,6 @@ impl TokenKVPool {
                 }
             }
 
-            // Scale buffers (FP8/INT8)
             if format.has_scales() {
                 for _ in 0..num_layers {
                     k_scales.push(
@@ -566,7 +560,6 @@ impl TokenKVPool {
                 (None, 0)
             };
 
-        // TurboQuant state: rotation matrices + codebook
         let (tq_k_state, tq_v_state) = if let KVFormat::TurboQuant { key_bits, val_bits } = format {
             let k_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, key_bits, 42)?;
             let v_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, val_bits, 137)?;
@@ -1198,8 +1191,6 @@ impl TokenKVPool {
         self.seq_lens[slot] = 0;
     }
 
-    /// Truncate a live slot to `new_len` logical tokens and recycle any full
-    /// trailing pages that are no longer reachable.
     pub fn truncate_slot(&mut self, slot: usize, new_len: usize) -> Result<Vec<u32>> {
         let old_len = self.seq_lens[slot];
         if new_len > old_len {
@@ -1264,7 +1255,6 @@ impl TokenKVPool {
         if self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1 {
             return None;
         }
-        // Drop this slot's attachment and recycle the physical page.
         self.page_attach_count[page_idx] = self.page_attach_count[page_idx].saturating_sub(1);
         let freed = self.recycle_page_if_unreferenced(page);
         debug_assert!(
@@ -1368,12 +1358,10 @@ impl TokenKVPool {
         newly_freed
     }
 
-    /// Get the page table for a request (physical page ids in logical-page order).
     pub fn page_indices(&self, slot: usize) -> &[u32] {
         &self.page_indices[slot]
     }
 
-    /// Get the sequence length for a request (number of tokens allocated).
     pub fn seq_len(&self, slot: usize) -> usize {
         self.seq_lens[slot]
     }
@@ -1383,7 +1371,6 @@ impl TokenKVPool {
         self.slot_epochs[slot]
     }
 
-    /// Number of currently free physical pages.
     pub fn free_page_count(&self) -> usize {
         self.free_pages.len()
     }
@@ -1501,7 +1488,6 @@ impl TokenKVPool {
             .ok_or_else(|| anyhow::anyhow!("quantized KV pool missing quantized_attn_workspace"))
     }
 
-    /// K data CudaSlice ref for a layer.
     pub fn k_data_slice(&self, layer: usize) -> &CudaSlice<u8> {
         &self.k_data[layer]
     }
@@ -1538,7 +1524,6 @@ impl TokenKVPool {
         scratch.as_slice()
     }
 
-    /// Build TileLang page-indices array (concatenated physical page ids).
     pub fn build_indices(&self, slots: &[usize]) -> Vec<i32> {
         slots
             .iter()
@@ -1564,7 +1549,6 @@ impl TokenKVPool {
             .collect()
     }
 
-    /// Build TileLang last_page_len array.
     pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
         slots
             .iter()

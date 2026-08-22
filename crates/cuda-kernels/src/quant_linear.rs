@@ -8,10 +8,7 @@ use half::bf16;
 use crate::ffi::{self, Half};
 use crate::tensor::{DeviceContext, RawDevicePtr};
 
-// Safe wrappers over the dense FP8 quant-linear FFI, per the `moe.rs` pattern:
-// typed buffers, checked i32 casts, pointer guards held through submission, one
-// FFI symbol per launcher. bf16 (Rust) and Half (u16, kernel ABI) share a
-// 16-bit layout, so pointers cast directly.
+// bf16 (Rust) and Half (u16, kernel ABI) share a 16-bit layout, so pointers cast directly.
 
 /// FP8 f32 scale-grid metadata as the block-scaled kernels consume it:
 /// `scales[(row/block_m)*scale_cols + (col/block_k)]`.
@@ -996,7 +993,6 @@ fn dsv4_route_gemv_batch(
     }
 }
 
-/// Routed DSv4 FP8 block-scaled batch GEMV over per-expert pointer tables.
 pub fn dsv4_fp8_route_gemv_batch(
     ctx: &DeviceContext,
     weight_ptrs: &impl DevicePtr<u64>,
@@ -1017,7 +1013,6 @@ pub fn dsv4_fp8_route_gemv_batch(
     )
 }
 
-/// Routed DSv4 FP4 block-scaled batch GEMV over per-expert pointer tables.
 pub fn dsv4_fp4_route_gemv_batch(
     ctx: &DeviceContext,
     weight_ptrs: &impl DevicePtr<u64>,

@@ -48,7 +48,6 @@ pub struct DeviceVec {
 }
 
 impl DeviceVec {
-    /// Create from host data (bf16)
     pub fn from_host(ctx: &DeviceContext, data: &[bf16]) -> Result<Self> {
         let gpu_data = ctx
             .stream
@@ -66,7 +65,6 @@ impl DeviceVec {
         Self::from_host(ctx, slice.as_ref())
     }
 
-    /// Create zeroed tensor
     #[track_caller]
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let gpu_data: CudaSlice<bf16> = ctx
@@ -102,7 +100,6 @@ impl DeviceVec {
         })
     }
 
-    /// Create a tensor filled with bf16 ones (1.0).
     /// Useful for dummy RMSNorm weights (identity normalization).
     pub fn ones(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let host = vec![bf16::ONE; len];
@@ -127,7 +124,6 @@ impl DeviceVec {
         Ok((host, freed))
     }
 
-    /// Restore the device buffer from a host snapshot, re-allocating VRAM.
     pub fn reload_from_host(&mut self, ctx: &DeviceContext, host: &[bf16]) -> Result<()> {
         self.data = ctx
             .stream
@@ -181,7 +177,6 @@ pub struct HiddenStates {
 }
 
 impl HiddenStates {
-    /// Create zeroed batch
     #[track_caller]
     pub fn zeros(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize) -> Result<Self> {
         let len = hidden_dim * seq_len;
@@ -312,12 +307,10 @@ impl<T> RawDevicePtr<T> {
         }
     }
 
-    /// Get as const pointer for kernel read parameters.
     pub fn as_ptr(self) -> *const T {
         self.ptr as *const T
     }
 
-    /// Get as mut pointer for kernel write parameters.
     pub fn as_mut_ptr(self) -> *mut T {
         self.ptr as *mut T
     }
@@ -342,7 +335,6 @@ impl<T> RawDevicePtr<T> {
     }
 }
 
-/// Extract and cache a raw device pointer from a CudaSlice.
 /// Calls device_ptr() once -- amortized over thousands of decode steps.
 pub fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T> {
     cache_ptr_on(slice, &ctx.stream)
