@@ -26,6 +26,8 @@ mod diffusion_gemma;
 #[cfg(feature = "metal")]
 mod gemma4;
 #[cfg(feature = "metal")]
+mod lfm2;
+#[cfg(feature = "metal")]
 mod loader;
 #[cfg(feature = "metal")]
 mod mlx;

@@ -35,26 +35,39 @@ impl MetalSlotState {
         let capacity = round_up_capacity(capacity_tokens);
         let kv_flat = allocate_kv_flat(config, kv_cache_dtype, capacity);
 
-        let la = &config.arch.linear;
-        let gdr_flat: Vec<mlx::MlxArray> = (0..config.arch.num_linear_attention_layers())
-            .flat_map(|_| {
-                [
+        let gdr_flat: Vec<mlx::MlxArray> = if let Some(lfm2) = config.arch.lfm2.as_ref() {
+            // LFM2: one conv state per gated conv layer — the last (kernel-1)
+            // post-gate frames, channels-last to match the C++ conv1d path.
+            (0..config.arch.num_conv_layers())
+                .map(|_| {
                     mlx::zeros(
-                        &[
-                            1,
-                            la.num_value_heads as i32,
-                            la.value_dim as i32,
-                            la.key_dim as i32,
-                        ],
-                        mlx::Dtype::Float32,
-                    ),
-                    mlx::zeros(
-                        &[1, (la.conv_kernel - 1) as i32, la.qkv_dim() as i32],
+                        &[1, (lfm2.conv_kernel - 1) as i32, config.hidden_size as i32],
                         mlx::Dtype::Bfloat16,
-                    ),
-                ]
-            })
-            .collect();
+                    )
+                })
+                .collect()
+        } else {
+            let la = &config.arch.linear;
+            (0..config.arch.num_linear_attention_layers())
+                .flat_map(|_| {
+                    [
+                        mlx::zeros(
+                            &[
+                                1,
+                                la.num_value_heads as i32,
+                                la.value_dim as i32,
+                                la.key_dim as i32,
+                            ],
+                            mlx::Dtype::Float32,
+                        ),
+                        mlx::zeros(
+                            &[1, (la.conv_kernel - 1) as i32, la.qkv_dim() as i32],
+                            mlx::Dtype::Bfloat16,
+                        ),
+                    ]
+                })
+                .collect()
+        };
 
         Self {
             slot,
@@ -93,21 +106,21 @@ impl MetalSlotState {
 
     pub(super) fn ensure_session_active(
         &mut self,
-        model: &qwen35::CppQwen35Model,
+        model: &dyn CompiledMetalModel,
     ) -> anyhow::Result<()> {
         if self.session_active {
             return Ok(());
         }
-        model.begin_session(&self.kv_flat, &self.gdr_flat)?;
+        model.session_begin(&self.kv_flat, &self.gdr_flat)?;
         self.session_active = true;
         Ok(())
     }
 
-    pub(super) fn drain_session(&mut self, model: &qwen35::CppQwen35Model) -> anyhow::Result<()> {
+    pub(super) fn drain_session(&mut self, model: &dyn CompiledMetalModel) -> anyhow::Result<()> {
         if !self.session_active {
             return Ok(());
         }
-        let (kv_flat, gdr_flat) = model.end_session(self.kv_flat.len(), self.gdr_flat.len())?;
+        let (kv_flat, gdr_flat) = model.session_end(self.kv_flat.len(), self.gdr_flat.len())?;
         self.kv_flat = kv_flat;
         self.gdr_flat = gdr_flat;
         self.session_active = false;
@@ -206,7 +219,7 @@ impl MetalSlotState {
     /// re-activates it via `ensure_session_active`.
     pub(super) fn ensure_kv_capacity(
         &mut self,
-        model: &qwen35::CppQwen35Model,
+        model: &dyn CompiledMetalModel,
         needed: usize,
     ) -> anyhow::Result<()> {
         let capacity = self

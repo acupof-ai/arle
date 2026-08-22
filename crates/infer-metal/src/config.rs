@@ -34,6 +34,8 @@ pub(crate) struct QuantConfig {
 pub(crate) enum MetalQwen35LayerType {
     FullAttention,
     LinearAttention,
+    /// LFM2 gated short-conv block (`layer_types: ["conv", ...]`).
+    Conv,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,9 @@ pub(crate) struct MetalQwen35ArchConfig {
     pub(crate) rotary_dim: usize,
     pub(crate) linear: MetalGdrConfig,
     pub(crate) moe: Option<MetalQwen35MoeConfig>,
+    /// LFM2 (`lfm2_moe`) hybrid conv/attention MoE. When set, the executor
+    /// loads weights through the LFM2 path, not the Qwen3.5 path.
+    pub(crate) lfm2: Option<MetalLfm2Config>,
 }
 
 impl MetalQwen35ArchConfig {
@@ -96,6 +101,39 @@ impl MetalQwen35ArchConfig {
             .filter(|&&layer| layer == MetalQwen35LayerType::LinearAttention)
             .count()
     }
+
+    pub(crate) fn num_conv_layers(&self) -> usize {
+        self.layer_types
+            .iter()
+            .filter(|&&layer| layer == MetalQwen35LayerType::Conv)
+            .count()
+    }
+}
+
+/// LFM2-specific arch config. Conv layers are gated short-convolutions
+/// (no recurrent state beyond a `conv_kernel - 1`-frame history); the MoE
+/// uses sigmoid routing with a persistent per-expert bias and no shared
+/// expert.
+#[derive(Debug, Clone)]
+pub(crate) struct MetalLfm2Config {
+    pub(crate) conv_kernel: usize,
+    pub(crate) num_dense_layers: usize,
+    pub(crate) moe: MetalLfm2MoeConfig,
+}
+
+impl MetalLfm2Config {
+    pub(crate) fn is_moe_layer(&self, idx: usize) -> bool {
+        idx >= self.num_dense_layers
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MetalLfm2MoeConfig {
+    pub(crate) num_experts: usize,
+    pub(crate) num_experts_per_tok: usize,
+    pub(crate) norm_topk_prob: bool,
+    pub(crate) expert_bits: i32,
+    pub(crate) expert_group_size: i32,
 }
 
 /// `stop_token_ids` is the model-default stop set the executor exposes via
@@ -476,16 +514,21 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 .unwrap_or(default)
         };
 
+    let is_lfm2 = model_type_is(model, "lfm2_moe") || model_type_is(root, "lfm2_moe");
     let layer_types = model
         .get("layer_types")
         .and_then(serde_json::Value::as_array)
-        .context("R3a Metal executor requires Qwen3.5 `layer_types`")?
+        .context("R3a Metal executor requires `layer_types`")?
         .iter()
         .map(|value| match value.as_str() {
             Some("full_attention") => Ok(MetalQwen35LayerType::FullAttention),
             Some("linear_attention") => Ok(MetalQwen35LayerType::LinearAttention),
-            Some(other) => anyhow::bail!("unsupported Qwen3.5 layer type '{other}'"),
-            None => anyhow::bail!("Qwen3.5 layer_types entries must be strings"),
+            Some("conv") if is_lfm2 => Ok(MetalQwen35LayerType::Conv),
+            Some("conv") => {
+                anyhow::bail!("layer type 'conv' is only supported for lfm2_moe checkpoints")
+            }
+            Some(other) => anyhow::bail!("unsupported layer type '{other}'"),
+            None => anyhow::bail!("layer_types entries must be strings"),
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -500,7 +543,7 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         num_hidden_layers
     );
 
-    let rms_norm_eps = get_f64(model, "rms_norm_eps", 1e-6);
+    let rms_norm_eps = get_f64(model, "rms_norm_eps", get_f64(model, "norm_eps", 1e-6));
     let rope_parameters = model
         .get("rope_parameters")
         .and_then(serde_json::Value::as_object);
@@ -519,7 +562,9 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         .map(parse_quant_config)
         .transpose()?;
 
-    let moe = {
+    let moe = if is_lfm2 {
+        None
+    } else {
         let nested_moe = model
             .get("moe_config")
             .and_then(serde_json::Value::as_object);
@@ -579,6 +624,34 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         }
     };
 
+    let lfm2 = if is_lfm2 {
+        let num_experts = get_usize(model, "num_experts", 0);
+        let top_k = get_usize(model, "num_experts_per_tok", 0);
+        anyhow::ensure!(
+            num_experts > 0 && top_k > 0,
+            "lfm2_moe requires num_experts/num_experts_per_tok"
+        );
+        let (group_size_default, bits_default) = quantization
+            .as_ref()
+            .map_or((64, 4), |qc| (qc.group_size, qc.bits));
+        Some(MetalLfm2Config {
+            conv_kernel: get_usize(model, "conv_L_cache", 3),
+            num_dense_layers: get_usize(model, "num_dense_layers", 0),
+            moe: MetalLfm2MoeConfig {
+                num_experts,
+                num_experts_per_tok: top_k,
+                norm_topk_prob: model
+                    .get("norm_topk_prob")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                expert_bits: bits_default,
+                expert_group_size: group_size_default,
+            },
+        })
+    } else {
+        None
+    };
+
     let stop_token_ids = resolve_stop_token_ids(model_dir, root, model)?;
 
     Ok(MetalModelConfig {
@@ -603,6 +676,7 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 rms_norm_eps: rms_norm_eps as f32,
             },
             moe,
+            lfm2,
         },
     })
 }

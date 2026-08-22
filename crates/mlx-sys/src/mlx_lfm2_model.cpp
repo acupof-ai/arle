@@ -1,0 +1,759 @@
+//! LFM2.5 C++ forward model — collapses per-op Rust/FFI overhead, same
+//! pattern as `mlx_qwen35_model.cpp`.
+//!
+//! Architecture (see docs/reference: HuggingFace transformers
+//! `modeling_lfm2_moe.py`):
+//!   - 24 layers, each either a gated short-conv block (18) or full
+//!     attention (6), with pre-norm (operator_norm / ffn_norm).
+//!   - Conv block: y = out_proj(C * conv1d(B * x)); in_proj splits into
+//!     B|C|x, gates are multiplicative with NO activation, conv has NO
+//!     activation. Conv state keeps the last (kernel-1) post-gate frames.
+//!   - Attention: standard MHA with per-head-dim Q/K RMSNorm, RoPE, GQA.
+//!   - FFN: SwiGLU — dense (intermediate 7168) for the first 2 layers,
+//!     32-expert top-4 MoE (sigmoid routing + expert_bias, no shared
+//!     expert) for the rest.
+//!   - Final RMSNorm (`embedding_norm`, despite the name) + tied lm_head.
+//!
+//! API:
+//!   model = lfm2_compiled_new()
+//!   lfm2_compiled_set_config(model, ...)
+//!   lfm2_compiled_set_embed(model, embed, embedding_norm, lm_head_id)
+//!   lfm2_compiled_set_embed_as_linear(model, embed_quant_id)  // tied lm_head
+//!   lfm2_compiled_push_conv_layer(model, ...)  // ×18
+//!   lfm2_compiled_push_attn_layer(model, ...)  // ×6
+//!   lfm2_compiled_set_last_moe(model, ...)     // ×22 (after the layer push)
+//!   lfm2_compiled_finalize(model)
+//!   lfm2_session_begin/end, lfm2_compiled_prefill/step[_paged]_session
+//!   lfm2_compiled_free(model)
+
+#include "mlx_common.h"
+#include <algorithm>
+#include <charconv>
+#include <cstdlib>
+#include <functional>
+#include <map>
+#include <tuple>
+#include <stdexcept>
+
+namespace {
+
+bool parse_env_bool(const char* name, bool fallback) {
+    const char* env = std::getenv(name);
+    return env ? std::string(env) != "0" : fallback;
+}
+
+bool use_prefill_last_logits_only() {
+    static const bool enabled =
+        parse_env_bool("AGENT_INFER_LFM2_CPP_PREFILL_LAST_LOGITS_ONLY", true);
+    return enabled;
+}
+
+bool keep_prefill_intermediates() {
+    static const bool enabled =
+        parse_env_bool("AGENT_INFER_LFM2_CPP_KEEP_PREFILL_INTERMEDIATES", false);
+    return enabled;
+}
+
+std::optional<array> bias_if_affine(const array& biases, int mode) {
+    return mode == 0 ? std::optional(biases) : std::nullopt;
+}
+
+// Compiled SwiGLU: silu(gate) * up.
+std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
+    auto gate = inputs[0];
+    auto up = inputs[1];
+    return {(gate * mlx::core::sigmoid(gate)) * up};
+}
+
+auto& compiled_swiglu() {
+    static auto fn = mlx::core::compile(swiglu_impl, /*shapeless=*/true);
+    return fn;
+}
+
+// Compiled fused dense MLP: gate_up matmul -> split -> swiglu -> down matmul.
+// Encoded once per (gate_dim, gs, bits, mode); decode (S=1) only. Mirrors
+// compiled_mlp_fn in mlx_qwen35_model.cpp.
+using CompiledFn = std::function<std::vector<array>(const std::vector<array>&)>;
+CompiledFn& compiled_mlp_fn(int gate_dim, int gs, int bits, int mode) {
+    static std::map<std::tuple<int, int, int, int>, CompiledFn> cache;
+    auto key = std::make_tuple(gate_dim, gs, bits, mode);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    auto impl = [gate_dim, gs, bits, mode](const std::vector<array>& in) -> std::vector<array> {
+        auto gu = quantized_matmul(in[0], in[1], in[2], bias_if_affine(in[3], mode), true,
+                                   gs, bits, quant_mode_str(mode));
+        auto parts = split(gu, Shape{gate_dim}, -1);
+        auto h = (parts[0] * sigmoid(parts[0])) * parts[1];
+        return {quantized_matmul(h, in[4], in[5], bias_if_affine(in[6], mode), true, gs,
+                                 bits, quant_mode_str(mode))};
+    };
+    return cache.emplace(key, mlx::core::compile(impl, /*shapeless=*/false)).first->second;
+}
+
+} // namespace
+
+struct Lfm2Weight {
+    array w = array(0);
+    array scales = array(0);
+    array biases = array(0);
+    int group_size = 64;
+    int bits = 4;
+    bool is_dense = false;  // w pre-transposed [in, out]
+    int mode = 0;           // 0=affine, 1=mxfp4
+
+    array apply(const array& x) const {
+        if (is_dense) {
+            return matmul(x, w);
+        }
+        return quantized_matmul(
+            x, w, scales, bias_if_affine(biases, mode), true, group_size, bits,
+            quant_mode_str(mode));
+    }
+};
+
+struct Lfm2ConvLayer {
+    array op_norm_w = array(0), ffn_norm_w = array(0);
+    Lfm2Weight in_proj;   // H -> 3H
+    array conv_w = array(0);  // [H, kernel, 1]
+    Lfm2Weight out_proj;  // H -> H
+    Lfm2Weight gate_up;   // dense FFN (merged gate+up), empty for MoE layers
+    Lfm2Weight down;
+    int gate_dim = 0;
+};
+
+struct Lfm2AttnLayer {
+    array op_norm_w = array(0), ffn_norm_w = array(0);
+    Lfm2Weight q_proj, k_proj, v_proj, o_proj;
+    array q_norm_w = array(0), k_norm_w = array(0);  // [head_dim]
+    Lfm2Weight gate_up;
+    Lfm2Weight down;
+    int gate_dim = 0;
+};
+
+struct Lfm2MoeFFN {
+    array router_w = array(0);    // dense [H, E] (pre-transposed)
+    array expert_bias = array(0); // [E]
+    Lfm2Weight switch_gate, switch_up, switch_down;  // stacked [E, I, H/pack]
+    int num_experts = 0;
+    int top_k = 0;
+    bool norm_topk_prob = true;
+    int expert_bits = 4;
+    int expert_group_size = 64;
+};
+
+struct Lfm2Layer {
+    bool is_conv = false;
+    Lfm2ConvLayer conv;
+    Lfm2AttnLayer attn;
+    bool has_moe = false;
+    Lfm2MoeFFN moe;
+};
+
+// Defined in mlx_lfm2_moe_block.cpp.
+array lfm2_moe_block_forward_cpp(
+    const array& x,
+    const array& router_w,
+    const array& expert_bias,
+    const array& expert_gate_w, const array& expert_gate_s, const array& expert_gate_b,
+    const array& expert_up_w,   const array& expert_up_s,   const array& expert_up_b,
+    const array& expert_down_w, const array& expert_down_s, const array& expert_down_b,
+    int32_t expert_group_size, int32_t expert_bits,
+    int32_t num_experts, int32_t top_k, bool norm_topk_prob);
+
+struct Lfm2CompiledModel {
+    // Weights
+    array embed_tokens = array(0);       // dequantized bf16 for take()
+    array embedding_norm_w = array(0);   // final RMSNorm (despite the name)
+    Lfm2Weight lm_head;
+    Lfm2Weight embed_as_linear;          // quantized embed for tied lm_head
+    bool use_embed_as_linear = false;
+    std::vector<Lfm2Layer> layers;
+    std::vector<Lfm2Weight> weight_pool;
+
+    // Config
+    float rope_theta = 5e6f;
+    float rms_eps = 1e-5f;
+    int n_heads = 32, n_kv_heads = 8, head_dim = 64;
+    int hidden_size = 2048;
+    int conv_kernel = 3;
+    int n_full_attn = 0, n_conv = 0;
+
+    // Session state
+    std::vector<array> session_kv_caches;   // [k0, v0, ...] per full-attn layer
+    std::vector<array> session_conv_states; // one per conv layer
+    bool session_active = false;
+
+    // Per-step runtime state
+    int current_cache_pos = 0;
+    int current_seq_len = 1;
+    int current_batch_size = 1;
+    bool current_last_logits_only = false;
+    bool current_has_paged_prefix = false;
+    std::vector<array> current_paged_k;
+    std::vector<array> current_paged_v;
+    std::vector<array> prev_outputs;
+
+    static const bool mlp_compile() {
+        static const bool on = std::getenv("INFER_METAL_NO_MLP_COMPILE") == nullptr;
+        return on;
+    }
+
+    array dense_mlp(const array& x, const Lfm2Weight& gate_up, const Lfm2Weight& down,
+                    int gate_dim) const {
+        if (mlp_compile() && x.ndim() == 3 && x.shape(1) == 1 && !gate_up.is_dense
+            && !down.is_dense && gate_up.group_size == down.group_size
+            && gate_up.bits == down.bits && gate_up.mode == down.mode) {
+            return compiled_mlp_fn(
+                gate_dim, gate_up.group_size, gate_up.bits, gate_up.mode)(
+                {x, gate_up.w, gate_up.scales, gate_up.biases,
+                 down.w, down.scales, down.biases})[0];
+        }
+        auto gu = gate_up.apply(x);
+        auto parts = split(gu, Shape{gate_dim}, -1);
+        auto h = compiled_swiglu()({parts[0], parts[1]})[0];
+        return down.apply(h);
+    }
+
+    array conv_step(
+        const array& x, const Lfm2ConvLayer& lw,
+        const array& conv_state_in,
+        array& conv_state_out) const {
+        int B = current_batch_size;
+        int S = current_seq_len;
+        int H = hidden_size;
+
+        auto z = lw.in_proj.apply(x);  // [B, S, 3H]
+        auto parts = split(z, Shape{H, 2 * H}, -1);
+        // in_proj output order is B|C|x: input gate, output gate, conv input.
+        auto h = parts[0] * parts[2];
+
+        int n_keep = conv_kernel - 1;
+        auto conv_input = concatenate({conv_state_in, h}, 1);  // [B, S+n_keep, H]
+        conv_state_out = contiguous(slice(
+            conv_input, {0, S, 0}, {B, S + n_keep, H}));
+        auto conv_out = conv1d(conv_input, lw.conv_w, 1, 0, 1, H);  // [B, S, H]
+
+        auto y = parts[1] * conv_out;
+        return lw.out_proj.apply(y);
+    }
+
+    array full_attn_step(
+        const array& x, const Lfm2AttnLayer& lw,
+        const array& k_cache, const array& v_cache,
+        int full_layer_idx,
+        array& new_k_cache, array& new_v_cache) const {
+        int B = current_batch_size;
+        int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
+        int S = current_seq_len;
+        float attn_scale = 1.0f / std::sqrt((float)hd);
+
+        auto q = reshape(lw.q_proj.apply(x), {B, S, nh, hd});
+        q = fast::rms_norm(q, lw.q_norm_w, rms_eps);
+        q = transpose(q, {0, 2, 1, 3});
+
+        auto k = reshape(lw.k_proj.apply(x), {B, S, nkv, hd});
+        k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
+        k = transpose(k, {0, 2, 1, 3});
+
+        q = fast::rope(q, hd, false, rope_theta, 1.0f, current_cache_pos);
+        k = fast::rope(k, hd, false, rope_theta, 1.0f, current_cache_pos);
+
+        auto v = transpose(reshape(lw.v_proj.apply(x), {B, S, nkv, hd}), {0, 2, 1, 3});
+
+        int end = current_cache_pos + S;
+        new_k_cache = slice_update(k_cache, k, {0, 0, current_cache_pos, 0}, {B, nkv, end, hd});
+        new_v_cache = slice_update(v_cache, v, {0, 0, current_cache_pos, 0}, {B, nkv, end, hd});
+
+        array k_full(0), v_full(0);
+        if (current_has_paged_prefix) {
+            if (S != 1 || B != 1) {
+                throw std::runtime_error("paged KV read supports only single-token decode");
+            }
+            if (full_layer_idx < 0 || full_layer_idx >= (int)current_paged_k.size()
+                || full_layer_idx >= (int)current_paged_v.size()) {
+                throw std::runtime_error("paged KV read missing layer input");
+            }
+            k_full = concatenate(std::vector<array>{current_paged_k[full_layer_idx], k}, 2);
+            v_full = concatenate(std::vector<array>{current_paged_v[full_layer_idx], v}, 2);
+        } else {
+            k_full = slice(new_k_cache, {0, 0, 0, 0}, {B, nkv, end, hd});
+            v_full = slice(new_v_cache, {0, 0, 0, 0}, {B, nkv, end, hd});
+        }
+
+        std::string mask_mode = (S > 1) ? "causal" : "";
+        auto attn = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, mask_mode);
+        attn = reshape(transpose(attn, {0, 2, 1, 3}), {B, S, nh * hd});
+        return lw.o_proj.apply(attn);
+    }
+
+    // inputs layout:
+    //   [0]            : token ids
+    //   [1 .. 1+2F)    : k_cache_i, v_cache_i for F full-attn layers
+    //   [1+2F .. 1+2F+C) : conv_state_i for C conv layers
+    // outputs: [logits, new_kv..., new_conv...]
+    std::vector<array> forward_impl(const std::vector<array>& inputs) const {
+        auto token_id = inputs[0];
+        int B = current_batch_size;
+        int S = current_seq_len;
+        int F = n_full_attn, C = n_conv;
+
+        auto x = take(embed_tokens, flatten(token_id), 0);
+        x = reshape(x, {B, S, hidden_size});
+
+        std::vector<array> new_kv(2 * F, array(0));
+        std::vector<array> new_conv(C, array(0));
+        int full_idx = 0, conv_idx = 0;
+
+        for (int i = 0; i < (int)layers.size(); ++i) {
+            auto& layer = layers[i];
+            auto residual = x;
+            auto op_norm_w = layer.is_conv ? layer.conv.op_norm_w : layer.attn.op_norm_w;
+            auto xn = fast::rms_norm(x, op_norm_w, rms_eps);
+
+            array attn_out(0);
+            if (layer.is_conv) {
+                int si = 1 + 2 * F + conv_idx;
+                attn_out = conv_step(xn, layer.conv, inputs[si], new_conv[conv_idx]);
+                conv_idx++;
+            } else {
+                int si = 1 + 2 * full_idx;
+                attn_out = full_attn_step(
+                    xn, layer.attn, inputs[si], inputs[si + 1], full_idx,
+                    new_kv[2 * full_idx], new_kv[2 * full_idx + 1]);
+                full_idx++;
+            }
+            x = residual + attn_out;
+
+            auto residual2 = x;
+            auto ffn_norm_w = layer.is_conv ? layer.conv.ffn_norm_w : layer.attn.ffn_norm_w;
+            auto xn2 = fast::rms_norm(x, ffn_norm_w, rms_eps);
+            if (layer.has_moe) {
+                auto& moe = layer.moe;
+                x = residual2 + lfm2_moe_block_forward_cpp(
+                    xn2,
+                    moe.router_w, moe.expert_bias,
+                    moe.switch_gate.w, moe.switch_gate.scales, moe.switch_gate.biases,
+                    moe.switch_up.w, moe.switch_up.scales, moe.switch_up.biases,
+                    moe.switch_down.w, moe.switch_down.scales, moe.switch_down.biases,
+                    moe.expert_group_size, moe.expert_bits,
+                    moe.num_experts, moe.top_k, moe.norm_topk_prob);
+            } else if (layer.is_conv) {
+                x = residual2 + dense_mlp(xn2, layer.conv.gate_up, layer.conv.down,
+                                          layer.conv.gate_dim);
+            } else {
+                x = residual2 + dense_mlp(xn2, layer.attn.gate_up, layer.attn.down,
+                                          layer.attn.gate_dim);
+            }
+        }
+
+        auto final_x = fast::rms_norm(x, embedding_norm_w, rms_eps);
+        if (current_last_logits_only && S > 1) {
+            final_x = slice(final_x, {0, S - 1, 0}, {B, S, hidden_size});
+        }
+        auto logits = use_embed_as_linear ? embed_as_linear.apply(final_x) : lm_head.apply(final_x);
+
+        std::vector<array> outputs;
+        outputs.reserve(1 + 2 * F + C);
+        outputs.push_back(std::move(logits));
+        for (auto& kv : new_kv) outputs.push_back(std::move(kv));
+        for (auto& c : new_conv) outputs.push_back(std::move(c));
+        return outputs;
+    }
+
+    std::vector<array> forward(const std::vector<array>& inputs) {
+        auto outputs = forward_impl(inputs);
+        // Keep previous outputs alive so lazy graphs don't release GPU buffers
+        // mid-pipeline (mirrors the qwen35 model's prev_outputs).
+        prev_outputs = outputs;
+        return prev_outputs;  // copies of handles; buffers stay owned here
+    }
+};
+
+Lfm2Weight& lfm2_weight_by_id(Lfm2CompiledModel* model, int32_t id) {
+    if (id < 0 || id >= (int32_t)model->weight_pool.size()) {
+        throw std::runtime_error("invalid LFM2 compiled weight id");
+    }
+    return model->weight_pool[(size_t)id];
+}
+
+extern "C" {
+
+void* lfm2_compiled_new() {
+    MLX_TRY_RETURN(new Lfm2CompiledModel());
+}
+
+void lfm2_compiled_free(void* model) {
+    MLX_TRY_VOID(delete static_cast<Lfm2CompiledModel*>(model));
+}
+
+int32_t lfm2_compiled_add_dense_weight(void* model, mlx_array* w) {
+    MLX_TRY_RETURN_VALUE(-1, [&]() {
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        m->weight_pool.push_back({*to_arr(w), array(0), array(0), 0, 0, true});
+        return (int32_t)(m->weight_pool.size() - 1);
+    }());
+}
+
+int32_t lfm2_compiled_add_quant_weight(
+    void* model, mlx_array* w, mlx_array* scales, mlx_array* biases,
+    int32_t group_size, int32_t bits, int32_t mode) {
+    MLX_TRY_RETURN_VALUE(-1, [&]() {
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        m->weight_pool.push_back({
+            *to_arr(w), *to_arr(scales),
+            biases ? *to_arr(biases) : array(0),
+            group_size, bits, false, mode});
+        return (int32_t)(m->weight_pool.size() - 1);
+    }());
+}
+
+void lfm2_compiled_set_config(
+    void* model,
+    float rope_theta, float rms_eps,
+    int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
+    int32_t hidden_size, int32_t conv_kernel) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        m->rope_theta = rope_theta;
+        m->rms_eps = rms_eps;
+        m->n_heads = n_heads;
+        m->n_kv_heads = n_kv_heads;
+        m->head_dim = head_dim;
+        m->hidden_size = hidden_size;
+        m->conv_kernel = conv_kernel;
+    });
+}
+
+void lfm2_compiled_set_embed(
+    void* model, mlx_array* embed_tokens, mlx_array* embedding_norm_w,
+    int32_t lm_head_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        m->embed_tokens = embed_tokens ? *to_arr(embed_tokens) : array(0);
+        m->embedding_norm_w = *to_arr(embedding_norm_w);
+        m->lm_head = lfm2_weight_by_id(m, lm_head_id);
+        m->use_embed_as_linear = false;
+    });
+}
+
+void lfm2_compiled_set_embed_as_linear(void* model, int32_t embed_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        m->embed_as_linear = lfm2_weight_by_id(m, embed_id);
+        m->use_embed_as_linear = true;
+    });
+}
+
+void lfm2_compiled_push_conv_layer(
+    void* model,
+    mlx_array* op_norm, mlx_array* ffn_norm,
+    int32_t in_proj_id, mlx_array* conv_w, int32_t out_proj_id,
+    int32_t gate_up_id, int32_t gate_dim, int32_t down_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        Lfm2Layer layer;
+        layer.is_conv = true;
+        layer.conv.op_norm_w = *to_arr(op_norm);
+        layer.conv.ffn_norm_w = *to_arr(ffn_norm);
+        layer.conv.in_proj = lfm2_weight_by_id(m, in_proj_id);
+        layer.conv.conv_w = *to_arr(conv_w);
+        layer.conv.out_proj = lfm2_weight_by_id(m, out_proj_id);
+        if (gate_up_id >= 0) {
+            layer.conv.gate_up = lfm2_weight_by_id(m, gate_up_id);
+            layer.conv.gate_dim = gate_dim;
+        }
+        if (down_id >= 0) {
+            layer.conv.down = lfm2_weight_by_id(m, down_id);
+        }
+        m->layers.push_back(std::move(layer));
+        m->n_conv++;
+    });
+}
+
+void lfm2_compiled_push_attn_layer(
+    void* model,
+    mlx_array* op_norm, mlx_array* ffn_norm,
+    int32_t q_id, int32_t k_id, int32_t v_id, int32_t o_id,
+    mlx_array* q_norm, mlx_array* k_norm,
+    int32_t gate_up_id, int32_t gate_dim, int32_t down_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        Lfm2Layer layer;
+        layer.is_conv = false;
+        layer.attn.op_norm_w = *to_arr(op_norm);
+        layer.attn.ffn_norm_w = *to_arr(ffn_norm);
+        layer.attn.q_proj = lfm2_weight_by_id(m, q_id);
+        layer.attn.k_proj = lfm2_weight_by_id(m, k_id);
+        layer.attn.v_proj = lfm2_weight_by_id(m, v_id);
+        layer.attn.o_proj = lfm2_weight_by_id(m, o_id);
+        layer.attn.q_norm_w = *to_arr(q_norm);
+        layer.attn.k_norm_w = *to_arr(k_norm);
+        if (gate_up_id >= 0) {
+            layer.attn.gate_up = lfm2_weight_by_id(m, gate_up_id);
+            layer.attn.gate_dim = gate_dim;
+        }
+        if (down_id >= 0) {
+            layer.attn.down = lfm2_weight_by_id(m, down_id);
+        }
+        m->layers.push_back(std::move(layer));
+        m->n_full_attn++;
+    });
+}
+
+void lfm2_compiled_set_last_moe(
+    void* model,
+    mlx_array* router_w, mlx_array* expert_bias,
+    int32_t switch_gate_id, int32_t switch_up_id, int32_t switch_down_id,
+    int32_t expert_group_size, int32_t expert_bits,
+    int32_t num_experts, int32_t top_k, bool norm_topk_prob) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        if (m->layers.empty()) {
+            throw std::runtime_error("lfm2_compiled_set_last_moe requires an existing layer");
+        }
+        auto& layer = m->layers.back();
+        layer.has_moe = true;
+        layer.moe.router_w = *to_arr(router_w);
+        layer.moe.expert_bias = *to_arr(expert_bias);
+        layer.moe.switch_gate = lfm2_weight_by_id(m, switch_gate_id);
+        layer.moe.switch_up = lfm2_weight_by_id(m, switch_up_id);
+        layer.moe.switch_down = lfm2_weight_by_id(m, switch_down_id);
+        layer.moe.expert_group_size = expert_group_size;
+        layer.moe.expert_bits = expert_bits;
+        layer.moe.num_experts = num_experts;
+        layer.moe.top_k = top_k;
+        layer.moe.norm_topk_prob = norm_topk_prob;
+    });
+}
+
+int32_t lfm2_compiled_finalize(void* model) {
+    auto* m = static_cast<Lfm2CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if ((int)m->layers.size() != m->n_conv + m->n_full_attn) {
+            throw std::runtime_error("LFM2 layer count mismatch");
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_session_begin(
+    void* model, mlx_array** kv_caches, int32_t n_kv,
+    mlx_array** conv_states, int32_t n_conv) {
+    auto* m = static_cast<Lfm2CompiledModel*>(model);
+    mlx_clear_error();
+    try {
+        if (m->session_active) {
+            throw std::runtime_error("lfm2_session_begin requires an inactive session");
+        }
+        if (n_kv != 2 * m->n_full_attn) {
+            throw std::runtime_error(
+                "lfm2_session_begin KV cache count must be 2*full_attn_layers");
+        }
+        if (n_conv != m->n_conv) {
+            throw std::runtime_error(
+                "lfm2_session_begin conv state count must match conv layers");
+        }
+        m->session_kv_caches.clear();
+        m->session_conv_states.clear();
+        for (int i = 0; i < n_kv; ++i) {
+            m->session_kv_caches.push_back(*to_arr(kv_caches[i]));
+        }
+        for (int i = 0; i < n_conv; ++i) {
+            m->session_conv_states.push_back(*to_arr(conv_states[i]));
+        }
+        m->session_active = true;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_session_end(
+    void* model, mlx_array** out_kv, int32_t n_kv,
+    mlx_array** out_conv, int32_t n_conv) {
+    auto* m = static_cast<Lfm2CompiledModel*>(model);
+    mlx_clear_error();
+    try {
+        if (!m->session_active) {
+            throw std::runtime_error("lfm2_session_end requires an active session");
+        }
+        if ((int)m->session_kv_caches.size() != n_kv
+            || (int)m->session_conv_states.size() != n_conv) {
+            throw std::runtime_error("lfm2_session_end cache counts do not match the session");
+        }
+        for (int i = 0; i < n_kv; ++i) {
+            out_kv[i] = from_arr(std::move(m->session_kv_caches[i]));
+        }
+        for (int i = 0; i < n_conv; ++i) {
+            out_conv[i] = from_arr(std::move(m->session_conv_states[i]));
+        }
+        m->session_kv_caches.clear();
+        m->session_conv_states.clear();
+        m->session_active = false;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_compiled_step_session(
+    void* model, mlx_array* token_id, int32_t cache_pos, mlx_array** out_logits) {
+    auto* m = static_cast<Lfm2CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if (!m->session_active) {
+            throw std::runtime_error("lfm2_compiled_step_session requires an active session");
+        }
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->current_has_paged_prefix = false;
+        m->current_paged_k.clear();
+        m->current_paged_v.clear();
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
+        inputs.push_back(*to_arr(token_id));
+        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
+        for (const auto& c : m->session_conv_states) inputs.push_back(c);
+
+        auto outputs = m->forward(inputs);
+
+        std::vector<array> next_kv, next_conv;
+        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
+            next_kv.push_back(std::move(outputs[1 + i]));
+        }
+        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
+            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
+        }
+        *out_logits = from_arr(std::move(outputs[0]));
+        m->session_kv_caches = std::move(next_kv);
+        m->session_conv_states = std::move(next_conv);
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_compiled_step_session_paged(
+    void* model, mlx_array* token_id, int32_t cache_pos,
+    mlx_array** k_full_per_layer, mlx_array** v_full_per_layer, int32_t n_layers,
+    mlx_array** out_logits) {
+    auto* m = static_cast<Lfm2CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if (!m->session_active) {
+            throw std::runtime_error("lfm2_compiled_step_session_paged requires an active session");
+        }
+        if (n_layers != m->n_full_attn) {
+            throw std::runtime_error("lfm2_compiled_step_session_paged layer count mismatch");
+        }
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->current_has_paged_prefix = true;
+        m->current_paged_k.clear();
+        m->current_paged_v.clear();
+        m->current_paged_k.reserve(n_layers);
+        m->current_paged_v.reserve(n_layers);
+        for (int32_t i = 0; i < n_layers; ++i) {
+            if (!k_full_per_layer[i] || !v_full_per_layer[i]) {
+                throw std::runtime_error("lfm2_compiled_step_session_paged received null layer input");
+            }
+            m->current_paged_k.push_back(*to_arr(k_full_per_layer[i]));
+            m->current_paged_v.push_back(*to_arr(v_full_per_layer[i]));
+        }
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
+        inputs.push_back(*to_arr(token_id));
+        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
+        for (const auto& c : m->session_conv_states) inputs.push_back(c);
+
+        auto outputs = m->forward(inputs);
+
+        m->current_has_paged_prefix = false;
+        m->current_paged_k.clear();
+        m->current_paged_v.clear();
+
+        std::vector<array> next_kv, next_conv;
+        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
+            next_kv.push_back(std::move(outputs[1 + i]));
+        }
+        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
+            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
+        }
+        *out_logits = from_arr(std::move(outputs[0]));
+        m->session_kv_caches = std::move(next_kv);
+        m->session_conv_states = std::move(next_conv);
+        return 0;
+    } catch (const std::exception& e) {
+        m->current_has_paged_prefix = false;
+        m->current_paged_k.clear();
+        m->current_paged_v.clear();
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_compiled_prefill_session(
+    void* model, mlx_array* token_ids, int32_t prompt_len, int32_t cache_pos,
+    mlx_array** out_logits) {
+    auto* m = static_cast<Lfm2CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if (!m->session_active) {
+            throw std::runtime_error("lfm2_compiled_prefill_session requires an active session");
+        }
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = prompt_len;
+        m->current_last_logits_only = use_prefill_last_logits_only();
+        m->current_has_paged_prefix = false;
+        m->current_paged_k.clear();
+        m->current_paged_v.clear();
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
+        inputs.push_back(*to_arr(token_ids));
+        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
+        for (const auto& c : m->session_conv_states) inputs.push_back(c);
+
+        auto outputs = m->forward(inputs);
+
+        std::vector<array> next_kv, next_conv;
+        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
+            next_kv.push_back(std::move(outputs[1 + i]));
+        }
+        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
+            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
+        }
+        *out_logits = from_arr(std::move(outputs[0]));
+        m->session_kv_caches = std::move(next_kv);
+        m->session_conv_states = std::move(next_conv);
+
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        return 0;
+    } catch (const std::exception& e) {
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+} // extern "C"

@@ -167,6 +167,8 @@ fn main() {
         .file("src/mlx_gemma4_diffusion_model.cpp")
         .file("src/mlx_qwen35_model.cpp")
         .file("src/mlx_qwen35_moe_block.cpp")
+        .file("src/mlx_lfm2_model.cpp")
+        .file("src/mlx_lfm2_moe_block.cpp")
         .include("src")
         .include(&mlx_vendor_dir)
         .include(&mlx_build) // for generated headers
