@@ -80,17 +80,13 @@ const FA3_DECODE_SPLITS_FLOOR: usize = 8;
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
 /// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
 /// kernel (42.1% of prefill GPU time at 3k).
-/// Default ON (licensed 2026-06-11: 3k prefill −36%, multi-shape verified —
-/// see `wins/2026-06-11-qwen35-fa3-prefill-licensed.md`);
-/// `--qwen35-fa3 false` is the same-binary fallback arm. A build without an
+/// Licensed 2026-06-11: 3k prefill −36%, multi-shape verified — see
+/// `wins/2026-06-11-qwen35-fa3-prefill-licensed.md`. A build without an
 /// sm_90 target links the stub, whose marker is 0, and the gate keeps the
 /// in-tree kernel.
 /// The marker is process-wide, but capability is checked on the bound context
 /// so mixed-device workers cannot inherit another device's decision.
 fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
-    if !crate::runtime_flags::qwen35_fa3() {
-        return false;
-    }
     let real = cuda_kernels::ring_attention::fa3_kernel_marker();
     if !real {
         static LOGGED: OnceLock<()> = OnceLock::new();

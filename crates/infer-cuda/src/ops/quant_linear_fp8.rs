@@ -155,16 +155,11 @@ fn sfb_ones_len(n: usize, k: usize) -> usize {
 
 pub(super) fn qwen_fp8_deepgemm_dense_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !crate::runtime_flags::qwen35_deepgemm() {
-            return false;
-        }
-        match cuda_moe::dsv4_deepgemm_native_preflight() {
-            Ok(_) => true,
-            Err(err) => {
-                log::warn!("Qwen FP8 dense DeepGEMM disabled: native bridge unavailable ({err})");
-                false
-            }
+    *ENABLED.get_or_init(|| match cuda_moe::dsv4_deepgemm_native_preflight() {
+        Ok(_) => true,
+        Err(err) => {
+            log::warn!("Qwen FP8 dense DeepGEMM disabled: native bridge unavailable ({err})");
+            false
         }
     })
 }

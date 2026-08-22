@@ -822,18 +822,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "K")]
     pub(crate) mtp_draft_topk: Option<usize>,
 
-    /// DeepGEMM grouped expert GEMMs (read at load: builds grouped weight caches).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_deepgemm: bool,
-
-    /// Decode-band batch grouped MoE kernels; false = hand batch kernels A/B arm.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_moe_decode_kernel: bool,
-
-    /// FA3 full-attention prefill (silently in-tree on stub builds).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_fa3: bool,
-
     /// Routed-row floor for the DeepGEMM grouped expert path (default 1024).
     /// Batched decode is `R = top_k * B`, so 1024 keeps decode off DeepGEMM;
     /// lower it to reach the uncharacterized mid-band.
@@ -925,9 +913,6 @@ impl ServeArgs {
     pub(crate) fn cuda_runtime_flags(&self) -> infer_api::CudaRuntimeFlags {
         infer_api::CudaRuntimeFlags {
             qwen35_decode_graph: true,
-            qwen35_deepgemm: self.qwen35_deepgemm,
-            qwen35_moe_decode_kernel: self.qwen35_moe_decode_kernel,
-            qwen35_fa3: self.qwen35_fa3,
             qwen35_deepgemm_min_routes: self.qwen35_deepgemm_min_routes,
             qwen35_gdr_chunked: self.qwen35_gdr_chunked,
             mempool_retain: self.cuda_mempool_retain,

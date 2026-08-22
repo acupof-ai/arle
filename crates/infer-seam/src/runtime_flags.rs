@@ -45,15 +45,6 @@ pub struct CudaRuntimeFlags {
     /// its own off-by-default lever.
     #[serde(default = "d_true")]
     pub qwen35_decode_graph: bool,
-    /// DeepGEMM grouped expert GEMMs (load-time: builds grouped weight caches).
-    #[serde(default = "d_true")]
-    pub qwen35_deepgemm: bool,
-    /// Decode-band batch grouped MoE kernels; off = hand batch kernels A/B arm.
-    #[serde(default = "d_true")]
-    pub qwen35_moe_decode_kernel: bool,
-    /// FA3 full-attention prefill (silently ignored on stub builds).
-    #[serde(default = "d_true")]
-    pub qwen35_fa3: bool,
     /// Routed-row floor for the DeepGEMM grouped expert path. Default 1024,
     /// the compile-time `QWEN35_DEEPGEMM_MIN_ROUTES`; lower it to reach the
     /// uncharacterized mid-band (batched decode is `R = top_k * B`).
@@ -107,9 +98,6 @@ impl Default for CudaRuntimeFlags {
     fn default() -> Self {
         Self {
             qwen35_decode_graph: d_true(),
-            qwen35_deepgemm: d_true(),
-            qwen35_moe_decode_kernel: d_true(),
-            qwen35_fa3: d_true(),
             qwen35_deepgemm_min_routes: d_deepgemm_min_routes(),
             qwen35_gdr_chunked: d_true(),
             mempool_retain: d_true(),
@@ -132,7 +120,7 @@ impl Default for CudaRuntimeFlags {
 /// Metal executor runtime toggles, applied via `infer_metal::apply_runtime_flags`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetalRuntimeFlags {
-    #[serde(default = "d_true")]
+    #[serde(default)]
     pub warmup: bool,
     /// Host (blocking D2H) non-greedy sampler; off = device greedy argmax.
     #[serde(default)]
@@ -158,7 +146,7 @@ fn d_spec_accept_topk() -> i32 {
 impl Default for MetalRuntimeFlags {
     fn default() -> Self {
         Self {
-            warmup: d_true(),
+            warmup: false,
             host_sampling: false,
             speculative: d_true(),
             draft_model: None,

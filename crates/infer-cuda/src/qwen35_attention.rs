@@ -977,7 +977,7 @@ impl Qwen35Model {
                                     )?;
                                 }
                                 other => anyhow::bail!(
-                                    "Qwen35 full-attn paged attention: prefill rows over a {other:?} pool need the FA3 lane (sm_90, --qwen35-fa3)"
+                                    "Qwen35 full-attn paged attention: prefill rows over a {other:?} pool need the FA3 lane (sm_90)"
                                 ),
                             }
                             Ok(())

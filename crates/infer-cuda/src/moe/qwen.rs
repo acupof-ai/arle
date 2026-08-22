@@ -231,8 +231,7 @@ pub(crate) fn moe_forward_into(
     // kernels instead of killing the engine.
     let fp8_masked_unsupported = weights.expert_weight_format == WeightFormat::Fp8BlockScaled
         && num_tokens * topk <= DEEPGEMM_MASKED_BAND;
-    let use_deepgemm = crate::runtime_flags::qwen35_deepgemm()
-        && has_deepgemm_grouped
+    let use_deepgemm = has_deepgemm_grouped
         && !fp8_masked_unsupported
         && num_tokens * topk >= crate::runtime_flags::qwen35_deepgemm_min_routes();
     if !use_deepgemm {
@@ -475,13 +474,11 @@ pub(crate) fn moe_forward_into(
     let use_bf16_decode_kernels = weights.expert_weight_format == WeightFormat::DenseBf16
         && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
         && hidden_dim.is_multiple_of(8)
-        && moe_inter.is_multiple_of(8)
-        && crate::runtime_flags::qwen35_moe_decode_kernel();
+        && moe_inter.is_multiple_of(8);
     let fp8_decode_scale_cols = if weights.expert_weight_format == WeightFormat::Fp8BlockScaled
         && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
         && hidden_dim.is_multiple_of(16)
         && moe_inter.is_multiple_of(16)
-        && crate::runtime_flags::qwen35_moe_decode_kernel()
     {
         let (gate_scale_rows, gate_scale_cols, gate_block_m, gate_block_k) =
             fp8_signature_shape(weights.gate_up_quant_signature, "gate/up")?;
@@ -811,9 +808,7 @@ fn deepgemm_routed_tail(
         );
         moe_inter
     } else {
-        anyhow::bail!(
-            "DeepGEMM MoE path requires grouped expert caches (load with --qwen35-deepgemm)"
-        )
+        anyhow::bail!("DeepGEMM MoE path requires grouped expert caches (none built at load)")
     };
     // Fail loud if the native DeepGEMM bridge is a build-time stub (sm_120
     // uses the CUTLASS collective instead).

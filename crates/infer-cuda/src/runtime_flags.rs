@@ -59,9 +59,6 @@ static SHARD_CACHE_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DEEPEP_MAX_DISPATCH_TOKENS_PER_RANK: AtomicU32 = AtomicU32::new(0);
 
 static QWEN35_DECODE_GRAPH: AtomicBool = AtomicBool::new(true);
-static QWEN35_DEEPGEMM: AtomicBool = AtomicBool::new(true);
-static QWEN35_MOE_DECODE_KERNEL: AtomicBool = AtomicBool::new(true);
-static QWEN35_FA3: AtomicBool = AtomicBool::new(true);
 static QWEN35_DEEPGEMM_MIN_ROUTES: AtomicUsize = AtomicUsize::new(1024);
 static QWEN35_GDR_CHUNKED: AtomicBool = AtomicBool::new(true);
 static NUMA_PIN: AtomicBool = AtomicBool::new(true);
@@ -87,9 +84,6 @@ static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
 /// `DeviceContext` creation.
 pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     QWEN35_DECODE_GRAPH.store(f.qwen35_decode_graph, Relaxed);
-    QWEN35_DEEPGEMM.store(f.qwen35_deepgemm, Relaxed);
-    QWEN35_MOE_DECODE_KERNEL.store(f.qwen35_moe_decode_kernel, Relaxed);
-    QWEN35_FA3.store(f.qwen35_fa3, Relaxed);
     QWEN35_DEEPGEMM_MIN_ROUTES.store(f.qwen35_deepgemm_min_routes.max(1), Relaxed);
     QWEN35_GDR_CHUNKED.store(f.qwen35_gdr_chunked, Relaxed);
     SHARD_CACHE_BYTES.store(f.shard_cache_bytes.unwrap_or(usize::MAX), Relaxed);
@@ -118,23 +112,6 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
 
 pub(crate) fn qwen35_decode_graph() -> bool {
     QWEN35_DECODE_GRAPH.load(Relaxed)
-}
-/// `--qwen35-deepgemm` (default on): DeepGEMM SM90 BF16 m-grouped GEMMs for the
-/// expert GEMMs — decode neutral, prefill needle 3k wall 9.10 -> 2.32 s. Also
-/// read at LOAD time (the loader builds the contiguous grouped-B caches only
-/// when enabled), so flipping it requires a process restart.
-pub(crate) fn qwen35_deepgemm() -> bool {
-    QWEN35_DEEPGEMM.load(Relaxed)
-}
-/// `--qwen35-moe-decode-kernel` (default on): the decode-band weight-read-bound
-/// grouped kernels; `false` runs the hand batch kernels below the DeepGEMM floor.
-/// Read per call — inside a captured decode graph the value read at capture
-/// time is what replays.
-pub(crate) fn qwen35_moe_decode_kernel() -> bool {
-    QWEN35_MOE_DECODE_KERNEL.load(Relaxed)
-}
-pub(crate) fn qwen35_fa3() -> bool {
-    QWEN35_FA3.load(Relaxed)
 }
 pub(crate) fn qwen35_deepgemm_min_routes() -> usize {
     QWEN35_DEEPGEMM_MIN_ROUTES.load(Relaxed)
