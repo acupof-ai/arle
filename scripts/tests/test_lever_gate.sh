@@ -63,6 +63,15 @@ if LEVER_GATE_VALIDATE_LOG="$tmp/incomplete.log" LENGTHS=115,300 RUNS=3 \
     exit 1
 fi
 
+# Missing baseline is loud unless explicitly allowed (silent-skip guard).
+if LEVER_GATE_VALIDATE_LOG="$tmp/pass.log" LENGTHS=115,300 RUNS=3 \
+    "$ROOT/scripts/lever_gate.sh" test >/dev/null 2>&1; then
+    echo "lever gate accepted a run with no baseline to gate against" >&2
+    exit 1
+fi
+LEVER_GATE_ALLOW_NO_BASELINE=1 LEVER_GATE_VALIDATE_LOG="$tmp/pass.log" \
+    LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test >/dev/null
+
 expect_fail() {
     if "$@" >/dev/null 2>&1; then
         echo "unexpected success: $*" >&2
@@ -93,6 +102,9 @@ cat >"$tmp/needle.py" <<'EOF'
 #!/usr/bin/env python3
 print('SUMMARY len=115 depth=0.00 exact=1 partial=0 miss=0 DET')
 EOF
+cat >"$tmp/identity-baseline.log" <<'EOF'
+SUMMARY len=115 depth=0.00 exact=1 partial=0 miss=0 DET
+EOF
 mkdir -p "$tmp/root/scripts"
 cp "$ROOT/scripts/lever_gate.sh" "$tmp/root/scripts/lever_gate.sh"
 cp "$ROOT/scripts/pick-gpu.sh" "$tmp/root/scripts/pick-gpu.sh"
@@ -103,7 +115,8 @@ run_gate() {
     local stats="$1" out="$2" sha="${3:-$SHA}" kernel="${4:-$KERNEL_ID}" port="$5"
     STATS="$stats" SERVER="$tmp/server.py" BIN="$tmp/bin" MODEL=model GATE_PROFILE=generic \
         PORT="$port" LENGTHS=115 RUNS=1 STATS_OUT="$out" EXPECTED_PRODUCT_SHA256="$sha" \
-        EXPECTED_KERNEL_BUNDLE_ID="$kernel" "$tmp/root/scripts/lever_gate.sh" identity >/dev/null
+        EXPECTED_KERNEL_BUNDLE_ID="$kernel" BASELINE_LOG="$tmp/identity-baseline.log" \
+        "$tmp/root/scripts/lever_gate.sh" identity >/dev/null
 }
 
 STATS="{\"build_identity\":{\"product_binary_sha256\":\"sha256:$SHA\",\"kernel_bundle_id\":\"$KERNEL_ID\"}}"

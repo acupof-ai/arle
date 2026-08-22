@@ -45,10 +45,11 @@ export RUST_LOG="${RUST_LOG:-info}"
 validate_summary() {
     local log=$1
     local baseline=${2:-}
-    python3 - "$log" "$RUNS" "$LENGTHS" "$baseline" "${LEVER_GATE_REQUIRE_EXACT:-0}" "$ROOT/scripts" <<'PY'
+    python3 - "$log" "$RUNS" "$LENGTHS" "$baseline" "${LEVER_GATE_REQUIRE_EXACT:-0}" "$ROOT/scripts" "${LEVER_GATE_ALLOW_NO_BASELINE:-0}" <<'PY'
 import sys
 
 path, runs, lengths, baseline, require_exact, scripts = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6]
+allow_no_baseline = sys.argv[7] == "1"
 sys.path.insert(0, scripts)
 from needle_summary import parse_summaries
 
@@ -73,6 +74,11 @@ if require_exact:
             raise SystemExit(
                 f"[gate] len={length} requires exact={runs}, got exact={exact} partial={partial} miss={miss}"
             )
+if not baseline and not require_exact and not allow_no_baseline:
+    raise SystemExit(
+        "[gate] no BASELINE_LOG and LEVER_GATE_REQUIRE_EXACT=0: any miss count would pass "
+        "(set BASELINE_LOG, or LEVER_GATE_ALLOW_NO_BASELINE=1 to seed a first baseline)"
+    )
 if baseline:
     baseline_counts = load(baseline)
     for length in expected_lengths:
