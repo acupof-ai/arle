@@ -163,7 +163,6 @@ impl DiffusionCanvasPrediction {
     }
 }
 
-/// Backend hook consumed by [`generate_diffusion_with_cancel`].
 pub trait DiffusionBlockModel {
     /// Optional backend-owned generation fast path.
     ///
