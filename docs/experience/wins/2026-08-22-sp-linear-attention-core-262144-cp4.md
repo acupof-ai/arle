@@ -1,9 +1,9 @@
-# Sequence-parallel linear-attention core: global 262,144 trains on 4×H20 — 2026-08-22
+# Sequence-parallel linear-attention core: global 262,144 trains on 2×H20 — 2026-08-22
 
 > Status: Shipped
 
 Measured on `ThinkingCap-Qwen3.6-27B-FP8`, H20 (97,508 MiB), `--synthetic-writeback-seq`,
-binaries `sp12` … `sp16` (`b3fef817d` … `e632993f9`).
+binaries `sp12` … `sp17` (`b3fef817d` … `11ef1f089`).
 
 ## Context
 
@@ -33,7 +33,10 @@ duplicates inside the core region: row-slice copies of qkv/z, a packed `out‖st
 chunk, the `cat` over chunk outputs, and an f32 grad for each — +13.4 GB at 65,536
 rows/rank. It is now an untaped chunk loop writing rows into one `SeqAccum`, raw p2p for
 the carry, and a reverse-chunk replay backward that exchanges `d_state` with the
-neighbouring ranks explicitly. `CpRecv` / `CpSendAttach` deleted.
+neighbouring ranks explicitly. `CpRecv` / `CpSendAttach` deleted. The chunk loop trims the driver pool at its
+end, as `checkpoint_seq_chunked` does — without it two of four ranks grew 33 GB
+of device memory the arle pool did not account for, and the forward died at
+layer 59 with 16 MB free while its pool sat at 55 GB.
 
 ## Result
 
@@ -41,10 +44,15 @@ neighbouring ranks explicitly. `CpRecv` / `CpSendAttach` deleted.
 |---|---|---|---|---|---|---|
 | 4,096 | 2 | 2 | 9.857565 | — | 9.0 s | — |
 | 16,384 | 2 | 2 | 11.229959 | — | 35.0 s | 44.5 GB |
-| 262,144 | 4 | 4 | 1.560897 | 158 s | 538 s | 78.1 GB |
+| 131,072 | 2 | 2 | 3.034898 | 125 s | 391 s | 64.6 GB |
+| 262,144 | 2 | 2 | 1.561557 | 280 s | 1,083 s | 85.7 GB |
+| 262,144 | 4 | 4 | 1.560897 | 154 s | 539 s | 65.1 GB |
 
-Both cp=2 rungs are bit-identical to the pre-rewrite SP core, and 16,384 matches the
-a2a-era value (11.229878, Δ 0.0007%). The 262,144 step is ~12 min end to end.
+Peak was 78.1 GB before change 3, so the rewrite left 32 GB of headroom on a
+97 GB card at cp=4 and 11.8 GB at cp=2. The two 262,144 losses differ by 0.04 %
+(MoE non-determinism plus a different shard split); 4,096 and 16,384 are
+bit-identical to the pre-rewrite SP core, and 16,384 matches the a2a-era value
+(11.229878, Δ 0.0007 %). A 262,144 step takes ~12 min on 4 GPUs, ~23 min on 2.
 
 Backward memory is flat across layers once grads are parked: `used` held 52.5 GB with
 45 GB free from layer 63 down to layer 0, where before it climbed 52.6 → 61.2 GB.
@@ -59,3 +67,6 @@ Backward memory is flat across layers once grads are parked: `used` held 52.5 GB
 - A chunked replay that slices its inputs per chunk pays for the slice copies **and**
   their f32 grads. Slice inside the replay against the full-seq input instead, and write
   outputs into one accumulator rather than concatenating chunk outputs.
+- A hand-written chunk loop must trim the driver pool at its end. Device `used`
+  climbing while `pool_reserved` stays flat is the driver's async pool holding
+  freed blocks, not a leak in the store.
