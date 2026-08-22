@@ -414,7 +414,57 @@ pub unsafe fn dequantize_fp4_marlin_to_fp8(
     }
 }
 
-/// W8A16 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). Scratch
+/// Widen Marlin NVFP4 tiles + their S0E5M3 scale tail to dense BF16 `[n, k]`.
+/// `inv_lift` undoes the per-tensor power of two the repack multiplied into the
+/// stored scale byte. Unlike the FP8 twin there is no per-block divisor: this
+/// output is the weight itself, not DeepGEMM's B.
+///
+/// The only lane that reaches a Marlin-repacked NVFP4 weight's values on the
+/// host side -- the repack releases the group bytes, so a LoRA merge has
+/// nothing else to promote from.
+pub fn dequantize_fp4_marlin_to_bf16(
+    ctx: &DeviceContext,
+    packed: &impl DevicePtr<u8>,
+    global: &impl DevicePtr<f32>,
+    inv_lift: f32,
+    output: &mut impl DevicePtrMut<bf16>,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    let nk = extent(n, k, "dequantize_fp4_marlin_to_bf16 weight")?;
+    ensure!(
+        group_size > 0
+            && packed.len() >= nk / 2 + nk / group_size
+            && global.len() >= 1
+            && output.len() >= nk,
+        "dequantize_fp4_marlin_to_bf16 buffers do not cover [n,k,gs]=[{n},{k},{group_size}]: packed={} global={} output={}",
+        packed.len(),
+        global.len(),
+        output.len()
+    );
+    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
+    let (global_ptr, _gg) = global.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; `packed` is the layout
+    // `repack_for_marlin_fp4` produced for these dims.
+    unsafe {
+        ffi::dequantize_fp4_marlin_to_bf16_cuda(
+            packed_ptr as *const u8,
+            global_ptr as *const f32,
+            inv_lift,
+            out_ptr as *mut Half,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dequantize_fp4_marlin_to_bf16_cuda failed at [n,k]=[{n},{k}]: {e}"))
+    }
+}
+
+/// W8A16 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). Scratch/// W8A16 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). Scratch
 /// contract matches `marlin_fp8_gemm`.
 #[allow(clippy::too_many_arguments)]
 pub fn marlin_w8a16_gemm(

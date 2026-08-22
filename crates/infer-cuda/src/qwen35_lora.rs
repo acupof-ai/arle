@@ -576,10 +576,92 @@ impl Qwen35Model {
         if matrix.is_dense_bf16() {
             return Ok(());
         }
+        // NVFP4's only resident form is the Marlin layout (the repack releases
+        // the group bytes at load), so it promotes straight from those tiles.
+        // The pristine Marlin buffer is kept, not freed: a share-frozen-base
+        // student aliases it, and `weight_format = DenseBf16` already routes the
+        // forward to `data`, so nothing reads the stale tiles.
+        if matrix.weight_format() == WeightFormat::Fp4E2M1Group {
+            let dense = ctx
+                .stream
+                .alloc_zeros::<bf16>(matrix.rows * matrix.cols)
+                .map_err(|e| {
+                    anyhow!("layer {layer_idx} {label}: NVFP4 BF16 promotion alloc failed: {e}")
+                })?;
+            let packed = matrix.marlin_packed.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "layer {layer_idx} {label}: NVFP4 LoRA target has no Marlin layout to promote \
+                     from and its group source was released at load"
+                )
+            })?;
+            let global = matrix.scale_f32.as_ref().ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: NVFP4 LoRA target missing its global scale")
+            })?;
+            let mut dense = dense;
+            cuda_ql::dequantize_fp4_marlin_to_bf16(
+                &ctx,
+                packed,
+                global,
+                matrix.fp4_marlin_scale_lift_inv,
+                &mut dense,
+                matrix.rows,
+                matrix.cols,
+                matrix.group_size,
+            )
+            .map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: NVFP4→BF16 promotion dequant failed: {e}")
+            })?;
+            // Give the matrix the FP8 slots the merge lane expects. Without
+            // them `requant_merged_matrix` finds no `qweight_u8`, returns
+            // early, and the weight stays dense BF16 forever -- 4x the NVFP4
+            // bytes per touched projection, which OOMs a 27B all-linear merge.
+            // From here every re-merge rides the proven FP8 lane; the engine
+            // serves FP8 rather than NVFP4 once a LoRA has been merged in.
+            const FP8_BLOCK: usize = 128;
+            let scale_rows = matrix.rows.div_ceil(FP8_BLOCK);
+            let scale_cols = matrix.cols.div_ceil(FP8_BLOCK);
+            let mut qweight = ctx
+                .stream
+                .alloc_zeros::<u8>(matrix.rows * matrix.cols)
+                .map_err(|e| anyhow!("layer {layer_idx} {label}: NVFP4 fp8 slot alloc: {e}"))?;
+            let mut scales = ctx
+                .stream
+                .alloc_zeros::<f32>(scale_rows * scale_cols)
+                .map_err(|e| anyhow!("layer {layer_idx} {label}: NVFP4 fp8 scale alloc: {e}"))?;
+            cuda_ql::quantize_bf16_to_fp8_block_scaled(
+                &ctx,
+                &dense,
+                &mut qweight,
+                &mut scales,
+                matrix.rows,
+                matrix.cols,
+                FP8_BLOCK,
+                FP8_BLOCK,
+            )
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: NVFP4→FP8 pristine requant: {e}"))?;
+            matrix.qweight_u8 = Some(qweight);
+            matrix.scale_f32 = Some(scales);
+            matrix.quant_block_m = FP8_BLOCK;
+            matrix.quant_block_k = FP8_BLOCK;
+            matrix.quant_scale_rows = scale_rows;
+            matrix.quant_scale_cols = scale_cols;
+            matrix.data = dense;
+            matrix.weight_format = WeightFormat::DenseBf16;
+            // Park the tiles instead of freeing them: a share-frozen-base
+            // student aliases the packed bytes. Out of `marlin_packed` the FP8
+            // arm this weight requants into can no longer pick them up and read
+            // FP4 tiles as FP8.
+            matrix.retired_marlin = match (matrix.marlin_packed.take(), matrix.marlin_scales.take())
+            {
+                (Some(packed), Some(global)) => Some((packed, global)),
+                _ => None,
+            };
+            return Ok(());
+        }
         ensure!(
             matrix.weight_format() == WeightFormat::Fp8BlockScaled,
-            "layer {layer_idx} {label}: LoRA merge supports dense BF16 or FP8 block-scaled \
-             weights; got {:?}",
+            "layer {layer_idx} {label}: LoRA merge supports dense BF16, FP8 block-scaled, or \
+             Marlin-repacked NVFP4 weights; got {:?}",
             matrix.weight_format()
         );
         ensure!(
