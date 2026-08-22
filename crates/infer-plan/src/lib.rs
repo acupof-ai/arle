@@ -61,14 +61,11 @@ pub struct PrefillRow {
 }
 
 impl PrefillRow {
-    /// Logical position one past this chunk's last token.
     #[must_use]
     pub fn end_pos(&self) -> usize {
         self.start_pos + self.tokens.len()
     }
 
-    /// Whether this chunk completes the request's prompt.
-    ///
     /// One predicate for every backend: the open-coded form was written both as
     /// `==` and as `>=`, so a chunk that overshot `total_tokens` counted as final
     /// on some paths and not on others.
@@ -140,10 +137,8 @@ pub struct StepOutput {
     pub tokens: Vec<SlotToken>,
 }
 
-/// Parameters controlling token sampling from a logits distribution.
-///
-/// This is the pure-data subset of the existing runtime sampling contract.
-/// Penalty and filtering kernels live below the executor seam.
+/// Pure-data subset of the runtime sampling contract; penalty and filtering
+/// kernels live below the executor seam.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
