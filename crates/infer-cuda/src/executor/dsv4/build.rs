@@ -220,7 +220,7 @@ impl Dsv4CudaExecutor {
             pending_prefix_captures: VecDeque::new(),
             dspark,
             slot_tier,
-            decode_graph: None,
+            decode_graphs: (0..num_slots).map(|_| None).collect(),
         };
         log::info!(
             "DSv4 prefill chunk capability: {} tokens (deepep per-forward cap {:?})",
