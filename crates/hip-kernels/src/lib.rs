@@ -37,7 +37,6 @@ pub const fn iq2_xxs_row_bytes(ncols: usize) -> Option<usize> {
     Some(ncols / QK_K * BLOCK_IQ2_XXS_BYTES)
 }
 
-/// Bytes of one Q2_K weight row. `None` unless `ncols % QK_K == 0`.
 pub const fn q2_k_row_bytes(ncols: usize) -> Option<usize> {
     if ncols == 0 || !ncols.is_multiple_of(QK_K) {
         return None;
@@ -45,7 +44,6 @@ pub const fn q2_k_row_bytes(ncols: usize) -> Option<usize> {
     Some(ncols / QK_K * BLOCK_Q2_K_BYTES)
 }
 
-/// Bytes of one q8_1 activation row. `None` unless `ncols % QK8_1 == 0`.
 pub const fn q8_1_row_bytes(ncols: usize) -> Option<usize> {
     if ncols == 0 || !ncols.is_multiple_of(QK8_1) {
         return None;
@@ -59,7 +57,6 @@ pub const fn q8_1_row_bytes(ncols: usize) -> Option<usize> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelError(pub i32);
 
-/// Sentinel returned by every stub entry point when built without `hip`.
 pub const NOT_COMPILED: KernelError = KernelError(-1);
 
 pub type Result<T> = std::result::Result<T, KernelError>;
