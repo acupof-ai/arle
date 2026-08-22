@@ -240,12 +240,12 @@ legality = "pool BF16 && resolved (head_dim, q_heads, kv_heads, phase) instantia
 fallback = ""
 
 [[implementation]]
-id = "cuda.qwen35.paged_varlen_quantized"
+id = "cuda.qwen35.paged_quantized_fa3"
 semantic = "qwen35.full_attention_paged"
 provider = "arle"
-source = "crates/infer-cuda/src/qwen35_attention.rs"
-legality = "pool in {FP8E4M3,INT8}; terminal quantized arm; !graph_capture"
-fallback = ""
+source = "crates/cuda-kernels/csrc/attention/paged_attention_quantized_fa3.cu"
+legality = "pool in {FP8E4M3,INT8} && decode rows (qlen==1) && head_dim in {128,256} && gqa_ratio<=16 && sm>=8.0; tensor-core split-KV over the 1-byte pool, graph-capturable"
+fallback = "cuda.qwen35.paged_fa3_bf16"
 
 [policy."qwen35.full_attention_paged"]
 fallback_status = "legacy-default-unqualified"

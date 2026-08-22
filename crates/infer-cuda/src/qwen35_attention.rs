@@ -637,82 +637,69 @@ impl Qwen35Model {
                             // Short queries and batch==1 prefill take FA3 paged
                             // split-KV; ragged multi-request prefill keeps TileLang
                             // (routing it here cost c=8 TTFT 12.07→18.23 s).
-                            // Quantized pools try the native 1-byte kernel first;
+                            // Quantized pools: decode rows take the native 1-byte
+                            // tensor-core kernel (one CTA per kv-head group);
                             // prefill rows and workspace overflow fall through to
-                            // the FA3 quant shim, then the varlen kernel below.
+                            // the FA3 quant shim.
+                            if decode && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8) {
+                                // Splits capped at 16: the pool's split-KV
+                                // workspace is sized for 16 splits.
+                                let splits = self
+                                    .ctx
+                                    .sm_count()
+                                    .div_ceil(meta.batch.max(1) * kv_heads.max(1))
+                                    .max(FA3_DECODE_SPLITS_FLOOR)
+                                    .clamp(2, 16);
+                                let needed =
+                                    kv_quant::paged_attention_quantized_fa3_workspace_bytes(
+                                        meta.total_q,
+                                        q_heads,
+                                        c.head_dim,
+                                        splits,
+                                    );
+                                if needed <= pool.quantized_attn_workspace_bytes {
+                                    let ws = pool.quantized_attn_workspace()?;
+                                    let (rect_ptr, _fr) =
+                                        meta.page_table_rect.device_ptr(&self.ctx.stream);
+                                    let (q_indptr_ptr, _fq) =
+                                        meta.q_indptr.device_ptr(&self.ctx.stream);
+                                    let (kv_lens_ptr, _fl) =
+                                        meta.kv_lens_dev.device_ptr(&self.ctx.stream);
+                                    kv_quant::paged_attention_quantized_fa3(
+                                        &self.ctx,
+                                        q_prepped,
+                                        pool.k_data_ptr(full_idx, &self.ctx.stream),
+                                        pool.v_data_ptr(full_idx, &self.ctx.stream),
+                                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
+                                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
+                                        rect_ptr,
+                                        q_indptr_ptr,
+                                        kv_lens_ptr,
+                                        attn_out,
+                                        q_heads,
+                                        kv_heads,
+                                        c.head_dim,
+                                        pool.page_size,
+                                        meta.page_table_stride,
+                                        meta.batch,
+                                        meta.total_q,
+                                        sm_scale,
+                                        pool.format,
+                                        splits,
+                                        ws,
+                                        pool.quantized_attn_workspace_bytes,
+                                    )?;
+                                    return Ok(());
+                                }
+                            }
                             if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1)
                                 && c.head_dim == 256
+                                && qwen35_fa3_enabled(&self.ctx)
+                                && matches!(
+                                    pool.format,
+                                    KVFormat::BF16 | KVFormat::FP8E4M3 | KVFormat::INT8
+                                )
                             {
-                                if decode
-                                    && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8)
-                                {
-                                    // One CTA dequantizes K/V once for `heads_per_cta`
-                                    // q-heads of a kv-head; the group shrinks at small
-                                    // batch so the grid still covers ~2 CTAs per SM
-                                    // (H=6 at B=1 is 0.88x, at B>=4 1.44-1.59x).
-                                    // Splits capped at 16: the pool's split-KV
-                                    // workspace is sized for 16 splits at GQA ratio 8.
-                                    let sm = self.ctx.sm_count();
-                                    let heads_per_cta = [8usize, 6, 4, 3, 2, 1]
-                                        .into_iter()
-                                        .find(|&h| {
-                                            (q_heads / kv_heads.max(1)) % h == 0
-                                                && meta.batch.max(1) * (q_heads / h) * 16 >= 2 * sm
-                                        })
-                                        .unwrap_or(1);
-                                    let splits = (sm
-                                        .div_ceil(meta.batch.max(1) * kv_heads.max(1))
-                                        .max(FA3_DECODE_SPLITS_FLOOR)
-                                        * heads_per_cta)
-                                        .clamp(2, 16);
-                                    let needed =
-                                        kv_quant::paged_attention_quantized_fa3_workspace_bytes(
-                                            meta.total_q,
-                                            q_heads,
-                                            c.head_dim,
-                                            splits,
-                                        );
-                                    if needed <= pool.quantized_attn_workspace_bytes {
-                                        let ws = pool.quantized_attn_workspace()?;
-                                        let (rect_ptr, _fr) =
-                                            meta.page_table_rect.device_ptr(&self.ctx.stream);
-                                        let (q_indptr_ptr, _fq) =
-                                            meta.q_indptr.device_ptr(&self.ctx.stream);
-                                        let (kv_lens_ptr, _fl) =
-                                            meta.kv_lens_dev.device_ptr(&self.ctx.stream);
-                                        kv_quant::paged_attention_quantized_fa3(
-                                            &self.ctx,
-                                            q_prepped,
-                                            pool.k_data_ptr(full_idx, &self.ctx.stream),
-                                            pool.v_data_ptr(full_idx, &self.ctx.stream),
-                                            pool.k_scales_ptr(full_idx, &self.ctx.stream),
-                                            pool.v_scales_ptr(full_idx, &self.ctx.stream),
-                                            rect_ptr,
-                                            q_indptr_ptr,
-                                            kv_lens_ptr,
-                                            attn_out,
-                                            q_heads,
-                                            kv_heads,
-                                            c.head_dim,
-                                            pool.page_size,
-                                            meta.page_table_stride,
-                                            meta.batch,
-                                            meta.total_q,
-                                            sm_scale,
-                                            pool.format,
-                                            splits,
-                                            heads_per_cta,
-                                            ws,
-                                            pool.quantized_attn_workspace_bytes,
-                                        )?;
-                                        return Ok(());
-                                    }
-                                }
-                                if qwen35_fa3_enabled(&self.ctx)
-                                    && matches!(
-                                        pool.format,
-                                        KVFormat::BF16 | KVFormat::FP8E4M3 | KVFormat::INT8
-                                    )
                                 {
                                     let (qp_ptr, _g0) =
                                         q_prepped.data.device_ptr_mut(&self.ctx.stream);
@@ -990,39 +977,8 @@ impl Qwen35Model {
                                         sm_scale,
                                     )?;
                                 }
-                                KVFormat::FP8E4M3 | KVFormat::INT8 => {
-                                    // Per-(token, kv_head) symmetric quant; both
-                                    // formats share the split-KV varlen kernel.
-                                    let ws = pool.quantized_attn_workspace()?;
-                                    let max_kv_len = meta.max_kv_len();
-                                    kv_quant::decode_attention_varlen_quantized(
-                                        &self.ctx,
-                                        q_prepped,
-                                        q_indptr_ptr,
-                                        pool.k_data_ptr(full_idx, &self.ctx.stream),
-                                        pool.v_data_ptr(full_idx, &self.ctx.stream),
-                                        Some(pool.k_scales_ptr(full_idx, &self.ctx.stream)),
-                                        Some(pool.v_scales_ptr(full_idx, &self.ctx.stream)),
-                                        kv_indptr_ptr,
-                                        kv_indices_ptr,
-                                        last_page_len_ptr,
-                                        attn_out,
-                                        q_heads,
-                                        kv_heads,
-                                        c.head_dim,
-                                        pool.page_size,
-                                        meta.batch,
-                                        meta.total_q,
-                                        max_kv_len,
-                                        true, // causal
-                                        pool.format,
-                                        sm_scale,
-                                        ws,
-                                        pool.quantized_attn_workspace_bytes,
-                                    )?;
-                                }
                                 other => anyhow::bail!(
-                                    "Qwen35 full-attn paged attention: unsupported pool format {other:?}"
+                                    "Qwen35 full-attn paged attention: prefill rows over a {other:?} pool need the FA3 lane (sm_90, --qwen35-fa3)"
                                 ),
                             }
                             Ok(())

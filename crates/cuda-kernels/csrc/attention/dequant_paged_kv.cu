@@ -10,7 +10,7 @@
 //     launch shape per (batch, stride), so it replays under CUDA graph
 //     capture.
 //
-// Conversion idioms mirror decode_attention_varlen_quantized.cu: software
+// Conversion idioms mirror paged_attention_quantized_fa3.cu: software
 // casts, valid on every arch this file is compiled for.
 
 #include <cuda_runtime.h>

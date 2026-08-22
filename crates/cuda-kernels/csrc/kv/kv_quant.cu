@@ -177,7 +177,7 @@ __global__ void quantize_paged_kv_fp8_kernel(
                    + offset_in_page * head_dim
                    + d;
     // NHD paged layout: [token, kv_head, dim] — matches the split-KV
-    // varlen decode kernel (decode_attention_varlen_quantized) and the dense-Qwen3
+    // paged decode kernel (paged_attention_quantized_fa3) and the dense-Qwen3
     // per-channel FP8 decode kernel.
     int dst_offset = row_idx * kv_dim + kv_head * head_dim + d;
     float val = __bfloat162float(kv_bf16[src_offset]);

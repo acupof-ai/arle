@@ -573,7 +573,7 @@ fn calibrate_and_quantize_new_rows(
 }
 
 /// Fused-dequant decode attention over the quantized pool planes. NOT
-/// `decode_attention_varlen_quantized`: that kernel consumes per-token K scales and
+/// `paged_attention_quantized_fa3`: that kernel consumes per-token K scales and
 /// is incompatible with per-channel K.
 #[allow(clippy::too_many_arguments)]
 fn run_quant_decode(
