@@ -646,7 +646,23 @@ fn cp_chunked_forward(
         keep.extend(inits.iter().flatten().flatten().copied());
         keep.extend(carry.iter().flatten().copied());
         store.free_new_except(&live_before, &keep)?;
+        if std::env::var("ARLE_OPD_CHUNK_POOL_TRACE").is_ok_and(|v| v != "0")
+            && let Some((free, total)) = store.backend().device_mem_info()
+        {
+            let pool = store.backend().mem_pool_stats();
+            eprintln!(
+                "[cp-core-chunk] r0={} used={}MiB pool_reserved={:?} pool_used={:?} live={}",
+                c.r0,
+                (total - free) >> 20,
+                pool.map(|(r, _)| r >> 20),
+                pool.map(|(_, u)| u >> 20),
+                store.live_tensor_count(),
+            );
+        }
     }
+    // Mirrors `checkpoint_seq_chunked`: the chunk loop's freed blocks stay in the
+    // driver's async pool otherwise (2 of 4 ranks hoarded 33 GB at 262,144).
+    crate::ops::checkpoint::trim_if_hoarding(store)?;
     Ok((out.finish(), inits))
 }
 
@@ -794,6 +810,7 @@ pub(crate) fn linear_attention_cp_chunked_backward(
         keep.extend(d_params.iter().filter_map(ChunkSum::id));
         keep.extend(d_carry.iter().flatten().copied());
         store.free_new_except(&live_before, &keep)?;
+        crate::ops::checkpoint::trim_if_hoarding(store)?;
     }
     for id in chunk_inits.iter().flatten().flatten() {
         store.free(*id)?;
