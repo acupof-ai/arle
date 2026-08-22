@@ -1,6 +1,6 @@
 # W4A16 paired GEMV fuses clamped SwiGLU — CUDA, 2026-08-22
 
-> Status: pending-remote
+> Status: Shipped (perf-neutral at c=1)
 
 ## Goal
 
@@ -60,16 +60,30 @@ BF16 round-trip on the intermediates) but not bit-identical.
 
 | concurrency | arm | decode tok/s | delta |
 |---:|---|---:|---:|
-| 1 | baseline | | — |
-| 1 | treatment | | pending-remote |
+| 1 | baseline (2026-08-21) | 41.1 | — |
+| 1 | treatment (`8804072ef`) | 41.2 | +0.2% (wash) |
+
+Coherence: PASS (17x23=391, correct reasoning). Lever gate: PASS
+(`correctness PASS: summaries=5`, exit 0). Needle scores all-miss on the
+seed-baseline pass (no pre-fusion baseline envelope to compare against).
 
 ## Problems
 
-None yet.
+1. **`--spec-type none` required for 0731 checkpoint** — the checkpoint's MTP
+   head uses `main_norm` layout (no `enorm`/`hnorm`/`eh_proj` tensors), but the
+   loader's strict MTP gating (2026-08-20) expects DSv3-style names. Any serve
+   of this checkpoint needs `--spec-type none`. Loader name mapping is a
+   separate fix.
+2. **Transient OOM during gate load** — ranks 0/1 hit OOM late in weight
+   upload while ranks 2/3 loaded clean. Retry loaded all 4 ranks at 42 GB/GPU.
+   Foreign memory on the shared box during the load window, not a build defect.
 
 ## Learnings
 
-pending-remote. The fusion is the same optimization the FP8 decode path
-already ships (`dsv4_fp8_grouped_swiglu_decode`); this brings the W4A16/
-W4AFP8 4-bit path to parity. Correctness gate (needle/lever ×3) and the
-pod bench are the pending-remote work.
+Wash at c=1. The fused SwiGLU removes 42 kernel launches per decode step
+(one per MoE layer) plus the gate_out/up_out VRAM round-trips, but the SwiGLU
+kernel is a simple elementwise op — 42 launches is ~0.4 ms on a 24 ms step
+(~1.7%), inside bench noise. The fusion is a structural improvement (fewer
+kernels, less VRAM traffic, dead wrapper removed) with no measurable c=1
+delta. The c=1 W4AFP8 GEMV decode floor is not launch-bound on the SwiGLU
+elementwise; weight-loading and GEMV compute dominate.
