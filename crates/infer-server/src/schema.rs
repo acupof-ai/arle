@@ -2,9 +2,7 @@
 //!
 //! Request/response bodies for `/v1/completions` and `/v1/chat/completions`, the
 //! sampling-field mapping into the shared [`SamplingParams`] contract, and
-//! [`ApiError`] / its [`IntoResponse`] rendering. The HTTP handlers in
-//! [`crate::http`] own request ingress; this file owns only the wire shapes and
-//! their validation/conversion.
+//! [`ApiError`] / its [`IntoResponse`] rendering.
 
 use std::path::Path;
 use std::sync::RwLock;
@@ -206,7 +204,6 @@ impl CompletionRequest {
         )
     }
 
-    /// Convert compatible sampling fields into the shared pure-data contract.
     #[must_use]
     pub fn sampling_params(&self) -> SamplingParams {
         sampling_params(
@@ -324,7 +321,6 @@ impl ChatCompletionRequest {
         )
     }
 
-    /// Convert compatible sampling fields into the shared pure-data contract.
     #[must_use]
     pub fn sampling_params(&self) -> SamplingParams {
         sampling_params(
@@ -1066,7 +1062,6 @@ pub struct AssistantMessage {
     pub tool_calls: Vec<ResponseToolCall>,
 }
 
-/// One OpenAI-format tool call in a chat completion response.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseToolCall {
     pub id: String,
@@ -1126,11 +1121,12 @@ pub(crate) const SYSTEM_FINGERPRINT: &str = "arle_fp_1";
 /// byte-identically.
 ///
 /// Empty reasoning collapses to `None` so the field is omitted.
-// ponytail: chat SSE splits incrementally via
-// `sse_util::StreamingReasoningSplitter` — keep the two policies in lockstep.
-// pub(crate): also the canonical pre-split for the tools path
-// (`coordinator::finalize_chat_content`) — the tool parser's paired-tag strip
-// misses the prompt-prefilled `reasoning</think>` form.
+///
+/// Also the canonical pre-split for the tools path
+/// (`coordinator::finalize_chat_content`): the tool parser's paired-tag strip
+/// misses the prompt-prefilled `reasoning</think>` form. The chat SSE path
+/// splits incrementally via `sse_util::StreamingReasoningSplitter` — keep the
+/// two policies in lockstep.
 pub(crate) fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<String>, String) {
     let trimmed = text.trim_start();
 
@@ -1144,7 +1140,6 @@ pub(crate) fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<Stri
     let mut buf = trimmed;
     let mut in_thinking = true;
 
-    // Strip the model's own <think> opener if present.
     if let Some(rest) = buf.strip_prefix(THINK_START) {
         buf = rest;
     }
@@ -1299,7 +1294,6 @@ impl ApiError {
         self.message
     }
 
-    /// OpenAI error `type` for the response's HTTP status.
     fn error_type(&self) -> &'static str {
         match self.status {
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",

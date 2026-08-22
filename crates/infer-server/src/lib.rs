@@ -19,13 +19,6 @@
 //! The engine thread is an OS good citizen: it only spins while there is work,
 //! and parks on the submit channel (`recv_timeout`) when fully idle instead of
 //! busy-looping.
-//!
-//! Internal layout (pure-reorganization split, same numerics):
-//!
-//! - [`execution`] — the HOT engine loop (`engine_loop` + `Submission`).
-//! - [`http`] — the axum OpenAI v1 router and route handlers.
-//! - [`tokenizer`] — the tokenizer / chat-template adapter (COLD).
-//! - [`schema`] — the OpenAI wire types and `ApiError` (COLD).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -206,8 +199,6 @@ impl RequestTicket {
         self.handle
     }
 
-    /// Block until this request completes and return its result.
-    ///
     /// Returns an error if the engine thread exited before delivering the
     /// completion (e.g. the engine panicked or was shut down).
     pub fn collect(self) -> Result<CompletedRequest> {
@@ -235,17 +226,10 @@ where
     E: BackendExecutor + Send + 'static,
     K: KvPool + Send + 'static,
 {
-    /// Spawn an engine thread owning `Engine::with_config(executor, kv, config)`.
-    ///
-    /// The returned handle is the only way to reach the engine: submit requests
-    /// with [`ServeHandle::submit`] and collect results with
-    /// [`ServeHandle::collect`].
     pub fn spawn(executor: E, kv: K, config: SchedulerConfig) -> Self {
         Self::spawn_with_shutdown(executor, kv, config, ServeShutdown::new())
     }
 
-    /// Spawn an engine thread that also observes `shutdown` for process-level
-    /// aborts.
     pub fn spawn_with_shutdown(
         executor: E,
         kv: K,
@@ -297,8 +281,6 @@ where
     E: BackendExecutor + 'static,
     K: KvPool + 'static,
 {
-    /// Spawn an engine thread, build the engine inside that thread, and observe
-    /// `shutdown` for process-level aborts.
     pub fn spawn_with_engine_builder_and_shutdown<B>(
         builder: B,
         shutdown: ServeShutdown,
@@ -354,8 +336,6 @@ where
         }
     }
 
-    /// Submit a prompt for generation and return a [`RequestTicket`].
-    ///
     /// Blocks only until the engine thread assigns a [`RequestHandle`] (a single
     /// channel round-trip), not until the request finishes. Use the returned
     /// ticket to [`collect`](RequestTicket::collect) the result.

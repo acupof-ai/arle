@@ -19,11 +19,9 @@ use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatMessage,
 };
 
-// ---------------------------------------------------------------------------
-// Request wire shapes. Unknown fields are tolerated everywhere (no
-// deny_unknown_fields): Claude Code sends `cache_control`, `metadata`,
-// `thinking`, and evolving extras on every level.
-// ---------------------------------------------------------------------------
+// Unknown fields are tolerated everywhere (no `deny_unknown_fields`): Claude
+// Code sends `cache_control`, `metadata`, `thinking`, and evolving extras on
+// every level.
 
 /// `POST /v1/messages` body (also `count_tokens`, which ignores `max_tokens`
 /// and `stream`).
@@ -387,10 +385,6 @@ fn to_openai_tool_choice(choice: &ToolChoice) -> Value {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Response wire shapes.
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum ResponseBlock {
@@ -428,8 +422,6 @@ pub(crate) struct MessagesResponse {
 }
 
 impl MessagesResponse {
-    /// Map the OpenAI-shaped completion (built by the shared chat machinery,
-    /// reasoning already split out) into the Anthropic envelope.
     pub(crate) fn from_chat(chat: &ChatCompletionResponse) -> Self {
         let choice = &chat.choices[0];
         let mut content = Vec::new();
@@ -512,10 +504,6 @@ pub(crate) fn stop_reason(finish: Option<&FinishReason>, has_tool_use: bool) -> 
         Some(FinishReason::Length) | None => "max_tokens",
     }
 }
-
-// ---------------------------------------------------------------------------
-// Streaming SSE encoder.
-// ---------------------------------------------------------------------------
 
 fn frame(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
@@ -735,9 +723,7 @@ impl StreamEncoder {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Error shape: `{"type":"error","error":{"type":…,"message":…}}`.
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub(crate) struct MessagesError {
