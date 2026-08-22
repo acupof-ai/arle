@@ -825,8 +825,9 @@ pub struct ArleFa3FwdHd256Args {
 /// Quantized-KV variant of [`ArleFa3FwdHd256Args`] (Path A): the shim
 /// dequantizes the 1-byte paged K/V pools into a per-call bf16 temp — only
 /// the pages `base.page_table` names, compacted to slots `b * stride + j` —
-/// and runs the fp8 FA3 fwd on it (e4m3 operands, one descale per (row,
-/// kv_head); bf16 output). The temp allocations are stream-ordered
+/// and runs FA3 on it: bf16 operands below 64K KV tokens, e4m3 operands with
+/// one descale per (row, kv_head) at or above (bf16 output either way). The
+/// temp allocations are stream-ordered
 /// and the kernels read only device tables, so the call stays CUDA-graph
 /// capture-safe. `base.k` / `base.v` / `base.num_pages` are overwritten by
 /// the shim; the compact pool keeps the HND per-page layout, so the caller's
