@@ -393,10 +393,6 @@ pub(crate) struct Args {
     )]
     pub(crate) temperature: f32,
 
-    /// Disable CUDA graph capture (CUDA only; no-op on other backends).
-    #[arg(long, default_value_t = false)]
-    pub(crate) no_cuda_graph: bool,
-
     /// Disable built-in shell/python tools for the local agent runtime.
     /// Also honored per-run via `arle run --no-tools`.
     #[arg(long, default_value_t = false)]

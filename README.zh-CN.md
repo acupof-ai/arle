@@ -91,12 +91,12 @@ print(client.chat.completions.create(
 
 **NVIDIA —— 单卡 H20,32K 多轮 agent prompt**(不是短 prompt 合成负载):
 
-| Qwen3.6 · 1×H20 · decode / total tok/s | c=1 | c=8 | c=16 |
+| Qwen3.6 · 1×H20 · 单请求 decode tok/s | c=1 | c=8 | c=16 |
 |---|---:|---:|---:|
-| 35B-A3B MoE | 61.7 / 6,707 | 22.7 / 27,968 | 13.6 / 33,859 |
-| 27B dense + DSpark 草稿器 | **100.7** / 7,837 | 20.9 / 25,074 | 11.1 / 26,790 |
+| 35B-A3B MoE | 61.7 | 22.7 | 13.6 |
+| 27B dense + DSpark 草稿器 | **100.7** | 20.9 | 11.1 |
 
-<sub><code>decode tok/s</code> 是单流延迟,<code>total tok/s</code> 是吞吐(prompt+生成 / 墙钟)· DSpark 在 c=1 是普通 decode 的 2.9×,到 c=16 抹平 —— GPU 有空闲算力时 verify 才免费 · 见 <a href="docs/baselines.md">baselines</a></sub>
+<sub><code>decode tok/s</code> 是单请求 decode 速度(1000 / ITL mean),prefill 单独按 TTFT 报告 · DSpark 在 c=1 是普通 decode 的 2.9×,到 c=16 抹平 —— GPU 有空闲算力时 verify 才免费 · 见 <a href="docs/baselines.md">baselines</a></sub>
 
 **DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);开 DSpark 块草稿器后 B=1 **72.4 tok/s**(+37%,接受率 58.7%);并发批量 decode lane 在 c=8 再 **+48%**。
 
@@ -120,7 +120,7 @@ sm_90 没有 FP4 张量核,所以真正的 GEMM 必须先把 nibble 展宽,唯�
 </p>
 <p align="center"><sub>TB-OPD 蒸馏 loss,27B student · 41 records × 3 epochs · <b>0.2165 → 0.1796 → 0.1453</b>。<a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">MATH</a> · <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">Terminal-Bench</a></sub></p>
 
-**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3-dense + Qwen3.5/3.6(hybrid·MoE)on CUDA + Metal;DeepSeek-V4-Flash + GLM-5.2(CUDA 8×H20 TP=8/EP=8;GLM-5.2 verify pending)· Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma(Metal)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
+**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5/3.6(hybrid·MoE)on CUDA + Metal(Metal 另支持 Qwen3-dense);DeepSeek-V4-Flash + GLM-5.2(CUDA 8×H20 TP=8/EP=8;GLM-5.2 verify pending)· Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma(Metal)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
 ---
 

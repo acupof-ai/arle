@@ -106,7 +106,6 @@ fn load_infer_engine(model_dir: &Path) -> anyhow::Result<LoadedInferenceEngine> 
         model_dir
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
-        false, // enable_cuda_graph
         EngineLoadConfig {
             num_slots: 1,
             total_pages: 8,

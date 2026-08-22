@@ -1,6 +1,6 @@
 //! Real CUDA executor: the engine-facing step driver and sampling tail.
 //!
-//! Wraps the loaded [`CudaModel`] + device [`PagedKVPool`], validates the
+//! Wraps the loaded model + device [`PagedKVPool`], validates the
 //! single-row plan, mirrors host→device page allocation, runs the forward, and
 //! samples the next token (`sample_cuda_token`: greedy argmax / host sampling).
 
@@ -19,25 +19,18 @@ use infer_seam::{
 use log::{info, warn};
 
 use crate::attention::ModelKvAdapter;
-use crate::decode_graph::DecodeGraphContext;
-use crate::decode_graph_key::{DECODE_GRAPH_BATCH, DecodeGraphKey};
-use crate::graph::GraphBucket;
 use crate::loader::PageMeta;
-use crate::model::CudaModel;
 use crate::ops::argmax;
 
 #[cfg(feature = "cuda")]
 #[path = "executor/dsv4.rs"]
 mod dsv4;
-#[path = "executor/qwen.rs"]
-mod qwen;
 #[path = "executor/qwen35.rs"]
 mod qwen35;
 #[path = "executor/spec_decode.rs"]
 mod spec_decode;
 
 use dsv4::Dsv4CudaExecutor;
-use qwen::QwenCudaExecutor;
 use qwen35::Qwen35CudaExecutor;
 
 pub(crate) const SUPPORTED_PAGE_SIZE: usize = 16;
@@ -60,33 +53,6 @@ pub(crate) const SIDECAR_SNAPSHOT_STRIDE_PAGES: usize = 512;
 /// for write-through keys and pack `session` (low 31 bits) and `block` (low 32
 /// bits) below it. Two distinct sessions therefore never alias (tenant
 /// isolation, the "session A never prefetches into session B" gate), and no
-/// Seq-len budget the captured decode graph's fixed `kv_indices` is sized to;
-/// pages beyond it fall back to eager rather than replay a stale graph.
-pub(crate) const DECODE_GRAPH_MAX_SEQ_LEN: usize = 32_768;
-
-/// Decode-graph gate. Set once at load from the `enable_cuda_graph` load flag
-/// (CLI `--cuda-graph`/`--no-cuda-graph`, default on) via
-/// [`set_decode_graph_default`]. Single-GPU Qwen dense only — `warmup` still
-/// hard-disables the graph under TP (NCCL not graph-capturable) and MoE (host
-/// routing per step).
-static DECODE_GRAPH_DEFAULT_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Set the load-time decode-graph default. Wired from
-/// `LoadedInferenceEngine::load(.., enable_cuda_graph)` so the CLI
-/// `--cuda-graph`/`--no-cuda-graph` flag controls the graph — single set at
-/// load, read once at `warmup`.
-pub fn set_decode_graph_default(enabled: bool) {
-    DECODE_GRAPH_DEFAULT_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Captured B=1 decode graph enabled? CLI-driven (`--cuda-graph`/
-/// `--no-cuda-graph`, default on). The eager path stays the correctness floor;
-/// `warmup` still gates TP and MoE off regardless of this.
-pub(crate) fn decode_graph_enabled() -> bool {
-    DECODE_GRAPH_DEFAULT_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 fn cuda_startup_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("ARLE_CUDA_STARTUP_PROFILE").is_some())
@@ -109,9 +75,9 @@ pub(crate) fn cuda_startup_log(phase: &str, start: Instant, extra: std::fmt::Arg
 /// fails loud rather than silently downgrading.
 ///
 /// The CUDA path resolves BF16 (default) plus the paged quant-KV modes INT8 and
-/// FP8 E4M3 (#68 T3) on the dense-Qwen3 paged pool: KIVI per-channel K scales +
-/// per-(token, head) V scales, fused-dequant decode attention. `Tq4` stays a
-/// loud explicit deferral until a paged-prefill kernel path exists for
+/// FP8 E4M3 on the Qwen3.5/3.6 full-attention pool: per-(token, head) scales
+/// for both K and V, decode on `paged_attention_quantized_fa3.cu`. `Tq4` stays
+/// a loud explicit deferral until a paged-prefill kernel path exists for
 /// TurboQuant — the enum trails the real, validated paths, it does not
 /// pre-declare unimplemented ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -119,9 +85,9 @@ pub enum CudaKvCacheDtype {
     /// Native BF16 per-layer caches (the default CUDA KV dtype).
     #[default]
     Bf16,
-    /// Paged INT8 quant KV (KIVI per-channel K + per-token V scales, #68 T3).
+    /// Paged INT8 quant KV (per-(token, head) K and V scales).
     Int8,
-    /// Paged FP8 E4M3 quant KV (KIVI per-channel K + per-token V scales, #68 T3).
+    /// Paged FP8 E4M3 quant KV (per-(token, head) K and V scales).
     Fp8,
 }
 
@@ -165,11 +131,9 @@ impl CudaKvCacheDtype {
     }
 }
 
-/// The real cuda-kernels executor. Dense Qwen3 uses the paged KV pool;
-/// Qwen3.5/3.6 and DSv4 keep model-specific per-slot state inside their
-/// executor arms.
+/// The real cuda-kernels executor. Qwen3.5/3.6 and DSv4 keep model-specific
+/// per-slot state inside their executor arms.
 pub(crate) enum RealCudaExecutor {
-    Qwen(Box<QwenCudaExecutor>),
     Qwen35(Box<Qwen35CudaExecutor>),
     Dsv4(Box<Dsv4CudaExecutor>),
 }
@@ -177,7 +141,6 @@ pub(crate) enum RealCudaExecutor {
 impl std::fmt::Debug for RealCudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Qwen(q) => q.fmt(f),
             Self::Qwen35(q) => q.fmt(f),
             Self::Dsv4(d) => d.fmt(f),
         }
@@ -185,24 +148,6 @@ impl std::fmt::Debug for RealCudaExecutor {
 }
 
 impl RealCudaExecutor {
-    pub(crate) fn from_qwen3_bf16_safetensors(
-        model_path: impl AsRef<Path>,
-        num_slots: usize,
-        total_pages: usize,
-        kv_dtype: CudaKvCacheDtype,
-        mem_fraction_static: f64,
-    ) -> Result<Self> {
-        Ok(Self::Qwen(Box::new(
-            QwenCudaExecutor::from_qwen3_bf16_safetensors(
-                model_path,
-                num_slots,
-                total_pages,
-                kv_dtype,
-                mem_fraction_static,
-            )?,
-        )))
-    }
-
     /// `dspark_draft_model`: `Some(dir)` loads the DSpark/DFlash block drafter
     /// from that checkpoint dir and enables `--spec-type dspark` decode.
     /// `mtp_draft_tokens`: `Some(n)` loads the checkpoint-native NextN-MTP head
@@ -280,10 +225,6 @@ impl RealCudaExecutor {
         // Qwen3.5 reads the host pool directly rather than the flattened
         // descriptor — its spec path also GROWS the slot mid-step.
         match self {
-            Self::Qwen(q) => {
-                let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
-                q.submit(plan, host_kv, &kv_batch)
-            }
             Self::Qwen35(q) => q.submit(plan, host_kv),
             Self::Dsv4(d) => {
                 let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
@@ -294,7 +235,6 @@ impl RealCudaExecutor {
 
     pub(crate) fn warmup(&mut self) -> Result<()> {
         match self {
-            Self::Qwen(q) => q.warmup(),
             // Qwen3.5/3.6 hybrid: whole-step decode graph (opt-in,
             // --qwen35-decode-graph) — warmup logs the gate verdict;
             // capture itself is lazy per slot.
@@ -318,7 +258,6 @@ impl RealCudaExecutor {
     /// equivalent override).
     pub(crate) fn model_stop_token_ids(&self) -> Vec<u32> {
         match self {
-            Self::Qwen(q) => q.model.config.eos_token_ids.clone(),
             Self::Qwen35(q) => q.model.config.stop_token_ids.clone(),
             Self::Dsv4(d) => d.model.config.eos_token_id.into_iter().collect(),
         }
@@ -329,33 +268,13 @@ impl RealCudaExecutor {
     /// `num_max_dispatch_tokens_per_rank`); all other arms are unbounded.
     pub(crate) fn max_tokens_per_step(&self) -> usize {
         match self {
-            Self::Qwen(_) | Self::Qwen35(_) => usize::MAX,
+            Self::Qwen35(_) => usize::MAX,
             Self::Dsv4(d) => d.model.max_tokens_per_step().unwrap_or(usize::MAX),
-        }
-    }
-
-    /// Page-granular host-tier hooks. Dense Qwen3 is the only CUDA arm with a
-    /// page-addressable device pool here; DSv4 whole-slot swap is a separate
-    /// hook below.
-    pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
-        match self {
-            Self::Qwen(q) => q.kv_tier_capacity_pages(),
-            Self::Dsv4(_) => 0,
-            Self::Qwen35(_) => 0,
-        }
-    }
-
-    pub(crate) fn kv_tier_page_bytes(&self) -> usize {
-        match self {
-            Self::Qwen(q) => q.kv_tier_page_bytes(),
-            Self::Dsv4(_) => 0,
-            Self::Qwen35(_) => 0,
         }
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
         match self {
-            Self::Qwen(q) => q.kv_tier_host_demoted_pages(),
             Self::Dsv4(d) => d.kv_tier_host_demoted_pages(),
             Self::Qwen35(q) => q.kv_tier_host_demoted_pages(),
         }
@@ -365,7 +284,6 @@ impl RealCudaExecutor {
     /// Host-side integers maintained in the accept-commit paths — no device sync.
     pub(crate) fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
         match self {
-            Self::Qwen(_) => infer_seam::SpecDecodeStats::default(),
             Self::Qwen35(q) => {
                 if let Some(ds) = q.dspark.as_ref() {
                     infer_seam::SpecDecodeStats {
@@ -399,11 +317,11 @@ impl RealCudaExecutor {
 
     /// KV tokens a decode row reaches in one submit. Only the Qwen3.5/3.6 arm
     /// grows the host pool for its spec chain (MTP/DSpark); DSv4 MTP grows its
-    /// own device bands instead, and dense Qwen has no spec.
+    /// own device bands instead.
     pub(crate) fn spec_row_tokens(&self) -> usize {
         match self {
             Self::Qwen35(q) => q.spec_row_tokens(),
-            Self::Qwen(_) | Self::Dsv4(_) => 1,
+            Self::Dsv4(_) => 1,
         }
     }
 
@@ -427,7 +345,6 @@ impl RealCudaExecutor {
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         match self {
-            Self::Qwen(q) => q.kv_tier_disk_pages(),
             Self::Dsv4(d) => d.kv_tier_disk_pages(),
             Self::Qwen35(q) => q.kv_tier_disk_pages(),
         }
@@ -436,14 +353,12 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
         match self {
             Self::Dsv4(d) => d.kv_tier_read_hits(),
-            Self::Qwen(q) => q.kv_tier_read_hits(),
             Self::Qwen35(q) => q.kv_tier_read_hits(),
         }
     }
 
     pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
         match self {
-            Self::Qwen(q) => q.kv_tier_io_stats(),
             Self::Dsv4(d) => d.kv_tier_io_stats(),
             Self::Qwen35(q) => q.kv_tier_io_stats(),
         }
@@ -451,7 +366,6 @@ impl RealCudaExecutor {
 
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         match self {
-            Self::Qwen(q) => q.kv_tier_location(key),
             Self::Dsv4(d) => d.kv_tier_location(key),
             Self::Qwen35(q) => q.kv_tier_location(key),
         }
@@ -459,7 +373,6 @@ impl RealCudaExecutor {
 
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         match self {
-            Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
             Self::Qwen35(q) => q.reusable_prefix_blocks(blocks),
             Self::Dsv4(d) => d.reusable_prefix_blocks(blocks),
         }
@@ -475,49 +388,20 @@ impl RealCudaExecutor {
     ) -> usize {
         match self {
             Self::Dsv4(d) => d.reusable_prefix_blocks_for_prompt(blocks, tokens),
-            Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
             Self::Qwen35(q) => q.reusable_prefix_blocks(blocks),
         }
     }
 
-    pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
-        match self {
-            Self::Qwen(q) => q.demote_prefix_pages(entries),
-            Self::Dsv4(_) => Ok(0),
-            Self::Qwen35(_) => Ok(0),
-        }
-    }
-
-    pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
-        match self {
-            Self::Qwen(q) => q.promote_prefix_pages(entries),
-            Self::Dsv4(_) => Ok(()),
-            Self::Qwen35(_) => {
-                anyhow::bail!(
-                    "page-granular KV tier store is implemented only for dense Qwen3 CUDA"
-                )
-            }
-        }
-    }
-
-    pub(crate) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
-        if let Self::Qwen(q) = self {
-            q.drop_kv_tier_entries(keys);
-        }
-    }
-
     /// Whole-slot KV tier hooks. Qwen3.6 and DSv4 park a demoted slot's full
-    /// device image in the tier; dense Qwen3 reports no slot tier (its
-    /// page-granular radix tier handles capacity).
+    /// device image in the tier.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
-        matches!(self, Self::Qwen35(_) | Self::Dsv4(_))
+        true
     }
 
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         match self {
             Self::Qwen35(q) => q.demote_slot(slot, key),
             Self::Dsv4(d) => d.demote_slot(slot, key),
-            Self::Qwen(_) => Ok(false),
         }
     }
 
@@ -525,9 +409,6 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen35(q) => q.promote_slot(key, slot, slot_pages),
             Self::Dsv4(d) => d.promote_slot(key, slot, slot_pages),
-            Self::Qwen(_) => {
-                anyhow::bail!("whole-slot KV tier store is only implemented for Qwen3.6/DSv4 CUDA")
-            }
         }
     }
 
@@ -535,7 +416,6 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen35(q) => q.drop_kv_slot_entries(keys),
             Self::Dsv4(d) => d.drop_kv_slot_entries(keys),
-            Self::Qwen(_) => {}
         }
     }
 
@@ -548,7 +428,6 @@ impl RealCudaExecutor {
     /// this (2026-07-05 TP=4 admission livelock).
     pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
         match self {
-            Self::Qwen(q) => q.tp_sync_min(local),
             Self::Qwen35(q) => q.tp_sync_min(local),
             Self::Dsv4(d) => d.tp_sync_min(local),
         }
@@ -559,7 +438,7 @@ impl RealCudaExecutor {
     pub(crate) fn kv_shard_spec(&self) -> Option<(usize, usize)> {
         match self {
             Self::Qwen35(q) => q.kv_shard_spec(),
-            Self::Qwen(_) | Self::Dsv4(_) => None,
+            Self::Dsv4(_) => None,
         }
     }
 
@@ -595,7 +474,6 @@ impl RealCudaExecutor {
             Self::Dsv4(d) => d
                 .restore_prefix_state(slot, tokens, matched_len, prefix_pages)
                 .map(|extra| matched_len + extra),
-            Self::Qwen(_) => Ok(matched_len),
         }
     }
 
@@ -612,7 +490,7 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.capture_finish_frontier(slot, tokens, slot_pages),
-            Self::Qwen(_) | Self::Qwen35(_) => {
+            Self::Qwen35(_) => {
                 let _ = (slot, tokens, slot_pages);
                 Ok(())
             }
@@ -625,7 +503,7 @@ impl RealCudaExecutor {
     pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
         match self {
             Self::Dsv4(d) => d.prefill_restore_boundary_alignment(),
-            Self::Qwen(_) | Self::Qwen35(_) => 1,
+            Self::Qwen35(_) => 1,
         }
     }
 
@@ -634,7 +512,7 @@ impl RealCudaExecutor {
     pub(crate) fn max_prefill_chunk(&self) -> usize {
         match self {
             Self::Dsv4(d) => d.max_prefill_chunk(),
-            Self::Qwen(_) | Self::Qwen35(_) => usize::MAX,
+            Self::Qwen35(_) => usize::MAX,
         }
     }
 
@@ -663,7 +541,6 @@ impl RealCudaExecutor {
                 d.repair_prefix_pool_chain(prefix_pages, slot_pages);
                 Ok(())
             }
-            Self::Qwen(_) => Ok(()),
         }
     }
 
@@ -674,7 +551,6 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen35(q) => q.release_sidecar_pages(pages),
             Self::Dsv4(d) => d.release_prefix_pages(pages),
-            Self::Qwen(_) => {}
         }
     }
 
@@ -692,7 +568,7 @@ impl RealCudaExecutor {
     /// free capacity and the planner licenses chunks the device pool can't
     /// hold (engine-fatal at submit). DSv4 returns demand-paged FlashMLA band
     /// pages (#154 Phase 3b); Qwen3.5/3.6 drops its page mirror (and any recall
-    /// keepalive); dense Qwen mirrors the host pool (nothing to free).
+    /// keepalive).
     pub(crate) fn release_kv_slot(&mut self, slot: usize) {
         match self {
             Self::Qwen35(q) => {
@@ -705,7 +581,6 @@ impl RealCudaExecutor {
                     warn!("DSv4 release_kv_slot({slot}) failed: {err:#}");
                 }
             }
-            Self::Qwen(_) => {}
         }
     }
 
@@ -714,7 +589,7 @@ impl RealCudaExecutor {
     pub(crate) fn kv_device_gate_active(&self) -> bool {
         match self {
             Self::Dsv4(d) => d.kv_device_gate_active(),
-            Self::Qwen(_) | Self::Qwen35(_) => false,
+            Self::Qwen35(_) => false,
         }
     }
 
@@ -735,7 +610,6 @@ impl RealCudaExecutor {
     /// arms without a tier store.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         match self {
-            Self::Qwen(q) => q.set_kv_tier_budget_bytes(bytes),
             // L2: the Qwen3.6 arm's G3 slot_tier also honors the explicit cap.
             Self::Qwen35(q) => q.set_kv_tier_budget_bytes(bytes),
             Self::Dsv4(d) => d.set_kv_tier_budget_bytes(bytes),
@@ -751,7 +625,6 @@ impl RealCudaExecutor {
         budget_bytes: usize,
     ) -> bool {
         match self {
-            Self::Qwen(q) => q.set_kv_tier_disk(root, budget_bytes),
             Self::Qwen35(q) => q.set_kv_tier_disk(root, budget_bytes),
             Self::Dsv4(d) => d.set_kv_tier_disk(root, budget_bytes),
         }
@@ -760,7 +633,7 @@ impl RealCudaExecutor {
     pub(crate) fn dsv4_verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.verify_forward_selftest(prompt),
-            Self::Qwen(_) | Self::Qwen35(_) => {
+            Self::Qwen35(_) => {
                 anyhow::bail!("DSv4 verify-forward selftest requires a DSv4 executor")
             }
         }
@@ -772,7 +645,6 @@ impl RealCudaExecutor {
     /// one, or it admits requests to slots the executor has no arena for.
     pub(crate) fn effective_num_slots(&self) -> usize {
         match self {
-            Self::Qwen(q) => q.num_slots,
             Self::Qwen35(q) => q.num_slots,
             Self::Dsv4(d) => d.num_slots,
         }
@@ -784,7 +656,6 @@ impl RealCudaExecutor {
     /// host admission pool MUST mirror 1:1 — not the requested `total_pages`.
     pub(crate) fn effective_total_pages(&self) -> Option<usize> {
         match self {
-            Self::Qwen(q) => Some(q.kv.max_total_pages),
             Self::Qwen35(q) => q.full_attn_pool_pages(),
             Self::Dsv4(d) => d.kv_adapter.flashmla_total_pages(),
         }
@@ -797,20 +668,20 @@ impl RealCudaExecutor {
     /// `None` where the host page size already matches the device default.
     pub(crate) fn effective_page_size(&self) -> Option<usize> {
         match self {
-            Self::Qwen(_) | Self::Qwen35(_) => None,
+            Self::Qwen35(_) => None,
             Self::Dsv4(d) => d.kv_adapter.flashmla_page_size(),
         }
     }
 
     pub(crate) fn effective_fixed_pages_per_slot(&self) -> Option<usize> {
         match self {
-            Self::Qwen(_) | Self::Qwen35(_) => None,
+            Self::Qwen35(_) => None,
             Self::Dsv4(d) => d.kv_adapter.flashmla_max_slot_pages(),
         }
     }
 
     /// OPD teacher raw-logits forward (Qwen3.5/3.6 hybrid only). Returns the full
-    /// `[seq_len, vocab]` logits without sampling. Dense Qwen3 / DSv4 are not OPD
+    /// `[seq_len, vocab]` logits without sampling. DSv4 is not an OPD
     /// teacher targets on this surface and bail.
     pub(crate) fn forward_token_logits(
         &mut self,
@@ -819,11 +690,6 @@ impl RealCudaExecutor {
     ) -> Result<(DeviceVec, [usize; 2])> {
         match self {
             Self::Qwen35(q) => q.forward_token_logits(input_ids, positions),
-            Self::Qwen(_) => {
-                anyhow::bail!(
-                    "forward_token_logits is wired for the Qwen3.5/3.6 hybrid OPD teacher, not dense Qwen3"
-                )
-            }
             Self::Dsv4(_) => {
                 anyhow::bail!(
                     "forward_token_logits is wired for the Qwen3.5/3.6 hybrid OPD teacher, not DSv4"
@@ -841,9 +707,9 @@ impl RealCudaExecutor {
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         match self {
             Self::Qwen35(q) => q.forward_training_taps(input_ids, target_layer_ids),
-            Self::Qwen(_) | Self::Dsv4(_) => anyhow::bail!(
+            Self::Dsv4(_) => anyhow::bail!(
                 "forward_training_taps is wired for the Qwen3.5/3.6 hybrid DSpark draft, \
-                 not dense Qwen3 or DSv4"
+                 not DSv4"
             ),
         }
     }
@@ -853,7 +719,6 @@ impl RealCudaExecutor {
     pub(crate) fn device(&self) -> &DeviceContext {
         match self {
             Self::Qwen35(q) => q.device(),
-            Self::Qwen(q) => &q.model.ctx,
             Self::Dsv4(d) => &d.model.ctx,
         }
     }
@@ -865,11 +730,6 @@ impl RealCudaExecutor {
     pub(crate) fn offload_engine_weights(&mut self) -> Result<usize> {
         match self {
             Self::Qwen35(q) => q.offload_engine_weights(),
-            Self::Qwen(_) => {
-                anyhow::bail!(
-                    "offload_engine_weights is only supported on the Qwen3.5/3.6 hybrid OPD teacher path"
-                )
-            }
             Self::Dsv4(_) => {
                 anyhow::bail!(
                     "offload_engine_weights is not supported on the DSv4 multi-GPU FP8 path"
@@ -884,7 +744,6 @@ impl RealCudaExecutor {
     pub(crate) fn release_inference_scratch(&mut self) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.release_inference_scratch(),
-            Self::Qwen(_) => Ok(()),
             Self::Dsv4(_) => Ok(()),
         }
     }
@@ -894,7 +753,6 @@ impl RealCudaExecutor {
     pub(crate) fn release_kv_pool(&mut self) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.release_kv_pool(),
-            Self::Qwen(_) => Ok(()),
             Self::Dsv4(_) => Ok(()),
         }
     }
@@ -904,7 +762,6 @@ impl RealCudaExecutor {
     pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.ensure_kv_pool(),
-            Self::Qwen(_) => Ok(()),
             Self::Dsv4(_) => Ok(()),
         }
     }
@@ -912,11 +769,6 @@ impl RealCudaExecutor {
     pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.reload_engine_weights(),
-            Self::Qwen(_) => {
-                anyhow::bail!(
-                    "reload_engine_weights is only supported on the Qwen3.5/3.6 hybrid OPD teacher path"
-                )
-            }
             Self::Dsv4(_) => {
                 anyhow::bail!(
                     "reload_engine_weights is not supported on the DSv4 multi-GPU FP8 path"
@@ -926,7 +778,7 @@ impl RealCudaExecutor {
     }
 
     /// Per-step student LoRA re-merge (OPD P2). Only the Qwen3.5/3.6 hybrid
-    /// executor carries the OPD student; dense Qwen3 / DSv4 are not student
+    /// executor carries the OPD student; DSv4 are not student
     /// targets and reject the update.
     pub(crate) fn remerge_student_lora(
         &mut self,
@@ -934,10 +786,6 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.remerge_student_lora(update),
-            Self::Qwen(_) => anyhow::bail!(
-                "student LoRA re-merge is only wired for the Qwen3.5/3.6 hybrid OPD student; \
-                 the dense Qwen3 executor is not a student target"
-            ),
             Self::Dsv4(_) => anyhow::bail!(
                 "student LoRA re-merge is only wired for the Qwen3.5/3.6 hybrid OPD student; \
                  the DSv4-Flash executor is not a student target"
@@ -950,10 +798,6 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen35(q) => q.update_dspark_markov_weights(w1, w2),
             Self::Dsv4(d) => d.update_dspark_markov_weights(w1, w2),
-            Self::Qwen(_) => anyhow::bail!(
-                "DSpark Markov weight update is only wired for the Qwen3.5/3.6 and DSv4-Flash executors; \
-                 the dense Qwen3 executor has no DSpark head"
-            ),
         }
     }
 
@@ -965,10 +809,6 @@ impl RealCudaExecutor {
     ) -> Result<Vec<crate::qwen35::SharedFp8BaseProjection>> {
         match self {
             Self::Qwen35(q) => q.frozen_base_fp8_pointers(),
-            Self::Qwen(_) => anyhow::bail!(
-                "frozen-base FP8 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student; \
-                 the dense Qwen3 executor is not a student target"
-            ),
             Self::Dsv4(_) => anyhow::bail!(
                 "frozen-base FP8 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student; \
                  the DSv4-Flash executor is not a student target"
@@ -984,9 +824,6 @@ impl RealCudaExecutor {
     ) -> Result<Vec<crate::qwen35::SharedBf16BaseProjection>> {
         match self {
             Self::Qwen35(q) => q.frozen_base_bf16_pointers(),
-            Self::Qwen(_) => anyhow::bail!(
-                "frozen-base BF16 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student"
-            ),
             Self::Dsv4(_) => anyhow::bail!(
                 "frozen-base BF16 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student"
             ),

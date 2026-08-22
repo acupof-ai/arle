@@ -28,7 +28,7 @@ pub(crate) fn run(args: &OcrArgs) -> Result<()> {
         None => resolve_or_download_ocr_model()?,
     };
 
-    let mut engine = LoadedInferenceEngine::load(&model_source, /*cuda_graph=*/ false)
+    let mut engine = LoadedInferenceEngine::load(&model_source)
         .with_context(|| format!("failed to load DeepSeek-OCR model from `{model_source}`"))?;
 
     let prompt = args

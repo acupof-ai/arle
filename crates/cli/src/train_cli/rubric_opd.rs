@@ -257,7 +257,6 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         student_dir
             .to_str()
             .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
-        true,
         EngineLoadConfig {
             // num_slots>1 lets batched eval (generate_batch) decode multiple
             // prompts concurrently — B=1 decode is memory-bandwidth-bound, so
@@ -398,7 +397,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                     teacher_dir.display()
                 );
                 let judge_engine =
-                    LoadedInferenceEngine::load_with_config(teacher_str, true, judge_config)
+                    LoadedInferenceEngine::load_with_config(teacher_str, judge_config)
                         .with_context(|| {
                             format!("load Flash judge from {}", teacher_dir.display())
                         })?;
@@ -409,7 +408,7 @@ pub(super) fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             }
         } else {
             let judge_engine =
-                LoadedInferenceEngine::load_with_config(teacher_str, true, judge_config)
+                LoadedInferenceEngine::load_with_config(teacher_str, judge_config)
                     .with_context(|| format!("load Flash judge from {}", teacher_dir.display()))?;
             Some(FlashJudge::new(
                 Arc::new(Mutex::new(judge_engine)),

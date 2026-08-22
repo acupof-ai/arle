@@ -48,8 +48,6 @@ pub struct ServeHttpOptions {
     pub model_path: String,
     pub bind: String,
     pub port: u16,
-    /// Honored by the CUDA decode-graph default only.
-    pub enable_cuda_graph: bool,
     pub engine_config: EngineLoadConfig,
     /// Speculative-decode request surface. The rewrite server keeps this
     /// fail-closed until a backend actually consumes it.
@@ -284,13 +282,9 @@ pub fn serve_http(
     }
 
     let shutdown = infer_server::ServeShutdown::new();
-    let (router, engine) = crate::loaded::router_for_backend(
-        &opts.model_path,
-        opts.enable_cuda_graph,
-        engine_config,
-        shutdown.clone(),
-    )
-    .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
+    let (router, engine) =
+        crate::loaded::router_for_backend(&opts.model_path, engine_config, shutdown.clone())
+            .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
 
     if let (Some(engine), Some(hook)) = (engine.as_ref(), on_engine_loaded.as_ref()) {
         hook(engine)?;

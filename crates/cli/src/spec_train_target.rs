@@ -120,7 +120,6 @@ pub(crate) fn run_spec_draft(args: TrainSpecDraftArgs) -> Result<()> {
     // sequence).
     let engine = LoadedInferenceEngine::load_with_config(
         model_path,
-        /*cuda_graph=*/ false,
         EngineLoadConfig {
             mem_fraction_static: args.trunk_mem_fraction,
             world_size: None,

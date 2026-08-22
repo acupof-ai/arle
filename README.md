@@ -119,16 +119,16 @@ Qwen3.6-27B (OptiQ 4/8-bit): the model's own NextN/MTP head drafts, the base ver
 
 The real workload: 32K-token multi-turn agent prompts, not a synthetic short prompt.
 
-| Qwen3.6, 1×H20 · decode / total tok/s | c=1 | c=8 | c=16 |
+| Qwen3.6, 1×H20 · per-request decode tok/s | c=1 | c=8 | c=16 |
 |---|---:|---:|---:|
-| 35B-A3B MoE | 149.3 / 11,860 | 27.7 / 32,589 | 15.1 / 36,075 |
-| 27B dense + DSpark drafter | **91.8** / 7,676 | 20.5 / 25,011 | 11.2 / 27,522 |
+| 35B-A3B MoE | 149.3 | 27.7 | 15.1 |
+| 27B dense + DSpark drafter | **91.8** | 20.5 | 11.2 |
 
-`decode tok/s` is single-stream latency (`1000 / ITL mean`); `total tok/s` is capacity (prompt + generated over wall clock). They are separate SLOs — on a 32K prompt at c=1 the end-to-end figure is half the decode figure, because prefill dominates the wall clock. Per-request decode falls with concurrency while total rises: verify is free only while the GPU has idle compute. Full rows in [docs/baselines.md](docs/baselines.md).
+`decode tok/s` is per-request decode speed (`1000 / ITL mean`); prefill is reported separately as TTFT. Per-request decode falls with concurrency: verify is free only while the GPU has idle compute. Full rows with TTFT in [docs/baselines.md](docs/baselines.md).
 
 ### DeepSeek-V4-Flash (8×H20, TP=8/EP=8, FP8 MoE)
 
-With the DSpark block drafter: c=1 **65.6 tok/s**, c=8 182.1, c=16 244.8 (output tok/s, 50.4% acceptance at c=1). Speculation only engages at c=1 — by c=8 the drafter contributes under 1% and those points are plain decode. Full rows in [docs/baselines.md](docs/baselines.md).
+With the DSpark block drafter: 50.4% acceptance at c=1, TTFT p50 170 / 444 / 871 ms at c=1/8/16. Speculation only engages at c=1 — by c=8 the drafter contributes under 1% and those points are plain decode. Full rows in [docs/baselines.md](docs/baselines.md).
 
 ### DeepSeek-V4-Flash (2×H20, TP=2, W4AFP8 MoE)
 
@@ -250,7 +250,7 @@ Deep dive: [docs/onboarding.md](docs/onboarding.md) (30 min) · [docs/architectu
 | | CUDA | Metal | OPD Train |
 |---|---|---|---|
 | **Stability** | Stable | Beta | Beta |
-| **Models** | Qwen3-dense, Qwen3.5/3.6, DeepSeek-V4-Flash, GLM-5.2 | Qwen3-dense, Qwen3.5/3.6, Gemma4, DeepSeek-OCR, DiffusionGemma | CUDA models |
+| **Models** | Qwen3.5/3.6/3.8, DeepSeek-V4-Flash, GLM-5.2 | Qwen3-dense, Qwen3.5/3.6, Gemma4, DeepSeek-OCR, DiffusionGemma | CUDA models |
 
 Full tiers: [docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md).
 

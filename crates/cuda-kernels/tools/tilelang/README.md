@@ -6,9 +6,8 @@ chunk-wise GDR.
 
 ## What this covers
 
-- TileLang attention kernels: `batch_prefill_paged_hd128.py`,
-  `batch_prefill_paged_hd256.py`, and
-  `batch_decode_paged_hd256.py`.
+- TileLang attention kernels: `batch_prefill_paged_hd256.py`,
+  `batch_decode_paged_hd256.py`, and the HD64 pair.
 - AOT-specialized per Qwen head config and target SM. Build emits one cubin + C
   wrapper per `(config, SM)` and runtime dispatches by model shape plus the active
   device SM. Add a size by updating `kernels.toml`, `build.rs`, and the matching
@@ -87,7 +86,7 @@ relocation.
 
 - TileLang version pinned during the H100 spike; see
   `docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md`.
-- TileLang paged prefill HD128/HD256, HD256 decode, and the AOT-compatible
+- TileLang paged prefill HD64/HD256, HD64/HD256 decode, and the AOT-compatible
   Qwen3.5 GDR stages are linked under `--features cuda`.
 - The old external AOT and wrapper surfaces have been removed from the
   CUDA runtime. New attention/GDR kernels should be added through
@@ -105,7 +104,7 @@ ARLE_TILELANG_PYTHON=/tmp/arle-tilelang-mac-venv/bin/python \
 ```
 
 The smoke imports TileLang from that checkout, lowers ARLE's in-tree
-`batch_prefill_paged_hd128.py` attention kernel to Metal, and executes a
+`batch_prefill_paged_hd256.py` attention kernel to Metal, and executes a
 TileLang Metal `T.gemm` kernel on MPS. This is a development-only compiler gate;
 the production Metal executor remains `crates/mlx-sys`.
 

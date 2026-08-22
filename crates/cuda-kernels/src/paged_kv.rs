@@ -17,7 +17,7 @@ use cudarc::driver::{CudaSlice, DevicePtr};
 use log::info;
 
 use super::tensor::DeviceContext;
-use crate::kv_quant::decode_attention_int8_workspace_bytes;
+use crate::kv_quant::paged_attention_quantized_fa3_workspace_bytes;
 use crate::kv_types::{KVCacheDtype, KVFormat};
 use crate::turboquant_state::TurboQuantLayerState;
 
@@ -63,23 +63,6 @@ pub struct TokenKVPool {
     /// Per-head per-token f32 scales (INT8 + FP8 default). `[max_total_tokens, num_kv_heads]`
     k_scales: Vec<CudaSlice<f32>>,
     v_scales: Vec<CudaSlice<f32>>,
-    /// **KIVI per-channel K scale** (FP8 only, optional). `[num_kv_heads, head_dim]` f32
-    /// per layer. When `Some`, FP8 K quantization uses this static per-channel
-    /// scale instead of computing per-(token, head) scales into `k_scales`. The
-    /// per-channel scheme reduces K's outlier-channel-dominated quantization
-    /// error that catastrophically compounds through Qwen3-dense's 36 layers
-    /// (see `docs/experience/errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md`).
-    /// V keeps
-    /// per-(token, head) scales (KIVI's asymmetric choice — V doesn't have the
-    /// channel-outlier structure K does).
-    pub k_static_scales: Option<Vec<CudaSlice<f32>>>,
-    /// Per-layer KIVI calibration latch. `true` = `k_static_scales[layer]` has
-    /// been populated via `compute_k_per_channel_absmax` +
-    /// `finalize_k_per_channel_scales` and can be used for quantization.
-    /// `false` (initial state) signals the first FP8 prefill batch through
-    /// that layer to first calibrate, then quantize. Length = num_layers
-    /// when `k_static_scales` is `Some`, empty otherwise.
-    pub k_kivi_calibrated: Vec<std::sync::atomic::AtomicBool>,
     /// Shared bf16 working buffers (1 layer, for decode_prep write target).
     /// Only allocated when format != BF16.
     k_work: Option<CudaSlice<u8>>,
@@ -257,7 +240,7 @@ impl TokenKVPool {
     /// count, NOT the cudaMalloc-rounded physical reservation. Covers the
     /// per-layer K/V data planes, per-token scales (FP8/INT8), per-token norms
     /// (TurboQuant), the 1-layer bf16 work buffers, the split-KV attention
-    /// workspace, and the KIVI per-channel K scale tables.
+    /// workspace.
     ///
     /// `tq_k_state`/`tq_v_state` (TurboQuant rotation/codebook device buffers)
     /// are NOT summed here — they are always `None` for the DSv4 FlashMLA pool
@@ -276,11 +259,6 @@ impl TokenKVPool {
         }
         for s in &self.v_scales {
             total += s.len() * std::mem::size_of::<f32>();
-        }
-        if let Some(buf) = &self.k_static_scales {
-            for s in buf {
-                total += s.len() * std::mem::size_of::<f32>();
-            }
         }
         for s in &self.k_norms {
             total += s.len() * std::mem::size_of::<u16>();
@@ -467,11 +445,9 @@ impl TokenKVPool {
             format,
         );
 
-        // INT4 packs 2 nibbles per byte → kv_dim/2 actual bytes per token.
         // PackedBytes stores one opaque record per token (K plane only).
         // Other formats: kv_dim * bytes_per_element bytes per token.
         let pool_bytes_per_layer = match format {
-            KVFormat::INT4 => max_total_tokens * kv_dim.div_ceil(2),
             KVFormat::PackedBytes { bytes_per_token } => max_total_tokens * bytes_per_token,
             _ => max_total_tokens * kv_dim * format.bytes_per_element(),
         };
@@ -571,22 +547,16 @@ impl TokenKVPool {
         let page_attach_count = vec![0_u32; max_total_pages];
         let page_ref_count = vec![0_u32; max_total_pages];
 
-        // Quantized split-KV attention workspace.
-        // FP8 reuses the same two-phase reduction scratch layout as INT8.
-        let num_splits = 32;
+        // Split-KV attention workspace for the quantized decode kernel: every
+        // slot in one batch, 16 splits, GQA ratio up to 8.
         let (quantized_attn_workspace, quantized_attn_workspace_bytes) =
-            if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3 | KVFormat::INT4)
-                && pool_bytes_per_layer > 0
-            {
-                let ws_bytes = decode_attention_int8_workspace_bytes(
+            if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
+                let ws_bytes = paged_attention_quantized_fa3_workspace_bytes(
                     num_slots,
-                    num_kv_heads * (head_dim / 128).max(1) * 4, // approximate max q_heads
+                    num_kv_heads * 8,
                     head_dim,
-                    num_splits,
+                    16,
                 );
-                // Use a reasonable upper bound: max_batch * max_heads * head_dim * num_splits * 3 floats
-                let ws_bytes_safe = num_splits * num_slots * num_kv_heads * 4 * (head_dim + 2) * 4;
-                let ws_bytes = ws_bytes.max(ws_bytes_safe);
                 let ws = ctx
                     .stream
                     .alloc_zeros::<u8>(ws_bytes)
@@ -605,44 +575,11 @@ impl TokenKVPool {
             (None, None)
         };
 
-        // KIVI per-channel K scale: one `[num_kv_heads, head_dim]` table per
-        // layer for FP8 and INT8 modes. Zero-init — the first prefill batch
-        // populates these via `populate_kivi_k_scales_from_prefill` (online
-        // calibration from the prefill K statistics). For BF16/TQ formats
-        // this stays None to keep the existing path bit-identical.
-        //
-        // INT8 was added to this gate on 2026-05-27 after the V100 Qwen3.5-4B
-        // audit (wins/2026-05-27-v100-kv-precision-parity-qwen35-4b.md)
-        // showed INT8 step-1 divergence from BF16 while FP8 was bit-identical;
-        // the discriminator was that FP8 had per-channel K calibration and
-        // INT8 still used per-(token, head) absmax.
-        let (k_static_scales, k_kivi_calibrated) =
-            if matches!(format, KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::INT4)
-                && pool_bytes_per_layer > 0
-            {
-                let channels = num_kv_heads * head_dim;
-                let mut buf = Vec::with_capacity(num_layers);
-                let mut latches = Vec::with_capacity(num_layers);
-                for _ in 0..num_layers {
-                    buf.push(
-                        ctx.stream
-                            .alloc_zeros::<f32>(channels)
-                            .map_err(|e| anyhow!("KIVI k_static_scales alloc failed: {e}"))?,
-                    );
-                    latches.push(std::sync::atomic::AtomicBool::new(false));
-                }
-                (Some(buf), latches)
-            } else {
-                (None, Vec::new())
-            };
-
-        // Legacy dtype mapping. INT4 falls back to BF16 contig (PoC has no
-        // contig INT4 storage; prefill stages K/V in bf16 work buffer then
-        // packs to INT4 in the pool). PackedBytes carries no per-head quant
+        // Legacy dtype mapping. PackedBytes carries no per-head quant
         // dispatch — BF16 is the inert legacy mapping (P2's FlashMLA
         // consumer reads the packed record directly, never this field).
         let dtype = match format {
-            KVFormat::BF16 | KVFormat::INT4 | KVFormat::PackedBytes { .. } => KVCacheDtype::BF16,
+            KVFormat::BF16 | KVFormat::PackedBytes { .. } => KVCacheDtype::BF16,
             KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::TurboQuant { .. } => KVCacheDtype::INT8,
         };
 
@@ -655,8 +592,6 @@ impl TokenKVPool {
             v_work,
             quantized_attn_workspace,
             quantized_attn_workspace_bytes,
-            k_static_scales,
-            k_kivi_calibrated,
             k_norms,
             v_norms,
             tq_k_state,
@@ -1116,36 +1051,11 @@ impl TokenKVPool {
         pages: &[u32],
         payload: &[u8],
     ) -> Result<()> {
-        self.copy_pages_from_host_impl(ctx, pages, payload, false)
-    }
-
-    /// As [`Self::copy_pages_from_host`], but enqueues copies on `copy_stream`.
-    /// Pair with `ctx.sync_copy()`.
-    pub fn copy_pages_from_host_on_copy_stream(
-        &mut self,
-        ctx: &DeviceContext,
-        pages: &[u32],
-        payload: &[u8],
-    ) -> Result<()> {
-        self.copy_pages_from_host_impl(ctx, pages, payload, true)
-    }
-
-    fn copy_pages_from_host_impl(
-        &mut self,
-        ctx: &DeviceContext,
-        pages: &[u32],
-        payload: &[u8],
-        on_copy_stream: bool,
-    ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
             // See copy_pages_to_host: validate ids before any byte math.
             self.validate_page_ids(pages, "copy_pages_from_host")?;
-            let stream = if on_copy_stream {
-                &ctx.copy_stream
-            } else {
-                &ctx.stream
-            };
+            let stream = &ctx.stream;
             let token_bytes = self.data_plane_bytes_per_page();
             let single_plane = self.is_single_plane();
             let scale_len = self.page_size * self.num_kv_heads;
@@ -1242,7 +1152,6 @@ impl TokenKVPool {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = ctx;
-            let _ = on_copy_stream;
             let _ = pages;
             let _ = payload;
             Err(anyhow!(
@@ -1584,7 +1493,7 @@ impl TokenKVPool {
         ptr
     }
 
-    /// Split-KV attention workspace (FP8/INT8/INT4). Allocated at pool
+    /// Split-KV attention workspace (FP8/INT8). Allocated at pool
     /// construction for quantized formats.
     pub fn quantized_attn_workspace(&self) -> anyhow::Result<&CudaSlice<u8>> {
         self.quantized_attn_workspace
@@ -1603,32 +1512,6 @@ impl TokenKVPool {
     /// memset / D2D restore paths that the raw-pointer accessors can't serve.
     pub fn k_data_slice_mut(&mut self, layer: usize) -> &mut CudaSlice<u8> {
         &mut self.k_data[layer]
-    }
-
-    /// KIVI per-channel K scale pointer for a layer (raw device address),
-    /// for kernels that consume `*const f32`. `None` when the format carries
-    /// no per-channel K table (allocated for FP8E4M3 / INT8 / INT4).
-    pub fn k_static_scales_ptr(
-        &self,
-        layer: usize,
-        stream: &cudarc::driver::CudaStream,
-    ) -> Option<u64> {
-        self.k_static_scales.as_ref().map(|s| {
-            let (ptr, _guard) = s[layer].device_ptr(stream);
-            ptr
-        })
-    }
-
-    /// K working buffer pointer (bf16, shared across layers).
-    pub fn k_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
-        let (ptr, _guard) = self.k_work.as_ref().expect("k_work").device_ptr(stream);
-        ptr
-    }
-
-    /// V working buffer pointer (bf16, shared across layers).
-    pub fn v_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
-        let (ptr, _guard) = self.v_work.as_ref().expect("v_work").device_ptr(stream);
-        ptr
     }
 
     // Convenience accessors that mirror the old PagedKVPool API so callers can
@@ -1698,18 +1581,6 @@ impl TokenKVPool {
                 .map(|&slot| self.slot_last_page_len(slot) as i32),
         );
         scratch.as_slice()
-    }
-
-    /// Build packed decode metadata for quantized page-aware kernels:
-    /// `[page_indptr..., last_page_len...]`.
-    ///
-    /// `page_indptr` is length `batch + 1` and indexes into the page-granular
-    /// `kv_indices` array. `last_page_len` is length `batch` and records how
-    /// many logical tokens in the final page are valid.
-    pub fn build_quantized_decode_indptr(&self, slots: &[usize]) -> Vec<i32> {
-        let mut packed = self.build_indptr(slots);
-        packed.extend(self.build_last_page_lens(slots));
-        packed
     }
 }
 

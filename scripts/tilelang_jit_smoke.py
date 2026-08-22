@@ -47,8 +47,6 @@ KERNELS_DIR = (
 
 # Module -> required public attributes (must include SUPPORTED_HEADS + get_kernel)
 KERNEL_MANIFEST = (
-    "batch_prefill_paged_hd128",
-    "batch_decode_paged_hd128",
     "batch_prefill_paged_hd256",
     "batch_decode_paged_hd256",
     # E4 substrate (subagent in flight; auto-skip if not yet committed):

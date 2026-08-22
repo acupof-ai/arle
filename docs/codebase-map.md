@@ -212,9 +212,9 @@ host-only seam with zero device coupling.
 
 - `crates/infer-cuda/src/executor.rs`: the `BackendExecutor` impl (CPU-testable
  placeholder without `cuda`, real cuda-kernels path with it).
-- `crates/infer-cuda/src/model.rs`: the BF16 dense-Qwen3 forward.
 - `crates/infer-cuda/src/ops.rs` + `crates/infer-cuda/src/attention.rs`: the two
- perf hotspots over `cuda-kernels`.
+ perf hotspots over `cuda-kernels` (`attention.rs` is the DSv4 MLA / FlashMLA /
+ DSA path; Qwen3.5/3.6 attention lives in `qwen35_attention.rs`).
 - `crates/infer-cuda/src/loader.rs`: safetensors weight loading.
 - `crates/infer-cuda/src/qwen35.rs`: Qwen3.5/3.6 **hybrid** model
  (gated-delta linear attention + periodic full attention) with shape- and
@@ -229,9 +229,8 @@ host-only seam with zero device coupling.
  MoE forward + config (uses `infer-moe` for the routing reference).
 - `crates/infer-cuda/src/tp.rs` + `crates/infer-cuda/src/shard_slice.rs`:
  TP/EP shard-aware load + slicing (uses `infer-topo` for the placement math).
-- `crates/infer-cuda/src/decode_graph.rs` + `decode_graph_key.rs` +
- `graph.rs`: CUDA graph capture/reuse; `decode_graph_key.rs` is the host
- capture-key math (CPU-testable without nvcc).
+- `crates/infer-cuda/src/graph.rs`: CUDA graph capture/reuse primitives
+ (`CudaGraphState`), driven by the Qwen3.5/3.6 and DSv4 executors.
 - `crates/cuda-kernels/src/{paged_kv,tilelang,graph_pool,tensor,kv_quant}.rs`
  + `crates/cuda-kernels/csrc/{attention,comm,elementwise,gemm,kv,moe,norm,quant,recurrent,sampling}/`:
  the kernel layer `infer-cuda` calls into. `deepep_sidecar/` is a separate C++
@@ -444,7 +443,7 @@ CI (`.github/workflows/ci.yml`) builds and tests `infer-api`, `cli`, the
  `crates/infer-core/src/planner.rs`.
 - A real backend end-to-end: `crates/infer-metal/src/executor.rs` (shipped,
  parity-verified) — the cleanest thin seam impl; for CUDA see
- `crates/infer-cuda/src/executor.rs` + `model.rs`.
+ `crates/infer-cuda/src/executor.rs` + `executor/qwen35.rs`.
 - The front door: `crates/infer-api/src/lib.rs` (`InferenceEngine` /
  `LoadedInferenceEngine`) → `crates/infer-api/src/serve_engine.rs`.
 - Serving: `crates/infer-server/src/lib.rs` (`ServeHandle::spawn` / `submit` /

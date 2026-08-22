@@ -18,7 +18,6 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool}
 use cudarc::driver::CudaSlice;
 use infer_seam::ShardSpec;
 use infer_topo::ShardingSpec;
-use qwen3_spec::Qwen3Config;
 use safetensors::{SafeTensors, tensor::Dtype};
 
 // Re-exports keep `crate::loader::` paths stable for consumers of the moved
@@ -35,7 +34,6 @@ pub(crate) use crate::qwen35::load::{
     ExpertQuantDispatchSignature, MoeFp8ExpertGroup, MoeLayerHostSnapshot, MoeLayerWeights,
 };
 
-pub(crate) const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 const DEFAULT_SHARD_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const PREFETCH_CACHE_HEADROOM: usize = 64 * 1024 * 1024 * 1024;
 
@@ -121,26 +119,12 @@ pub fn mint_nccl_unique_id_hex() -> Result<String> {
     Ok(hex)
 }
 
-pub(crate) fn validate_clean_bf16_config(config: &Qwen3Config) -> Result<()> {
-    // Qwen3 decouples head_dim from hidden_size/num_heads, so `hidden_size ==
-    // heads*head_dim`
-    // is NOT an invariant; only GQA divisibility is.
-    ensure!(
-        config
-            .num_attention_heads
-            .is_multiple_of(config.num_key_value_heads),
-        "Qwen3 num_attention_heads must be divisible by num_key_value_heads"
-    );
-    Ok(())
-}
-
 #[derive(Debug)]
 pub(crate) struct PageMeta {
     pub(crate) q_indptr: CudaSlice<i32>,
     pub(crate) kv_indptr: CudaSlice<i32>,
     pub(crate) kv_indices: CudaSlice<i32>,
     pub(crate) kv_last_page_len: CudaSlice<i32>,
-    pub(crate) page_table_offsets: CudaSlice<i32>,
     pub(crate) start_positions: CudaSlice<i32>,
     pub(crate) positions: CudaSlice<i32>,
     /// Host mirrors of `q_indptr` / `kv_indptr` — the prep kernel is single-row, so it
@@ -172,11 +156,6 @@ pub(crate) struct PageMeta {
     /// Global pool token rows for the NEW tokens [start_pos, start_pos+seq_len).
     /// Quant formats only; None for BF16.
     pub(crate) new_token_rows: Option<CudaSlice<i32>>,
-    /// Global pool token rows for the prefix [0, start_pos). Quant + start_pos>0 only.
-    pub(crate) prefix_token_rows: Option<CudaSlice<i32>>,
-    /// Packed fused-decode metadata `[page_indptr(b+1) | last_page_len(b)]`
-    /// from `build_quantized_decode_indptr`. Quant formats only.
-    pub(crate) quant_decode_meta: Option<CudaSlice<i32>>,
     /// When set, the FA3 launch uses this as `seqlen_k` instead of the step's true max
     /// KV
     /// length — required under CUDA graph capture, where the true length is only on
@@ -290,13 +269,11 @@ impl PageMeta {
             q_indptr.push(total_q as i32);
             kv_indptr.push(total_pages as i32);
         }
-        // Quant formats address the pool by global token row and consume packed decode
-        // metadata; BF16 carries None.
+        // Quant formats address the pool by global token row; BF16 carries None.
         let quant = matches!(pool.format, KVFormat::INT8 | KVFormat::FP8E4M3);
-        let (new_token_rows, prefix_token_rows, quant_decode_meta) = if quant {
+        let new_token_rows = if quant {
             // Row lists concatenate in row order — the quantize kernel indexes them by
-            // flat
-            // Q-token position.
+            // flat Q-token position.
             let mut new_rows = Vec::new();
             for &(slot, start_pos, len) in rows {
                 new_rows.extend(
@@ -305,31 +282,9 @@ impl PageMeta {
                         .map(|row| row as i32),
                 );
             }
-            // The prefix refill feeds the single-row prefill path only; a batched
-            // decode reads
-            // the already-quantized prefix straight from the pool planes.
-            let prefix_rows = if batch == 1 && rows[0].1 > 0 {
-                let (slot, start_pos, _) = rows[0];
-                let rows = pool
-                    .token_rows_for_range(slot, 0, start_pos)
-                    .into_iter()
-                    .map(|row| row as i32)
-                    .collect::<Vec<_>>();
-                Some(upload_i32(ctx, &rows)?)
-            } else {
-                None
-            };
-            let slots: Vec<usize> = rows.iter().map(|&(slot, _, _)| slot).collect();
-            (
-                Some(upload_i32(ctx, &new_rows)?),
-                prefix_rows,
-                Some(upload_i32(
-                    ctx,
-                    &pool.build_quantized_decode_indptr(&slots),
-                )?),
-            )
+            Some(upload_i32(ctx, &new_rows)?)
         } else {
-            (None, None, None)
+            None
         };
         // Pad each row with its own last page so a stray read stays inside the
         // request's KV.
@@ -352,7 +307,6 @@ impl PageMeta {
             page_table_rect: upload_i32(ctx, &rect)?,
             page_table_stride: stride,
             kv_last_page_len: upload_i32(ctx, &last_page_lens)?,
-            page_table_offsets: upload_i32(ctx, &[0])?,
             start_positions: upload_i32(ctx, &start_positions)?,
             positions: upload_i32(ctx, &positions)?,
             q_offsets: q_indptr.iter().map(|&q| q as usize).collect(),
@@ -364,8 +318,6 @@ impl PageMeta {
             batch,
             start_pos: rows[0].1,
             new_token_rows,
-            prefix_token_rows,
-            quant_decode_meta,
             seqlen_k_capture: None,
             write_kv: 1,
         })
@@ -396,7 +348,6 @@ impl PageMeta {
             kv_indptr: upload_i32(ctx, &[0, 0])?,
             kv_indices: zero.clone(),
             kv_last_page_len: zero.clone(),
-            page_table_offsets: zero.clone(),
             start_positions: upload_i32(ctx, &[start_pos as i32])?,
             positions: upload_i32(ctx, &[(start_pos + rows.saturating_sub(1)) as i32])?,
             q_offsets: vec![0, rows],
@@ -411,8 +362,6 @@ impl PageMeta {
             batch: 1,
             start_pos,
             new_token_rows: None,
-            prefix_token_rows: None,
-            quant_decode_meta: None,
             seqlen_k_capture: None,
             write_kv: 0,
         })
@@ -427,9 +376,7 @@ impl PageMeta {
     ///
     /// A quantized pool needs two more buffers, and at B=1 both are fixed-size: one
     /// pool row for the new token, and the packed `[page_indptr(2) | last_page_len]`
-    /// the split-KV kernel reads. `prefix_token_rows` stays `None` — it is the one
-    /// quant buffer that grows with context, and only the quant PREFILL path reads
-    /// it, never decode.
+    /// the split-KV kernel reads.
     pub(crate) fn persistent_decode(
         ctx: &DeviceContext,
         page_size: usize,
@@ -446,7 +393,6 @@ impl PageMeta {
             page_table_rect: upload_i32(ctx, &vec![0i32; cap])?,
             page_table_stride: cap,
             kv_last_page_len: upload_i32(ctx, &[0])?,
-            page_table_offsets: upload_i32(ctx, &[0])?,
             start_positions: upload_i32(ctx, &[0])?,
             positions: upload_i32(ctx, &[0])?,
             q_offsets: vec![0, 1],
@@ -458,8 +404,6 @@ impl PageMeta {
             batch: 1,
             start_pos: 0,
             new_token_rows: quant.then(|| upload_i32(ctx, &[0])).transpose()?,
-            prefix_token_rows: None,
-            quant_decode_meta: quant.then(|| upload_i32(ctx, &[0, 0, 0])).transpose()?,
             seqlen_k_capture: Some(cap * page_size),
             write_kv: 1,
         })
@@ -476,9 +420,9 @@ impl PageMeta {
         start_pos: usize,
     ) -> Result<()> {
         ensure!(
-            (pool.format == KVFormat::BF16) == self.quant_decode_meta.is_none(),
+            (pool.format == KVFormat::BF16) == self.new_token_rows.is_none(),
             "persistent decode table was built for a {} pool but got {:?}",
-            if self.quant_decode_meta.is_none() {
+            if self.new_token_rows.is_none() {
                 "BF16"
             } else {
                 "quantized"
@@ -539,28 +483,16 @@ impl PageMeta {
         stream
             .memcpy_htod(&[total_len as i32], &mut self.kv_lens_dev.slice_mut(0..1))
             .map_err(|e| anyhow!("refresh kv_lens_dev: {e}"))?;
-        if let (Some(new_rows), Some(quant_meta)) = (
-            self.new_token_rows.as_mut(),
-            self.quant_decode_meta.as_mut(),
-        ) {
+        if let Some(new_rows) = self.new_token_rows.as_mut() {
             let rows = pool.token_rows_for_range(slot, start_pos, 1);
             ensure!(
                 rows.len() == 1,
                 "decode token-row lookup returned {} rows for slot {slot}",
                 rows.len()
             );
-            let packed = pool.build_quantized_decode_indptr(&[slot]);
-            ensure!(
-                packed.len() == 3,
-                "quant decode indptr is {} i32 at B=1, expected 3",
-                packed.len()
-            );
             stream
                 .memcpy_htod(&[rows[0] as i32], &mut new_rows.slice_mut(0..1))
                 .map_err(|e| anyhow!("refresh new_token_rows: {e}"))?;
-            stream
-                .memcpy_htod(&packed, &mut quant_meta.slice_mut(0..3))
-                .map_err(|e| anyhow!("refresh quant_decode_meta: {e}"))?;
         }
         self.page_offsets = vec![0, num_pages];
         self.kv_lens = vec![total_len];

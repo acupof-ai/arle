@@ -1,28 +1,6 @@
 use super::{CUresult, CUstream, Half};
 
 unsafe extern "C" {
-    pub fn prefill_attention_paged_prep_cuda(
-        q_batch: *mut Half,
-        k_batch: *mut Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        page_table: *const i32,
-        page_table_offset_ptr: *const i32,
-        page_size: i32,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        start_pos_ptr: *const i32,
-        rms_eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn prefill_attention_hd256_prep_cuda(
         q_full_batch: *const Half,
         k_batch: *const Half,
@@ -418,29 +396,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn decode_prep_paged_cuda(
-        q_batch: *mut Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        positions: *const i32,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-        page_table: *const i32,
-        page_indptr: *const i32,
-        last_page_len: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        stride_page: i32,
-        batch_size: i32,
-        rms_eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn paged_kv_append_last_token_indices_cuda(
         kv_indices: *mut i32,
         kv_indptr: *const i32,
@@ -517,60 +472,6 @@ unsafe extern "C" {
         num_q_heads: i32,
         batch_size: i32,
         stream: CUstream,
-    ) -> CUresult;
-
-    pub fn decode_attention_int8_workspace_bytes(
-        batch_size: i32,
-        num_qo_heads: i32,
-        head_dim: i32,
-        num_splits: i32,
-    ) -> usize;
-
-    /// KIVI per-channel K decode attention. `k_static_scales` shape is
-    /// `[num_kv_heads, head_dim]` f32 (one scale per channel per KV head,
-    /// shared across tokens). `v_scales` keeps per-(row, head) layout
-    /// `[max_total_tokens, num_kv_heads]`.
-    pub fn decode_attention_fp8_per_channel_k_cuda(
-        q: *const Half,
-        k_data: *const u8,
-        v_data: *const u8,
-        k_static_scales: *const f32,
-        v_scales: *const f32,
-        kv_indices: *const i32,
-        kv_indptr: *const i32,
-        o: *mut Half,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        sm_scale: f32,
-        stream: CUstream,
-        workspace: *mut u8,
-        workspace_bytes: usize,
-    ) -> CUresult;
-
-    /// INT8 KIVI per-channel K decode attention. Mirrors
-    /// `decode_attention_fp8_per_channel_k_cuda` but reads INT8 K/V (with
-    /// the cp.async-pipelined tiling from `decode_attention_int8_cuda`).
-    pub fn decode_attention_int8_per_channel_k_cuda(
-        q: *const Half,
-        k_data: *const i8,
-        v_data: *const i8,
-        k_static_scales: *const f32,
-        v_scales: *const f32,
-        kv_indices: *const i32,
-        kv_indptr: *const i32,
-        o: *mut Half,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        sm_scale: f32,
-        stream: CUstream,
-        workspace: *mut u8,
-        workspace_bytes: usize,
     ) -> CUresult;
 
     /// Workspace bytes for [`paged_attention_quantized_fa3_cuda`]:

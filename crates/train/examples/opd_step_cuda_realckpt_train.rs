@@ -614,7 +614,6 @@ pub mod app {
             model_dir
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
-            true,
             EngineLoadConfig {
                 num_slots: 1,
                 page_size,

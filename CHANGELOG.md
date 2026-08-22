@@ -8,6 +8,12 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **CUDA drops Qwen3 dense and KIVI per-channel K.** `model_type=qwen3` fails at
+  load; every quantized KV pool is per-(token, head) K+V on the tensor-core
+  decode kernel. −7,340 lines incl. `decode_attention_quantized.cu`, the dense
+  executor, the HD128 TileLang rows and the `--no-cuda-graph` flag.
+  ([entry](docs/experience/wins/2026-08-22-delete-qwen3-dense-cuda-and-kivi.md))
+
 - **Quantized paged attention on tensor cores — accepted; the only quantized
   decode path.** Phase 1 of the quantized-KV unification plan. Qwen3.8-27B-
   NVFP4, fp8 KV, 32 K prompts: per-request decode tok/s c=16 9.9–10.2 → 14.3

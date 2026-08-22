@@ -317,7 +317,7 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
 // Quantized-KV variant (Path A): dequantize the 1-byte paged K/V pools the
 // page table actually names into a per-call bf16 temp (compacted: slot
 // b*stride+j holds row b's logical page j), then run the bf16 fwd on it.
-// Upstream FA3 cannot express KIVI per-(token, head) scales, so the dequant
+// Upstream FA3 cannot express per-(token, head) scales, so the dequant
 // happens here instead of inside the paged load path. The temp allocations are
 // stream-ordered and the dequant reads only device tables, so the call stays
 // CUDA-graph capture-safe. The caller passes the SAME args as the bf16 entry
