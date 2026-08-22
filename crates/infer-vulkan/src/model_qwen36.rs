@@ -219,13 +219,10 @@ impl VulkanQwen36Model {
         }
     }
 
-    /// Drain the accumulated GEMV timing `(submit_secs, other_secs, gemv_count)`.
     pub fn take_decode_profile(&mut self) -> (f64, f64, u64) {
         self.decode.take_profile()
     }
 
-    /// Total `vkQueueSubmit` calls issued by the decode recorder so far — lets a
-    /// timed decode report submits/token (perf-parity Step 4).
     pub fn decode_submit_count(&self) -> u64 {
         self.decode.submit_count()
     }
@@ -235,7 +232,6 @@ impl VulkanQwen36Model {
         self.weights.tensors.len()
     }
 
-    /// Total bytes of device-resident weights across all tensors.
     pub fn resident_device_bytes(&self) -> u64 {
         self.weights
             .tensors
@@ -244,7 +240,6 @@ impl VulkanQwen36Model {
             .sum()
     }
 
-    /// The Vulkan device this model is resident on.
     pub fn device_name(&self) -> &str {
         self.ctx.device_name()
     }

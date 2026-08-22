@@ -33,7 +33,6 @@ pub enum Residency {
     KeepQuant(GgmlType),
     /// F16/BF16 dequantized to F16 on device.
     DequantF16,
-    /// F32 norms / SSM params / router uploaded as F32.
     DequantF32,
     /// `token_embd.weight`: kept as raw GGUF bytes on the host; the forward
     /// gathers + dequantizes one row per token (see [`Qwen35TensorKind::TokenEmbedding`]).
@@ -46,14 +45,11 @@ pub enum Residency {
 /// given layer uses is decided by tensor presence at model-build time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen35TensorKind {
-    // --- global ---
     TokenEmbedding,
     OutputNorm,
     LmHead,
-    // --- per-layer norms ---
     AttnNorm,
     PostAttentionNorm,
-    // --- full-attention layer ---
     AttnQ,
     AttnK,
     AttnV,
@@ -61,7 +57,6 @@ pub enum Qwen35TensorKind {
     AttnKNorm,
     AttnOutput,
     AttnGate,
-    // --- linear (gated-delta / SSM) layer ---
     AttnQkv,
     SsmConv1d,
     SsmA,
@@ -70,12 +65,10 @@ pub enum Qwen35TensorKind {
     SsmDtBias,
     SsmNorm,
     SsmOut,
-    // --- dense FFN (Qwen3.5 dense, e.g. the 27B) ---
     FfnNorm,
     FfnGate,
     FfnUp,
     FfnDown,
-    // --- MoE FFN ---
     FfnGateInp,
     FfnGateExps,
     FfnUpExps,
@@ -123,7 +116,6 @@ pub struct Qwen35TensorRole {
 pub fn classify_qwen35_tensor(name: &str) -> Result<Qwen35TensorRole> {
     use Qwen35TensorKind::*;
 
-    // Global (no `blk.` prefix).
     let global = match name {
         "token_embd.weight" => Some(TokenEmbedding),
         "output_norm.weight" => Some(OutputNorm),
@@ -134,7 +126,6 @@ pub fn classify_qwen35_tensor(name: &str) -> Result<Qwen35TensorRole> {
         return Ok(Qwen35TensorRole { kind, layer: None });
     }
 
-    // Per-layer: `blk.<N>.<suffix>`.
     let rest = name
         .strip_prefix("blk.")
         .ok_or_else(|| anyhow::anyhow!("qwen35: unrecognized tensor name `{name}`"))?;
@@ -188,7 +179,6 @@ pub fn classify_qwen35_tensor(name: &str) -> Result<Qwen35TensorRole> {
     })
 }
 
-/// Device-format decision for a classified tensor.
 pub fn plan_residency(kind: Qwen35TensorKind, ty: GgmlType) -> Residency {
     if kind == Qwen35TensorKind::TokenEmbedding {
         return Residency::HostEmbedding;
@@ -198,12 +188,10 @@ pub fn plan_residency(kind: Qwen35TensorKind, ty: GgmlType) -> Residency {
         // K-quants via `mul_mat_vecq`, Q8_0 via `q8_0_gemv`.
         GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0 => Residency::KeepQuant(ty),
         GgmlType::F32 => Residency::DequantF32,
-        // F16 / BF16 (and anything else dequantizable) → F16 on device.
         _ => Residency::DequantF16,
     }
 }
 
-/// Exact device bytes for one tensor under `residency`.
 pub fn device_bytes(residency: Residency, info: &TensorInfo) -> Result<u64> {
     let n = info.element_count();
     Ok(match residency {
@@ -241,7 +229,6 @@ pub struct ResidencyPlan {
     pub device_bytes: u64,
 }
 
-/// Walk every GGUF tensor, classify it, and compute the device byte budget.
 pub fn plan_model(gguf: &GgufFile, num_layers: usize) -> Result<ResidencyPlan> {
     let mut plan = ResidencyPlan {
         layer_bytes: vec![0; num_layers],
@@ -306,7 +293,6 @@ pub struct HostEmbeddingTable {
 }
 
 impl HostEmbeddingTable {
-    /// Build from the raw GGUF bytes of `token_embd.weight` and its dims.
     pub fn new(ggml_type: GgmlType, hidden: usize, vocab: usize, data: Vec<u8>) -> Result<Self> {
         let row_bytes = ggml_type.row_bytes(hidden).ok_or_else(|| {
             anyhow::anyhow!("token_embd: {ggml_type:?} row of {hidden} cols is not block-aligned")
@@ -326,7 +312,6 @@ impl HostEmbeddingTable {
         })
     }
 
-    /// Gather + dequantize the embedding row for `token` → `hidden` f32 values.
     pub fn embed_row(&self, token: u32) -> Result<Vec<f32>> {
         let t = token as usize;
         ensure!(t < self.vocab, "token id {t} >= vocab {}", self.vocab);
@@ -409,7 +394,6 @@ pub mod upload {
         sign | (result as u16)
     }
 
-    /// One device-resident weight tensor plus its provenance.
     pub struct DeviceTensor<'a> {
         pub name: String,
         pub kind: Qwen35TensorKind,
@@ -434,7 +418,6 @@ pub mod upload {
         pub host_f32: Option<Vec<f32>>,
     }
 
-    /// All device-resident weights for a model plus the host embedding table.
     pub struct ResidentWeights<'a> {
         pub tensors: std::collections::HashMap<String, DeviceTensor<'a>>,
         pub embedding: HostEmbeddingTable,
@@ -458,7 +441,6 @@ pub mod upload {
         let mut embedding: Option<HostEmbeddingTable> = None;
 
         for t in &plan.tensors {
-            // The host-resident token embedding: never gets a device buffer.
             if t.residency == Residency::HostEmbedding {
                 let info = gguf
                     .tensor(&t.name)
@@ -658,7 +640,6 @@ pub mod upload {
                 "three device tensors expected (norm, attn_q, ffn_gate_exps)"
             );
 
-            // Each device buffer is exactly its planned byte count.
             let by_name = |n: &str| plan.tensors.iter().find(|t| t.name == n).unwrap();
             for name in [
                 "blk.0.attn_norm.weight",
@@ -702,7 +683,6 @@ pub mod upload {
             q8.buffer.copy_to_host(&mut q8_back).expect("D2H Q8_0");
             assert_eq!(q8_back, q8_0, "Q8_0 device round-trip mismatch");
 
-            // Embedding row 0 gathers `hidden` f32 values.
             let row0 = resident.embedding.embed_row(0).expect("embed_row(0)");
             assert_eq!(row0.len(), hidden as usize);
             assert_eq!(row0, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -803,7 +783,6 @@ mod tests {
             plan_residency(TokenEmbedding, Q8_0),
             Residency::HostEmbedding
         );
-        // K-quants stay packed for the GEMV.
         assert_eq!(plan_residency(FfnGateExps, Q4K), Residency::KeepQuant(Q4K));
         assert_eq!(plan_residency(FfnDownExps, Q5K), Residency::KeepQuant(Q5K));
         assert_eq!(plan_residency(LmHead, Q6K), Residency::KeepQuant(Q6K));
@@ -811,7 +790,6 @@ mod tests {
         // reads them directly) — NOT dequantized to F16.
         assert_eq!(plan_residency(AttnQ, Q8_0), Residency::KeepQuant(Q8_0));
         assert_eq!(plan_residency(SsmOut, Q8_0), Residency::KeepQuant(Q8_0));
-        // F32 norms / SSM params / router → F32.
         assert_eq!(plan_residency(AttnNorm, F32), Residency::DequantF32);
         assert_eq!(plan_residency(SsmA, F32), Residency::DequantF32);
         assert_eq!(plan_residency(FfnGateInp, F32), Residency::DequantF32);

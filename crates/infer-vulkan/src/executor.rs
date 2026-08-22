@@ -117,7 +117,6 @@ impl VulkanExecutor {
         Self::default()
     }
 
-    /// Whether a model is resident on the device.
     #[must_use]
     pub fn has_model(&self) -> bool {
         #[cfg(feature = "vulkan")]
@@ -144,7 +143,6 @@ impl VulkanExecutor {
         })
     }
 
-    /// Device name of the loaded model, or `None` if no model is loaded.
     #[cfg(feature = "vulkan")]
     #[must_use]
     pub fn device_name(&self) -> Option<&str> {
@@ -429,7 +427,6 @@ mod tests {
             eprintln!("skip: {} not present", path.display());
             return;
         }
-        // Skip cleanly if no Vulkan device is available on this box.
         if let Err(e) = vulkan_sys::VulkanContext::create() {
             eprintln!("skip: no Vulkan device available ({e})");
             return;

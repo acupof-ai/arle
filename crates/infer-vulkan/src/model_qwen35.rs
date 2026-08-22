@@ -225,7 +225,6 @@ pub struct VulkanQwen35Model {
     pub config: qwen35_spec::Qwen35Config,
     ctx: &'static vulkan_sys::VulkanContext,
     weights: crate::loader::upload::ResidentWeights<'static>,
-    /// Per-slot recurrent + KV state for the (single-slot) numeric forward.
     state: crate::forward::Qwen35ForwardState,
     /// Persistent decode resources (perf-parity Steps 3+4): the GEMV activation
     /// arena, the compile-once `KernelCache`, and the record-many/submit-once
@@ -280,8 +279,6 @@ impl VulkanQwen35Model {
         self.decode.take_profile()
     }
 
-    /// Total `vkQueueSubmit` calls issued by the decode recorder so far — lets a
-    /// timed decode report submits/token (perf-parity Step 4).
     pub fn decode_submit_count(&self) -> u64 {
         self.decode.submit_count()
     }
@@ -292,7 +289,6 @@ impl VulkanQwen35Model {
         self.weights.tensors.len()
     }
 
-    /// Total bytes of device-resident weights across all tensors.
     pub fn resident_device_bytes(&self) -> u64 {
         self.weights
             .tensors
@@ -301,7 +297,6 @@ impl VulkanQwen35Model {
             .sum()
     }
 
-    /// The Vulkan device this model is resident on.
     pub fn device_name(&self) -> &str {
         self.ctx.device_name()
     }

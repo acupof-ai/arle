@@ -89,7 +89,6 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
             .ok_or_else(|| anyhow!("GGUF missing required key {}", key(suffix)))
     };
 
-    // ── Core transformer dims. ────────────────────────────────────────────
     let num_hidden_layers = req_usize("block_count")?;
     let hidden_size = req_usize("embedding_length")?;
     // Dense MLP width. The MoE GGUF (qwen35moe, all-sparse) ships NO
@@ -145,8 +144,6 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
         .get_usize(&key("context_length"))
         .or_else(|| gguf.get_usize(&key("max_position_embeddings")));
 
-    // ── Linear (gated-delta / SSM) head dims. See module docs for the
-    // ssm.* → linear_* derivation and its consistency proof. ───────────────
     let linear_conv_kernel_dim = req_usize("ssm.conv_kernel")?;
     let ssm_inner_size = req_usize("ssm.inner_size")?;
     let ssm_state_size = req_usize("ssm.state_size")?;
@@ -182,9 +179,6 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
         );
     }
 
-    // ── Per-layer types from tensor presence. A layer is LINEAR (gated-delta)
-    // iff `blk.N.ssm_conv1d.weight` exists, FULL iff `blk.N.attn_q.weight`
-    // exists. Both archs interleave with no fixed pattern, so read it. ──────
     let layer_types = derive_layer_types(gguf, num_hidden_layers)?;
 
     // Full-attention Q gate: Qwen3.5/3.6 FUSE a per-head sigmoid gate into the
@@ -204,7 +198,6 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
         .map(|ne1| ne1 as usize == q_gate_width)
         .unwrap_or(true);
 
-    // ── MoE block (qwen35moe only; dense leaves num_experts = 0). ──────────
     let (num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size) =
         if is_moe {
             (
@@ -218,7 +211,6 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
             (0, 0, 0, 0)
         };
 
-    // ── Tokenizer special ids + tie. ──────────────────────────────────────
     let eos_token_id = gguf
         .get_u64("tokenizer.ggml.eos_token_id")
         .and_then(|v| u32::try_from(v).ok())
