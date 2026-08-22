@@ -2,8 +2,7 @@
 //! rank-group math.
 //!
 //! Port of SGLang `parallel_state.py` / `dp_attention.py` (per-function line
-//! refs kept on the comments below). Device-coupled NCCL collectives land in a
-//! later H20-gated phase.
+//! refs kept on the comments below).
 
 use crate::error::{Result, bail};
 use crate::sharding::parse_parallel_env_usize;
@@ -33,9 +32,6 @@ impl MultiAxisConfig {
 
     /// The only multi-rank DSv4 execution shape wired today: global TP and EP,
     /// no attention-DP/CP or MoE-DP subgroups.
-    ///
-    /// # Errors
-    /// Errors if the resulting config fails [`Self::validate`].
     pub fn global_tp_ep(tp_size: usize, ep_size: usize) -> Result<Self> {
         let cfg = Self {
             tp_size,
@@ -53,15 +49,10 @@ impl MultiAxisConfig {
     /// contract input used by DSv4 startup diagnostics and fail-closed guards so
     /// a run cannot silently claim a SGLang-equivalent layout while only wiring
     /// global TP/EP.
-    ///
-    /// # Errors
-    /// Errors on a non-`usize` env value or a config that fails [`Self::validate`].
     pub fn from_env() -> Result<Self> {
         Self::from_env_with_defaults(1, 1, 1)
     }
 
-    /// # Errors
-    /// Errors on a non-`usize` env value or a config that fails [`Self::validate`].
     pub fn from_env_with_defaults(
         tp_default: usize,
         pp_default: usize,
@@ -72,8 +63,6 @@ impl MultiAxisConfig {
         })
     }
 
-    /// # Errors
-    /// Errors on a non-`usize` env value or a config that fails [`Self::validate`].
     pub fn current_route_from_env_with_defaults(
         tp_world_size: usize,
         ep_world_size: usize,
@@ -175,10 +164,6 @@ impl MultiAxisConfig {
     }
 
     /// SGLang `parallel_state.py:1781,1827-1829,1897-1899`.
-    ///
-    /// # Errors
-    /// Errors if any axis size is 0, if `tp_size % (attn_dp_size * attn_cp_size) != 0`,
-    /// or if `tp_size % (ep_size * moe_dp_size) != 0`.
     pub fn validate(&self) -> Result<()> {
         if self.tp_size == 0
             || self.pp_size == 0
@@ -261,10 +246,6 @@ pub struct RankCoord {
 
 impl RankCoord {
     /// SGLang `dp_attention.py:240-254` + `parallel_state.py:1789,1981`.
-    ///
-    /// # Errors
-    /// Errors if `cfg` fails [`MultiAxisConfig::validate`] or
-    /// `world_rank >= cfg.world_size()`.
     pub fn from_world_rank(cfg: MultiAxisConfig, world_rank: usize) -> Result<Self> {
         cfg.validate()?;
         let world = cfg.world_size();
