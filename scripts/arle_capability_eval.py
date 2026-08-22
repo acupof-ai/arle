@@ -336,6 +336,7 @@ def run_mmlu(
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     max_tokens: int = 32,
     concurrency: int = 1,
+    local_dir: str | None = None,
 ) -> dict:
     """Run MMLU 5-shot eval. Saves the first `debug_samples` raw responses
     to <output_dir>/mmlu_debug.json so future extractor fixes can target
@@ -356,8 +357,12 @@ def run_mmlu(
 
     # MMLU has a `dev` split (5 shots per subject) and `test` split (eval).
     print("[mmlu] loading dataset...", flush=True)
-    ds_test = load_dataset("cais/mmlu", "all", split="test", revision=dataset_revision)
-    ds_dev = load_dataset("cais/mmlu", "all", split="dev", revision=dataset_revision)
+    if local_dir is not None:
+        ds_test = load_dataset("parquet", data_files=f"{local_dir}/all/test-*.parquet", split="train")
+        ds_dev = load_dataset("parquet", data_files=f"{local_dir}/all/dev-*.parquet", split="train")
+    else:
+        ds_test = load_dataset("cais/mmlu", "all", split="test", revision=dataset_revision)
+        ds_dev = load_dataset("cais/mmlu", "all", split="dev", revision=dataset_revision)
 
     # Build per-subject dev pools for the 5-shot prompt.
     dev_by_subject: dict[str, list[dict]] = {}
@@ -1025,6 +1030,7 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
                 dataset_revision=args.mmlu_revision,
                 max_tokens=args.mmlu_max_tokens,
                 concurrency=args.concurrency,
+                local_dir=args.mmlu_local_dir,
             )
         elif task == "math500":
             report = run_math500(
@@ -1097,6 +1103,8 @@ def main(argv: list[str]) -> int:
                              "deterministic MATH-500; use training-seed checkpoints instead.")
     parser.add_argument("--mmlu-revision", default=os.environ.get("ARLE_MMLU_REVISION", DEFAULT_DATASET_REVISION),
                         help="Hugging Face revision for cais/mmlu")
+    parser.add_argument("--mmlu-local-dir", default=os.environ.get("ARLE_MMLU_LOCAL_DIR"),
+                        help="local MMLU snapshot dir with all/{dev,test}-*.parquet; skips Hub download")
     parser.add_argument("--gsm8k-revision", default=os.environ.get("ARLE_GSM8K_REVISION", DEFAULT_DATASET_REVISION),
                         help="Hugging Face revision for openai/gsm8k")
     parser.add_argument("--math500-revision", default=os.environ.get("ARLE_MATH500_REVISION", DEFAULT_DATASET_REVISION),
