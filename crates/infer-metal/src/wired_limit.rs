@@ -1,5 +1,3 @@
-//! MLX wired-memory limit helpers for clean Metal executor construction.
-
 use std::path::{Path, PathBuf};
 
 pub(crate) fn auto_wired_limit_bytes(model_dir: &Path) -> Option<usize> {

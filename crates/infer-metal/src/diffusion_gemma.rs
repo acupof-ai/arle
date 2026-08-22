@@ -1,5 +1,3 @@
-//! DiffusionGemma Metal loader and block-diffusion model wrapper.
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

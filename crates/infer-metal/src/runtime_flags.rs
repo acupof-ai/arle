@@ -16,7 +16,7 @@ static HOST_SAMPLING: AtomicBool = AtomicBool::new(false);
 static SPEC: LazyLock<Mutex<MetalRuntimeFlags>> =
     LazyLock::new(|| Mutex::new(MetalRuntimeFlags::default()));
 
-/// Apply the CLI-resolved flags. Must run before `MetalExecutor` construction.
+/// Must run before `MetalExecutor` construction.
 pub fn apply_runtime_flags(f: &MetalRuntimeFlags) {
     PIPELINE.store(f.pipeline, Relaxed);
     WARMUP.store(f.warmup, Relaxed);

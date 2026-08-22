@@ -1,5 +1,3 @@
-//! Model-source resolver for Metal weights (local path or HuggingFace id).
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

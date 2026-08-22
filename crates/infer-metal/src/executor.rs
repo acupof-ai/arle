@@ -169,8 +169,6 @@ impl std::fmt::Debug for MetalInflight {
     }
 }
 
-/// Turn a logits array into an in-flight result under `params`.
-///
 /// The raw-argmax fast path keeps the device `argmax` + async path. Non-greedy
 /// Metal sampling used to materialize host f32 logits and sample on CPU every
 /// token, which creates synchronous D2H stalls on the local desktop path;
@@ -1285,7 +1283,6 @@ impl RealMetalExecutor {
             .slots
             .get_mut(&slot_idx)
             .ok_or_else(|| anyhow::anyhow!("prequeue missing slot {slot_idx}"))?;
-        // Bound the prequeue to the slot's reserved cache (kv_flat capacity).
         let capacity = slot
             .kv_flat
             .first()
@@ -1669,7 +1666,6 @@ mod tests {
     #[test]
     fn qwen36_27b_detection_matches_family_and_rejects_others() {
         use std::path::Path;
-        // Positive: OptiQ + MTP, both HF cache-dir and local-dir shapes.
         for p in [
             "/u/.cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-OptiQ-4bit/snapshots/abc",
             "/u/.cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-MTP-4bit/snapshots/abc",
@@ -1680,7 +1676,6 @@ mod tests {
                 "expected Qwen3.6-27B detection for {p}"
             );
         }
-        // Negative: Qwen3.5 and the 35B-A3B MoE must not auto-enable.
         for p in [
             "models/Qwen3.5-0.8B-MLX-4bit",
             "models/Qwen3.5-4B",
@@ -1701,16 +1696,14 @@ mod tests {
     #[test]
     fn grow_kv_seq_axis_preserves_tokens_and_zero_pads_tail() {
         let _guard = mlx_sys::mlx_guard();
-        // [B=1, n_kv=1, seq=2, head_dim=2] with distinct, known values.
         let src = mlx::MlxArray::from_slice_i32(&[10, 11, 20, 21], &[1, 1, 2, 2]);
         let src = mlx::as_dtype(&src, mlx::Dtype::Float32);
         let grown = grow_kv_seq_axis(&src, 4).unwrap();
         mlx::eval(&[&grown]);
         assert_eq!(grown.shape(), &[1, 1, 4, 2], "seq axis must extend to 4");
         let vals = grown.as_slice_f32();
-        // Tokens 0,1 preserved bit-for-bit.
         assert_eq!(&vals[0..4], &[10.0, 11.0, 20.0, 21.0]);
-        // Tokens 2,3 (the grown tail) are zero — the slice_update write target.
+        // The grown tail is the slice_update write target.
         assert_eq!(&vals[4..8], &[0.0, 0.0, 0.0, 0.0]);
     }
 
@@ -1909,8 +1902,6 @@ mod tests {
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(2, 8, 4);
 
-        // First occupant: slot 0, 8 tokens = 2 full pages, exact page boundary
-        // -> publishes both page blocks and a restore snapshot.
         pool.alloc(0, 8).unwrap();
         let first_pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state_a = MetalSlotState::from_arrays(
@@ -1958,8 +1949,6 @@ mod tests {
         );
         store.publish_slot(&state_b, &pool).unwrap();
 
-        // The first occupant's prefix key is pruned: it contains overwritten
-        // page ids and is not a prefix of the new occupant's page list.
         assert!(
             !store.prefixes.contains_key(&first_key),
             "stale prefix key {first_key:?} must be pruned on page reuse"
@@ -1969,8 +1958,6 @@ mod tests {
             0
         );
 
-        // The new occupant's own boundary snapshot survives and carries ITS
-        // restore state, not the first occupant's.
         assert_eq!(
             store.reusable_prefix_blocks(&resident_prefix_blocks(&second_pages)),
             2
@@ -1998,7 +1985,6 @@ mod tests {
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        // First chunk: 4 tokens = 1 full page -> snapshot at [p0].
         pool.alloc(0, 4).unwrap();
         let one_page: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(

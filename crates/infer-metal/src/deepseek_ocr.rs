@@ -1,5 +1,3 @@
-//! DeepSeek-OCR Metal loader and autoregressive VLM wrapper.
-//!
 //! Mirrors `gemma4.rs`: a thin Rust shell over the C++ MLX bridge
 //! (`mlx_deepseek_ocr_model.cpp`). The model rides the shared autoregressive
 //! `Engine` through `DiffusionBlockModel` + `BufferedDiffusionExecutor`
