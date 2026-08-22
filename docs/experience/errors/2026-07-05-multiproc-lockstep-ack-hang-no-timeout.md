@@ -249,15 +249,6 @@ on both servers — no false-positive rejection. Server health after
 rejection: control → repro → repro → repro → control, all correct, no
 degradation, no zombie state.
 
-## Status — CLOSED. The original user-reported hang is fully resolved end-to-end
-
-Five rounds: 1-3 fixed real relay-layer gaps (kept, not the root cause); 4
-fixed a genuine SPMD admission-collective divergence (pod-verified); 5 fixed
-the actual terminal mechanism — an unbounded `Throttled` retry with no
-"can this ever fit" check (pod-verified). `prompt_tokens≈8106` at TP=4/EP=4
-now returns a fast, correct abort instead of freezing the server forever, and
-the server keeps serving normal traffic afterward.
-
 ## Round 6 — `InFlightGuard` cancellation propagation, landed (`d9222a29a`, `b7ec09160`)
 
 The one gap rounds 1-5 left open, deliberately deferred pending a scope
@@ -308,10 +299,7 @@ baseline) both unregressed.
 Rounds 1-3: relay-layer hardening (kept). Round 4: SPMD admission-collective
 divergence (pod-verified). Round 5: capacity-shortfall reject path
 (pod-verified). Round 6: `InFlightGuard` cancellation propagation
-(pod-verified). No further gaps identified. One explicitly deferred,
-low-priority item: single-GPU/local-relay-driver serve does not handle
-`CancelRequest` (silent no-op) — own follow-up if ever needed, not a gap in
-the multiproc path this investigation covered.
+(pod-verified). No further gaps identified.
 
 Deliberately out of scope: the single-process/local relay driver
 (`infer-server/src/lib.rs`'s "local-relay-driver" loop, used for single-GPU
