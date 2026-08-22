@@ -8,6 +8,13 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **MTP on the 32 K chain — measured, no flip.** Same binary, c=1/4/8/16 decode
+  tok/s: no-spec 73.0/42.1/25.9/14.8, MTP d=2 84.3/42.0/24.8/14.0, d=4
+  83.0/42.1/26.3/15.1; TTFT identical. +15 % at c=1 only (already the `auto`
+  default); inert from c=4 until the verify step is batched. Closes the
+  quantized-KV unification plan.
+  ([plan](docs/plans/2026-08-22-quantized-kv-attention-unification.md))
+
 - **CUDA drops Qwen3 dense and KIVI per-channel K.** `model_type=qwen3` fails at
   load; every quantized KV pool is per-(token, head) K+V on the tensor-core
   decode kernel. −7,340 lines incl. `decode_attention_quantized.cu`, the dense

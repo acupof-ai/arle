@@ -1,6 +1,6 @@
 # Quantized-KV attention: one tensor-core kernel for every Qwen — 2026-08-22
 
-> Status: Open. Runtime `5759a2caa`, Qwen3.8-27B-NVFP4, 1×H20. Each phase
+> Status: Closed 2026-08-22. Runtime `5759a2caa` → `1df0acf68`, Qwen3.8-27B-NVFP4, 1×H20. Each phase
 > closes on a measurement and a CHANGELOG line.
 
 ## Where we stand
@@ -62,16 +62,21 @@ TTFT levers, in order: the prefill GEMMs of `dense_ffn`, the linear-attention
 projections, then FA3 fp8 compute (per-tensor descale only — incompatible
 with per-token KV scales; low certainty).
 
-## Phase 4 — fill the free GEMM rows
+## Phase 4 — fill the free GEMM rows — CLOSED (measured; no default to flip)
 
-Marlin costs the same at M=1..8
-([backlog #1](2026-08-21-nvfp4-decode-lever-backlog.md)). With decode
-attention near its floor, MTP d=2/4 is the mechanism that fills those rows:
-no-spec / d=2 / d=4 on one binary, ITL and end-to-end. Serving experiment,
-no kernel work.
+One binary (`1df0acf68`), Qwen3.8-27B-NVFP4, fp8 KV, 32 K chain, c=1/4/8/16,
+per-request decode tok/s: no-spec 73.0 / 42.1 / 25.9 / 14.8; MTP d=2 **84.3**
+/ 42.0 / 24.8 / 14.0; MTP d=4 83.0 / 42.1 / 26.3 / 15.1. TTFT identical.
+MTP pays +15 % at c=1 only — the default `--spec-type auto` already selects
+it — and is inert from c=4 because the verify step is not batched
+([plan](2026-08-21-batched-mtp-verify.md)). The free Marlin rows (M ≤ 8) bound
+the lever: c=1·d=2 verifies at M=3; c=4·d=2 would already be M=12. d=4 does
+not beat d=2 (acceptance-limited). Caveat for future runs: with a drafter on,
+`ITL p50` collapses (0.03 ms at d=4 — accepted tokens stream together); read
+decode tok/s or ITL mean.
 
 ## Close-out
 
-- `docs/support-matrix.md`: FP8 KV from opt-in to production once Phases 1–2
-  carry a quality verdict on both families.
-- CHANGELOG line per phase; phase exits cut a tag.
+All four phases closed 2026-08-22. Remaining decode lever on this chain is
+the batched MTP verify; remaining TTFT levers are GEMM-bound on H20 (no FP4
+tensor cores) — see Phase 3.
