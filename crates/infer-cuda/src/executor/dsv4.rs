@@ -46,15 +46,9 @@ pub(crate) struct Dsv4CudaExecutor {
     /// on promote (without it, KV overflow falls back to recompute). NVMe spill
     /// is opt-in via `set_kv_tier_disk`.
     pub(super) slot_tier: KvTierStore,
-    /// c=1 decode graph: `Some` after the first successful capture; `None` if
-    /// the capture failed or the model doesn't qualify.
-    decode_graph: Option<Dsv4DecodeGraph>,
-}
-
-/// CUDA graph state for the c=1 decode path. The graph captures the transformer
-/// layers; the LM head + sampling run eagerly after replay.
-struct Dsv4DecodeGraph {
-    state: crate::graph::CudaGraphState,
+    /// Per-slot c=1 decode graph: the capture bakes the slot's device buffers
+    /// (start_pos, page table), so one graph per slot.
+    decode_graphs: Vec<Option<crate::graph::CudaGraphState>>,
 }
 
 pub(crate) struct Dsv4DsparkExec {
@@ -246,12 +240,9 @@ impl Dsv4CudaExecutor {
             return Ok(None);
         }
 
-        if self.decode_graph.is_none() {
-            self.decode_graph = Some(Dsv4DecodeGraph {
-                state: crate::graph::CudaGraphState::new(self.model.ctx.stream.clone()),
-            });
-        }
-        let graph = self.decode_graph.as_mut().unwrap();
+        let graph = self.decode_graphs[slot_idx].get_or_insert_with(|| {
+            crate::graph::CudaGraphState::new(self.model.ctx.stream.clone())
+        });
 
         let model = &self.model;
         let slot = &mut self.slots[slot_idx];
@@ -274,7 +265,7 @@ impl Dsv4CudaExecutor {
         // Graph: capture/replay transformer layers. The closure stores the
         // output stream so the LM head can read it after replay.
         let result = std::cell::RefCell::new(None);
-        let capture_result = graph.state.run_or_capture(|| {
+        let capture_result = graph.run_or_capture(|| {
             let (stream, keepalive) = model.forward_tokens_stream_impl(
                 slot,
                 kv_adapter,
@@ -294,7 +285,7 @@ impl Dsv4CudaExecutor {
 
         if let Err(e) = capture_result {
             log::warn!("DSv4 c=1 decode graph failed, falling back to eager: {e}");
-            self.decode_graph = None;
+            self.decode_graphs[slot_idx] = None;
             return Ok(None);
         }
 

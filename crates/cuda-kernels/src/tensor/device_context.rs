@@ -466,7 +466,12 @@ impl DeviceContext {
                     Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
                         continue;
                     }
-                    Err(err) => return Err(anyhow!("CUDA event query in pool failed: {err}")),
+                    Err(err) => {
+                        return Err(anyhow!(
+                            "CUDA event query in pool failed: {err} (producer={producer:?})\n{}",
+                            std::backtrace::Backtrace::force_capture()
+                        ))
+                    }
                 }
             }
             match ready {
