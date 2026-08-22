@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Flag deletion wave 3 follow-up — accepted: `examples/dsv4_resident_ab.rs` (601 lines) and the fused-WQKV override chain deleted (the axis was a proven +18.4 % winner with a preflight fallback); a dangling `set_dsv4_moe_contig_decode` doc comment removed.** See `docs/experience/wins/2026-08-22-flag-deletion-wave3.md`.
 - **Flag deletion wave 3 — accepted: `--dspark-confidence-threshold`/`--mtp-adaptive`/`--mtp-min-accept`/`--dsv4-flashmla-decode` deleted with full chains (incl. the FlashMLA override API and the resident A/B example's scalar arm), `dsv4_decode_reuse_enabled()` shim removed; serve flags 53 → 49.** See `docs/experience/wins/2026-08-22-flag-deletion-wave3.md`.
 - **Flag deletion wave 2 — accepted: `--qwen35-fa3`/`--qwen35-deepgemm`/`--qwen35-moe-decode-kernel` deleted (off-arms 2.76×/15.4×/10.8× worse), Metal warmup seam default fixed to match shipped false, 12 stale doc refs cleaned** (`5b880f2f8`). See `docs/experience/wins/2026-08-22-flag-deletion-wave2.md`.
 - **FIX: decode graph was hardcoded OFF by the flag-deletion wave (`1864ddac5`) — serve mapping now hardcodes on (the off-arm costs −58.7 % TPOT); caught by the SOTA-defaults audit.** See `docs/experience/errors/2026-08-22-decode-graph-hardcoded-off-in-flag-deletion.md`.
