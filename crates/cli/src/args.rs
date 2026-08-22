@@ -924,7 +924,7 @@ impl ServeArgs {
     /// CUDA runtime toggles for `EngineLoadConfig.cuda`.
     pub(crate) fn cuda_runtime_flags(&self) -> infer_api::CudaRuntimeFlags {
         infer_api::CudaRuntimeFlags {
-            qwen35_decode_graph: false,
+            qwen35_decode_graph: true,
             qwen35_deepgemm: self.qwen35_deepgemm,
             qwen35_moe_decode_kernel: self.qwen35_moe_decode_kernel,
             qwen35_fa3: self.qwen35_fa3,

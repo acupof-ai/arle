@@ -950,7 +950,7 @@ impl Qwen35CudaExecutor {
         if !crate::runtime_flags::qwen35_decode_graph() {
             info!(
                 "Qwen3.5 whole-step decode graph disabled \
-                 (set --qwen35-decode-graph to enable)"
+                 (OPD: set --qwen35-decode-graph to enable)"
             );
             cuda_startup_log(
                 "executor.qwen35_warmup_total",
