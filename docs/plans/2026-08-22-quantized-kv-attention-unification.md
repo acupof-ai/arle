@@ -41,22 +41,26 @@ the floor ([entry](../experience/wins/2026-08-22-paged-attention-quantized-tenso
   the 32 K chain, needle ×3, 200-item eval. Target: B≥16 within 2× of the
   bandwidth floor.
 
-## Phase 2 — Qwen3 dense joins the same path
+## Phase 2 — Qwen3 dense joins the same path — CLOSED (family deleted)
 
-- Switch Qwen3 dense KV quantisation from KIVI per-channel K to per-token
-  (the SGLang / vLLM scheme), route `attention.rs` decode to the Phase 1
-  kernel, delete `decode_attention_quantized.cu` and the KIVI calibration
-  scaffolding.
-- Gate: needle ×3 + 200-item eval on a Qwen3 dense checkpoint with INT8 and
-  FP8 KV against the KIVI baseline. If per-token loses quality on Qwen3 dense,
-  KIVI stays and the phase closes as rejected with the numbers.
+No Qwen3 dense checkpoint is served on CUDA; the family and KIVI per-channel K
+were deleted instead of ported (`1df0acf68`, −7,340 lines,
+[entry](../experience/wins/2026-08-22-delete-qwen3-dense-cuda-and-kivi.md)).
+Every CUDA quantized pool is per-(token, head) K+V on the Phase 1 kernel.
 
-## Phase 3 — prefill on the same pool
+## Phase 3 — prefill on the same pool — CLOSED (rejected on measurement)
 
-The 32 K agent chain is 154:1 prefill to decode; after Phase 1 the end-to-end
-number is set by prefill, which still dequantises the quantized prefix into a
-bf16 temp for FA3 (5× the KV traffic). Land FA3's native FP8 KV prefill over
-the paged pool; delete the shim. Gate: c=1/16 TTFT on the 32 K chain, needle.
+Per-op prefill profile, one 32 K prompt, Qwen3.8-27B-NVFP4, fp8 KV,
+`ARLE_CUDA_PROFILE=1` (synchronising; shares, not absolutes): `dense_ffn`
+4835 ms (48 %), `linear_attention` 2828 ms (28 %: in_proj 1213, gdr 800,
+out_proj 443, conv1d 212), `full_attention` 2156 ms (22 %: FA3 + dequant shim
+1566, qkv_gemm 352, o_proj 148). FA3's compute floor for 32 K × 16 layers
+(4·L²·d·H/2 per layer ≈ 211 TFLOP) is ≈1.4 s on H20 bf16, so the 1566 ms is
+the attention itself; the shim moves ≈2 GB across 16 layers, under 100 ms,
+under 1 % of TTFT. A native fp8-pool prefill kernel has no TTFT to win.
+TTFT levers, in order: the prefill GEMMs of `dense_ffn`, the linear-attention
+projections, then FA3 fp8 compute (per-tensor descale only — incompatible
+with per-token KV scales; low certainty).
 
 ## Phase 4 — fill the free GEMM rows
 
