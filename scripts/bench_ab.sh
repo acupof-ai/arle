@@ -230,8 +230,8 @@ for k in keys:
 lines.append("")
 lines.append("Δ is (B - A) / A. Negative TTFT Δ is faster; positive tok/s Δ is faster.")
 lines.append("")
-lines.append("> Reminder: effects ≤10% in a single session are thermal noise. See")
-lines.append("> memory/feedback_matched_ab_for_small_bench_effects.md.")
+lines.append("Reminder: effects <=10% in a single session are thermal noise; rerun")
+lines.append("or extend the cell duration before trusting small deltas.")
 
 pathlib.Path(out_path).write_text("\n".join(lines) + "\n")
 print("".join(f"{l}\n" for l in lines))
