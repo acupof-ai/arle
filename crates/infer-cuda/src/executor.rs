@@ -237,8 +237,9 @@ impl RealCudaExecutor {
     }
 
     pub(crate) fn poll_background(&mut self) {
-        if let Self::Dsv4(d) = self {
-            d.poll_prefix_captures();
+        match self {
+            Self::Qwen35(q) => q.poll_sidecar_serializations(),
+            Self::Dsv4(d) => d.poll_prefix_captures(),
         }
     }
 
