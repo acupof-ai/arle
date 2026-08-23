@@ -223,6 +223,14 @@ impl Dsv4CudaExecutor {
             decode_graphs: (0..num_slots).map(|_| None).collect(),
         };
         log::info!(
+            "[dsv4-decode-graph] c=1 decode graph {} (ARLE_DSV4_DECODE_GRAPH=0 selects eager)",
+            if super::dsv4_decode_graph_enabled() {
+                "armed"
+            } else {
+                "off"
+            }
+        );
+        log::info!(
             "DSv4 prefill chunk capability: {} tokens (deepep per-forward cap {:?})",
             exec.max_prefill_chunk(),
             exec.model.max_tokens_per_step(),
