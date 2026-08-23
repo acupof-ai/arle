@@ -422,7 +422,8 @@ impl Dsv4Model {
                 )?;
                 // DeepEP combine already reduces the EP-sharded routed output; the
                 // non-deepep path needs the explicit TP all-reduce below.
-                let (shared_out, mut shared_scratch) = kv_adapter.shared_expert_decode_mut();
+                let (shared_out, mut shared_scratch, moe_tail) =
+                    kv_adapter.moe_decode_scratch_mut();
                 let needs_moe_allreduce = if use_deepep_transport {
                     #[cfg(feature = "deepep")]
                     {
@@ -492,7 +493,7 @@ impl Dsv4Model {
                             &normed,
                             &mut moe_out,
                             &mut keepalive,
-                            None,
+                            moe_tail,
                             mega_epoch,
                         )
                     })?
