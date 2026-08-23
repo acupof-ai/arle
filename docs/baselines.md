@@ -288,12 +288,13 @@ with profiling OFF:
 
 | | decode, clean |
 |---|---:|
-| Qwen3.6-27B-FP8 | **60.4 tok/s** |
+| Qwen3.6-27B-FP8 | **60.2 tok/s** |
 | Qwen3.8-27B-NVFP4 | **84.5 tok/s** |
 
-NVFP4 is 40% ahead of FP8 at c=1. NVFP4 moves 56% of the weight bytes per
-layer (150.4 MB vs 267.5 MB), and the Marlin NVFP4 decode path is
-compute-bound — the gap is expected. The Marlin bps tiebreaker
+2 runs each, clean GPU (nothing else resident). NVFP4 is 40% ahead of FP8 at
+c=1. NVFP4 moves 56% of the weight bytes per layer (150.4 MB vs 267.5 MB), and
+the Marlin NVFP4 decode path is compute-bound — the gap is expected. The
+Marlin bps tiebreaker
 ([wins entry](experience/wins/2026-08-23-marlin-nvfp4-decode-bps-tiebreaker.md))
 contributes +2-6% at the kernel level.
 
