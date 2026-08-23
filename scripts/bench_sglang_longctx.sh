@@ -22,7 +22,7 @@ set -euo pipefail
 
 SGLANG_COMMIT="214c35b03184c354acf1f86f99746799e1c9b3a9"
 MODEL="${MODEL:-Qwen/Qwen3-4B}"
-MODEL_PATH="${MODEL_PATH:-infer/models/Qwen3-4B}"
+MODEL_PATH="${MODEL_PATH:-models/Qwen3-4B}"
 SGLANG_DIR="${SGLANG_DIR:-/tmp/sglang-arle-${SGLANG_COMMIT}}"
 SGLANG_REPO="${SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
 PORT="${PORT:-30000}"

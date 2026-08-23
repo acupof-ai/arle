@@ -12,7 +12,7 @@
 #                                 [--port P] [--model PATH]
 #
 # Defaults match the M3.6 Phase-2 control config:
-#   --max-num-seqs 14 --max-model-len 2048 --port 8000 --model infer/models/Qwen3-4B
+#   --max-num-seqs 14 --max-model-len 2048 --port 8000 --model models/Qwen3-4B
 #
 # Run in foreground; Ctrl-C cleanly shuts down. To background, prefix
 # with `setsid env nohup ... < /dev/null & disown` (per the M4 lifecycle
@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VENV="${VLLM_VENV:-/tmp/arle-vllm-venv}"
 
-MODEL="${REPO_ROOT}/infer/models/Qwen3-4B"
+MODEL="${REPO_ROOT}/models/Qwen3-4B"
 SERVED_NAME="Qwen/Qwen3-4B"
 PORT=8000
 MAX_NUM_SEQS=14

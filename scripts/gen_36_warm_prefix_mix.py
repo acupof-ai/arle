@@ -14,7 +14,7 @@ Output is JSONL compatible with `bench_throughput.py --prompts-jsonl <path>`.
 
 Usage:
   ./scripts/gen_36_warm_prefix_mix.py \\
-      --tokenizer infer/models/Qwen3-4B/tokenizer.json \\
+      --tokenizer models/Qwen3-4B/tokenizer.json \\
       --out bench-output/36-warm-mix.jsonl \\
       --num-requests 256 \\
       --warm-fraction 0.6 \\

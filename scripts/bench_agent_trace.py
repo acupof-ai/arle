@@ -1130,7 +1130,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model",
         default="default",
         help="OpenAI v1 'model' field. ARLE uses 'default'; vLLM/SGLang need actual "
-             "model path or HF id (e.g. /home/ckl/projects/arle/infer/models/Qwen3-4B). "
+             "model path or HF id (e.g. Qwen/Qwen3-4B). "
              "(default: %(default)s)",
     )
     p.add_argument(
