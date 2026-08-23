@@ -5059,8 +5059,14 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     // table decides the true group dims, so resize once on the eager warm step
     // (which precedes any capture).
     if n == 1
-        && (scratch.oproj_in.as_ref().is_none_or(|b| b.hidden_dim != cols)
-            || scratch.oproj_out.as_ref().is_none_or(|b| b.hidden_dim != rows))
+        && (scratch
+            .oproj_in
+            .as_ref()
+            .is_none_or(|b| b.hidden_dim != cols)
+            || scratch
+                .oproj_out
+                .as_ref()
+                .is_none_or(|b| b.hidden_dim != rows))
     {
         // SAFETY: uninit device scratch; fully written before first read.
         scratch.oproj_in = Some(unsafe { HiddenStates::uninit(ctx, cols, 1)? });
