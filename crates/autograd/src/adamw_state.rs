@@ -105,7 +105,7 @@ impl AdamW {
                 );
             }
 
-            self.set_state(id, param.m.clone(), param.v.clone(), param.shape.clone());
+            self.set_state(id, param.m.clone(), param.v.clone(), param.shape.clone())?;
             restored += 1;
         }
 

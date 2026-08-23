@@ -293,7 +293,7 @@ fn log_opd_backward_profile(loss_value: f32, profile: &BackwardProfile) {
     let aggregate = {
         let mut aggregate = OPD_BACKWARD_PROFILE_TOTALS
             .lock()
-            .expect("OPD backward profile mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         aggregate.merge(profile);
         aggregate.clone()
     };

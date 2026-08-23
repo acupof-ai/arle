@@ -556,7 +556,7 @@ impl Tape {
         let Some(scope) = &self.checkpoint_op_mem_scope else {
             return;
         };
-        let mut scope = scope.lock().expect("checkpoint op memory scope poisoned");
+        let mut scope = scope.lock().unwrap_or_else(|e| e.into_inner());
         scope.records.push(CheckpointOpMemRecord {
             stage,
             op_seq,
@@ -569,7 +569,7 @@ impl Tape {
 
     fn checkpoint_op_mem_begin(&self, entry: &TapeEntry, store: &TensorStore) -> Option<usize> {
         let scope = self.checkpoint_op_mem_scope.as_ref()?;
-        let mut scope = scope.lock().expect("checkpoint op memory scope poisoned");
+        let mut scope = scope.lock().unwrap_or_else(|e| e.into_inner());
         let op_seq = scope.next_op_seq();
         scope.records.push(CheckpointOpMemRecord {
             stage: "pre_op",
@@ -1291,7 +1291,7 @@ pub fn checkpoint_replay_mem_stage(tape: &Tape, store: &TensorStore, stage: &'st
 }
 
 fn flush_checkpoint_op_mem(scope: &Arc<Mutex<CheckpointOpMemScope>>) {
-    let scope = scope.lock().expect("checkpoint op memory scope poisoned");
+    let scope = scope.lock().unwrap_or_else(|e| e.into_inner());
     let stderr = std::io::stderr();
     let mut out = BufWriter::new(stderr.lock());
     for record in &scope.records {
