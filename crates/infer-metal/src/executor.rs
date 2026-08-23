@@ -1238,8 +1238,7 @@ impl RealMetalExecutor {
         let layer_ids = runtime.target_layer_ids();
 
         // 1. Draft block (DSpark: backbone once + Markov head refinement).
-        //    Set rope_offset to the absolute position of the first target-hidden
-        //    row so the draft's RoPE aligns with the target's positions.
+        let t_step = std::time::Instant::now();
         let t_draft = std::time::Instant::now();
         let block_tokens = {
             let draft_state = slot.dflash_draft_state.as_mut().ok_or_else(|| {
@@ -1248,8 +1247,6 @@ impl RealMetalExecutor {
                     row.slot
                 )
             })?;
-            let target_hidden_len = target_hidden.shape().first().copied().unwrap_or(0) as i32;
-            draft_state.set_rope_offset(old_cache_len as i32 - target_hidden_len);
             dflash::prepare_draft_block(
                 runtime,
                 row.last_token,
@@ -1282,8 +1279,10 @@ impl RealMetalExecutor {
 
         // 3. Acceptance: argmax(target_logits[i]) vs block_tokens[i+1], for
         //    i in 0..block_size (block_size comparisons).
+        let t_accept = std::time::Instant::now();
         let target_pred = dflash::materialize_i32_tokens(&mlx::argmax_axis(&target_logits, -1))?;
         let draft_tokens = dflash::materialize_i32_tokens(&block_tokens)?;
+        let accept_ms = t_accept.elapsed().as_secs_f64() * 1000.0;
         let mut matched = 0usize;
         for i in 0..block_size {
             if target_pred[i] == draft_tokens[i + 1] {
@@ -1306,6 +1305,7 @@ impl RealMetalExecutor {
 
         // 4. Rollback conv state: slice captured conv_input to the accepted
         //    position (2 frames), then overwrite the session conv states.
+        let t_conv = std::time::Instant::now();
         let captured_conv = model.drain_captured_conv_inputs()?;
         let h = self.config.hidden_size as i32;
         let a = accepted_inputs as i32;
@@ -1317,8 +1317,10 @@ impl RealMetalExecutor {
             })
             .collect();
         model.set_session_conv_states(&rolled_back)?;
+        let conv_ms = t_conv.elapsed().as_secs_f64() * 1000.0;
 
         // 5. Build target hidden for the next draft block.
+        let t_hidden = std::time::Instant::now();
         let captured_hidden = model.drain_captured_hidden()?;
         model.clear_capture_layers();
         let updated_target_hidden = dflash::build_target_hidden_from_captures(
@@ -1326,6 +1328,7 @@ impl RealMetalExecutor {
             layer_ids.len(),
             accepted_inputs as i32,
         )?;
+        let hidden_ms = t_hidden.elapsed().as_secs_f64() * 1000.0;
         // 6. Close session + update cache length.
         slot.drain_session(model)?;
         slot.cache_len = old_cache_len + accepted_inputs;
@@ -1333,16 +1336,21 @@ impl RealMetalExecutor {
         slot.dflash_target_hidden = Some(updated_target_hidden);
         slot.last_sampled = None;
         self.active_session_slot = None;
+        let total_ms = t_step.elapsed().as_secs_f64() * 1000.0;
         if dflash::dflash_draft_trace_enabled() {
             log::info!(
-                "Metal DSpark LFM2 trace slot={} cache_len={} matched={} accepted={}/{} draft_ms={:.2} verify_ms={:.2}",
+                "Metal DSpark LFM2 trace slot={} cache_len={} matched={} accepted={}/{} draft_ms={:.2} verify_ms={:.2} accept_ms={:.2} conv_ms={:.2} hidden_ms={:.2} total_ms={:.2}",
                 row.slot,
                 slot.cache_len,
                 matched,
                 accepted_inputs,
                 block_size,
                 draft_ms,
-                verify_ms
+                verify_ms,
+                accept_ms,
+                conv_ms,
+                hidden_ms,
+                total_ms
             );
         }
         let mut tokens = Vec::with_capacity(accepted_inputs);
