@@ -9,7 +9,7 @@ directory unless noted.
 |---|---|
 | `bench_throughput.py` | Canonical OpenAI-compatible streaming throughput runner. |
 | `bench_ab.sh` | Matched A/B benchmark driver wrapping `bench_throughput.py`. |
-| `bench_compare.py` | Compare two benchmark JSON snapshots with Δ% and threshold. |
+| `bench_compare.py` | Compare two `bench_throughput.py` v1 snapshots with Δ% and threshold. |
 | `bench_dsv4_trace_http.py` | DSv4 trace-driven HTTP benchmark. |
 | `bench_local_metal.py` | Local Metal backend benchmark. |
 | `bench_local_metal_all.sh` | Run full Metal benchmark grid. |

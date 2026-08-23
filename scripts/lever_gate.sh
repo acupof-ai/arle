@@ -195,20 +195,25 @@ if [ "$status" -ne 0 ]; then
     exit "$status"
 fi
 # Temp coherence arm: the greedy-only gate misses argmax-preserving distortions.
+# Backgrounded: it and the concurrent arm are independent HTTP clients.
+TEMP_PID=""
 if [ "${LEVER_GATE_SKIP_TEMP:-0}" != "1" ]; then
-    PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" temp || {
-        echo "[gate] temp coherence arm FAIL"
-        exit 1
-    }
+    PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" temp &
+    TEMP_PID=$!
 fi
 # Concurrent needle arm: catches cross-row state mix-up in batched decode that
 # a single-request ladder cannot see. Conservative defaults keep it fast.
 if [ "${LEVER_GATE_SKIP_CONCURRENT:-0}" != "1" ]; then
-    PORT="$PORT" python3 "$ROOT/scripts/needle_concurrent.py" \
-        "$PORT" "${CONCURRENT_CONC:-4}" "${CONCURRENT_TOKENS:-2000}" "${CONCURRENT_ROUNDS:-1}" 0 || {
+    python3 "$ROOT/scripts/needle_concurrent.py" \
+        "$PORT" "${CONCURRENT_CONC:-4}" "${CONCURRENT_TOKENS:-2000}" "${CONCURRENT_ROUNDS:-1}" \
+        "${CONCURRENT_DEPTH:-0}" || {
         echo "[gate] concurrent needle arm FAIL"
+        [ -z "$TEMP_PID" ] || kill "$TEMP_PID" 2>/dev/null
         exit 1
     }
+fi
+if [ -n "$TEMP_PID" ]; then
+    wait "$TEMP_PID" || { echo "[gate] temp coherence arm FAIL"; exit 1; }
 fi
 validate_summary "$OUT" "${BASELINE_LOG:-}"
 echo "[gate] $LABEL done -> $OUT"
