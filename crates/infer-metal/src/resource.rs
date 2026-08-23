@@ -37,6 +37,21 @@ const PAGING_SAMPLE_MILLIS: u64 = 200;
 const ACTIVE_PAGEOUT_GUARD_BYTES: usize = 64 * MIB;
 const ACTIVE_SWAPOUT_GUARD_BYTES: usize = 16 * MIB;
 
+fn available_reserve_bytes(low_impact: bool) -> usize {
+    let base = if low_impact {
+        LOW_IMPACT_AVAILABLE_RESERVE_BYTES
+    } else {
+        DEFAULT_AVAILABLE_RESERVE_BYTES
+    };
+    // CI runners and other constrained environments override the
+    // anti-swap reserve (GitHub macOS runners have 7 GiB total).
+    std::env::var("ARLE_METAL_AVAILABLE_RESERVE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(base)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MetalResourceRequest {
     pub kv_cache_dtype: MetalKvCacheDtype,
@@ -510,18 +525,7 @@ fn resolve_memory_limit(
             );
         }
         if let Some(available) = available_memory_bytes {
-            let reserve = if low_impact {
-                LOW_IMPACT_AVAILABLE_RESERVE_BYTES
-            } else {
-                DEFAULT_AVAILABLE_RESERVE_BYTES
-            };
-            // CI runners and other constrained environments override the
-            // anti-swap reserve (GitHub macOS runners have 7 GiB total).
-            let reserve = std::env::var("ARLE_METAL_AVAILABLE_RESERVE_MB")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(|mb| mb * 1024 * 1024)
-                .unwrap_or(reserve);
+            let reserve = available_reserve_bytes(low_impact);
             anyhow::ensure!(
                 available > reserve,
                 "Metal resource guard rejected startup: {system_status_line}; available memory {} GiB is <= anti-swap reserve {} GiB. \
@@ -561,11 +565,7 @@ fn resolve_memory_limit(
         candidates.push(total - reserve);
     }
     if let Some(available) = available_memory_bytes {
-        let reserve = if low_impact {
-            LOW_IMPACT_AVAILABLE_RESERVE_BYTES
-        } else {
-            DEFAULT_AVAILABLE_RESERVE_BYTES
-        };
+        let reserve = available_reserve_bytes(low_impact);
         anyhow::ensure!(
             available > reserve,
             "Metal resource guard rejected startup: {system_status_line}; available memory {} GiB is <= anti-swap reserve {} GiB. \
