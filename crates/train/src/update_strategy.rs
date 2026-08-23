@@ -426,7 +426,7 @@ impl UpdatePreset {
             Ok(())
         })();
         if let Err(e) = accumulate {
-            opt.zero_grad(store, trainable);
+            opt.zero_grad(store, trainable)?;
             return Err(e);
         }
 

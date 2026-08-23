@@ -165,7 +165,7 @@ impl Trainer {
         tape: &mut Tape,
     ) -> Result<StepStats> {
         ensure!(!samples.is_empty(), "empty batch");
-        AdamW::zero_grad(&mut self.opt, &self.params, store);
+        AdamW::zero_grad(&mut self.opt, &self.params, store)?;
 
         let plans: Vec<Option<(Vec<Block>, Vec<f32>)>> = samples
             .iter()
@@ -900,7 +900,7 @@ mod tests {
 
         let mut grads = |trainer: &mut Trainer, bpb: usize, store: &mut TensorStore| {
             trainer.cfg.blocks_per_backward = bpb;
-            AdamW::zero_grad(&mut trainer.opt, &trainer.params, store);
+            AdamW::zero_grad(&mut trainer.opt, &trainer.params, store).unwrap();
             let plan = trainer
                 .plan_sample(&s, 7)
                 .unwrap()

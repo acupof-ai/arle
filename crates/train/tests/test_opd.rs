@@ -98,10 +98,10 @@ fn kl_distill_loss_drops_over_three_steps() {
         .expect("kl loss");
         losses.push(store.to_host(loss).expect("loss value")[0]);
 
-        optimizer.zero_grad(&params, &mut store);
+        optimizer.zero_grad(&params, &mut store).unwrap();
         tape.backward(loss, &mut store).expect("backward");
-        clip_grad_norm(&params, 1.0, &mut store);
-        optimizer.step(&params, &mut store);
+        clip_grad_norm(&params, 1.0, &mut store).unwrap();
+        optimizer.step(&params, &mut store).unwrap();
 
         tape.entries.clear();
         tape.set_enabled(true);

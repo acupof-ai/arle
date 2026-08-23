@@ -551,7 +551,7 @@ mod tests {
             .and_then(|slot| slot.as_mut())
             .expect("student adapter tensor present")
             .grad = Some(grad);
-        optimizer.step(&[s_b0], &mut store);
+        optimizer.step(&[s_b0], &mut store)?;
         // sanity: the rejected step really created a moment entry.
         assert_eq!(
             optimizer.clear_param_state(&[s_b0]),
@@ -566,7 +566,7 @@ mod tests {
             .and_then(|slot| slot.as_mut())
             .expect("student adapter tensor present")
             .grad = Some(grad);
-        optimizer.step(&[s_b0], &mut store);
+        optimizer.step(&[s_b0], &mut store)?;
 
         // 3. Restore must clear those moments (absent from the snapshot).
         ema.restore(&snap, &student, &mut optimizer, &mut store)?;

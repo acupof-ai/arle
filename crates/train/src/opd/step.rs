@@ -86,7 +86,7 @@ fn windowed_gkd_step<O: Optimizer, T: TeacherForward + ?Sized>(
         format!("window_size={window_size}"),
     );
     let phase_started = Instant::now();
-    optimizer.zero_grad(store, rt.student_params);
+    optimizer.zero_grad(store, rt.student_params)?;
     record_profile(profile, |profile| {
         profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
     });
@@ -248,7 +248,7 @@ fn chunked_kl_step<O: Optimizer, T: TeacherForward + ?Sized>(
     profile: &mut Option<&mut OpdStepProfile>,
 ) -> Result<OpdStepOutcome> {
     let phase_started = Instant::now();
-    optimizer.zero_grad(store, rt.student_params);
+    optimizer.zero_grad(store, rt.student_params)?;
     record_profile(profile, |profile| {
         profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
     });
@@ -578,7 +578,7 @@ pub fn opd_step_with_teacher<O: Optimizer, T: TeacherForward + ?Sized>(
         });
 
         let phase_started = Instant::now();
-        optimizer.zero_grad(store, student_params);
+        optimizer.zero_grad(store, student_params)?;
         record_profile(&mut profile, |profile| {
             profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
         });

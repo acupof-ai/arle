@@ -585,7 +585,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     // non-writeback OPD paths; the agentic-OPD writeback steps the optimizer here
     // directly, so surface the global L2 norm at this step too (env-gated).
     if std::env::var("ARLE_OPD_LOG_GRAD_NORM").is_ok() {
-        let gn = crate::grad_clip::compute_global_norm_f64(trainable_params, store);
+        let gn = crate::grad_clip::compute_global_norm_f64(trainable_params, store)?;
         eprintln!("[writeback-grad] grad_norm={gn:.6e}");
     }
     // Per-param grad norms, post-all-reduce: a global norm cannot say WHICH
@@ -598,7 +598,7 @@ pub fn masked_writeback_step<O: Optimizer>(
             .map(|(name, id)| (id, name))
             .collect();
         for &param in trainable_params {
-            let norm = crate::grad_clip::compute_global_norm_f64(&[param], store);
+            let norm = crate::grad_clip::compute_global_norm_f64(&[param], store)?;
             let name = names.get(&param).copied().unwrap_or("<unnamed>");
             eprintln!("[param-grad] {name} id={param} norm={norm:.9e}");
         }
