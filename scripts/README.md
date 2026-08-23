@@ -59,7 +59,10 @@ directory unless noted.
 | Script | Purpose |
 |---|---|
 | `needle_gate.py` | Needle-in-haystack retrieval correctness gate. |
-| `lever_gate.sh` | Multi-step reasoning gate; validates complete summaries and caps candidate misses at the baseline miss count. |
+| `needle_concurrent.py` | Concurrent needle gate: N in-flight requests, distinct needle per row (catches cross-row state mix-up). |
+| `needle_summary.py` | Shared parser for `needle_gate.py` SUMMARY lines. |
+| `lever_gate.sh` | Model/backend-neutral correctness gate: boots serve, runs needle ladder + temp + concurrent arms, validates against baseline envelope. |
+| `sampling_gate.py` | End-to-end sampling-parameter gate (penalties, logit_bias, liveness). |
 | `longctx_numerical_gate.py` | Long-context numerical quality gate. |
 | `kv_recall_quality_eval.py` | KV-recall (importance-based block recall) quality evaluation (Metal). |
 | `dsv4_batched_decode_validate.py` | DSv4 batched decode correctness. |
