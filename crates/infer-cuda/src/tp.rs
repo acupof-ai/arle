@@ -664,7 +664,9 @@ impl TpRuntime {
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::{CollectiveBackend, DType};
 
-                ctx.comm_waits_for_compute()?;
+                // Compute stream: the gather feeds the next kernel directly, so
+                // comm-stream overlap buys nothing, and a single stream keeps the
+                // collective inside a decode-graph capture.
                 // SAFETY: this fn's contract — `sendbuf` holds `sendcount` bf16 and
                 // `recvbuf` `sendcount * world`, both live on `ctx`'s device.
                 unsafe {
@@ -673,10 +675,9 @@ impl TpRuntime {
                         recvbuf,
                         sendcount,
                         DType::BF16,
-                        ctx.comm_stream.cu_stream().cast::<std::ffi::c_void>(),
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
                     )?;
                 }
-                ctx.compute_waits_for_comm()?;
                 Ok(())
             }
         }
