@@ -786,10 +786,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "HF_ID_OR_PATH")]
     pub(crate) draft_model: Option<String>,
 
-    /// Metal speculative draft depth (NextN/MTP tokens proposed per verify
-    /// block). Default 2 is the measured optimum on Qwen3.6-27B (~18.1 tok/s).
-    #[arg(long, default_value_t = 2, value_parser = parse_speculative_tokens, value_name = "N")]
-    pub(crate) speculative_tokens: usize,
+    /// Metal speculative draft depth (NextN/MTP/DSpark tokens proposed per
+    /// verify block). Unset = model-specific default (2 for Qwen3.6, 4 for
+    /// DSpark on Metal).
+    #[arg(long, value_parser = parse_speculative_tokens, value_name = "N")]
+    pub(crate) speculative_tokens: Option<usize>,
 
     /// Disable Metal speculative decode, including the Qwen3.6-27B default-on
     /// auto-enable. Forces plain single-token decode.
@@ -915,10 +916,7 @@ impl ServeArgs {
             host_sampling: self.metal_host_sampling,
             speculative: !self.no_speculative,
             draft_model: self.draft_model.clone(),
-            speculative_tokens: self
-                .draft_model
-                .is_some()
-                .then_some(self.speculative_tokens),
+            speculative_tokens: self.speculative_tokens,
             spec_accept_topk: i32::try_from(self.spec_accept_topk).unwrap_or(i32::MAX),
         }
     }
