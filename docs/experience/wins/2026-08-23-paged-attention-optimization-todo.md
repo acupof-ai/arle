@@ -61,15 +61,25 @@ Manual load cost: ~128 LDS.U8/lane/tile for A + ~64 for B = 192 load instruction
 
 **Verdict**: Do not pursue on H20. Revisit on sm_100 hardware.
 
-### 5. Marlin GEMV M-split occupancy — PLANNED (separate kernel)
+### 5. ~~Marlin GEMV M-split occupancy~~ — DONE (small win, M-split not worth it)
 
-- [ ] M-split grid (n_tiles × m_tiles) in marlin_fp4_gemm
-- [ ] Target: 4-8 blocks/SM (from 1-4)
-- [ ] Expected: ~2× kernel → +26% decode on NVFP4/27B
-- [ ] Baseline: 1.29 TB/s (32% of 4 TB/s), 1-4 blocks/SM, warp active 12-22%
-- [ ] Kernel correctness verified (20/20 tests pass)
+- [x] Tiebreaker fix: prefer higher bps for NVFP4 decode (m_block_size_8, num_bits==4)
+- [x] Target: 4-8 blocks/SM (from 1-4) — achieved 5 blocks/SM (from 4)
+- [x] Expected: ~2× kernel → +26% decode — **actual: +2-6% kernel, not 2×**
+- [x] Baseline: 1.29 TB/s (32% of 4 TB/s), 1-4 blocks/SM, warp active 12-22%
+- [x] Kernel correctness verified (20/20 tests pass)
+- **Result**: gate_up +1.9-2.5%, down +4.0-5.7% at M=1. ncu: occupancy 20.6%→24.5%,
+  bandwidth 37.5%→38.4%. Kernel is compute-bound ("Compute is more heavily utilized
+  than Memory"), not occupancy-limited. The 2026-08-19 errors entry confirmed:
+  issue utilization barely moves with occupancy. M-split grid (n_tiles × m_tiles)
+  is not worth pursuing — the dependent-chain latency (dequant→scale→MMA) is the
+  bottleneck, not warp supply.
+- **fp8 regression**: first iteration applied to all quant types; fp8 per-channel
+  down regressed -7% (N=5120, only 40 tiles → 90% idle blocks at bps=5). Fixed by
+  gating to num_bits==4 only. See [wins entry](2026-08-23-marlin-nvfp4-decode-bps-tiebreaker.md).
 
 ## Progress Log
 
 - 2026-08-23: ncu baseline. Three approaches ruled out (o_acc→smem, launch bounds, K+V parallel). Kernel is instruction-issue bound. fp8 tensor core Q·Kᵀ is the correct direction.
 - 2026-08-23: fp8 MMA blocked on sm_90 — ldmatrix.b8 is sm_100 only. Manual fragment load cost offsets dequant savings. Direction viable only on Blackwell. Next: Marlin GEMV M-split (item 5).
+- 2026-08-23: Marlin bps tiebreaker shipped (0777aa346). +2-6% at M=1, not the expected 2×. Kernel is compute-bound, not occupancy-limited. M-split grid direction ruled out.
