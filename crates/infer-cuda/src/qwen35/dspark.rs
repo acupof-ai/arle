@@ -682,8 +682,43 @@ pub(crate) fn load_dspark_head(
             }
         }
     }
-    let (cos_cache, sin_cache) =
-        crate::ops::precompute_rope(ctx, cfg.head_dim, rope_cap, cfg.rope_theta, None)?;
+    // The drafter's own scaling, not the trunk's: they are separate
+    // checkpoints and a `yarn` drafter read as vanilla puts every draft at the
+    // wrong position, which the verify step then rejects.
+    //
+    // The two enums mirror each other across crates (qwen35-spec says so at its
+    // definition); convert here rather than make one crate depend on the other
+    // for a three-variant map.
+    let scaling = cfg.rope_scaling.as_ref().map(|s| match *s {
+        qwen35_spec::RopeScalingConfig::Yarn {
+            factor,
+            original_max_position_embeddings,
+            beta_fast,
+            beta_slow,
+            attention_factor,
+            mscale,
+        } => qwen3_spec::RopeScalingConfig::Yarn {
+            factor,
+            original_max_position_embeddings,
+            beta_fast,
+            beta_slow,
+            attention_factor,
+            mscale,
+        },
+        qwen35_spec::RopeScalingConfig::Linear { factor } => {
+            qwen3_spec::RopeScalingConfig::Linear { factor }
+        }
+        qwen35_spec::RopeScalingConfig::NtkAware { factor } => {
+            qwen3_spec::RopeScalingConfig::NtkAware { factor }
+        }
+    });
+    let (cos_cache, sin_cache) = crate::ops::precompute_rope(
+        ctx,
+        cfg.head_dim,
+        rope_cap,
+        cfg.rope_theta,
+        scaling.as_ref(),
+    )?;
     Ok(Qwen35DsparkHead {
         sps,
         cfg,
