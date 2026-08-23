@@ -365,6 +365,7 @@ pub fn score_workdir(
     apply_test_patch(workdir, test_patch)?;
     let (output, code, killed) = run_fail_to_pass(workdir, fail_to_pass, pythonpath, timeout_secs)?;
     let log_tail = format_bash_output(&output, &[], code, killed);
+    tests_actually_ran(code, killed, fail_to_pass, &log_tail)?;
 
     // Fall back to binary (exit-0 → 1.0) when killed or summary unparseable,
     // so a timed-out/crashed run never mints spurious credit.
@@ -412,6 +413,7 @@ pub fn control_arm_check(
     )?;
     apply_test_patch(&arm, test_patch)?;
     let (output, code, killed) = run_fail_to_pass(&arm, fail_to_pass, pythonpath, timeout_secs)?;
+    tests_actually_ran(code, killed, fail_to_pass, &format_bash_output(&output, &[], code, killed))?;
     let passed = match parse_pytest_counts(&String::from_utf8_lossy(&output)) {
         Some((passed, _)) if !killed => passed,
         _ => {
@@ -433,6 +435,30 @@ pub fn control_arm_check(
         );
     }
     Ok(())
+}
+
+/// pytest exits 0 (all passed) or 1 (tests failed) when it actually ran the
+/// tests; 2-5 mean it never got that far — interrupted, internal error, usage
+/// error, nothing collected. Scoring a non-run as a pass-fraction turns one
+/// missing dependency into a corpus-wide model failure (errors/2026-08-23).
+fn tests_actually_ran(
+    code: Option<i32>,
+    killed: bool,
+    fail_to_pass: &[String],
+    log_tail: &str,
+) -> Result<()> {
+    if killed {
+        return Ok(());
+    }
+    match code {
+        Some(0) | Some(1) => Ok(()),
+        other => bail!(
+            "pytest did not run the tests (exit {}): {} fail_to_pass test(s) never produced a \
+             verdict — environment fault, not a model failure. {log_tail}",
+            other.map_or_else(|| "signal".to_owned(), |c| c.to_string()),
+            fail_to_pass.len()
+        ),
+    }
 }
 
 fn apply_test_patch(workdir: &Path, test_patch: &str) -> Result<()> {
