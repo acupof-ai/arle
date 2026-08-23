@@ -68,9 +68,16 @@ fp8 10 %, NCCL all-reduce 6.5 %, paged attention 4.5 %.
 
 Roofline: the quantized projections are ~20 B params × ~0.63 B/param (4-bit +
 group scales) ≈ 12.7 GB, ~6.4 GB/rank at TP2, read once per step. 6.4 GB /
-8.6 ms ≈ 740 GB/s — 18 % of the H20's 4 TB/s HBM peak. The bf16 lm_head GEMM
-in the same trace runs at ~80 % of peak, so the gap is the Marlin path, not
-the hardware. A 2× Marlin GEMV is worth ~+26 % decode throughput.
+8.6 ms ≈ 740 GB/s — but this is a **whole-step e2e** number that includes
+non-Marlin traffic (BF16 lm_head 2.54 GB/step, FP8 DeepGEMM projections,
+attention, norms, sampling). ncu on the 4-layer slice (2026-08-23) measured the
+Marlin kernel itself at **1.29 TB/s (32% of the 4 TB/s HBM3 peak)**. The gap to
+peak is occupancy: at M=32 the N-tiled grid launches only 1-4 blocks/SM
+(8-16 warps/SM, warp active 12-22%), insufficient memory-level parallelism to
+saturate HBM. The 4-blocks/SM config already hits 1.48 TB/s vs 1.14 TB/s at
+1 block/SM — a direct signal that more blocks/SM buys BW. The fix is an M-split
+GEMV grid (n_tiles × m_tiles) targeting 4-8 blocks/SM. A 2× Marlin GEMV is
+worth ~+26 % decode throughput.
 
 ## Follow-up: kernel A/B harness (2026-08-23)
 
@@ -90,5 +97,8 @@ attribution. `bench_throughput.py --ignore-warmup-gate` skips the warmup
 correctness gate (a 4-layer model generates garbage by design).
 
 Caveat: the NVFP4 baseline has a confirmed correctness bug on tool-rendered
-prompts (`docs/experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md`) —
-Marlin optimization on this quant is secondary to that.
+prompts (`docs/experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md`).
+The static weight chain is verified clean (repack bit-exact, zero flushes on
+all 263 tensors, sfb correct, checkpoint weights cosine 0.985 vs FP8) — the
+bug is narrowed to the Marlin fp4 kernel's runtime output. Marlin optimization
+on this quant is secondary to that.

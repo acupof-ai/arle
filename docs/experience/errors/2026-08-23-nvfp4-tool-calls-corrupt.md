@@ -59,6 +59,15 @@ result and is not one.
   `lm_head` are BF16 in the checkpoint; `repack_for_marlin_fp4` only touches
   `WeightFormat::Fp4E2M1Group`. (Falsified by the `qwen3-nvfp4-support`
   session.)
+- Not the static weight chain at all. A 4-agent workflow (2026-08-23) verified
+  on the actual checkpoint: repack layout bit-exact (full-chain nibbles ==
+  checkpoint nibbles on gate_proj, q_proj, MTP gate_proj), scale encoding
+  bit-exact roundtrip with **zero flushes on all 263 NVFP4 tensors**
+  (0/5,570,560 on gate_proj), sfb algebra correct, global fold correct. The
+  repack is lossless on this checkpoint.
+- Not the checkpoint weights. NVFP4 vs FP8 dequantized weights: cosine 0.985,
+  max abs diff 0.18 on a ±0.43 range (layer 0 gate_proj). Normal 4-bit vs 8-bit
+  quantization error, not corruption.
 
 ## A trap worth naming
 
@@ -70,15 +79,27 @@ before calling an output damaged.
 
 ## Cause
 
-Unknown. What is left after the exclusions above is the token sequence the chat
-template produces when it renders tool definitions — and FP8 handles that same
-sequence correctly, so it takes the rendered prompt AND the NVFP4 weights
-together.
+Unknown. The static weight chain is verified clean (repack, scales, sfb, global
+fold — all bit-exact on the actual checkpoint). The checkpoint weights are a
+reasonable 4-bit quantization (cosine 0.985 vs FP8). The kernel's algebra is
+correct on paper (2^-126 × 128 × 2^119 = 2^0, global applied once).
+
+What remains untested: the Marlin fp4 kernel's **runtime output** on real
+weights at the model's actual shapes. The existing tests
+(`test_cuda_marlin_fp4_share.rs`) compare two GPU code paths against each other
+at 128×128 / 256×512 with synthetic weights — never against a CPU ground truth
+at 17408×5120 / 34816×5120. A correctness probe
+(`crates/infer-cuda/examples/marlin_fp4_correctness.rs`) is built to close this
+gap: it runs `marlin_fp4_gemm` at the model's shapes with realistic E2M1/E4M3
+distributions and compares against a CPU reference.
 
 No single variable separates the passing prompts from the failing ones. The
-layout math itself is bit-exact against `marlin_fp4_gemm` on synthetic weights
-that do flush (`test_cuda_marlin_fp4_share.rs`), so if the repack is implicated
-it is about which weights it damages, not the index math.
+corruption is content-dependent (tools field, 51-token prose) but the weight
+chain is content-independent — weights are loaded/repacked once and process
+every token identically. This narrows the suspect to either a kernel runtime
+bug that manifests on certain weight patterns, or something in the engine's
+forward path that is shared with FP8 but interacts differently with the NVFP4
+weight distribution.
 
 Handed to the `qwen3-nvfp4-support` session.
 
@@ -86,8 +107,9 @@ Handed to the `qwen3-nvfp4-support` session.
 
 The NVFP4-vs-FP8 rubric-opd loss gap recorded on 2026-08-22 (0.3363 against
 0.6414 on matched greedy rollouts) was attributed to the Marlin repack's
-flush-to-zero being lossy but correct. That attribution is no longer safe while
-the NVFP4 path is known to damage generation. It needs re-examining.
+flush-to-zero being lossy but correct. That attribution is **dead**: the repack
+is lossless on this checkpoint (zero flushes, bit-exact scale roundtrip on all
+263 tensors). The gap needs a new explanation or a rerun.
 
 ## Rule
 
