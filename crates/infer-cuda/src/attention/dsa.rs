@@ -991,10 +991,15 @@ impl Dsv4LayerAttentionState {
         total_len: usize,
     ) {
         self.advance_decode_len(mode, ratio, total_len);
-        if mode != DeepSeekV4AttentionMode::SlidingWindow
-            && let Some(flash) = &mut self.flashmla
-        {
-            flash.fp8_kv_comp_packed_rows = total_len / ratio.max(1);
+        if mode != DeepSeekV4AttentionMode::SlidingWindow {
+            let rows = total_len / ratio.max(1);
+            if let Some(flash) = &mut self.flashmla {
+                flash.fp8_kv_comp_packed_rows = rows;
+            }
+            // The captured device-gated pack wrote the row the step completed.
+            if let Some(dsa) = &mut self.dsa_official {
+                dsa.packed_rows = rows;
+            }
         }
     }
 

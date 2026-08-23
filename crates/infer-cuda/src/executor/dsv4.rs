@@ -287,6 +287,11 @@ impl Dsv4CudaExecutor {
         if let Err(e) = capture_result {
             log::warn!("DSv4 c=1 decode graph failed, falling back to eager: {e}");
             self.decode_graphs[slot_idx] = None;
+            // Captured work was recorded, not executed: roll the host counters
+            // the closure advanced back to the step's start so eager redoes it.
+            if slot.seq_len > start_pos {
+                slot.truncate(&model.layers, kv_adapter, start_pos)?;
+            }
             return Ok(None);
         }
 
@@ -298,6 +303,12 @@ impl Dsv4CudaExecutor {
         } else {
             model.graph_stream_clone()?
         };
+        // The replayed body already advanced the device state; mirror it on
+        // the host before the eager tail so an LM-head error cannot leave the
+        // two disagreeing.
+        if was_replay {
+            slot.advance_after_replay(&model.layers);
+        }
         // LM head + sampling (outside the graph).
         let mut keepalive = crate::dsv4::Dsv4ForwardKeepalive::new(false);
         let token = model.forward_stream_last_token(
@@ -310,10 +321,6 @@ impl Dsv4CudaExecutor {
             &mut keepalive,
         )?;
         drop(keepalive);
-
-        if was_replay {
-            slot.advance_after_replay(&model.layers);
-        }
 
         Ok(Some(vec![token]))
     }

@@ -7104,7 +7104,47 @@ fn csa_select_official(
     );
 
     let newly_packed = indexer_rows_after.saturating_sub(official.packed_rows);
-    if newly_packed > 0 {
+    // Decode-graph lane: the host `newly_packed` branch would bake one step's
+    // decision into the capture, so pack from `start_pos_device` on device —
+    // at most one row per decode step, gated by the compression boundary.
+    // Requires the full-retention ring (window base 0) and packed_rows already
+    // caught up to the prior step, which the eager warm-up guarantees.
+    if let Some(start_pos_device) = pos
+        .device
+        .filter(|_| q_i.seq_len == 1 && keys_window_base == 0)
+        && newly_packed <= 1
+        && official.packed_rows + newly_packed == indexer_rows_after
+    {
+        let cache_range = pool.dsa_slot_range(official.slot_idx)?;
+        let cache_pool = pool
+            .dsa_key_cache
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 official DSA shared key-cache missing"))?;
+        ensure!(
+            cache_range.end <= cache_pool.len() && cache_range.len() == official.key_cache_len,
+            "DSv4 official DSA shared key-cache range {:?} invalid pool_len={} slot_len={}",
+            cache_range,
+            cache_pool.len(),
+            official.key_cache_len
+        );
+        let mut cache_view = cache_pool.slice_mut(cache_range);
+        let (keys_ptr, _kg) = keys.data.device_ptr(&ctx.stream);
+        let (rot_ptr, _rg) = official.rotated_keys.device_ptr_mut(&ctx.stream);
+        let (cache_ptr_u8, _cg) = cache_view.device_ptr_mut(&ctx.stream);
+        let (locs_ptr, _lg) = shared.cache_locs.device_ptr(&ctx.stream);
+        let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+        flash_kv::dsv4_dsa_pack_index_row_start_pos_raw(
+            &ctx.stream,
+            keys_ptr,
+            rot_ptr,
+            cache_ptr_u8,
+            locs_ptr,
+            start_ptr,
+            i32::try_from(ratio)?,
+            64,
+        )?;
+        official.packed_rows = indexer_rows_after;
+    } else if newly_packed > 0 {
         ensure!(
             official.packed_rows <= indexer_rows_before,
             "DSv4 official DSA packed rows {} ahead of indexer rows before {}",
