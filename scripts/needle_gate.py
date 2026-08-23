@@ -6,6 +6,10 @@ Usage: python3 needle_gate.py [lengths_csv] [runs] [depth]
   runs         same-config repeats per length (default 3)
   depth        needle depth 0.0=start .. 1.0=end (default 0.0)
 
+  --check      exit 0/1: PASS if every length has >= --min-exact exact hits,
+               FAIL otherwise. Standalone gate without a baseline log.
+  --min-exact  minimum exact hits per length for --check (default 1).
+
 Routing (the gate is model-neutral via the checkpoint Jinja chat template, #66):
   default      /v1/chat/completions — correct for any model, no per-model shim
   RAW=1        raw /v1/completions (+ TEMPLATE=qwen3_nonthink for Qwen3.x
@@ -19,6 +23,16 @@ Prints one line per run with the raw decoded completion, then a per-length
 summary line: exact/partial/miss counts + deterministic? (all runs identical).
 """
 import os, sys, json, urllib.request, time
+
+CHECK = "--check" in sys.argv
+MIN_EXACT = 1
+if CHECK:
+    sys.argv.remove("--check")
+    for i, a in enumerate(sys.argv):
+        if a == "--min-exact" and i + 1 < len(sys.argv):
+            MIN_EXACT = int(sys.argv[i + 1])
+            sys.argv[i : i + 2] = []
+            break
 
 BASE = "http://127.0.0.1:" + os.environ.get("PORT", "18189")
 NEEDLE = "738291"
@@ -146,6 +160,7 @@ def classify(out):
     return "miss"
 
 
+exact_per_length = {}
 for target in lengths:
     prompt = build_prompt(target, depth)
     outs = []
@@ -161,8 +176,18 @@ for target in lengths:
               % (target, depth, r, pt, classify(out), dt, KV_DTYPE, out))
     ok = [o for o in outs if o is not None]
     cls = [classify(o) for o in ok]
+    n_exact = cls.count("exact")
+    exact_per_length[target] = n_exact
     det = "DET" if len(set(ok)) <= 1 and len(ok) == runs else "NONDET"
     print("SUMMARY len=%d depth=%.2f exact=%d partial=%d miss=%d %s kv=%s"
-          % (target, depth, cls.count("exact"), cls.count("partial"),
+          % (target, depth, n_exact, cls.count("partial"),
              cls.count("miss"), det, KV_DTYPE))
     sys.stdout.flush()
+
+if CHECK:
+    bad = [t for t in lengths if exact_per_length.get(t, 0) < MIN_EXACT]
+    if bad:
+        print("CHECK FAIL: lengths %s have < %d exact hits" % (bad, MIN_EXACT))
+        sys.exit(1)
+    print("CHECK PASS: all %d lengths have >= %d exact hits" % (len(lengths), MIN_EXACT))
+    sys.exit(0)
