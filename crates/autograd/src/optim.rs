@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::adamw_state::AdamWState;
 use crate::backend::{Backend, DeviceHandle};
 use crate::tensor::Dirty;
-use crate::{Result, TensorId, tensor::TensorStore};
+use crate::{AutogradError, Result, TensorId, tensor::TensorStore};
 
 /// Per-parameter moment storage. The device path keeps `m`/`v` resident on
 /// the backend across steps so the update stays in the MLX lazy graph and
@@ -90,17 +90,18 @@ impl AdamW {
         }
     }
 
-    pub fn step(&mut self, params: &[TensorId], store: &mut TensorStore) {
+    pub fn step(&mut self, params: &[TensorId], store: &mut TensorStore) -> Result<()> {
         self.step += 1;
         let (beta1, beta2) = self.betas;
         let bc1 = 1.0 - beta1.powi(self.step);
         let bc2 = 1.0 - beta2.powi(self.step);
 
         if self.backend.is_some() {
-            self.step_device(params, store, beta1, beta2, bc1, bc2);
+            self.step_device(params, store, beta1, beta2, bc1, bc2)?;
         } else {
-            self.step_host(params, store, beta1, beta2, bc1, bc2);
+            self.step_host(params, store, beta1, beta2, bc1, bc2)?;
         }
+        Ok(())
     }
 
     fn step_host(
@@ -111,11 +112,11 @@ impl AdamW {
         beta2: f32,
         bc1: f32,
         bc2: f32,
-    ) {
+    ) -> Result<()> {
         for &param_id in params {
             let (grad_id, param_len, param_shape) = {
                 let Some(param_snapshot) = store.get(param_id) else {
-                    panic!("adamw parameter {param_id} does not exist");
+                    return Err(AutogradError::InvalidTensorId(param_id));
                 };
                 let Some(grad_id) = param_snapshot.grad else {
                     continue;
@@ -127,9 +128,7 @@ impl AdamW {
                 )
             };
 
-            let grad = store
-                .to_host(grad_id)
-                .expect("gradient tensor should be readable from the store");
+            let grad = store.to_host(grad_id)?;
             let moments = self.state.entry(param_id).or_insert_with(|| ParamMoments {
                 m: MomentStorage::Host(vec![0.0; param_len]),
                 v: MomentStorage::Host(vec![0.0; param_len]),
@@ -137,20 +136,24 @@ impl AdamW {
             });
             let (m, v) = match (&mut moments.m, &mut moments.v) {
                 (MomentStorage::Host(m), MomentStorage::Host(v)) => (m, v),
-                _ => panic!(
-                    "host AdamW path encountered device-resident moments for param {param_id}; \
-                     use `new_with_device` on the optimizer or drop the device moments first"
-                ),
+                _ => {
+                    return Err(AutogradError::TapeInvariant(
+                        "host AdamW path encountered device-resident moments; \
+                         use `new_with_device` or drop the device moments first",
+                    ));
+                }
             };
             let param = store
                 .get_mut(param_id)
-                .expect("parameter tensor should still exist when stepping");
+                .ok_or(AutogradError::InvalidTensorId(param_id))?;
 
-            assert_eq!(
-                grad.len(),
-                param.data.len(),
-                "AdamW grad length must match parameter length for param {param_id}"
-            );
+            if grad.len() != param.data.len() {
+                return Err(AutogradError::GradientShapeMismatch {
+                    tensor_id: param_id,
+                    expected: vec![param.data.len()],
+                    got: vec![grad.len()],
+                });
+            }
             if self.wd > 0.0 {
                 let decay = 1.0 - (self.lr * self.wd);
                 for value in &mut param.data {
@@ -176,6 +179,7 @@ impl AdamW {
                 *param_value -= step_size * m_next / denom;
             }
         }
+        Ok(())
     }
 
     fn step_device(
@@ -186,7 +190,7 @@ impl AdamW {
         beta2: f32,
         bc1: f32,
         bc2: f32,
-    ) {
+    ) -> Result<()> {
         let backend = self
             .backend
             .as_ref()
@@ -202,7 +206,7 @@ impl AdamW {
         for &param_id in params {
             let (grad_id, param_shape) = {
                 let Some(param_snapshot) = store.get(param_id) else {
-                    panic!("adamw parameter {param_id} does not exist");
+                    return Err(AutogradError::InvalidTensorId(param_id));
                 };
                 let Some(grad_id) = param_snapshot.grad else {
                     continue;
@@ -215,9 +219,7 @@ impl AdamW {
             // measured a +1.8% wash (3423 extra DtoH calls, 41.5 GB/step).
             // The host fallback stays for grads still produced on host.
             let grad_device_handle = {
-                let grad_tensor = store
-                    .tensor(grad_id)
-                    .expect("gradient tensor should exist in the store");
+                let grad_tensor = store.tensor(grad_id)?;
                 if grad_tensor.dirty != Dirty::Host {
                     grad_tensor.device_handle.clone()
                 } else {
@@ -227,41 +229,32 @@ impl AdamW {
 
             // Clone the handle so the backend call borrows it without
             // holding `store` hostage.
-            store
-                .ensure_device(param_id)
-                .expect("ensure_device for adamw param");
+            store.ensure_device(param_id)?;
             let param_handle = store
                 .tensors
                 .get(param_id)
                 .and_then(|slot| slot.as_ref())
                 .and_then(|t| t.device_handle.clone())
-                .expect("param device_handle after ensure_device");
+                .ok_or(AutogradError::TapeInvariant(
+                    "param missing device_handle after ensure_device",
+                ))?;
 
-            let entry = self.state.entry(param_id).or_insert_with(|| ParamMoments {
-                m: MomentStorage::Device(
-                    backend
-                        .zeros(&param_shape)
-                        .expect("allocate zero m on first adamw step"),
-                ),
-                v: MomentStorage::Device(
-                    backend
-                        .zeros(&param_shape)
-                        .expect("allocate zero v on first adamw step"),
-                ),
-                shape: param_shape.clone(),
-            });
+            let entry = match self.state.entry(param_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(ParamMoments {
+                    m: MomentStorage::Device(backend.zeros(&param_shape)?),
+                    v: MomentStorage::Device(backend.zeros(&param_shape)?),
+                    shape: param_shape.clone(),
+                }),
+            };
 
             // A prior host path may have left host moments; migrate them.
             if let MomentStorage::Host(host_m) = &entry.m {
-                let handle = backend
-                    .upload(host_m, &entry.shape)
-                    .expect("upload host m to device");
+                let handle = backend.upload(host_m, &entry.shape)?;
                 entry.m = MomentStorage::Device(handle);
             }
             if let MomentStorage::Host(host_v) = &entry.v {
-                let handle = backend
-                    .upload(host_v, &entry.shape)
-                    .expect("upload host v to device");
+                let handle = backend.upload(host_v, &entry.shape)?;
                 entry.v = MomentStorage::Device(handle);
             }
 
@@ -271,43 +264,37 @@ impl AdamW {
             };
 
             let (new_param, new_m, new_v) = if let Some(grad_h) = grad_device_handle {
-                backend
-                    .adamw_step_device(
-                        &param_handle,
-                        &m_handle,
-                        &v_handle,
-                        &grad_h,
-                        &entry.shape,
-                        self.lr,
-                        beta1,
-                        beta2,
-                        self.eps,
-                        self.wd,
-                        bc1,
-                        bc2,
-                    )
-                    .expect("backend adamw_step_device")
+                backend.adamw_step_device(
+                    &param_handle,
+                    &m_handle,
+                    &v_handle,
+                    &grad_h,
+                    &entry.shape,
+                    self.lr,
+                    beta1,
+                    beta2,
+                    self.eps,
+                    self.wd,
+                    bc1,
+                    bc2,
+                )?
             } else {
                 // Host fallback: grad still authoritative on host.
-                let grad = store
-                    .to_host(grad_id)
-                    .expect("gradient tensor should be readable from the store");
-                backend
-                    .adamw_step(
-                        &param_handle,
-                        &m_handle,
-                        &v_handle,
-                        &grad,
-                        &entry.shape,
-                        self.lr,
-                        beta1,
-                        beta2,
-                        self.eps,
-                        self.wd,
-                        bc1,
-                        bc2,
-                    )
-                    .expect("backend adamw_step")
+                let grad = store.to_host(grad_id)?;
+                backend.adamw_step(
+                    &param_handle,
+                    &m_handle,
+                    &v_handle,
+                    &grad,
+                    &entry.shape,
+                    self.lr,
+                    beta1,
+                    beta2,
+                    self.eps,
+                    self.wd,
+                    bc1,
+                    bc2,
+                )?
             };
 
             pending_eval.push(new_param.clone());
@@ -316,9 +303,7 @@ impl AdamW {
 
             // Install the new param handle WITHOUT going through `get_mut`
             // (which would ensure_host → mark Dirty::Host → force re-upload).
-            store
-                .replace_device_handle(param_id, new_param)
-                .expect("replace_device_handle for adamw param");
+            store.replace_device_handle(param_id, new_param)?;
 
             entry.m = MomentStorage::Device(new_m);
             entry.v = MomentStorage::Device(new_v);
@@ -330,33 +315,20 @@ impl AdamW {
         // default `Backend::eval` is a no-op.
         if !pending_eval.is_empty() {
             let refs: Vec<&DeviceHandle> = pending_eval.iter().collect();
-            backend.eval(&refs).expect("batched adamw terminal eval");
+            backend.eval(&refs)?;
         }
+        Ok(())
     }
 
-    pub fn zero_grad(&mut self, params: &[TensorId], store: &mut TensorStore) {
-        if self.backend.is_some() {
-            for &param_id in params {
-                let grad_id = store.get(param_id).and_then(|tensor| tensor.grad);
-                if let Some(grad_id) = grad_id {
-                    store
-                        .set_grad(param_id, None)
-                        .expect("clear device-backed grad id");
-                    store.free(grad_id).expect("free device-backed grad tensor");
-                }
-            }
-            return;
-        }
-
+    pub fn zero_grad(&mut self, params: &[TensorId], store: &mut TensorStore) -> Result<()> {
         for &param_id in params {
             let grad_id = store.get(param_id).and_then(|tensor| tensor.grad);
             if let Some(grad_id) = grad_id {
-                store
-                    .set_grad(param_id, None)
-                    .expect("clear host-backed grad id");
-                store.free(grad_id).expect("free host-backed grad tensor");
+                store.set_grad(param_id, None)?;
+                store.free(grad_id)?;
             }
         }
+        Ok(())
     }
 
     /// Drop the optimizer moments for the given parameter ids, returning how
@@ -507,12 +479,11 @@ impl Clone for AdamW {
 ///
 /// Argument order: the trait takes `store` before `params` (context-first);
 /// the concrete `AdamW::step` keeps `(params, store)` for source compat
-/// with the training binaries, and the impl swaps them. Trait `step`
-/// always returns `Ok(())` — the concrete method panics on invariant
-/// violations unreachable from shipped call sites.
+/// with the training binaries, and the impl swaps them. Both propagate the
+/// store/backend error the underlying op produced.
 pub trait Optimizer: Send {
     fn step(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()>;
-    fn zero_grad(&mut self, store: &mut TensorStore, params: &[TensorId]);
+    fn zero_grad(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()>;
     fn set_lr(&mut self, lr: f32);
     fn lr(&self) -> f32;
 
@@ -534,12 +505,11 @@ pub trait Optimizer: Send {
 
 impl Optimizer for AdamW {
     fn step(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()> {
-        AdamW::step(self, params, store);
-        Ok(())
+        AdamW::step(self, params, store)
     }
 
-    fn zero_grad(&mut self, store: &mut TensorStore, params: &[TensorId]) {
-        AdamW::zero_grad(self, params, store);
+    fn zero_grad(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()> {
+        AdamW::zero_grad(self, params, store)
     }
 
     fn set_lr(&mut self, lr: f32) {

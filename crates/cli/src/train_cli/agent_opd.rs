@@ -133,7 +133,7 @@ fn synthetic_writeback_fd_probe<O: autograd::Optimizer>(
             store,
         )?
         .0;
-        optimizer.zero_grad(store, all_params);
+        optimizer.zero_grad(store, all_params)?;
     }
     let handle = store.backend().upload(&base, &shape)?;
     store.replace_device_handle(param, handle)?;

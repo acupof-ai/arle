@@ -16,7 +16,10 @@ pub enum FiniteStepError {
 /// Pre-clip global L2 norm across every param's gradient.
 ///
 /// Missing grads are skipped (matches `clip_grad_norm`'s traversal).
-pub fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 {
+pub fn compute_global_norm_f64(
+    params: &[TensorId],
+    store: &TensorStore,
+) -> Result<f64, AutogradError> {
     let mut total_sq_norm = 0.0_f64;
     for &param_id in params {
         let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
@@ -32,10 +35,7 @@ pub fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 
         if grad.dirty != Dirty::Host
             && let Some(handle) = grad.device_handle.as_ref()
         {
-            total_sq_norm += store
-                .backend()
-                .sum_squares(handle, &grad.shape)
-                .expect("device grad norm should be computable");
+            total_sq_norm += store.backend().sum_squares(handle, &grad.shape)?;
         } else {
             total_sq_norm += grad
                 .data
@@ -47,7 +47,7 @@ pub fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 
                 .sum::<f64>();
         }
     }
-    total_sq_norm.sqrt()
+    Ok(total_sq_norm.sqrt())
 }
 
 pub fn ensure_finite_loss<O: Optimizer>(
@@ -59,7 +59,7 @@ pub fn ensure_finite_loss<O: Optimizer>(
     if loss.is_finite() {
         return Ok(());
     }
-    optimizer.zero_grad(store, params);
+    optimizer.zero_grad(store, params)?;
     Err(FiniteStepError::NonFiniteLoss(loss))
 }
 
@@ -74,7 +74,7 @@ pub fn finite_optimizer_step<O: Optimizer>(
 ) -> Result<f64, FiniteStepError> {
     ensure_finite_loss(loss, params, optimizer, store)?;
 
-    let global_norm = compute_global_norm_f64(params, store);
+    let global_norm = compute_global_norm_f64(params, store)?;
     if !global_norm.is_finite() {
         // Localize which params carry the non-finite grads before they are
         // cleared; index+shape identifies the layer (tensors carry no names).
@@ -99,25 +99,29 @@ pub fn finite_optimizer_step<O: Optimizer>(
                 );
             }
         }
-        optimizer.zero_grad(store, params);
+        optimizer.zero_grad(store, params)?;
         return Err(FiniteStepError::NonFiniteGradNorm(global_norm));
     }
 
-    clip_grad_norm(params, max_norm, store);
+    clip_grad_norm(params, max_norm, store)?;
     if let Err(error) = optimizer.step(store, params) {
-        optimizer.zero_grad(store, params);
+        optimizer.zero_grad(store, params)?;
         return Err(FiniteStepError::Optimizer(error));
     }
-    optimizer.zero_grad(store, params);
+    optimizer.zero_grad(store, params)?;
     Ok(global_norm)
 }
 
-pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStore) {
+pub fn clip_grad_norm(
+    params: &[TensorId],
+    max_norm: f32,
+    store: &mut TensorStore,
+) -> Result<(), AutogradError> {
     // Non-positive / non-finite max_norm is treated as disabling gradient
     // clipping. NaN/inf used to silently propagate into the scale factor
     // and poison every gradient (codex review ef24ca6 P2).
     if !(max_norm > 0.0 && max_norm.is_finite()) {
-        return;
+        return Ok(());
     }
 
     // Diagnostic (opt-in, env-gated to avoid per-step stderr spam): surface the
@@ -126,20 +130,20 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
     // re-introduce an LR cut via clipping instead of AdamW eps. The prod clip
     // path otherwise discards this norm, leaving the question unobservable.
     if std::env::var("ARLE_OPD_LOG_GRAD_NORM").is_ok() {
-        let pre_clip_norm = compute_global_norm_f64(params, store);
+        let pre_clip_norm = compute_global_norm_f64(params, store)?;
         eprintln!(
             "[grad-clip] pre_clip_norm={pre_clip_norm:.6e} max_norm={max_norm:.3e} clipped={}",
             pre_clip_norm > f64::from(max_norm)
         );
     }
 
-    if try_clip_grad_norm_device(params, max_norm, store) {
-        return;
+    if try_clip_grad_norm_device(params, max_norm, store)? {
+        return Ok(());
     }
 
-    let total_norm = compute_global_norm_f64(params, store);
+    let total_norm = compute_global_norm_f64(params, store)?;
     if total_norm <= f64::from(max_norm) || total_norm == 0.0 {
-        return;
+        return Ok(());
     }
 
     let scale = f64::from(max_norm) / total_norm;
@@ -160,13 +164,8 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
             }
         };
         if let Some((handle, shape)) = device_grad {
-            let scaled = store
-                .backend()
-                .mul_scalar(&handle, scale as f32, &shape)
-                .expect("device grad scale should be computable");
-            store
-                .replace_device_handle(grad_id, scaled)
-                .expect("scaled device grad should be installable");
+            let scaled = store.backend().mul_scalar(&handle, scale as f32, &shape)?;
+            store.replace_device_handle(grad_id, scaled)?;
             continue;
         }
         let Some(grad) = store.get_mut(grad_id) else {
@@ -176,11 +175,16 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
             *value *= scale as f32;
         }
     }
+    Ok(())
 }
 
-fn try_clip_grad_norm_device(params: &[TensorId], max_norm: f32, store: &mut TensorStore) -> bool {
+fn try_clip_grad_norm_device(
+    params: &[TensorId],
+    max_norm: f32,
+    store: &mut TensorStore,
+) -> Result<bool, AutogradError> {
     if store.backend().device() == Device::Cpu {
-        return false;
+        return Ok(false);
     }
 
     let mut grad_ids = Vec::new();
@@ -195,41 +199,38 @@ fn try_clip_grad_norm_device(params: &[TensorId], max_norm: f32, store: &mut Ten
             continue;
         };
         if grad.dirty == Dirty::Host {
-            return false;
+            return Ok(false);
         }
         let Some(handle) = grad.device_handle.as_ref() else {
-            return false;
+            return Ok(false);
         };
         grad_ids.push(grad_id);
         device_grads.push((handle.clone(), grad.shape.clone()));
     }
 
     if !saw_grad || device_grads.is_empty() {
-        return true;
+        return Ok(true);
     }
 
     let result = store
         .backend()
-        .clip_grad_norm_device(&device_grads, max_norm)
-        .expect("device grad clip should be computable");
+        .clip_grad_norm_device(&device_grads, max_norm)?;
     let Some(result) = result else {
-        return false;
+        return Ok(false);
     };
     let _pre_clip_norm = result.pre_clip_norm;
     let Some(clipped_grads) = result.clipped_grads else {
-        return true;
+        return Ok(true);
     };
-    assert_eq!(
-        clipped_grads.len(),
-        grad_ids.len(),
-        "device grad clip returned mismatched gradient handle count"
-    );
-    for (grad_id, handle) in grad_ids.into_iter().zip(clipped_grads) {
-        store
-            .replace_device_handle(grad_id, handle)
-            .expect("clipped device grad should be installable");
+    if clipped_grads.len() != grad_ids.len() {
+        return Err(AutogradError::TapeInvariant(
+            "device grad clip returned mismatched gradient handle count",
+        ));
     }
-    true
+    for (grad_id, handle) in grad_ids.into_iter().zip(clipped_grads) {
+        store.replace_device_handle(grad_id, handle)?;
+    }
+    Ok(true)
 }
 
 /// Sum a per-rank integer count across the collective group (DP global-target

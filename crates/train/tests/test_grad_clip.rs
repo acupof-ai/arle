@@ -97,7 +97,7 @@ fn global_norm_rescales_cuda_device_grads() {
         store.ensure_device(grad_id).expect("grad upload");
     }
 
-    clip_grad_norm(&params, 1.0, &mut store);
+    clip_grad_norm(&params, 1.0, &mut store).unwrap();
 
     let mut clipped = Vec::new();
     for &param in &params {
@@ -130,7 +130,7 @@ fn global_norm_large_finite_grads_do_not_overflow_to_zero() {
         .accumulate_grad(param, grad)
         .expect("accumulate large grad");
 
-    clip_grad_norm(&[param], 1.0e20, &mut store);
+    clip_grad_norm(&[param], 1.0e20, &mut store).unwrap();
 
     let grad_id = store.get(param).and_then(|tensor| tensor.grad).unwrap();
     let clipped = store.get(grad_id).expect("clipped grad");
@@ -163,7 +163,7 @@ fn global_norm_above_f32_max_still_scales_to_finite_grads() {
         .accumulate_grad(param, grad)
         .expect("accumulate max grad");
 
-    clip_grad_norm(&[param], 1.0e38, &mut store);
+    clip_grad_norm(&[param], 1.0e38, &mut store).unwrap();
 
     let grad_id = store.get(param).and_then(|tensor| tensor.grad).unwrap();
     let clipped = store.get(grad_id).expect("clipped grad");
@@ -236,7 +236,7 @@ fn non_finite_max_norm_is_noop() {
     for max_norm in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0_f32] {
         let (mut store, params) = setup_two_params_with_grads();
         let before = snapshot_grads(&params, &store);
-        clip_grad_norm(&params, max_norm, &mut store);
+        clip_grad_norm(&params, max_norm, &mut store).unwrap();
         let after = snapshot_grads(&params, &store);
         assert_eq!(
             before, after,
@@ -271,14 +271,14 @@ fn cpu_backend_device_resident_grad_is_counted_and_clipped() {
     store.accumulate_grad(param, grad).expect("accumulate");
 
     let params = [param];
-    let norm = train::grad_clip::compute_global_norm_f64(&params, &store);
+    let norm = train::grad_clip::compute_global_norm_f64(&params, &store).unwrap();
     assert!(
         (norm - 2.0).abs() < 1.0e-6,
         "device-resident grad on the CPU backend must count toward the norm, got {norm}"
     );
 
-    clip_grad_norm(&params, 1.0, &mut store);
-    let clipped = train::grad_clip::compute_global_norm_f64(&params, &store);
+    clip_grad_norm(&params, 1.0, &mut store).unwrap();
+    let clipped = train::grad_clip::compute_global_norm_f64(&params, &store).unwrap();
     assert!(
         (clipped - 1.0).abs() < 1.0e-6,
         "clipping must scale a device-resident grad, norm stayed {clipped}"

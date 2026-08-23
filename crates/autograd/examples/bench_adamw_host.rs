@@ -74,11 +74,11 @@ fn main() {
     let (mut store, param_ids) = build_store(params, len);
     let mut optim = AdamW::new(lr, (0.9, 0.999), 1.0e-8, wd);
 
-    optim.step(&param_ids, &mut store);
+    optim.step(&param_ids, &mut store).unwrap();
 
     let t0 = Instant::now();
     for _ in 0..iters {
-        optim.step(&param_ids, &mut store);
+        optim.step(&param_ids, &mut store).unwrap();
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let total_elements = params * len * iters;

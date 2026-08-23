@@ -210,7 +210,7 @@ fn profiled_opd_step<O: Optimizer>(
     let loss_value = timed(&mut totals, "loss_readback", || Ok(store.to_host(loss)?[0]))?;
 
     timed(&mut totals, "optimizer_zero_grad", || {
-        optimizer.zero_grad(store, student_params);
+        optimizer.zero_grad(store, student_params)?;
         Ok(())
     })?;
     let backward_profile = timed(&mut totals, "backward", || {
@@ -218,7 +218,7 @@ fn profiled_opd_step<O: Optimizer>(
         Ok(profile)
     })?;
     timed(&mut totals, "grad_clip", || {
-        clip_grad_norm(student_params, cfg.grad_clip, store);
+        clip_grad_norm(student_params, cfg.grad_clip, store)?;
         Ok(())
     })?;
     timed(&mut totals, "optimizer_step", || {

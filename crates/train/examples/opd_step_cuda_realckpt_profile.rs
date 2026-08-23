@@ -506,7 +506,7 @@ mod app {
         let loss_value = timed(&mut totals, "loss_readback", || Ok(store.to_host(loss)?[0]))?;
 
         timed(&mut totals, "optimizer_zero_grad", || {
-            optimizer.zero_grad(store, student_trainable_params);
+            optimizer.zero_grad(store, student_trainable_params)?;
             Ok(())
         })?;
         let backward_profile = timed(&mut totals, "backward", || {
@@ -514,7 +514,7 @@ mod app {
             Ok(profile)
         })?;
         timed(&mut totals, "grad_clip", || {
-            clip_grad_norm(student_trainable_params, cfg.grad_clip, store);
+            clip_grad_norm(student_trainable_params, cfg.grad_clip, store)?;
             Ok(())
         })?;
         timed(&mut totals, "optimizer_step", || {
