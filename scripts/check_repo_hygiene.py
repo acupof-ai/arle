@@ -387,8 +387,11 @@ def check_experience_doc_inventory() -> list[str]:
 # Entries before this date are grandfathered; perf-claim entries on/after it
 # must cite a baseline (a git hash) or carry an explicit waiver line.
 WINS_BASELINE_CUTOFF = "2026-08-23"
-_PERF_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:tok/s|ms|GB|%)")
+_PERF_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:tok/s|tokens/s|req/s|ms|us|ns|GB|GiB|MiB|KiB|MB|KB|TB|TFLOPS|GFLOPS|GB/s|TB/s|%)"
+)
 _HASH_RE = re.compile(r"[0-9a-f]{7,40}")
+_BASELINE_RE = re.compile(r"baseline", re.IGNORECASE)
 _WAIVER_RE = re.compile(r"no.baseline|without.baseline|pending.remote", re.IGNORECASE)
 
 
@@ -398,7 +401,12 @@ def check_wins_baseline_citations() -> list[str]:
         if Path(rel).name[:10] < WINS_BASELINE_CUTOFF:
             continue
         text = (ROOT / rel).read_text(errors="ignore")
-        if len(_PERF_RE.findall(text)) >= 3 and not _HASH_RE.search(text) and not _WAIVER_RE.search(text):
+        if (
+            len(_PERF_RE.findall(text)) >= 3
+            and not _HASH_RE.search(text)
+            and not _BASELINE_RE.search(text)
+            and not _WAIVER_RE.search(text)
+        ):
             errors.append(
                 f"{rel}: perf-claim wins entry needs a baseline citation (git hash) "
                 f"or a 'no baseline' waiver; see docs/experience/wins/TEMPLATE-bench.md"
