@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- Note that the DSpark drafter RoPE fix (`7130f0b8b`) corrected a real dropped-config defect but did not move draft acceptance (13% before and after); the Qwen3.8 acceptance collapse is unexplained, see `docs/experience/errors/2026-08-23-dspark-rope-fix-was-not-the-cause.md`.
 - Record the agent-OPD baseline for `Qwen3.8-27B-FP8` on the localized swe-smith corpus — 4/10 solved, 0.617 mean partial credit, every task control-validated; see `docs/experience/wins/2026-08-23-agent-opd-qwen38-baseline.md`.
 - Accept-or-reject: DSv4 c=1 decode graph lands correct but below the eager arm (ITL p50 30.2 vs 24.5 ms, p99 156 vs 42 ms; MMLU 166/199 vs 171/200) — shipped opt-in `ARLE_DSV4_DECODE_GRAPH=1`, default stays eager; six replay defects fixed on the way, 1296 alloc nodes remain the next wall. See `docs/experience/wins/2026-08-23-dsv4-c1-decode-graph.md`.
 - Record that NVFP4 serving corrupts tool-call generation while FP8 on the same request is clean, which is what took every agent-OPD rollout to `edited=false`; cause unknown, see `docs/experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md`.
