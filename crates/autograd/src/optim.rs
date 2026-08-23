@@ -422,15 +422,17 @@ impl AdamW {
         self.step = step;
     }
 
-    pub(crate) fn set_state(&mut self, id: TensorId, m: Vec<f32>, v: Vec<f32>, shape: Vec<usize>) {
+    pub(crate) fn set_state(
+        &mut self,
+        id: TensorId,
+        m: Vec<f32>,
+        v: Vec<f32>,
+        shape: Vec<usize>,
+    ) -> Result<()> {
         debug_assert_eq!(m.len(), v.len(), "m and v must share length");
         let (m_store, v_store) = if let Some(backend) = self.backend.as_ref() {
-            let m_handle = backend
-                .upload(&m, &shape)
-                .expect("upload m on import to device");
-            let v_handle = backend
-                .upload(&v, &shape)
-                .expect("upload v on import to device");
+            let m_handle = backend.upload(&m, &shape)?;
+            let v_handle = backend.upload(&v, &shape)?;
             (
                 MomentStorage::Device(m_handle),
                 MomentStorage::Device(v_handle),
@@ -446,6 +448,7 @@ impl AdamW {
                 shape,
             },
         );
+        Ok(())
     }
 }
 

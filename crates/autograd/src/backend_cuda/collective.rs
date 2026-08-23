@@ -420,7 +420,9 @@ pub(super) fn cuda_all_to_all_device(
                 if j == rank {
                     send[rank].clone()
                 } else {
-                    DeviceHandle::Cuda(CudaStorage::new(recv[j].take().unwrap()))
+                    DeviceHandle::Cuda(CudaStorage::new(
+                        recv[j].take().expect("recv buffer allocated above"),
+                    ))
                 }
             })
             .collect();

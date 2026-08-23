@@ -161,7 +161,7 @@ fn log_linear_attention_backward_profile(profile: &LinearAttentionBackwardProfil
     let aggregate = {
         let mut aggregate = LINEAR_ATTENTION_BACKWARD_PROFILE_TOTALS
             .lock()
-            .expect("linear attention backward profile mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         aggregate.merge(profile);
         aggregate.clone()
     };

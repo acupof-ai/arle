@@ -473,16 +473,19 @@ fn write_synth_tokenizer(
         })
         .unwrap_or(0);
     let unk_token = synth_token_for_id(unk_id, cfg, unk_id);
-    let vocab = (0..cfg.vocab_size)
+    let vocab: std::collections::HashMap<String, u32> = (0..cfg.vocab_size)
         .map(|id| {
-            (
-                synth_token_for_id(id, cfg, unk_id),
-                u32::try_from(id).expect("vocab id fits in u32"),
-            )
+            let token_id = u32::try_from(id).map_err(|_| {
+                Qwen35CheckpointError::Custom(format!(
+                    "synth tokenizer vocab id {id} exceeds u32::MAX (vocab_size={})",
+                    cfg.vocab_size
+                ))
+            })?;
+            Ok::<_, Qwen35CheckpointError>((synth_token_for_id(id, cfg, unk_id), token_id))
         })
-        .collect();
+        .collect::<std::result::Result<_, _>>()?;
     let model = WordLevel::builder()
-        .vocab(vocab)
+        .vocab(vocab.into_iter().collect())
         .unk_token(unk_token)
         .build()
         .map_err(|err| Qwen35CheckpointError::Custom(format!("build synth tokenizer: {err}")))?;
