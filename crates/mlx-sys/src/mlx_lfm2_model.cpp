@@ -145,6 +145,10 @@ struct Lfm2MoeFFN {
     bool norm_topk_prob = true;
     int expert_bits = 4;
     int expert_group_size = 64;
+    // Dense BF16 expert weights (optional — when non-empty, bypasses quantized path).
+    array dense_gate_w = array(0);  // [E, I, H]
+    array dense_up_w = array(0);    // [E, I, H]
+    array dense_down_w = array(0);  // [E, H, I]
 };
 
 struct Lfm2Layer {
@@ -164,6 +168,14 @@ array lfm2_moe_block_forward_cpp(
     const array& expert_up_w,   const array& expert_up_s,   const array& expert_up_b,
     const array& expert_down_w, const array& expert_down_s, const array& expert_down_b,
     int32_t expert_group_size, int32_t expert_bits,
+    int32_t num_experts, int32_t top_k, bool norm_topk_prob);
+array lfm2_moe_block_forward_dense_cpp(
+    const array& x,
+    const array& router_w,
+    const array& expert_bias,
+    const array& expert_gate_w,
+    const array& expert_up_w,
+    const array& expert_down_w,
     int32_t num_experts, int32_t top_k, bool norm_topk_prob);
 
 struct Lfm2CompiledModel {
@@ -357,14 +369,22 @@ struct Lfm2CompiledModel {
             auto xn2 = fast::rms_norm(x, ffn_norm_w, rms_eps);
             if (layer.has_moe) {
                 auto& moe = layer.moe;
-                x = residual2 + lfm2_moe_block_forward_cpp(
-                    xn2,
-                    moe.router_w, moe.expert_bias,
-                    moe.switch_gate.w, moe.switch_gate.scales, moe.switch_gate.biases,
-                    moe.switch_up.w, moe.switch_up.scales, moe.switch_up.biases,
-                    moe.switch_down.w, moe.switch_down.scales, moe.switch_down.biases,
-                    moe.expert_group_size, moe.expert_bits,
-                    moe.num_experts, moe.top_k, moe.norm_topk_prob);
+                if (moe.dense_gate_w.ndim() > 0) {
+                    x = residual2 + lfm2_moe_block_forward_dense_cpp(
+                        xn2,
+                        moe.router_w, moe.expert_bias,
+                        moe.dense_gate_w, moe.dense_up_w, moe.dense_down_w,
+                        moe.num_experts, moe.top_k, moe.norm_topk_prob);
+                } else {
+                    x = residual2 + lfm2_moe_block_forward_cpp(
+                        xn2,
+                        moe.router_w, moe.expert_bias,
+                        moe.switch_gate.w, moe.switch_gate.scales, moe.switch_gate.biases,
+                        moe.switch_up.w, moe.switch_up.scales, moe.switch_up.biases,
+                        moe.switch_down.w, moe.switch_down.scales, moe.switch_down.biases,
+                        moe.expert_group_size, moe.expert_bits,
+                        moe.num_experts, moe.top_k, moe.norm_topk_prob);
+                }
             } else if (layer.is_conv) {
                 x = residual2 + dense_mlp(xn2, layer.conv.gate_up, layer.conv.down,
                                           layer.conv.gate_dim);
@@ -554,6 +574,29 @@ void lfm2_compiled_set_last_moe(
         layer.moe.switch_down = lfm2_weight_by_id(m, switch_down_id);
         layer.moe.expert_group_size = expert_group_size;
         layer.moe.expert_bits = expert_bits;
+        layer.moe.num_experts = num_experts;
+        layer.moe.top_k = top_k;
+        layer.moe.norm_topk_prob = norm_topk_prob;
+    });
+}
+
+void lfm2_compiled_set_last_moe_dense(
+    void* model,
+    mlx_array* router_w, mlx_array* expert_bias,
+    mlx_array* gate_w, mlx_array* up_w, mlx_array* down_w,
+    int32_t num_experts, int32_t top_k, bool norm_topk_prob) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Lfm2CompiledModel*>(model);
+        if (m->layers.empty()) {
+            throw std::runtime_error("lfm2_compiled_set_last_moe_dense requires an existing layer");
+        }
+        auto& layer = m->layers.back();
+        layer.has_moe = true;
+        layer.moe.router_w = *to_arr(router_w);
+        layer.moe.expert_bias = *to_arr(expert_bias);
+        layer.moe.dense_gate_w = *to_arr(gate_w);
+        layer.moe.dense_up_w = *to_arr(up_w);
+        layer.moe.dense_down_w = *to_arr(down_w);
         layer.moe.num_experts = num_experts;
         layer.moe.top_k = top_k;
         layer.moe.norm_topk_prob = norm_topk_prob;
