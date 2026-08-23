@@ -35,7 +35,6 @@ directory unless noted.
 | `convert_dspark_speculators.py` | Convert DSpark speculator checkpoints. |
 | `gguf_to_safetensors.py` | Convert GGUF to safetensors format. |
 | `merge_w4_hybrid_checkpoint.py` | Merge hybrid W4A16/W4A8 checkpoint shards. |
-| `marlin_repack.py` | GPTQ int32 → Marlin tile layout repack. |
 | `setup_qwen3_yarn_config.py` | Set up YaRN RoPE config for Qwen models. |
 
 ## Quantization
@@ -86,7 +85,6 @@ directory unless noted.
 | `score_rubric_eval.py` | Rubric-based evaluation scoring. |
 | `analyze_multi_seed.py` | Multi-seed eval analysis with mean±σ and Wilson CI. |
 | `probe_report.py` | Probe logit-lens report generator. |
-| `reduce_operator_evidence.py` | FP8 operator evidence reduction analysis. |
 
 ## OPD Training
 

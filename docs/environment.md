@@ -529,12 +529,12 @@ Defaults to `$HOME/.cache/huggingface`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GATE_PROFILE` | `dsv4` | Gate profile: `dsv4` (8×H20 TP=8), `metal` (local Metal), `generic` (single GPU) |
+| `GATE_PROFILE` | `dsv4` | `dsv4` (8×H20 TP=8), `metal` (local Metal), `generic` (single GPU) |
 | `MODEL` | profile-dependent | Model path or HF repo ID |
 | `LENGTHS` | `115,300,446,2000,8000` | Needle ladder lengths (comma-separated) |
 | `RUNS` | `3` | Repeats per length |
 | `BASELINE_LOG` | _(unset)_ | Baseline needle log for envelope comparison |
-| `LEVER_GATE_ALLOW_NO_BASELINE` | `0` | Allow seeding a first baseline (passes `--check` to needle_gate.py) |
+| `LEVER_GATE_ALLOW_NO_BASELINE` | `0` | Seed a first baseline without one |
 | `LEVER_GATE_REQUIRE_EXACT` | `0` | Require exact=RUNS at every length |
 | `LEVER_GATE_SKIP_TEMP` | `0` | Skip the temp coherence arm |
 | `LEVER_GATE_SKIP_CONCURRENT` | `0` | Skip the concurrent needle arm |
@@ -542,7 +542,7 @@ Defaults to `$HOME/.cache/huggingface`.
 | `CONCURRENT_TOKENS` | `2000` | Concurrent arm: prompt tokens per request |
 | `CONCURRENT_ROUNDS` | `1` | Concurrent arm: rounds |
 | `CONCURRENT_DEPTH` | `0` | Concurrent arm: needle depth % (set 50 under `--kv-recall`) |
-| `ARLE_PRE_PUSH_METAL` | `0` | Set `1` to run the Metal needle gate in the pre-push hook |
+| `ARLE_PRE_PUSH_METAL` | `0` | Run the Metal needle gate in the pre-push hook |
 
 ---
 
