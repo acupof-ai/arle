@@ -203,6 +203,14 @@ impl std::fmt::Debug for Qwen35CudaExecutor {
     }
 }
 
+/// Log the first decode-graph gate miss. A miss is silent by design (the eager
+/// lane is the correctness floor), which makes "armed but never captured"
+/// indistinguishable from "captured fine" in a log.
+fn graph_gate_miss(reason: impl FnOnce() -> String) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| info!("[qwen35-decode-graph] gate miss: {}", reason()));
+}
+
 impl Qwen35CudaExecutor {
     /// `|_| false`: demote/promote is a no-op for Qwen35, so demoted pages are never
     /// restorable.
@@ -2030,7 +2038,8 @@ impl Qwen35CudaExecutor {
                     "[qwen35-decode-graph] {label}slot {slot}: workspace addresses changed; \
                      dropping stale capture and recapturing"
                 );
-                graphs[slot] = crate::graph::CudaGraphState::new(model.ctx.stream.clone()).allow_alloc_nodes();
+                graphs[slot] =
+                    crate::graph::CudaGraphState::new(model.ctx.stream.clone()).allow_alloc_nodes();
                 baked[slot] = Some(bake);
             }
             None => baked[slot] = Some(bake),
@@ -2104,9 +2113,25 @@ impl Qwen35CudaExecutor {
             _ => false,
         };
         if !self.decode_graph_armed || !capturable {
+            graph_gate_miss(|| {
+                format!(
+                    "armed={} capturable={} kv_format={:?} fa3_active={}",
+                    self.decode_graph_armed,
+                    capturable,
+                    self.full_attn_kv.as_ref().map(|p| p.format),
+                    self.model.paged_decode_fa3_active(),
+                )
+            });
             return Ok(None);
         }
         if row.kv_seq_len + 1 > self.model.max_seq_len() {
+            graph_gate_miss(|| {
+                format!(
+                    "kv_seq_len {} + 1 > max_seq_len {}",
+                    row.kv_seq_len,
+                    self.model.max_seq_len()
+                )
+            });
             return Ok(None);
         }
         let slot = row.slot;
@@ -2448,7 +2473,8 @@ impl Qwen35CudaExecutor {
             // mem.
             if let Some(dg) = self.decode_graph.as_mut() {
                 dg.graphs[row.slot] =
-                    crate::graph::CudaGraphState::new(self.model.ctx.stream.clone()).allow_alloc_nodes();
+                    crate::graph::CudaGraphState::new(self.model.ctx.stream.clone())
+                        .allow_alloc_nodes();
                 dg.baked[row.slot] = None;
             }
             // Free the prior occupant's pages so a fresh prefill starts at logical
