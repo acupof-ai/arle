@@ -115,6 +115,7 @@ def main() -> int:
 
     out = Path(args.out)
     opening: float | None = None
+    last_failed = 0
     while True:
         row = sample(args.port)
         if row is None:
@@ -131,8 +132,15 @@ def main() -> int:
                     f"against {opening:.1f} at the run's start",
                     flush=True,
                 )
-            if row["failed"]:
-                print(f"ALERT {row['failed']} requests failed", flush=True)
+            # `failed` is cumulative: alerting on it repeats one old failure
+            # every interval and trains the reader to ignore the channel.
+            if row["failed"] > last_failed:
+                print(
+                    f"ALERT {row['failed'] - last_failed} new request failure(s) "
+                    f"({row['failed']} total)",
+                    flush=True,
+                )
+                last_failed = row["failed"]
         time.sleep(args.interval)
 
 
