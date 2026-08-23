@@ -717,11 +717,9 @@ impl Dsv4CudaExecutor {
     }
 }
 
-/// Matched-A/B control arm: `ARLE_DSV4_DECODE_GRAPH=0` runs the eager path.
+/// Opt-in while the c=1 graph is below the eager arm (2026-08-23: ITL p50
+/// 30.2 vs 24.5 ms, MMLU 6/200 one-sided misses); `ARLE_DSV4_DECODE_GRAPH=1`.
 fn dsv4_decode_graph_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        crate::runtime_flags::qwen35_decode_graph()
-            && std::env::var_os("ARLE_DSV4_DECODE_GRAPH").is_none_or(|v| v != "0")
-    })
+    *ON.get_or_init(|| std::env::var_os("ARLE_DSV4_DECODE_GRAPH").is_some_and(|v| v == "1"))
 }
