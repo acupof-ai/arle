@@ -785,7 +785,7 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     );
                 }
                 let clip_frac = report.stats.clip_frac();
-                if !report.stats.ratio_max.is_finite() || !clip_frac.is_finite() || clip_frac == 1.0
+                if !report.stats.ratio_max.is_finite() || !clip_frac.is_finite() || clip_frac >= 1.0
                 {
                     bail!(
                         "agent-opd round {round} preset {preset_name}: degenerate policy/rollout \
