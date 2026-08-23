@@ -115,14 +115,40 @@ struct Lfm2Weight {
             x, w, scales, bias_if_affine(biases, mode), true, group_size, bits,
             quant_mode_str(mode));
     }
+
+    // Sub-weight for output dimensions [start, end).  Slice is on the weight
+    // (a compile-time constant), so it folds away under mlx::core::compile —
+    // this is what lets the compiled verify forward avoid split/slice on
+    // intermediate activations (which shapeless compile cannot infer).
+    Lfm2Weight sub_weight(int start, int end) const {
+        Lfm2Weight sub;
+        sub.is_dense = is_dense;
+        sub.group_size = group_size;
+        sub.bits = bits;
+        sub.mode = mode;
+        if (is_dense) {
+            sub.w = slice(w, {0, start}, {w.shape(0), end});
+        } else {
+            sub.w = slice(w, {start, 0}, {end, w.shape(1)});
+            sub.scales = slice(scales, {start, 0}, {end, scales.shape(1)});
+            if (biases.ndim() > 0) {
+                sub.biases = slice(biases, {start, 0}, {end, biases.shape(1)});
+            }
+        }
+        return sub;
+    }
 };
 
 struct Lfm2ConvLayer {
     array op_norm_w = array(0), ffn_norm_w = array(0);
     Lfm2Weight in_proj;   // H -> 3H
+    // Pre-split projections (constant-folded at setup time, avoiding
+    // slice/split on dynamic-shape intermediates in the compiled verify path).
+    Lfm2Weight b_proj, c_proj, x_proj;
     array conv_w = array(0);  // [H, kernel, 1]
     Lfm2Weight out_proj;  // H -> H
     Lfm2Weight gate_up;   // dense FFN (merged gate+up), empty for MoE layers
+    Lfm2Weight gate_proj, up_proj;  // pre-split for compiled verify
     Lfm2Weight down;
     int gate_dim = 0;
 };
@@ -132,6 +158,7 @@ struct Lfm2AttnLayer {
     Lfm2Weight q_proj, k_proj, v_proj, o_proj;
     array q_norm_w = array(0), k_norm_w = array(0);  // [head_dim]
     Lfm2Weight gate_up;
+    Lfm2Weight gate_proj, up_proj;  // pre-split for compiled verify
     Lfm2Weight down;
     int gate_dim = 0;
 };
@@ -149,6 +176,10 @@ struct Lfm2MoeFFN {
     array dense_gate_w = array(0);  // [E, I, H]
     array dense_up_w = array(0);    // [E, I, H]
     array dense_down_w = array(0);  // [E, H, I]
+    // Lazily-compiled MoE forward (shapeless=false, fixed verify-block shape).
+    // Cuts ~23 eager kernel launches per MoE layer × 22 layers.
+    // mutable: lazily initialized in const forward_impl.
+    mutable std::function<std::vector<array>(const std::vector<array>&)> compiled_moe;
 };
 
 struct Lfm2Layer {
@@ -205,11 +236,17 @@ struct Lfm2CompiledModel {
     int current_cache_pos = 0;
     int current_seq_len = 1;
     int current_batch_size = 1;
+
+    // Lazily-compiled verify forward (shapeless=true, dynamic KV cache length).
+    mutable std::function<std::vector<array>(const std::vector<array>&)> compiled_verify;
     bool current_last_logits_only = false;
     bool current_has_paged_prefix = false;
     std::vector<array> current_paged_k;
     std::vector<array> current_paged_v;
     std::vector<array> prev_outputs;
+
+    // Compiled verify forward (shapeless; shapes are fixed for spec decode).
+    std::function<std::vector<array>(const std::vector<array>&)> compiled_verify_forward;
 
     // DSpark speculative-decode capture. When non-empty, forward_impl captures
     // the residual stream after each listed layer and (for conv layers) the
@@ -223,8 +260,9 @@ struct Lfm2CompiledModel {
         return on;
     }
 
-    array dense_mlp(const array& x, const Lfm2Weight& gate_up, const Lfm2Weight& down,
-                    int gate_dim) const {
+    array dense_mlp(const array& x, const Lfm2Weight& gate_up,
+                    const Lfm2Weight& gate, const Lfm2Weight& up,
+                    const Lfm2Weight& down, int gate_dim) const {
         if (mlp_compile() && x.ndim() == 3 && x.shape(1) == 1 && !gate_up.is_dense
             && !down.is_dense && gate_up.group_size == down.group_size
             && gate_up.bits == down.bits && gate_up.mode == down.mode) {
@@ -233,9 +271,9 @@ struct Lfm2CompiledModel {
                 {x, gate_up.w, gate_up.scales, gate_up.biases,
                  down.w, down.scales, down.biases})[0];
         }
-        auto gu = gate_up.apply(x);
-        auto parts = split(gu, Shape{gate_dim}, -1);
-        auto h = compiled_swiglu()({parts[0], parts[1]})[0];
+        // Pre-split gate/up projections (setup-time sub_weight) — avoids
+        // slice/split on the activation which shapeless compile can't infer.
+        auto h = compiled_swiglu()({gate.apply(x), up.apply(x)})[0];
         return down.apply(h);
     }
 
@@ -248,10 +286,13 @@ struct Lfm2CompiledModel {
         int S = current_seq_len;
         int H = hidden_size;
 
-        auto z = lw.in_proj.apply(x);  // [B, S, 3H]
-        auto parts = split(z, Shape{H, 2 * H}, -1);
+        // Pre-split projections (computed at setup time, avoiding slice on
+        // dynamic-shape intermediates in the compiled verify path).
+        auto gate_b = lw.b_proj.apply(x);
+        auto gate_c = lw.c_proj.apply(x);
+        auto conv_in = lw.x_proj.apply(x);
         // in_proj output order is B|C|x: input gate, output gate, conv input.
-        auto h = parts[0] * parts[2];
+        auto h = gate_b * conv_in;
 
         int n_keep = conv_kernel - 1;
         auto conv_input = concatenate({conv_state_in, h}, 1);  // [B, S+n_keep, H]
@@ -263,13 +304,14 @@ struct Lfm2CompiledModel {
             conv_input, {0, S, 0}, {B, S + n_keep, H}));
         auto conv_out = conv1d(conv_input, lw.conv_w, 1, 0, 1, H);  // [B, S, H]
 
-        auto y = parts[1] * conv_out;
+        auto y = gate_c * conv_out;
         return lw.out_proj.apply(y);
     }
 
     array full_attn_step(
         const array& x, const Lfm2AttnLayer& lw,
         const array& k_cache, const array& v_cache,
+        const array& cache_pos,
         int full_layer_idx,
         array& new_k_cache, array& new_v_cache) const {
         int B = current_batch_size;
@@ -285,14 +327,16 @@ struct Lfm2CompiledModel {
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
 
-        q = fast::rope(q, hd, false, rope_theta, 1.0f, current_cache_pos);
-        k = fast::rope(k, hd, false, rope_theta, 1.0f, current_cache_pos);
+        q = fast::rope(q, hd, false, rope_theta, 1.0f, cache_pos);
+        k = fast::rope(k, hd, false, rope_theta, 1.0f, cache_pos);
 
         auto v = transpose(reshape(lw.v_proj.apply(x), {B, S, nkv, hd}), {0, 2, 1, 3});
 
-        int end = current_cache_pos + S;
-        new_k_cache = slice_update(k_cache, k, {0, 0, current_cache_pos, 0}, {B, nkv, end, hd});
-        new_v_cache = slice_update(v_cache, v, {0, 0, current_cache_pos, 0}, {B, nkv, end, hd});
+        // Grow KV cache via concatenate (cache is pre-trimmed to cache_pos by
+        // the caller). This avoids slice_update whose Shape indices would bake
+        // cache_pos as a stale constant under shapeless compile.
+        new_k_cache = concatenate({k_cache, k}, 2);
+        new_v_cache = concatenate({v_cache, v}, 2);
 
         array k_full(0), v_full(0);
         if (current_has_paged_prefix) {
@@ -306,8 +350,9 @@ struct Lfm2CompiledModel {
             k_full = concatenate(std::vector<array>{current_paged_k[full_layer_idx], k}, 2);
             v_full = concatenate(std::vector<array>{current_paged_v[full_layer_idx], v}, 2);
         } else {
-            k_full = slice(new_k_cache, {0, 0, 0, 0}, {B, nkv, end, hd});
-            v_full = slice(new_v_cache, {0, 0, 0, 0}, {B, nkv, end, hd});
+            // Cache is already exactly [1, nkv, cache_pos+S, hd] after concat.
+            k_full = new_k_cache;
+            v_full = new_v_cache;
         }
 
         std::string mask_mode = (S > 1) ? "causal" : "";
@@ -320,6 +365,7 @@ struct Lfm2CompiledModel {
     //   [0]            : token ids
     //   [1 .. 1+2F)    : k_cache_i, v_cache_i for F full-attn layers
     //   [1+2F .. 1+2F+C) : conv_state_i for C conv layers
+    //   [1+2F+C]       : cache_pos (int32 scalar array)
     // outputs: [logits, new_kv..., new_conv..., captured_conv_inputs..., captured_hidden...]
     // The captured tails are only present when capture_layer_ids is non-empty.
     std::vector<array> forward_impl(const std::vector<array>& inputs) const {
@@ -327,6 +373,7 @@ struct Lfm2CompiledModel {
         int B = current_batch_size;
         int S = current_seq_len;
         int F = n_full_attn, C = n_conv;
+        auto cache_pos = inputs[1 + 2 * F + C];
 
         auto x = take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {B, S, hidden_size});
@@ -358,7 +405,7 @@ struct Lfm2CompiledModel {
             } else {
                 int si = 1 + 2 * full_idx;
                 attn_out = full_attn_step(
-                    xn, layer.attn, inputs[si], inputs[si + 1], full_idx,
+                    xn, layer.attn, inputs[si], inputs[si + 1], cache_pos, full_idx,
                     new_kv[2 * full_idx], new_kv[2 * full_idx + 1]);
                 full_idx++;
             }
@@ -376,21 +423,35 @@ struct Lfm2CompiledModel {
                         moe.dense_gate_w, moe.dense_up_w, moe.dense_down_w,
                         moe.num_experts, moe.top_k, moe.norm_topk_prob);
                 } else {
-                    x = residual2 + lfm2_moe_block_forward_cpp(
-                        xn2,
-                        moe.router_w, moe.expert_bias,
-                        moe.switch_gate.w, moe.switch_gate.scales, moe.switch_gate.biases,
-                        moe.switch_up.w, moe.switch_up.scales, moe.switch_up.biases,
-                        moe.switch_down.w, moe.switch_down.scales, moe.switch_down.biases,
-                        moe.expert_group_size, moe.expert_bits,
-                        moe.num_experts, moe.top_k, moe.norm_topk_prob);
+                    if (!moe.compiled_moe) {
+                        auto router_w = moe.router_w;
+                        auto expert_bias = moe.expert_bias;
+                        auto gw = moe.switch_gate.w, gs = moe.switch_gate.scales, gb = moe.switch_gate.biases;
+                        auto uw = moe.switch_up.w, us = moe.switch_up.scales, ub = moe.switch_up.biases;
+                        auto dw = moe.switch_down.w, ds = moe.switch_down.scales, db = moe.switch_down.biases;
+                        int egs = moe.expert_group_size, eb = moe.expert_bits;
+                        int ne = moe.num_experts, tk = moe.top_k;
+                        bool ntp = moe.norm_topk_prob;
+                        std::function<std::vector<array>(const std::vector<array>&)> fn =
+                            [router_w, expert_bias, gw, gs, gb, uw, us, ub, dw, ds, db,
+                             egs, eb, ne, tk, ntp](const std::vector<array>& inputs) -> std::vector<array> {
+                                return {lfm2_moe_block_forward_cpp(
+                                    inputs[0], router_w, expert_bias,
+                                    gw, gs, gb, uw, us, ub, dw, ds, db,
+                                    egs, eb, ne, tk, ntp)};
+                            };
+                        moe.compiled_moe = mlx::core::compile(fn, false /* shapeless */);
+                    }
+                    x = residual2 + moe.compiled_moe({xn2})[0];
                 }
             } else if (layer.is_conv) {
-                x = residual2 + dense_mlp(xn2, layer.conv.gate_up, layer.conv.down,
-                                          layer.conv.gate_dim);
+                x = residual2 + dense_mlp(xn2, layer.conv.gate_up,
+                                          layer.conv.gate_proj, layer.conv.up_proj,
+                                          layer.conv.down, layer.conv.gate_dim);
             } else {
-                x = residual2 + dense_mlp(xn2, layer.attn.gate_up, layer.attn.down,
-                                          layer.attn.gate_dim);
+                x = residual2 + dense_mlp(xn2, layer.attn.gate_up,
+                                          layer.attn.gate_proj, layer.attn.up_proj,
+                                          layer.attn.down, layer.attn.gate_dim);
             }
             // DSpark: capture the post-layer residual stream at target layers.
             if (capture && contains_layer_id(capture_layer_ids, i)) {
@@ -420,6 +481,23 @@ struct Lfm2CompiledModel {
         // mid-pipeline (mirrors the qwen35 model's prev_outputs).
         prev_outputs = outputs;
         return prev_outputs;  // copies of handles; buffers stay owned here
+    }
+
+    // Compiled verify path — shapeless=true handles the growing KV cache.
+    // MoE blocks are compiled separately (shapeless=false) to avoid the
+    // argpartition/slice shape inference issue. The conv state slice is the
+    // remaining risk; if compile fails, fall back to eager.
+    std::vector<array> forward_verify(const std::vector<array>& inputs) {
+        if (!compiled_verify) {
+            try {
+                compiled_verify = mlx::core::compile(
+                    [this](const std::vector<array>& ins) { return this->forward_impl(ins); },
+                    true /* shapeless */);
+            } catch (const std::exception&) {
+                return forward(inputs);  // fall back to eager
+            }
+        }
+        return compiled_verify(inputs);
     }
 };
 
@@ -510,10 +588,16 @@ void lfm2_compiled_push_conv_layer(
         layer.conv.op_norm_w = *to_arr(op_norm);
         layer.conv.ffn_norm_w = *to_arr(ffn_norm);
         layer.conv.in_proj = lfm2_weight_by_id(m, in_proj_id);
+        int H = m->hidden_size;
+        layer.conv.b_proj = layer.conv.in_proj.sub_weight(0, H);
+        layer.conv.c_proj = layer.conv.in_proj.sub_weight(H, 2 * H);
+        layer.conv.x_proj = layer.conv.in_proj.sub_weight(2 * H, 3 * H);
         layer.conv.conv_w = *to_arr(conv_w);
         layer.conv.out_proj = lfm2_weight_by_id(m, out_proj_id);
         if (gate_up_id >= 0) {
             layer.conv.gate_up = lfm2_weight_by_id(m, gate_up_id);
+            layer.conv.gate_proj = layer.conv.gate_up.sub_weight(0, gate_dim);
+            layer.conv.up_proj = layer.conv.gate_up.sub_weight(gate_dim, 2 * gate_dim);
             layer.conv.gate_dim = gate_dim;
         }
         if (down_id >= 0) {
@@ -544,6 +628,8 @@ void lfm2_compiled_push_attn_layer(
         layer.attn.k_norm_w = *to_arr(k_norm);
         if (gate_up_id >= 0) {
             layer.attn.gate_up = lfm2_weight_by_id(m, gate_up_id);
+            layer.attn.gate_proj = layer.attn.gate_up.sub_weight(0, gate_dim);
+            layer.attn.up_proj = layer.attn.gate_up.sub_weight(gate_dim, 2 * gate_dim);
             layer.attn.gate_dim = gate_dim;
         }
         if (down_id >= 0) {
@@ -679,6 +765,39 @@ int32_t lfm2_session_end(
     }
 }
 
+// Build forward inputs: token_ids + KV caches (trimmed to cache_pos) + conv
+// states + cache_pos (as int32 array). Trimming is an eager view (no copy);
+// the compiled forward then grows the cache via concatenate.
+static std::vector<array> build_forward_inputs(
+    const Lfm2CompiledModel* m, const array& token_ids, int32_t cache_pos) {
+    std::vector<array> inputs;
+    inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size() + 1);
+    inputs.push_back(token_ids);
+    for (const auto& kv : m->session_kv_caches) {
+        int nkv = kv.shape(1);
+        int hd = kv.shape(3);
+        inputs.push_back(slice(kv, {0, 0, 0, 0}, {1, nkv, cache_pos, hd}));
+    }
+    for (const auto& c : m->session_conv_states) inputs.push_back(c);
+    int32_t cp_data[1] = {cache_pos};
+    inputs.emplace_back(cp_data, Shape{1}, int32);
+    return inputs;
+}
+
+static void extract_forward_outputs(
+    Lfm2CompiledModel* m, std::vector<array>& outputs, mlx_array** out_logits) {
+    std::vector<array> next_kv, next_conv;
+    for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
+        next_kv.push_back(std::move(outputs[1 + i]));
+    }
+    for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
+        next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
+    }
+    *out_logits = from_arr(std::move(outputs[0]));
+    m->session_kv_caches = std::move(next_kv);
+    m->session_conv_states = std::move(next_conv);
+}
+
 int32_t lfm2_compiled_step_session(
     void* model, mlx_array* token_id, int32_t cache_pos, mlx_array** out_logits) {
     auto* m = static_cast<Lfm2CompiledModel*>(model);
@@ -695,24 +814,9 @@ int32_t lfm2_compiled_step_session(
         m->current_paged_k.clear();
         m->current_paged_v.clear();
 
-        std::vector<array> inputs;
-        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
-        inputs.push_back(*to_arr(token_id));
-        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
-        for (const auto& c : m->session_conv_states) inputs.push_back(c);
-
+        auto inputs = build_forward_inputs(m, *to_arr(token_id), cache_pos);
         auto outputs = m->forward(inputs);
-
-        std::vector<array> next_kv, next_conv;
-        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
-            next_kv.push_back(std::move(outputs[1 + i]));
-        }
-        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
-            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
-        }
-        *out_logits = from_arr(std::move(outputs[0]));
-        m->session_kv_caches = std::move(next_kv);
-        m->session_conv_states = std::move(next_conv);
+        extract_forward_outputs(m, outputs, out_logits);
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
@@ -750,28 +854,14 @@ int32_t lfm2_compiled_step_session_paged(
             m->current_paged_v.push_back(*to_arr(v_full_per_layer[i]));
         }
 
-        std::vector<array> inputs;
-        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
-        inputs.push_back(*to_arr(token_id));
-        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
-        for (const auto& c : m->session_conv_states) inputs.push_back(c);
-
+        auto inputs = build_forward_inputs(m, *to_arr(token_id), cache_pos);
         auto outputs = m->forward(inputs);
 
         m->current_has_paged_prefix = false;
         m->current_paged_k.clear();
         m->current_paged_v.clear();
 
-        std::vector<array> next_kv, next_conv;
-        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
-            next_kv.push_back(std::move(outputs[1 + i]));
-        }
-        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
-            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
-        }
-        *out_logits = from_arr(std::move(outputs[0]));
-        m->session_kv_caches = std::move(next_kv);
-        m->session_conv_states = std::move(next_conv);
+        extract_forward_outputs(m, outputs, out_logits);
         return 0;
     } catch (const std::exception& e) {
         m->current_has_paged_prefix = false;
@@ -799,24 +889,9 @@ int32_t lfm2_compiled_prefill_session(
         m->current_paged_k.clear();
         m->current_paged_v.clear();
 
-        std::vector<array> inputs;
-        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
-        inputs.push_back(*to_arr(token_ids));
-        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
-        for (const auto& c : m->session_conv_states) inputs.push_back(c);
-
+        auto inputs = build_forward_inputs(m, *to_arr(token_ids), cache_pos);
         auto outputs = m->forward(inputs);
-
-        std::vector<array> next_kv, next_conv;
-        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
-            next_kv.push_back(std::move(outputs[1 + i]));
-        }
-        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
-            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
-        }
-        *out_logits = from_arr(std::move(outputs[0]));
-        m->session_kv_caches = std::move(next_kv);
-        m->session_conv_states = std::move(next_conv);
+        extract_forward_outputs(m, outputs, out_logits);
 
         m->current_batch_size = 1;
         m->current_seq_len = 1;
@@ -855,24 +930,9 @@ int32_t lfm2_compiled_verify_block_session(
         m->current_paged_k.clear();
         m->current_paged_v.clear();
 
-        std::vector<array> inputs;
-        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
-        inputs.push_back(*to_arr(token_ids));
-        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
-        for (const auto& c : m->session_conv_states) inputs.push_back(c);
-
-        auto outputs = m->forward(inputs);
-
-        std::vector<array> next_kv, next_conv;
-        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
-            next_kv.push_back(std::move(outputs[1 + i]));
-        }
-        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
-            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
-        }
-        *out_logits = from_arr(std::move(outputs[0]));
-        m->session_kv_caches = std::move(next_kv);
-        m->session_conv_states = std::move(next_conv);
+        auto inputs = build_forward_inputs(m, *to_arr(token_ids), cache_pos);
+        auto outputs = m->forward_verify(inputs);
+        extract_forward_outputs(m, outputs, out_logits);
 
         m->current_batch_size = 1;
         m->current_seq_len = 1;
