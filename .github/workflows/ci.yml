@@ -111,15 +111,14 @@ jobs:
           cargo clippy -p arle --release --no-default-features --features cuda,no-cuda,cli,nccl,deepep --bin arle -- -D warnings
           cargo clippy -p cli --release --no-default-features --features cuda,no-cuda,nccl,deepep -- -D warnings
 
-      # First-run baseline: advisories are reported but do not fail the lane.
-      # Flip continue-on-error to false once the tree is clean.
+      # Enforced 2026-08-23: tree clean (zero advisories; paste 1.0.15 is an
+      # unmaintained warning, which does not fail the lane).
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
 
       - name: cargo audit
-        continue-on-error: true
         run: cargo audit
 
   # Two lanes by feature set (cargo rebuilds on feature change, so crates
