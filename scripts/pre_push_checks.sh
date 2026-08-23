@@ -76,7 +76,23 @@ METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 
 if [[ "${METAL_CHECKS}" == "1" && "$(uname -s)" == "Darwin" ]]; then
     run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --release
-    run cargo check --no-default-features --features metal,no-cuda,cli -p arle --release --bin arle
+    run cargo build --no-default-features --features metal,no-cuda,cli -p arle --release --bin arle
+    # Metal correctness gate: needle ladder on the local 0.8B test model.
+    GATE_BIN="${CARGO_TARGET_DIR}/release/arle"
+    GATE_MODEL="${REPO_ROOT}/models/Qwen3.5-0.8B-MLX-4bit"
+    if [[ -x "$GATE_BIN" && -d "$GATE_MODEL" ]]; then
+        info "Metal needle gate (Qwen3.5-0.8B-MLX-4bit, lengths 115/300/446)"
+        BIN="$GATE_BIN" MODEL="$GATE_MODEL" \
+        GATE_PROFILE=metal LENGTHS=115,300,446 RUNS=1 \
+        PORT=18189 LEVER_GATE_ALLOW_NO_BASELINE=1 LEVER_GATE_SKIP_TEMP=1 \
+        RUST_LOG=warn \
+        bash scripts/lever_gate.sh "prepush-$$" || {
+            echo "[pre-push] Metal needle gate FAIL" >&2
+            exit 1
+        }
+    else
+        info "skipping Metal needle gate (binary or model missing)"
+    fi
 elif [[ "${METAL_CHECKS}" == "1" ]]; then
     info "skipping Metal-only checks on non-macOS host"
 else
