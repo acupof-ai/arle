@@ -362,78 +362,8 @@ pub fn score_workdir(
     pythonpath: Option<&str>,
     timeout_secs: u64,
 ) -> Result<(f32, String)> {
-    if !test_patch.trim().is_empty() {
-        // Reset the patch's test paths to base before applying, so `git apply`
-        // lands cleanly even if the rollout dirtied a test file. The student's
-        // source fix in other files is preserved.
-        // A `+++ b/<path>` is a real header only when it follows a `--- ` line.
-        //
-        // A hunk whose `---` side is /dev/null CREATES its file, and several
-        // swe-smith tasks create a test file the staged repo already ships. The
-        // patch's version is the authority there, so delete the target first:
-        // `git apply` refuses a create-over-existing outright, which loses the
-        // whole task, and `patch` skips the hunk and scores the repo's own
-        // stale tests instead.
-        let mut creates = false;
-        for line in test_patch.lines() {
-            if let Some(path) = line.strip_prefix("+++ b/") {
-                let path = path.trim_end();
-                if !path.is_empty() && path != "/dev/null" {
-                    if creates {
-                        let _ = fs::remove_file(workdir.join(path));
-                    } else {
-                        let mut checkout = Command::new("git");
-                        checkout
-                            .arg("-C")
-                            .arg(workdir)
-                            .args(["checkout", "--", path]);
-                        // Ignore failure: a path with no base has nothing to reset to.
-                        let _ = plain_output(&mut checkout, "git checkout test path");
-                    }
-                }
-            }
-            creates = line.starts_with("--- /dev/null");
-        }
-
-        // Hand `git apply` the bare filename: `git -C workdir` resolves it
-        // relative to workdir, so a workdir-relative path would double the prefix.
-        let patch_name = ".arle_test_patch.diff";
-        let patch_file = workdir.join(patch_name);
-        fs::write(&patch_file, test_patch)
-            .with_context(|| format!("failed to write test patch {}", patch_file.display()))?;
-        let mut apply_cmd = Command::new("git");
-        apply_cmd
-            .arg("-C")
-            .arg(workdir)
-            .arg("apply")
-            .arg(patch_name);
-        let apply = plain_output(&mut apply_cmd, "git apply")?;
-        let _ = fs::remove_file(&patch_file);
-        if !apply.success {
-            bail!(
-                "git apply of test_patch failed: {}",
-                String::from_utf8_lossy(&apply.stderr)
-            );
-        }
-    }
-
-    let quoted: Vec<String> = fail_to_pass
-        .iter()
-        .map(|t| format!("'{}'", t.replace('\'', r"'\''")))
-        .collect();
-    let cmd = format!(
-        "python3 -m pytest {} -q -p no:cacheprovider",
-        quoted.join(" ")
-    );
-
-    let mut command = Command::new("bash");
-    command.arg("-lc").arg(&cmd).current_dir(workdir);
-    // No bytecode: scoring must execute edited source, not cached pyc.
-    command.env("PYTHONDONTWRITEBYTECODE", "1");
-    command.env("PYTHONPATH", workdir_pythonpath(workdir, pythonpath));
-
-    let (output, code, killed) = run_captured(command, Duration::from_secs(timeout_secs))
-        .with_context(|| "failed to run pytest".to_string())?;
+    apply_test_patch(workdir, test_patch)?;
+    let (output, code, killed) = run_fail_to_pass(workdir, fail_to_pass, pythonpath, timeout_secs)?;
     let log_tail = format_bash_output(&output, &[], code, killed);
 
     // Fall back to binary (exit-0 → 1.0) when killed or summary unparseable,
@@ -451,6 +381,142 @@ pub fn score_workdir(
         }
     };
     Ok((reward, log_tail))
+}
+
+/// Control arm: a task's `fail_to_pass` tests must FAIL on the pristine tree
+/// (base + test_patch, no agent edit). A pass means scoring would measure
+/// something other than the edit — a poisoned import path or a broken task.
+/// Runs on a throwaway copy so the agent's workdir stays untouched.
+pub fn control_arm_check(
+    workdir: &Path,
+    test_patch: &str,
+    fail_to_pass: &[String],
+    pythonpath: Option<&str>,
+    timeout_secs: u64,
+) -> Result<()> {
+    if fail_to_pass.is_empty() {
+        return Ok(());
+    }
+    let tmp = tempfile::Builder::new()
+        .prefix("arle-control-arm-")
+        .tempdir_in(workdir.parent().unwrap_or(Path::new(".")))
+        .context("control-arm tempdir")?;
+    let arm = tmp.path().join("tree");
+    fs::create_dir_all(&arm)?;
+    run_checked(
+        Command::new("cp")
+            .arg("-a")
+            .arg(format!("{}/.", workdir.display()))
+            .arg(&arm),
+        "cp -a control-arm tree",
+    )?;
+    apply_test_patch(&arm, test_patch)?;
+    let (output, code, killed) = run_fail_to_pass(&arm, fail_to_pass, pythonpath, timeout_secs)?;
+    let passed = match parse_pytest_counts(&String::from_utf8_lossy(&output)) {
+        Some((passed, _)) if !killed => passed,
+        _ => {
+            // Inconclusive (timeout/crash/unparseable) is not a violation.
+            eprintln!(
+                "[sandbox] control-arm inconclusive (rc={code:?}, killed={killed}): cannot confirm \
+                 {} fail_to_pass test(s) fail on base — continuing",
+                fail_to_pass.len()
+            );
+            return Ok(());
+        }
+    };
+    if passed > 0 {
+        bail!(
+            "control-arm violation: {passed}/{} fail_to_pass test(s) PASS on the pristine tree — \
+             scoring would measure a different checkout (poisoned import path?) or the task is \
+             broken",
+            fail_to_pass.len()
+        );
+    }
+    Ok(())
+}
+
+fn apply_test_patch(workdir: &Path, test_patch: &str) -> Result<()> {
+    if test_patch.trim().is_empty() {
+        return Ok(());
+    }
+    // Reset the patch's test paths to base before applying, so `git apply`
+    // lands cleanly even if the rollout dirtied a test file. The student's
+    // source fix in other files is preserved.
+    // A `+++ b/<path>` is a real header only when it follows a `--- ` line.
+    //
+    // A hunk whose `---` side is /dev/null CREATES its file, and several
+    // swe-smith tasks create a test file the staged repo already ships. The
+    // patch's version is the authority there, so delete the target first:
+    // `git apply` refuses a create-over-existing outright, which loses the
+    // whole task, and `patch` skips the hunk and scores the repo's own
+    // stale tests instead.
+    let mut creates = false;
+    for line in test_patch.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            let path = path.trim_end();
+            if !path.is_empty() && path != "/dev/null" {
+                if creates {
+                    let _ = fs::remove_file(workdir.join(path));
+                } else {
+                    let mut checkout = Command::new("git");
+                    checkout
+                        .arg("-C")
+                        .arg(workdir)
+                        .args(["checkout", "--", path]);
+                    // Ignore failure: a path with no base has nothing to reset to.
+                    let _ = plain_output(&mut checkout, "git checkout test path");
+                }
+            }
+        }
+        creates = line.starts_with("--- /dev/null");
+    }
+
+    // Hand `git apply` the bare filename: `git -C workdir` resolves it
+    // relative to workdir, so a workdir-relative path would double the prefix.
+    let patch_name = ".arle_test_patch.diff";
+    let patch_file = workdir.join(patch_name);
+    fs::write(&patch_file, test_patch)
+        .with_context(|| format!("failed to write test patch {}", patch_file.display()))?;
+    let mut apply_cmd = Command::new("git");
+    apply_cmd
+        .arg("-C")
+        .arg(workdir)
+        .arg("apply")
+        .arg(patch_name);
+    let apply = plain_output(&mut apply_cmd, "git apply")?;
+    let _ = fs::remove_file(&patch_file);
+    if !apply.success {
+        bail!(
+            "git apply of test_patch failed: {}",
+            String::from_utf8_lossy(&apply.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn run_fail_to_pass(
+    workdir: &Path,
+    fail_to_pass: &[String],
+    pythonpath: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(Vec<u8>, Option<i32>, bool)> {
+    let quoted: Vec<String> = fail_to_pass
+        .iter()
+        .map(|t| format!("'{}'", t.replace('\'', r"'\''")))
+        .collect();
+    let cmd = format!(
+        "python3 -m pytest {} -q -p no:cacheprovider",
+        quoted.join(" ")
+    );
+
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(&cmd).current_dir(workdir);
+    // No bytecode: scoring must execute edited source, not cached pyc.
+    command.env("PYTHONDONTWRITEBYTECODE", "1");
+    command.env("PYTHONPATH", workdir_pythonpath(workdir, pythonpath));
+
+    run_captured(command, Duration::from_secs(timeout_secs))
+        .with_context(|| "failed to run pytest".to_string())
 }
 
 fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
@@ -487,4 +553,60 @@ fn run_checked(command: &mut Command, label: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PASSING_TEST_PATCH: &str = "\
+--- /dev/null
++++ b/tests/test_pass.py
+@@ -0,0 +1,2 @@
++def test_pass():
++    assert True
+";
+
+    const FAILING_TEST_PATCH: &str = "\
+--- /dev/null
++++ b/tests/test_fail.py
+@@ -0,0 +1,2 @@
++def test_fail():
++    assert False
+";
+
+    #[test]
+    fn control_arm_gate() {
+        // Mirror the run's own login shell: a python3 without pytest there
+        // skips the gate rather than failing it (the harness is Linux/pod-only).
+        let pytest_ok = Command::new("bash")
+            .args(["-lc", "python3 -m pytest --version"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !pytest_ok {
+            eprintln!("skipping control_arm_gate: python3/pytest unavailable in the login shell");
+            return;
+        }
+        let bad = tempfile::tempdir().unwrap();
+        assert!(
+            control_arm_check(
+                bad.path(),
+                PASSING_TEST_PATCH,
+                &["tests/test_pass.py".to_owned()],
+                None,
+                120,
+            )
+            .is_err(),
+            "pristine pass must abort the run"
+        );
+        let good = tempfile::tempdir().unwrap();
+        control_arm_check(
+            good.path(),
+            FAILING_TEST_PATCH,
+            &["tests/test_fail.py".to_owned()],
+            None,
+            120,
+        )
+        .expect("a test that fails on base must pass the control arm");
+    }
 }

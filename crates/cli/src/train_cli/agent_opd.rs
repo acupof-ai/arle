@@ -407,6 +407,9 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // train reward climbs but held-out doesn't, the two diverge — a sign the model
     // is gaming the reward. We warn only when the gap is large AND still widening.
     let mut prev_eval_gap: Option<f64> = None;
+    // Consecutive zero-edit rounds before the run is called broken: a harness
+    // fault wears a weak model's clothes.
+    let mut edit_drought_rounds = 0usize;
     for round in 0..args.rounds {
         // Anchor the per-stage profiler (human table opt-in via ARLE_AOPD_PROFILE).
         train::aopd_profile::begin_round();
@@ -424,6 +427,7 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         let (mut rollouts, mut passed, mut tasks_passed, mut zero_variance_groups) =
             (0usize, 0usize, 0usize, 0usize);
         let mut replayed_groups = 0usize;
+        let mut round_any_edited = false;
         let mut reward_sum = 0.0f64;
         // How far the generation-time token probabilities drift from the
         // training-time ones for the same weights; near 0 means our rollout and
@@ -548,6 +552,7 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 let group_passed = group.samples.iter().filter(|s| s.passed()).count();
                 let group_zero_variance = train::cc_harness::zero_variance(&group.samples);
                 rollouts += group.samples.len();
+                round_any_edited |= group.samples.iter().any(|s| s.edited);
                 passed += group_passed;
                 tasks_passed += usize::from(group_passed > 0);
                 zero_variance_groups += usize::from(group_zero_variance);
@@ -772,6 +777,23 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         .extend(extra);
                 }
                 metrics.append(&row);
+                if report.trained > 0 && report.tokens == 0 {
+                    bail!(
+                        "agent-opd round {round} preset {preset_name}: {} trajectories trained 0 \
+                         tokens — the update is a no-op (--max-update-seq below the corpus?)",
+                        report.trained
+                    );
+                }
+                let clip_frac = report.stats.clip_frac();
+                if !report.stats.ratio_max.is_finite() || !clip_frac.is_finite() || clip_frac == 1.0
+                {
+                    bail!(
+                        "agent-opd round {round} preset {preset_name}: degenerate policy/rollout \
+                         divergence (ratio_max={:.3}, clip_frac={clip_frac:.3}) — clipped to \
+                         nothing or numerically blown up",
+                        report.stats.ratio_max
+                    );
+                }
                 Ok(())
             };
             let merged: Vec<train::update_strategy::ScoredTrajectory> = per_group
@@ -1026,6 +1048,21 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             "delta": held_out_pass_rate.zip(baseline_pass_rate).map(|(p, b)| p - b),
             "reward_heldout_gap": reward_heldout_gap,
         }));
+
+        // 3, not the monitor's 5: an in-loop abort needs no human-paging margin.
+        const EDIT_DROUGHT_ROUNDS: usize = 3;
+        if rollouts > 0 && !round_any_edited {
+            edit_drought_rounds += 1;
+            if edit_drought_rounds >= EDIT_DROUGHT_ROUNDS {
+                bail!(
+                    "agent-opd: {EDIT_DROUGHT_ROUNDS} consecutive rounds with no edited rollout \
+                     (round {round}, {rollouts} rollouts) — harness fault (cc binary missing, \
+                     stream aborted, trajectory skip), not a weak model"
+                );
+            }
+        } else {
+            edit_drought_rounds = 0;
+        }
 
         // Per-stage ms + %-of-round breakdown (opt-in ARLE_AOPD_PROFILE; no-op off).
         train::aopd_profile::print_round(round);
