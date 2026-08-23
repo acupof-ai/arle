@@ -531,6 +531,43 @@ fn hoist_system_first(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 ///
 /// The environment is built per call — chat rendering is the COLD facade path
 /// and per-call compile keeps [`OpenAiTokenizer`] `Clone` without sharing a
+/// Strip HuggingFace `{% generation %}`/`{% endgeneration %}` markers,
+/// honoring `-` whitespace control. minijinja has no such tag; the body
+/// renders as ordinary template text.
+fn strip_generation_markers(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("{%") {
+        let close_rel = match rest[open + 2..].find("%}") {
+            Some(c) => c,
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        };
+        let body = &rest[open + 2..open + 2 + close_rel];
+        let trim_left = body.starts_with('-');
+        let trim_right = body.ends_with('-');
+        let name = body.trim_matches('-').trim();
+        if name == "generation" || name == "endgeneration" {
+            out.push_str(&rest[..open]);
+            if trim_left {
+                let keep = out.trim_end().len();
+                out.truncate(keep);
+            }
+            rest = &rest[open + 2 + close_rel + 2..];
+            if trim_right {
+                rest = rest.trim_start();
+            }
+        } else {
+            out.push_str(&rest[..open + 2]);
+            rest = &rest[open + 2..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// non-`Clone` minijinja environment.
 pub(crate) fn render_jinja(
     source: &str,
@@ -541,6 +578,8 @@ pub(crate) fn render_jinja(
     tools: &[chat::OpenAiToolDefinition],
 ) -> Result<String> {
     use minijinja::{Environment, UndefinedBehavior, context};
+
+    let source = strip_generation_markers(source);
 
     let mut env = Environment::new();
     // HF templates probe optional context (`tools`, `enable_thinking`, …) with
@@ -559,7 +598,7 @@ pub(crate) fn render_jinja(
             ))
         },
     );
-    env.add_template("chat", source)
+    env.add_template("chat", &source)
         .map_err(|err| anyhow!("compile checkpoint chat_template failed: {err}"))?;
 
     let rows: Vec<minijinja::Value> = messages

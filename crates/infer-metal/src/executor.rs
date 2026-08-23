@@ -241,12 +241,19 @@ fn sample_inflight(
         Some(history) => infer_plan::sample_token_penalized(logits_f32, params, position, history),
         None => infer_plan::sample_token(logits_f32, params, position),
     };
+    // ponytail: host logits are already here; capture top-k when requested so
+    // the Metal path surfaces logprobs (parity harness + API).
+    let top_logprobs = if params.top_logprobs.is_some() {
+        infer_plan::sampled_top_logprobs(logits_f32, params, history.unwrap_or_default(), token)
+    } else {
+        Vec::new()
+    };
     MetalInflight::Ready(StepOutput {
         tokens: vec![SlotToken {
             slot,
             token,
             logprob: None,
-            top_logprobs: Vec::new(),
+            top_logprobs,
             finish: None,
         }],
     })
