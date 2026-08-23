@@ -45,12 +45,22 @@ args_file() {
 # gone; a 47 MB tree.tgz never finishes inside that. The constant encodes an
 # assumed transfer rate, so a slower link needs a smaller PUSH_CHUNK_BYTES.
 PUSH_CHUNK_BYTES="${PUSH_CHUNK_BYTES:-12582912}"
+# One transfer, retried: the held tn connection drops often enough that a
+# single-attempt push fails a whole sync for no lasting reason.
+push_one() {
+  local src="$1" dst="$2" attempt
+  for attempt in 1 2 3; do
+    "$TN" push "$src" "$dst" && return 0
+    [ "$attempt" = 3 ] || { echo "push $dst failed (attempt $attempt), retrying" >&2; sleep 5; }
+  done
+  return 1
+}
 push_or_die() {
   local src="$1" dst="$2" size
   # stat, not `wc -c`: the latter reads all 47 MB just to report the length.
   size="$(stat -f%z "$src" 2>/dev/null || stat -c%s "$src")"
   if [ "$size" -le "$PUSH_CHUNK_BYTES" ]; then
-    "$TN" push "$src" "$dst" || { echo "push $dst failed; remote tree unchanged" >&2; exit 1; }
+    push_one "$src" "$dst" || { echo "push $dst failed; remote tree unchanged" >&2; exit 1; }
     return 0
   fi
   local parts
@@ -60,7 +70,7 @@ push_or_die() {
   # the remote `cat` reassembles in the order they were written.
   split -b "$PUSH_CHUNK_BYTES" "$src" "$parts/part."
   for part in "$parts"/part.*; do
-    "$TN" push "$part" "$dst.$(basename "$part")" ||
+    push_one "$part" "$dst.$(basename "$part")" ||
       { echo "push $dst $(basename "$part") failed; remote tree unchanged" >&2; exit 1; }
   done
   "$TN" exec "cat '$dst'.part.* > '$dst' && rm -f '$dst'.part.*" >/dev/null || {
