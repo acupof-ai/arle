@@ -32,7 +32,7 @@ pub struct CudaGraphState {
     /// future model) is capture-safe by construction instead of each call
     /// site rediscovering error 900.
     warm_remaining: u32,
-    reject_alloc_nodes: bool,
+    allow_alloc_nodes: bool,
 }
 
 // SAFETY: the wrapped `CudaGraph` holds `!Send` handles (a CUDA graph must be
@@ -50,18 +50,21 @@ impl CudaGraphState {
             graph: None,
             bypass: false,
             warm_remaining: 1,
-            reject_alloc_nodes: false,
+            allow_alloc_nodes: false,
         }
     }
 
-    /// Reject a capture that allocates. Alloc nodes are legal under
-    /// `AUTO_FREE_ON_LAUNCH` but re-allocate through the async pool on every
-    /// replay: at 1296 of them the DSv4 c=1 graph measured 23% SLOWER than
-    /// eager, and the warning alone let that ship. A caller whose scratch is
-    /// meant to be fully persistent sets this so the regression fails the
-    /// capture (and falls back to eager) instead of silently degrading.
-    pub fn reject_alloc_nodes(mut self) -> Self {
-        self.reject_alloc_nodes = true;
+    /// Accept a capture that allocates, downgrading the rejection to a warning.
+    ///
+    /// Allocating is rejected by default for the same reason the host-node
+    /// audit is: every replay re-allocates through the async pool, and at 1296
+    /// such nodes the DSv4 c=1 graph measured 23% SLOWER than eager while a
+    /// `log::warn` let it ship. A rejected capture is discarded and the caller
+    /// falls back to eager, so the failure mode is perf-neutral plus one hard
+    /// error line. Opt out only with a measurement showing the allocations are
+    /// unavoidable for that path.
+    pub fn allow_alloc_nodes(mut self) -> Self {
+        self.allow_alloc_nodes = true;
         self
     }
 
@@ -152,18 +155,19 @@ impl CudaGraphState {
                     a.host_fn_nodes,
                     a.total_nodes,
                 );
-                ensure!(
-                    !(self.reject_alloc_nodes && a.mem_alloc_nodes > 0),
-                    "captured graph allocates: {} alloc / {} free node(s) of {} — this caller \
-                     declared fully persistent scratch, so an allocation is a regression \
-                     (graph discarded, eager fallback); see wins/2026-08-23-dsv4-c1-decode-graph",
-                    a.mem_alloc_nodes,
-                    a.mem_free_nodes,
-                    a.total_nodes,
-                );
                 if a.mem_alloc_nodes > 0 {
+                    ensure!(
+                        self.allow_alloc_nodes,
+                        "captured graph allocates: {} alloc / {} free node(s) of {} — every \
+                         replay re-allocates them through the async pool (graph discarded, \
+                         eager fallback); see wins/2026-08-23-dsv4-c1-decode-graph",
+                        a.mem_alloc_nodes,
+                        a.mem_free_nodes,
+                        a.total_nodes,
+                    );
                     log::warn!(
-                        "captured graph allocates: {} alloc / {} free node(s) of {} — legal                          (AUTO_FREE_ON_LAUNCH) but fragile; prefer persistent scratch",
+                        "captured graph allocates: {} alloc / {} free node(s) of {} — legal \
+                         under AUTO_FREE_ON_LAUNCH but fragile; prefer persistent scratch",
                         a.mem_alloc_nodes,
                         a.mem_free_nodes,
                         a.total_nodes,

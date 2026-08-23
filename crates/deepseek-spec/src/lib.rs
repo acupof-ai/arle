@@ -11,7 +11,7 @@ pub use v4::{
     DeepSeekV4ExpertTensorNames, DeepSeekV4HyperConnectionTensorNames, DeepSeekV4IndexerShape,
     DeepSeekV4IndexerTensorNames, DeepSeekV4LayerTensorNames, DeepSeekV4MoeRoute,
     DeepSeekV4MoeRoutingKind, DeepSeekV4MoeTensorNames, DeepSeekV4MtpTensorNames,
-    DeepSeekV4RopeParameters, DeepSeekV4TensorNames, TensorDialect,
+    DeepSeekV4RopeParameters, DeepSeekV4TensorNames, TensorDialect, indexer_stride,
 };
 
 #[derive(Debug, Error)]

@@ -507,6 +507,19 @@ pub enum DeepSeekV4AttentionMode {
     SparseIndexed,
 }
 
+/// The stride a layer's compressor/indexer advances by.
+///
+/// `compress_ratio == 0` encodes two different things: "this layer has no main
+/// key compressor" (the `SlidingWindow` layers `from_compress_ratio` maps 0 to)
+/// and "`SparseIndexed` shares the indexer at stride 1" (GLM, which overrides
+/// the mode via `per_layer_attention_mode` while leaving every ratio at 0).
+/// Dividing or multiplying by the raw field is therefore a divide-by-zero on
+/// the second case; every consumer goes through this instead.
+#[must_use]
+pub fn indexer_stride(compress_ratio: usize) -> usize {
+    compress_ratio.max(1)
+}
+
 impl DeepSeekV4AttentionMode {
     pub fn from_compress_ratio(compress_ratio: usize) -> Self {
         match compress_ratio {

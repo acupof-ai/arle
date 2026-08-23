@@ -232,7 +232,7 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
             let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
                 1
             } else {
-                ratio.max(1)
+                indexer_stride(ratio)
             };
             let rpp = page_tokens.div_ceil(index_ratio);
             total += 2 * rpp * (config.index_head_dim + 4);
@@ -786,7 +786,7 @@ impl Dsv4LayerAttentionState {
         out: &mut Dsv4LayerPageState,
     ) -> Result<()> {
         if let Some(c) = &self.compressor {
-            let ratio = compress_ratio.max(1);
+            let ratio = indexer_stride(compress_ratio);
             (out.pending_kv, out.pending_score) = capture_pending_tail(
                 ctx,
                 &c.pending_kv,
@@ -860,7 +860,7 @@ impl Dsv4LayerAttentionState {
         state: &Dsv4LayerPageState,
     ) -> Result<()> {
         if let Some(c) = &mut self.compressor {
-            let ratio = compress_ratio.max(1);
+            let ratio = indexer_stride(compress_ratio);
             restore_pending_tail(
                 ctx,
                 &mut c.pending_kv,
@@ -970,12 +970,12 @@ impl Dsv4LayerAttentionState {
         let comp_rows = if mode == DeepSeekV4AttentionMode::SlidingWindow {
             0
         } else {
-            restore_len / compress_ratio.max(1)
+            restore_len / indexer_stride(compress_ratio)
         };
         let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
             1
         } else {
-            compress_ratio.max(1)
+            indexer_stride(compress_ratio)
         };
         let index_rows = if mode.has_indexer() {
             restore_len / index_ratio

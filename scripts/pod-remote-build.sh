@@ -4,7 +4,6 @@ set -uo pipefail
 TREE="${POD_TREE:-/host/arle-build}"
 STATE="${POD_STATE:-/root/arle-ops}"
 TREE_LOCK="/tmp/arle-build$(printf '%s' "$TREE" | tr '/.' '__').lock"
-mkdir -p "$STATE/builds" "$STATE/runs"
 
 proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
@@ -102,6 +101,25 @@ if len(out_dirs) != 1: raise SystemExit(f"expected exactly one cuda-kernels buil
 print(executables[0]); print(out_dirs[0])
 PY
 }
+# Delete files present in the remote tree but absent from the incoming tarball.
+# Only untracked-unignored paths are considered: tracked deletions already
+# arrive via `deletes`, and ignored paths (target/, .venv/, bench-output/) are
+# build state the sync must not touch.
+reconcile_untracked() {
+  local tree="$1" archive="$2" tmp
+  tmp="$(mktemp -d)" || return 0
+  trap 'rm -rf "$tmp"' RETURN
+  tar -tzf "$archive" 2>/dev/null | sed 's:/$::' | sort -u > "$tmp/incoming" || return 0
+  git -C "$tree" ls-files -co --exclude-standard -z 2>/dev/null |
+    tr '\0' '\n' | sort -u > "$tmp/present" || return 0
+  comm -13 "$tmp/incoming" "$tmp/present" > "$tmp/strays"
+  [ -s "$tmp/strays" ] || return 0
+  echo "sync: removing $(wc -l < "$tmp/strays" | tr -d ' ') untracked file(s) absent from the pusher's tree" >&2
+  while IFS= read -r path; do
+    [ -n "$path" ] && rm -f "$tree/$path"
+  done < "$tmp/strays"
+}
+
 restore_persistent() {
   local from="$1" to="$2" path
   for path in target crates/cuda-kernels/tools/tilelang/.venv bench-output; do
@@ -152,6 +170,12 @@ case "${1:-}" in
     fi
     tar -C "$overlay" -xzf "$archive"
     while IFS= read -r -d '' path; do rm -f "$overlay/$path"; done < "$deletes"
+    # Reconcile untracked files too, not just tracked deletions. `source_digest`
+    # counts every untracked-unignored file, so one left behind here (a debug
+    # probe, a crash dump, an editor backup) puts the remote permanently out of
+    # sync and fails EVERY later sync until a human removes it by hand. The
+    # pusher's tarball is the authority on what the tree contains.
+    reconcile_untracked "$overlay" "$archive"
     if [ "$bundle_mode" = full ]; then
       if ! mv "$TREE" "$backup" || ! mv "$incoming" "$TREE"; then
         [ -d "$backup" ] && mv "$backup" "$TREE"
@@ -170,16 +194,16 @@ case "${1:-}" in
       # always a stray untracked file left in the remote tree (a probe, a dump,
       # an editor backup): it is counted by `git ls-files -co` here but absent
       # from the pusher's tree, and two bare hashes say nothing about which.
-      if [ "$actual_digest" != "$expected_digest" ]; then
-        tar -tzf "$archive" 2>/dev/null | sed 's:/$::' | sort -u > "$TREE/.sync-incoming.$$" || true
-        git -C "$TREE" ls-files -co --exclude-standard | sort -u > "$TREE/.sync-present.$$" || true
-        strays="$(comm -13 "$TREE/.sync-incoming.$$" "$TREE/.sync-present.$$" \
-          | grep -v '^\.sync-\(incoming\|present\)\.' | head -20)"
-        rm -f "$TREE/.sync-incoming.$$" "$TREE/.sync-present.$$"
-        [ -z "$strays" ] || {
-          echo "sync source mismatch: remote tree carries files the pusher does not; remove them and re-sync:" >&2
-          printf '  %s\n' $strays >&2
+      if [ "$actual_digest" != "$expected_digest" ] && [ -n "${strays_tmp:=$(mktemp -d)}" ]; then
+        tar -tzf "$archive" 2>/dev/null | sed 's:/$::' | sort -u > "$strays_tmp/incoming" || true
+        git -C "$TREE" ls-files -co --exclude-standard -z 2>/dev/null |
+          tr '\0' '\n' | sort -u > "$strays_tmp/present" || true
+        comm -13 "$strays_tmp/incoming" "$strays_tmp/present" | head -20 > "$strays_tmp/strays"
+        [ -s "$strays_tmp/strays" ] && {
+          echo "sync source mismatch: remote tree still carries files the pusher does not:" >&2
+          sed 's/^/  /' "$strays_tmp/strays" >&2
         }
+        rm -rf "$strays_tmp"
       fi
       [ -z "$backup" ] || { restore_persistent "$TREE" "$backup" || true; rm -rf "$TREE"; mv "$backup" "$TREE"; }
       echo "sync source mismatch: head=$actual_head expected_head=$head digest=$actual_digest expected_digest=$expected_digest" >&2; exit 1
@@ -197,6 +221,10 @@ case "${1:-}" in
   build)
     LABEL="${2:?missing label}"; OP="${3:?missing operation}"; ARGV_FILE="${4:?missing argv file}"
     binary_name="$(validate_build_args "$ARGV_FILE")" || exit 2
+    # Only `build` writes under STATE. Creating it at file scope also fired for
+    # `source-digest`, which pod.sh runs LOCALLY, so every sync from a Mac
+    # printed two "mkdir: /host: Read-only file system" lines.
+    mkdir -p "$STATE/builds" || exit 1
     DIR="$STATE/builds/$LABEL"
     [ ! -e "$DIR" ] || { echo "build label exists: $LABEL" >&2; exit 1; }
     mkdir "$DIR" || exit 1

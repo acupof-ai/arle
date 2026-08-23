@@ -36,7 +36,7 @@ impl Dsv4CompressorState {
         staging_ring: bool,
     ) -> Result<Self> {
         let width = dsv4_compressor_width(head_dim, overlap);
-        let compressed_capacity = max_seq_len.div_ceil(ratio).max(1);
+        let compressed_capacity = max_seq_len.div_ceil(indexer_stride(ratio)).max(1);
         let ring_rows = if staging_ring {
             DSV4_INDEXER_STAGING_RING_ROWS.min(compressed_capacity)
         } else {
@@ -157,7 +157,7 @@ impl Dsv4CompressorState {
     ) -> usize {
         let bf16 = std::mem::size_of::<half::bf16>();
         let width = dsv4_compressor_width(head_dim, overlap);
-        let compressed_capacity = max_seq_len.div_ceil(ratio.max(1)).max(1);
+        let compressed_capacity = max_seq_len.div_ceil(indexer_stride(ratio)).max(1);
         let ring_rows = if staging_ring {
             DSV4_INDEXER_STAGING_RING_ROWS.min(compressed_capacity)
         } else {
@@ -1360,7 +1360,7 @@ impl Dsv4LayerKvLayout {
             if flashmla_demand_paged && mode != DeepSeekV4AttentionMode::SlidingWindow {
                 kv_arena
                     .page_block_size
-                    .saturating_mul(compress_ratio.max(1))
+                    .saturating_mul(indexer_stride(compress_ratio))
             } else {
                 0
             };
