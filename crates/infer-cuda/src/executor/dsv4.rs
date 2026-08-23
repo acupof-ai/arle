@@ -48,7 +48,7 @@ pub(crate) struct Dsv4CudaExecutor {
     pub(super) slot_tier: KvTierStore,
     /// Per-slot c=1 decode graph: the capture bakes the slot's device buffers
     /// (start_pos, page table), so one graph per slot.
-    decode_graphs: Vec<Option<crate::graph::CudaGraphState>>,
+    pub(super) decode_graphs: Vec<Option<crate::graph::CudaGraphState>>,
 }
 
 pub(crate) struct Dsv4DsparkExec {
