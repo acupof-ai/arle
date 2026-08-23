@@ -619,7 +619,7 @@ Identity:
 - GPU: 4×H20 (sm_90), TP=4, 4 slots/rank, BF16 KV, `--comm-backend nccl`
 - Workload `bench-agent-32k-16x8.jsonl`, prompt p50 28568 tok, max_tokens 256
   exact (ignore_eos), temperature 0
-- Capture audit: 0 alloc / 0 free / 0 host memcpy / 0 host callback nodes
+- Capture audit: 0 host memcpy / 0 host callback nodes; 86 alloc / 86 free of 3196 on this build (removed later; the numbers below predate that and are a floor)
 
 NVFP4 experts, 16 requests per point, same binary both arms:
 
