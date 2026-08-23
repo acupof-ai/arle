@@ -515,6 +515,13 @@ fn resolve_memory_limit(
             } else {
                 DEFAULT_AVAILABLE_RESERVE_BYTES
             };
+            // CI runners and other constrained environments override the
+            // anti-swap reserve (GitHub macOS runners have 7 GiB total).
+            let reserve = std::env::var("ARLE_METAL_AVAILABLE_RESERVE_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or(reserve);
             anyhow::ensure!(
                 available > reserve,
                 "Metal resource guard rejected startup: {system_status_line}; available memory {} GiB is <= anti-swap reserve {} GiB. \
