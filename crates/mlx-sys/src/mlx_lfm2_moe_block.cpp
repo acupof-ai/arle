@@ -1,19 +1,18 @@
 //! LFM2.5 SparseMoeBlock — C++ forward (Metal).
 //!
-//! Ports `Lfm2MoeSparseMoeBlock` from the HuggingFace transformers reference
-//! (`modeling_lfm2_moe.py`). Differences from the Qwen3.5 MoE block
-//! (`mlx_qwen35_moe_block.cpp`):
-//!   - sigmoid routing (not softmax): scores = sigmoid(x @ W_gate.T)
-//!   - a persistent per-expert bias (`expert_bias`, F32, nonzero in the
-//!     checkpoint — aux-loss-free balancing baked in at train time) is added
-//!     to the scores ONLY for top-k selection, never to the routing weights
-//!   - no shared expert
+//! Ports `Lfm2MoeSparseMoeBlock` from the mlx-lm reference
+//! (`models/lfm2_moe.py`), which is the convention the published
+//! checkpoint was trained with. Note this DIVERGES from the HuggingFace
+//! transformers `modeling_lfm2_moe.py` (sigmoid routing): the checkpoint
+//! is numerically softmax-routed — verified by greedy-stream parity
+//! (sigmoid gives degenerate loops; softmax gives coherent text).
 //!
 //! Reference flow:
-//!   s       = sigmoid(matmul(x, router_w))          // [..., E]
-//!   idx     = topk(s + expert_bias, k).indices       // [..., top_k]
-//!   w       = take_along_axis(s, idx)                // un-biased sigmoid
-//!   if norm_topk_prob: w = w / (sum(w, -1) + 1e-6)
+//!   s       = softmax(matmul(x, router_w), -1)      // [..., E], f32
+//!   s      += expert_bias                           // persistent bias
+//!   idx     = argpartition(s, E-k)[..., -k:]        // top-k
+//!   w       = take_along_axis(s, idx)               // biased softmax scores
+//!   if norm_topk_prob: w = w / (sum(w, -1) + 1e-20)
 //!   y       = SwitchGLU(x, idx)                      // gather_qmm x 3 + SiLU
 //!   y       = sum(y * w[..., None], axis=-2)
 
@@ -124,7 +123,7 @@ array switch_glu_forward(
 //
 //   x            : [..., H]
 //   router_w     : [H, E] dense (pre-transposed at load)
-//   expert_bias  : [E] persistent aux-loss-free bias (f32)
+//   expert_bias  : [E] persistent per-expert bias (f32/bf16), added post-softmax
 //   switch_*     : [E, I, H/pack] stacked 4-bit affine experts
 array lfm2_moe_block_forward_cpp(
     const array& x,
@@ -143,17 +142,15 @@ array lfm2_moe_block_forward_cpp(
         throw std::invalid_argument("lfm2_moe_block_forward_cpp: hidden must have rank >= 2");
     }
 
-    // Sigmoid routing in f32 (matches the transformers reference upcast).
+    // Softmax routing in f32 (matches the mlx-lm reference upcast).
     auto logits = mlx::core::matmul(astype(x, float32), astype(router_w, float32));
-    auto s = mlx::core::sigmoid(logits);
+    auto s = mlx::core::softmax(logits, /*axis=*/-1);
+    s = s + astype(expert_bias, float32);
 
-    // top-k selection on biased scores; weights come from the un-biased sigmoid.
-    // The vendored MLX topk returns values only, so use argpartition (same
-    // pattern as the Qwen3.5 MoE block): the last-k slice of the partitioned
-    // indices holds the top-k expert ids.
-    auto sel = s + astype(expert_bias, float32);
+    // Top-k via argpartition (the vendored MLX topk returns values only):
+    // the last-k slice of the partitioned indices holds the top-k expert ids.
     const int kth = num_experts - top_k;
-    auto part = mlx::core::argpartition(sel, kth, /*axis=*/-1);
+    auto part = mlx::core::argpartition(s, kth, /*axis=*/-1);
     const int sel_rank = static_cast<int>(part.ndim());
     mlx::core::Shape start(sel_rank, 0);
     mlx::core::Shape stop = part.shape();
@@ -162,9 +159,12 @@ array lfm2_moe_block_forward_cpp(
     auto idx = astype(mlx::core::slice(part, start, stop, strides), mlx::core::int32);
     auto w = mlx::core::take_along_axis(s, idx, /*axis=*/-1);
     if (norm_topk_prob) {
-        auto denom = mlx::core::sum(w, /*axis=*/-1, /*keepdims=*/true) + array(1e-6f);
+        auto denom = mlx::core::sum(w, /*axis=*/-1, /*keepdims=*/true) + array(1e-20f);
         w = mlx::core::divide(w, denom);
     }
+    // Match the reference: scores cast back to x dtype, so the expert
+    // weighted sum runs in bf16 (f32 here would drift across 22 MoE layers).
+    w = astype(w, x.dtype());
 
     auto y_switch = switch_glu_forward(
         x, idx,
