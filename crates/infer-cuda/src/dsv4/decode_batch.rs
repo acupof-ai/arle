@@ -223,6 +223,7 @@ impl Dsv4Model {
                 &stream,
                 &mut normed,
                 &mut keepalive,
+                false,
             )?;
             keepalive.keep_hidden(&normed);
 
@@ -1229,6 +1230,7 @@ impl Dsv4Model {
                 &stream,
                 &mut normed,
                 &mut keepalive,
+                false,
             )?;
             keepalive.keep_hidden(&normed);
             // Routed MoE over the whole [N] batch. allreduce transport: one router
@@ -1549,6 +1551,7 @@ impl Dsv4Model {
                     &stream,
                     &mut normed,
                     &mut keepalive,
+                    false,
                 )?;
                 keepalive.keep_hidden(&normed);
 
@@ -1686,6 +1689,7 @@ impl Dsv4Model {
                     &stream,
                     &mut normed,
                     &mut keepalive,
+                    false,
                 )?;
                 keepalive.keep_hidden(&normed);
                 // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
