@@ -25,7 +25,9 @@ Mac dev path — had no gate at all; the smoke test only checks CLI help text.
    in `docs/environment.md`.
 4. **Metal CI needle gate** — `.github/workflows/metal-ci.yml` runs the needle
    ladder on `mlx-community/Qwen3.5-0.8B-MLX-4bit` after building arle; gate
-   scripts added to the paths filter.
+   scripts added to the paths filter. `ARLE_METAL_AVAILABLE_RESERVE_MB`
+   overrides the anti-swap reserve (7 GiB CI runners); extracted to
+   `available_reserve_bytes()` so both guard paths read it.
 5. **`bench_compare.py` rewritten for v1 format** — the old tool could not
    parse `arle.bench_throughput.v1` output. Now keys on concurrency, refuses
    cross-workload comparison (dataset_sha256 or max_tokens mismatch), and
