@@ -2308,6 +2308,12 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 600)]
     pub(crate) cc_timeout: u64,
 
+    /// Unprivileged account the rollout agent runs as. It has Bash and no
+    /// filesystem confinement, so root would let it read the corpus it is
+    /// scored against (errors/2026-08-24).
+    #[arg(long, default_value = "arle-rollout")]
+    pub(crate) rollout_user: String,
+
     /// Weight-sync cadence into the rollout serve.
     #[arg(long, value_enum, default_value_t = SyncArg::EveryGroup)]
     pub(crate) sync: SyncArg,

@@ -236,6 +236,7 @@ pub fn boot_workdir(
     instance_id: &str,
     staged_tree: &Path,
     setup_cmd: Option<&str>,
+    user: RolloutUser,
 ) -> Result<PathBuf> {
     // An ancestor CLAUDE.md costs ~31K tokens/request of CC preamble.
     static ANCESTOR_CLAUDE_MD_WARN: std::sync::Once = std::sync::Once::new();
@@ -309,7 +310,111 @@ pub fn boot_workdir(
         "git commit base",
     )?;
 
+    // Handed over last: the staging commands above run as root, and the agent
+    // only ever sees trees it owns and nobody else can enter.
+    let home = agent_home(work_root, instance_id);
+    fs::create_dir_all(&home)
+        .with_context(|| format!("failed to create agent home {}", home.display()))?;
+    for dir in [&workdir, &home] {
+        run_checked(
+            Command::new("chown")
+                .arg("-R")
+                .arg(format!("{}:{}", user.uid, user.gid))
+                .arg(dir),
+            "chown to rollout user",
+        )?;
+        run_checked(Command::new("chmod").arg("700").arg(dir), "chmod 700")?;
+    }
+
     Ok(workdir)
+}
+
+/// The unprivileged account each rollout's agent runs as.
+///
+/// The agent has Bash and no filesystem confinement: on 2026-08-23 one read
+/// `eval.jsonl` out of the corpus root, found its own `instance_id`, and
+/// printed the `test_patch` it was being scored against. Running it as a
+/// non-root user is what makes the corpus permissions below mean anything.
+#[derive(Copy, Clone, Debug)]
+pub struct RolloutUser {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+pub fn resolve_rollout_user(name: &str) -> Result<RolloutUser> {
+    let entry = plain_output(
+        Command::new("getent").args(["passwd", name]),
+        "getent passwd",
+    )?;
+    if !entry.success {
+        bail!(
+            "rollout user {name:?} does not exist. The agent would run as root and could read \
+             the corpus it is scored against. Create it first:\n    \
+             useradd --system --create-home --shell /usr/sbin/nologin {name}"
+        );
+    }
+    let line = String::from_utf8_lossy(&entry.stdout);
+    let mut fields = line.trim_end().split(':').skip(2);
+    let parse = |f: Option<&str>, what: &str| -> Result<u32> {
+        f.and_then(|v| v.parse().ok())
+            .with_context(|| format!("getent passwd {name}: unparseable {what} in {line:?}"))
+    };
+    let uid = parse(fields.next(), "uid")?;
+    let gid = parse(fields.next(), "gid")?;
+    if uid == 0 {
+        bail!("rollout user {name:?} is uid 0 — that defeats the point");
+    }
+    Ok(RolloutUser { uid, gid })
+}
+
+/// Refuse to start when the rollout user can reach the answers.
+///
+/// This is a startup assertion rather than a documented chmod because the
+/// failure it prevents is silent: a readable corpus produces a run that looks
+/// normal and scores nothing real.
+pub fn assert_corpus_unreadable(paths: &[&Path], user: RolloutUser) -> Result<()> {
+    for path in paths {
+        let mut probe = Command::new("setpriv");
+        probe
+            .args([
+                format!("--reuid={}", user.uid),
+                format!("--regid={}", user.gid),
+                "--clear-groups".to_owned(),
+            ])
+            .args(["test", "-r"])
+            .arg(path);
+        // A readable corpus is the failure; an unrunnable probe is also a
+        // failure, because then nothing was actually checked.
+        let out = plain_output(&mut probe, "setpriv corpus probe")?;
+        if out.success {
+            bail!(
+                "{} is readable by the rollout user — the agent can read the patch it is \
+                 scored against. Restrict it:\n    chmod -R go-rwx {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Where the agent's HOME lives: beside the scored tree, never inside it, so
+/// CC's own config and history cannot read as an edit.
+pub fn agent_home(work_root: &Path, instance_id: &str) -> PathBuf {
+    work_root.join(".home").join(instance_id)
+}
+
+/// Drop a scored rollout's tree. A workdir that outlives its score is the next
+/// run's answer key: the 2026-08-23 agent diffed the previous run's copy of its
+/// own task to recover the fix.
+pub fn discard_workdir(work_root: &Path, instance_id: &str) {
+    for dir in [work_root.join(instance_id), agent_home(work_root, instance_id)] {
+        if let Err(err) = fs::remove_dir_all(&dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("[sandbox] failed to discard {}: {err}", dir.display());
+        }
+    }
 }
 
 pub fn diff_workdir(workdir: &Path) -> Result<String> {
