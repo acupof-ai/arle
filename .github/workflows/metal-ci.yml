@@ -109,8 +109,13 @@ jobs:
           LEVER_GATE_ALLOW_NO_BASELINE: "1"
           LEVER_GATE_SKIP_TEMP: "1"
           LEVER_GATE_SKIP_CONCURRENT: "1"
-          RUST_LOG: warn
-        run: bash scripts/lever_gate.sh "ci-metal"
+          RUST_LOG: info
+        run: |
+          bash scripts/lever_gate.sh "ci-metal" || {
+            echo "=== serve_ci-metal.log ==="
+            cat serve_ci-metal.log 2>/dev/null || echo "(no serve log)"
+            exit 1
+          }
 
       # Validate that the baseline snapshots are well-formed JSON.
       # Model-level correctness is covered by the needle gate above.
