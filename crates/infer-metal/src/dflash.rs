@@ -89,6 +89,14 @@ impl MetalDflashRuntime {
         let draft_cpp_model = DFlashDraftCppModel::build(&draft_weights, &draft_config)?;
         let markov = draft_weights.markov.take();
         let default_block_size = draft_config.block_size.max(2);
+        // DSpark (Markov head): cap default block_size at 4 — measured optimal
+        // on M4 Max (1.26× speedup at bs=4 vs 0.99× at bs=9). Override with
+        // --speculative-tokens.
+        let default_block_size = if markov.is_some() {
+            default_block_size.min(4)
+        } else {
+            default_block_size
+        };
         let block_size = options
             .speculative_tokens
             .unwrap_or(default_block_size)
