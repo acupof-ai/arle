@@ -112,7 +112,7 @@ jobs:
           RUST_LOG: info
           ARLE_METAL_AVAILABLE_RESERVE_MB: "1024"
           ARLE_METAL_RUNTIME_HEADROOM_MB: "128"
-          SERVE_FLAGS: "--system-reserve-bytes 1073741824 --memory-budget-bytes 5368709120 --allow-swap"
+          SERVE_FLAGS: "--system-reserve-bytes 1073741824 --memory-budget-bytes 6442450944 --allow-swap"
         run: |
           bash scripts/lever_gate.sh "ci-metal" || {
             echo "=== serve_ci-metal.log ==="
