@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 
 use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps};
-use crate::sandbox::{boot_workdir, diff_workdir, run_captured, score_workdir};
+use crate::sandbox::{boot_workdir, control_arm_check, diff_workdir, run_captured, score_workdir};
 use crate::swe_dataset::SweTask;
 
 /// TYPICAL cc SWE-session tokens: sizes the per-stream KV budget and is the
@@ -198,6 +198,8 @@ impl CcHarness {
                 staged_tree.to_owned(),
                 self.work_root.clone(),
             );
+            let pythonpath = self.pythonpath.clone();
+            let test_timeout_secs = self.test_timeout_secs;
             std::thread::spawn(move || {
                 loop {
                     let sample = next.fetch_add(1, Ordering::Relaxed);
@@ -208,7 +210,21 @@ impl CcHarness {
                     let booted =
                         boot_workdir(&root, &name, &staged, task.before_repo_set_cmd.as_deref())
                             .with_context(|| format!("boot cc sandbox {name}"))
-                            .map(|workdir| (sample, workdir));
+                            .and_then(|workdir| {
+                                // One arm per group: the pristine tree failing its
+                                // own fail_to_pass is the task being discriminative.
+                                if sample == 0 {
+                                    control_arm_check(
+                                        &workdir,
+                                        &task.test_patch,
+                                        &task.fail_to_pass(),
+                                        pythonpath.as_deref(),
+                                        test_timeout_secs,
+                                    )
+                                    .with_context(|| format!("control-arm check {name}"))?;
+                                }
+                                Ok((sample, workdir))
+                            });
                     // Deliver the error before stopping — run_group propagates it.
                     let failed = booted.is_err();
                     if tx.send(booted).is_err() || failed {
