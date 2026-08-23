@@ -343,7 +343,7 @@ pub(crate) fn dsv4_moe_forward_deepep_ll(
             .alloc_zeros::<f32>(1)
             .map_err(|e| anyhow::anyhow!("deepep_ll empty route-weight alloc failed: {e}"))?;
         keepalive.keep_f32(&w);
-        w
+        StepSlice::Owned(w)
     };
 
     // `scratch` is model-owned (outlives the forward), so it does not need the
