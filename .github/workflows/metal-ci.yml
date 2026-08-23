@@ -110,6 +110,7 @@ jobs:
           LEVER_GATE_SKIP_TEMP: "1"
           LEVER_GATE_SKIP_CONCURRENT: "1"
           RUST_LOG: info
+          ARLE_METAL_AVAILABLE_RESERVE_MB: "1024"
         run: |
           bash scripts/lever_gate.sh "ci-metal" || {
             echo "=== serve_ci-metal.log ==="
