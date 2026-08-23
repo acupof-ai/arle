@@ -992,6 +992,22 @@ impl Dsv4KvAdapter {
         )
     }
 
+    /// Shared-expert output + scratch and the routed-MoE tail scratch as one
+    /// disjoint-field borrow for the decode layer loop.
+    pub(crate) fn moe_decode_scratch_mut(
+        &mut self,
+    ) -> (
+        &mut HiddenStates,
+        Option<&mut crate::moe::Dsv4SharedDecodeScratch>,
+        Option<&mut crate::moe::Dsv4MoeTailScratch>,
+    ) {
+        (
+            &mut self.shared_expert_out,
+            self.shared_expert_scratch.as_mut(),
+            self.moe_tail_scratch.as_mut(),
+        )
+    }
+
     pub(crate) fn layer_mut(&mut self, layer_idx: usize) -> Result<&mut Dsv4LayerKvLayout> {
         let len = self.layers.len();
         self.layers

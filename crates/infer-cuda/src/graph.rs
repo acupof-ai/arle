@@ -325,6 +325,23 @@ fn log_kernel_node_census(
             .result()
             .is_ok();
         if !params_ok {
+            let mut ty = cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
+            // SAFETY: node handle from cuGraphGetNodes on a live graph.
+            let _ = unsafe { cu::cuGraphNodeGetType(node, &mut ty) };
+            if ty == cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC {
+                let mut ap = std::mem::MaybeUninit::<cu::CUDA_MEM_ALLOC_NODE_PARAMS>::uninit();
+                // SAFETY: node is a live MEM_ALLOC node; the driver fills params.
+                if unsafe { cu::cuGraphMemAllocNodeGetParams(node, ap.as_mut_ptr()) }
+                    .result()
+                    .is_ok()
+                {
+                    // SAFETY: success above guarantees initialization.
+                    let ap = unsafe { ap.assume_init() };
+                    log::info!("[graph-node-census] {i:04} ALLOC bytes={}", ap.bytesize);
+                }
+            } else if ty == cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE {
+                log::info!("[graph-node-census] {i:04} FREE");
+            }
             continue;
         }
         // SAFETY: success above guarantees initialization.
