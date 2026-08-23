@@ -30,6 +30,7 @@ def metrics(summary):
         "ttft_p50": ttft.get("p50_ms"),
         "itl_p50": itl.get("p50_ms"),
         "rps": summary.get("requests_per_s"),
+        "complete": summary.get("complete", 0),
     }
 
 
@@ -44,7 +45,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=5.0,
                         help="Regression threshold %% (default: 5)")
     parser.add_argument("--metric", default="decode",
-                        choices=sorted(HIGHER_IS_BETTER | {"ttft_p50", "itl_p50"}),
+                        choices=sorted(UNIT),
                         help="Primary metric to compare (default: decode tok/s)")
     args = parser.parse_args()
 
@@ -55,6 +56,17 @@ def main():
         if snap.get("schema") != "arle.bench_throughput.v1":
             print(f"error: {name} snapshot is not arle.bench_throughput.v1", file=sys.stderr)
             return 2
+
+    # Refuse cross-workload comparisons: different prompt sets or output lengths
+    # make every delta meaningless.
+    base_fp = base.get("fingerprint") or {}
+    curr_fp = curr.get("fingerprint") or {}
+    if base_fp.get("dataset_sha256") != curr_fp.get("dataset_sha256"):
+        print("error: dataset_sha256 mismatch — snapshots are from different prompt sets", file=sys.stderr)
+        return 2
+    if base["config"].get("max_tokens") != curr["config"].get("max_tokens"):
+        print("error: max_tokens mismatch — snapshots used different output lengths", file=sys.stderr)
+        return 2
 
     date_fmt = lambda s: time.strftime("%Y-%m-%d", time.localtime(s))
     print(f"Baseline: {base['config'].get('model', '?')} ({date_fmt(base['started_unix_s'])})")
@@ -79,8 +91,15 @@ def main():
     print("-" * len(hdr))
 
     for c in common:
-        bv = base_map[c].get(args.metric)
-        cv = curr_map[c].get(args.metric)
+        bm = base_map[c]
+        cm = curr_map[c]
+        bv = bm.get(args.metric)
+        cv = cm.get(args.metric)
+        # Zero completed requests is a collapse, not a skip.
+        if bm["complete"] == 0 or cm["complete"] == 0:
+            print(f"{c:4d} | {'n/a':>10} | {'n/a':>10} | {'n/a':>8} | COLLAPSE")
+            regressions.append((c, bv or 0, cv or 0, 0.0))
+            continue
         if bv is None or cv is None:
             print(f"{c:4d} | {'n/a':>10} | {'n/a':>10} | {'n/a':>8} | SKIP")
             continue
