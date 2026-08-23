@@ -111,6 +111,17 @@ jobs:
           cargo clippy -p arle --release --no-default-features --features cuda,no-cuda,cli,nccl,deepep --bin arle -- -D warnings
           cargo clippy -p cli --release --no-default-features --features cuda,no-cuda,nccl,deepep -- -D warnings
 
+      # First-run baseline: advisories are reported but do not fail the lane.
+      # Flip continue-on-error to false once the tree is clean.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        continue-on-error: true
+        run: cargo audit
+
   # Two lanes by feature set (cargo rebuilds on feature change, so crates
   # sharing a set share one build). `--lib` on the backend lane is a no-op for
   # infer-api/cli/arle (no tests/ dir) and load-bearing for autograd/train
