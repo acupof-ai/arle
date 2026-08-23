@@ -232,7 +232,7 @@ impl Dsv4CudaExecutor {
         if !params.is_raw_argmax() || params.has_penalty() {
             return Ok(None);
         }
-        if self.spec_requested() || self.dspark.is_some() {
+        if self.spec_requested() || self.dspark.is_some() || !dsv4_decode_graph_enabled() {
             return Ok(None);
         }
         #[cfg(feature = "deepep")]
@@ -712,4 +712,13 @@ impl Dsv4CudaExecutor {
             .map(|token| Self::slot_token(slot, token))
             .collect())
     }
+}
+
+/// Matched-A/B control arm: `ARLE_DSV4_DECODE_GRAPH=0` runs the eager path.
+fn dsv4_decode_graph_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::runtime_flags::qwen35_decode_graph()
+            && std::env::var_os("ARLE_DSV4_DECODE_GRAPH").is_none_or(|v| v != "0")
+    })
 }
