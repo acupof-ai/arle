@@ -47,7 +47,7 @@ impl WeightTensor {
     /// weight is dequantized (raw layout `[out, in]`) then transposed to match
     /// the `Dense` convention. Used to row-concatenate projections whose
     /// quantized layouts cannot be merged in place (mixed-bit per-weight quant).
-    fn to_dense_in_out(&self) -> MlxArray {
+    pub(crate) fn to_dense_in_out(&self) -> MlxArray {
         match self {
             WeightTensor::Dense(w_t) => w_t.clone(),
             WeightTensor::Quantized {

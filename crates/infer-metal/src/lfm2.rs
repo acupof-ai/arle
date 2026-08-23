@@ -137,7 +137,12 @@ pub(crate) fn load_lfm2_metal_weights(
             let op_norm = get(&format!("{lp}.operator_norm.weight"))?;
             let ffn_norm = get(&format!("{lp}.ffn_norm.weight"))?;
             let ffn = if lfm2.is_moe_layer(i) {
-                Lfm2Ffn::Moe(load_moe_ffn(&tensors, &lp, &lfm2.moe)?)
+                Lfm2Ffn::Moe(load_moe_ffn(
+                    &tensors,
+                    &lp,
+                    &lfm2.moe,
+                    config.quantization.as_ref(),
+                )?)
             } else {
                 load_dense_ffn(&lp, &load_proj)?
             };
@@ -206,15 +211,22 @@ fn load_moe_ffn(
     tensors: &TensorMap,
     lp: &str,
     moe: &crate::config::MetalLfm2MoeConfig,
+    quantization: Option<&crate::config::QuantConfig>,
 ) -> Result<Lfm2MoeWeights> {
     let base = format!("{lp}.feed_forward");
     let num_experts =
         i32::try_from(moe.num_experts).context("LFM2 num_experts does not fit i32")?;
     let top_k = i32::try_from(moe.num_experts_per_tok)
         .context("LFM2 num_experts_per_tok does not fit i32")?;
+    // Router may be quantized (8-bit) in some checkpoints; dequantize to dense
+    // because the C++ MoE block uses matmul, not quantized_matmul, for the router.
+    let router =
+        match load_proj_from_tensors(tensors, &format!("{base}.gate"), quantization.cloned())? {
+            d @ WeightTensor::Dense(_) => d,
+            q @ WeightTensor::Quantized { .. } => WeightTensor::Dense(q.to_dense_in_out()),
+        };
     Ok(Lfm2MoeWeights {
-        // Dense f32 [E, H] in the checkpoint; load_proj transposes to [H, E].
-        router: load_proj_from_tensors(tensors, &format!("{base}.gate"), None)?,
+        router,
         expert_bias: tensor_get(tensors, &format!("{base}.expert_bias"))?,
         switch_gate: load_stacked_quantized(tensors, &format!("{base}.switch_mlp.gate_proj"))?,
         switch_up: load_stacked_quantized(tensors, &format!("{base}.switch_mlp.up_proj"))?,
@@ -279,15 +291,17 @@ impl CppLfm2Model {
                         group_size,
                         bits,
                         mode,
-                    } => mlx_sys::lfm2_compiled_add_quant_weight(
-                        model,
-                        w.as_raw(),
-                        scales.as_raw(),
-                        MlxArray::as_raw_opt(biases.as_ref()),
-                        *group_size,
-                        *bits,
-                        *mode as i32,
-                    ),
+                    } => {
+                        mlx_sys::lfm2_compiled_add_quant_weight(
+                            model,
+                            w.as_raw(),
+                            scales.as_raw(),
+                            MlxArray::as_raw_opt(biases.as_ref()),
+                            *group_size,
+                            *bits,
+                            *mode as i32,
+                        )
+                    }
                 }
             };
             if id < 0 {
@@ -582,6 +596,127 @@ impl CppLfm2Model {
         }
         // SAFETY: the bridge wrote a valid owned handle on success.
         Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    /// DSpark block-verification forward: runs `block_len` tokens in one pass
+    /// with FULL logits (all positions) and hidden/conv capture enabled. The
+    /// captured tails are read back via `drain_captured_hidden` /
+    /// `drain_captured_conv_inputs`; clear with `clear_capture_layers` after.
+    pub(crate) fn verify_block_session(
+        &self,
+        tokens: &MlxArray,
+        block_len: i32,
+        cache_pos: i32,
+        capture_layer_ids: &[usize],
+    ) -> Result<MlxArray> {
+        let ids: Vec<i32> = capture_layer_ids
+            .iter()
+            .map(|&id| i32::try_from(id).context("capture layer id does not fit in i32"))
+            .collect::<Result<Vec<_>>>()?;
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // SAFETY: FFI over live session arrays.
+        let rc = unsafe {
+            mlx_sys::lfm2_compiled_verify_block_session(
+                self.raw,
+                tokens.as_raw(),
+                block_len,
+                cache_pos,
+                ids.as_ptr(),
+                ids.len() as i32,
+                &raw mut out_logits,
+            )
+        };
+        if rc != 0 {
+            return Err(crate::mlx::check_mlx_error().unwrap_err());
+        }
+        // SAFETY: the bridge wrote a valid owned handle on success.
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    pub(crate) fn set_capture_layers(&self, layer_ids: &[usize]) -> Result<()> {
+        let ids: Vec<i32> = layer_ids
+            .iter()
+            .map(|&id| i32::try_from(id).context("capture layer id does not fit in i32"))
+            .collect::<Result<Vec<_>>>()?;
+        // SAFETY: FFI over valid owned handle and live caller buffer.
+        unsafe {
+            mlx_sys::lfm2_set_capture_layers(self.raw, ids.as_ptr(), ids.len() as i32);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_capture_layers(&self) {
+        // SAFETY: FFI over valid owned handle.
+        unsafe {
+            mlx_sys::lfm2_set_capture_layers(self.raw, std::ptr::null(), 0);
+        }
+    }
+
+    pub(crate) fn drain_captured_hidden(&self) -> Result<Vec<MlxArray>> {
+        Self::drain_captured(
+            self.raw,
+            mlx_sys::lfm2_get_captured_hidden_count,
+            mlx_sys::lfm2_get_captured_hidden,
+            "hidden",
+        )
+    }
+
+    pub(crate) fn drain_captured_conv_inputs(&self) -> Result<Vec<MlxArray>> {
+        Self::drain_captured(
+            self.raw,
+            mlx_sys::lfm2_get_captured_conv_count,
+            mlx_sys::lfm2_get_captured_conv_input,
+            "conv",
+        )
+    }
+
+    fn drain_captured(
+        raw: *mut std::ffi::c_void,
+        count_fn: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+        get_fn: unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            i32,
+            *mut *mut mlx_sys::mlx_array,
+        ) -> i32,
+        what: &str,
+    ) -> Result<Vec<MlxArray>> {
+        // SAFETY: FFI over valid owned handle; rc/error checked after.
+        let n_cap = unsafe { count_fn(raw) };
+        anyhow::ensure!(
+            n_cap >= 0,
+            "LFM2 captured-{what} count was negative: {n_cap}"
+        );
+        (0..n_cap)
+            .map(|idx| {
+                let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                // SAFETY: FFI over valid owned handle.
+                let rc = unsafe { get_fn(raw, idx, &raw mut h_ptr) };
+                if rc != 0 {
+                    return Err(crate::mlx::check_mlx_error().unwrap_err());
+                }
+                anyhow::ensure!(
+                    !h_ptr.is_null(),
+                    "LFM2 captured-{what} handle #{idx} was null"
+                );
+                // SAFETY: the bridge wrote a valid owned handle on success.
+                Ok(unsafe { MlxArray::from_raw(h_ptr) })
+            })
+            .collect()
+    }
+
+    /// Overwrite the session conv states (used by the DSpark spec loop to
+    /// roll the conv window back to the accepted position without a re-run).
+    pub(crate) fn set_session_conv_states(&self, conv_states: &[MlxArray]) -> Result<()> {
+        let mut ptrs: Vec<*mut mlx_sys::mlx_array> =
+            conv_states.iter().map(MlxArray::as_raw).collect();
+        // SAFETY: FFI over live session arrays.
+        let rc = unsafe {
+            mlx_sys::lfm2_session_set_conv_states(self.raw, ptrs.as_mut_ptr(), ptrs.len() as i32)
+        };
+        if rc != 0 {
+            return Err(crate::mlx::check_mlx_error().unwrap_err());
+        }
+        Ok(())
     }
 }
 

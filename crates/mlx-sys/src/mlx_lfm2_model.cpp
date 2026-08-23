@@ -58,6 +58,10 @@ std::optional<array> bias_if_affine(const array& biases, int mode) {
     return mode == 0 ? std::optional(biases) : std::nullopt;
 }
 
+bool contains_layer_id(const std::vector<int>& ids, int id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
 // Compiled SwiGLU: silu(gate) * up.
 std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
     auto gate = inputs[0];
@@ -195,6 +199,13 @@ struct Lfm2CompiledModel {
     std::vector<array> current_paged_v;
     std::vector<array> prev_outputs;
 
+    // DSpark speculative-decode capture. When non-empty, forward_impl captures
+    // the residual stream after each listed layer and (for conv layers) the
+    // full conv_input window, appending both to the outputs tail. Read back via
+    // lfm2_get_captured_hidden / lfm2_get_captured_conv_input after the forward.
+    std::vector<int> capture_layer_ids;
+    bool capture_conv_inputs = false;
+
     static const bool mlp_compile() {
         static const bool on = std::getenv("INFER_METAL_NO_MLP_COMPILE") == nullptr;
         return on;
@@ -219,7 +230,8 @@ struct Lfm2CompiledModel {
     array conv_step(
         const array& x, const Lfm2ConvLayer& lw,
         const array& conv_state_in,
-        array& conv_state_out) const {
+        array& conv_state_out,
+        std::vector<array>* captured_conv_inputs) const {
         int B = current_batch_size;
         int S = current_seq_len;
         int H = hidden_size;
@@ -231,6 +243,10 @@ struct Lfm2CompiledModel {
 
         int n_keep = conv_kernel - 1;
         auto conv_input = concatenate({conv_state_in, h}, 1);  // [B, S+n_keep, H]
+        // DSpark: save the full conv window so the spec loop can slice the
+        // 2-frame conv state at any accepted position (avoids a re-run on
+        // partial acceptance).
+        if (captured_conv_inputs) captured_conv_inputs->push_back(conv_input);
         conv_state_out = contiguous(slice(
             conv_input, {0, S, 0}, {B, S + n_keep, H}));
         auto conv_out = conv1d(conv_input, lw.conv_w, 1, 0, 1, H);  // [B, S, H]
@@ -292,7 +308,8 @@ struct Lfm2CompiledModel {
     //   [0]            : token ids
     //   [1 .. 1+2F)    : k_cache_i, v_cache_i for F full-attn layers
     //   [1+2F .. 1+2F+C) : conv_state_i for C conv layers
-    // outputs: [logits, new_kv..., new_conv...]
+    // outputs: [logits, new_kv..., new_conv..., captured_conv_inputs..., captured_hidden...]
+    // The captured tails are only present when capture_layer_ids is non-empty.
     std::vector<array> forward_impl(const std::vector<array>& inputs) const {
         auto token_id = inputs[0];
         int B = current_batch_size;
@@ -306,6 +323,14 @@ struct Lfm2CompiledModel {
         std::vector<array> new_conv(C, array(0));
         int full_idx = 0, conv_idx = 0;
 
+        const bool capture = !capture_layer_ids.empty();
+        std::vector<array> captured_hidden;
+        std::vector<array> captured_conv_inputs;
+        if (capture) {
+            captured_hidden.reserve(capture_layer_ids.size());
+            if (capture_conv_inputs) captured_conv_inputs.reserve(C);
+        }
+
         for (int i = 0; i < (int)layers.size(); ++i) {
             auto& layer = layers[i];
             auto residual = x;
@@ -315,7 +340,8 @@ struct Lfm2CompiledModel {
             array attn_out(0);
             if (layer.is_conv) {
                 int si = 1 + 2 * F + conv_idx;
-                attn_out = conv_step(xn, layer.conv, inputs[si], new_conv[conv_idx]);
+                attn_out = conv_step(xn, layer.conv, inputs[si], new_conv[conv_idx],
+                                     capture_conv_inputs ? &captured_conv_inputs : nullptr);
                 conv_idx++;
             } else {
                 int si = 1 + 2 * full_idx;
@@ -346,6 +372,10 @@ struct Lfm2CompiledModel {
                 x = residual2 + dense_mlp(xn2, layer.attn.gate_up, layer.attn.down,
                                           layer.attn.gate_dim);
             }
+            // DSpark: capture the post-layer residual stream at target layers.
+            if (capture && contains_layer_id(capture_layer_ids, i)) {
+                captured_hidden.push_back(x);
+            }
         }
 
         auto final_x = fast::rms_norm(x, embedding_norm_w, rms_eps);
@@ -355,10 +385,12 @@ struct Lfm2CompiledModel {
         auto logits = use_embed_as_linear ? embed_as_linear.apply(final_x) : lm_head.apply(final_x);
 
         std::vector<array> outputs;
-        outputs.reserve(1 + 2 * F + C);
+        outputs.reserve(1 + 2 * F + C + captured_conv_inputs.size() + captured_hidden.size());
         outputs.push_back(std::move(logits));
         for (auto& kv : new_kv) outputs.push_back(std::move(kv));
         for (auto& c : new_conv) outputs.push_back(std::move(c));
+        for (auto& ci : captured_conv_inputs) outputs.push_back(std::move(ci));
+        for (auto& h : captured_hidden) outputs.push_back(std::move(h));
         return outputs;
     }
 
@@ -751,6 +783,152 @@ int32_t lfm2_compiled_prefill_session(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_compiled_verify_block_session(
+    void* model, mlx_array* token_ids, int32_t block_len, int32_t cache_pos,
+    const int32_t* capture_layer_ids, int32_t capture_count,
+    mlx_array** out_logits) {
+    auto* m = reinterpret_cast<Lfm2CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if (!m->session_active) {
+            throw std::runtime_error("lfm2 verify_block requires an active session");
+        }
+        m->capture_layer_ids.clear();
+        m->capture_conv_inputs = false;
+        if (capture_layer_ids && capture_count > 0) {
+            m->capture_layer_ids.assign(capture_layer_ids, capture_layer_ids + capture_count);
+            m->capture_conv_inputs = true;
+        }
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = block_len;
+        m->current_last_logits_only = false;  // full logits for verification
+        m->current_has_paged_prefix = false;
+        m->current_paged_k.clear();
+        m->current_paged_v.clear();
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + m->session_kv_caches.size() + m->session_conv_states.size());
+        inputs.push_back(*to_arr(token_ids));
+        for (const auto& kv : m->session_kv_caches) inputs.push_back(kv);
+        for (const auto& c : m->session_conv_states) inputs.push_back(c);
+
+        auto outputs = m->forward(inputs);
+
+        std::vector<array> next_kv, next_conv;
+        for (size_t i = 0; i < m->session_kv_caches.size(); ++i) {
+            next_kv.push_back(std::move(outputs[1 + i]));
+        }
+        for (size_t i = 0; i < m->session_conv_states.size(); ++i) {
+            next_conv.push_back(std::move(outputs[1 + m->session_kv_caches.size() + i]));
+        }
+        *out_logits = from_arr(std::move(outputs[0]));
+        m->session_kv_caches = std::move(next_kv);
+        m->session_conv_states = std::move(next_conv);
+
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        return 0;
+    } catch (const std::exception& e) {
+        m->capture_layer_ids.clear();
+        m->capture_conv_inputs = false;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+void lfm2_set_capture_layers(void* model, const int32_t* layer_ids, int32_t count) {
+    auto* m = reinterpret_cast<Lfm2CompiledModel*>(model);
+    m->capture_layer_ids.clear();
+    m->capture_conv_inputs = false;
+    if (layer_ids && count > 0) {
+        m->capture_layer_ids.assign(layer_ids, layer_ids + count);
+        m->capture_conv_inputs = true;
+    }
+}
+
+int32_t lfm2_get_captured_hidden_count(void* model) {
+    auto* m = reinterpret_cast<Lfm2CompiledModel*>(model);
+    int hidden_count = static_cast<int>(m->capture_layer_ids.size());
+    if (hidden_count <= 0) return 0;
+    if ((int)m->prev_outputs.size() < hidden_count) return 0;
+    return static_cast<int32_t>(hidden_count);
+}
+
+int32_t lfm2_get_captured_hidden(void* model, int32_t idx, mlx_array** out) {
+    try {
+        auto* m = reinterpret_cast<Lfm2CompiledModel*>(model);
+        int hidden_count = static_cast<int>(m->capture_layer_ids.size());
+        if (hidden_count <= 0)
+            throw std::out_of_range("no captured hidden states are active");
+        if ((int)m->prev_outputs.size() < hidden_count)
+            throw std::out_of_range("captured hidden output tail is shorter than capture count");
+        int hi = static_cast<int>(m->prev_outputs.size()) - hidden_count + idx;
+        if (hi < 0 || hi >= (int)m->prev_outputs.size())
+            throw std::out_of_range("captured hidden index out of range");
+        *out = reinterpret_cast<mlx_array*>(new array(m->prev_outputs[hi]));
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_get_captured_conv_count(void* model) {
+    auto* m = reinterpret_cast<Lfm2CompiledModel*>(model);
+    if (!m->capture_conv_inputs) return 0;
+    int conv_count = m->n_conv;
+    int hidden_count = static_cast<int>(m->capture_layer_ids.size());
+    if ((int)m->prev_outputs.size() < hidden_count + conv_count) return 0;
+    return static_cast<int32_t>(conv_count);
+}
+
+int32_t lfm2_get_captured_conv_input(void* model, int32_t idx, mlx_array** out) {
+    try {
+        auto* m = reinterpret_cast<Lfm2CompiledModel*>(model);
+        if (!m->capture_conv_inputs)
+            throw std::out_of_range("conv input capture is not active");
+        int conv_count = m->n_conv;
+        int hidden_count = static_cast<int>(m->capture_layer_ids.size());
+        if ((int)m->prev_outputs.size() < hidden_count + conv_count)
+            throw std::out_of_range("captured conv output tail is too short");
+        int hi = static_cast<int>(m->prev_outputs.size()) - hidden_count - conv_count + idx;
+        if (hi < 0 || hi >= (int)m->prev_outputs.size())
+            throw std::out_of_range("captured conv input index out of range");
+        *out = reinterpret_cast<mlx_array*>(new array(m->prev_outputs[hi]));
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t lfm2_session_set_conv_states(void* model, mlx_array** conv_states, int32_t n) {
+    auto* m = reinterpret_cast<Lfm2CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if (!m->session_active) {
+            throw std::runtime_error("lfm2_session_set_conv_states requires an active session");
+        }
+        if (n != m->n_conv) {
+            throw std::runtime_error("lfm2_session_set_conv_states conv count mismatch");
+        }
+        m->session_conv_states.clear();
+        for (int32_t i = 0; i < n; ++i) {
+            if (!conv_states[i]) throw std::runtime_error("null conv state input");
+            m->session_conv_states.push_back(*to_arr(conv_states[i]));
+        }
+        return 0;
+    } catch (const std::exception& e) {
         mlx_set_error(e.what());
         return -1;
     }
