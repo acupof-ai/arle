@@ -764,12 +764,15 @@ fn serve_handle_relay_driver<E, K>(
                     // Bind recv() in its own scope so the work_rx guard drops
                     // BEFORE relay_stream's long blocking loop — else one worker
                     // holds the lock for its whole stream, collapsing the pool.
-                    let next = { work_rx.lock().unwrap().recv() };
+                    let next = { work_rx.lock().unwrap_or_else(|e| e.into_inner()).recv() };
                     let Ok((request_id, _ticket, rx)) = next else {
                         break;
                     };
                     relay_stream(request_id, rx, &tx);
-                    handles.lock().unwrap().remove(&request_id);
+                    handles
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&request_id);
                     // _ticket drops here — live_requests decremented after relay completes
                 }
             })
@@ -820,7 +823,10 @@ fn serve_handle_relay_driver<E, K>(
                                         // Insert BEFORE handing to a worker so the
                                         // worker's remove-at-stream-end can never
                                         // race the insert.
-                                        handles.lock().unwrap().insert(request_id, ticket.handle());
+                                        handles
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .insert(request_id, ticket.handle());
                                         let _ = work_tx.send((request_id, ticket, rx));
                                     }
                                     Err(e) => {
@@ -842,7 +848,11 @@ fn serve_handle_relay_driver<E, K>(
                         // a missing/finished handle is a benign race with natural
                         // finish.
                         RelayEnvelope::CancelRequest { request_id } => {
-                            let handle = handles.lock().unwrap().get(&request_id).copied();
+                            let handle = handles
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&request_id)
+                                .copied();
                             if let Some(handle) = handle
                                 && serve
                                     .run_on_engine(move |engine| engine.cancel_request(handle))

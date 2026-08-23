@@ -352,8 +352,14 @@ pub(crate) fn dsv4_moe_forward_deepep_ll(
 
     let m = scratch.m_padded;
     let sfa_aligned_m = scratch.sfa_aligned_m;
-    let w13 = layer.w13_grouped.as_ref().unwrap();
-    let w2 = layer.w2_grouped.as_ref().unwrap();
+    let w13 = layer
+        .w13_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("deepep_ll layer missing grouped w13 weights"))?;
+    let w2 = layer
+        .w2_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("deepep_ll layer missing grouped w2 weights"))?;
     ensure!(
         w13.groups == num_local_experts
             && w2.groups == num_local_experts

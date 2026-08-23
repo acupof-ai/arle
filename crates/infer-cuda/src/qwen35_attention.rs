@@ -1232,7 +1232,9 @@ impl Qwen35Model {
                         if hop == 0 {
                             (&*m_a, &*l_a, &*o_a)
                         } else {
-                            let acc = fa3_acc.as_ref().unwrap();
+                            let acc = fa3_acc.as_ref().ok_or_else(|| {
+                                anyhow!("ring attention hop>0 without accumulated FA3 state")
+                            })?;
                             (&acc.0, &acc.1, &acc.2)
                         };
                     let (m_out, l_out, o_out) =
@@ -1266,7 +1268,9 @@ impl Qwen35Model {
                 }
             }
             if active {
-                let acc = fa3_acc.as_ref().unwrap();
+                let acc = fa3_acc.as_ref().ok_or_else(|| {
+                    anyhow!("ring attention finalize without accumulated FA3 state")
+                })?;
                 self.ring_prefill_finalize(&acc.1, &acc.2, attn_out, q_heads, rows, full_idx)?;
             }
         } else {
@@ -1890,7 +1894,9 @@ impl Qwen35Model {
                 // B2: allocate the decode recurrent pair (first B2 step for
                 // this slot) and scatter this layer's head subset into it.
                 if b2 {
-                    let cp = cp_decode.unwrap();
+                    let cp = cp_decode.ok_or_else(|| {
+                        anyhow!("linear attention b2 decode lane without cp_decode state")
+                    })?;
                     let (num_linear, gdr_len_d, conv_len_d) =
                         self.recurrent_dims_decode(cp.cp_size);
                     let slot = &mut *rs[0].slot;
@@ -1908,7 +1914,9 @@ impl Qwen35Model {
                     )?;
                 }
                 let decode_geom = if b2 {
-                    let cp = cp_decode.unwrap();
+                    let cp = cp_decode.ok_or_else(|| {
+                        anyhow!("linear attention b2 decode lane without cp_decode state")
+                    })?;
                     let (v_off, _) = cp.subset(self.local_linear_v_heads);
                     Some(LinearDecodeGeom {
                         qkv_dim,
@@ -2341,7 +2349,8 @@ impl Qwen35Model {
                 .ctx
                 .bind_to_thread()
                 .map_err(|e| anyhow!("bind CUDA context for chunked GDR failed: {e}"))?;
-            let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns.unwrap();
+            let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns
+                .ok_or_else(|| anyhow!("chunked GDR fq_fns missing despite use_fq_chunked gate"))?;
             let hg_dim = k_heads * c.linear_key_head_dim;
             let fq_q = fq_q.get(&self.ctx, hg_dim, seq_len)?;
             let fq_k = fq_k.get(&self.ctx, hg_dim, seq_len)?;
