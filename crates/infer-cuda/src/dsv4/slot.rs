@@ -519,6 +519,16 @@ impl Dsv4SlotState {
         }
     }
 
+    /// Rewind the host counters a decode closure advanced, without touching
+    /// the FlashMLA pool cursor (`prepare_kv_batch` already advanced it for
+    /// the step that the eager fallback is about to run).
+    pub(crate) fn rewind_host_counters(&mut self, layers: &[Dsv4Layer], len: usize) {
+        self.seq_len = len;
+        for (layer, state) in layers.iter().zip(&mut self.attention) {
+            state.truncate_decode_len(layer.mode, layer.compress_ratio, len);
+        }
+    }
+
     pub(crate) fn truncate(
         &mut self,
         layers: &[Dsv4Layer],
