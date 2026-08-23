@@ -544,6 +544,7 @@ Defaults to `$HOME/.cache/huggingface`.
 | `CONCURRENT_DEPTH` | `0` | Concurrent arm: needle depth % (set 50 under `--kv-recall`) |
 | `ARLE_PRE_PUSH_METAL` | `0` | Run the Metal needle gate in the pre-push hook |
 | `ARLE_METAL_AVAILABLE_RESERVE_MB` | `6144` (6 GiB) | Metal anti-swap reserve in MB; lower for CI runners with constrained RAM |
+| `ARLE_METAL_RUNTIME_HEADROOM_MB` | `4096` (4 GiB) | Metal runtime headroom in MB; lower for CI runners with constrained RAM |
 
 ---
 

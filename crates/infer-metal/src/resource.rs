@@ -52,6 +52,20 @@ fn available_reserve_bytes(low_impact: bool) -> usize {
         .unwrap_or(base)
 }
 
+fn runtime_headroom_bytes(low_impact: bool) -> usize {
+    let base = if low_impact {
+        LOW_IMPACT_RUNTIME_HEADROOM_BYTES
+    } else {
+        DEFAULT_RUNTIME_HEADROOM_BYTES
+    };
+    // CI runners override the runtime headroom (7 GiB total, 0.8B model).
+    std::env::var("ARLE_METAL_RUNTIME_HEADROOM_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(base)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MetalResourceRequest {
     pub kv_cache_dtype: MetalKvCacheDtype,
@@ -279,11 +293,7 @@ pub fn plan_resource_budget(
             ACTIVE_SWAPOUT_GUARD_BYTES / MIB,
         );
     }
-    let runtime_headroom_bytes = if request.low_impact {
-        LOW_IMPACT_RUNTIME_HEADROOM_BYTES
-    } else {
-        DEFAULT_RUNTIME_HEADROOM_BYTES
-    };
+    let runtime_headroom_bytes = runtime_headroom_bytes(request.low_impact);
     let cache_limit_bytes = if request.low_impact {
         LOW_IMPACT_CACHE_LIMIT_BYTES
     } else {
@@ -434,11 +444,7 @@ pub fn plan_weight_only_resource_budget(
         );
     }
 
-    let runtime_headroom_bytes = if request.low_impact {
-        LOW_IMPACT_RUNTIME_HEADROOM_BYTES
-    } else {
-        DEFAULT_RUNTIME_HEADROOM_BYTES
-    };
+    let runtime_headroom_bytes = runtime_headroom_bytes(request.low_impact);
     let cache_limit_bytes = if request.low_impact {
         LOW_IMPACT_CACHE_LIMIT_BYTES
     } else {
