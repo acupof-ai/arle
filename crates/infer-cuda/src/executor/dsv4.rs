@@ -241,7 +241,7 @@ impl Dsv4CudaExecutor {
         }
 
         let graph = self.decode_graphs[slot_idx].get_or_insert_with(|| {
-            crate::graph::CudaGraphState::new(self.model.ctx.stream.clone())
+            crate::graph::CudaGraphState::new(self.model.ctx.stream.clone()).reject_alloc_nodes()
         });
 
         let model = &self.model;

@@ -32,6 +32,7 @@ pub struct CudaGraphState {
     /// future model) is capture-safe by construction instead of each call
     /// site rediscovering error 900.
     warm_remaining: u32,
+    reject_alloc_nodes: bool,
 }
 
 // SAFETY: the wrapped `CudaGraph` holds `!Send` handles (a CUDA graph must be
@@ -49,7 +50,19 @@ impl CudaGraphState {
             graph: None,
             bypass: false,
             warm_remaining: 1,
+            reject_alloc_nodes: false,
         }
+    }
+
+    /// Reject a capture that allocates. Alloc nodes are legal under
+    /// `AUTO_FREE_ON_LAUNCH` but re-allocate through the async pool on every
+    /// replay: at 1296 of them the DSv4 c=1 graph measured 23% SLOWER than
+    /// eager, and the warning alone let that ship. A caller whose scratch is
+    /// meant to be fully persistent sets this so the regression fails the
+    /// capture (and falls back to eager) instead of silently degrading.
+    pub fn reject_alloc_nodes(mut self) -> Self {
+        self.reject_alloc_nodes = true;
+        self
     }
 
     /// Re-arm `n` eager warm runs without dropping the captured graph. Called
@@ -137,6 +150,15 @@ impl CudaGraphState {
                     "captured graph is host-coupled: {} host-side memcpy node(s), {} host-callback node(s)                      of {} total — per-step values must be device-derived or pre-replay updates into                      persistent buffers (graph discarded; see errors/2026-06-10 graph rekill entry)",
                     a.host_memcpy_nodes,
                     a.host_fn_nodes,
+                    a.total_nodes,
+                );
+                ensure!(
+                    !(self.reject_alloc_nodes && a.mem_alloc_nodes > 0),
+                    "captured graph allocates: {} alloc / {} free node(s) of {} — this caller \
+                     declared fully persistent scratch, so an allocation is a regression \
+                     (graph discarded, eager fallback); see wins/2026-08-23-dsv4-c1-decode-graph",
+                    a.mem_alloc_nodes,
+                    a.mem_free_nodes,
                     a.total_nodes,
                 );
                 if a.mem_alloc_nodes > 0 {
