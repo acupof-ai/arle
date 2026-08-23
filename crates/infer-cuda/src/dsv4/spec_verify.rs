@@ -262,6 +262,7 @@ impl Dsv4Model {
                     stream,
                     normed,
                     &mut keepalive,
+                    false,
                 )?;
 
                 if let Some(cache) = slot.spec_normed.as_mut() {
@@ -328,6 +329,7 @@ impl Dsv4Model {
                     stream,
                     normed,
                     &mut keepalive,
+                    false,
                 )?;
 
                 if let Some(dense) = layer.dense_mlp.as_ref() {

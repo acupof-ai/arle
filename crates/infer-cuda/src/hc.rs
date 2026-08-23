@@ -7,7 +7,7 @@
 //! and the post/comb weights scatter the sub-block output back across the lanes
 //! and re-mix the residual. Reuses the shared `dsv4_mhc_*` kernels; the math is
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 use cuda_kernels::tensor_ops;
 use cudarc::driver::CudaSlice;
@@ -17,11 +17,11 @@ use crate::dsv4::Dsv4HyperConnection;
 
 pub(crate) struct MhcParams {
     /// `[seq_len * hc_mult]` pre-mix lane weights (stream → hidden).
-    pub pre: CudaSlice<f32>,
+    pub pre: crate::dsv4::StepSlice<f32>,
     /// `[seq_len * hc_mult]` post-mix lane weights (new hidden → stream lanes).
-    pub post: CudaSlice<f32>,
+    pub post: crate::dsv4::StepSlice<f32>,
     /// `[seq_len * hc_mult * hc_mult]` residual re-combination weights.
-    pub comb: CudaSlice<f32>,
+    pub comb: crate::dsv4::StepSlice<f32>,
 }
 
 pub(crate) fn initial_stream_from_embeddings(
@@ -56,11 +56,16 @@ pub(crate) fn initial_stream_from_embeddings(
 }
 
 pub(crate) fn gen_mhc_params(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
+    model: &crate::dsv4::Dsv4Model,
     hc: &Dsv4HyperConnection,
     stream: &HiddenStates,
+    graph_mode: bool,
+    layer_idx: usize,
+    half: u8,
 ) -> Result<MhcParams> {
+    use crate::dsv4::GraphSlot;
+    let ctx = &model.ctx;
+    let config = &model.config;
     let hc_mult = config.hc_mult;
     ensure!(hc_mult > 0, "DSv4 MHC requires non-zero hc_mult");
     let mix_dim = (2 + hc_mult) * hc_mult;
@@ -78,28 +83,22 @@ pub(crate) fn gen_mhc_params(
         hc.scale.len
     );
 
-    // SAFETY: dsv4_linear writes the full mix buffer.
-    let mut mixes = unsafe { HiddenStates::uninit(ctx, hc.mix_fn.rows, stream.seq_len)? };
+    let mut mixes = model.step_hidden(
+        graph_mode,
+        (layer_idx, GraphSlot::HcMixes(half)),
+        hc.mix_fn.rows,
+        stream.seq_len,
+    )?;
     crate::attention::dsv4_linear(ctx, &hc.mix_fn, stream, &mut mixes)?;
 
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut pre = unsafe {
-        ctx.stream
-            .alloc::<f32>(stream.seq_len * hc_mult)
-            .map_err(|e| anyhow!("DSv4 HC pre alloc failed: {e}"))?
-    };
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut post = unsafe {
-        ctx.stream
-            .alloc::<f32>(stream.seq_len * hc_mult)
-            .map_err(|e| anyhow!("DSv4 HC post alloc failed: {e}"))?
-    };
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut comb = unsafe {
-        ctx.stream
-            .alloc::<f32>(stream.seq_len * hc_mult * hc_mult)
-            .map_err(|e| anyhow!("DSv4 HC comb alloc failed: {e}"))?
-    };
+    let n = stream.seq_len * hc_mult;
+    let mut pre = model.step_f32(graph_mode, (layer_idx, GraphSlot::HcPre(half)), n)?;
+    let mut post = model.step_f32(graph_mode, (layer_idx, GraphSlot::HcPost(half)), n)?;
+    let mut comb = model.step_f32(
+        graph_mode,
+        (layer_idx, GraphSlot::HcComb(half)),
+        n * hc_mult,
+    )?;
 
     tensor_ops::dsv4_mhc_params(
         ctx,
@@ -107,9 +106,9 @@ pub(crate) fn gen_mhc_params(
         &mixes.data,
         &hc.base.data,
         &hc.scale.data,
-        &mut pre,
-        &mut post,
-        &mut comb,
+        &mut *pre,
+        &mut *post,
+        &mut *comb,
         stream.seq_len,
         stream.hidden_dim,
         mixes.hidden_dim,

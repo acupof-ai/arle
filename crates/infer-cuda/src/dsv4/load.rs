@@ -47,6 +47,7 @@ pub(crate) fn load_dspark_draft(
                 split,
                 DeepSeekV4MoeRoutingKind::LearnedBias,
                 false,
+                crate::dsv4::GRAPH_DSPARK_LAYER_BASE + stage_idx,
             )?;
             Ok(Dsv4DsparkStage {
                 layer: Dsv4Layer {
@@ -429,6 +430,7 @@ impl Dsv4Model {
                     &split,
                     config.moe_routing_kind(layer_idx),
                     glm,
+                    layer_idx,
                 )?;
                 (Some(moe), None)
             };
@@ -478,6 +480,7 @@ impl Dsv4Model {
                 &split,
                 DeepSeekV4MoeRoutingKind::LearnedBias,
                 false,
+                crate::dsv4::GRAPH_MTP_LAYER,
             )?;
             let compress_ratio = 0;
             Some(Dsv4MtpLayer {
@@ -527,7 +530,9 @@ impl Dsv4Model {
             graph_mode: std::sync::atomic::AtomicBool::new(false),
             graph_token_ids: std::sync::Mutex::new(None),
             graph_token_ids_u32: std::sync::Mutex::new(None),
-            graph_bufs: std::sync::Mutex::new(Vec::new()),
+            graph_bufs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            graph_f32: std::sync::Mutex::new(std::collections::HashMap::new()),
+            graph_i32: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -1033,6 +1038,7 @@ impl SafetensorLoader {
         // GLM (`weight_scale_inv` FP8) ⇒ re-encode experts into the DSv4 FP8+E8M0
         // layout the grouped DeepGEMM cache consumes; DSv4 loads E8M0 directly.
         glm: bool,
+        layer_idx: usize,
     ) -> Result<crate::dsv4::Dsv4MoeLayer> {
         use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
         use deepseek_spec::DeepSeekV4MoeRoutingKind;
@@ -1482,6 +1488,7 @@ impl SafetensorLoader {
         };
 
         Ok(crate::dsv4::Dsv4MoeLayer {
+            layer_idx,
             w13_grouped,
             w2_grouped,
             w13_w4a16,

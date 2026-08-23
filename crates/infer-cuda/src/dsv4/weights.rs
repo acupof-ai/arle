@@ -176,6 +176,10 @@ pub(crate) struct Dsv4MoeLayer {
     /// Hash-routed layers only: device `tid2eid` table for the on-device router.
     pub hash_tid2eid_device: Option<CudaSlice<i64>>,
     pub routing_kind: DeepSeekV4MoeRoutingKind,
+    /// Position in `Dsv4Model::layers`; keys this layer's persistent
+    /// decode-graph scratch. DSpark stages / the MTP block use the
+    /// model-level key space above the main stack.
+    pub layer_idx: usize,
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1). GLM
     /// ships F32 `weight_scale_inv` block scales the 1D2D FP8 GEMM reads directly.
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,

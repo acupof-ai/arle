@@ -172,7 +172,7 @@ impl Dsv4Model {
         // SAFETY: embed_stream writes the full stream buffer.
         let mut stream = self.step_hidden(
             graph_mode,
-            super::graph_buf_idx_stream(),
+            (super::GRAPH_MODEL_LAYER, super::GraphSlot::Stream),
             stream_dim,
             seq_len,
         )?;
@@ -204,7 +204,7 @@ impl Dsv4Model {
             // [seq_len, hidden_size] buffer.
             let mut normed = self.step_hidden(
                 graph_mode,
-                super::graph_buf_idx_layer(layer_idx, 0),
+                (layer_idx, super::GraphSlot::NormedAttn),
                 hidden_size,
                 seq_len,
             )?;
@@ -216,6 +216,7 @@ impl Dsv4Model {
                 &stream,
                 &mut normed,
                 &mut keepalive,
+                graph_mode,
             )?;
             keepalive.keep_hidden(&normed);
             if persist_spec_normed {
@@ -234,7 +235,7 @@ impl Dsv4Model {
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = self.step_hidden(
                 graph_mode,
-                super::graph_buf_idx_layer(layer_idx, 1),
+                (layer_idx, super::GraphSlot::AttnOut),
                 hidden_size,
                 seq_len,
             )?;
@@ -348,7 +349,7 @@ impl Dsv4Model {
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut attn_stream = self.step_hidden(
                 graph_mode,
-                super::graph_buf_idx_layer(layer_idx, 2),
+                (layer_idx, super::GraphSlot::AttnStream),
                 stream_dim,
                 seq_len,
             )?;
@@ -368,7 +369,7 @@ impl Dsv4Model {
             // [seq_len, hidden_size] buffer.
             let mut normed = self.step_hidden(
                 graph_mode,
-                super::graph_buf_idx_layer(layer_idx, 3),
+                (layer_idx, super::GraphSlot::NormedFfn),
                 hidden_size,
                 seq_len,
             )?;
@@ -380,13 +381,14 @@ impl Dsv4Model {
                 &stream,
                 &mut normed,
                 &mut keepalive,
+                graph_mode,
             )?;
             keepalive.keep_hidden(&normed);
             // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
             // replaces the routed-expert + shared-expert MoE entirely.
             let mut moe_with_shared = self.step_hidden(
                 graph_mode,
-                super::graph_buf_idx_layer(layer_idx, 4),
+                (layer_idx, super::GraphSlot::MoeWithShared),
                 hidden_size,
                 seq_len,
             )?;
@@ -414,7 +416,7 @@ impl Dsv4Model {
                 // SAFETY: the MoE forward writes the full routed output buffer.
                 let mut moe_out = self.step_hidden(
                     graph_mode,
-                    super::graph_buf_idx_layer(layer_idx, 5),
+                    (layer_idx, super::GraphSlot::MoeOut),
                     hidden_size,
                     seq_len,
                 )?;
@@ -646,7 +648,7 @@ impl Dsv4Model {
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut ffn_stream = self.step_hidden(
                 graph_mode,
-                super::graph_buf_idx_layer(layer_idx, 6),
+                (layer_idx, super::GraphSlot::FfnStream),
                 stream_dim,
                 seq_len,
             )?;

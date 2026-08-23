@@ -10,12 +10,13 @@ use super::{
     DEEPGEMM_CONTIG_ALIGN, DSV4_DECODE_CONTIG_ALIGN, DSV4_DECODE_CONTIG_MAX_ROUTES, alloc_neg1_i32,
     deepgemm_contig_rows_cap,
 };
+use crate::dsv4::GraphSlot;
 use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
 use crate::ops::gemm_batch;
 
 pub(super) struct DeviceRouting {
-    pub(super) indices: CudaSlice<i32>,
-    pub(super) weights: CudaSlice<f32>,
+    pub(super) indices: crate::dsv4::StepSlice<i32>,
+    pub(super) weights: crate::dsv4::StepSlice<f32>,
 }
 
 pub(crate) struct Dsv4SharedDecodeScratch {
@@ -255,14 +256,17 @@ pub(super) fn dsv4_route_device(
         cfg.num_experts
     );
 
-    let route_indices = ctx
-        .stream
-        .alloc_zeros::<i32>(total_routes)
-        .map_err(|e| anyhow::anyhow!("DSv4 device route-index alloc failed: {e}"))?;
-    let route_weights = ctx
-        .stream
-        .alloc_zeros::<f32>(total_routes)
-        .map_err(|e| anyhow::anyhow!("DSv4 device route-weight alloc failed: {e}"))?;
+    let graph_mode = model.graph_mode() && num_tokens == 1;
+    let route_indices = model.step_i32(
+        graph_mode,
+        (layer.layer_idx, GraphSlot::RouteIndices),
+        total_routes,
+    )?;
+    let route_weights = model.step_f32(
+        graph_mode,
+        (layer.layer_idx, GraphSlot::RouteWeights),
+        total_routes,
+    )?;
     let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
         let token_ids = if model.graph_mode() {
             // Graph capture: the persistent pre-replay buffer, not a host-coupled memcpy node.
@@ -381,8 +385,13 @@ pub(crate) fn dsv4_moe_forward(
     let (route_indices, route_weights) =
         crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
             crate::profile::profile_op(ctx, "moe_route", None, num_tokens, || {
-                // SAFETY: router gemm writes the full logits buffer.
-                let mut logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
+                let graph_mode = model.graph_mode() && num_tokens == 1;
+                let mut logits = model.step_hidden(
+                    graph_mode,
+                    (layer.layer_idx, GraphSlot::RouterLogits),
+                    cfg.num_experts,
+                    num_tokens,
+                )?;
                 gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
                 let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
                 Ok((routing.indices, routing.weights))
@@ -831,7 +840,8 @@ fn dsv4_moe_forward_w4a16(
     route_weights: &CudaSlice<f32>,
     hidden: &HiddenStates,
     out: &mut HiddenStates,
-    keepalive: &mut Dsv4ForwardKeepalive,
+    _keepalive: &mut Dsv4ForwardKeepalive,
+    tail: Option<&mut Dsv4MoeTailScratch>,
 ) -> Result<()> {
     let ctx = &model.ctx;
     let cfg = &model.moe_config;
@@ -845,21 +855,30 @@ fn dsv4_moe_forward_w4a16(
     let total_routes = num_tokens * topk;
     let rows = total_routes.max(1);
 
-    let counts = ctx
-        .stream
-        .alloc_zeros::<i32>(experts_per_rank)
-        .map_err(|e| anyhow::anyhow!("DSv4 W4A16 count alloc failed: {e}"))?;
-    let offsets = ctx
-        .stream
-        .alloc_zeros::<i32>(experts_per_rank)
-        .map_err(|e| anyhow::anyhow!("DSv4 W4A16 offset alloc failed: {e}"))?;
-    let scan_total = ctx
-        .stream
-        .alloc_zeros::<i32>(1)
-        .map_err(|e| anyhow::anyhow!("DSv4 W4A16 scan-total alloc failed: {e}"))?;
-    keepalive.keep_i32(&counts);
-    keepalive.keep_i32(&offsets);
-    keepalive.keep_i32(&scan_total);
+    // The model-wide tail scratch is pre-allocated to the band ceiling (zero
+    // per-step allocs, graph-replay stable); the owned fallback only serves
+    // callers without one.
+    let mut owned_tail;
+    let scratch: &mut Dsv4MoeTailScratch = match tail {
+        Some(s) if rows <= s.max_rows => {
+            s.reinit(ctx, rows)?;
+            s
+        }
+        _ => {
+            owned_tail = Dsv4MoeTailScratch::new(ctx, hidden_dim, i_dim, experts_per_rank)?;
+            &mut owned_tail
+        }
+    };
+    let counts = &scratch.counts;
+    let offsets = &scratch.offsets;
+    let scan_total = &scratch.scan_total;
+    let cursors = &scratch.cursors;
+    let packed_hidden = &scratch.packed_hidden;
+    let packed_route_slot = &scratch.packed_route_slot;
+    let packed_weight = &scratch.packed_weight;
+    let act = &scratch.act;
+    let expert_out = &scratch.expert_out;
+    let route_out = &scratch.route_out;
 
     // SAFETY: `route_indices` holds `num_tokens * topk` global expert ids;
     // `counts`/`offsets` hold `experts_per_rank` i32 and `scan_total` one, all
@@ -867,7 +886,7 @@ fn dsv4_moe_forward_w4a16(
     unsafe {
         moe::dsv4_count_local_experts(
             cache_ptr(route_indices, ctx),
-            cache_ptr(&counts, ctx),
+            cache_ptr(counts, ctx),
             num_tokens,
             topk,
             local_start,
@@ -875,28 +894,13 @@ fn dsv4_moe_forward_w4a16(
             ctx.stream.cu_stream(),
         )?;
         moe::dsv4_exclusive_scan_i32(
-            cache_ptr(&counts, ctx),
-            cache_ptr(&offsets, ctx),
-            cache_ptr(&scan_total, ctx),
+            cache_ptr(counts, ctx),
+            cache_ptr(offsets, ctx),
+            cache_ptr(scan_total, ctx),
             experts_per_rank,
             ctx.stream.cu_stream(),
         )?;
     }
-
-    let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-    let packed_route_slot = alloc_neg1_i32(ctx, rows)?;
-    let packed_weight = ctx
-        .stream
-        .alloc_zeros::<f32>(rows)
-        .map_err(|e| anyhow::anyhow!("DSv4 W4A16 packed_weight alloc failed: {e}"))?;
-    let cursors = ctx
-        .stream
-        .alloc_zeros::<i32>(experts_per_rank)
-        .map_err(|e| anyhow::anyhow!("DSv4 W4A16 cursors alloc failed: {e}"))?;
-    keepalive.keep_hidden(&packed_hidden);
-    keepalive.keep_i32(&packed_route_slot);
-    keepalive.keep_f32(&packed_weight);
-    keepalive.keep_i32(&cursors);
 
     // SAFETY: `hidden`/`route_indices`/`route_weights` hold `num_tokens` rows × `topk`
     // routes; packed_* hold `rows = max(total_routes, 1)`, `cursors`/`offsets`
@@ -906,11 +910,11 @@ fn dsv4_moe_forward_w4a16(
             cache_ptr(&hidden.data, ctx),
             cache_ptr(route_indices, ctx),
             cache_ptr(route_weights, ctx),
-            cache_ptr(&offsets, ctx),
-            cache_ptr(&cursors, ctx),
+            cache_ptr(offsets, ctx),
+            cache_ptr(cursors, ctx),
             cache_ptr(&packed_hidden.data, ctx),
-            cache_ptr(&packed_route_slot, ctx),
-            cache_ptr(&packed_weight, ctx),
+            cache_ptr(packed_route_slot, ctx),
+            cache_ptr(packed_weight, ctx),
             num_tokens,
             hidden_dim,
             topk,
@@ -919,9 +923,6 @@ fn dsv4_moe_forward_w4a16(
             ctx.stream.cu_stream(),
         )?;
     }
-
-    let act = HiddenStates::zeros(ctx, i_dim, rows)?;
-    keepalive.keep_hidden(&act);
 
     // Fused gate+up GEMV with clamped SwiGLU: the kernel accumulates both
     // halves and writes `act` directly, skipping the gate_out/up_out
@@ -938,8 +939,8 @@ fn dsv4_moe_forward_w4a16(
                 cache_ptr(&tables.up_s, ctx),
                 cache_ptr(&packed_hidden.data, ctx),
                 cache_ptr(&act.data, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&counts, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
                 experts_per_rank,
                 rows,
                 i_dim,
@@ -958,8 +959,8 @@ fn dsv4_moe_forward_w4a16(
                 cache_ptr(&packed_hidden.data, ctx),
                 cache_ptr(&act.data, ctx),
                 None,
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&counts, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
                 cache_ptr(&tables.expert_indices, ctx),
                 experts_per_rank,
                 rows,
@@ -975,8 +976,6 @@ fn dsv4_moe_forward_w4a16(
         }
     }
 
-    let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-    keepalive.keep_hidden(&expert_out);
     // SAFETY: `tables.w2_*` are the layer-resident W4A16 down tables; `act` is
     // [rows, i_dim] and `expert_out` [rows, hidden_dim], keepalive-held on `ctx.stream`.
     unsafe {
@@ -985,8 +984,8 @@ fn dsv4_moe_forward_w4a16(
             &tables.w2_s,
             cache_ptr(&act.data, ctx),
             cache_ptr(&expert_out.data, ctx),
-            cache_ptr(&offsets, ctx),
-            cache_ptr(&counts, ctx),
+            cache_ptr(offsets, ctx),
+            cache_ptr(counts, ctx),
             cache_ptr(&tables.expert_indices, ctx),
             experts_per_rank,
             rows,
@@ -999,8 +998,6 @@ fn dsv4_moe_forward_w4a16(
         )?;
     }
 
-    let route_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-    keepalive.keep_hidden(&route_out);
     // SAFETY: `expert_out`/`route_out` are [rows, hidden_dim], `out` is
     // [num_tokens, hidden_dim]; `packed_route_slot` is -1 on padding rows, which
     // the scatter skips; all on `ctx.stream`.
@@ -1008,8 +1005,8 @@ fn dsv4_moe_forward_w4a16(
         moe::dsv4_scatter_all_route_slots(
             cache_ptr(&expert_out.data, ctx),
             cache_ptr(&route_out.data, ctx),
-            cache_ptr(&packed_route_slot, ctx),
-            cache_ptr(&packed_weight, ctx),
+            cache_ptr(packed_route_slot, ctx),
+            cache_ptr(packed_weight, ctx),
             rows,
             hidden_dim,
             ctx.stream.cu_stream(),
@@ -1483,6 +1480,7 @@ fn dsv4_moe_forward_masked_tail(
                 hidden,
                 out,
                 keepalive,
+                tail,
             );
         }
     }
@@ -1507,6 +1505,7 @@ fn dsv4_moe_forward_masked_tail(
                 hidden,
                 out,
                 keepalive,
+                tail,
             );
         }
         return dsv4_moe_forward_w4afp8(

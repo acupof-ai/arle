@@ -82,7 +82,9 @@ pub(crate) struct Dsv4Model {
     pub graph_mode: std::sync::atomic::AtomicBool,
     graph_token_ids: std::sync::Mutex<Option<CudaSlice<i32>>>,
     graph_token_ids_u32: std::sync::Mutex<Option<CudaSlice<u32>>>,
-    graph_bufs: std::sync::Mutex<Vec<Option<HiddenStates>>>,
+    graph_bufs: std::sync::Mutex<std::collections::HashMap<GraphBufKey, HiddenStates>>,
+    graph_f32: std::sync::Mutex<std::collections::HashMap<GraphBufKey, CudaSlice<f32>>>,
+    graph_i32: std::sync::Mutex<std::collections::HashMap<GraphBufKey, CudaSlice<i32>>>,
 }
 
 impl std::fmt::Debug for Dsv4Model {
@@ -99,10 +101,30 @@ impl std::fmt::Debug for Dsv4Model {
     }
 }
 
-/// Persistent-buffer indexing for the c=1 decode graph.
-/// Index 0 = stream output; per-layer base = 1 + layer_idx * 7.
-/// Per-layer offsets: 0=normed_attn 1=attn_out 2=attn_stream 3=normed_ffn
-/// 4=moe_with_shared 5=moe_out 6=ffn_stream.
+/// Persistent decode-graph buffer identity: `(layer, slot)`; `layer ==
+/// usize::MAX` is the model-level slot (embedding stream, token ids).
+pub(crate) type GraphBufKey = (usize, GraphSlot);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum GraphSlot {
+    Stream,
+    Embeddings,
+    NormedAttn,
+    AttnOut,
+    AttnStream,
+    NormedFfn,
+    MoeWithShared,
+    MoeOut,
+    FfnStream,
+    RouterLogits,
+    RouteIndices,
+    RouteWeights,
+    HcMixes(u8),
+    HcPre(u8),
+    HcPost(u8),
+    HcComb(u8),
+}
+
 /// A per-step activation buffer: owned (freed on drop) or an alias of a
 /// persistent graph buffer (never freed; the owner lives in `graph_bufs`).
 pub(crate) enum StepBuf {
@@ -120,6 +142,31 @@ impl std::ops::Deref for StepBuf {
     }
 }
 
+/// Typed per-step scratch: owned or a never-freed alias (see `StepBuf`).
+pub(crate) enum StepSlice<T> {
+    Owned(CudaSlice<T>),
+    Alias(std::mem::ManuallyDrop<CudaSlice<T>>),
+}
+
+impl<T> std::ops::Deref for StepSlice<T> {
+    type Target = CudaSlice<T>;
+    fn deref(&self) -> &CudaSlice<T> {
+        match self {
+            StepSlice::Owned(h) => h,
+            StepSlice::Alias(h) => h,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for StepSlice<T> {
+    fn deref_mut(&mut self) -> &mut CudaSlice<T> {
+        match self {
+            StepSlice::Owned(h) => h,
+            StepSlice::Alias(h) => h,
+        }
+    }
+}
+
 impl std::ops::DerefMut for StepBuf {
     fn deref_mut(&mut self) -> &mut HiddenStates {
         match self {
@@ -129,12 +176,9 @@ impl std::ops::DerefMut for StepBuf {
     }
 }
 
-const fn graph_buf_idx_stream() -> usize {
-    0
-}
-const fn graph_buf_idx_layer(layer_idx: usize, offset: usize) -> usize {
-    1 + layer_idx * 7 + offset
-}
+pub(crate) const GRAPH_MODEL_LAYER: usize = usize::MAX;
+pub(crate) const GRAPH_MTP_LAYER: usize = usize::MAX - 1;
+pub(crate) const GRAPH_DSPARK_LAYER_BASE: usize = usize::MAX - 1024;
 
 impl Dsv4Model {
     /// Upload token IDs to the persistent graph buffer (called before capture/replay).
@@ -168,19 +212,24 @@ impl Dsv4Model {
         Ok(())
     }
 
-    /// Alias of a persistent graph buffer sharing the same device pointer.
+    /// Alias of a persistent device buffer sharing the same pointer.
     /// `CudaSlice::clone` is a D2D copy into a fresh allocation, so the capture
     /// must alias the raw pointer for replay to read/write the same memory.
-    fn graph_alias(&self, b: &HiddenStates) -> StepBuf {
+    fn graph_alias_slice<T: cudarc::driver::DeviceRepr>(
+        &self,
+        b: &CudaSlice<T>,
+    ) -> std::mem::ManuallyDrop<CudaSlice<T>> {
         use cudarc::driver::DevicePtr;
-        let (ptr, _g) = b.data.device_ptr(&self.ctx.stream);
-        // SAFETY: `ptr` is the live persistent allocation held by `graph_bufs`
-        // for the model's lifetime; `StepBuf::Alias` never frees it.
-        let data = unsafe {
-            self.ctx
-                .stream
-                .upgrade_device_ptr::<half::bf16>(ptr, b.data.len())
-        };
+        let (ptr, _g) = b.device_ptr(&self.ctx.stream);
+        // SAFETY: `ptr` is the live persistent allocation held by the model's
+        // graph pools for its lifetime; the alias is never freed.
+        std::mem::ManuallyDrop::new(unsafe {
+            self.ctx.stream.upgrade_device_ptr::<T>(ptr, b.len())
+        })
+    }
+
+    fn graph_alias(&self, b: &HiddenStates) -> StepBuf {
+        let data = std::mem::ManuallyDrop::into_inner(self.graph_alias_slice(&b.data));
         StepBuf::Alias(std::mem::ManuallyDrop::new(HiddenStates {
             data,
             hidden_dim: b.hidden_dim,
@@ -188,37 +237,89 @@ impl Dsv4Model {
         }))
     }
 
-    /// Allocate (first call) or alias (subsequent calls) a persistent HiddenStates
-    /// at the given buffer index, so graph replay reads/writes the same addresses.
-    fn graph_alloc_hidden(&self, idx: usize, dim: usize, seq_len: usize) -> Result<StepBuf> {
-        let mut bufs = self.graph_bufs.lock().unwrap();
-        if bufs.len() <= idx {
-            bufs.resize_with(idx + 1, || None);
-        }
-        if bufs[idx].is_none() {
-            // SAFETY: fully written by the forward kernels before first read.
-            bufs[idx] = Some(unsafe { HiddenStates::uninit(&self.ctx, dim, seq_len)? });
-        }
-        Ok(self.graph_alias(bufs[idx].as_ref().unwrap()))
-    }
-
     /// Per-step activation: a persistent graph buffer alias in graph mode,
     /// else a fresh transient allocation.
-    pub(super) fn step_hidden(
+    pub(crate) fn step_hidden(
         &self,
         graph_mode: bool,
-        idx: usize,
+        key: GraphBufKey,
         dim: usize,
         seq_len: usize,
     ) -> Result<StepBuf> {
-        if graph_mode {
-            self.graph_alloc_hidden(idx, dim, seq_len)
-        } else {
+        if !graph_mode {
             // SAFETY: fully written before first read.
-            Ok(StepBuf::Owned(unsafe {
+            return Ok(StepBuf::Owned(unsafe {
                 HiddenStates::uninit(&self.ctx, dim, seq_len)?
-            }))
+            }));
         }
+        let mut bufs = self.graph_bufs.lock().unwrap();
+        let b = match bufs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // SAFETY: fully written by the forward kernels before first read.
+                e.insert(unsafe { HiddenStates::uninit(&self.ctx, dim, seq_len)? })
+            }
+        };
+        ensure!(
+            b.hidden_dim == dim && b.seq_len == seq_len,
+            "DSv4 graph buffer {key:?} shape {}x{} != {dim}x{seq_len}",
+            b.hidden_dim,
+            b.seq_len
+        );
+        Ok(self.graph_alias(b))
+    }
+
+    /// Per-step f32 scratch (mHC lane weights): persistent alias in graph mode.
+    pub(crate) fn step_f32(
+        &self,
+        graph_mode: bool,
+        key: GraphBufKey,
+        len: usize,
+    ) -> Result<StepSlice<f32>> {
+        if !graph_mode {
+            // SAFETY: fully written before first read.
+            return Ok(StepSlice::Owned(unsafe {
+                self.ctx.stream.alloc::<f32>(len)?
+            }));
+        }
+        let mut bufs = self.graph_f32.lock().unwrap();
+        let b = match bufs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(self.ctx.stream.alloc_zeros::<f32>(len)?)
+            }
+        };
+        ensure!(
+            b.len() == len,
+            "DSv4 graph f32 buffer {key:?} len {} != {len}",
+            b.len()
+        );
+        Ok(StepSlice::Alias(self.graph_alias_slice(b)))
+    }
+
+    /// Per-step i32 scratch (route indices): persistent alias in graph mode.
+    pub(crate) fn step_i32(
+        &self,
+        graph_mode: bool,
+        key: GraphBufKey,
+        len: usize,
+    ) -> Result<StepSlice<i32>> {
+        if !graph_mode {
+            return Ok(StepSlice::Owned(self.ctx.stream.alloc_zeros::<i32>(len)?));
+        }
+        let mut bufs = self.graph_i32.lock().unwrap();
+        let b = match bufs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(self.ctx.stream.alloc_zeros::<i32>(len)?)
+            }
+        };
+        ensure!(
+            b.len() == len,
+            "DSv4 graph i32 buffer {key:?} len {} != {len}",
+            b.len()
+        );
+        Ok(StepSlice::Alias(self.graph_alias_slice(b)))
     }
 
     /// Persistent u32 token ids for hash routing (same pre-replay upload).
@@ -230,8 +331,8 @@ impl Dsv4Model {
             .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))
     }
 
-    /// Clone of the persistent final-layer output stream: the last layer's
-    /// ffn_stream buffer (index 0 is the embedding).
+    /// Alias of the persistent final-layer output stream (the last layer's
+    /// ffn_stream), read by the LM head after a replay.
     pub(crate) fn graph_stream_clone(&self) -> Result<StepBuf> {
         let bufs = self.graph_bufs.lock().unwrap();
         let last = self
@@ -240,8 +341,7 @@ impl Dsv4Model {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("DSv4 no layers"))?;
         let b = bufs
-            .get(graph_buf_idx_layer(last, 6))
-            .and_then(|b| b.as_ref())
+            .get(&(last, GraphSlot::FfnStream))
             .ok_or_else(|| anyhow!("DSv4 graph output stream buffer not allocated"))?;
         Ok(self.graph_alias(b))
     }

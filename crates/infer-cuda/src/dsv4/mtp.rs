@@ -144,6 +144,7 @@ impl Dsv4Model {
             &stream,
             &mut attn_normed,
             &mut keepalive,
+            false,
         )?;
         keepalive.keep_hidden(&attn_normed);
         // SAFETY: scratch fully written before read.
@@ -224,6 +225,7 @@ impl Dsv4Model {
             &attn_stream,
             &mut ffn_normed,
             &mut keepalive,
+            false,
         )?;
         keepalive.keep_hidden(&ffn_normed);
         let level_tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();

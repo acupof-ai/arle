@@ -160,6 +160,7 @@ impl Dsv4Model {
             stream_in,
             &mut attn_normed,
             &mut keepalive,
+            false,
         )?;
         keepalive.keep_hidden(&attn_normed);
 
@@ -293,6 +294,7 @@ impl Dsv4Model {
             &attn_stream,
             &mut ffn_normed,
             &mut keepalive,
+            false,
         )?;
         keepalive.keep_hidden(&ffn_normed);
         let moe = layer.moe.as_ref().expect("DSpark draft layer.moe");

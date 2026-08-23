@@ -2,6 +2,7 @@ use super::*;
 
 /// Selects the weights and the profile labels.
 #[derive(Copy, Clone)]
+#[repr(u8)]
 pub(super) enum HcHalf {
     Attn,
     Ffn,
@@ -74,8 +75,12 @@ impl Dsv4Model {
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         let hidden_size = self.config.hidden_size;
-        // SAFETY: embedding_batch writes the full [seq_len, hidden_size] buffer.
-        let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+        let mut embeddings = self.step_hidden(
+            self.graph_mode() && seq_len == 1,
+            (super::GRAPH_MODEL_LAYER, super::GraphSlot::Embeddings),
+            hidden_size,
+            seq_len,
+        )?;
         crate::profile::profile_op(&self.ctx, "embedding", None, seq_len, || {
             crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, token_ids, &mut embeddings)
                 .map_err(|e| anyhow!("DSv4 embed lookup failed: {e}"))?;
@@ -105,6 +110,7 @@ impl Dsv4Model {
         stream: &HiddenStates,
         normed: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
+        graph_mode: bool,
     ) -> Result<Option<crate::hc::MhcParams>> {
         let norm = half.norm(layer);
         let eps = self.config.rms_norm_eps;
@@ -123,7 +129,16 @@ impl Dsv4Model {
             half.params_label(),
             Some(layer_idx),
             seq_len,
-            || crate::hc::gen_mhc_params(&self.ctx, &self.config, half.hc(layer), stream),
+            || {
+                crate::hc::gen_mhc_params(
+                    self,
+                    half.hc(layer),
+                    stream,
+                    graph_mode,
+                    layer_idx,
+                    half as u8,
+                )
+            },
         )?;
         keepalive.keep_f32(&mhc.pre);
         keepalive.keep_f32(&mhc.post);
