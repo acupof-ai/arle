@@ -320,7 +320,21 @@ impl CcHarness {
             .env("ANTHROPIC_SMALL_FAST_MODEL", &model)
             .env("DISABLE_TELEMETRY", "1")
             .env("DISABLE_AUTOUPDATER", "1")
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            // The agent has Bash. A `pip install -e .` from inside one rollout
+            // writes a `.pth` into the SHARED site-packages pointing at that
+            // rollout's directory, and every later `import <pkg>` on the box --
+            // other tasks, other tenants -- resolves there. Refuse the install
+            // rather than let it land: bare pip outside a venv now fails loudly.
+            .env("PIP_REQUIRE_VIRTUALENV", "1")
+            .env("PYTHONNOUSERSITE", "1")
+            // Same tree the scorer will use, so the agent's own verification
+            // runs against its edits instead of whatever is installed.
+            .env(
+                "PYTHONPATH",
+                crate::sandbox::workdir_pythonpath(workdir, self.pythonpath.as_deref()),
+            )
+            .env("PYTHONDONTWRITEBYTECODE", "1");
 
         let t_start_ms = epoch_ms();
         let spawned = run_captured(cmd, Duration::from_secs(self.cc_timeout_secs));

@@ -5,6 +5,12 @@
 //! reward signal. No container — the caller is responsible for isolation if it
 //! wants any. [`run_captured`] is the fork-safe subprocess primitive both
 //! scoring and the cc spawn use.
+//!
+//! Without a container the one isolation this module does enforce is import
+//! resolution: [`workdir_pythonpath`] puts the task's own tree ahead of
+//! site-packages for both the agent and the scorer, and the harness refuses
+//! the agent's bare `pip install`. Everything else the agent's Bash can reach
+//! is still shared.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -319,6 +325,36 @@ pub fn diff_workdir(workdir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// `PYTHONPATH` that resolves the task's OWN tree first.
+///
+/// Scoring an import against anything else is not scoring the edit. A stale
+/// editable install is enough to break this: an agent that ran `pip install -e .`
+/// inside one rollout leaves a `.pth` in the shared site-packages pointing at
+/// that rollout's directory, and from then on every task's `import <pkg>` on the
+/// box resolves there. That happened on the H20 pod (2026-08-23) and silently
+/// scored six flake8 tasks against one unrelated leftover.
+///
+/// `src` is included when present so a src-layout repo resolves without the
+/// operator having to know its layout. `extra` is the caller's
+/// `--pythonpath`, sandbox-relative, and still comes after.
+pub(crate) fn workdir_pythonpath(workdir: &Path, extra: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let src = workdir.join("src");
+    if src.is_dir() {
+        parts.push(src.to_string_lossy().into_owned());
+    }
+    parts.push(workdir.to_string_lossy().into_owned());
+    if let Some(extra) = extra.filter(|e| !e.is_empty()) {
+        parts.push(extra.to_owned());
+    }
+    if let Ok(existing) = std::env::var("PYTHONPATH")
+        && !existing.is_empty()
+    {
+        parts.push(existing);
+    }
+    parts.join(":")
+}
+
 pub fn score_workdir(
     workdir: &Path,
     test_patch: &str,
@@ -383,13 +419,7 @@ pub fn score_workdir(
     command.arg("-lc").arg(&cmd).current_dir(workdir);
     // No bytecode: scoring must execute edited source, not cached pyc.
     command.env("PYTHONDONTWRITEBYTECODE", "1");
-    if let Some(pythonpath) = pythonpath {
-        let combined = match std::env::var("PYTHONPATH") {
-            Ok(existing) if !existing.is_empty() => format!("{pythonpath}:{existing}"),
-            _ => pythonpath.to_string(),
-        };
-        command.env("PYTHONPATH", combined);
-    }
+    command.env("PYTHONPATH", workdir_pythonpath(workdir, pythonpath));
 
     let (output, code, killed) = run_captured(command, Duration::from_secs(timeout_secs))
         .with_context(|| "failed to run pytest".to_string())?;
