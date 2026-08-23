@@ -367,21 +367,32 @@ pub fn score_workdir(
         // lands cleanly even if the rollout dirtied a test file. The student's
         // source fix in other files is preserved.
         // A `+++ b/<path>` is a real header only when it follows a `--- ` line.
-        let mut after_minus_header = false;
+        //
+        // A hunk whose `---` side is /dev/null CREATES its file, and several
+        // swe-smith tasks create a test file the staged repo already ships. The
+        // patch's version is the authority there, so delete the target first:
+        // `git apply` refuses a create-over-existing outright, which loses the
+        // whole task, and `patch` skips the hunk and scores the repo's own
+        // stale tests instead.
+        let mut creates = false;
         for line in test_patch.lines() {
-            if after_minus_header && let Some(path) = line.strip_prefix("+++ b/") {
+            if let Some(path) = line.strip_prefix("+++ b/") {
                 let path = path.trim_end();
                 if !path.is_empty() && path != "/dev/null" {
-                    let mut checkout = Command::new("git");
-                    checkout
-                        .arg("-C")
-                        .arg(workdir)
-                        .args(["checkout", "--", path]);
-                    // Ignore failure: a path the patch CREATES has no base to reset to.
-                    let _ = plain_output(&mut checkout, "git checkout test path");
+                    if creates {
+                        let _ = fs::remove_file(workdir.join(path));
+                    } else {
+                        let mut checkout = Command::new("git");
+                        checkout
+                            .arg("-C")
+                            .arg(workdir)
+                            .args(["checkout", "--", path]);
+                        // Ignore failure: a path with no base has nothing to reset to.
+                        let _ = plain_output(&mut checkout, "git checkout test path");
+                    }
                 }
             }
-            after_minus_header = line.starts_with("--- ");
+            creates = line.starts_with("--- /dev/null");
         }
 
         // Hand `git apply` the bare filename: `git -C workdir` resolves it
