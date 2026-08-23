@@ -45,10 +45,30 @@ result and is not one.
   correctly.
 - Not prompt length. The one-line tool prompt fails too.
 
+- Not the schema content, and not quantization damage in general. The same tool
+  schemas delivered as plain user text — no `tools` field — get a coherent,
+  correct answer from NVFP4: it names `textfsm/terminal.py`, the
+  `StripAnsiText` function, and the argument-order fix. Only the `tools` field
+  form corrupts.
+
 ## Cause
 
-Unknown. The variable that separates working from broken is the presence of
-tool definitions in the request, not length and not the GEMM route.
+Unknown. What is left after the exclusions above is the token sequence the chat
+template produces when it renders tool definitions — and FP8 handles that same
+sequence correctly, so it takes the rendered prompt AND the NVFP4 weights
+together.
+
+One hypothesis, untested: the tool template introduces special tokens
+(`<tools>`, `<tool_call>`). If the repack's flush-to-zero lands hard on the
+embedding or lm_head rows for those ids, the shape matches exactly — ordinary
+text fine, garbage once special tokens enter. Two cheap checks would settle it:
+compare the flushed fraction of those rows against an average row, or run the
+probe with the repack disabled and see whether the corruption goes away. The
+layout math itself is bit-exact against `marlin_fp4_gemm` on synthetic weights
+that do flush (`test_cuda_marlin_fp4_share.rs`), so if the repack is implicated
+it is about which rows it damages, not the index math.
+
+Handed to the `qwen3-nvfp4-support` session.
 
 ## Consequence for open results
 
