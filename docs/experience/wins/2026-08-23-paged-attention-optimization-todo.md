@@ -1,5 +1,7 @@
 # Paged Attention Optimization TODO
 
+Baseline: kernel at ab8c96200 (pre-fp8-MMA); ncu data below is that baseline.
+
 Kernel: `crates/cuda-kernels/csrc/attention/paged_attention_quantized_fa3.cu`
 Hardware: H20 (sm_90, 78 SM, 4.0 TB/s HBM3, 228 KB smem/SM, 65536 regs/SM)
 
