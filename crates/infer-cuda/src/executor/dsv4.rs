@@ -290,7 +290,7 @@ impl Dsv4CudaExecutor {
             // Captured work was recorded, not executed: roll the host counters
             // the closure advanced back to the step's start so eager redoes it.
             if slot.seq_len > start_pos {
-                slot.truncate(&model.layers, kv_adapter, start_pos)?;
+                slot.rewind_host_counters(&model.layers, start_pos);
             }
             return Ok(None);
         }

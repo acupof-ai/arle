@@ -5052,20 +5052,51 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     );
     let cols = shape.cols_per_group;
     let rows = shape.rows_per_group;
-    let fits = |b: &Option<HiddenStates>, dim: usize| {
-        b.as_ref()
-            .is_some_and(|h| h.hidden_dim == dim && h.seq_len == n)
+    // n == 1 (the decode graph lane) uses the scratch's fixed staging so the
+    // capture's addresses stay valid; batched rows stage transiently. The fixed
+    // buffers are moved out for the GEMM borrow and put back below.
+    let use_fixed =
+        n == 1 && scratch.oproj_in.hidden_dim == cols && scratch.oproj_out.hidden_dim == rows;
+    let (mut in_g, mut out_g) = if use_fixed {
+        // SAFETY: placeholders; never read, replaced by the put-back below.
+        let a = std::mem::replace(&mut scratch.oproj_in, unsafe {
+            HiddenStates::uninit(ctx, 1, 1)?
+        });
+        // SAFETY: same placeholder contract.
+        let b = std::mem::replace(&mut scratch.oproj_out, unsafe {
+            HiddenStates::uninit(ctx, 1, 1)?
+        });
+        (a, b)
+    } else {
+        // SAFETY: uninit device scratch; fully written before first read.
+        (unsafe { HiddenStates::uninit(ctx, cols, n)? }, unsafe {
+            HiddenStates::uninit(ctx, rows, n)?
+        })
     };
-    if !fits(&scratch.oproj_in, cols) {
-        // SAFETY: uninit device scratch; fully written before first read.
-        scratch.oproj_in = Some(unsafe { HiddenStates::uninit(ctx, cols, n)? });
+    let res = dsv4_wo_a_grouped_deepgemm_decode_body(
+        ctx, scratch, caches, local_attn, shape, latent, &mut in_g, &mut out_g,
+    );
+    if use_fixed {
+        scratch.oproj_in = in_g;
+        scratch.oproj_out = out_g;
     }
-    if !fits(&scratch.oproj_out, rows) {
-        // SAFETY: uninit device scratch; fully written before first read.
-        scratch.oproj_out = Some(unsafe { HiddenStates::uninit(ctx, rows, n)? });
-    }
-    let mut in_g = scratch.oproj_in.take().expect("sized above");
-    let mut out_g = scratch.oproj_out.take().expect("sized above");
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dsv4_wo_a_grouped_deepgemm_decode_body(
+    ctx: &DeviceContext,
+    scratch: &mut Dsv4FusedWqkvDecodeScratch,
+    caches: &[cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache],
+    local_attn: &HiddenStates,
+    shape: Dsv4OProjGroupShape,
+    latent: &mut HiddenStates,
+    in_g: &mut HiddenStates,
+    out_g: &mut HiddenStates,
+) -> Result<()> {
+    let n = local_attn.seq_len;
+    let cols = shape.cols_per_group;
+    let rows = shape.rows_per_group;
     let in_len = in_g.data.len();
     let out_len = out_g.data.len();
     for (group, cache) in caches.iter().enumerate() {
@@ -5116,8 +5147,6 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
             }
         }
     }
-    scratch.oproj_in = Some(in_g);
-    scratch.oproj_out = Some(out_g);
     Ok(())
 }
 

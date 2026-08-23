@@ -1320,10 +1320,10 @@ pub(super) struct Dsv4FusedWqkvDecodeScratch {
     pub(super) active_experts: CudaSlice<i32>,
     pub(super) active_offsets: CudaSlice<i32>,
     pub(super) active_counts: CudaSlice<i32>,
-    /// Grouped O-LoRA gather/scatter staging, sized on first decode use
-    /// (eager warm-up precedes graph capture, so the capture sees no alloc).
-    pub(super) oproj_in: Option<HiddenStates>,
-    pub(super) oproj_out: Option<HiddenStates>,
+    /// Grouped O-LoRA gather/scatter staging for the one-row decode lane;
+    /// fixed at construction so a captured decode graph keeps stable addresses.
+    pub(super) oproj_in: HiddenStates,
+    pub(super) oproj_out: HiddenStates,
     pub(super) max_m: usize,
     pub(super) scale_stride_m: usize,
     pub(super) hidden_dim: usize,
@@ -1339,6 +1339,7 @@ impl Dsv4FusedWqkvDecodeScratch {
         let q_lora_rank = config.q_lora_rank;
         let head_dim = config.head_dim;
         let scale_cols = hidden_dim.div_ceil(128);
+        let (oproj_cols, oproj_rows) = dsv4_oproj_group_dims(config)?;
         Ok(Self {
             input_fp8: ctx
                 .stream
@@ -1362,8 +1363,10 @@ impl Dsv4FusedWqkvDecodeScratch {
                 .stream
                 .clone_htod(&[1_i32])
                 .map_err(|e| anyhow!("DSv4 fused wqkv active_counts H2D failed: {e}"))?,
-            oproj_in: None,
-            oproj_out: None,
+            // SAFETY: uninit device scratch; fully written before first read.
+            oproj_in: unsafe { HiddenStates::uninit(ctx, oproj_cols, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
+            oproj_out: unsafe { HiddenStates::uninit(ctx, oproj_rows, 1)? },
             max_m,
             scale_stride_m,
             hidden_dim,
@@ -1382,6 +1385,8 @@ impl Dsv4FusedWqkvDecodeScratch {
             + self.active_experts.len() * i32_sz
             + self.active_offsets.len() * i32_sz
             + self.active_counts.len() * i32_sz
+            + self.oproj_in.device_bytes()
+            + self.oproj_out.device_bytes()
     }
 
     /// Static predictor of `device_bytes` from config dims — must mirror `new`.
@@ -1393,10 +1398,12 @@ impl Dsv4FusedWqkvDecodeScratch {
         let scale_stride_m = 128usize;
         let hidden_dim = config.hidden_size;
         let scale_cols = hidden_dim.div_ceil(128);
+        let (oproj_cols, oproj_rows) = dsv4_oproj_group_dims(config).unwrap_or((0, 0));
         max_m * hidden_dim
             + scale_stride_m * scale_cols * f32_sz
             + (config.q_lora_rank + config.head_dim) * bf16
             + 3 * i32_sz
+            + (oproj_cols + oproj_rows) * bf16
     }
 }
 
