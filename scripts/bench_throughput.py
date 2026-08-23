@@ -443,6 +443,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--ignore-warmup-gate",
+        action="store_true",
+        help="proceed even if the warmup correctness gate fails (slice/garbage models)",
+    )
     parser.add_argument("--output", type=Path, default=Path("bench_throughput"))
     args = parser.parse_args(argv)
     if args.requests_per_concurrency is None and args.seconds_per_concurrency is None:
@@ -501,7 +506,7 @@ async def async_main(args: argparse.Namespace) -> int:
             0.0,
             -1,
         )
-        if not warmup.gate_pass:
+        if not warmup.gate_pass and not args.ignore_warmup_gate:
             print(f"warmup failed: {warmup.error or warmup.correctness_error}", file=sys.stderr)
             return 2
         for concurrency in args.concurrency_grid:
