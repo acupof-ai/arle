@@ -171,14 +171,19 @@ impl Dsv4Model {
             .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))
     }
 
-    /// Clone of the persistent stream output buffer (index 0).
-    /// Only valid after the first graph-mode forward allocated it.
+    /// Clone of the persistent final-layer output stream: the last layer's
+    /// ffn_stream buffer (index 0 is the embedding).
     pub(crate) fn graph_stream_clone(&self) -> Result<HiddenStates> {
         let bufs = self.graph_bufs.lock().unwrap();
+        let last = self
+            .layers
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| anyhow!("DSv4 no layers"))?;
         let b = bufs
-            .first()
+            .get(graph_buf_idx_layer(last, 6))
             .and_then(|b| b.as_ref())
-            .ok_or_else(|| anyhow!("DSv4 graph stream buffer not allocated"))?;
+            .ok_or_else(|| anyhow!("DSv4 graph output stream buffer not allocated"))?;
         Ok(HiddenStates {
             data: b.data.clone(),
             hidden_dim: b.hidden_dim,
