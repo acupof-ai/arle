@@ -470,10 +470,12 @@ exec_config_t determine_exec_config(
   // resident block buy issue slots that a single block cannot fill. Search
   // blocks_per_sm as well and keep the configuration that covers the output
   // tiles with the fewest waves. At NVFP4 decode shapes (m_block_size_8,
-  // num_bits==4), ties go to the higher blocks_per_sm — more resident blocks
-  // buy issue slots; at prefill or fp8 shapes, ties go to the larger tile,
-  // which amortises the per-block prologue. Measured on H20 at the 27B
-  // dense-MLP shapes: gate_up -19.6%, down -5.9%, per-layer MLP -14.8%.
+  // kFE2M1f), ties go to the higher blocks_per_sm — more resident blocks
+  // buy issue slots; at prefill or other quant shapes, ties go to the
+  // larger tile, which amortises the per-block prologue. The kFE2M1f gate
+  // avoids regressing W4A16 (kU4) and W4A8 (kU4B8), which share num_bits==4.
+  // Measured on H20 at the 27B dense-MLP shapes:
+  // gate_up -19.6%, down -5.9%, per-layer MLP -14.8%.
   int best_waves = INT_MAX;
   int best_tile_k = 0;
   int best_bps = 0;
@@ -548,7 +550,7 @@ exec_config_t determine_exec_config(
 
       bool update = waves < best_waves;
       if (waves == best_waves) {
-        if (m_block_size_8 && num_bits == 4) {
+        if (m_block_size_8 && q_type == host::kFE2M1f) {
           // NVFP4 decode: more resident blocks = more issue slots
           update = bps > best_bps || (bps == best_bps && th_config.thread_k > best_tile_k);
         } else {
