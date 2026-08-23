@@ -83,7 +83,10 @@ async fn handle_raw_logits(
             );
             headers.insert("x-logits-rows", shape[0].into());
             headers.insert("x-logits-cols", shape[1].into());
-            headers.insert("x-logits-dtype", axum::http::HeaderValue::from_static("bf16"));
+            headers.insert(
+                "x-logits-dtype",
+                axum::http::HeaderValue::from_static("bf16"),
+            );
             (headers, body).into_response()
         }
         Err(err) => (
