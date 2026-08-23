@@ -105,10 +105,12 @@ if [ -n "$EXPECTED_PRODUCT_SHA256" ] || [ -n "$EXPECTED_KERNEL_BUNDLE_ID" ]; the
 fi
 
 # DSv4 multi-GPU profile: the TP=8 + DSv4 kernel env. Defaults to dsv4 so the
-# existing DSv4 gate is byte-identical; any other GATE_PROFILE (generic, qwen)
-# skips it for a single-GPU model that brings its own config via SERVE_FLAGS.
+# existing DSv4 gate is byte-identical; any other GATE_PROFILE (generic, metal,
+# qwen) skips it for a single-GPU model that brings its own config via
+# SERVE_FLAGS.
 DSV4_FLAGS=()
 DSV4_CLAIMS=""
+BACKEND="cuda"
 if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
     export INFER_CUDA_DEVICES="${INFER_CUDA_DEVICES:-0,1,2,3,4,5,6,7}"
     [ "${INFER_TP_SIZE:-8}" = 8 ] || { echo "[gate] DSv4 requires INFER_TP_SIZE=8" >&2; exit 2; }
@@ -124,19 +126,16 @@ if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
     export ARLE_DSV4_INCREMENTAL_KV=1
     export ARLE_DSV4_EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
     DSV4_FLAGS=(--max-total-tokens "${MAX_TOTAL_TOKENS:-16384}")
+elif [ "${GATE_PROFILE:-dsv4}" = "metal" ]; then
+    BACKEND="metal"
+    MODEL="${MODEL:-mlx-community/Qwen3.6-35B-A3B-4bit}"
 fi
 # Lever env flips ride the CLI: lever_gate.sh <label> KEY=VAL ...
 for kv in "$@"; do export "${kv?}"; done
 
-if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
-    # shellcheck disable=SC2086  # SERVE_FLAGS is an intentional word-split passthrough
-    "$BIN" serve --backend cuda --model-path "$MODEL" --port "$PORT" "${DSV4_FLAGS[@]}" $SERVE_FLAGS \
-        > "serve_${LABEL}.log" 2>&1 &
-else
-    # shellcheck disable=SC2086  # SERVE_FLAGS is an intentional word-split passthrough
-    "$BIN" serve --backend cuda --model-path "$MODEL" --port "$PORT" $SERVE_FLAGS \
-        > "serve_${LABEL}.log" 2>&1 &
-fi
+# shellcheck disable=SC2086  # SERVE_FLAGS is an intentional word-split passthrough
+"$BIN" serve --backend "$BACKEND" --model-path "$MODEL" --port "$PORT" ${DSV4_FLAGS[@]+"${DSV4_FLAGS[@]}"} $SERVE_FLAGS \
+    > "serve_${LABEL}.log" 2>&1 &
 SERVE_PID=$!
 cleanup() {
     kill "$SERVE_PID" 2>/dev/null
@@ -185,6 +184,13 @@ status=${PIPESTATUS[0]}
 if [ "$status" -ne 0 ]; then
     echo "[gate] needle gate failed with status $status"
     exit "$status"
+fi
+# Temp coherence arm: the greedy-only gate misses argmax-preserving distortions.
+if [ "${LEVER_GATE_SKIP_TEMP:-0}" != "1" ]; then
+    PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" temp || {
+        echo "[gate] temp coherence arm FAIL"
+        exit 1
+    }
 fi
 validate_summary "$OUT" "${BASELINE_LOG:-}"
 echo "[gate] $LABEL done -> $OUT"
