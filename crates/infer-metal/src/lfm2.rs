@@ -37,6 +37,11 @@ pub(crate) struct Lfm2MoeWeights {
     pub(crate) norm_topk_prob: bool,
     pub(crate) expert_bits: i32,
     pub(crate) expert_group_size: i32,
+    /// Dense BF16 stacked expert weights (from `experts.{i}.w1/w2/w3.weight`).
+    /// When set, the C++ model bypasses the quantized gather_qmm path.
+    pub(crate) dense_gate: Option<MlxArray>, // [E, I, H]
+    pub(crate) dense_up: Option<MlxArray>,   // [E, I, H]
+    pub(crate) dense_down: Option<MlxArray>, // [E, H, I]
 }
 
 pub(crate) enum Lfm2Ffn {
@@ -192,9 +197,20 @@ pub(crate) fn load_lfm2_metal_weights(
 
 fn load_dense_ffn(lp: &str, load_proj: &impl Fn(&str) -> Result<WeightTensor>) -> Result<Lfm2Ffn> {
     let base = format!("{lp}.feed_forward");
-    let gate = load_proj(&format!("{base}.gate_proj"))?;
-    let up = load_proj(&format!("{base}.up_proj"))?;
-    let down = load_proj(&format!("{base}.down_proj"))?;
+    // BF16 checkpoints use w1/w2/w3 (w1=gate, w2=down, w3=up);
+    // quantized checkpoints use gate_proj/down_proj/up_proj.
+    let (gate, up, down) = match load_proj(&format!("{base}.gate_proj")) {
+        Ok(gate) => (
+            gate,
+            load_proj(&format!("{base}.up_proj"))?,
+            load_proj(&format!("{base}.down_proj"))?,
+        ),
+        Err(_) => (
+            load_proj(&format!("{base}.w1"))?,
+            load_proj(&format!("{base}.w3"))?,
+            load_proj(&format!("{base}.w2"))?,
+        ),
+    };
     let gate_dim = gate.output_dim()?;
     let gate_up = match merge_quantized_projection_rows(&[&gate, &up])? {
         Some(merged) => merged,
@@ -225,26 +241,81 @@ fn load_moe_ffn(
             d @ WeightTensor::Dense(_) => d,
             q @ WeightTensor::Quantized { .. } => WeightTensor::Dense(q.to_dense_in_out()),
         };
+    let expert_bias = tensor_get(tensors, &format!("{base}.expert_bias"))?;
+
+    // Try stacked quantized path first; fall back to individual BF16 expert weights.
+    let (switch_gate, switch_up, switch_down, dense_gate, dense_up, dense_down) =
+        match load_stacked_quantized(tensors, &format!("{base}.switch_mlp.gate_proj")) {
+            Ok(gate) => {
+                let up = load_stacked_quantized(tensors, &format!("{base}.switch_mlp.up_proj"))?;
+                let down =
+                    load_stacked_quantized(tensors, &format!("{base}.switch_mlp.down_proj"))?;
+                (gate, up, down, None, None, None)
+            }
+            Err(_) => {
+                // BF16 dense stacked switch_mlp (no scales/biases)
+                let dense_gate =
+                    tensor_get(tensors, &format!("{base}.switch_mlp.gate_proj.weight"));
+                if let Ok(gate) = dense_gate {
+                    let up = tensor_get(tensors, &format!("{base}.switch_mlp.up_proj.weight"))?;
+                    let down = tensor_get(tensors, &format!("{base}.switch_mlp.down_proj.weight"))?;
+                    let empty = || StackedQuantized {
+                        weight: crate::mlx::zeros(&[1], crate::mlx::Dtype::Bfloat16),
+                        scales: crate::mlx::zeros(&[1], crate::mlx::Dtype::Bfloat16),
+                        biases: crate::mlx::zeros(&[1], crate::mlx::Dtype::Bfloat16),
+                    };
+                    (empty(), empty(), empty(), Some(gate), Some(up), Some(down))
+                } else {
+                    // Individual experts.{i}.w1/w2/w3.weight → stack to [E, ...]
+                    let e = moe.num_experts;
+                    let stack = |w: &str| -> Result<MlxArray> {
+                        let arrs: Vec<_> = (0..e)
+                            .map(|i| tensor_get(tensors, &format!("{base}.experts.{i}.{w}.weight")))
+                            .collect::<Result<_>>()?;
+                        let expert_shape = arrs[0].shape();
+                        let mut new_shape = vec![e as i32];
+                        new_shape.extend_from_slice(expert_shape);
+                        let flat = crate::mlx::concatenate_axis(&arrs, 0);
+                        Ok(crate::mlx::reshape(&flat, &new_shape))
+                    };
+                    let gate = stack("w1")?;
+                    let up = stack("w3")?;
+                    let down = stack("w2")?;
+                    let empty = || StackedQuantized {
+                        weight: crate::mlx::zeros(&[1], crate::mlx::Dtype::Bfloat16),
+                        scales: crate::mlx::zeros(&[1], crate::mlx::Dtype::Bfloat16),
+                        biases: crate::mlx::zeros(&[1], crate::mlx::Dtype::Bfloat16),
+                    };
+                    (empty(), empty(), empty(), Some(gate), Some(up), Some(down))
+                }
+            }
+        };
+
     Ok(Lfm2MoeWeights {
         router,
-        expert_bias: tensor_get(tensors, &format!("{base}.expert_bias"))?,
-        switch_gate: load_stacked_quantized(tensors, &format!("{base}.switch_mlp.gate_proj"))?,
-        switch_up: load_stacked_quantized(tensors, &format!("{base}.switch_mlp.up_proj"))?,
-        switch_down: load_stacked_quantized(tensors, &format!("{base}.switch_mlp.down_proj"))?,
+        expert_bias,
+        switch_gate,
+        switch_up,
+        switch_down,
         num_experts,
         top_k,
         norm_topk_prob: moe.norm_topk_prob,
         expert_bits: moe.expert_bits,
         expert_group_size: moe.expert_group_size,
+        dense_gate,
+        dense_up,
+        dense_down,
     })
 }
 
 /// Depthwise conv1d weight. MLX wants `[C_out, K, C_in/groups]` = `[H, K, 1]`.
+/// BF16 checkpoints may ship `[H, 1, K]`; transpose to match.
 fn load_conv_weight(weight: &MlxArray, lfm2: &MetalLfm2Config) -> Result<MlxArray> {
     let h = weight.shape().first().copied().unwrap_or(0);
     let k = lfm2.conv_kernel as i32;
     match weight.shape() {
         [_, ks, 1] if *ks == k => Ok(weight.clone()),
+        [_, 1, ks] if *ks == k => Ok(crate::mlx::transpose_axes(weight, &[0, 2, 1])),
         [_, ks] if *ks == k => Ok(crate::mlx::reshape(weight, &[h, k, 1])),
         shape => {
             anyhow::bail!("unsupported LFM2 conv weight shape {shape:?}, expected [H, {k}, 1]")
@@ -412,33 +483,51 @@ impl CppLfm2Model {
                     unsafe { mlx_sys::lfm2_compiled_free(model) };
                     return None;
                 };
-                let register_stack = |stacked: &StackedQuantized| -> Option<i32> {
-                    // The pool entry only stores the packed trio; the MoE block's
-                    // gather_qmm uses the gs/bits passed to set_last_moe, not these.
-                    let wt = WeightTensor::Quantized {
-                        w: stacked.weight.clone(),
-                        scales: stacked.scales.clone(),
-                        biases: Some(stacked.biases.clone()),
-                        group_size: moe.expert_group_size,
-                        bits: moe.expert_bits,
-                        mode: crate::config::QuantMode::Affine,
+                if let (Some(gate), Some(up), Some(down)) =
+                    (&moe.dense_gate, &moe.dense_up, &moe.dense_down)
+                {
+                    // BF16 dense expert path
+                    unsafe {
+                        mlx_sys::lfm2_compiled_set_last_moe_dense(
+                            model,
+                            router_w.as_raw(),
+                            moe.expert_bias.as_raw(),
+                            gate.as_raw(),
+                            up.as_raw(),
+                            down.as_raw(),
+                            moe.num_experts,
+                            moe.top_k,
+                            moe.norm_topk_prob,
+                        );
+                    }
+                } else {
+                    // Quantized stacked expert path
+                    let register_stack = |stacked: &StackedQuantized| -> Option<i32> {
+                        let wt = WeightTensor::Quantized {
+                            w: stacked.weight.clone(),
+                            scales: stacked.scales.clone(),
+                            biases: Some(stacked.biases.clone()),
+                            group_size: moe.expert_group_size,
+                            bits: moe.expert_bits,
+                            mode: crate::config::QuantMode::Affine,
+                        };
+                        add_weight(&wt)
                     };
-                    add_weight(&wt)
-                };
-                unsafe {
-                    mlx_sys::lfm2_compiled_set_last_moe(
-                        model,
-                        router_w.as_raw(),
-                        moe.expert_bias.as_raw(),
-                        some_or_free!(register_stack(&moe.switch_gate)),
-                        some_or_free!(register_stack(&moe.switch_up)),
-                        some_or_free!(register_stack(&moe.switch_down)),
-                        moe.expert_group_size,
-                        moe.expert_bits,
-                        moe.num_experts,
-                        moe.top_k,
-                        moe.norm_topk_prob,
-                    );
+                    unsafe {
+                        mlx_sys::lfm2_compiled_set_last_moe(
+                            model,
+                            router_w.as_raw(),
+                            moe.expert_bias.as_raw(),
+                            some_or_free!(register_stack(&moe.switch_gate)),
+                            some_or_free!(register_stack(&moe.switch_up)),
+                            some_or_free!(register_stack(&moe.switch_down)),
+                            moe.expert_group_size,
+                            moe.expert_bits,
+                            moe.num_experts,
+                            moe.top_k,
+                            moe.norm_topk_prob,
+                        );
+                    }
                 }
                 if let Err(err) = crate::mlx::check_mlx_error() {
                     log::warn!("C++ LFM2 MoE registration failed: {err}");

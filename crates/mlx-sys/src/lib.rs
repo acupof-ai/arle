@@ -973,6 +973,17 @@ unsafe extern "C" {
         top_k: i32,
         norm_topk_prob: bool,
     );
+    pub fn lfm2_compiled_set_last_moe_dense(
+        model: *mut std::ffi::c_void,
+        router_w: *mut mlx_array,
+        expert_bias: *mut mlx_array,
+        gate_w: *mut mlx_array,
+        up_w: *mut mlx_array,
+        down_w: *mut mlx_array,
+        num_experts: i32,
+        top_k: i32,
+        norm_topk_prob: bool,
+    );
     pub fn lfm2_compiled_finalize(model: *mut std::ffi::c_void) -> i32;
     pub fn lfm2_session_begin(
         model: *mut std::ffi::c_void,

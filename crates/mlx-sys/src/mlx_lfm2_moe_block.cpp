@@ -119,6 +119,77 @@ array switch_glu_forward(
 
 } // namespace
 
+// Dense SwitchGLU forward — take + matmul for BF16 expert weights.
+// gate_w/up_w: [E, I, H], down_w: [E, H, I] (PyTorch layout, pre-transposed
+// at load so the matmul is x @ w[e].T).
+// x: [N, H], inds: [N, K] — callers must flatten batch dims first.
+array switch_glu_forward_dense(
+    const array& x, const array& inds,
+    const array& gate_w, const array& up_w, const array& down_w) {
+    const int N = static_cast<int>(x.shape(0));
+    const int H = static_cast<int>(x.shape(1));
+    const int K = static_cast<int>(inds.shape().back());
+    auto idx_flat = mlx::core::flatten(inds);  // [N*K]
+
+    // Repeat each x row K times: [N, H] -> [N, K, H] -> [N*K, H]
+    auto x3 = mlx::core::expand_dims(x, 1);
+    x3 = mlx::core::broadcast_to(x3, {N, K, H});
+    auto x_rep = mlx::core::flatten(x3, 0, 1);
+
+    auto gate_e = mlx::core::take(gate_w, idx_flat, 0);
+    auto up_e   = mlx::core::take(up_w,   idx_flat, 0);
+    auto down_e = mlx::core::take(down_w, idx_flat, 0);
+
+    auto x5 = mlx::core::expand_dims(x_rep, -2);  // [N*K, 1, H]
+    auto x_gate = mlx::core::matmul(x5, mlx::core::transpose(gate_e, {0, 2, 1}));
+    auto x_up   = mlx::core::matmul(x5, mlx::core::transpose(up_e,   {0, 2, 1}));
+    auto h = swiglu(x_gate, x_up);
+    auto y = mlx::core::matmul(h, mlx::core::transpose(down_e, {0, 2, 1}));
+    y = mlx::core::squeeze(y, -2);  // [N*K, H]
+
+    return mlx::core::reshape(y, {N, K, H});
+}
+
+// LFM2.5 sparse-MoE forward (dense BF16 experts).
+array lfm2_moe_block_forward_dense_cpp(
+    const array& x,
+    const array& router_w,
+    const array& expert_bias,
+    const array& expert_gate_w,
+    const array& expert_up_w,
+    const array& expert_down_w,
+    int32_t num_experts, int32_t top_k, bool norm_topk_prob) {
+    if (num_experts <= 0 || top_k <= 0 || top_k > num_experts) {
+        throw std::invalid_argument("lfm2_moe_block_forward_dense_cpp: invalid num_experts/top_k");
+    }
+    // Flatten to 2D [N, H] — take() with multi-dim indices would otherwise
+    // produce rank-4 expert weights that break transpose.
+    auto x_2d = mlx::core::flatten(x, 0, -2);
+    auto logits = mlx::core::matmul(astype(x_2d, float32), astype(router_w, float32));
+    auto s = mlx::core::softmax(logits, /*axis=*/-1);
+    s = s + astype(expert_bias, float32);
+
+    const int kth = num_experts - top_k;
+    auto part = mlx::core::argpartition(s, kth, /*axis=*/-1);
+    const int sel_rank = static_cast<int>(part.ndim());
+    mlx::core::Shape start(sel_rank, 0);
+    mlx::core::Shape stop = part.shape();
+    mlx::core::Shape strides(sel_rank, 1);
+    start[sel_rank - 1] = num_experts - top_k;
+    auto idx = astype(mlx::core::slice(part, start, stop, strides), mlx::core::int32);
+    auto w = mlx::core::take_along_axis(s, idx, /*axis=*/-1);
+    if (norm_topk_prob) {
+        auto denom = mlx::core::sum(w, /*axis=*/-1, /*keepdims=*/true) + array(1e-20f);
+        w = mlx::core::divide(w, denom);
+    }
+    w = astype(w, x.dtype());
+
+    auto y_switch = switch_glu_forward_dense(x_2d, idx, expert_gate_w, expert_up_w, expert_down_w);
+    auto y = mlx::core::sum(
+        y_switch * mlx::core::expand_dims(w, -1), /*axis=*/-2, /*keepdims=*/false);
+    return astype(mlx::core::reshape(y, x.shape()), x.dtype());
+}
+
 // LFM2.5 sparse-MoE forward. Throws on invalid arguments.
 //
 //   x            : [..., H]

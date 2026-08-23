@@ -106,15 +106,8 @@ pub(crate) fn load_embed_tokens_from_tensors(
             .get(base)
             .copied()
             .unwrap_or((qc.bits, qc.group_size));
-        log::info!("  dequantizing embed_tokens at load time");
-        return Ok(dequantize(
-            &w,
-            &scales,
-            biases.as_ref(),
-            group_size,
-            bits,
-            qc.mode,
-        ));
+        let dequant = dequantize(&w, &scales, biases.as_ref(), group_size, bits, qc.mode);
+        return Ok(dequant);
     }
     Ok(w)
 }

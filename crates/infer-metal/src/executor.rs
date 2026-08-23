@@ -1233,29 +1233,30 @@ impl RealMetalExecutor {
                 )
             })?
             .clone();
-        let draft_state = slot.dflash_draft_state.as_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "DFlash decode for slot {} has no draft cache state",
-                row.slot
-            )
-        })?;
-
         let block_size = runtime.block_size();
         let old_cache_len = slot.cache_len;
         let layer_ids = runtime.target_layer_ids();
 
         // 1. Draft block (DSpark: backbone once + Markov head refinement).
         let t_draft = std::time::Instant::now();
-        let block_tokens = dflash::prepare_draft_block(
-            runtime,
-            row.last_token,
-            &target_hidden,
-            embed_tokens,
-            lm_head,
-            &self.config,
-            &row.params,
-            draft_state,
-        )?;
+        let block_tokens = {
+            let draft_state = slot.dflash_draft_state.as_mut().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DFlash decode for slot {} has no draft cache state",
+                    row.slot
+                )
+            })?;
+            dflash::prepare_draft_block(
+                runtime,
+                row.last_token,
+                &target_hidden,
+                embed_tokens,
+                lm_head,
+                &self.config,
+                &row.params,
+                draft_state,
+            )?
+        };
         let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
 
         // 2. Open session + target block forward (full logits + capture).
