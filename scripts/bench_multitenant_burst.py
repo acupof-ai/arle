@@ -17,9 +17,9 @@ Workload (matches existing ARLE 318ms / vLLM 573ms baselines):
 Usage:
   ARLE:   python3 scripts/bench_multitenant_burst.py http://localhost:8000 default
   vLLM:   python3 scripts/bench_multitenant_burst.py http://localhost:8000 \\
-            /home/ckl/projects/arle/infer/models/Qwen3-4B
+            Qwen/Qwen3-4B
   SGLang: python3 scripts/bench_multitenant_burst.py http://localhost:8001 \\
-            /home/ckl/projects/arle/infer/models/Qwen3-4B
+            Qwen/Qwen3-4B
 
 Reference data (M_ibp Phase 0 wins entry):
 - ARLE post-F4-Small/M_b.1/M_pf-P0: TTFT mdn 318 ms

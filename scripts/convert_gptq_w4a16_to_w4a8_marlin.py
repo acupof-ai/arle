@@ -12,8 +12,8 @@ already at GPTQ-quantized values(integer multiples of GPTQ scale)。
 
 Usage:
   python scripts/convert_gptq_w4a16_to_w4a8_marlin.py \\
-    --src infer/models/Qwen3-4B-GPTQ-Int4-marlin \\
-    --dst infer/models/Qwen3-4B-GPTQ-W4A8-marlin
+    --src models/Qwen3-4B-GPTQ-Int4-marlin \\
+    --dst models/Qwen3-4B-GPTQ-W4A8-marlin
 
 Codex KILL criteria(see `8bb57ea`):
   - re-quant noise > 5% on diag → fall back to AutoGPTQ-direct

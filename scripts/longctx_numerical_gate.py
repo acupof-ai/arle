@@ -464,7 +464,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-name", default="left")
     parser.add_argument("--right-name", default="right")
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
-    parser.add_argument("--tokenizer", default="infer/models/Qwen3-4B")
+    parser.add_argument("--tokenizer", default="models/Qwen3-4B")
     parser.add_argument("--prompt-count", type=int, default=16)
     parser.add_argument("--prompt-tokens", type=int)
     parser.add_argument("--max-tokens", type=int, default=64)

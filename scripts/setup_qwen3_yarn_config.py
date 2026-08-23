@@ -7,12 +7,12 @@ reproducibility.
 
 Usage:
   ./scripts/setup_qwen3_yarn_config.py \\
-      --src infer/models/Qwen3-4B \\
+      --src models/Qwen3-4B \\
       --type yarn --factor 2.0 --orig-max-pos 40960
-  # → creates infer/models/Qwen3-4B-yarn-f2.0/
+  # → creates models/Qwen3-4B-yarn-f2.0/
 
   # --in-place to mutate the source config.json (no copy)
-  ./scripts/setup_qwen3_yarn_config.py --src infer/models/Qwen3-4B \\
+  ./scripts/setup_qwen3_yarn_config.py --src models/Qwen3-4B \\
       --type linear --factor 2.0 --in-place
 
 Phase 3a/b/c.

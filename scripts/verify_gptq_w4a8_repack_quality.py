@@ -9,8 +9,8 @@ may add noise on top of GPTQ-calibrated weights. Test single layer:
 
 Usage:
   python scripts/verify_gptq_w4a8_repack_quality.py \\
-    --src infer/models/Qwen3-4B-GPTQ-Int4-marlin \\
-    --dst infer/models/Qwen3-4B-GPTQ-W4A8-marlin \\
+    --src models/Qwen3-4B-GPTQ-Int4-marlin \\
+    --dst models/Qwen3-4B-GPTQ-W4A8-marlin \\
     [--layer 0] [--proj down_proj]
 """
 

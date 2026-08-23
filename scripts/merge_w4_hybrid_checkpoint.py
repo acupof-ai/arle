@@ -24,9 +24,9 @@ Loader contract(per codex Phase 1):
 
 Usage:
   python scripts/merge_w4_hybrid_checkpoint.py \\
-    --w4a16 infer/models/Qwen3-4B-GPTQ-W4A16-marlin-zpfix \\
-    --w4a8  infer/models/Qwen3-4B-GPTQ-W4A8-zpfix \\
-    --dst   infer/models/Qwen3-4B-W4-hybrid-zpfix
+    --w4a16 models/Qwen3-4B-GPTQ-W4A16-marlin-zpfix \\
+    --w4a8  models/Qwen3-4B-GPTQ-W4A8-zpfix \\
+    --dst   models/Qwen3-4B-W4-hybrid-zpfix
 """
 
 from __future__ import annotations
