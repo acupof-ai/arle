@@ -301,11 +301,17 @@ impl Dsv4CudaExecutor {
             use cudarc::driver::DevicePtr;
             let (p, _g) = stream.data.device_ptr(&model.ctx.stream);
             let mut h = vec![half::bf16::ZERO; 8];
-            model.ctx.stream.memcpy_dtoh(&stream.data.slice(0..8), &mut h)?;
+            model
+                .ctx
+                .stream
+                .memcpy_dtoh(&stream.data.slice(0..8), &mut h)?;
             model.ctx.stream.synchronize()?;
             let mut t = vec![half::bf16::ZERO; 8];
             let nb = stream.data.len();
-            model.ctx.stream.memcpy_dtoh(&stream.data.slice(nb - 8..nb), &mut t)?;
+            model
+                .ctx
+                .stream
+                .memcpy_dtoh(&stream.data.slice(nb - 8..nb), &mut t)?;
             model.ctx.stream.synchronize()?;
             log::warn!(
                 "graph dbg: replay={was_replay} pos={start_pos} tok={last_token} stream=0x{p:x} len={nb} head={:?} tail={:?}",
