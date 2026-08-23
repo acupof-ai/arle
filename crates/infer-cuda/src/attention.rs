@@ -5055,8 +5055,16 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     // n == 1 (the decode graph lane) uses the scratch's fixed staging so the
     // capture's addresses stay valid; batched rows stage transiently. The fixed
     // buffers are moved out for the GEMM borrow and put back below.
-    let use_fixed =
-        n == 1 && scratch.oproj_in.hidden_dim == cols && scratch.oproj_out.hidden_dim == rows;
+    // The constructor sizes the fixed staging from config; the loaded TP-local
+    // table decides the true group dims, so resize once on the eager warm step
+    // (which precedes any capture).
+    if n == 1 && (scratch.oproj_in.hidden_dim != cols || scratch.oproj_out.hidden_dim != rows) {
+        // SAFETY: uninit device scratch; fully written before first read.
+        scratch.oproj_in = unsafe { HiddenStates::uninit(ctx, cols, 1)? };
+        // SAFETY: uninit device scratch; fully written before first read.
+        scratch.oproj_out = unsafe { HiddenStates::uninit(ctx, rows, 1)? };
+    }
+    let use_fixed = n == 1;
     let (mut in_g, mut out_g) = if use_fixed {
         // SAFETY: placeholders; never read, replaced by the put-back below.
         let a = std::mem::replace(&mut scratch.oproj_in, unsafe {
