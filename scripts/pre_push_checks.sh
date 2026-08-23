@@ -66,7 +66,7 @@ for test in \
 done
 run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
 run cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
-run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --release
+run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys --release
 run cargo test --release \
     -p infer-core -p infer-server -p infer-plan -p infer-seam \
     -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
