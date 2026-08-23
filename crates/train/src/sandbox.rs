@@ -413,7 +413,12 @@ pub fn control_arm_check(
     )?;
     apply_test_patch(&arm, test_patch)?;
     let (output, code, killed) = run_fail_to_pass(&arm, fail_to_pass, pythonpath, timeout_secs)?;
-    tests_actually_ran(code, killed, fail_to_pass, &format_bash_output(&output, &[], code, killed))?;
+    tests_actually_ran(
+        code,
+        killed,
+        fail_to_pass,
+        &format_bash_output(&output, &[], code, killed),
+    )?;
     let passed = match parse_pytest_counts(&String::from_utf8_lossy(&output)) {
         Some((passed, _)) if !killed => passed,
         _ => {
@@ -601,15 +606,18 @@ mod tests {
 +    assert False
 ";
 
-    #[test]
-    fn control_arm_gate() {
-        // Mirror the run's own login shell: a python3 without pytest there
-        // skips the gate rather than failing it (the harness is Linux/pod-only).
-        let pytest_ok = Command::new("bash")
+    // Mirror the run's own login shell: a python3 without pytest there skips
+    // the gate rather than failing it (the harness is Linux/pod-only).
+    fn login_shell_has_pytest() -> bool {
+        Command::new("bash")
             .args(["-lc", "python3 -m pytest --version"])
             .status()
-            .is_ok_and(|s| s.success());
-        if !pytest_ok {
+            .is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn control_arm_gate() {
+        if !login_shell_has_pytest() {
             eprintln!("skipping control_arm_gate: python3/pytest unavailable in the login shell");
             return;
         }
@@ -634,5 +642,27 @@ mod tests {
             120,
         )
         .expect("a test that fails on base must pass the control arm");
+    }
+
+    #[test]
+    fn score_workdir_bails_on_collection_error() {
+        if !login_shell_has_pytest() {
+            eprintln!(
+                "skipping score_workdir_bails_on_collection_error: pytest unavailable in the \
+                 login shell"
+            );
+            return;
+        }
+        // A fail_to_pass path that does not exist makes pytest exit 4 (usage
+        // error): the tests never ran, so this must bail instead of scoring 0.0.
+        let dir = tempfile::tempdir().unwrap();
+        score_workdir(
+            dir.path(),
+            "",
+            &["tests/does_not_exist.py".to_owned()],
+            None,
+            120,
+        )
+        .expect_err("a pytest collection error must abort, not score as 0.0");
     }
 }
