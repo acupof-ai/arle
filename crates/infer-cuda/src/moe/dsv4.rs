@@ -272,9 +272,11 @@ pub(super) fn dsv4_route_device(
             // Graph capture: the persistent pre-replay buffer, not a host-coupled memcpy node.
             model.graph_token_ids_u32()?
         } else {
-            ctx.stream
-                .clone_htod(tokens)
-                .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?
+            crate::dsv4::StepSlice::Owned(
+                ctx.stream
+                    .clone_htod(tokens)
+                    .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?,
+            )
         };
         keepalive.keep_u32(&token_ids);
         Some(token_ids)

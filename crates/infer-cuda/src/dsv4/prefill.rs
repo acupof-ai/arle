@@ -159,14 +159,9 @@ impl Dsv4Model {
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let token_ids = if graph_mode {
-            self.graph_token_ids
-                .lock()
-                .unwrap()
-                .as_ref()
-                .expect("graph_token_ids uploaded before graph closure")
-                .clone()
+            self.graph_token_ids_i32()?
         } else {
-            crate::ops::upload_i32(&self.ctx, &token_ids_host)?
+            super::StepSlice::Owned(crate::ops::upload_i32(&self.ctx, &token_ids_host)?)
         };
         keepalive.keep_i32(&token_ids);
         // SAFETY: embed_stream writes the full stream buffer.

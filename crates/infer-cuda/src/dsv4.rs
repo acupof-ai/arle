@@ -323,12 +323,21 @@ impl Dsv4Model {
     }
 
     /// Persistent u32 token ids for hash routing (same pre-replay upload).
-    pub(crate) fn graph_token_ids_u32(&self) -> Result<CudaSlice<u32>> {
-        self.graph_token_ids_u32
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))
+    pub(crate) fn graph_token_ids_u32(&self) -> Result<StepSlice<u32>> {
+        let buf = self.graph_token_ids_u32.lock().unwrap();
+        let b = buf
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))?;
+        Ok(StepSlice::Alias(self.graph_alias_slice(b)))
+    }
+
+    /// Persistent i32 token ids for the embedding lookup (pre-replay upload).
+    pub(crate) fn graph_token_ids_i32(&self) -> Result<StepSlice<i32>> {
+        let buf = self.graph_token_ids.lock().unwrap();
+        let b = buf
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))?;
+        Ok(StepSlice::Alias(self.graph_alias_slice(b)))
     }
 
     /// Alias of the persistent final-layer output stream (the last layer's

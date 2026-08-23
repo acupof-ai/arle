@@ -5052,10 +5052,20 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     );
     let cols = shape.cols_per_group;
     let rows = shape.rows_per_group;
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut in_g = unsafe { HiddenStates::uninit(ctx, cols, n)? };
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut out_g = unsafe { HiddenStates::uninit(ctx, rows, n)? };
+    let fits = |b: &Option<HiddenStates>, dim: usize| {
+        b.as_ref()
+            .is_some_and(|h| h.hidden_dim == dim && h.seq_len == n)
+    };
+    if !fits(&scratch.oproj_in, cols) {
+        // SAFETY: uninit device scratch; fully written before first read.
+        scratch.oproj_in = Some(unsafe { HiddenStates::uninit(ctx, cols, n)? });
+    }
+    if !fits(&scratch.oproj_out, rows) {
+        // SAFETY: uninit device scratch; fully written before first read.
+        scratch.oproj_out = Some(unsafe { HiddenStates::uninit(ctx, rows, n)? });
+    }
+    let mut in_g = scratch.oproj_in.take().expect("sized above");
+    let mut out_g = scratch.oproj_out.take().expect("sized above");
     let in_len = in_g.data.len();
     let out_len = out_g.data.len();
     for (group, cache) in caches.iter().enumerate() {
@@ -5106,6 +5116,8 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
             }
         }
     }
+    scratch.oproj_in = Some(in_g);
+    scratch.oproj_out = Some(out_g);
     Ok(())
 }
 

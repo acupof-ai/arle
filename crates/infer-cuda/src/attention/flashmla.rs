@@ -1320,6 +1320,10 @@ pub(super) struct Dsv4FusedWqkvDecodeScratch {
     pub(super) active_experts: CudaSlice<i32>,
     pub(super) active_offsets: CudaSlice<i32>,
     pub(super) active_counts: CudaSlice<i32>,
+    /// Grouped O-LoRA gather/scatter staging, sized on first decode use
+    /// (eager warm-up precedes graph capture, so the capture sees no alloc).
+    pub(super) oproj_in: Option<HiddenStates>,
+    pub(super) oproj_out: Option<HiddenStates>,
     pub(super) max_m: usize,
     pub(super) scale_stride_m: usize,
     pub(super) hidden_dim: usize,
@@ -1358,6 +1362,8 @@ impl Dsv4FusedWqkvDecodeScratch {
                 .stream
                 .clone_htod(&[1_i32])
                 .map_err(|e| anyhow!("DSv4 fused wqkv active_counts H2D failed: {e}"))?,
+            oproj_in: None,
+            oproj_out: None,
             max_m,
             scale_stride_m,
             hidden_dim,
