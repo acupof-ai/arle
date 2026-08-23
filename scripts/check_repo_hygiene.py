@@ -384,6 +384,28 @@ def check_experience_doc_inventory() -> list[str]:
     return errors
 
 
+# Entries before this date are grandfathered; perf-claim entries on/after it
+# must cite a baseline (a git hash) or carry an explicit waiver line.
+WINS_BASELINE_CUTOFF = "2026-08-23"
+_PERF_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:tok/s|ms|GB|%)")
+_HASH_RE = re.compile(r"[0-9a-f]{7,40}")
+_WAIVER_RE = re.compile(r"no.baseline|without.baseline|pending.remote", re.IGNORECASE)
+
+
+def check_wins_baseline_citations() -> list[str]:
+    errors = []
+    for rel in list_experience_entries(Path("docs/experience/wins")):
+        if Path(rel).name[:10] < WINS_BASELINE_CUTOFF:
+            continue
+        text = (ROOT / rel).read_text(errors="ignore")
+        if len(_PERF_RE.findall(text)) >= 3 and not _HASH_RE.search(text) and not _WAIVER_RE.search(text):
+            errors.append(
+                f"{rel}: perf-claim wins entry needs a baseline citation (git hash) "
+                f"or a 'no baseline' waiver; see docs/experience/wins/TEMPLATE-bench.md"
+            )
+    return errors
+
+
 def main() -> int:
     errors: list[str] = []
 
@@ -396,6 +418,7 @@ def main() -> int:
     errors.extend(check_template(Path(".github/ISSUE_TEMPLATE/feature_request.md"), FEATURE_TEMPLATE_REQUIRED_FIELDS))
     errors.extend(check_git_tracked_junk())
     errors.extend(check_experience_doc_inventory())
+    errors.extend(check_wins_baseline_citations())
     errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
     errors.extend(check_launcher_boundary())
