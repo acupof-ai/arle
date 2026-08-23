@@ -1217,7 +1217,12 @@ impl RealMetalExecutor {
             .ok_or_else(|| anyhow::anyhow!("DFlash decode requested without a runtime"))?;
         let lfm2_weights = self.weights.lfm2()?;
         let embed_tokens = &lfm2_weights.embedding;
-        let lm_head = &lfm2_weights.lm_head;
+        // Use the quantized lm_head (6-bit, ~196MB) when available — the dense
+        // BF16 transpose is ~524MB and costs 2.5× more memory bandwidth.
+        let lm_head = lfm2_weights
+            .embed_quantized
+            .as_ref()
+            .unwrap_or(&lfm2_weights.lm_head);
         let model = lfm2_weights.cpp_model()?;
         let slot = self
             .slots
@@ -1284,7 +1289,8 @@ impl RealMetalExecutor {
         let draft_tokens = dflash::materialize_i32_tokens(&block_tokens)?;
         let accept_ms = t_accept.elapsed().as_secs_f64() * 1000.0;
         let mut matched = 0usize;
-        for i in 0..block_size {
+        let draft_len = (verify_len - 1) as usize; // block is [real, d1..dN]
+        for i in 0..draft_len {
             if target_pred[i] == draft_tokens[i + 1] {
                 matched += 1;
             } else {
@@ -1299,7 +1305,7 @@ impl RealMetalExecutor {
                 row.slot,
                 old_cache_len,
                 &draft_tokens[1..],
-                &target_pred[..block_size]
+                &target_pred[..verify_len as usize]
             );
         }
 
@@ -1344,7 +1350,7 @@ impl RealMetalExecutor {
                 slot.cache_len,
                 matched,
                 accepted_inputs,
-                block_size,
+                draft_len,
                 draft_ms,
                 verify_ms,
                 accept_ms,
@@ -1768,7 +1774,7 @@ fn resolve_dflash(
         Ok(value) if !value.trim().is_empty() => value.trim().parse::<usize>().map_err(|err| {
             anyhow::anyhow!("invalid INFER_METAL_DFLASH_MAX_ROWS='{value}': {err}")
         })?,
-        _ => 4,
+        _ => 16,
     };
     let options = dflash::MetalDflashOptions {
         draft_model,

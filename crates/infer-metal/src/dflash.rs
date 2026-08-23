@@ -62,6 +62,7 @@ pub(crate) struct MetalDflashRuntime {
     _draft_weights: DFlashDraftWeights,
     draft_cpp_model: DFlashDraftCppModel,
     markov: Option<MarkovHead>,
+    confidence_head: Option<ConfidenceHead>,
 }
 
 impl MetalDflashRuntime {
@@ -88,10 +89,11 @@ impl MetalDflashRuntime {
             })?;
         let draft_cpp_model = DFlashDraftCppModel::build(&draft_weights, &draft_config)?;
         let markov = draft_weights.markov.take();
+        let confidence_head = draft_weights.confidence_head.take();
         let default_block_size = draft_config.block_size.max(2);
         // DSpark (Markov head): cap default block_size at 4 — measured optimal
-        // on M4 Max (1.26× speedup at bs=4 vs 0.99× at bs=9). Override with
-        // --speculative-tokens.
+        // on M4 Pro. The confidence head truncates further when the draft is
+        // uncertain, but larger defaults hurt because acceptance drops sharply.
         let default_block_size = if markov.is_some() {
             default_block_size.min(4)
         } else {
@@ -118,6 +120,7 @@ impl MetalDflashRuntime {
             _draft_weights: draft_weights,
             draft_cpp_model,
             markov,
+            confidence_head,
         })
     }
 
@@ -275,6 +278,19 @@ impl MarkovHead {
         let latent = mlx::take_axis(&self.w1, prev_token, 0); // [1, rank]
         mlx::matmul(&latent, &self.w2) // [1, vocab]
     }
+
+    /// Markov latent `[1, rank]` — the w1 embedding used by the confidence head.
+    fn latent(&self, prev_token: &MlxArray) -> MlxArray {
+        mlx::take_axis(&self.w1, prev_token, 0) // [1, rank]
+    }
+}
+
+/// DSpark confidence head — predicts per-position draft acceptance.
+/// Input: concat[draft_hidden (2048), markov_latent (256)] = 2304.
+/// Output: sigmoid(x @ W.T + b) — per-position confidence in [0, 1].
+struct ConfidenceHead {
+    weight: MlxArray, // [2304, 1] (transposed from [1, 2304])
+    bias: MlxArray,   // [1]
 }
 
 #[derive(Clone, Debug)]
@@ -505,6 +521,8 @@ struct DFlashDraftWeights {
     norm: MlxArray,
     // DSpark only: the Markov bigram head (absent for plain DFlashEagle/MTP).
     markov: Option<MarkovHead>,
+    // DSpark only: the confidence head for adaptive block sizing.
+    confidence_head: Option<ConfidenceHead>,
 }
 
 impl DFlashDraftWeights {
@@ -577,6 +595,18 @@ impl DFlashDraftWeights {
             _ => None,
         };
 
+        // DSpark confidence head (optional — absent in plain DFlashEagle checkpoints).
+        let confidence_head = match (
+            get("confidence_head.proj.weight"),
+            get("confidence_head.proj.bias"),
+        ) {
+            (Ok(w), Ok(b)) => {
+                let w = mlx::transpose_all(&w); // [1, 2304] -> [2304, 1]
+                Some(ConfidenceHead { weight: w, bias: b })
+            }
+            _ => None,
+        };
+
         Ok(Self {
             layers,
             fc: load_proj("fc")?,
@@ -585,6 +615,7 @@ impl DFlashDraftWeights {
             pre_fc_norm_hidden,
             norm: load_norm("norm.weight")?,
             markov,
+            confidence_head,
         })
     }
 }
@@ -1199,10 +1230,13 @@ pub(crate) fn prepare_draft_block(
             .context("DSpark draft logits missing vocab dim")?;
         let mut prev = MlxArray::from_slice_i32(&[current_token as i32], &[1]);
         let mut token_arrays: Vec<MlxArray> = Vec::with_capacity(runtime.block_size);
+        let mut latent_arrays: Vec<MlxArray> = Vec::with_capacity(runtime.block_size);
         for step in 0..runtime.block_size {
             let s = i32::try_from(step).context("draft step does not fit in i32")?;
             let step_logits = mlx::slice(&draft_logits, &[s, 0], &[s + 1, vocab], &[1, 1]);
-            let bias = markov.bias(&prev);
+            let latent = markov.latent(&prev);
+            let bias = mlx::matmul(&latent, &markov.w2);
+            latent_arrays.push(latent);
             let corrected = mlx::add(&step_logits, &bias);
             let next = mlx::argmax_axis(&corrected, -1); // [1] int32 on GPU
             token_arrays.push(next.clone());
@@ -1222,8 +1256,36 @@ pub(crate) fn prepare_draft_block(
                 i
             );
         }
-        // The verify block is [real, d1..d_block_size] — block_size+1 tokens.
-        let mut block = Vec::with_capacity(runtime.block_size + 1);
+        // Confidence-head adaptive block sizing: truncate the draft at the first
+        // low-confidence position. This lets us default to the native block_size
+        // (9) while only verifying tokens the model is confident about.
+        let actual_bs = if let Some(conf_head) = &runtime.confidence_head {
+            let all_latents = mlx::concatenate_axis(&latent_arrays, 0);
+            let conf_input =
+                mlx::concatenate_axis(&[draft_hidden, all_latents], -1);
+            let conf_logits = mlx::add(
+                &mlx::matmul(&conf_input, &conf_head.weight),
+                &conf_head.bias,
+            );
+            let conf_values = materialize_f32(&conf_logits)?;
+            let mut bs = runtime.block_size;
+            for (i, &c) in conf_values.iter().enumerate() {
+                // ponytail: threshold -100 effectively disables truncation —
+                // with bs=4 the draft cost is already paid, so truncating saves
+                // less verify time than it costs in accepted tokens. Re-enable
+                // with a tuned threshold when using larger block sizes.
+                if c < -100.0 {
+                    bs = i;
+                    break;
+                }
+            }
+            bs.max(1)
+        } else {
+            runtime.block_size
+        };
+        let draft_tokens = &draft_tokens[..actual_bs];
+        // The verify block is [real, d1..d_actual_bs] — actual_bs+1 tokens.
+        let mut block = Vec::with_capacity(actual_bs + 1);
         block.push(current_token);
         block.extend(draft_tokens.iter().map(|&t| t as u32));
         draft_state.trim(runtime.block_size);
@@ -1529,6 +1591,16 @@ pub(crate) fn materialize_i32_tokens(tokens: &MlxArray) -> Result<Vec<i32>> {
     };
     mlx::eval(&[&tokens_i32]);
     Ok(tokens_i32.as_slice_i32().to_vec())
+}
+
+pub(crate) fn materialize_f32(values: &MlxArray) -> Result<Vec<f32>> {
+    let values_f32 = if values.dtype() == mlx::Dtype::Float32 {
+        values.clone()
+    } else {
+        mlx::as_dtype(values, mlx::Dtype::Float32)
+    };
+    mlx::eval(&[&values_f32]);
+    Ok(values_f32.as_slice_f32().to_vec())
 }
 
 fn apply_weight(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
