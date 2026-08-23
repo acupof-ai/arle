@@ -264,6 +264,7 @@ impl Dsv4CudaExecutor {
 
         // Graph: capture/replay transformer layers. The closure stores the
         // output stream so the LM head can read it after replay.
+        let was_captured = graph.is_captured();
         let result: std::cell::RefCell<Option<crate::dsv4::StepBuf>> =
             std::cell::RefCell::new(None);
         let capture_result = graph.run_or_capture(|| {
@@ -284,8 +285,11 @@ impl Dsv4CudaExecutor {
             .graph_mode
             .store(false, std::sync::atomic::Ordering::Relaxed);
 
+        if capture_result.is_ok() && !was_captured && graph.is_captured() {
+            log::info!("[dsv4-decode-graph] captured slot {slot_idx} at pos {start_pos}");
+        }
         if let Err(e) = capture_result {
-            log::warn!("DSv4 c=1 decode graph failed, falling back to eager: {e}");
+            log::warn!("[dsv4-decode-graph] capture failed, falling back to eager: {e}");
             self.decode_graphs[slot_idx] = None;
             // Captured work was recorded, not executed: roll the host counters
             // the closure advanced back to the step's start so eager redoes it.
@@ -724,9 +728,12 @@ impl Dsv4CudaExecutor {
     }
 }
 
-/// Opt-in while the c=1 graph is below the eager arm (2026-08-23: ITL p50
-/// 30.2 vs 24.5 ms, MMLU 6/200 one-sided misses); `ARLE_DSV4_DECODE_GRAPH=1`.
-fn dsv4_decode_graph_enabled() -> bool {
+/// Default on; `ARLE_DSV4_DECODE_GRAPH=0` selects the eager control arm
+/// (matched A/B 2026-08-23: ITL p50 22.2 vs 24.5 ms, MMLU 200 identical).
+pub(super) fn dsv4_decode_graph_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ARLE_DSV4_DECODE_GRAPH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        crate::runtime_flags::qwen35_decode_graph()
+            && std::env::var_os("ARLE_DSV4_DECODE_GRAPH").is_none_or(|v| v != "0")
+    })
 }
