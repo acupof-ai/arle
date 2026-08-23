@@ -86,7 +86,12 @@ impl Qwen35DecodeGraph {
         Self {
             ws: crate::qwen35::Qwen35Workspace::new(),
             graphs: (0..num_slots)
-                .map(|_| crate::graph::CudaGraphState::new(stream.clone()))
+                // allow_alloc_nodes: this lane's capture has never been audited
+                // for alloc nodes, and a short single-GPU smoke could not get it
+                // to capture. Keeping the pre-2026-08-23 warn-only behaviour
+                // rather than risking a silent fallback to eager; drop the call
+                // once a capture here is measured at zero.
+                .map(|_| crate::graph::CudaGraphState::new(stream.clone()).allow_alloc_nodes())
                 .collect(),
             baked: vec![None; num_slots],
         }
@@ -2025,7 +2030,7 @@ impl Qwen35CudaExecutor {
                     "[qwen35-decode-graph] {label}slot {slot}: workspace addresses changed; \
                      dropping stale capture and recapturing"
                 );
-                graphs[slot] = crate::graph::CudaGraphState::new(model.ctx.stream.clone());
+                graphs[slot] = crate::graph::CudaGraphState::new(model.ctx.stream.clone()).allow_alloc_nodes();
                 baked[slot] = Some(bake);
             }
             None => baked[slot] = Some(bake),
@@ -2443,7 +2448,7 @@ impl Qwen35CudaExecutor {
             // mem.
             if let Some(dg) = self.decode_graph.as_mut() {
                 dg.graphs[row.slot] =
-                    crate::graph::CudaGraphState::new(self.model.ctx.stream.clone());
+                    crate::graph::CudaGraphState::new(self.model.ctx.stream.clone()).allow_alloc_nodes();
                 dg.baked[row.slot] = None;
             }
             // Free the prior occupant's pages so a fresh prefill starts at logical
