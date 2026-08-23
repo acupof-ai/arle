@@ -60,8 +60,35 @@ nsys trace of the batched TP2 serve under the c=32 bench (490 decode steps,
 upper bound for batched-under-graph, and part of it is non-capturable (per-row
 sampling D2H, host PageMeta build, pointer staging) — realistic gain ~10 %.
 
-GPU-side cost per step (kernel share of the window): MoE/dense Marlin bf16
-GEMV 41 % (8.7 ms of the 20.3 ms step, ~148 launches), linear-attention
-recurrent decode (gdr+conv1d) 11 %, DeepGEMM fp8 10 %, NCCL all-reduce 6.5 %,
-paged attention 4.5 %. The MoE GEMV is the floor; graph capture addresses the
-idle, not the busy.
+The model is dense (no expert keys in config; FFN intermediate 17408). GPU-side
+cost per step (kernel share of the window, per rank): the NVFP4 Marlin W4A16
+GEMV fleet 41 % (8.6 ms of the 20.3 ms step — quantized qkv/o + gate/up/down
+projections), linear-attention recurrent decode (gdr+conv1d) 11 %, DeepGEMM
+fp8 10 %, NCCL all-reduce 6.5 %, paged attention 4.5 %.
+
+Roofline: the quantized projections are ~20 B params × ~0.63 B/param (4-bit +
+group scales) ≈ 12.7 GB, ~6.4 GB/rank at TP2, read once per step. 6.4 GB /
+8.6 ms ≈ 740 GB/s — 18 % of the H20's 4 TB/s HBM peak. The bf16 lm_head GEMM
+in the same trace runs at ~80 % of peak, so the gap is the Marlin path, not
+the hardware. A 2× Marlin GEMV is worth ~+26 % decode throughput.
+
+## Follow-up: kernel A/B harness (2026-08-23)
+
+`scripts/slice_checkpoint.py` writes a self-contained N-layer checkpoint
+(config truncated, layers 0..N-1 + all non-layer weights); the engine loads
+it unmodified. The 4-layer slice of this model (must include ≥1 full-attention
+layer — `full_attention_interval 4`, so `--layers 4` — or the KV-pool profiler
+sees 0 full-attn layers and clamps slots to 1) is ~7 GB and loads in seconds.
+
+Per-op timing: `ARLE_CUDA_PROFILE=1 arle serve --model-path <slice>` disarms
+the graph (events cannot record on a capturing stream) and exposes exact
+per-op µs on `/v1/stats` — the kernel A/B bed. Kernel-level: nsys on the slice
+produces a 4 MB trace (vs 157 MB for the full model).
+`scripts/nsys_op_attrib.py` joins kernels to NVTX op ranges, but NVTX ranges
+are absent under graph replay — use the ARLE_CUDA_PROFILE path for op-level
+attribution. `bench_throughput.py --ignore-warmup-gate` skips the warmup
+correctness gate (a 4-layer model generates garbage by design).
+
+Caveat: the NVFP4 baseline has a confirmed correctness bug on tool-rendered
+prompts (`docs/experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md`) —
+Marlin optimization on this quant is secondary to that.
