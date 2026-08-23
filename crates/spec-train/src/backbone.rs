@@ -811,6 +811,7 @@ mod tests {
             head_dim: 4,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            rope_scaling: None,
             sliding_window: Some(4096),
             layer_types: vec![DsparkLayerType::Full; 2],
             block_size: 3,

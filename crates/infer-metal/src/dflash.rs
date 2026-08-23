@@ -816,10 +816,18 @@ impl DFlashDraftState {
 
     /// Drop all written KV: the next `active_kv_flat` returns empty slices so the
     /// head's KV is rebuilt from scratch. Used by the Qwen35Mtp draft, which seeds
-    /// a fresh head KV each block (see prepare_draft_block_mtp).
-    fn reset(&mut self) {
+    /// a fresh head KV each block (see prepare_draft_block_mtp), and by DSpark,
+    /// whose target context changes every block (stale KV would accumulate).
+    pub(crate) fn reset(&mut self) {
         self.len = 0;
         self.rope_offset = 0;
+    }
+
+    /// Set the absolute RoPE base for the next forward. DSpark target context
+    /// represents tokens at absolute positions in the sequence; the draft's
+    /// rope_offset must match so q/k align with the target's positions.
+    pub(crate) fn set_rope_offset(&mut self, offset: i32) {
+        self.rope_offset = offset;
     }
 
     fn active_kv_flat(&self) -> Vec<MlxArray> {
@@ -1203,8 +1211,11 @@ pub(crate) fn prepare_draft_block(
         let mut block = Vec::with_capacity(runtime.block_size + 1);
         block.push(current_token);
         block.extend(draft_tokens);
-        draft_state.trim(runtime.block_size);
-        draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
+        // DSpark: the target context changes every block, so the draft KV must
+        // not persist stale context. Reset to empty; the next block rebuilds KV
+        // from the fresh target hidden. rope_offset is set by the caller before
+        // the next forward.
+        draft_state.reset();
         let block_arr = tokens_to_array(&block);
         let t_argmax = Instant::now();
         if draft_trace {

@@ -1238,6 +1238,8 @@ impl RealMetalExecutor {
         let layer_ids = runtime.target_layer_ids();
 
         // 1. Draft block (DSpark: backbone once + Markov head refinement).
+        //    Set rope_offset to the absolute position of the first target-hidden
+        //    row so the draft's RoPE aligns with the target's positions.
         let t_draft = std::time::Instant::now();
         let block_tokens = {
             let draft_state = slot.dflash_draft_state.as_mut().ok_or_else(|| {
@@ -1246,6 +1248,8 @@ impl RealMetalExecutor {
                     row.slot
                 )
             })?;
+            let target_hidden_len = target_hidden.shape().first().copied().unwrap_or(0) as i32;
+            draft_state.set_rope_offset(old_cache_len as i32 - target_hidden_len);
             dflash::prepare_draft_block(
                 runtime,
                 row.last_token,
