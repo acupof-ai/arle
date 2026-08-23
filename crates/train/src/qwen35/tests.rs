@@ -137,9 +137,7 @@ fn fill_tensor(store: &mut TensorStore, tensor_id: TensorId, value: f32) -> Test
     let tensor = store
         .get_mut(tensor_id)
         .ok_or_else(|| format!("missing tensor {tensor_id}"))?;
-    for slot in &mut tensor.data {
-        *slot = value;
-    }
+    tensor.data.fill(value);
     tensor.device_handle = None;
     Ok(())
 }
