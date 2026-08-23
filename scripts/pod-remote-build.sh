@@ -110,8 +110,11 @@ reconcile_untracked() {
   tmp="$(mktemp -d)" || return 0
   trap 'rm -rf "$tmp"' RETURN
   tar -tzf "$archive" 2>/dev/null | sed 's:/$::' | sort -u > "$tmp/incoming" || return 0
+  # `.arle-source-receipt` is untracked and never in the tarball, and
+  # `source_digest` discards it for the same reason — deleting it here made
+  # every sync strip the receipt the next build requires.
   git -C "$tree" ls-files -co --exclude-standard -z 2>/dev/null |
-    tr '\0' '\n' | sort -u > "$tmp/present" || return 0
+    tr '\0' '\n' | grep -v '^\.arle-source-receipt$' | sort -u > "$tmp/present" || return 0
   comm -13 "$tmp/incoming" "$tmp/present" > "$tmp/strays"
   [ -s "$tmp/strays" ] || return 0
   echo "sync: removing $(wc -l < "$tmp/strays" | tr -d ' ') untracked file(s) absent from the pusher's tree" >&2
@@ -197,7 +200,7 @@ case "${1:-}" in
       if [ "$actual_digest" != "$expected_digest" ] && [ -n "${strays_tmp:=$(mktemp -d)}" ]; then
         tar -tzf "$archive" 2>/dev/null | sed 's:/$::' | sort -u > "$strays_tmp/incoming" || true
         git -C "$TREE" ls-files -co --exclude-standard -z 2>/dev/null |
-          tr '\0' '\n' | sort -u > "$strays_tmp/present" || true
+          tr '\0' '\n' | grep -v '^\.arle-source-receipt$' | sort -u > "$strays_tmp/present" || true
         comm -13 "$strays_tmp/incoming" "$strays_tmp/present" | head -20 > "$strays_tmp/strays"
         [ -s "$strays_tmp/strays" ] && {
           echo "sync source mismatch: remote tree still carries files the pusher does not:" >&2
