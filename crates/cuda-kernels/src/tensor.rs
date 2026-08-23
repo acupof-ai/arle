@@ -364,7 +364,7 @@ pub fn null_raw_ptr<T>() -> RawDevicePtr<T> {
 
 /// FP8 E4M3FN → f32 (host twin of `dsv4_decode_fp8_e4m3`; 0x7f/0xff is the
 /// format's NaN and is clamped to +/-448, matching the device decoder).
-pub(super) fn e4m3_to_f32(bits: u8) -> f32 {
+pub fn e4m3_to_f32(bits: u8) -> f32 {
     let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
     let exp = i32::from((bits >> 3) & 0x0f);
     let mant = f32::from(bits & 0x07);
@@ -375,4 +375,12 @@ pub(super) fn e4m3_to_f32(bits: u8) -> f32 {
         return sign * (mant / 8.0) * 2.0_f32.powi(-6);
     }
     sign * (1.0 + mant / 8.0) * 2.0_f32.powi(exp - 7)
+}
+
+/// FP4 E2M1 → f32, matching the kernel's LUT (dequant.h).
+pub fn e2m1_to_f32(nibble: u8) -> f32 {
+    const LUT: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    LUT[(nibble & 0x0f) as usize]
 }

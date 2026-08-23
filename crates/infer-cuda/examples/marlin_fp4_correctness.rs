@@ -24,6 +24,7 @@ mod real {
     use cuda_kernels::ffi;
     use cuda_kernels::prelude::DeviceContext;
     use cuda_kernels::tensor::DeviceMatrix;
+    use cuda_kernels::tensor::{e2m1_to_f32, e4m3_to_f32};
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
@@ -40,28 +41,6 @@ mod real {
     /// Check this many output rows in the CPU reference.
     const CHECK_ROWS: usize = 64;
 
-    fn e2m1_val(b: u8) -> f32 {
-        const E2M1: [f32; 16] = [
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-        ];
-        E2M1[(b & 0xF) as usize]
-    }
-
-    fn e4m3_val(b: u8) -> f32 {
-        // Must match the repack's `e4m3_to_f32` (tensor.rs): only 0x7F maps to
-        // 448.0; 0x78-0x7E are regular (1+m/8)*2^8 values.
-        let sign = if b & 0x80 == 0 { 1.0 } else { -1.0 };
-        let exp = i32::from((b >> 3) & 0x0f);
-        let mant = f32::from(b & 0x07);
-        if b & 0x7f == 0x7f {
-            return sign * 448.0;
-        }
-        if exp == 0 {
-            return sign * (mant / 8.0) * 2.0f32.powi(-6);
-        }
-        sign * (1.0 + mant / 8.0) * 2.0f32.powi(exp - 7)
-    }
-
     struct Lcg(u64);
     impl Lcg {
         fn next_u8(&mut self) -> u8 {
@@ -77,7 +56,6 @@ mod real {
         global_scale: f32,
         x: &[bf16],
         m: usize,
-        n: usize,
         k: usize,
         rows: &[usize],
     ) -> Vec<f32> {
@@ -93,8 +71,8 @@ mod real {
                     } else {
                         (byte >> 4) & 0xF
                     };
-                    let w = e2m1_val(nibble);
-                    let s = e4m3_val(scales[ni * scale_cols + ki / GROUP]);
+                    let w = e2m1_to_f32(nibble);
+                    let s = e4m3_to_f32(scales[ni * scale_cols + ki / GROUP]);
                     acc += x[mi * k + ki].to_f32() * w * s * global_scale;
                 }
                 out.push(acc);
@@ -202,7 +180,7 @@ mod real {
                 let gpu_out: Vec<bf16> = ctx.stream.clone_dtoh(&out_dev)?;
                 ctx.sync()?;
 
-                let cpu = cpu_ref_rows(&packed, &scales, global_scale, &x, m, n, k, &check_rows);
+                let cpu = cpu_ref_rows(&packed, &scales, global_scale, &x, m, k, &check_rows);
 
                 let mut max_rel = 0f32;
                 let mut sum_rel = 0f32;
