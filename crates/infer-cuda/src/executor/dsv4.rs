@@ -677,6 +677,9 @@ impl Dsv4CudaExecutor {
             self.slots[row.slot].reset(&self.model.ctx, &mut self.kv_adapter)?;
             self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
             self.reset_dspark_slot(row.slot, 0);
+            // The capture skipped the per-request bootstrap work (SW ring bulk
+            // pack) that reset re-arms, and bakes this occupant's page band.
+            self.decode_graphs[row.slot] = None;
         }
         let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
         validate_dsv4_kv_view(&expect, &kv_view)?;
