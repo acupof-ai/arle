@@ -561,6 +561,8 @@ impl CppLfm2Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    // paged Metal decode path; wired with the DSpark draft
+    #[allow(dead_code)]
     pub(crate) fn step_session_paged_bf16(
         &self,
         token: &MlxArray,

@@ -127,6 +127,7 @@ impl MetalSlotState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn bf16_prefix_read_inputs(
         &self,
         cache_len: usize,
@@ -158,6 +159,7 @@ impl MetalSlotState {
         Ok((k_full, v_full))
     }
 
+    #[cfg(test)]
     pub(super) fn int8_prefix_read_inputs(
         &self,
         cache_len: usize,
