@@ -77,6 +77,12 @@ consumes the budget, and the truncated result reads exactly like corruption.
 Every probe here was re-run at 1500 before being believed. Budget the thinking
 before calling an output damaged.
 
+- Not the NVFP4 serving path in general. `Qwen3.8-27B-NVFP4` runs the same
+  binary, the same kernels and the same probe scripts and passes every one:
+  prose identifiers, structured JSON, and a clean `tool_use`
+  (`Read{file_path:"textfsm/terminal.py"}`), at 52.3 tok/s with 33% MTP
+  acceptance. One NVFP4 checkpoint is clean where the other garbles.
+
 ## Cause
 
 Unknown. The static weight chain is verified clean (repack, scales, sfb, global
