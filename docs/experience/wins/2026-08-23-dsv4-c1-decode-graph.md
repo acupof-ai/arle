@@ -283,3 +283,67 @@ one-element placeholders are nearly free through the async pool. The reason
 to remove them anyway is that they blocked `reject_alloc_nodes()`, and that
 guard is what stops the next 1296-node regression from shipping behind a
 warning.
+
+## Where the remaining c=1 time is — 2026-08-23
+
+Chasing further headroom produced a negative result worth recording, because
+the phantom lever is easy to re-derive from the ITL summary alone.
+
+The c=1 ITL distribution is bimodal and strictly period-3. Per token, both
+arms repeat a triad:
+
+| arm | step 1 | step 2 | step 3 | mean |
+|---|---:|---:|---:|---:|
+| graph | 22.4 ms | 41.5 ms | 3.3 ms | 22.4 |
+| eager | 24.0 ms | 41.3 ms | 7.0 ms | 24.1 |
+
+Read from the summary alone this says "a third of all steps cost 41 ms and
+the graph does not touch them" — the 41.3 ms figure is identical in both
+arms, so it looks like a large untouched lever. It is not one.
+
+**The deviations are symmetric and sum to zero.** Graph: +19.1 / −19.1 around
+its own mean. Eager: +17.2 / −17.1. A linear fit of cumulative arrival time
+against token index has slope 22.56 ms/token with residuals
+`[0.0, −0.2, 18.8, −0.5, −1.0, 17.1, −2.2, −1.9, 16.7, …]` — the residual
+jumps on every third token and immediately returns. It never accumulates, and
+the per-triad sum has a standard deviation of 4.57 ms against a mean of 67.6.
+
+Production is uniform. One delivery is late by ~19 ms and the next is early by
+the same amount. `ARLE_STEP_PHASE=1` confirms it from the server side:
+`poll=0.000 apply_out=0.001 poll_bg=0.000 admit=0.052 plan=0.035
+submit=21.978 ms` — the whole step is one uniform `submit`, and host-side
+scheduling contributes 0.09 ms.
+
+So **ITL p90 on this workload measures streaming delivery jitter, not GPU
+work**, and there is no 41 ms compute step to remove. The only c=1 cost is the
+uniform ~22.5 ms step, which the graph already moved 24.1 → 22.2.
+
+Ruled out along the way, each with its evidence:
+
+- An extra operator every third step — `ARLE_CUDA_PROFILE` op_timing shows
+  every per-layer op at exactly 300 calls over 300 tokens and the fused ops at
+  12900 (43 layers x 300). Nothing runs at 1/3 frequency.
+- A compression boundary — `compress_ratios` on this checkpoint is 21 layers
+  at 4 and 20 at 128. No layer has ratio 3.
+- SSE event coalescing — 254 events for 256 tokens, one event per token.
+- The cooperative governor's periodic yield — `arle serve` builds
+  `Engine::new`, which takes `PermissiveGovernor` (`infer-core/src/lib.rs:591`):
+  `should_yield()` is always false and the budget is unbounded. The
+  `with_yield_every_ticks(8)` governor exists only on the `infer-api`
+  programmatic path, and its period is 8.
+
+Rule: before treating an ITL percentile as a compute lever, check whether the
+deviations around the mean sum to zero. A latency that is stolen from one
+sample and returned to the next is a delivery artifact; only a residual that
+accumulates is real work.
+
+## Instrumentation note
+
+Two profilers `docs/environment.md` documented for this exact job were dead
+(removed in `b159c6bef`): `ARLE_DSV4_OPERATOR_TRACE` does not exist in the
+crates at all, and `ARLE_DSV4_STAGE_PROFILE`'s serve auto-flush keyed on a
+stage label with no call site, so a serve accumulated stats and printed
+nothing. The live tools are `ARLE_CUDA_PROFILE` (per-op, via `op_timing` in
+`/v1/stats`, but its event pairs serialize the pipeline and inflate absolute
+latencies ~3x) and `ARLE_STEP_PHASE` (host-side step phases, no CUDA sync —
+the only instrument that splits a captured whole-step replay).
