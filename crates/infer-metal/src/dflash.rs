@@ -262,10 +262,9 @@ struct MarkovHead {
 }
 
 impl MarkovHead {
-    /// Bigram bias `[1, vocab]` for the given previous token.
-    fn bias(&self, prev_token: u32) -> MlxArray {
-        let idx = MlxArray::from_slice_i32(&[prev_token as i32], &[1]);
-        let latent = mlx::take_axis(&self.w1, &idx, 0); // [1, rank]
+    /// Bigram bias `[1, vocab]` for the given previous token (GPU array index).
+    fn bias(&self, prev_token: &MlxArray) -> MlxArray {
+        let latent = mlx::take_axis(&self.w1, prev_token, 0); // [1, rank]
         mlx::matmul(&latent, &self.w2) // [1, vocab]
     }
 }
@@ -1183,39 +1182,44 @@ pub(crate) fn prepare_draft_block(
         // and the Markov head produces block_size draft tokens — the verify block
         // is [real, d1..d_block_size] (block_size+1 tokens). Reference:
         // DeepSpec sample_block_tokens loops range(proposal_len) = block_size.
+        //
+        // All Markov steps stay on the GPU (take_axis accepts array indices);
+        // a single materialize at the end avoids 9 GPU-CPU syncs.
         let vocab = *draft_logits
             .shape()
             .get(1)
             .context("DSpark draft logits missing vocab dim")?;
-        let mut prev = current_token;
-        let mut draft_tokens = Vec::with_capacity(runtime.block_size);
+        let mut prev = MlxArray::from_slice_i32(&[current_token as i32], &[1]);
+        let mut token_arrays: Vec<MlxArray> = Vec::with_capacity(runtime.block_size);
         for step in 0..runtime.block_size {
             let s = i32::try_from(step).context("draft step does not fit in i32")?;
             let step_logits = mlx::slice(&draft_logits, &[s, 0], &[s + 1, vocab], &[1, 1]);
-            let bias = markov.bias(prev);
+            let bias = markov.bias(&prev);
             let corrected = mlx::add(&step_logits, &bias);
-            let next = mlx::argmax(&corrected).item_i32();
+            let next = mlx::argmax_axis(&corrected, -1); // [1] int32 on GPU
+            token_arrays.push(next.clone());
+            prev = next;
+        }
+        let all_tokens = mlx::concatenate_axis(&token_arrays, 0);
+        let draft_tokens = materialize_i32_tokens(&all_tokens)?;
+        for (i, &token) in draft_tokens.iter().enumerate() {
             ensure!(
-                next >= 0,
-                "DSpark draft emitted a negative token id: {next}"
+                token >= 0,
+                "DSpark draft emitted a negative token id: {token}"
             );
             ensure!(
-                next as u32 != runtime.mask_token_id(),
-                "DSpark draft emitted mask_token_id {}; refusing to verify a masked draft token",
-                runtime.mask_token_id()
+                token as u32 != runtime.mask_token_id(),
+                "DSpark draft emitted mask_token_id {} at step {}; refusing to verify a masked draft token",
+                runtime.mask_token_id(),
+                i
             );
-            draft_tokens.push(next as u32);
-            prev = next as u32;
         }
         // The verify block is [real, d1..d_block_size] — block_size+1 tokens.
         let mut block = Vec::with_capacity(runtime.block_size + 1);
         block.push(current_token);
-        block.extend(draft_tokens);
-        // DSpark: the target context changes every block, so the draft KV must
-        // not persist stale context. Reset to empty; the next block rebuilds KV
-        // from the fresh target hidden. rope_offset is set by the caller before
-        // the next forward.
-        draft_state.reset();
+        block.extend(draft_tokens.iter().map(|&t| t as u32));
+        draft_state.trim(runtime.block_size);
+        draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
         let block_arr = tokens_to_array(&block);
         let t_argmax = Instant::now();
         if draft_trace {
