@@ -964,7 +964,9 @@ impl Dsv4LayerAttentionState {
         if mode == DeepSeekV4AttentionMode::SlidingWindow {
             return;
         }
-        let compressed_rows = total_len / ratio;
+        // SparseIndexed (GLM) carries compress_ratio 0 and shares the indexer at
+        // ratio 1, matching the eager path's absolute `start_pos + seq_len`.
+        let compressed_rows = total_len / ratio.max(1);
         // Graph-replay ticks advance the bf16 carry with no compressor_forward
         // host call — mark the FP32 probe carry stale here (host bookkeeping
         // that runs every step); a redundant set on eager ticks is free.
