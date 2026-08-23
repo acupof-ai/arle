@@ -983,6 +983,8 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    // paged Metal decode path; wired with the DSpark draft
+    #[allow(dead_code)]
     pub(crate) fn step_session_paged_bf16(
         &self,
         token: &MlxArray,
@@ -1023,6 +1025,7 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn step_session_paged_int8(
         &self,
         token: &MlxArray,

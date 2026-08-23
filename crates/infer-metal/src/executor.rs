@@ -83,6 +83,8 @@ pub(crate) trait CompiledMetalModel {
         cache_pos: i32,
     ) -> anyhow::Result<mlx::MlxArray>;
     fn session_step(&self, token: &mlx::MlxArray, cache_pos: i32) -> anyhow::Result<mlx::MlxArray>;
+    // paged Metal decode path; wired with the DSpark draft
+    #[allow(dead_code)]
     fn session_step_paged_bf16(
         &self,
         token: &mlx::MlxArray,
@@ -90,6 +92,7 @@ pub(crate) trait CompiledMetalModel {
         k: &[mlx::MlxArray],
         v: &[mlx::MlxArray],
     ) -> anyhow::Result<mlx::MlxArray>;
+    #[allow(dead_code)]
     fn session_step_paged_int8(
         &self,
         token: &mlx::MlxArray,
@@ -200,6 +203,7 @@ pub(crate) static PAGED_KV_READ_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(feature = "metal")]
+#[allow(dead_code)] // paged Metal decode path; wired with the DSpark draft
 fn probe_paged_kv_read_hit() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -208,6 +212,7 @@ fn probe_paged_kv_read_hit() {
 }
 
 #[cfg(feature = "metal")]
+#[allow(dead_code)] // paged Metal decode path; wired with the DSpark draft
 fn probe_paged_kv_read_fallback() {
     PAGED_KV_READ_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
