@@ -637,13 +637,14 @@ hypothesis; see *Measurement debt*.
 ```mermaid
 flowchart TB
     subgraph ADMIT["Admission — infer-core/src/planner.rs"]
-        A1["HTTP → tokenize"] --> A2["radix prefix match"]
+        A1["HTTP → tokenize"] --> A2["radix prefix match<br/>T0 GPU radix — tier diagram below"]
         A2 --> A3["build_forward_plan<br/>budget 16384 tok/tick, ≤16 rows"]
     end
 
     A3 --> P{"ForwardMode"}
+    LOAD["model load — checkpoint format selects the GEMM arm"] --> WF{"weight format"}
 
-    subgraph PREFILL["Prefill — 94% of GPU time on the anchor (279:1 prompt:output)"]
+    subgraph PREFILL["Prefill — 94% of GPU time on the FP8 anchor (279:1 prompt:output)"]
         direction TB
         B1["chunk 2048 tok"] --> B2["FP8 GEMM — 57.7% of all kernel time<br/>gate_up 33.9% at 93% of peak<br/>down 24.2% at 88% — AT THE FLOOR"]
         B2 --> B3["full attention ×16<br/>FA3 / TileLang — 16.3%"]
@@ -659,16 +660,69 @@ flowchart TB
         C4 --> C5["rollback replay<br/>batched varlen"]
     end
 
+    subgraph NVFP4["NVFP4 / Marlin fp4 — Qwen3.8-27B, alternative to the FP8 GEMM (ops/quant_linear_fp4.rs)"]
+        direction TB
+        N0["load: repack_for_marlin_fp4 — device_matrix.rs:1658<br/>E2M1 weights + E4M3 per-block scales<br/>S0E5M3 scale encode + global scale fold → Marlin W4A16 tiles"] --> N1{"m"}
+        N1 -->|"m ≥ 512 (prefill)"| N2["dequantize_fp4_marlin_to_fp8<br/>→ DeepGEMM FP8 MMA"]
+        N1 -->|"m < 512 + decode"| N3["marlin_fp4_gemm<br/>W4A16 tensor-core — csrc/gemm/marlin"]
+    end
+
+    subgraph QKV["Quantized-KV attention — 2026-08-22 unification"]
+        Q1["4 old paths → 1 kernel<br/>paged_attention_quantized_fa3.cu<br/>INT8/FP8 per-(token,head) K+V scales, tensor-core MMA<br/>decode +40% c=16 · +50% c=32 · c=1 wash"]
+    end
+
+    subgraph DSV4["DSv4 decode graph — opt-in ARLE_DSV4_DECODE_GRAPH=1 (graph.rs)"]
+        D1["whole-step CUDA graph<br/>43-layer body, ~6300 launches collapsed"] --> D2["below eager today:<br/>ITL p99 156 ms vs 42 ms<br/>1296 alloc / 1295 free nodes per replay — eager stays default"]
+    end
+
     P -->|Prefill / Mixed| PREFILL
     P -->|Decode / Mixed| DECODE
+    WF -->|FP8| B2
+    WF -->|NVFP4 E2M1| N0
+    N2 --> B3
+    N3 --> B3
+    N3 --> C3
+    B3 -.->|--kv-cache-dtype int8/fp8| Q1
+    C3 -.-> Q1
+    DECODE -.->|DSv4 family replaces| D1
     PREFILL --> OUT["detokenize → SSE"]
     DECODE --> OUT
+    D2 --> OUT
     C5 -.->|next tick| C1
 ```
 
 Prefill and decode rows share a tick (`ForwardMode::Mixed`), but the executor
 still decomposes the mixed plan into per-row prefill submissions followed by a
 batched decode dispatch (`infer-cuda/src/executor/qwen35.rs:2932`).
+
+**The other served paths.** The anchor chain above is one of several. The
+Metal backend unifies its model families behind one compiled forward trait,
+and prefix reuse on both backends sits on the T0–T3 KV tier hierarchy:
+
+```mermaid
+flowchart TB
+    subgraph METAL["Metal model paths — infer-metal over mlx-sys"]
+        direction TB
+        M0["load checkpoint"] --> MW{"MetalWeights<br/>executor.rs"}
+        MW -->|Qwen35| M1["Qwen3.5/3.6 hybrid+MoE — qwen35.rs<br/>DFlash/NextN spec decode"]
+        MW -->|Lfm2| M2["LFM2.5-8B-A1B hybrid — lfm2.rs<br/>mlx_lfm2_model.cpp<br/>18 gated short-conv + 6 full-attn layers<br/>conv1d, multiplicative gates, MoE FFN"]
+        M1 --> MT["CompiledMetalModel trait<br/>one compiled forward surface"]
+        M2 --> MT
+    end
+
+    subgraph TIER["KV tier hierarchy — infer-core/src/{prefix,radix}.rs + kv-native-sys"]
+        direction TB
+        T0["T0 — GPU radix cache<br/>page-aligned, LRU evict, retain/release refcounts"] -->|demote on eviction| T1
+        T1["T1 — DRAM host tier store<br/>default-on, 50% of MemAvailable<br/>16 MiB chunked blobs, per arm<br/>DSv4 position-0 prefix store rides the same budget"] -->|spill| T2
+        T2["T2 — NVMe opt-in<br/>--kv-disk, KvMmapStore sparse mmap"] -.->|stub, no traffic| T3
+        T3["T3 — NIXL cluster-shared<br/>stub only — no KV export/import surface"]
+        T1 -.->|promote on next prefix match| T0
+    end
+```
+
+T1 is wired per arm (`infer-cuda/src/executor/dsv4/slot_tier.rs`) over the
+shared `kv-native-sys` store; T2 attaches inside the engine constructor for
+both single-proc and multiproc TP workers. T3 has no data path today.
 
 ### 0.1 Where a request's own latency goes
 
