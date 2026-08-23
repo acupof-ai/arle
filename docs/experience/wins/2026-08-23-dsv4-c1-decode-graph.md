@@ -166,11 +166,10 @@ staging now resizes on the eager warm step when the loaded table dims differ
 matters more than the p50 for an agent workload. c≥8 is untouched because the
 gate is c=1-only, and DSpark is provably untouched (0 captures).
 
-**Cutting alloc nodes is the precondition, not an optimization.** At 1296
-alloc nodes the graph was 23% *slower* than eager; at 86 it is 21% faster.
-The gain lives in removing per-step allocation from the replay, not in
-removing launch overhead. Any future graph on this family should audit the
-alloc-node count before measuring anything.
+**Cutting large alloc nodes is the precondition, not an optimization.** At
+1296 alloc nodes the graph was 23% *slower* than eager. Small placeholder
+allocations are nearly free (see the re-measure below). Any future graph on
+this family should audit the alloc-node count before measuring anything.
 
 **A captured graph is bound to a slot's page band, not just to the slot.**
 Every path that re-points a slot at different pages — request reset, prefix
@@ -247,3 +246,40 @@ that carried the 86 nodes, so they are a floor, not a ceiling.
 Rule: a grep that returns zero is evidence only if a positive control proves
 the pattern can match. Assert against a line the log is known to contain
 before trusting an absence.
+
+## Re-measure — 2026-08-23, v26 matched A/B supersedes the headline numbers
+
+After removing the 86 placeholder allocations, a same-binary A/B on build
+`c1-graph-v26` (commit `1c56ca0dd`, GPUs 0/1/2/4, arms adjacent in time,
+16 requests):
+
+| arm | decode tok/s | ITL p50 ms | ITL p99 ms | TTFT p50 ms | captures |
+|---|---:|---:|---:|---:|---:|
+| eager | 40.8 | 24.1 | 47.7 | 7905 | **0** |
+| graph | **44.2** | **22.2** | **44.1** | 7865 | 4 |
+| delta | +8.3% | −7.9% | −7.5% | — | — |
+
+Capture audit on this build: **0 alloc, 0 free, 0 host memcpy, 0 host
+callback nodes**, verified with a positive control (4 `captured slot` lines
+matched by the same grep run that reported the zeros).
+
+**The +21.3% headline above is stale, and the eager baseline is why.** The
+v24b eager arm ran at 35.6 tok/s; the v26 eager arm runs at 40.8, a 14.6%
+baseline improvement contributed by two commits from concurrent work
+(`0777aa346`, Marlin `blocks_per_sm` config search; `c5a3a11d1`, Markov head
+resident on GPU). The graph arm barely moved (43.2 → 44.2). The current,
+licensed number for this lever is **+8.3% decode / −7.9% ITL p50**.
+
+The p99 claim is stale for the same reason: 122.6 → 44.5 ms was measured
+against a v24b eager arm whose p99 was 122.6. The v26 eager p99 is 47.7, so
+the graph's p99 advantage is −7.5%, not −63.7%.
+
+Removing the 86 placeholder allocations was worth +1.0 tok/s (43.2 → 44.2,
++2.3%) on its own. That is far short of the 1296-node case, which cost 23%.
+
+Correction to the learning above: the gain comes from removing *large*
+per-step allocations, not from removing allocation as such. Eighty-six
+one-element placeholders are nearly free through the async pool. The reason
+to remove them anyway is that they blocked `reject_alloc_nodes()`, and that
+guard is what stops the next 1296-node regression from shipping behind a
+warning.

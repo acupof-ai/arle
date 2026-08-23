@@ -614,19 +614,21 @@ c=1-only and disarms under DSpark/MTP, so c>=2 and spec-decode are untouched.
 
 Identity:
 
-- Runtime commit `1a48d179f`, build `c1-graph-v24b`
+- Runtime commit `1c56ca0dd`, build `c1-graph-v26` (headline A/B); the
+  c=8/16 and FP8 rows below are from `1a48d179f` / `c1-graph-v24b`
 - Models `/data00/DeepSeek-V4-Flash-0731` (NVFP4 experts) and `-FP8`
 - GPU: 4×H20 (sm_90), TP=4, 4 slots/rank, BF16 KV, `--comm-backend nccl`
 - Workload `bench-agent-32k-16x8.jsonl`, prompt p50 28568 tok, max_tokens 256
   exact (ignore_eos), temperature 0
-- Capture audit: 0 host memcpy / 0 host callback nodes; 86 alloc / 86 free of 3196 on this build (removed later; the numbers below predate that and are a floor)
+- Capture audit on v26: 0 alloc / 0 free / 0 host memcpy / 0 host callback
+  nodes, positive-control verified
 
 NVFP4 experts, 16 requests per point, same binary both arms:
 
 | c | arm | decode tok/s | ITL p50/p99 ms | TTFT p50 ms |
 | ---: | --- | ---: | --- | ---: |
-| 1 | eager | 35.6 | 24.5 / 122.6 | 7926 |
-| 1 | **graph** | **43.2** | **22.3 / 44.5** | 7898 |
+| 1 | eager (v26) | 40.8 | 24.1 / 47.7 | 7905 |
+| 1 | **graph (v26)** | **44.2** | **22.2 / 44.1** | 7865 |
 | 8 | eager | 22.4 | 40.5 / 99.4 | 11409 |
 | 8 | graph | 22.4 | 40.8 / 99.0 | 11507 |
 | 16 | eager | 17.8 | 51.4 / 104.0 | 22270 |
@@ -640,6 +642,9 @@ FP8 experts, 8 requests, c=1:
 | **graph** | **59.5** | **16.3 / 42.0** |
 
 0 errors at every point. c=8/16 are the no-op control that confirms the gate.
+The c=1 rows are a same-binary v26 A/B (+8.3% decode); an earlier v24b reading
+of +21.3% is superseded because the eager baseline itself improved 14.6%
+through concurrent Marlin and Markov-head work.
 
 Correctness: MMLU 5-shot, 200 samples, greedy — 171/200 in both arms, 0
 per-item diffs. DSpark control (`--spec-type dspark`): ITL p50 65.8 (off) vs
