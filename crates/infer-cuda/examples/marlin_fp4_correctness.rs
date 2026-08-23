@@ -48,17 +48,18 @@ mod real {
     }
 
     fn e4m3_val(b: u8) -> f32 {
-        let s = ((b >> 7) & 1) as f32;
-        let e = ((b >> 3) & 0xF) as i32;
-        let m = (b & 0x7) as f32;
-        let v = if e == 0 {
-            m / 8.0
-        } else if e == 0xF {
-            448.0
-        } else {
-            (1.0 + m / 8.0) * 2f32.powi(e - 7)
-        };
-        if s == 1.0 { -v } else { v }
+        // Must match the repack's `e4m3_to_f32` (tensor.rs): only 0x7F maps to
+        // 448.0; 0x78-0x7E are regular (1+m/8)*2^8 values.
+        let sign = if b & 0x80 == 0 { 1.0 } else { -1.0 };
+        let exp = i32::from((b >> 3) & 0x0f);
+        let mant = f32::from(b & 0x07);
+        if b & 0x7f == 0x7f {
+            return sign * 448.0;
+        }
+        if exp == 0 {
+            return sign * (mant / 8.0) * 2.0f32.powi(-6);
+        }
+        sign * (1.0 + mant / 8.0) * 2.0f32.powi(exp - 7)
     }
 
     struct Lcg(u64);
@@ -94,7 +95,7 @@ mod real {
                     };
                     let w = e2m1_val(nibble);
                     let s = e4m3_val(scales[ni * scale_cols + ki / GROUP]);
-                    acc += x[mi * k + ki].to_f32() * w * s / global_scale;
+                    acc += x[mi * k + ki].to_f32() * w * s * global_scale;
                 }
                 out.push(acc);
             }
@@ -178,24 +179,25 @@ mod real {
                 let x_dev = ctx.stream.memcpy_stod(&x)?;
                 let mut out_dev = ctx.stream.alloc_zeros::<bf16>(m * n)?;
                 let (x_ptr, _gx) = x_dev.device_ptr(&ctx.stream);
-                let (out_ptr, _go) = out_dev.device_ptr_mut(&ctx.stream);
-
-                unsafe {
-                    ffi::marlin_fp4_gemm_cuda(
-                        x_ptr as *const ffi::Half,
-                        p4 as *const u32,
-                        s4 as *const u8,
-                        g4 as *const u16,
-                        out_ptr as *mut ffi::Half,
-                        c_tmp_ptr as *mut f32,
-                        ws_ptr as *mut i32,
-                        m as i32,
-                        n as i32,
-                        k as i32,
-                        GROUP as i32,
-                        stream,
-                    )
-                    .result()?;
+                {
+                    let (out_ptr, _go) = out_dev.device_ptr_mut(&ctx.stream);
+                    unsafe {
+                        ffi::marlin_fp4_gemm_cuda(
+                            x_ptr as *const ffi::Half,
+                            p4 as *const u32,
+                            s4 as *const u8,
+                            g4 as *const u16,
+                            out_ptr as *mut ffi::Half,
+                            c_tmp_ptr as *mut f32,
+                            ws_ptr as *mut i32,
+                            m as i32,
+                            n as i32,
+                            k as i32,
+                            GROUP as i32,
+                            stream,
+                        )
+                        .result()?;
+                    }
                 }
                 let gpu_out: Vec<bf16> = ctx.stream.clone_dtoh(&out_dev)?;
                 ctx.sync()?;
