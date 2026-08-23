@@ -8,6 +8,7 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- Record that NVFP4 serving corrupts tool-call generation while FP8 on the same request is clean, which is what took every agent-OPD rollout to `edited=false`; cause unknown, see `docs/experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md`.
 - **Verification harness — Metal gate + standalone check + temp arm integrated.** `needle_gate.py --check` exits 0/1 without a baseline; `lever_gate.sh GATE_PROFILE=metal` boots a Metal serve so local dev has a correctness gate; the temp coherence arm now runs inside `lever_gate.sh` instead of as a separate invocation. Verified on Qwen3.5-0.8B-MLX-4bit (3/3 exact, temp PASS). See `docs/experience/wins/2026-08-23-verification-harness-metal-gate.md`.
 - **Rust toolchain bumped 1.95.0 → 1.98.0** (next trait solver on nightly, blog 2026-08-21; stable gets the `chunks_exact_to_as_chunks` clippy lint). 20+ byte-conversion sites converted to `as_chunks`; pod/Dockerfile pins bumped in lockstep. Three lint lanes exit 0.
 - First agent-OPD rollouts on an NVFP4 27B reach the model: 16/16 `edited=false` with the tool path proven working, so the gap is sustaining tool use under a long agent context rather than emitting it; see `docs/experience/wins/2026-08-23-agent-opd-nvfp4-baseline.md`.
