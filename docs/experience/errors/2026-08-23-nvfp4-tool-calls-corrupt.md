@@ -4,30 +4,36 @@
 
 ## Phenomenon
 
-`ThinkingCap-Qwen3.6-27B-NVFP4` produces malformed output on any request that
-carries tool definitions. The same request against
-`ThinkingCap-Qwen3.6-27B-FP8` is clean.
+`ThinkingCap-Qwen3.6-27B-NVFP4` is wrong on a subset of prompts where
+`ThinkingCap-Qwen3.6-27B-FP8` is right. Matched probes, identical request
+bodies, same binary, same box, `max_tokens=1500` on both:
 
-Matched probe, identical JSON body, same binary, same box:
-
-| request | NVFP4 | FP8 |
+| probe | FP8 | NVFP4 |
 |---|---|---|
-| plain text, 100–1200 tokens | coherent | — |
-| one tool, one-line instruction | empty text, `end_turn` / `max_tokens` | — |
-| agent prompt + 2 tools | token soup | `tool_use` `Read{file_path:"textfsm/terminal.py"}` |
+| tool defs + agent prompt | `tool_use Read{file_path:"textfsm/terminal.py"}` | token soup |
+| prose, 51 input tokens | correct | wrong, deterministically |
+| structured JSON, 80 input tokens | correct | correct |
+| plain prose 100-1200 tokens, trivial output | — | coherent |
 
-The corruption is deterministic — two runs returned the identical string —
-and includes tokens that are not words:
+The tool-call output contains strings that are not words, and repeats
+byte-identically across runs:
 
 ```
-<tool_call> = </think>  <tool_call> ="c-plain{cat,textfsm/terminal.py" </think>
-<tool_call> <endfaclettothxink> ```<toolhas_n </think> ... <dimwit_to_replace>
-</toolkit_content_placeholder>
+<tool_call> <endfaclettothxink> ```<toolhas_n </think>
+<tool_call> <function=readme.txt> </antmltext/terminal.py</tooldi> </think>
+<tool_call> <endthreadindex_to> </thinking>
 ```
 
 One parse surfaced a `tool_use` block named `readme.txt` with a mangled input
 object, so the damage reaches the client as a well-formed block carrying
 nonsense.
+
+The prose failure, at 51 input tokens, substitutes plausible names for the
+literal ones given:
+
+> The function `strip_ansi_escapes` in `textfsm/ansi.py` needs fixing...
+
+The prompt named `StripAnsiText` in `textfsm/terminal.py`.
 
 ## Impact
 
@@ -37,19 +43,30 @@ result and is not one.
 
 ## What it is not
 
-- Not the DeepGEMM prefill arm. That route engages at `m >= 512`
-  (`QWEN_FP4_DEEPGEMM_MIN_M`); a prompt-length sweep at 100/300/480/520/700/1200
-  tokens returns coherent text at every point, with no cliff at the threshold.
-- Not the harness. Claude Code completes turns cleanly against the same serve
-  (`terminal_reason=completed`), and the FP8 serve answers the same prompt
-  correctly.
-- Not prompt length. The one-line tool prompt fails too.
+- Not the prefill arm. Both corrupt, in different ways: m<512 (Marlin) gives
+  total token soup, m>=512 (DeepGEMM, verified by padding the tool prompt to
+  1643 input tokens) gives coherent structure with rotten identifiers
+  (`textfrig/terminal.py`).
+- Not prompt length. 51 tokens fails; 1200 tokens of plain prose passes.
+- Not structured output. The JSON probe passes on both.
+- Not tool definitions alone. The failing prose probe carries none.
+- Not the sampling path. `tools_active` in `infer-server/src/coordinator.rs`
+  selects prompt rendering and post-parse only; no sampling, stop, or logit
+  setting.
+- Not the harness or the server. FP8 answers every one of these bodies
+  correctly through the same code.
+- Not the repack's flush-to-zero on special-token rows. `embed_tokens` and
+  `lm_head` are BF16 in the checkpoint; `repack_for_marlin_fp4` only touches
+  `WeightFormat::Fp4E2M1Group`. (Falsified by the `qwen3-nvfp4-support`
+  session.)
 
-- Not the schema content, and not quantization damage in general. The same tool
-  schemas delivered as plain user text — no `tools` field — get a coherent,
-  correct answer from NVFP4: it names `textfsm/terminal.py`, the
-  `StripAnsiText` function, and the argument-order fix. Only the `tools` field
-  form corrupts.
+## A trap worth naming
+
+An intermediate reading of this bug — "NVFP4 hallucinates on structured
+output" — was an artifact of `max_tokens=250`. This model's thinking preamble
+consumes the budget, and the truncated result reads exactly like corruption.
+Every probe here was re-run at 1500 before being believed. Budget the thinking
+before calling an output damaged.
 
 ## Cause
 
@@ -58,15 +75,10 @@ template produces when it renders tool definitions — and FP8 handles that same
 sequence correctly, so it takes the rendered prompt AND the NVFP4 weights
 together.
 
-One hypothesis, untested: the tool template introduces special tokens
-(`<tools>`, `<tool_call>`). If the repack's flush-to-zero lands hard on the
-embedding or lm_head rows for those ids, the shape matches exactly — ordinary
-text fine, garbage once special tokens enter. Two cheap checks would settle it:
-compare the flushed fraction of those rows against an average row, or run the
-probe with the repack disabled and see whether the corruption goes away. The
+No single variable separates the passing prompts from the failing ones. The
 layout math itself is bit-exact against `marlin_fp4_gemm` on synthetic weights
 that do flush (`test_cuda_marlin_fp4_share.rs`), so if the repack is implicated
-it is about which rows it damages, not the index math.
+it is about which weights it damages, not the index math.
 
 Handed to the `qwen3-nvfp4-support` session.
 
