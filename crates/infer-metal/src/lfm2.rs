@@ -291,17 +291,15 @@ impl CppLfm2Model {
                         group_size,
                         bits,
                         mode,
-                    } => {
-                        mlx_sys::lfm2_compiled_add_quant_weight(
-                            model,
-                            w.as_raw(),
-                            scales.as_raw(),
-                            MlxArray::as_raw_opt(biases.as_ref()),
-                            *group_size,
-                            *bits,
-                            *mode as i32,
-                        )
-                    }
+                    } => mlx_sys::lfm2_compiled_add_quant_weight(
+                        model,
+                        w.as_raw(),
+                        scales.as_raw(),
+                        MlxArray::as_raw_opt(biases.as_ref()),
+                        *group_size,
+                        *bits,
+                        *mode as i32,
+                    ),
                 }
             };
             if id < 0 {
