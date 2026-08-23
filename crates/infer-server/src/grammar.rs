@@ -76,11 +76,11 @@ impl GrammarCache {
     }
 
     fn compile(&self, key: &str) -> Result<Arc<CompiledGrammar>> {
-        let mut cache = self.compiled.lock().expect("grammar cache poisoned");
+        let mut cache = self.compiled.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, g)) = cache.iter().find(|(k, _)| k == key) {
             return Ok(g.clone());
         }
-        let mut compiler = self.compiler.lock().expect("grammar compiler poisoned");
+        let mut compiler = self.compiler.lock().unwrap_or_else(|e| e.into_inner());
         let grammar = Arc::new(
             compiler
                 .compile_json_schema(key, false)

@@ -107,7 +107,9 @@ impl Dsv4ProbeCapture {
             return Ok(());
         }
         let vocab = model.lm_head.rows;
-        let last_layer = *self.lens_layers.last().unwrap();
+        let last_layer = *self.lens_layers.last().ok_or_else(|| {
+            anyhow!("probe lens_layers empty (ARLE_PROBE_LENS_LAYERS filtered all indices)")
+        })?;
 
         self.layer_logits_to_host(model, last_layer, rows)?;
         let reference: Vec<u32> = (0..rows)
