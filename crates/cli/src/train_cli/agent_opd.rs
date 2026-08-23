@@ -308,8 +308,10 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // out of its reach — a readable corpus yields a run that looks normal and
     // measures nothing.
     let rollout_user = train::sandbox::resolve_rollout_user(&args.rollout_user)?;
-    let mut secrets: Vec<&std::path::Path> = vec![&args.dataset, &args.staged_root];
-    secrets.extend(args.eval_dataset.as_deref());
+    let secrets: Vec<&std::path::Path> = [&args.dataset, &args.staged_root, &args.eval_dataset]
+        .into_iter()
+        .filter_map(|p| p.as_deref())
+        .collect();
     train::sandbox::assert_corpus_unreadable(&secrets, rollout_user)?;
 
     let harness = Arc::new(train::cc_harness::CcHarness {
