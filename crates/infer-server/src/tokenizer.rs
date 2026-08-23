@@ -142,20 +142,33 @@ impl OpenAiTokenizer {
         Ok(Self { inner, template })
     }
 
-    /// Encode text into token ids without adding special tokens.
+    /// Encode text into token ids.
     ///
     /// DSv4's BOS (`<｜begin▁of▁sentence｜>`, id 0) is in the vocab but missing
     /// from `added_tokens`, so the BPE pre-tokenizer splits it into mojibake
     /// subwords. Strip the BOS prefix and prepend id 0 directly.
+    ///
+    /// Otherwise follow the mlx-lm convention: add special tokens (BOS) unless
+    /// the prompt already starts with the BOS string. Models whose tokenizer
+    /// has no BOS post-processor are unaffected (`add_special_tokens` is a
+    /// no-op for them); models trained with BOS (LFM2, Llama, …) need it —
+    /// greedy decode loops without it.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let bos = "<｜begin▁of▁sentence｜>";
         let (body, prepend_bos) = match text.strip_prefix(bos) {
             Some(rest) => (rest, true),
             None => (text, false),
         };
+        let bos_token = match &self.template {
+            ChatTemplate::Jinja { bos_token, .. } if !bos_token.is_empty() => {
+                Some(bos_token.as_str())
+            }
+            _ => None,
+        };
+        let add_special = bos_token.is_some_and(|b| !body.starts_with(b));
         let encoding = self
             .inner
-            .encode(body, false)
+            .encode(body, add_special)
             .map_err(|err| anyhow!("tokenize prompt failed: {err}"))?;
         let mut ids = encoding.get_ids().to_vec();
         if prepend_bos {
