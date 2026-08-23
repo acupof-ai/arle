@@ -2,6 +2,14 @@ use super::*;
 use crate::qwen35::alloc_recurrent_block;
 use std::cmp::Ordering;
 
+/// A sidecar blob whose `to_bytes()` serialization completed on a background thread.
+struct SidecarBlob {
+    pos: usize,
+    key: u64,
+    bytes: Vec<u8>,
+    prefix_pages: Vec<u32>,
+}
+
 /// Set the host slot's accounted length to `target`. The engine pre-budgets
 /// the full spec chain (#197), so this normally no-ops; a warm row or a chain
 /// shorter than the budget truncates the over-allocation instead of leaving
@@ -169,6 +177,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// MTP spec-decode state (`--spec-type mtp`): the spec state plus the seed
     /// (pending token + hidden) for the next spec step.
     pub(crate) mtp: Option<MtpExec>,
+    /// Background sidecar serialization: `to_bytes()` runs off the engine's
+    /// critical path; results drain in `poll_sidecar_serializations`.
+    sidecar_tx: std::sync::mpsc::Sender<SidecarBlob>,
+    sidecar_rx: std::sync::mpsc::Receiver<SidecarBlob>,
 }
 
 /// Per-slot MTP spec-decode state; created lazily by the first warm decode step.
@@ -274,15 +286,16 @@ impl Qwen35CudaExecutor {
         if mat_len == 0 {
             return Ok(());
         }
-        // Periodic sidecars for a future cross-conversation restore, each keyed at its
-        // exact snapshot position. Full-attn KV is not in the blob: restore mirrors the
-        // radix prefix's own device pages.
+        // Collect (pos, key, snapshot) items; `to_bytes()` runs on a background
+        // thread so the 146.8 MiB serialization doesn't stall the engine step
+        // when several requests finish prefill in the same step.
+        let mut work: Vec<(usize, u64, crate::qwen35::Qwen35RecurrentSnapshot)> = Vec::new();
         for (pos, psnap) in periodic {
             if pos == 0 || pos > mat_len {
                 continue;
             }
             let pkey = crate::qwen35::hash_prefix_tokens(&tokens[..pos]);
-            self.store_sidecar_blob(pos, pkey, psnap.to_bytes(), prefix_pages);
+            work.push((pos, pkey, psnap));
         }
         // The L* prefill snapshot (full pair) is always restorable. A fresh
         // snapshot on a B2-live slot is not: the live state is the 1/cp decode
@@ -296,9 +309,37 @@ impl Qwen35CudaExecutor {
         };
         if let Some(snap) = snap {
             let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
-            self.store_sidecar_blob(mat_len, key, snap.to_bytes(), prefix_pages);
+            work.push((mat_len, key, snap));
         }
+        if work.is_empty() {
+            return Ok(());
+        }
+        let tx = self.sidecar_tx.clone();
+        let pages = prefix_pages.to_vec();
+        std::thread::spawn(move || {
+            for (pos, key, snap) in work {
+                let bytes = snap.to_bytes();
+                if tx
+                    .send(SidecarBlob {
+                        pos,
+                        key,
+                        bytes,
+                        prefix_pages: pages.clone(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Ok(())
+    }
+
+    /// Drain completed background serializations into `slot_tier` / `sidecar_page_key`.
+    pub(crate) fn poll_sidecar_serializations(&mut self) {
+        while let Ok(blob) = self.sidecar_rx.try_recv() {
+            self.store_sidecar_blob(blob.pos, blob.key, blob.bytes, &blob.prefix_pages);
+        }
     }
 
     /// Insert a sidecar blob and coordinate its eviction off the last radix page it
@@ -805,6 +846,7 @@ impl Qwen35CudaExecutor {
         // graph-capturable. Eager fallback disarms on any capture failure.
         let decode_graph_armed = crate::runtime_flags::qwen35_decode_graph()
             && model.decode_graph_unsupported_reason().is_none();
+        let (sidecar_tx, sidecar_rx) = std::sync::mpsc::channel();
         let executor = Self {
             model,
             slots,
@@ -832,6 +874,8 @@ impl Qwen35CudaExecutor {
                 rejects: 0,
                 chains: 0,
             }),
+            sidecar_tx,
+            sidecar_rx,
         };
         cuda_startup_log(
             "executor.qwen35_executor_total",
