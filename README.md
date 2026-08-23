@@ -138,6 +138,15 @@ NVFP4 checkpoint (E2M1+E8M0) converted to W4AFP8 (INT4+BF16) at load time — 4-
 
 Same conversion, 4-way tensor parallelism. B=1 decode **47.7 tok/s** (1.29× over TP=2); per-GPU efficiency 11.9 tok/s/GPU vs FP8 TP=8's 6.6 tok/s/GPU.
 
+### DeepSeek-V4-Flash (4×H20, TP=4) — c=1 decode CUDA graph, on by default
+
+The 43-layer c=1 decode body is captured into one CUDA graph per slot and
+replayed, with zero allocation nodes inside the capture. On 32K-token agent
+prompts, per-request decode at c=1: NVFP4 experts **35.6 → 43.2 tok/s**
+(ITL p99 122.6 → **44.5 ms**), FP8 experts **52.4 → 59.5 tok/s**. The gate is
+c=1-only, so c≥8 and spec decode are byte-for-byte unchanged; MMLU is identical
+to the eager arm on all 200 items. `ARLE_DSV4_DECODE_GRAPH=0` selects eager.
+
 ### Qwen3.8-27B-NVFP4 (one H20) — 4-bit that is actually smaller
 
 A mixed-precision checkpoint: NVFP4 MLP (group 16) plus per-channel FP8
