@@ -8,7 +8,7 @@ use super::{
     DEEPGEMM_CONTIG_ALIGN, DSV4_DECODE_CONTIG_ALIGN, DSV4_DECODE_CONTIG_MAX_ROUTES, alloc_neg1_i32,
     deepgemm_contig_rows_cap,
 };
-use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
+use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer, StepSlice};
 use crate::ops::gemm_batch;
 
 pub(crate) fn dsv4_moe_forward_deepep(
