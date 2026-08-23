@@ -501,6 +501,9 @@ impl Dsv4CudaExecutor {
         // latent cache to the restored frontier for the same reason.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
         self.reset_dspark_slot(slot, finish_len);
+        // The restored occupant has a new page band and ring/compressor state;
+        // the prior occupant's capture would replay over it unwarmed.
+        self.decode_graphs[slot] = None;
         self.slots[slot].restore_prefix_state(
             &self.model.ctx,
             &self.model.layers,

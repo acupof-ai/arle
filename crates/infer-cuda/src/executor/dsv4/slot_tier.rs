@@ -133,6 +133,8 @@ impl Dsv4CudaExecutor {
                 .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote read")));
         }
         let image = image?;
+        // A promoted occupant's page band differs from the captured one.
+        self.decode_graphs[slot] = None;
         let restored = {
             let Self {
                 model,
