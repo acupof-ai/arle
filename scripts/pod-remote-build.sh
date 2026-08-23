@@ -166,6 +166,21 @@ case "${1:-}" in
     expected_digest="$(awk -F= '$1=="dirty_digest" {print $2}' "$meta")"
     actual_digest="$(source_digest)"
     if [ "$actual_head" != "$head" ] || [ "$actual_digest" != "$expected_digest" ]; then
+      # Name the offenders before rolling back. A digest mismatch is almost
+      # always a stray untracked file left in the remote tree (a probe, a dump,
+      # an editor backup): it is counted by `git ls-files -co` here but absent
+      # from the pusher's tree, and two bare hashes say nothing about which.
+      if [ "$actual_digest" != "$expected_digest" ]; then
+        tar -tzf "$archive" 2>/dev/null | sed 's:/$::' | sort -u > "$TREE/.sync-incoming.$$" || true
+        git -C "$TREE" ls-files -co --exclude-standard | sort -u > "$TREE/.sync-present.$$" || true
+        strays="$(comm -13 "$TREE/.sync-incoming.$$" "$TREE/.sync-present.$$" \
+          | grep -v '^\.sync-\(incoming\|present\)\.' | head -20)"
+        rm -f "$TREE/.sync-incoming.$$" "$TREE/.sync-present.$$"
+        [ -z "$strays" ] || {
+          echo "sync source mismatch: remote tree carries files the pusher does not; remove them and re-sync:" >&2
+          printf '  %s\n' $strays >&2
+        }
+      fi
       [ -z "$backup" ] || { restore_persistent "$TREE" "$backup" || true; rm -rf "$TREE"; mv "$backup" "$TREE"; }
       echo "sync source mismatch: head=$actual_head expected_head=$head digest=$actual_digest expected_digest=$expected_digest" >&2; exit 1
     fi
