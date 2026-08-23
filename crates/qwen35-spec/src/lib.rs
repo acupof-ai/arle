@@ -1149,6 +1149,11 @@ pub struct DsparkConfig {
     pub head_dim: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// Long-context scaling the drafter was trained with. Dropping it makes the
+    /// draft's positions disagree with the target's from layer one, and the
+    /// verify step then rejects nearly everything -- a `yarn` drafter read as
+    /// vanilla measured 13% acceptance falling to 0% at c=8.
+    pub rope_scaling: Option<RopeScalingConfig>,
     /// `None` = no window. DeepSpec draft configs declare no `sliding_window`
     /// at all, so substituting one gives a converted checkpoint a reach it was
     /// never trained with.
@@ -1226,6 +1231,47 @@ impl DsparkConfig {
             .and_then(serde_json::Value::as_u64)
             .map(|n| n as usize)
             .ok_or(Qwen35ConfigError::InvalidConfig("block_size"))?;
+        // transformers >= 5.12 nests the RoPE base and its scaling under
+        // `rope_parameters`; older exports keep `rope_theta` at the top level
+        // and carry no scaling. Reading only the top level silently defaults
+        // the base AND discards the scaling.
+        let rope = v.get("rope_parameters").filter(|r| r.is_object());
+        let rope_num = |name: &str| -> Option<f64> {
+            rope.and_then(|r| r.get(name))
+                .and_then(serde_json::Value::as_f64)
+        };
+        let rope_theta = v
+            .get("rope_theta")
+            .and_then(serde_json::Value::as_f64)
+            .or_else(|| rope_num("rope_theta"))
+            .map_or(1e7, |f| f as f32);
+        let rope_scaling = match rope
+            .and_then(|r| r.get("rope_type"))
+            .and_then(serde_json::Value::as_str)
+        {
+            None | Some("default") => None,
+            Some("yarn") => Some(RopeScalingConfig::Yarn {
+                factor: rope_num("factor").ok_or(Qwen35ConfigError::InvalidConfig(
+                    "dspark rope_parameters.rope_type=yarn requires `factor`",
+                ))? as f32,
+                original_max_position_embeddings: rope_num("original_max_position_embeddings")
+                    .ok_or(Qwen35ConfigError::InvalidConfig(
+                        "dspark rope_parameters.rope_type=yarn requires \
+                         `original_max_position_embeddings`",
+                    ))? as usize,
+                beta_fast: rope_num("beta_fast").map_or_else(default_yarn_beta_fast, |f| f as f32),
+                beta_slow: rope_num("beta_slow").map_or_else(default_yarn_beta_slow, |f| f as f32),
+                attention_factor: rope_num("attention_factor").map(|f| f as f32),
+                mscale: rope_num("mscale").map_or_else(default_yarn_mscale, |f| f as f32),
+            }),
+            // Loud, like the trunk's resolver: a scaling we cannot reproduce
+            // makes every draft wrong, and silence looks like a weak drafter.
+            Some(_) => {
+                return Err(Qwen35ConfigError::InvalidConfig(
+                    "dspark rope_parameters.rope_type is not one this drafter path supports",
+                ));
+            }
+        };
         Ok(Self {
             hidden_size: usize_of("hidden_size")?,
             intermediate_size: usize_of("intermediate_size")?,
@@ -1234,7 +1280,8 @@ impl DsparkConfig {
             num_key_value_heads: usize_of("num_key_value_heads")?,
             head_dim: usize_of("head_dim")?,
             rms_norm_eps: f32_of("rms_norm_eps", 1e-6),
-            rope_theta: f32_of("rope_theta", 1e7),
+            rope_theta,
+            rope_scaling,
             sliding_window,
             layer_types,
             block_size,
