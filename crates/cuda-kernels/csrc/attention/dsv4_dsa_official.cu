@@ -322,6 +322,105 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void hadamard128_bf16_batched
   out_vec.store(out_ptr, lane_id);
 }
 
+// Decode-graph variant: ONE launch per step that packs AT MOST one compressed
+// index-key row into the CSA key cache, gated on device by `start_pos`:
+// the row `start_pos / ratio` completes when `(start_pos + 1) % ratio == 0`.
+// Rotates keys[row] (absolute, full-retention ring base 0) into `rotated[0]`
+// then quantizes into the cache band at `cache_locs[row]`, mirroring the two
+// per-row kernels byte-for-byte. Captures into a CUDA graph (no host branch).
+__global__ __launch_bounds__(kFusedQBlockSize, 16) void dsv4_dsa_pack_index_row_start_pos_kernel(
+    const bf16_t* __restrict__ keys,
+    bf16_t* __restrict__ rotated,
+    uint8_t* __restrict__ cache,
+    const int64_t* __restrict__ cache_locs,
+    const int32_t* __restrict__ start_pos_ptr,
+    int ratio) {
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kVecSize = 4;
+  constexpr uint32_t kPageBits = 6;
+  constexpr int64_t kPageBytes = 132ll << kPageBits;
+  using Storage = AlignedVec<bf16_t, kVecSize>;
+  using Float4 = AlignedVec<float, kVecSize>;
+  using KeyT2 = bf16x2_t;
+  using InStorage = AlignedVec<KeyT2, 2>;
+  using OutStorage = AlignedVec<fp8x2_e4m3_t, 2>;
+
+  const int start_pos = start_pos_ptr[0];
+  if ((start_pos + 1) % ratio != 0) return;
+  const int64_t row = start_pos / ratio;
+  const auto lane_id = threadIdx.x % kWarpSize;
+  if (threadIdx.x >= kWarpSize) return;
+
+  // Hadamard rotate keys[row] -> rotated[0] (per-row kernel body).
+  Storage input_vec;
+  input_vec.load(keys + row * kHeadDim, lane_id);
+  Float4 data;
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) data[i] = bf16_to_float(input_vec[i]);
+  {
+    float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+    data[0] = a0 + a1; data[1] = a0 - a1; data[2] = a2 + a3; data[3] = a2 - a3;
+  }
+  {
+    float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+    data[0] = a0 + a2; data[1] = a1 + a3; data[2] = a0 - a2; data[3] = a1 - a3;
+  }
+#pragma unroll
+  for (uint32_t mask = 1; mask < kWarpSize; mask <<= 1) {
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpSize);
+      data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
+    }
+  }
+  Storage out_vec;
+  const float scale_h = rsqrtf(static_cast<float>(kHeadDim));
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) out_vec[i] = float_to_bf16(data[i] * scale_h);
+  out_vec.store(rotated, lane_id);
+  __syncwarp();
+
+  // FP8 store rotated[0] -> cache[cache_locs[row]] (per-row kernel body).
+  const auto index = cache_locs[row];
+  const auto elems = reinterpret_cast<const InStorage*>(rotated)[lane_id];
+  float2 x = __bfloat1622float2(elems[0]);
+  float2 y = __bfloat1622float2(elems[1]);
+  const auto local_max = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(y.x), fabsf(y.y)));
+  const auto abs_max = warp_reduce_max_xor(local_max);
+  const auto scale = fmaxf(1e-4f, abs_max) / kFP8Max;
+  const auto inv_scale = 1.0f / scale;
+  const int32_t page = static_cast<int32_t>(index >> kPageBits);
+  const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
+  auto page_ptr = cache + page * kPageBytes;
+  auto value_ptr = page_ptr + offset * 128;
+  auto scale_ptr = page_ptr + (128ll << kPageBits) + offset * 4;
+  OutStorage result;
+  result[0] = pack_fp8(x.x * inv_scale, x.y * inv_scale);
+  result[1] = pack_fp8(y.x * inv_scale, y.y * inv_scale);
+  reinterpret_cast<OutStorage*>(value_ptr)[lane_id] = result;
+  reinterpret_cast<float*>(scale_ptr)[0] = scale;
+}
+
+extern "C" CUresult dsv4_dsa_pack_index_row_start_pos_cuda(
+    const uint16_t* keys,
+    uint16_t* rotated,
+    uint8_t* cache,
+    const int64_t* cache_locs,
+    const int32_t* start_pos,
+    int ratio,
+    int page_size,
+    CUstream stream) {
+  if (keys == nullptr || rotated == nullptr || cache == nullptr || cache_locs == nullptr ||
+      start_pos == nullptr || stream == nullptr || ratio <= 0 || page_size != 64) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_dsa_pack_index_row_start_pos_kernel<<<1, kFusedQBlockSize, 0,
+                                             reinterpret_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<const bf16_t*>(keys), reinterpret_cast<bf16_t*>(rotated), cache,
+      cache_locs, start_pos, ratio);
+  return static_cast<CUresult>(cudaGetLastError());
+}
+
 // SGLang fused_store_index_k_cache, raw C ABI.
 
 template <typename IndicesT, uint32_t kPageBits>

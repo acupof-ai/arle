@@ -1691,6 +1691,37 @@ pub fn dsv4_dsa_fused_store_index_k_cache_raw(
     }
 }
 
+/// Decode-graph CSA key-cache pack: device-gated on `start_pos`.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_dsa_pack_index_row_start_pos_raw(
+    stream: &CudaStream,
+    keys_ptr: u64,
+    rotated_ptr: u64,
+    cache_ptr: u64,
+    cache_locs_ptr: u64,
+    start_pos_ptr: u64,
+    ratio: i32,
+    page_size: i32,
+) -> Result<()> {
+    // SAFETY: caller passes live device addresses (full-retention index keys,
+    // one-row rotated staging, cache band, capacity cache locs, start_pos),
+    // stream-ordered on `stream`.
+    unsafe {
+        ffi::dsv4_dsa_pack_index_row_start_pos_cuda(
+            keys_ptr as *const ffi::Half,
+            rotated_ptr as *mut ffi::Half,
+            cache_ptr as *mut u8,
+            cache_locs_ptr as *const i64,
+            start_pos_ptr as *const i32,
+            ratio,
+            page_size,
+            stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("dsv4_dsa_pack_index_row_start_pos_cuda failed: {e}"))
+    }
+}
+
 /// Batched (grid.y=slot) DSA Hadamard rotate: ONE launch over `n` slots' rows.
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_dsa_hadamard128_batched_raw(

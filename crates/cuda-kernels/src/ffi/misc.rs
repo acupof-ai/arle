@@ -720,6 +720,19 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    /// Decode-graph CSA key-cache pack: device-gated on `start_pos`, packs the
+    /// completed compressed row (`start_pos / ratio`) when the step closes it.
+    pub fn dsv4_dsa_pack_index_row_start_pos_cuda(
+        keys: *const super::Half,
+        rotated: *mut super::Half,
+        cache: *mut u8,
+        cache_locs: *const i64,
+        start_pos: *const i32,
+        ratio: i32,
+        page_size: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
         context_lens: *mut i32,
         positions: *mut i32,
