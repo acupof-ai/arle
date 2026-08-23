@@ -72,11 +72,6 @@ path = "examples/comm_bench.rs"
 required-features = ["cuda", "nccl"]
 
 [[example]]
-name = "dsv4_resident_ab"
-path = "examples/dsv4_resident_ab.rs"
-required-features = ["cuda"]
-
-[[example]]
 name = "fp8_grouped_prefill_probe"
 path = "examples/fp8_grouped_prefill_probe.rs"
 required-features = ["cuda"]
