@@ -179,7 +179,13 @@ if [ -n "$EXPECTED_PRODUCT_SHA256" ]; then
     mv "$stats_tmp" "$STATS_OUT"
 fi
 
-PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" "$LENGTHS" "$RUNS" 0.0 2>&1 | tee "$OUT"
+# When no baseline is provided, fall back to the standalone --check threshold
+# (>= 1 exact hit per length) instead of the baseline-envelope comparison.
+NEEDLE_CHECK=""
+if [ -z "${BASELINE_LOG:-}" ] && [ "${LEVER_GATE_ALLOW_NO_BASELINE:-0}" = "1" ]; then
+    NEEDLE_CHECK="--check"
+fi
+PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" $NEEDLE_CHECK "$LENGTHS" "$RUNS" 0.0 2>&1 | tee "$OUT"
 status=${PIPESTATUS[0]}
 if [ "$status" -ne 0 ]; then
     echo "[gate] needle gate failed with status $status"
