@@ -241,7 +241,12 @@ impl Dsv4CudaExecutor {
         }
 
         let graph = self.decode_graphs[slot_idx].get_or_insert_with(|| {
-            crate::graph::CudaGraphState::new(self.model.ctx.stream.clone())
+            // allow_alloc_nodes: NVFP4 experts capture at 0 alloc nodes, but the
+            // FP8 checkpoint still records 86 (2 per layer) because the O-LoRA
+            // staging resizes per layer, and rejecting that capture costs the
+            // FP8 path its graph entirely (59.5 -> 26.5 tok/s, matrix run
+            // 2026-08-24). Restore the warn until the resize thrash is fixed.
+            crate::graph::CudaGraphState::new(self.model.ctx.stream.clone()).allow_alloc_nodes()
         });
 
         let model = &self.model;
