@@ -5058,22 +5058,28 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     // The constructor sizes the fixed staging from config; the loaded TP-local
     // table decides the true group dims, so resize once on the eager warm step
     // (which precedes any capture).
-    if n == 1 && (scratch.oproj_in.hidden_dim != cols || scratch.oproj_out.hidden_dim != rows) {
+    if n == 1
+        && (scratch.oproj_in.as_ref().is_none_or(|b| b.hidden_dim != cols)
+            || scratch.oproj_out.as_ref().is_none_or(|b| b.hidden_dim != rows))
+    {
         // SAFETY: uninit device scratch; fully written before first read.
-        scratch.oproj_in = unsafe { HiddenStates::uninit(ctx, cols, 1)? };
+        scratch.oproj_in = Some(unsafe { HiddenStates::uninit(ctx, cols, 1)? });
         // SAFETY: uninit device scratch; fully written before first read.
-        scratch.oproj_out = unsafe { HiddenStates::uninit(ctx, rows, 1)? };
+        scratch.oproj_out = Some(unsafe { HiddenStates::uninit(ctx, rows, 1)? });
     }
     let use_fixed = n == 1;
     let (mut in_g, mut out_g) = if use_fixed {
-        // SAFETY: placeholders; never read, replaced by the put-back below.
-        let a = std::mem::replace(&mut scratch.oproj_in, unsafe {
-            HiddenStates::uninit(ctx, 1, 1)?
-        });
-        // SAFETY: same placeholder contract.
-        let b = std::mem::replace(&mut scratch.oproj_out, unsafe {
-            HiddenStates::uninit(ctx, 1, 1)?
-        });
+        // `take` leaves None rather than a placeholder buffer: the two
+        // `uninit(1, 1)` allocations a `mem::replace` needed here recorded
+        // 2 alloc nodes per layer (86 on 43) into every capture.
+        let a = scratch
+            .oproj_in
+            .take()
+            .ok_or_else(|| anyhow!("DSv4 grouped O-LoRA decode staging missing"))?;
+        let b = scratch
+            .oproj_out
+            .take()
+            .ok_or_else(|| anyhow!("DSv4 grouped O-LoRA decode staging missing"))?;
         (a, b)
     } else {
         // SAFETY: uninit device scratch; fully written before first read.
@@ -5085,8 +5091,8 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         ctx, scratch, caches, local_attn, shape, latent, &mut in_g, &mut out_g,
     );
     if use_fixed {
-        scratch.oproj_in = in_g;
-        scratch.oproj_out = out_g;
+        scratch.oproj_in = Some(in_g);
+        scratch.oproj_out = Some(out_g);
     }
     res
 }

@@ -1322,8 +1322,11 @@ pub(super) struct Dsv4FusedWqkvDecodeScratch {
     pub(super) active_counts: CudaSlice<i32>,
     /// Grouped O-LoRA gather/scatter staging for the one-row decode lane;
     /// fixed at construction so a captured decode graph keeps stable addresses.
-    pub(super) oproj_in: HiddenStates,
-    pub(super) oproj_out: HiddenStates,
+    /// `Option` so the decode lane can `take()` them for the GEMM borrow and
+    /// put them back: the placeholder buffers a `mem::replace` needed recorded
+    /// two alloc nodes per layer into the capture.
+    pub(super) oproj_in: Option<HiddenStates>,
+    pub(super) oproj_out: Option<HiddenStates>,
     pub(super) max_m: usize,
     pub(super) scale_stride_m: usize,
     pub(super) hidden_dim: usize,
@@ -1364,9 +1367,9 @@ impl Dsv4FusedWqkvDecodeScratch {
                 .clone_htod(&[1_i32])
                 .map_err(|e| anyhow!("DSv4 fused wqkv active_counts H2D failed: {e}"))?,
             // SAFETY: uninit device scratch; fully written before first read.
-            oproj_in: unsafe { HiddenStates::uninit(ctx, oproj_cols, 1)? },
+            oproj_in: Some(unsafe { HiddenStates::uninit(ctx, oproj_cols, 1)? }),
             // SAFETY: uninit device scratch; fully written before first read.
-            oproj_out: unsafe { HiddenStates::uninit(ctx, oproj_rows, 1)? },
+            oproj_out: Some(unsafe { HiddenStates::uninit(ctx, oproj_rows, 1)? }),
             max_m,
             scale_stride_m,
             hidden_dim,
@@ -1385,8 +1388,8 @@ impl Dsv4FusedWqkvDecodeScratch {
             + self.active_experts.len() * i32_sz
             + self.active_offsets.len() * i32_sz
             + self.active_counts.len() * i32_sz
-            + self.oproj_in.device_bytes()
-            + self.oproj_out.device_bytes()
+            + self.oproj_in.as_ref().map_or(0, HiddenStates::device_bytes)
+            + self.oproj_out.as_ref().map_or(0, HiddenStates::device_bytes)
     }
 
     /// Static predictor of `device_bytes` from config dims — must mirror `new`.
