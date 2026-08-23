@@ -83,11 +83,11 @@ static SAMPLING_DEFAULTS: RwLock<SamplingDefaults> = RwLock::new(SamplingDefault
 });
 
 pub fn set_sampling_defaults(defaults: SamplingDefaults) {
-    *SAMPLING_DEFAULTS.write().unwrap() = defaults;
+    *SAMPLING_DEFAULTS.write().unwrap_or_else(|e| e.into_inner()) = defaults;
 }
 
 fn sampling_defaults() -> SamplingDefaults {
-    *SAMPLING_DEFAULTS.read().unwrap()
+    *SAMPLING_DEFAULTS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// OpenAI `stream_options`: `{"include_usage": true}` asks the streaming

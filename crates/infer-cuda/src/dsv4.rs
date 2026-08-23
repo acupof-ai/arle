@@ -184,7 +184,10 @@ impl Dsv4Model {
     /// Upload token IDs to the persistent graph buffer (called before capture/replay).
     pub(crate) fn graph_upload_token_ids(&self, tokens: &[u32]) -> Result<()> {
         let host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let mut buf = self.graph_token_ids.lock().unwrap();
+        let mut buf = self
+            .graph_token_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if buf.is_none() {
             *buf = Some(crate::ops::upload_i32(&self.ctx, &host)?);
         } else {
@@ -193,7 +196,10 @@ impl Dsv4Model {
                 .memcpy_htod(&host, buf.as_mut().unwrap())
                 .map_err(|e| anyhow!("DSv4 graph token_ids H2D failed: {e}"))?;
         }
-        let mut buf = self.graph_token_ids_u32.lock().unwrap();
+        let mut buf = self
+            .graph_token_ids_u32
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match buf.as_mut() {
             None => {
                 *buf = Some(
@@ -252,7 +258,7 @@ impl Dsv4Model {
                 HiddenStates::uninit(&self.ctx, dim, seq_len)?
             }));
         }
-        let mut bufs = self.graph_bufs.lock().unwrap();
+        let mut bufs = self.graph_bufs.lock().unwrap_or_else(|e| e.into_inner());
         let b = match bufs.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -282,7 +288,7 @@ impl Dsv4Model {
                 self.ctx.stream.alloc::<f32>(len)?
             }));
         }
-        let mut bufs = self.graph_f32.lock().unwrap();
+        let mut bufs = self.graph_f32.lock().unwrap_or_else(|e| e.into_inner());
         let b = match bufs.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -307,7 +313,7 @@ impl Dsv4Model {
         if !graph_mode {
             return Ok(StepSlice::Owned(self.ctx.stream.alloc_zeros::<i32>(len)?));
         }
-        let mut bufs = self.graph_i32.lock().unwrap();
+        let mut bufs = self.graph_i32.lock().unwrap_or_else(|e| e.into_inner());
         let b = match bufs.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -324,7 +330,10 @@ impl Dsv4Model {
 
     /// Persistent u32 token ids for hash routing (same pre-replay upload).
     pub(crate) fn graph_token_ids_u32(&self) -> Result<StepSlice<u32>> {
-        let buf = self.graph_token_ids_u32.lock().unwrap();
+        let buf = self
+            .graph_token_ids_u32
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let b = buf
             .as_ref()
             .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))?;
@@ -333,7 +342,10 @@ impl Dsv4Model {
 
     /// Persistent i32 token ids for the embedding lookup (pre-replay upload).
     pub(crate) fn graph_token_ids_i32(&self) -> Result<StepSlice<i32>> {
-        let buf = self.graph_token_ids.lock().unwrap();
+        let buf = self
+            .graph_token_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let b = buf
             .as_ref()
             .ok_or_else(|| anyhow!("DSv4 graph token_ids not uploaded"))?;
@@ -343,7 +355,7 @@ impl Dsv4Model {
     /// Alias of the persistent final-layer output stream (the last layer's
     /// ffn_stream), read by the LM head after a replay.
     pub(crate) fn graph_stream_clone(&self) -> Result<StepBuf> {
-        let bufs = self.graph_bufs.lock().unwrap();
+        let bufs = self.graph_bufs.lock().unwrap_or_else(|e| e.into_inner());
         let last = self
             .layers
             .len()

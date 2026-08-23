@@ -432,7 +432,15 @@ pub(crate) fn dsv4_moe_forward(
                 )
             }
         })?;
-        crate::stage_profile::profile(ctx, "dsv4/stage/mega_moe", || {
+        crate::stage_profile::profile(ctx, "dsv4/stage/mega_moe", || -> Result<_> {
+            let w13 = layer
+                .w13_grouped
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE layer missing grouped w13 weights"))?;
+            let w2 = layer
+                .w2_grouped
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE layer missing grouped w2 weights"))?;
             // SAFETY: boot validates shape/workspace ownership; staging above
             // fully writes this step's four input regions on the same stream.
             unsafe {
@@ -448,12 +456,12 @@ pub(crate) fn dsv4_moe_forward(
                     activation_clamp: model.config.swiglu_limit,
                     fast_math: mega_moe.fast_math,
                     enable_pdl: mega_moe.enable_pdl,
-                    l1_weights: cache_ptr(&layer.w13_grouped.as_ref().unwrap().weight, ctx),
+                    l1_weights: cache_ptr(&w13.weight, ctx),
                     l1_weight_stride: hidden_dim,
-                    l1_weights_sf: cache_ptr(&layer.w13_grouped.as_ref().unwrap().scales, ctx),
-                    l2_weights: cache_ptr(&layer.w2_grouped.as_ref().unwrap().weight, ctx),
+                    l1_weights_sf: cache_ptr(&w13.scales, ctx),
+                    l2_weights: cache_ptr(&w2.weight, ctx),
                     l2_weight_stride: layer.intermediate,
-                    l2_weights_sf: cache_ptr(&layer.w2_grouped.as_ref().unwrap().scales, ctx),
+                    l2_weights_sf: cache_ptr(&w2.scales, ctx),
                     stream: ctx.stream.cu_stream(),
                 })
             }
@@ -531,8 +539,14 @@ fn build_gemv_tables(ctx: &DeviceContext, layer: &Dsv4MoeLayer) -> Result<Dsv4Ge
     let g = layer.num_groups;
     let h = layer.hidden_dim;
     let i_dim = layer.intermediate;
-    let w13 = layer.w13_grouped.as_ref().unwrap();
-    let w2 = layer.w2_grouped.as_ref().unwrap();
+    let w13 = layer
+        .w13_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("GEMV tables: layer missing grouped w13 weights"))?;
+    let w2 = layer
+        .w2_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("GEMV tables: layer missing grouped w2 weights"))?;
     ensure!(
         w13.groups == g && w13.rows == 2 * i_dim && w13.cols == h,
         "GEMV tables: w13 cache {}x{} g={} != [2I={}, H={h}]",
@@ -1629,21 +1643,27 @@ fn dsv4_moe_forward_masked_tail(
         hidden_dim.is_multiple_of(128) && intermediate.is_multiple_of(128),
         "DSv4 DeepGEMM needs H and I aligned to 128, got H={hidden_dim} I={intermediate}"
     );
+    let w13 = layer
+        .w13_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 masked-tail MoE layer missing grouped w13 weights"))?;
+    let w2 = layer
+        .w2_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 masked-tail MoE layer missing grouped w2 weights"))?;
     ensure!(
-        layer.w13_grouped.as_ref().unwrap().rows == intermediate * 2
-            && layer.w13_grouped.as_ref().unwrap().cols == hidden_dim,
+        w13.rows == intermediate * 2 && w13.cols == hidden_dim,
         "DSv4 grouped w13 cache shape {}x{} != [2*I={}, H={}]",
-        layer.w13_grouped.as_ref().unwrap().rows,
-        layer.w13_grouped.as_ref().unwrap().cols,
+        w13.rows,
+        w13.cols,
         intermediate * 2,
         hidden_dim
     );
     ensure!(
-        layer.w2_grouped.as_ref().unwrap().rows == hidden_dim
-            && layer.w2_grouped.as_ref().unwrap().cols == intermediate,
+        w2.rows == hidden_dim && w2.cols == intermediate,
         "DSv4 grouped w2 cache shape {}x{} != [H={}, I={}]",
-        layer.w2_grouped.as_ref().unwrap().rows,
-        layer.w2_grouped.as_ref().unwrap().cols,
+        w2.rows,
+        w2.cols,
         hidden_dim,
         intermediate
     );
@@ -1750,8 +1770,14 @@ pub(super) fn deepgemm_grouped_experts(
     let num_groups = layer.num_groups;
     let hidden_dim = packed_hidden.hidden_dim;
     let intermediate = layer.intermediate;
-    let w13 = layer.w13_grouped.as_ref().unwrap();
-    let w2 = layer.w2_grouped.as_ref().unwrap();
+    let w13 = layer
+        .w13_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 grouped experts layer missing grouped w13 weights"))?;
+    let w2 = layer
+        .w2_grouped
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 grouped experts layer missing grouped w2 weights"))?;
     ensure!(
         layer.hidden_dim == hidden_dim,
         "DSv4 grouped expert hidden dim {} != packed hidden dim {hidden_dim}",

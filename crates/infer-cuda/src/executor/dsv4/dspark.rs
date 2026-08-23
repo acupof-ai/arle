@@ -348,7 +348,13 @@ impl Dsv4CudaExecutor {
                 continue;
             }
             slot_ids.push(rows[i].slot);
-            chains.push(proposals[i].as_ref().unwrap().chain.clone());
+            chains.push(
+                proposals[i]
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("DSpark batched slot {i} missing proposal"))?
+                    .chain
+                    .clone(),
+            );
             starts.push(verify_positions[i]);
         }
         if slot_ids.is_empty() {
@@ -396,8 +402,12 @@ impl Dsv4CudaExecutor {
             }
             let slot_idx = rows[i].slot;
             let verify_pos = verify_positions[i];
-            let proposal = proposals[i].as_ref().unwrap();
-            let (argmax, _hiddens) = verified_iter.next().unwrap();
+            let proposal = proposals[i]
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("DSpark batched slot {i} missing proposal"))?;
+            let (argmax, _hiddens) = verified_iter.next().ok_or_else(|| {
+                anyhow::anyhow!("DSpark batched verify produced fewer outputs than slots")
+            })?;
             ensure!(
                 argmax.len() == proposal.chain.len(),
                 "DSpark batched verify slot {slot_idx} argmax {} != chain {}",

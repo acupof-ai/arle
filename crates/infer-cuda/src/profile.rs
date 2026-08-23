@@ -76,14 +76,14 @@ pub fn profile_op<T>(
     let cuda_micros = (cuda_ms * 1000.0).round() as u64;
 
     {
-        let read = stats().read().unwrap();
+        let read = stats().read().unwrap_or_else(|e| e.into_inner());
         if !read.contains_key(&stats_key) {
             drop(read);
-            let mut write = stats().write().unwrap();
+            let mut write = stats().write().unwrap_or_else(|e| e.into_inner());
             write.entry(stats_key.clone()).or_default();
         }
     }
-    let read = stats().read().unwrap();
+    let read = stats().read().unwrap_or_else(|e| e.into_inner());
     if let Some(entry) = read.get(&stats_key) {
         entry
             .total_cuda_micros
@@ -95,7 +95,7 @@ pub fn profile_op<T>(
 }
 
 pub fn get_op_stats() -> Vec<(String, u64, u64)> {
-    let read = stats().read().unwrap();
+    let read = stats().read().unwrap_or_else(|e| e.into_inner());
     let mut out: Vec<(String, u64, u64)> = read
         .iter()
         .map(|(name, stat)| {

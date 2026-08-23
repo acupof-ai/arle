@@ -77,10 +77,13 @@ async fn handle_raw_logits(
                 body.extend_from_slice(&bf16::from_f32(*v).to_bits().to_le_bytes());
             }
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+            headers.insert(
+                CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/octet-stream"),
+            );
             headers.insert("x-logits-rows", shape[0].into());
             headers.insert("x-logits-cols", shape[1].into());
-            headers.insert("x-logits-dtype", "bf16".parse().unwrap());
+            headers.insert("x-logits-dtype", axum::http::HeaderValue::from_static("bf16"));
             (headers, body).into_response()
         }
         Err(err) => (
