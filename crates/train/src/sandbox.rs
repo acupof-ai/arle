@@ -231,6 +231,20 @@ fn format_bash_output(stdout: &[u8], stderr: &[u8], code: Option<i32>, killed: b
     clip_middle(&combined, BASH_OUTPUT_CLIP)
 }
 
+/// `git -C workdir`, with the tree marked safe.
+///
+/// The workdir is owned by the rollout user and these run as root, so git's
+/// dubious-ownership guard refuses the repo outright ("Not a git repository")
+/// and every score reads as an unedited tree.
+fn git_in(workdir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg(format!("safe.directory={}", workdir.display()))
+        .arg("-C")
+        .arg(workdir);
+    cmd
+}
+
 pub fn boot_workdir(
     work_root: &Path,
     instance_id: &str,
@@ -408,7 +422,10 @@ pub fn agent_home(work_root: &Path, instance_id: &str) -> PathBuf {
 /// run's answer key: the 2026-08-23 agent diffed the previous run's copy of its
 /// own task to recover the fix.
 pub fn discard_workdir(work_root: &Path, instance_id: &str) {
-    for dir in [work_root.join(instance_id), agent_home(work_root, instance_id)] {
+    for dir in [
+        work_root.join(instance_id),
+        agent_home(work_root, instance_id),
+    ] {
         if let Err(err) = fs::remove_dir_all(&dir)
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -418,8 +435,8 @@ pub fn discard_workdir(work_root: &Path, instance_id: &str) {
 }
 
 pub fn diff_workdir(workdir: &Path) -> Result<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(workdir).arg("diff");
+    let mut command = git_in(workdir);
+    command.arg("diff");
     let output = plain_output(&mut command, "git diff")?;
     if !output.success {
         bail!(
@@ -594,11 +611,8 @@ fn apply_test_patch(workdir: &Path, test_patch: &str) -> Result<()> {
                 if creates {
                     let _ = fs::remove_file(workdir.join(path));
                 } else {
-                    let mut checkout = Command::new("git");
-                    checkout
-                        .arg("-C")
-                        .arg(workdir)
-                        .args(["checkout", "--", path]);
+                    let mut checkout = git_in(workdir);
+                    checkout.args(["checkout", "--", path]);
                     // Ignore failure: a path with no base has nothing to reset to.
                     let _ = plain_output(&mut checkout, "git checkout test path");
                 }
@@ -613,12 +627,8 @@ fn apply_test_patch(workdir: &Path, test_patch: &str) -> Result<()> {
     let patch_file = workdir.join(patch_name);
     fs::write(&patch_file, test_patch)
         .with_context(|| format!("failed to write test patch {}", patch_file.display()))?;
-    let mut apply_cmd = Command::new("git");
-    apply_cmd
-        .arg("-C")
-        .arg(workdir)
-        .arg("apply")
-        .arg(patch_name);
+    let mut apply_cmd = git_in(workdir);
+    apply_cmd.arg("apply").arg(patch_name);
     let apply = plain_output(&mut apply_cmd, "git apply")?;
     let _ = fs::remove_file(&patch_file);
     if !apply.success {
