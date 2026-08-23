@@ -264,7 +264,8 @@ impl Dsv4CudaExecutor {
 
         // Graph: capture/replay transformer layers. The closure stores the
         // output stream so the LM head can read it after replay.
-        let result = std::cell::RefCell::new(None);
+        let result: std::cell::RefCell<Option<crate::dsv4::StepBuf>> =
+            std::cell::RefCell::new(None);
         let capture_result = graph.run_or_capture(|| {
             let (stream, keepalive) = model.forward_tokens_stream_impl(
                 slot,
@@ -297,29 +298,6 @@ impl Dsv4CudaExecutor {
         } else {
             model.graph_stream_clone()?
         };
-        if std::env::var_os("ARLE_GRAPH_DBG").is_some() {
-            use cudarc::driver::DevicePtr;
-            let (p, _g) = stream.data.device_ptr(&model.ctx.stream);
-            let mut h = vec![half::bf16::ZERO; 8];
-            model
-                .ctx
-                .stream
-                .memcpy_dtoh(&stream.data.slice(0..8), &mut h)?;
-            model.ctx.stream.synchronize()?;
-            let mut t = vec![half::bf16::ZERO; 8];
-            let nb = stream.data.len();
-            model
-                .ctx
-                .stream
-                .memcpy_dtoh(&stream.data.slice(nb - 8..nb), &mut t)?;
-            model.ctx.stream.synchronize()?;
-            log::warn!(
-                "graph dbg: replay={was_replay} pos={start_pos} tok={last_token} stream=0x{p:x} len={nb} head={:?} tail={:?}",
-                h.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
-                t.iter().map(|v| v.to_f32()).collect::<Vec<_>>()
-            );
-        }
-
         // LM head + sampling (outside the graph).
         let mut keepalive = crate::dsv4::Dsv4ForwardKeepalive::new(false);
         let token = model.forward_stream_last_token(

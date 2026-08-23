@@ -103,6 +103,32 @@ impl std::fmt::Debug for Dsv4Model {
 /// Index 0 = stream output; per-layer base = 1 + layer_idx * 7.
 /// Per-layer offsets: 0=normed_attn 1=attn_out 2=attn_stream 3=normed_ffn
 /// 4=moe_with_shared 5=moe_out 6=ffn_stream.
+/// A per-step activation buffer: owned (freed on drop) or an alias of a
+/// persistent graph buffer (never freed; the owner lives in `graph_bufs`).
+pub(crate) enum StepBuf {
+    Owned(HiddenStates),
+    Alias(std::mem::ManuallyDrop<HiddenStates>),
+}
+
+impl std::ops::Deref for StepBuf {
+    type Target = HiddenStates;
+    fn deref(&self) -> &HiddenStates {
+        match self {
+            StepBuf::Owned(h) => h,
+            StepBuf::Alias(h) => h,
+        }
+    }
+}
+
+impl std::ops::DerefMut for StepBuf {
+    fn deref_mut(&mut self) -> &mut HiddenStates {
+        match self {
+            StepBuf::Owned(h) => h,
+            StepBuf::Alias(h) => h,
+        }
+    }
+}
+
 const fn graph_buf_idx_stream() -> usize {
     0
 }
@@ -142,10 +168,29 @@ impl Dsv4Model {
         Ok(())
     }
 
-    /// Allocate (first call) or clone (subsequent calls) a persistent HiddenStates
-    /// at the given buffer index. Clones share the same device memory (CudaSlice
-    /// is ref-counted), so graph replay reads/writes the same addresses.
-    fn graph_alloc_hidden(&self, idx: usize, dim: usize, seq_len: usize) -> Result<HiddenStates> {
+    /// Alias of a persistent graph buffer sharing the same device pointer.
+    /// `CudaSlice::clone` is a D2D copy into a fresh allocation, so the capture
+    /// must alias the raw pointer for replay to read/write the same memory.
+    fn graph_alias(&self, b: &HiddenStates) -> StepBuf {
+        use cudarc::driver::DevicePtr;
+        let (ptr, _g) = b.data.device_ptr(&self.ctx.stream);
+        // SAFETY: `ptr` is the live persistent allocation held by `graph_bufs`
+        // for the model's lifetime; `StepBuf::Alias` never frees it.
+        let data = unsafe {
+            self.ctx
+                .stream
+                .upgrade_device_ptr::<half::bf16>(ptr, b.data.len())
+        };
+        StepBuf::Alias(std::mem::ManuallyDrop::new(HiddenStates {
+            data,
+            hidden_dim: b.hidden_dim,
+            seq_len: b.seq_len,
+        }))
+    }
+
+    /// Allocate (first call) or alias (subsequent calls) a persistent HiddenStates
+    /// at the given buffer index, so graph replay reads/writes the same addresses.
+    fn graph_alloc_hidden(&self, idx: usize, dim: usize, seq_len: usize) -> Result<StepBuf> {
         let mut bufs = self.graph_bufs.lock().unwrap();
         if bufs.len() <= idx {
             bufs.resize_with(idx + 1, || None);
@@ -154,12 +199,26 @@ impl Dsv4Model {
             // SAFETY: fully written by the forward kernels before first read.
             bufs[idx] = Some(unsafe { HiddenStates::uninit(&self.ctx, dim, seq_len)? });
         }
-        let b = bufs[idx].as_ref().unwrap();
-        Ok(HiddenStates {
-            data: b.data.clone(),
-            hidden_dim: b.hidden_dim,
-            seq_len: b.seq_len,
-        })
+        Ok(self.graph_alias(bufs[idx].as_ref().unwrap()))
+    }
+
+    /// Per-step activation: a persistent graph buffer alias in graph mode,
+    /// else a fresh transient allocation.
+    pub(super) fn step_hidden(
+        &self,
+        graph_mode: bool,
+        idx: usize,
+        dim: usize,
+        seq_len: usize,
+    ) -> Result<StepBuf> {
+        if graph_mode {
+            self.graph_alloc_hidden(idx, dim, seq_len)
+        } else {
+            // SAFETY: fully written before first read.
+            Ok(StepBuf::Owned(unsafe {
+                HiddenStates::uninit(&self.ctx, dim, seq_len)?
+            }))
+        }
     }
 
     /// Persistent u32 token ids for hash routing (same pre-replay upload).
@@ -173,7 +232,7 @@ impl Dsv4Model {
 
     /// Clone of the persistent final-layer output stream: the last layer's
     /// ffn_stream buffer (index 0 is the embedding).
-    pub(crate) fn graph_stream_clone(&self) -> Result<HiddenStates> {
+    pub(crate) fn graph_stream_clone(&self) -> Result<StepBuf> {
         let bufs = self.graph_bufs.lock().unwrap();
         let last = self
             .layers
@@ -184,11 +243,7 @@ impl Dsv4Model {
             .get(graph_buf_idx_layer(last, 6))
             .and_then(|b| b.as_ref())
             .ok_or_else(|| anyhow!("DSv4 graph output stream buffer not allocated"))?;
-        Ok(HiddenStates {
-            data: b.data.clone(),
-            hidden_dim: b.hidden_dim,
-            seq_len: b.seq_len,
-        })
+        Ok(self.graph_alias(b))
     }
 
     /// True when the c=1 decode graph should use persistent buffers.
