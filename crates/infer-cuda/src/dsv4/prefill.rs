@@ -690,6 +690,14 @@ impl Dsv4Model {
             )?;
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            if graph_mode && std::env::var_os("ARLE_GRAPH_DBG").is_some() {
+                use cudarc::driver::DevicePtr;
+                let (p, _g) = stream.data.device_ptr(&ctx.stream);
+                log::warn!(
+                    "graph dbg: layer {layer_idx} ffn_stream=0x{p:x} idx={}",
+                    super::graph_buf_idx_layer(layer_idx, 6)
+                );
+            }
             self.probe_capture(&stream, layer_idx, &probe_positions)?;
             // D2D copy only (graph-safe, no readback).
             if dspark
