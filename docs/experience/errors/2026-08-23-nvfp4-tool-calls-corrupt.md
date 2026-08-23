@@ -84,24 +84,19 @@ fold — all bit-exact on the actual checkpoint). The checkpoint weights are a
 reasonable 4-bit quantization (cosine 0.985 vs FP8). The kernel's algebra is
 correct on paper (2^-126 × 128 × 2^119 = 2^0, global applied once).
 
-What remains untested: the Marlin fp4 kernel's **runtime output** on real
-weights at the model's actual shapes. The existing tests
-(`test_cuda_marlin_fp4_share.rs`) compare two GPU code paths against each other
-at 128×128 / 256×512 with synthetic weights — never against a CPU ground truth
-at 17408×5120 / 34816×5120. A correctness probe
-(`crates/infer-cuda/examples/marlin_fp4_correctness.rs`) is built to close this
-gap: it runs `marlin_fp4_gemm` at the model's shapes with realistic E2M1/E4M3
-distributions and compares against a CPU reference.
+The Marlin fp4 kernel's **runtime output** is now verified correct at all model
+shapes: `crates/infer-cuda/examples/marlin_fp4_correctness.rs` compares
+`marlin_fp4_gemm` against a CPU ground truth at 34816×5120 / 5120×17408 /
+14336×5120 / 5120×5120 and M=1..512 — all 20 cases pass at <0.3% max relative
+error. The existing tests (`test_cuda_marlin_fp4_share.rs`) were not circular
+(the autograd path dequantizes to bf16 + cuBLAS, a different code path), but
+they only covered 128×128 / 256×512 and never compared against CPU ground truth.
 
-No single variable separates the passing prompts from the failing ones. The
-corruption is content-dependent (tools field, 51-token prose) but the weight
-chain is content-independent — weights are loaded/repacked once and process
-every token identically. This narrows the suspect to either a kernel runtime
-bug that manifests on certain weight patterns, or something in the engine's
-forward path that is shared with FP8 but interacts differently with the NVFP4
-weight distribution.
-
-Handed to the `qwen3-nvfp4-support` session.
+The corruption is content-dependent (tools field, 51-token prose) but the
+weight chain and GEMM kernel are content-independent. This narrows the suspect
+to the engine's forward path — something shared with FP8 that interacts
+differently with the NVFP4 weight distribution, or a prefill/decode arm that
+has not been individually verified.
 
 ## Consequence for open results
 

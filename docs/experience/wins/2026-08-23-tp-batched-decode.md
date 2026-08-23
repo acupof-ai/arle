@@ -99,6 +99,7 @@ correctness gate (a 4-layer model generates garbage by design).
 Caveat: the NVFP4 baseline has a confirmed correctness bug on tool-rendered
 prompts (`docs/experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md`).
 The static weight chain is verified clean (repack bit-exact, zero flushes on
-all 263 tensors, sfb correct, checkpoint weights cosine 0.985 vs FP8) — the
-bug is narrowed to the Marlin fp4 kernel's runtime output. Marlin optimization
-on this quant is secondary to that.
+all 263 tensors, sfb correct, checkpoint weights cosine 0.985 vs FP8), and the
+Marlin fp4 kernel is now verified correct at all model shapes (CPU ground
+truth, <0.3% max relative error). The bug is in the engine's forward path,
+not the kernel. Marlin optimization on this quant is secondary to that.
