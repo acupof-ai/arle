@@ -142,8 +142,8 @@ Same conversion, 4-way tensor parallelism. B=1 decode **47.7 tok/s** (1.29× ove
 
 The 43-layer c=1 decode body is captured into one CUDA graph per slot and
 replayed, with zero allocation nodes inside the capture. On 32K-token agent
-prompts, per-request decode at c=1: NVFP4 experts **35.6 → 43.2 tok/s**
-(ITL p99 122.6 → **44.5 ms**), FP8 experts **52.4 → 59.5 tok/s**. The gate is
+prompts, per-request decode at c=1: NVFP4 experts **40.8 → 44.2 tok/s**
+(ITL p50 24.1 → **22.2 ms**), FP8 experts **52.4 → 59.5 tok/s**. The gate is
 c=1-only, so c≥8 and spec decode are byte-for-byte unchanged; MMLU is identical
 to the eager arm on all 200 items. `ARLE_DSV4_DECODE_GRAPH=0` selects eager.
 
