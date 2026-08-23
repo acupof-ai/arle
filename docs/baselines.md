@@ -267,7 +267,7 @@ build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 ## Qwen3.6-27B-FP8 vs Qwen3.8-27B-NVFP4 · 1×H20 · c=1 no-spec decode
 
-### Reference point for the NVFP4 kernel work (2026-08-19)
+### Reference point for the NVFP4 kernel work (2026-08-19, refreshed 2026-08-23)
 
 The 27B FP8 SOTA row above runs DSpark and a long-agent workload, so it is not
 comparable to a short-prompt no-spec decode. This row establishes that
@@ -286,15 +286,15 @@ below is therefore measured under profiling and is useful only for attribution
 between ops, never as a throughput figure. The headline tok/s rows are measured
 with profiling OFF:
 
-| | decode, profiled | decode, clean |
+| | decode, clean (`5185ce517`) | decode, clean (`110c6f7f6`) |
 |---|---:|---:|
-| Qwen3.6-27B-FP8 | 33.2 tok/s | **57.6 tok/s** |
-| Qwen3.8-27B-NVFP4 (`5185ce517`) | 31.5 tok/s | **52.3 tok/s** |
+| Qwen3.6-27B-FP8 | 57.6 tok/s | **60.4 tok/s** |
+| Qwen3.8-27B-NVFP4 | 52.3 tok/s | **84.5 tok/s** |
 
-NVFP4 is 9% behind FP8 on the clean measurement. The ratio is close to the
-profiled one (0.91 vs 0.95) because the overhead is per-op and both models run
-the same op count, so profiling did not distort the comparison — only the
-absolute numbers.
+NVFP4 is 40% ahead of FP8 on the clean measurement at `110c6f7f6` (was 9%
+behind at `5185ce517`). The gain is from decode-graph and Marlin optimizations
+that landed between the two commits; the Marlin bps tiebreaker alone is +2-6%
+at the kernel level ([wins entry](experience/wins/2026-08-23-marlin-nvfp4-decode-bps-tiebreaker.md)).
 
 > **This row is c=1 only, and c=1 is the one point where NVFP4 wins.** The
 > matched grid is in the Qwen3.8-27B-NVFP4 section below. Read that before
