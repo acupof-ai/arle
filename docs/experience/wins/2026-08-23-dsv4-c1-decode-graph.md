@@ -58,8 +58,9 @@ All points 16/16 or 8/8 completed, zero errors. c=8 and c=16 are unchanged —
 the graph only arms at c=1, so those points are a no-op control that confirms
 the gate.
 
-Capture audit on the shipped build: **0 alloc nodes, 0 free nodes, 0 host
-memcpy nodes, 0 host callback nodes**; `alloc warnings since launch: 0`.
+Capture audit on the benched build: 0 host memcpy nodes, 0 host callback
+nodes, and **86 alloc / 86 free nodes of 3196** — see the correction below.
+The measured gain above stands: it was produced by exactly this build.
 
 Correctness (MMLU 5-shot, 200 samples, greedy, same seed):
 
@@ -101,7 +102,7 @@ the graph arm, **0** in the eager arm.
 ## Problems
 
 Eleven independent defects stood between "capture attempted" and "replay
-correct at 0 alloc nodes", each found by the next probe after the previous fix:
+correct", each found by the next probe after the previous fix:
 
 1. `record_pipeline_fence` probed the event pool with `cuEventQuery` during
    capture → `STREAM_CAPTURE_UNSUPPORTED`, which also invalidated the capture.
@@ -165,11 +166,11 @@ staging now resizes on the eager warm step when the loaded table dims differ
 matters more than the p50 for an agent workload. c≥8 is untouched because the
 gate is c=1-only, and DSpark is provably untouched (0 captures).
 
-**Zero alloc nodes is the precondition, not an optimization.** At 1296 alloc
-nodes the graph was 23% *slower* than eager. The whole gain lives in removing
-per-step allocation from the replay, not in removing launch overhead. Any
-future graph on this family should audit `mem_alloc_nodes == 0` before
-measuring anything.
+**Cutting alloc nodes is the precondition, not an optimization.** At 1296
+alloc nodes the graph was 23% *slower* than eager; at 86 it is 21% faster.
+The gain lives in removing per-step allocation from the replay, not in
+removing launch overhead. Any future graph on this family should audit the
+alloc-node count before measuring anything.
 
 **A captured graph is bound to a slot's page band, not just to the slot.**
 Every path that re-points a slot at different pages — request reset, prefix
@@ -218,3 +219,31 @@ Rule: a counter helper written for one model family must be checked against
 every `mode`/`ratio` combination the family enum admits, not only the one the
 bench model exercises. A `.max(1)` in the caller is not protection when the
 callee divides first.
+
+## Correction — 2026-08-23, the alloc-node count was never zero
+
+The entry above originally claimed the shipped build captured **0 alloc
+nodes**. It did not: every capture recorded **86 alloc / 86 free of 3196**,
+and the run log carries 224 `captured graph allocates` warnings across the
+benched sessions.
+
+The false reading came from the verification, not the runtime. The check was
+`grep -c "mem_alloc_nodes\|alloc nodes"` against the log, and the log text is
+`captured graph allocates: N alloc / N free node(s)`. The pattern matches
+neither phrase, so it returned 0 and the 0 was read as a pass.
+
+The 86 are `2 × 43` layers: the two `HiddenStates::uninit(ctx, 1, 1)`
+placeholders that `mem::replace` needed to move the fixed n=1 O-LoRA staging
+out for the GEMM borrow. `oproj_in` / `oproj_out` are now `Option` and the
+lane `take()`s them, which allocates nothing.
+
+This was surfaced by `CudaGraphState::reject_alloc_nodes()` — a capture that
+allocates is now a hard error for callers that declared persistent scratch,
+instead of a `log::warn` nobody reads.
+
+**None of the performance numbers change.** They were measured on the build
+that carried the 86 nodes, so they are a floor, not a ceiling.
+
+Rule: a grep that returns zero is evidence only if a positive control proves
+the pattern can match. Assert against a line the log is known to contain
+before trusting an absence.
