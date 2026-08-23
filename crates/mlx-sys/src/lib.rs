@@ -1011,6 +1011,35 @@ unsafe extern "C" {
         out_logits: *mut *mut mlx_array,
     ) -> i32;
 
+    // DSpark speculative-decode capture + block verification.
+    pub fn lfm2_compiled_verify_block_session(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        block_len: i32,
+        cache_pos: i32,
+        capture_layer_ids: *const i32,
+        capture_count: i32,
+        out_logits: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn lfm2_set_capture_layers(model: *mut std::ffi::c_void, layer_ids: *const i32, count: i32);
+    pub fn lfm2_get_captured_hidden_count(model: *mut std::ffi::c_void) -> i32;
+    pub fn lfm2_get_captured_hidden(
+        model: *mut std::ffi::c_void,
+        idx: i32,
+        out: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn lfm2_get_captured_conv_count(model: *mut std::ffi::c_void) -> i32;
+    pub fn lfm2_get_captured_conv_input(
+        model: *mut std::ffi::c_void,
+        idx: i32,
+        out: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn lfm2_session_set_conv_states(
+        model: *mut std::ffi::c_void,
+        conv_states: *mut *mut mlx_array,
+        n: i32,
+    ) -> i32;
+
     pub fn mlx_eval(arrays: *mut *mut mlx_array, count: usize);
     pub fn mlx_async_eval(arrays: *mut *mut mlx_array, count: usize);
 

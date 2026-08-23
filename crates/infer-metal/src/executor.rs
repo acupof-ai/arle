@@ -121,6 +121,43 @@ impl MetalWeights {
             MetalWeights::Lfm2(_) => anyhow::bail!("this path requires a Qwen3.5 model"),
         }
     }
+
+    fn lfm2(&self) -> anyhow::Result<&lfm2::Lfm2MetalWeights> {
+        match self {
+            MetalWeights::Lfm2(w) => Ok(w),
+            MetalWeights::Qwen35(_) => anyhow::bail!("this path requires an LFM2 model"),
+        }
+    }
+
+    // DFlash/DSpark target-hidden capture, dispatched over both architectures.
+    fn set_capture_layers(&self, ids: &[usize]) -> anyhow::Result<()> {
+        match self {
+            MetalWeights::Qwen35(w) => w.cpp_model()?.set_capture_layers(ids),
+            MetalWeights::Lfm2(w) => w.cpp_model()?.set_capture_layers(ids),
+        }
+    }
+
+    fn clear_capture_layers(&self) {
+        match self {
+            MetalWeights::Qwen35(w) => {
+                if let Ok(m) = w.cpp_model() {
+                    m.clear_capture_layers()
+                }
+            }
+            MetalWeights::Lfm2(w) => {
+                if let Ok(m) = w.cpp_model() {
+                    m.clear_capture_layers()
+                }
+            }
+        }
+    }
+
+    fn drain_captured_hidden(&self) -> anyhow::Result<Vec<mlx::MlxArray>> {
+        match self {
+            MetalWeights::Qwen35(w) => w.cpp_model()?.drain_captured_hidden(),
+            MetalWeights::Lfm2(w) => w.cpp_model()?.drain_captured_hidden(),
+        }
+    }
 }
 
 // Cross-step decode pipelining (default ON since
@@ -912,10 +949,7 @@ impl RealMetalExecutor {
         let token_arr = mlx::MlxArray::from_slice_i32(&token_values, &[token_values.len() as i32]);
         let capture_dflash_hidden = self.dflash.is_some();
         if let Some(runtime) = self.dflash.as_ref() {
-            // DFlash targets Qwen3.5 only; resolve_dflash bails for other arches.
             self.weights
-                .qwen35()?
-                .cpp_model()?
                 .set_capture_layers(runtime.target_layer_ids())?;
         }
         let logits = match model.session_prefill(
@@ -926,21 +960,20 @@ impl RealMetalExecutor {
             Ok(logits) => logits,
             Err(err) => {
                 if capture_dflash_hidden {
-                    self.weights.qwen35()?.cpp_model()?.clear_capture_layers();
+                    self.weights.clear_capture_layers();
                 }
                 return Err(err);
             }
         };
         let dflash_hidden = if let Some(runtime) = self.dflash.as_ref() {
-            let qmodel = self.weights.qwen35()?.cpp_model()?;
-            let captured = match qmodel.drain_captured_hidden() {
+            let captured = match self.weights.drain_captured_hidden() {
                 Ok(captured) => captured,
                 Err(err) => {
-                    qmodel.clear_capture_layers();
+                    self.weights.clear_capture_layers();
                     return Err(err);
                 }
             };
-            qmodel.clear_capture_layers();
+            self.weights.clear_capture_layers();
             Some(dflash::build_target_hidden_from_captures(
                 &captured,
                 runtime.target_layer_ids().len(),
@@ -1115,6 +1148,11 @@ impl RealMetalExecutor {
             .dflash
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("DFlash decode requested without a runtime"))?;
+        // Dispatch on architecture: Qwen3.5 uses the flat-array GDR path; LFM2
+        // uses the session-based conv-state path.
+        if matches!(self.weights, MetalWeights::Lfm2(_)) {
+            return self.run_lfm2_dflash_decode_row(row);
+        }
         let qwen35_weights = self.weights.qwen35()?;
         let qwen35::Qwen35Embedding::Dense(embed_tokens) = &qwen35_weights.embedding;
         let model = qwen35_weights.cpp_model()?;
@@ -1158,6 +1196,162 @@ impl RealMetalExecutor {
         slot.last_sampled = None;
         self.active_session_slot = None;
         Ok(output)
+    }
+
+    /// LFM2.5 + DSpark speculative decode. The target verifies a draft block in
+    /// one session-prefill forward (full logits + hidden/conv capture), then the
+    /// conv window is rolled back to the accepted position by slicing the
+    /// captured conv_input — no re-run on partial acceptance.
+    fn run_lfm2_dflash_decode_row(
+        &mut self,
+        row: &infer_plan::DecodeRow,
+    ) -> anyhow::Result<StepOutput> {
+        let runtime = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash decode requested without a runtime"))?;
+        let lfm2_weights = self.weights.lfm2()?;
+        let embed_tokens = &lfm2_weights.embedding;
+        let lm_head = &lfm2_weights.lm_head;
+        let model = lfm2_weights.cpp_model()?;
+        let slot = self
+            .slots
+            .get_mut(&row.slot)
+            .ok_or_else(|| anyhow::anyhow!("DFlash decode missing slot {}", row.slot))?;
+        let target_hidden = slot
+            .dflash_target_hidden
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DFlash decode for slot {} has no target hidden feature store",
+                    row.slot
+                )
+            })?
+            .clone();
+        let draft_state = slot.dflash_draft_state.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "DFlash decode for slot {} has no draft cache state",
+                row.slot
+            )
+        })?;
+
+        let block_size = runtime.block_size();
+        let old_cache_len = slot.cache_len;
+        let layer_ids = runtime.target_layer_ids();
+
+        // 1. Draft block (DSpark: backbone once + Markov head refinement).
+        let t_draft = std::time::Instant::now();
+        let block_tokens = dflash::prepare_draft_block(
+            runtime,
+            row.last_token,
+            &target_hidden,
+            embed_tokens,
+            lm_head,
+            &self.config,
+            &row.params,
+            draft_state,
+        )?;
+        let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
+
+        // 2. Open session + target block forward (full logits + capture).
+        //    DSpark verify block is [real, d1..d_block_size] = block_size+1 tokens.
+        slot.ensure_session_active(model)?;
+        let verify_len = block_tokens
+            .shape()
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("draft block has empty shape"))?;
+        let t_verify = std::time::Instant::now();
+        let target_logits = model.verify_block_session(
+            &block_tokens,
+            verify_len,
+            old_cache_len as i32,
+            layer_ids,
+        )?;
+        let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+
+        // 3. Acceptance: argmax(target_logits[i]) vs block_tokens[i+1], for
+        //    i in 0..block_size (block_size comparisons).
+        let target_pred = dflash::materialize_i32_tokens(&mlx::argmax_axis(&target_logits, -1))?;
+        let draft_tokens = dflash::materialize_i32_tokens(&block_tokens)?;
+        let mut matched = 0usize;
+        for i in 0..block_size {
+            if target_pred[i] == draft_tokens[i + 1] {
+                matched += 1;
+            } else {
+                break;
+            }
+        }
+        let accepted_inputs = matched + 1;
+        let next_token = target_pred[matched] as u32;
+        if dflash::dflash_draft_trace_enabled() && old_cache_len < 80 {
+            log::info!(
+                "DSpark diag slot={} old={} draft={:?} target_pred={:?}",
+                row.slot,
+                old_cache_len,
+                &draft_tokens[1..],
+                &target_pred[..block_size]
+            );
+        }
+
+        // 4. Rollback conv state: slice captured conv_input to the accepted
+        //    position (2 frames), then overwrite the session conv states.
+        let captured_conv = model.drain_captured_conv_inputs()?;
+        let h = self.config.hidden_size as i32;
+        let a = accepted_inputs as i32;
+        let rolled_back: Vec<mlx::MlxArray> = captured_conv
+            .iter()
+            .map(|ci| {
+                let frame = mlx::slice(ci, &[0, a, 0], &[1, a + 2, h], &[1, 1, 1]);
+                mlx::reshape(&frame, &[1, 2, h])
+            })
+            .collect();
+        model.set_session_conv_states(&rolled_back)?;
+
+        // 5. Build target hidden for the next draft block.
+        let captured_hidden = model.drain_captured_hidden()?;
+        model.clear_capture_layers();
+        let updated_target_hidden = dflash::build_target_hidden_from_captures(
+            &captured_hidden,
+            layer_ids.len(),
+            accepted_inputs as i32,
+        )?;
+        // 6. Close session + update cache length.
+        slot.drain_session(model)?;
+        slot.cache_len = old_cache_len + accepted_inputs;
+        slot.committed_len = slot.cache_len;
+        slot.dflash_target_hidden = Some(updated_target_hidden);
+        slot.last_sampled = None;
+        self.active_session_slot = None;
+        if dflash::dflash_draft_trace_enabled() {
+            log::info!(
+                "Metal DSpark LFM2 trace slot={} cache_len={} matched={} accepted={}/{} draft_ms={:.2} verify_ms={:.2}",
+                row.slot,
+                slot.cache_len,
+                matched,
+                accepted_inputs,
+                block_size,
+                draft_ms,
+                verify_ms
+            );
+        }
+        let mut tokens = Vec::with_capacity(accepted_inputs);
+        for i in 1..=matched {
+            tokens.push(draft_tokens[i] as u32);
+        }
+        tokens.push(next_token);
+        Ok(StepOutput {
+            tokens: tokens
+                .into_iter()
+                .map(|token| SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    top_logprobs: Vec::new(),
+                    finish: None,
+                })
+                .collect(),
+        })
     }
 
     fn submit_decode(
@@ -1332,7 +1526,6 @@ impl RealMetalExecutor {
         };
         let model = self.weights.compiled()?;
         let token_arr = mlx::reshape(&seed, &[1]);
-        let kv_cache_dtype = self.kv_cache_dtype;
         let slot = self
             .slots
             .get_mut(&slot_idx)
@@ -1347,7 +1540,11 @@ impl RealMetalExecutor {
         }
         slot.ensure_session_active(model)?;
         self.active_session_slot = Some(slot_idx);
-        let logits = step_session_decode(model, slot, kv_cache_dtype, &token_arr)?;
+        // Session is active: read the LIVE session KV caches, not slot.kv_flat
+        // (stale until drain — the paged path would feed attention a garbage
+        // token at cache_len, causing repetition loops).
+        let cache_pos = usize_to_i32(slot.cache_len)?;
+        let logits = model.session_step(&token_arr, cache_pos)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = slot.cache_len.saturating_add(1);
         let next = mlx::argmax(&logits);
@@ -1412,26 +1609,13 @@ use slot::*;
 fn step_session_decode(
     model: &dyn CompiledMetalModel,
     slot: &MetalSlotState,
-    kv_cache_dtype: MetalKvCacheDtype,
+    _kv_cache_dtype: MetalKvCacheDtype,
     token: &mlx::MlxArray,
 ) -> anyhow::Result<mlx::MlxArray> {
     let cache_pos = usize_to_i32(slot.cache_len)?;
-    if slot.cache_len > 0 {
-        let logits = match kv_cache_dtype {
-            MetalKvCacheDtype::Bf16 => {
-                let (k_full, v_full) = slot.bf16_prefix_read_inputs(slot.cache_len)?;
-                model.session_step_paged_bf16(token, cache_pos, &k_full, &v_full)
-            }
-            MetalKvCacheDtype::Int8 => {
-                let (k_full, v_full) = slot.int8_prefix_read_inputs(slot.cache_len)?;
-                model.session_step_paged_int8(token, cache_pos, &k_full, &v_full)
-            }
-        }
-        .map_err(|err| anyhow::anyhow!("paged KV read step_session failed: {err}"))?;
-        probe_paged_kv_read_hit();
-        return Ok(logits);
-    }
-    probe_paged_kv_read_fallback();
+    // ponytail: non-paged path reads the live session caches; paged path reads
+    // stale kv_flat and was feeding attention garbage. Re-enable the paged path
+    // once kv_flat is drained before every paged read.
     model.session_step(token, cache_pos)
 }
 

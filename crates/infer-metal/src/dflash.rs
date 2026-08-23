@@ -61,6 +61,7 @@ pub(crate) struct MetalDflashRuntime {
     draft_config: DFlashDraftConfig,
     _draft_weights: DFlashDraftWeights,
     draft_cpp_model: DFlashDraftCppModel,
+    markov: Option<MarkovHead>,
 }
 
 impl MetalDflashRuntime {
@@ -78,7 +79,7 @@ impl MetalDflashRuntime {
             })?;
         let draft_config = DFlashDraftConfig::load(&draft_dir, target_config.num_hidden_layers)?;
         check_compatibility(target_config, &draft_config, &options.draft_model)?;
-        let draft_weights =
+        let mut draft_weights =
             DFlashDraftWeights::load(&draft_dir, &draft_config).with_context(|| {
                 format!(
                     "failed to load Metal DFlash draft weights from {}",
@@ -86,6 +87,7 @@ impl MetalDflashRuntime {
                 )
             })?;
         let draft_cpp_model = DFlashDraftCppModel::build(&draft_weights, &draft_config)?;
+        let markov = draft_weights.markov.take();
         let default_block_size = draft_config.block_size.max(2);
         let block_size = options
             .speculative_tokens
@@ -107,6 +109,7 @@ impl MetalDflashRuntime {
             draft_config,
             _draft_weights: draft_weights,
             draft_cpp_model,
+            markov,
         })
     }
 
@@ -247,6 +250,24 @@ fn check_compatibility(
 pub(crate) enum DraftKind {
     DFlashEagle,
     Qwen35Mtp,
+}
+
+/// DSpark Markov bigram head. `w1` is the [vocab, rank] embedding table;
+/// `w2` is pre-transposed to [rank, vocab] for `matmul(latent, w2)`.
+/// The bias for a given previous token is `w2(w1(prev))` — a rank-256
+/// bigram table that refines the draft backbone's base logits per step.
+struct MarkovHead {
+    w1: MlxArray,
+    w2: MlxArray,
+}
+
+impl MarkovHead {
+    /// Bigram bias `[1, vocab]` for the given previous token.
+    fn bias(&self, prev_token: u32) -> MlxArray {
+        let idx = MlxArray::from_slice_i32(&[prev_token as i32], &[1]);
+        let latent = mlx::take_axis(&self.w1, &idx, 0); // [1, rank]
+        mlx::matmul(&latent, &self.w2) // [1, vocab]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -475,6 +496,8 @@ struct DFlashDraftWeights {
     pre_fc_norm_embedding: MlxArray,
     pre_fc_norm_hidden: MlxArray,
     norm: MlxArray,
+    // DSpark only: the Markov bigram head (absent for plain DFlashEagle/MTP).
+    markov: Option<MarkovHead>,
 }
 
 impl DFlashDraftWeights {
@@ -533,6 +556,20 @@ impl DFlashDraftWeights {
             (get("hidden_norm.weight")?, zero(), zero())
         };
 
+        // DSpark Markov head (optional — absent in plain DFlashEagle checkpoints).
+        let markov = match (
+            get("markov_head.markov_w1.weight"),
+            get("markov_head.markov_w2.weight"),
+        ) {
+            (Ok(w1), Ok(w2)) => {
+                // w2 ships as [vocab, rank] (PyTorch Linear [out, in]); transpose
+                // to [rank, vocab] so `matmul(latent, w2)` yields the bias.
+                let w2 = mlx::transpose_all(&w2);
+                Some(MarkovHead { w1, w2 })
+            }
+            _ => None,
+        };
+
         Ok(Self {
             layers,
             fc: load_proj("fc")?,
@@ -540,6 +577,7 @@ impl DFlashDraftWeights {
             pre_fc_norm_embedding,
             pre_fc_norm_hidden,
             norm: load_norm("norm.weight")?,
+            markov,
         })
     }
 }
@@ -1049,7 +1087,7 @@ fn dflash_trace_enabled() -> bool {
     })
 }
 
-fn dflash_draft_trace_enabled() -> bool {
+pub(crate) fn dflash_draft_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1075,7 +1113,7 @@ impl Drop for Qwen35DflashStateGuard<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_draft_block(
+pub(crate) fn prepare_draft_block(
     runtime: &MetalDflashRuntime,
     current_token: u32,
     target_hidden: &MlxArray,
@@ -1113,27 +1151,83 @@ fn prepare_draft_block(
         mlx::eval(&[&draft_hidden]);
     }
     let t_forward = Instant::now();
-    let draft_block_hidden = mlx::slice(
-        &draft_hidden,
-        &[1, 0],
-        &[
-            block_size_i32,
-            i32::try_from(target_config.hidden_size).context("hidden_size does not fit in i32")?,
-        ],
-        &[1, 1],
-    );
-    if draft_trace {
-        mlx::eval(&[&draft_block_hidden]);
-    }
-    let t_slice = Instant::now();
-    let draft_logits = apply_weight(&draft_block_hidden, lm_head);
+    let hidden_i32 =
+        i32::try_from(target_config.hidden_size).context("hidden_size does not fit in i32")?;
+    let draft_logits = if runtime.markov.is_some() {
+        // DSpark: the backbone runs once over [real, mask, …] and the Markov
+        // head refines each position sequentially — use ALL rows (no slice).
+        apply_weight(&draft_hidden, lm_head)
+    } else {
+        let draft_block_hidden = mlx::slice(
+            &draft_hidden,
+            &[1, 0],
+            &[block_size_i32, hidden_i32],
+            &[1, 1],
+        );
+        apply_weight(&draft_block_hidden, lm_head)
+    };
     if draft_trace {
         mlx::eval(&[&draft_logits]);
     }
     let t_lm_head = Instant::now();
+    if let Some(markov) = &runtime.markov {
+        // DSpark: the backbone runs once over [real, mask, …] (block_size rows)
+        // and the Markov head produces block_size draft tokens — the verify block
+        // is [real, d1..d_block_size] (block_size+1 tokens). Reference:
+        // DeepSpec sample_block_tokens loops range(proposal_len) = block_size.
+        let vocab = *draft_logits
+            .shape()
+            .get(1)
+            .context("DSpark draft logits missing vocab dim")?;
+        let mut prev = current_token;
+        let mut draft_tokens = Vec::with_capacity(runtime.block_size);
+        for step in 0..runtime.block_size {
+            let s = i32::try_from(step).context("draft step does not fit in i32")?;
+            let step_logits = mlx::slice(&draft_logits, &[s, 0], &[s + 1, vocab], &[1, 1]);
+            let bias = markov.bias(prev);
+            let corrected = mlx::add(&step_logits, &bias);
+            let next = mlx::argmax(&corrected).item_i32();
+            ensure!(
+                next >= 0,
+                "DSpark draft emitted a negative token id: {next}"
+            );
+            ensure!(
+                next as u32 != runtime.mask_token_id(),
+                "DSpark draft emitted mask_token_id {}; refusing to verify a masked draft token",
+                runtime.mask_token_id()
+            );
+            draft_tokens.push(next as u32);
+            prev = next as u32;
+        }
+        // The verify block is [real, d1..d_block_size] — block_size+1 tokens.
+        let mut block = Vec::with_capacity(runtime.block_size + 1);
+        block.push(current_token);
+        block.extend(draft_tokens);
+        draft_state.trim(runtime.block_size);
+        draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
+        let block_arr = tokens_to_array(&block);
+        let t_argmax = Instant::now();
+        if draft_trace {
+            log::info!(
+                concat!(
+                    "Metal DFlash draft trace context={} block={} ",
+                    "embed_ms={:.3} forward_ms={:.3} logits_ms={:.3} ",
+                    "argmax_ms={:.3} tokens_ms={:.3} total_ms={:.3}"
+                ),
+                target_hidden.shape().first().copied().unwrap_or_default(),
+                runtime.block_size,
+                millis(t_embed - t0),
+                millis(t_forward - t_embed),
+                millis(t_lm_head - t_forward),
+                millis(t_argmax - t_lm_head),
+                0.0,
+                millis(t_argmax - t0)
+            );
+        }
+        return Ok(block_arr);
+    }
     let suffix = mlx::argmax_axis(&draft_logits, -1);
     let suffix_tokens = materialize_i32_tokens(&suffix)?;
-    let t_argmax = Instant::now();
     for (dst, token) in input_tokens.iter_mut().skip(1).zip(suffix_tokens) {
         ensure!(
             token >= 0,
@@ -1146,6 +1240,7 @@ fn prepare_draft_block(
         );
         *dst = token as u32;
     }
+    let t_argmax = Instant::now();
     draft_state.trim(runtime.block_size);
     draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
     let tokens = tokens_to_array(&input_tokens);
@@ -1154,15 +1249,14 @@ fn prepare_draft_block(
         log::info!(
             concat!(
                 "Metal DFlash draft trace context={} block={} ",
-                "embed_ms={:.3} forward_ms={:.3} slice_ms={:.3} ",
-                "lm_head_ms={:.3} argmax_ms={:.3} tokens_ms={:.3} total_ms={:.3}"
+                "embed_ms={:.3} forward_ms={:.3} logits_ms={:.3} ",
+                "argmax_ms={:.3} tokens_ms={:.3} total_ms={:.3}"
             ),
             target_hidden.shape().first().copied().unwrap_or_default(),
             runtime.block_size,
             millis(t_embed - t0),
             millis(t_forward - t_embed),
-            millis(t_slice - t_forward),
-            millis(t_lm_head - t_slice),
+            millis(t_lm_head - t_forward),
             millis(t_argmax - t_lm_head),
             millis(t_tokens - t_argmax),
             millis(t_tokens - t0)
@@ -1404,7 +1498,7 @@ fn tokens_to_array(tokens: &[u32]) -> MlxArray {
     MlxArray::from_slice_i32(&ids, &[ids.len() as i32])
 }
 
-fn materialize_i32_tokens(tokens: &MlxArray) -> Result<Vec<i32>> {
+pub(crate) fn materialize_i32_tokens(tokens: &MlxArray) -> Result<Vec<i32>> {
     let tokens_i32 = if tokens.dtype() == mlx::Dtype::Int32 {
         tokens.clone()
     } else {
