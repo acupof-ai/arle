@@ -955,18 +955,28 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
+    /// The committed compressed-row count for a decode tick, or `None` when
+    /// this mode keeps no compressed rows. The single derivation behind every
+    /// per-step counter below: `SparseIndexed` (GLM) carries `compress_ratio`
+    /// 0 and shares the indexer at ratio 1, matching the eager path's absolute
+    /// `start_pos + seq_len`.
+    fn compressed_rows(
+        mode: DeepSeekV4AttentionMode,
+        ratio: usize,
+        total_len: usize,
+    ) -> Option<usize> {
+        (mode != DeepSeekV4AttentionMode::SlidingWindow).then(|| total_len / ratio.max(1))
+    }
+
     pub(crate) fn advance_decode_len(
         &mut self,
         mode: DeepSeekV4AttentionMode,
         ratio: usize,
         total_len: usize,
     ) {
-        if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        let Some(compressed_rows) = Self::compressed_rows(mode, ratio, total_len) else {
             return;
-        }
-        // SparseIndexed (GLM) carries compress_ratio 0 and shares the indexer at
-        // ratio 1, matching the eager path's absolute `start_pos + seq_len`.
-        let compressed_rows = total_len / ratio.max(1);
+        };
         // Graph-replay ticks advance the bf16 carry with no compressor_forward
         // host call — mark the FP32 probe carry stale here (host bookkeeping
         // that runs every step); a redundant set on eager ticks is free.
@@ -993,15 +1003,15 @@ impl Dsv4LayerAttentionState {
         total_len: usize,
     ) {
         self.advance_decode_len(mode, ratio, total_len);
-        if mode != DeepSeekV4AttentionMode::SlidingWindow {
-            let rows = total_len / ratio.max(1);
-            if let Some(flash) = &mut self.flashmla {
-                flash.fp8_kv_comp_packed_rows = rows;
-            }
-            // The captured device-gated pack wrote the row the step completed.
-            if let Some(dsa) = &mut self.dsa_official {
-                dsa.packed_rows = rows;
-            }
+        let Some(rows) = Self::compressed_rows(mode, ratio, total_len) else {
+            return;
+        };
+        if let Some(flash) = &mut self.flashmla {
+            flash.fp8_kv_comp_packed_rows = rows;
+        }
+        // The captured device-gated pack wrote the row the step completed.
+        if let Some(dsa) = &mut self.dsa_official {
+            dsa.packed_rows = rows;
         }
     }
 
@@ -1032,8 +1042,10 @@ impl Dsv4LayerAttentionState {
         // A rejected draft can advance the DSA packed-row counter past the
         // committed compressed-row count. Clamp it down so the next real decode
         // repacks the boundary row instead of reusing stale draft cache bytes.
-        if let Some(dsa) = &mut self.dsa_official {
-            let compressed_rows = total_len / ratio.max(1);
+        if let (Some(dsa), Some(compressed_rows)) = (
+            self.dsa_official.as_mut(),
+            Self::compressed_rows(mode, ratio, total_len),
+        ) {
             dsa.packed_rows = dsa.packed_rows.min(compressed_rows);
         }
     }
