@@ -16,7 +16,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 
 use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps};
-use crate::sandbox::{boot_workdir, control_arm_check, diff_workdir, run_captured, score_workdir};
+use std::os::unix::process::CommandExt;
+
+use crate::sandbox::{
+    RolloutUser, boot_workdir, control_arm_check, diff_workdir, discard_workdir, run_captured,
+    score_workdir,
+};
 use crate::swe_dataset::SweTask;
 
 /// TYPICAL cc SWE-session tokens: sizes the per-stream KV budget and is the
@@ -41,6 +46,8 @@ pub struct CcHarness {
     pub pythonpath: Option<String>,
     pub reward_shape: RewardShape,
     pub tokenizer: tokenizers::Tokenizer,
+    /// Unprivileged account the agent runs as; see `sandbox::RolloutUser`.
+    pub rollout_user: RolloutUser,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -200,6 +207,7 @@ impl CcHarness {
             );
             let pythonpath = self.pythonpath.clone();
             let test_timeout_secs = self.test_timeout_secs;
+            let rollout_user = self.rollout_user;
             std::thread::spawn(move || {
                 loop {
                     let sample = next.fetch_add(1, Ordering::Relaxed);
@@ -207,24 +215,29 @@ impl CcHarness {
                         break;
                     }
                     let name = format!("{}#{sample}", task.instance_id);
-                    let booted =
-                        boot_workdir(&root, &name, &staged, task.before_repo_set_cmd.as_deref())
-                            .with_context(|| format!("boot cc sandbox {name}"))
-                            .and_then(|workdir| {
-                                // One arm per group: the pristine tree failing its
-                                // own fail_to_pass is the task being discriminative.
-                                if sample == 0 {
-                                    control_arm_check(
-                                        &workdir,
-                                        &task.test_patch,
-                                        &task.fail_to_pass(),
-                                        pythonpath.as_deref(),
-                                        test_timeout_secs,
-                                    )
-                                    .with_context(|| format!("control-arm check {name}"))?;
-                                }
-                                Ok((sample, workdir))
-                            });
+                    let booted = boot_workdir(
+                        &root,
+                        &name,
+                        &staged,
+                        task.before_repo_set_cmd.as_deref(),
+                        rollout_user,
+                    )
+                    .with_context(|| format!("boot cc sandbox {name}"))
+                    .and_then(|workdir| {
+                        // One arm per group: the pristine tree failing its
+                        // own fail_to_pass is the task being discriminative.
+                        if sample == 0 {
+                            control_arm_check(
+                                &workdir,
+                                &task.test_patch,
+                                &task.fail_to_pass(),
+                                pythonpath.as_deref(),
+                                test_timeout_secs,
+                            )
+                            .with_context(|| format!("control-arm check {name}"))?;
+                        }
+                        Ok((sample, workdir))
+                    });
                     // Deliver the error before stopping — run_group propagates it.
                     let failed = booted.is_err();
                     if tx.send(booted).is_err() || failed {
@@ -317,6 +330,7 @@ impl CcHarness {
     ) -> ScoredSample {
         // Per-sample model tag keeps concurrent samples' dumps attributable.
         let model = sample_model(&self.model_id, nonce, sample);
+        let task_name = format!("{}#{sample}", task.instance_id);
         let mut cmd = Command::new("claude");
         cmd.arg("-p")
             .args(["--model", &model])
@@ -350,7 +364,11 @@ impl CcHarness {
                 "PYTHONPATH",
                 crate::sandbox::workdir_pythonpath(workdir, self.pythonpath.as_deref()),
             )
-            .env("PYTHONDONTWRITEBYTECODE", "1");
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            // CC writes config and history into HOME; root's is unreadable now.
+            .env("HOME", crate::sandbox::agent_home(&self.work_root, &task_name))
+            .uid(self.rollout_user.uid)
+            .gid(self.rollout_user.gid);
 
         let t_start_ms = epoch_ms();
         let spawned = run_captured(cmd, Duration::from_secs(self.cc_timeout_secs));
@@ -390,6 +408,9 @@ impl CcHarness {
 
         let usage = cc.as_ref().and_then(|v| v.get("usage"));
         let get = |v: Option<&serde_json::Value>, key| v.and_then(|v| v.get(key)?.as_u64());
+        // Scored, so the tree has no further use — and a kept one is the next
+        // run's answer key.
+        discard_workdir(&self.work_root, &task_name);
         ScoredSample {
             task_id: task.instance_id.clone(),
             sample,

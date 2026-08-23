@@ -301,6 +301,17 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // --staleness 1: the next group rolls on a background thread while this
     // group trains+merges (Arc'd for that thread's 'static bound).
     let cp = train::context_parallel::CpContext::from_env();
+
+    // The agent gets Bash and no filesystem confinement: as root it read
+    // eval.jsonl, matched its own instance_id and printed the test_patch it was
+    // scored against (errors/2026-08-24). Refuse to start unless the answers are
+    // out of its reach — a readable corpus yields a run that looks normal and
+    // measures nothing.
+    let rollout_user = train::sandbox::resolve_rollout_user(&args.rollout_user)?;
+    let mut secrets: Vec<&std::path::Path> = vec![&args.dataset, &args.staged_root];
+    secrets.extend(args.eval_dataset.as_deref());
+    train::sandbox::assert_corpus_unreadable(&secrets, rollout_user)?;
+
     let harness = Arc::new(train::cc_harness::CcHarness {
         work_root: args.work_root.clone(),
         dump_dir,
@@ -316,6 +327,7 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         pythonpath: args.pythonpath.clone(),
         reward_shape: args.reward_shape.into(),
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
+        rollout_user,
     });
 
     // Prompts per update (verl shape): G groups roll concurrently under ONE
