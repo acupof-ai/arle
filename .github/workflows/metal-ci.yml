@@ -13,6 +13,9 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/package_macos_metal_artifact.sh'
+      - 'scripts/lever_gate.sh'
+      - 'scripts/needle_gate.py'
+      - 'scripts/needle_summary.py'
       - 'benchmarks/snapshots/**'
       - '.github/workflows/metal-ci.yml'
   pull_request:
@@ -24,6 +27,9 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/package_macos_metal_artifact.sh'
+      - 'scripts/lever_gate.sh'
+      - 'scripts/needle_gate.py'
+      - 'scripts/needle_summary.py'
       - 'benchmarks/snapshots/**'
       - '.github/workflows/metal-ci.yml'
 
@@ -90,10 +96,24 @@ jobs:
           --no-default-features --features metal,no-cuda,cli
           -p arle --bin arle --release
 
+      # Model-level correctness gate: needle ladder on the 0.8B test model.
+      # The Metal executor downloads the HF repo on first serve boot.
+      - name: Metal needle gate
+        timeout-minutes: 10
+        env:
+          MODEL: mlx-community/Qwen3.5-0.8B-MLX-4bit
+          GATE_PROFILE: metal
+          LENGTHS: "115,300,446"
+          RUNS: "1"
+          PORT: "18189"
+          LEVER_GATE_ALLOW_NO_BASELINE: "1"
+          LEVER_GATE_SKIP_TEMP: "1"
+          LEVER_GATE_SKIP_CONCURRENT: "1"
+          RUST_LOG: warn
+        run: bash scripts/lever_gate.sh "ci-metal"
+
       # Validate that the baseline snapshots are well-formed JSON.
-      # NOTE: Actually running benchmarks requires a model and a Metal GPU,
-      # so the CI job only validates that the binary compiles and every
-      # baseline snapshot parses correctly.
+      # Model-level correctness is covered by the needle gate above.
       - name: Validate baseline snapshots
         run: |
           python3 - <<'PY'
