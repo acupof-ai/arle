@@ -7,6 +7,9 @@ agent. At `--eval-concurrency 6`, four of twelve tasks hit the 1800 s cap with
 `edited=false` — thirty minutes of agent time that produced no file change.
 Suspected a hung harness; it was queueing.
 
+No baseline citation: c=6 and c=3 are two configs of the same binary, not a
+treatment-vs-baseline comparison across commits.
+
 ## What Worked
 
 Dropping `--eval-concurrency` from 6 to 3. Same binary, same corpus, same
