@@ -272,7 +272,21 @@ fn audit_capturing_graph(stream: &CudaStream) -> Result<CaptureAudit> {
                 }
             }
             cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_HOST => audit.host_fn_nodes += 1,
-            cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => audit.mem_alloc_nodes += 1,
+            cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => {
+                audit.mem_alloc_nodes += 1;
+                if std::env::var_os("ARLE_GRAPH_NODE_CENSUS").is_some() {
+                    let mut p = std::mem::MaybeUninit::<cu::CUDA_MEM_ALLOC_NODE_PARAMS>::uninit();
+                    // SAFETY: node is a live MEM_ALLOC node; the driver fills params.
+                    if unsafe { cu::cuGraphMemAllocNodeGetParams(node, p.as_mut_ptr()) }
+                        .result()
+                        .is_ok()
+                    {
+                        // SAFETY: success above guarantees initialization.
+                        let p = unsafe { p.assume_init() };
+                        log::info!("[graph-alloc-census] bytes={}", p.bytesize);
+                    }
+                }
+            }
             cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => audit.mem_free_nodes += 1,
             _ => {}
         }
