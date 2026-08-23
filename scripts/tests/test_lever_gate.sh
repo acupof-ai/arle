@@ -110,6 +110,11 @@ cp "$ROOT/scripts/lever_gate.sh" "$tmp/root/scripts/lever_gate.sh"
 cp "$ROOT/scripts/pick-gpu.sh" "$tmp/root/scripts/pick-gpu.sh"
 cp "$ROOT/scripts/needle_summary.py" "$tmp/root/scripts/needle_summary.py"
 cp "$tmp/needle.py" "$tmp/root/scripts/needle_gate.py"
+cat >"$tmp/root/scripts/needle_concurrent.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+sys.exit(0)
+EOF
 
 run_gate() {
     local stats="$1" out="$2" sha="${3:-$SHA}" kernel="${4:-$KERNEL_ID}" port="$5"

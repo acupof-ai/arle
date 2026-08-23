@@ -7,6 +7,9 @@
 #   2. baseline same-config envelope = the non-determinism floor
 #   3. self-consistency: the lever path's own greedy output is the reference
 #
+# Optional arms (skip with env): temp coherence (LEVER_GATE_SKIP_TEMP=1),
+# concurrent needle cross-row mix-up (LEVER_GATE_SKIP_CONCURRENT=1).
+#
 # Usage:
 #   # DSv4 (8xH20, TP=8) — the dsv4 profile carries the multi-GPU + kernel env:
 #   GATE_PROFILE=dsv4 scripts/lever_gate.sh baseline
@@ -195,6 +198,15 @@ fi
 if [ "${LEVER_GATE_SKIP_TEMP:-0}" != "1" ]; then
     PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" temp || {
         echo "[gate] temp coherence arm FAIL"
+        exit 1
+    }
+fi
+# Concurrent needle arm: catches cross-row state mix-up in batched decode that
+# a single-request ladder cannot see. Conservative defaults keep it fast.
+if [ "${LEVER_GATE_SKIP_CONCURRENT:-0}" != "1" ]; then
+    PORT="$PORT" python3 "$ROOT/scripts/needle_concurrent.py" \
+        "$PORT" "${CONCURRENT_CONC:-4}" "${CONCURRENT_TOKENS:-2000}" "${CONCURRENT_ROUNDS:-1}" 0 || {
+        echo "[gate] concurrent needle arm FAIL"
         exit 1
     }
 fi

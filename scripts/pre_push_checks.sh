@@ -84,7 +84,7 @@ if [[ "${METAL_CHECKS}" == "1" && "$(uname -s)" == "Darwin" ]]; then
         info "Metal needle gate (Qwen3.5-0.8B-MLX-4bit, lengths 115/300/446)"
         BIN="$GATE_BIN" MODEL="$GATE_MODEL" \
         GATE_PROFILE=metal LENGTHS=115,300,446 RUNS=1 \
-        PORT=18189 LEVER_GATE_ALLOW_NO_BASELINE=1 LEVER_GATE_SKIP_TEMP=1 \
+        PORT=18189 LEVER_GATE_ALLOW_NO_BASELINE=1 LEVER_GATE_SKIP_TEMP=1 LEVER_GATE_SKIP_CONCURRENT=1 \
         RUST_LOG=warn \
         bash scripts/lever_gate.sh "prepush-$$" || {
             echo "[pre-push] Metal needle gate FAIL" >&2
