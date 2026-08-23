@@ -42,25 +42,27 @@ args_file() {
   printf '%s\0' "$@" > "$out"
 }
 # The held tn connection gives one transfer 60s before it reports the daemon
-# gone; a 47 MB tree.tgz never finishes inside that. Anything above this splits.
+# gone; a 47 MB tree.tgz never finishes inside that. The constant encodes an
+# assumed transfer rate, so a slower link needs a smaller PUSH_CHUNK_BYTES.
 PUSH_CHUNK_BYTES="${PUSH_CHUNK_BYTES:-12582912}"
 push_or_die() {
   local src="$1" dst="$2" size
-  size="$(wc -c < "$src" | tr -d ' ')"
+  # stat, not `wc -c`: the latter reads all 47 MB just to report the length.
+  size="$(stat -f%z "$src" 2>/dev/null || stat -c%s "$src")"
   if [ "$size" -le "$PUSH_CHUNK_BYTES" ]; then
     "$TN" push "$src" "$dst" || { echo "push $dst failed; remote tree unchanged" >&2; exit 1; }
     return 0
   fi
-  local parts n=0
+  local parts
   parts="$(mktemp -d -t arle-push-XXXXXX)"
+  trap 'rm -rf "$parts"' RETURN
+  # split's own suffixes (part.aa, part.ab, ...) are already glob-ordered, so
+  # the remote `cat` reassembles in the order they were written.
   split -b "$PUSH_CHUNK_BYTES" "$src" "$parts/part."
   for part in "$parts"/part.*; do
-    "$TN" push "$part" "$(printf '%s.part.%03d' "$dst" "$n")" || {
-      rm -rf "$parts"; echo "push $dst part $n failed; remote tree unchanged" >&2; exit 1; }
-    n=$((n + 1))
+    "$TN" push "$part" "$dst.$(basename "$part")" ||
+      { echo "push $dst $(basename "$part") failed; remote tree unchanged" >&2; exit 1; }
   done
-  rm -rf "$parts"
-  # %03d keeps glob order == split order.
   "$TN" exec "cat '$dst'.part.* > '$dst' && rm -f '$dst'.part.*" >/dev/null || {
     echo "reassembling $dst on the node failed; remote tree unchanged" >&2; exit 1; }
 }

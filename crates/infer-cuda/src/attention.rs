@@ -10,7 +10,7 @@ use cuda_kernels::tensor::{RawDevicePtr, WeightFormat, cache_ptr};
 use cuda_kernels::tensor_ops;
 use cuda_kernels::{BandPage, KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
-use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config, indexer_stride};
 use infer_seam::{KvBatchDescriptor, KvBatchRowKind};
 use std::sync::atomic::Ordering;
 
@@ -836,7 +836,7 @@ pub(crate) fn dsv4_flashmla_slot_pages(
         0
     } else {
         max_seq_len
-            .div_ceil(compress_ratio.max(1))
+            .div_ceil(indexer_stride(compress_ratio))
             .max(1)
             .div_ceil(page_block_size)
     };
@@ -882,7 +882,7 @@ pub(crate) fn dsv4_flashmla_layer_pool_pages(
     if mode == DeepSeekV4AttentionMode::SlidingWindow {
         return Ok(num_slots.saturating_mul(sw_blocks));
     }
-    let comp_tokens_per_page = page_block_size.saturating_mul(compress_ratio.max(1));
+    let comp_tokens_per_page = page_block_size.saturating_mul(indexer_stride(compress_ratio));
     let shared_comp = pool_tokens.div_ceil(comp_tokens_per_page.max(1));
     Ok(num_slots
         .saturating_mul(sw_blocks + DSV4_COMP_SAFETY_PAGES_PER_SLOT)
@@ -5058,7 +5058,8 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     // The constructor sizes the fixed staging from config; the loaded TP-local
     // table decides the true group dims, so resize once on the eager warm step
     // (which precedes any capture).
-    if n == 1
+    let use_fixed = n == 1;
+    if use_fixed
         && (scratch
             .oproj_in
             .as_ref()
@@ -5073,19 +5074,13 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         // SAFETY: uninit device scratch; fully written before first read.
         scratch.oproj_out = Some(unsafe { HiddenStates::uninit(ctx, rows, 1)? });
     }
-    let use_fixed = n == 1;
     let (mut in_g, mut out_g) = if use_fixed {
         // `take` leaves None rather than a placeholder buffer: the two
         // `uninit(1, 1)` allocations a `mem::replace` needed here recorded
         // 2 alloc nodes per layer (86 on 43) into every capture.
-        let a = scratch
-            .oproj_in
-            .take()
-            .ok_or_else(|| anyhow!("DSv4 grouped O-LoRA decode staging missing"))?;
-        let b = scratch
-            .oproj_out
-            .take()
-            .ok_or_else(|| anyhow!("DSv4 grouped O-LoRA decode staging missing"))?;
+        let (Some(a), Some(b)) = (scratch.oproj_in.take(), scratch.oproj_out.take()) else {
+            bail!("DSv4 grouped O-LoRA decode staging missing")
+        };
         (a, b)
     } else {
         // SAFETY: uninit device scratch; fully written before first read.

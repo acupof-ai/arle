@@ -39,7 +39,7 @@ impl Dsv4DsaOfficialState {
         slot_idx: usize,
         pool: &Dsv4LayerKvLayout,
     ) -> Result<Self> {
-        let compressed_capacity = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+        let compressed_capacity = max_seq_len.div_ceil(indexer_stride(compress_ratio)).max(1);
         let key_cache_bytes = dsv4_dsa_key_cache_bytes(config, compress_ratio, max_seq_len)?;
         let range = pool.dsa_slot_range(slot_idx)?;
         ensure!(
@@ -186,7 +186,7 @@ impl Dsv4DsaSharedScratch {
             "Official DSv4 DSA indexer requires 32/64 heads, got {}",
             config.index_n_heads
         );
-        let compressed_capacity = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+        let compressed_capacity = max_seq_len.div_ceil(indexer_stride(compress_ratio)).max(1);
         let page_size = 64usize;
         let num_pages = compressed_capacity.div_ceil(page_size).max(1);
         let max_tokens = max_seq_len.max(1);
@@ -368,7 +368,7 @@ pub(crate) fn dsv4_dsa_shared_scratch_bytes(
     compress_ratio: usize,
     max_seq_len: usize,
 ) -> usize {
-    let cc = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+    let cc = max_seq_len.div_ceil(indexer_stride(compress_ratio)).max(1);
     let num_pages = cc.div_ceil(64).max(1);
     let query_tile = DSV4_DSA_PREFILL_QUERY_TILE.min(max_seq_len.max(1));
     let query_chunk = DSV4_PREFILL_QUERY_CHUNK.min(max_seq_len.max(1));
@@ -413,7 +413,7 @@ pub(crate) fn dsv4_dsa_batched_scratch_bytes_per_slot(
     compress_ratio: usize,
     max_seq_len: usize,
 ) -> usize {
-    let cc = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+    let cc = max_seq_len.div_ceil(indexer_stride(compress_ratio)).max(1);
     let num_pages = cc.div_ceil(64).max(1);
     let logits_stride = cc.div_ceil(256) * 256;
     // q_fp8_batch (u8) + weights_batch (f32) + context_lens_batch (i32) +
@@ -445,7 +445,7 @@ pub(crate) fn dsv4_dsa_rotated_keys_bytes(
     compress_ratio: usize,
     max_seq_len: usize,
 ) -> usize {
-    let cc = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+    let cc = max_seq_len.div_ceil(indexer_stride(compress_ratio)).max(1);
     dsv4_dsa_rotated_ring_rows(cc)
         .saturating_mul(config.index_head_dim)
         .saturating_mul(2)
@@ -466,7 +466,7 @@ pub(crate) fn dsv4_dsa_key_cache_bytes(
     compress_ratio: usize,
     max_seq_len: usize,
 ) -> Result<usize> {
-    let compressed_capacity = max_seq_len.div_ceil(compress_ratio).max(1);
+    let compressed_capacity = max_seq_len.div_ceil(indexer_stride(compress_ratio)).max(1);
     let page_size = 64usize;
     let num_pages = compressed_capacity.div_ceil(page_size).max(1);
     num_pages
@@ -965,21 +965,13 @@ impl Dsv4LayerAttentionState {
         ratio: usize,
         total_len: usize,
     ) -> Option<usize> {
-        (mode != DeepSeekV4AttentionMode::SlidingWindow).then(|| total_len / ratio.max(1))
+        (mode != DeepSeekV4AttentionMode::SlidingWindow).then(|| total_len / indexer_stride(ratio))
     }
 
-    pub(crate) fn advance_decode_len(
-        &mut self,
-        mode: DeepSeekV4AttentionMode,
-        ratio: usize,
-        total_len: usize,
-    ) {
-        let Some(compressed_rows) = Self::compressed_rows(mode, ratio, total_len) else {
-            return;
-        };
-        // Graph-replay ticks advance the bf16 carry with no compressor_forward
-        // host call — mark the FP32 probe carry stale here (host bookkeeping
-        // that runs every step); a redundant set on eager ticks is free.
+    /// Graph-replay ticks advance the bf16 carry with no compressor_forward
+    /// host call — mark the FP32 probe carry stale here (host bookkeeping that
+    /// runs every step); a redundant set on eager ticks is free.
+    fn advance_rows(&mut self, compressed_rows: usize) {
         if let Some(compressor) = &mut self.compressor {
             compressor.compressed.seq_len = compressed_rows;
             compressor.fp32_carry_stale = true;
@@ -1002,10 +994,10 @@ impl Dsv4LayerAttentionState {
         ratio: usize,
         total_len: usize,
     ) {
-        self.advance_decode_len(mode, ratio, total_len);
         let Some(rows) = Self::compressed_rows(mode, ratio, total_len) else {
             return;
         };
+        self.advance_rows(rows);
         if let Some(flash) = &mut self.flashmla {
             flash.fp8_kv_comp_packed_rows = rows;
         }
@@ -1038,15 +1030,15 @@ impl Dsv4LayerAttentionState {
         ratio: usize,
         total_len: usize,
     ) {
-        self.advance_decode_len(mode, ratio, total_len);
+        let Some(rows) = Self::compressed_rows(mode, ratio, total_len) else {
+            return;
+        };
+        self.advance_rows(rows);
         // A rejected draft can advance the DSA packed-row counter past the
         // committed compressed-row count. Clamp it down so the next real decode
         // repacks the boundary row instead of reusing stale draft cache bytes.
-        if let (Some(dsa), Some(compressed_rows)) = (
-            self.dsa_official.as_mut(),
-            Self::compressed_rows(mode, ratio, total_len),
-        ) {
-            dsa.packed_rows = dsa.packed_rows.min(compressed_rows);
+        if let Some(dsa) = &mut self.dsa_official {
+            dsa.packed_rows = dsa.packed_rows.min(rows);
         }
     }
 

@@ -145,11 +145,6 @@ pub fn reset_dsv4_stage_profile() {
 }
 
 #[cfg(feature = "cuda")]
-pub fn set_dsv4_stage_profile_active(active: bool) {
-    stage_profile::set_active(active);
-}
-
-#[cfg(feature = "cuda")]
 pub fn print_dsv4_stage_profile(tag: &str, timed_tokens: usize, timed_wall_ms: f64) {
     stage_profile::print_rank0(tag, timed_tokens, timed_wall_ms);
 }

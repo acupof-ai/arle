@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -15,7 +14,6 @@ struct Stat {
 }
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
-static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STATS: OnceLock<Mutex<BTreeMap<&'static str, Stat>>> = OnceLock::new();
 
 fn enabled() -> bool {
@@ -30,15 +28,8 @@ pub(crate) fn reset() {
     if !enabled() {
         return;
     }
-    ACTIVE.store(false, Ordering::Relaxed);
     if let Ok(mut guard) = stats().lock() {
         guard.clear();
-    }
-}
-
-pub(crate) fn set_active(active: bool) {
-    if enabled() {
-        ACTIVE.store(active, Ordering::Relaxed);
     }
 }
 
@@ -50,8 +41,6 @@ pub(crate) fn profile<T>(
     if !enabled() {
         return f();
     }
-    let _ = ACTIVE.load(Ordering::Relaxed); // retained for explicit-window callers
-
     let start = ctx
         .ctx
         .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))

@@ -62,7 +62,7 @@ impl Dsv4FlashMlaDecodeShape {
                 compress_ratio > 0 || mode == DeepSeekV4AttentionMode::SparseIndexed,
                 "DSv4 FlashMLA compressed decode requires non-zero ratio"
             );
-            max_seq_len.div_ceil(compress_ratio.max(1)).max(1)
+            max_seq_len.div_ceil(indexer_stride(compress_ratio)).max(1)
         };
         let comp_blocks = compressed_rows.div_ceil(kv_arena.page_block_size);
         let max_compressed_keys = match mode {
