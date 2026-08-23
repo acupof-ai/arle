@@ -195,3 +195,26 @@ rather than by a bench.
 - `/host/arle-ops/runs/c1g/bench-dspark-r2-{0,1}.json`
 - `/host/arle-ops/runs/c1g/mmlu-{graph,eager}-r2/`
 - `/host/arle-ops/runs/c1g/needle_ab.out`
+
+## Follow-up — 2026-08-23, codex round 3
+
+One P1 survived two prior review rounds and both bench arms:
+`advance_decode_len` (`crates/infer-cuda/src/attention/dsa.rs:967`) divided by
+the raw `compress_ratio`. `SparseIndexed` layers carry `compress_ratio == 0`
+and share the indexer at ratio 1 (`attention/dsa.rs:761`), and only
+`SlidingWindow` returns early, so the first graph replay on a GLM-family
+checkpoint would divide by zero and panic. It never showed on
+DeepSeek-V4-Flash because that checkpoint has no `SparseIndexed` layer, and the
+eager path never calls this function at all — its only two callers are
+`advance_after_replay` and `truncate_decode_len`, both introduced by this work.
+
+Fix: `total_len / ratio.max(1)`, which reproduces the eager path's absolute
+`start_pos + seq_len` (`attention.rs:5629`) for the shared indexer.
+
+The graph remains unvalidated on GLM-5.2 / `SparseIndexed`; that family's
+verification is pending-remote independently of this work.
+
+Rule: a counter helper written for one model family must be checked against
+every `mode`/`ratio` combination the family enum admits, not only the one the
+bench model exercises. A `.max(1)` in the caller is not protection when the
+callee divides first.
