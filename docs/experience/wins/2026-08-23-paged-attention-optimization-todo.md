@@ -63,7 +63,7 @@ Manual load cost: ~128 LDS.U8/lane/tile for A + ~64 for B = 192 load instruction
 
 ### 5. ~~Marlin GEMV M-split occupancy~~ — DONE (small win, M-split not worth it)
 
-- [x] Tiebreaker fix: prefer higher bps for NVFP4 decode (m_block_size_8, num_bits==4)
+- [x] Tiebreaker fix: prefer higher bps for NVFP4 decode (m_block_size_8, q_type==kFE2M1f)
 - [x] Target: 4-8 blocks/SM (from 1-4) — achieved 5 blocks/SM (from 4)
 - [x] Expected: ~2× kernel → +26% decode — **actual: +2-6% kernel, not 2×**
 - [x] Baseline: 1.29 TB/s (32% of 4 TB/s), 1-4 blocks/SM, warp active 12-22%
@@ -75,8 +75,9 @@ Manual load cost: ~128 LDS.U8/lane/tile for A + ~64 for B = 192 load instruction
   is not worth pursuing — the dependent-chain latency (dequant→scale→MMA) is the
   bottleneck, not warp supply.
 - **fp8 regression**: first iteration applied to all quant types; fp8 per-channel
-  down regressed -7% (N=5120, only 40 tiles → 90% idle blocks at bps=5). Fixed by
-  gating to num_bits==4 only. See [wins entry](2026-08-23-marlin-nvfp4-decode-bps-tiebreaker.md).
+  down regressed -7% (N=5120, only 40 tiles → 90% idle blocks at bps=5). Second
+  iteration gated to num_bits==4, but that matches kU4/kU4B8 too. Final gate:
+  q_type==host::kFE2M1f (NVFP4 only). See [wins entry](2026-08-23-marlin-nvfp4-decode-bps-tiebreaker.md).
 
 ## Progress Log
 

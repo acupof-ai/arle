@@ -24,7 +24,7 @@ INFER_CUDA_DEVICE=6 target/release/examples/marlin_fp4_probe
 ```
 
 - Baseline: `gptq_marlin.cuh` at f681c8156 (tiebreaker: larger thread_k)
-- Treatment: tiebreaker prefers higher bps for `m_block_size_8 && num_bits==4`
+- Treatment: tiebreaker prefers higher bps for `m_block_size_8 && q_type == host::kFE2M1f`
 - Shapes: Qwen3.8-27B dense-MLP (gate_up N=34816 K=5120, down N=5120 K=34816)
 - M sweep: 1, 16, 512, 2048
 - 20 iters/point, 3 runs
@@ -62,9 +62,10 @@ ncu (gate_up fp4, M=1):
 
 The first iteration applied the higher-bps preference to all quant types.
 The fp8 per-channel path regressed -7% on the down projection (N=5120, only
-40 tiles → 90% idle blocks at bps=5). Fixed by gating the preference to
-`num_bits==4` (NVFP4 group-quantized) only; fp8 per-channel keeps the
-upstream tiebreaker.
+40 tiles → 90% idle blocks at bps=5). The second iteration gated to
+`num_bits==4`, but that also matches kU4 (W4A16) and kU4B8 (W4A8). Final
+gate: `q_type == host::kFE2M1f` (NVFP4 only); fp8 per-channel and W4A16/W4A8
+keep the upstream tiebreaker.
 
 ## Learnings
 
