@@ -12,14 +12,6 @@ use thiserror::Error;
 
 use crate::FinishReason;
 
-pub const DEFAULT_DIFFUSION_CANVAS_LENGTH: usize = 256;
-pub const DEFAULT_DIFFUSION_MAX_DENOISING_STEPS: usize = 48;
-pub const DEFAULT_DIFFUSION_ENTROPY_BOUND: f32 = 0.1;
-pub const DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD: f32 = 0.005;
-pub const DEFAULT_DIFFUSION_T_MAX: f32 = 0.8;
-pub const DEFAULT_DIFFUSION_T_MIN: f32 = 0.4;
-pub const DEFAULT_DIFFUSION_STABILITY_THRESHOLD: usize = 1;
-
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffusionGenerationConfig {
