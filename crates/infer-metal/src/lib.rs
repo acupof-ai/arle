@@ -43,6 +43,8 @@ pub use config::model_dir_is_deepseek_ocr;
 #[cfg(feature = "metal")]
 pub use deepseek_ocr::{LoadedMetalDeepseekOcr, MetalDeepseekOcrModel};
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
+#[cfg(feature = "metal")]
+pub use executor::{default_t2_budget_bytes, paged_kv_read_fallbacks, paged_kv_read_hits};
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
 pub use mlx::{
