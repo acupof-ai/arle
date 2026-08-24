@@ -6,7 +6,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::ffi::{self, Half};
-use crate::tensor::{DeviceContext, RawDevicePtr};
+use crate::tensor::{DeviceContext, RawDevicePtr, cache_ptr};
 
 // bf16 (Rust) and Half (u16, kernel ABI) share a 16-bit layout, so pointers cast directly.
 
@@ -314,21 +314,19 @@ pub unsafe fn dequantize_fp8_marlin_to_bf16(
 ) -> Result<()> {
     let nk = extent(n, k, "dequantize_fp8_marlin_to_bf16 weight")?;
     ensure!(
-        packed.len() >= nk && scales.len() >= n && output.len() >= nk,
-        "dequantize_fp8_marlin_to_bf16 buffers do not cover [n,k]=[{n},{k}]: packed={} scales={} \
-         output={}",
+        packed.len() >= nk && scales.len() >= n,
+        "dequantize_fp8_marlin_to_bf16 buffers do not cover [n,k]=[{n},{k}]: packed={} scales={}",
         packed.len(),
-        scales.len(),
-        output.len()
+        scales.len()
     );
-    let mut scratch = ctx
+    let scratch = ctx
         .stream
         .alloc_zeros::<u8>(nk)
         .map_err(|e| anyhow!("dequantize_fp8_marlin_to_bf16 scratch alloc: {e}"))?;
     // SAFETY: lengths checked above; `packed` is the layout `repack_for_marlin_fp8`
-    // produced, and `output` covers n*k bf16 on this stream.
+    // produced, and `output` covers n*k bf16 on this stream (caller's contract).
     unsafe {
-        marlin_fp8_to_e4m3(ctx, packed, &mut scratch, n, k)
+        marlin_fp8_to_e4m3(ctx, packed, cache_ptr(&scratch, &ctx), n, k)
             .map_err(|e| anyhow!("marlin_fp8_to_e4m3 in dequantize_fp8_marlin_to_bf16: {e}"))?;
         dequantize_fp8_block_scaled_to_bf16(
             ctx,
