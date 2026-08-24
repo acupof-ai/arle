@@ -50,22 +50,41 @@ cuda_prebuilt_command_id() {
 }
 
 cuda_prebuilt_tracked_hash() {
-    local path="$1" root relative file
+    local path="$1" root relative list merged hasher
     root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     [[ -n "$root" ]] || { cuda_prebuilt_files_hash "$path"; return; }
     relative="$path"
     [[ "$path" != /* ]] || relative="${path#"$root"/}"
+    if command -v sha256sum >/dev/null 2>&1; then
+        hasher=(sha256sum)
+    else
+        hasher=(shasum -a 256)
+    fi
+    list="$(mktemp)"
+    merged="$(mktemp)"
+    # Existing files are hashed in one batched invocation; per-file forking
+    # made `kernel_artifacts.sh id` O(10s) on macOS (shasum is a Perl script).
+    git ls-files -z -- "$relative" | LC_ALL=C sort -z |
+        while IFS= read -r -d '' file; do
+            if [[ -f "$root/$file" ]]; then
+                printf 'F\t%s\n' "$file"
+            else
+                printf 'M\t%s\n' "$file"
+            fi
+        done >"$list"
     {
-        git ls-files -z -- "$relative" |
-            LC_ALL=C sort -z |
-            while IFS= read -r -d '' file; do
-                if [[ -f "$root/$file" ]]; then
-                    printf 'file\t%s\t%s\n' "$file" "$(cuda_prebuilt_hash_file "$root/$file")"
-                else
-                    printf 'missing\t%s\n' "$file"
-                fi
-            done
-    } | cuda_prebuilt_hash_stream
+        grep '^F	' "$list" | cut -f2- | (cd "$root" && xargs -r "${hasher[@]}") |
+            awk '{printf "F\t%s\t%s\n", $2, $1}'
+        grep '^M	' "$list" || true
+    } | LC_ALL=C sort -t$'\t' -k2,2 >"$merged"
+    while IFS=$'\t' read -r tag file hash; do
+        if [[ "$tag" == F ]]; then
+            printf 'file\t%s\t%s\n' "$file" "$hash"
+        else
+            printf 'missing\t%s\n' "$file"
+        fi
+    done <"$merged" | cuda_prebuilt_hash_stream
+    rm -f "$list" "$merged"
 }
 
 cuda_prebuilt_manifest_validate() {

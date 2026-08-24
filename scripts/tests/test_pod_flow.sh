@@ -4,6 +4,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d -t pod-flow-XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
+
+# Process start token for GPU claim files (compared only for liveness on a
+# live pid, so any stable per-process value works; /proc is Linux-only).
+claim_start() {
+    if [[ -r "/proc/$$/stat" ]]; then
+        awk '{print $22}' "/proc/$$/stat"
+    else
+        ps -o lstart= -p "$$"
+    fi
+}
 LOCAL="$TMP/local"; NODE="$TMP/node/tree"; TREE="$TMP/pod/tree"; STATE="$TMP/state"; BIN="$TMP/bin"
 mkdir -p "$LOCAL/scripts" "$TMP/node" "$TMP/pod" "$STATE" "$BIN"
 cp "$ROOT/.gitignore" "$LOCAL/"
@@ -276,7 +286,7 @@ PROC_ROOT="$TMP/proc" KILL_CMD="$BIN/mock-kill" POD_TREE="$TREE" POD_STATE="$STA
 [ -f "$KILL_MARKER" ]
 
 mkdir -p "$TMP/claims"
-printf 'schema=arle-gpu-claim-v1\nop=foreign\nowner=other\npid=%s\nstart=%s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$TMP/claims/0"
+printf 'schema=arle-gpu-claim-v1\nop=foreign\nowner=other\npid=%s\nstart=%s\n' "$$" "$(claim_start)" > "$TMP/claims/0"
 gpu="$(ARLE_GPU_CLAIMS="$TMP/claims" ARLE_OP_ID=ours ARLE_OWNER=test SMI='0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0' bash "$TREE/scripts/pick-gpu.sh")"
 [ "$gpu" = 1 ] && kill -0 $$
 
@@ -284,7 +294,7 @@ SM90_SET='0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0\n2, GPU-2, 0, 9.0\n3, GPU-3, 0, 9.0
 SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3,4,5,6,7 >/dev/null
 reserve_op=reserve-test
 SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/reserved-set" ARLE_OP_ID="$reserve_op" ARLE_OWNER=test \
-  ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$(awk '{print $22}' /proc/$$/stat)" \
+  ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$(claim_start)" \
   bash "$TREE/scripts/pick-gpu.sh" reserve-set 0,1,2,3,4,5,6,7 >/dev/null
 for gpu in $(seq 0 7); do [ "$(awk -F= '$1=="op" {print $2}' "$TMP/reserved-set/$gpu")" = "$reserve_op" ]; done
 set +e
@@ -296,7 +306,7 @@ SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh"
 rc=$?; set -e
 [ "$rc" -ne 0 ]
 mkdir -p "$TMP/tp4-busy"
-printf 'schema=arle-gpu-claim-v1\nop=foreign\npid=%s\nstart=%s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$TMP/tp4-busy/2"
+printf 'schema=arle-gpu-claim-v1\nop=foreign\npid=%s\nstart=%s\n' "$$" "$(claim_start)" > "$TMP/tp4-busy/2"
 set +e
 SMI="$TP4_SET" ARLE_GPU_CLAIMS="$TMP/tp4-busy" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3 >/dev/null 2>&1
 rc=$?; set -e
