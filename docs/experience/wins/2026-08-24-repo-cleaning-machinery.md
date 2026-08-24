@@ -20,7 +20,10 @@ Ported (fit):
   appends sha256 to `archived/manifest.json`. `check_repo_hygiene.py`
   fails on any hash drift, missing sealed file, or unsealed file in the
   archive. Sealed entries never change; corrections land as new live
-  entries.
+  entries. The script's `--delete --retarget-to` mode handles the dsh
+  consolidation rule: a fully-superseded entry has its unique facts merged
+  into the owner, its inbound links retargeted, and is then deleted rather
+  than frozen.
 - **Residue sweeper** — `scripts/clean_repo.py`, plan-then-delete modeled
   on dsh `clean.ts`: dry-run default, `--apply` to delete, tracked-file
   assertion, realpath boundary, protected roots (`target/`, `models/`,
