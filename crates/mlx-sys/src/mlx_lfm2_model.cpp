@@ -489,13 +489,22 @@ struct Lfm2CompiledModel {
     // remaining risk; if compile fails, fall back to eager.
     std::vector<array> forward_verify(const std::vector<array>& inputs) {
         static bool eager = getenv("LFM2_EAGER_VERIFY") != nullptr;
-        if (eager) { return forward_impl(inputs); }
-        if (!compiled_verify) {
-            compiled_verify = mlx::core::compile(
-                [this](const std::vector<array>& ins) { return this->forward_impl(ins); },
-                true /* shapeless */);
+        std::vector<array> outputs;
+        if (eager) {
+            outputs = forward_impl(inputs);
+        } else {
+            if (!compiled_verify) {
+                compiled_verify = mlx::core::compile(
+                    [this](const std::vector<array>& ins) { return this->forward_impl(ins); },
+                    true /* shapeless */);
+            }
+            outputs = compiled_verify(inputs);
         }
-        return compiled_verify(inputs);
+        // Store outputs so drain_captured_hidden/conv_inputs can read the
+        // capture tail (forward_verify is the only forward in the DSpark path;
+        // without this, prev_outputs stays stale from prefill).
+        prev_outputs = outputs;
+        return outputs;
     }
 };
 
