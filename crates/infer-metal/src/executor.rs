@@ -20,6 +20,11 @@ use crate::{config, dflash, lfm2, mlx, model_source, qwen35};
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
 
+/// Sentinel for `dflash_skip_remaining`: permanently disable DSpark for this
+/// session (circuit breaker tripped). The skip decrement never reaches 0.
+#[cfg(feature = "metal")]
+const DFLASH_DISABLED: u32 = u32::MAX;
+
 /// Machine-derived **L3 (NVMe)** spill budget for the Metal disk tier
 /// (unified with the CUDA policy — same probe, same clamp).
 #[cfg(feature = "metal")]
@@ -1396,8 +1401,8 @@ impl RealMetalExecutor {
         // hurting (below 2 tokens/block → worse than no-draft 138 tok/s).
         let accepted = accepted_inputs as f32;
         slot.dflash_ewma_accept = slot.dflash_ewma_accept * 0.75 + accepted * 0.25;
-        // Consecutive-rejection circuit breaker: 3 blocks with zero draft
-        // acceptance → disable DSpark for the rest of the session.
+        // Consecutive-rejection circuit breaker: 3 blocks with ≤1 accepted
+        // token → disable DSpark for the rest of the session.
         if accepted_inputs <= 1 {
             slot.dflash_consecutive_rejects += 1;
             if slot.dflash_consecutive_rejects >= 3 {
@@ -1406,15 +1411,15 @@ impl RealMetalExecutor {
                     slot.dflash_consecutive_rejects,
                     row.slot
                 );
-                slot.dflash_skip_remaining = u32::MAX;
+                slot.dflash_skip_remaining = DFLASH_DISABLED;
             }
         } else {
             slot.dflash_consecutive_rejects = 0;
         }
         // Skip when acceptance is below the break-even point (~3.66 tokens/block
         // at 27ms/block vs 7.2ms/token no-draft). 3.5 gives a small margin.
-        // Don't override the permanent disable (u32::MAX) from the circuit breaker.
-        if slot.dflash_ewma_accept < 3.5 && slot.dflash_skip_remaining != u32::MAX {
+        // Don't override the permanent disable from the circuit breaker.
+        if slot.dflash_ewma_accept < 3.5 && slot.dflash_skip_remaining != DFLASH_DISABLED {
             slot.dflash_skip_remaining = 4;
         }
         slot.last_sampled = None;
