@@ -88,23 +88,6 @@ pub(crate) trait CompiledMetalModel {
         cache_pos: i32,
     ) -> anyhow::Result<mlx::MlxArray>;
     fn session_step(&self, token: &mlx::MlxArray, cache_pos: i32) -> anyhow::Result<mlx::MlxArray>;
-    // paged Metal decode path; wired with the DSpark draft
-    #[allow(dead_code)]
-    fn session_step_paged_bf16(
-        &self,
-        token: &mlx::MlxArray,
-        cache_pos: i32,
-        k: &[mlx::MlxArray],
-        v: &[mlx::MlxArray],
-    ) -> anyhow::Result<mlx::MlxArray>;
-    #[allow(dead_code)]
-    fn session_step_paged_int8(
-        &self,
-        token: &mlx::MlxArray,
-        cache_pos: i32,
-        k: &[mlx::MlxArray],
-        v: &[mlx::MlxArray],
-    ) -> anyhow::Result<mlx::MlxArray>;
 }
 
 /// Loaded weights for whichever architecture the config selects.
@@ -194,44 +177,6 @@ fn probe_pipeline_fast_path() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| eprintln!("[infer-metal] pipeline fast path LIVE (overlapped decode)"));
-}
-
-// Paged-prefix read path for single-token decode. The C++ session still owns
-// K/V writes; only SDPA's prefix read source changes. Default on after BF16
-// and INT8 reachability gates.
-#[cfg(feature = "metal")]
-pub(crate) static PAGED_KV_READ_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(feature = "metal")]
-pub(crate) static PAGED_KV_READ_FALLBACKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(feature = "metal")]
-#[allow(dead_code)] // paged Metal decode path; wired with the DSpark draft
-fn probe_paged_kv_read_hit() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| eprintln!("[infer-metal] paged KV read LIVE (single-token decode)"));
-    PAGED_KV_READ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(feature = "metal")]
-#[allow(dead_code)] // paged Metal decode path; wired with the DSpark draft
-fn probe_paged_kv_read_fallback() {
-    PAGED_KV_READ_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(feature = "metal")]
-#[must_use]
-pub fn paged_kv_read_hits() -> u64 {
-    PAGED_KV_READ_HITS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-#[cfg(feature = "metal")]
-#[must_use]
-pub fn paged_kv_read_fallbacks() -> u64 {
-    PAGED_KV_READ_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub enum MetalInflight {
@@ -1498,7 +1443,6 @@ impl RealMetalExecutor {
             )?;
             self.slots.insert(row.slot, state);
         }
-        let kv_cache_dtype = self.kv_cache_dtype;
         let slot = self
             .slots
             .get_mut(&row.slot)
@@ -1518,7 +1462,7 @@ impl RealMetalExecutor {
         slot.ensure_session_active(model)?;
         self.active_session_slot = Some(row.slot);
         let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
-        let logits = step_session_decode(model, slot, kv_cache_dtype, &token_arr)?;
+        let logits = model.session_step(&token_arr, usize_to_i32(slot.cache_len)?)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = slot.cache_len.saturating_add(1);
         slot.committed_len = slot.cache_len;
@@ -1696,20 +1640,6 @@ use kv_ssd::*;
 mod slot;
 #[cfg(feature = "metal")]
 use slot::*;
-
-#[cfg(feature = "metal")]
-fn step_session_decode(
-    model: &dyn CompiledMetalModel,
-    slot: &MetalSlotState,
-    _kv_cache_dtype: MetalKvCacheDtype,
-    token: &mlx::MlxArray,
-) -> anyhow::Result<mlx::MlxArray> {
-    let cache_pos = usize_to_i32(slot.cache_len)?;
-    // ponytail: non-paged path reads the live session caches; paged path reads
-    // stale kv_flat and was feeding attention garbage. Re-enable the paged path
-    // once kv_flat is drained before every paged read.
-    model.session_step(token, cache_pos)
-}
 
 /// Extend a rank-4 `[B, n_kv, seq, head_dim]` K/V cache array along the seq axis
 /// (index 2) to `new_capacity`, padding the new tail with zeros. The leading
@@ -2096,70 +2026,6 @@ mod tests {
         assert!(int8_kv_group_size(80).is_err());
     }
 
-    #[cfg(feature = "metal")]
-    #[test]
-    fn bf16_prefix_read_inputs_slices_live_prefix_pairs() {
-        let _guard = mlx_sys::mlx_guard();
-        let state = MetalSlotState::from_arrays(
-            0,
-            0,
-            3,
-            vec![
-                kv_bf16_array(5, 10),
-                kv_bf16_array(5, 20),
-                kv_bf16_array(5, 30),
-                kv_bf16_array(5, 40),
-            ],
-            vec![],
-        );
-
-        let (k_full, v_full) = state.bf16_prefix_read_inputs(3).unwrap();
-        assert_eq!(k_full.len(), 2);
-        assert_eq!(v_full.len(), 2);
-        assert_eq!(k_full[0].shape(), &[1, 1, 3, 2]);
-        assert_eq!(v_full[1].shape(), &[1, 1, 3, 2]);
-        assert_eq!(k_full[0].dtype(), mlx::Dtype::Bfloat16);
-
-        let k0 = mlx::as_dtype(&k_full[0], mlx::Dtype::Float32);
-        mlx::eval(&[&k0]);
-        assert_eq!(k0.as_slice_f32(), &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn int8_prefix_read_inputs_slices_q_scale_bias_triples() {
-        let _guard = mlx_sys::mlx_guard();
-        let state = MetalSlotState::from_arrays(
-            0,
-            0,
-            3,
-            vec![
-                kv_u32_array(5, 10),
-                kv_bf16_array(5, 20),
-                kv_bf16_array(5, 30),
-                kv_u32_array(5, 40),
-                kv_bf16_array(5, 50),
-                kv_bf16_array(5, 60),
-            ],
-            vec![],
-        );
-
-        let (k_full, v_full) = state.int8_prefix_read_inputs(3).unwrap();
-        assert_eq!(k_full.len(), 3);
-        assert_eq!(v_full.len(), 3);
-        assert_eq!(k_full[0].shape(), &[1, 1, 3, 2]);
-        assert_eq!(k_full[0].dtype(), mlx::Dtype::Uint32);
-        assert_eq!(k_full[1].dtype(), mlx::Dtype::Bfloat16);
-        assert_eq!(v_full[0].dtype(), mlx::Dtype::Uint32);
-
-        let k_scale = mlx::as_dtype(&k_full[1], mlx::Dtype::Float32);
-        mlx::eval(&[&k_scale]);
-        assert_eq!(
-            k_scale.as_slice_f32(),
-            &[20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
-        );
-    }
-
     /// Rank-4 `[1, 1, seq, 2]` f32 K/V array filled with `fill` — the minimal
     /// shape `slice_kv_tokens` accepts, no model load needed.
     #[cfg(feature = "metal")]
@@ -2178,15 +2044,6 @@ mod tests {
             .collect();
         let arr = mlx::MlxArray::from_slice_i32(&vals, &[1, 1, seq as i32, 2]);
         mlx::as_dtype(&arr, mlx::Dtype::Bfloat16)
-    }
-
-    #[cfg(feature = "metal")]
-    fn kv_u32_array(seq: usize, base: i32) -> mlx::MlxArray {
-        let vals: Vec<i32> = (0..seq)
-            .flat_map(|token| [base + token as i32 * 10, base + token as i32 * 10 + 1])
-            .collect();
-        let arr = mlx::MlxArray::from_slice_i32(&vals, &[1, 1, seq as i32, 2]);
-        mlx::as_dtype(&arr, mlx::Dtype::Uint32)
     }
 
     /// Tiny stand-in restore-state array carrying a distinguishable `fill`

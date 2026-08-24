@@ -581,24 +581,6 @@ unsafe extern "C" {
         cache_pos: i32,
         out_logits: *mut *mut mlx_array,
     ) -> i32;
-    /// Paged single-step session decode. BF16 sessions accept pre-gathered
-    /// per-layer prefix K/V tensors. INT8 sessions accept flat per-layer
-    /// q/scale/bias triples for K and V. The session still writes the fresh
-    /// token into its contiguous cache for compatibility. Passing zero layers is
-    /// a legacy fallthrough; batch/verify paths keep separate entrypoints.
-    #[allow(clippy::too_many_arguments)]
-    pub fn qwen35_compiled_step_session_paged(
-        model: *mut std::ffi::c_void,
-        token_id: *mut mlx_array,
-        cache_pos: i32,
-        k_full_per_layer: *mut *mut mlx_array,
-        v_full_per_layer: *mut *mut mlx_array,
-        n_full_layers: i32,
-        k_int8_full_per_layer: *mut *mut mlx_array,
-        v_int8_full_per_layer: *mut *mut mlx_array,
-        n_int8_full_layers: i32,
-        out_logits: *mut *mut mlx_array,
-    ) -> i32;
     pub fn qwen35_compiled_prefill_session(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,
@@ -780,15 +762,6 @@ unsafe extern "C" {
         model: *mut std::ffi::c_void,
         token_id: *mut mlx_array,
         cache_pos: i32,
-        out_logits: *mut *mut mlx_array,
-    ) -> i32;
-    pub fn lfm2_compiled_step_session_paged(
-        model: *mut std::ffi::c_void,
-        token_id: *mut mlx_array,
-        cache_pos: i32,
-        k_full_per_layer: *mut *mut mlx_array,
-        v_full_per_layer: *mut *mut mlx_array,
-        n_layers: i32,
         out_logits: *mut *mut mlx_array,
     ) -> i32;
 
