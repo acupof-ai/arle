@@ -49,7 +49,27 @@ vs 0.860 on 200 items is one item. At c=1 the FP8 checkpoint is 1.34x NVFP4
 (59.5 vs 44.4) although it reads 1.8x the expert bytes; the M=1 lane is the
 W4AFP8 GEMV kernel (`moe/dsv4.rs` `dsv4_moe_forward_w4a16` with INT4 dequant)
 versus the FP8 GEMV lane, so the NVFP4 decode lane is kernel-bound, not
-bandwidth-bound. The two converge by c=8 (27.0 vs 25.7).
+bandwidth-bound.
+
+FP8 c=8 needs a slot budget the default flags do not give it. The per-slot
+attention state at the default `max_total_tokens` 1048576 is 6982 MB
+(`[dsv4-slot-ledger]`: compressor 5567, indexer 1344, dsa_rotated 42,
+fused_wqkv 23, sw_window 5), so the FP8 checkpoint (72 GB weights/rank) is
+clamped to **`num_slots=1`** and the matrix's "c=8" row was 8 requests
+serialized through one slot. With `--max-total-tokens 131072` the slot is
+1049 MB; the planner then admits 18 slots and c=8 dies with CUDA OOM at
+step 4432 on every rank (no reserve for prefill transients), and with
+`--max-running-requests 8` on top:
+
+| FP8, 128K total tokens, 8 slots | c=1 | c=8 |
+|---|---:|---:|
+| decode tok/s per request | 60.0 | 21.9 |
+| TTFT p50 ms | 8197 | 1996 |
+| MMLU (200) | 0.860 (172/200) | — |
+
+Prefill at c=1 is 28568 tokens in 8.2 s = 3.5k tok/s per request at TP=4
+(server-side prefill busy: 485,660 tokens in 135 s = 3.6k tok/s); NVFP4 is the
+same (TTFT 7870-7926 ms), so the expert format does not touch prefill.
 
 ## Problems
 
@@ -73,13 +93,35 @@ relay write payload: Broken pipe`. The real message is in the worker stdout,
 interleaved four ways because all four ranks write it concurrently.
 
 **The FP8 arm's 26.5 tok/s was a measurement artifact.** `16857e541` made an
-allocating capture fatal; the FP8 checkpoint still records 86 alloc nodes (2
-per layer: the O-LoRA staging resizes per layer), so every capture was
-rejected, and the matrix ran with `ARLE_GRAPH_NODE_CENSUS=1`, so every decode
-step re-attempted the capture and walked the node census. That is 2x slower
-than plain eager (26.5 vs 51.9). `ebb1dd89b` restores the warn; the re-measure
-above is the truth. DeepEP and DeepGEMM were not a factor: both checkpoints
-ran the default `allreduce` transport and the M=1 GEMV lanes.
+allocating capture fatal; the FP8 checkpoint recorded 86 alloc nodes per
+capture, so every capture was rejected, and the matrix ran with
+`ARLE_GRAPH_NODE_CENSUS=1`, so every decode step re-attempted the capture and
+walked the node census. That is 2x slower than plain eager (26.5 vs 51.9).
+`ebb1dd89b` restores the warn; the re-measure above is the truth. DeepEP and
+DeepGEMM were not a factor: both checkpoints ran the default `allreduce`
+transport and the M=1 GEMV lanes.
+
+**The 86 alloc nodes: the FP8 checkpoint's `wo_a` is dense BF16.** The first
+explanation written here ("the O-LoRA staging resizes per layer") was a guess;
+a probe on that resize branch fired 0 times while the capture still recorded
+86. The node census places each pair (`ALLOC 8192` + `ALLOC 2048`) between
+`dsv4_update_window_cache_start_pos_ptr_kernel` and
+`dsv4_oproj_group_gather_kernel` followed by a cuBLAS `nvjet` GEMM: the
+per-group cuBLAS lane `dsv4_wo_a_grouped_linear`, which the FP8
+re-serialization forces (its low-rank `wo_a` is left unquantized, so there is
+no DeepGEMM cache) and which at TP=4 < `o_groups`=8 allocated its `[4096,1]`
+gather and `[1024,1]` scatter scratch on every call. NVFP4's block-scaled
+`wo_a` takes the DeepGEMM lane, which already staged through the fixed
+buffers. `7fa06218a` shares that staging with the cuBLAS lane:
+
+| build | FP8 captures | FP8 alloc nodes | FP8 c=1 tok/s | NVFP4 alloc nodes | NVFP4 c=1 tok/s |
+|---|---:|---:|---:|---:|---:|
+| `a4bd9a8a2` | 72 | 86 | 60.3 | 0 | 45.2 |
+| `7fa06218a` | 72 | **0** | 60.4 | 0 | 45.1 |
+
+Decode is unchanged, as expected: the allocations were legal under
+`AUTO_FREE_ON_LAUNCH`; the fix is what lets the strict alloc audit hold across
+the family.
 
 ## Learnings
 
@@ -90,6 +132,17 @@ kernel, which is the lever if NVFP4 must serve at c=1.
 
 **Never bench with `ARLE_GRAPH_NODE_CENSUS=1` armed.** It is a diagnostic that
 runs on every capture attempt; with rejected captures that is every step.
+
+**The census is the only evidence for an alloc node's origin.** Two
+same-sized buffers (`normed` [4096,1] and the O-LoRA `latent` [1024,1]) were
+first "identified" from sizes alone and moved to graph buffers (`6469d1668`,
+reverted): node count and alloc count did not move, because the captured c=1
+lane is the slot lane, whose activations were already persistent. Read the
+kernel neighbours in the census before touching code.
+
+**The DSv4 slot budget has no reserve for prefill transients.** 18 slots of
+1049 MB filled the 19.7 GB budget and c=8 OOMed mid-prefill. Until the planner
+reserves the prefill working set, `--max-running-requests` is the guard.
 
 **A matrix arm that cannot load is worth running anyway.** The four failures
 took under two minutes each and produced the finding: a support-matrix claim
@@ -102,13 +155,15 @@ the FP8 checkpoint of the same model, on the same code path, still allocated
 quantization axis, and the run that would have caught it was the one this
 matrix ran.
 
-Open: the O-LoRA staging resize thrash on the FP8 path (86 alloc nodes).
-`decode_proj_deepgemm_raw` checks `input_len >= m * k && out_len >= m *
-cache.rows`, so `in_len`/`out_len` are bounds; a grow-only buffer sized to the
-largest layer removes the per-layer resize.
+Open: the slot budget's missing prefill-transient reserve (`budget.rs:600`),
+and the compressor's BF16 full-history retention (5.5 GB/slot at 1M): decode
+already attends the FP8-packed rows in the paged pool, but
+`flashmla_prefill_attention` reads the BF16 history, so a ring there is a
+prefill numerics change behind the needle gate, not host bookkeeping.
 
 ## Artifacts
 
 - `/host/arle-ops/runs/c1g/matrix/matrix.tsv`, `bench-*.json`, `mmlu-*/`
 - `/host/arle-ops/runs/c1g/kvprobe/serve-{fp8,int8}.log`
 - `/host/arle-ops/runs/c1g/recheck/bench-fp8-nocensus-{graph,eager}*`, `serve-{graph,eager}.log`
+- `/host/arle-ops/runs/c1g/c8/bench-fp8-mtt131072-mrr8*` (c=1,8), `eval8/mmlu/` (MMLU 200), `census2/rank0.txt` (node census), `fix/bench-{fp8,nvfp4}*` + `serve-{fp8,nvfp4}.log` (`7fa06218a`)
