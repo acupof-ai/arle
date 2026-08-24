@@ -1,4 +1,4 @@
-//! Mirrors `gemma4.rs`: a thin Rust shell over the C++ MLX bridge
+//! Thin Rust shell over the C++ MLX bridge
 //! (`mlx_deepseek_ocr_model.cpp`). The model rides the shared autoregressive
 //! `Engine` through `DiffusionBlockModel` + `BufferedDiffusionExecutor`
 //! (`canvas_length=1`, `max_denoising_steps=1`). Decoder/projector weights are

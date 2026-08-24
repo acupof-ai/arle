@@ -567,7 +567,7 @@ pub(crate) struct ModelDownloadArgs {
 #[derive(Debug, Clone, PartialEq, Eq, ClapArgs)]
 #[command(
     group(ArgGroup::new("run_input").args(["prompt", "stdin"])),
-    after_help = "Output:\n  Plain text is written to stdout by default.\n  `--json` emits one machine-readable document with model, backend, usage, and tool-call stats.\n\nExamples:\n  arle --model-path /path/to/model run\n  arle --model-path /path/to/model run --prompt \"Summarize this repo\"\n  arle --model-path /path/to/gemma4 run --prompt \"What is in this image?\" --image https://example.com/cat.jpg\n  arle --model-path /path/to/model run --stdin --json < prompt.txt\n  arle --model-path /path/to/model run --no-tools --prompt \"No tool execution\""
+    after_help = "Output:\n  Plain text is written to stdout by default.\n  `--json` emits one machine-readable document with model, backend, usage, and tool-call stats.\n\nExamples:\n  arle --model-path /path/to/model run\n  arle --model-path /path/to/model run --prompt \"Summarize this repo\"\n  arle --model-path /path/to/model run --stdin --json < prompt.txt\n  arle --model-path /path/to/model run --no-tools --prompt \"No tool execution\""
 )]
 pub(crate) struct RunArgs {
     /// Run a single prompt and exit.
