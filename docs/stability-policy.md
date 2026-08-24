@@ -78,7 +78,7 @@ surfaces fall under each tier.
 
 ### Experimental
 
-- fast-moving quantization paths (TurboQuant KV, W2, new quant formats)
+- fast-moving quantization paths (W2, new quant formats)
 - speculative decoding framework on CUDA (CPU stubs only today)
 - tensor-parallel scaffolding (sharding math shipped, NCCL comm not wired)
 - undocumented flags or undocumented environment variables

@@ -58,8 +58,6 @@ Options:
   --moe-backend NAME DSv4 MoE backend (default: $MOE_BACKEND).
                     Accepts: deepep | native-deepep | allreduce.
                     native-deepep requires --deepep-dir + nvcc at build time.
-  --expert-backend NAME
-                    DSv4 expert backend (default: $EXPERT_BACKEND)
   --deepep-dir DIR   path to deepseek-ai/DeepEP source tree; required when
                     --moe-backend=native-deepep unless found under standard
                     pod paths. Supports both csrc/kernels/api.cuh and
@@ -118,7 +116,6 @@ parse_args() {
             --mtp-draft-tokens) need_value "$@"; MTP_DRAFT_TOKENS="$2"; shift 2 ;;
             --mtp-draft-topk) need_value "$@"; MTP_DRAFT_TOPK="$2"; shift 2 ;;
             --moe-backend) need_value "$@"; MOE_BACKEND="$2"; shift 2 ;;
-            --expert-backend) need_value "$@"; EXPERT_BACKEND="$2"; shift 2 ;;
             --deepep-dir) need_value "$@"; DEEPEP_DIR="$(abs_path "$2")"; shift 2 ;;
             --prompt) need_value "$@"; PROMPT="$2"; shift 2 ;;
             --nsys-delay-seconds) need_value "$@"; NSYS_DELAY_SECONDS="$2"; shift 2 ;;

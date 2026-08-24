@@ -8,7 +8,6 @@ Usage:
   python scripts/quantize.py --format fp8 --bf16 <dir> --ref <fp8-ref> --out <dir>
   python scripts/quantize.py --format w8a16 --bf16 <dir> [--ref <w8a16-ref>] --out <dir>
   python scripts/quantize.py --format w4a8-marlin --src <dir> --dst <dir>
-  python scripts/quantize.py --format turboquant --model-path <dir> --output-path <dir> --bits 3
 """
 
 from __future__ import annotations
@@ -450,136 +449,6 @@ class W4A8MarlinQuantizer(Quantizer):
 
 
 # ---------------------------------------------------------------------------
-# TurboQuant (Hadamard + Lloyd-Max)
-# ---------------------------------------------------------------------------
-
-def _generate_signs(dim: int, seed: int):
-    import numpy as np
-    rng = np.random.default_rng(seed)
-    return rng.choice([-1, 1], size=dim).astype(np.float32)
-
-
-def _fwht_numpy(x):
-    """Fast Walsh-Hadamard Transform along last axis (normalized)."""
-    import math
-    n = x.shape[-1]
-    assert n & (n - 1) == 0, f"FWHT requires power-of-2 dim, got {n}"
-    h = 1
-    while h < n:
-        for i in range(0, n, h * 2):
-            for j in range(i, i + h):
-                a = x[..., j].copy()
-                b = x[..., j + h].copy()
-                x[..., j] = a + b
-                x[..., j + h] = a - b
-        h *= 2
-    x /= math.sqrt(n)
-    return x
-
-
-def _lloyd_max_codebook(dim: int, bits: int, max_iters: int = 200):
-    """Lloyd-Max codebook for Beta((d-1)/2, (d-1)/2) on [-1,1]."""
-    import numpy as np
-    from scipy.integrate import quad
-
-    alpha = (dim - 1) / 2.0
-    num_levels = 1 << bits
-
-    def pdf(x):
-        if abs(x) >= 1.0:
-            return 0.0
-        return (1 - x**2) ** (alpha - 1)
-
-    centroids = np.array([-1.0 + (2.0 * (i + 0.5)) / num_levels for i in range(num_levels)])
-    boundaries = np.zeros(num_levels + 1)
-    boundaries[0] = -1.0
-    boundaries[num_levels] = 1.0
-
-    for _ in range(max_iters):
-        for i in range(1, num_levels):
-            boundaries[i] = (centroids[i - 1] + centroids[i]) / 2.0
-        for i in range(num_levels):
-            a, b = boundaries[i], boundaries[i + 1]
-            if b - a < 1e-15:
-                continue
-            m0, _ = quad(pdf, a, b)
-            m1, _ = quad(lambda x: x * pdf(x), a, b)
-            if m0 > 1e-30:
-                centroids[i] = m1 / m0
-
-    return centroids.astype(np.float32), boundaries.astype(np.float32)
-
-
-def turboquant_tensor(
-    w, bits: int, group_size: int, centroids, boundaries, seed: int
-):
-    import numpy as np
-    N, K = w.shape
-    signs = _generate_signs(K, seed)
-    w_rot = w * signs[None, :]
-    w_rot = _fwht_numpy(w_rot)
-    w_rot = w_rot.reshape(N, K // group_size, group_size)
-    amax = np.abs(w_rot).max(axis=-1, keepdims=True)
-    amax = np.maximum(amax, 1e-8)
-    w_norm = w_rot / amax
-    idx = np.digitize(w_norm, boundaries)
-    idx = np.clip(idx, 0, len(centroids) - 1)
-    deq = centroids[idx] * amax
-    deq = deq.reshape(N, K)
-    deq = _fwht_numpy(deq)
-    deq = deq * signs[None, :]
-    packed = np.packbits(idx.reshape(-1).astype(np.uint8), bitorder="little")
-    packed = packed.reshape(N, -1)
-    scales = amax.squeeze(-1).astype(np.float16)
-    return packed, scales, signs.astype(np.int8)
-
-
-TURBOQUANT_LINEAR_SUFFIXES = (
-    ".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight",
-    ".gate_proj.weight", ".up_proj.weight", ".down_proj.weight",
-)
-
-
-class TurboQuantQuantizer(Quantizer):
-    name = "turboquant"
-
-    def __init__(self, bits: int = 3, group_size: int = 128):
-        self.bits = bits
-        self.group_size = group_size
-        self.centroids, self.boundaries = _lloyd_max_codebook(group_size, bits)
-
-    def can_quantize(self, weight: torch.Tensor) -> bool:
-        return weight.dim() == 2 and weight.shape[1] % self.group_size == 0
-
-    def quantize(self, weight: torch.Tensor) -> dict[str, torch.Tensor]:
-        packed, scales, signs = turboquant_tensor(
-            weight.float().numpy(), self.bits, self.group_size,
-            self.centroids, self.boundaries, 0,
-        )
-        return {
-            ".tq_packed": torch.from_numpy(packed),
-            ".tq_scales": torch.from_numpy(scales),
-            ".tq_signs": torch.from_numpy(signs),
-        }
-
-    def scope_names(
-        self, weight_map: dict[str, str], ref_dir: Path | None
-    ) -> set[str]:
-        return {
-            k for k in weight_map
-            if any(k.endswith(s) for s in TURBOQUANT_LINEAR_SUFFIXES)
-        }
-
-    def quant_config(self) -> dict:
-        return {
-            "quant_type": "turboquant",
-            "bits": self.bits,
-            "group_size": self.group_size,
-            "rotation": "hadamard",
-        }
-
-
-# ---------------------------------------------------------------------------
 # Registry + CLI
 # ---------------------------------------------------------------------------
 
@@ -587,7 +456,6 @@ QUANTIZERS: dict[str, type[Quantizer]] = {
     "fp8": FP8BlockCastQuantizer,
     "w8a16": W8A16Quantizer,
     "w4a8-marlin": W4A8MarlinQuantizer,
-    "turboquant": TurboQuantQuantizer,
 }
 
 
@@ -599,20 +467,15 @@ def main() -> None:
     # Generic checkpoint args
     ap.add_argument("--bf16", help="source BF16 checkpoint dir (fp8, w8a16)")
     ap.add_argument("--src", help="source checkpoint dir (w4a8-marlin)")
-    ap.add_argument("--model-path", help="source checkpoint dir (turboquant)")
     ap.add_argument("--ref", help="reference quantized checkpoint (fp8, w8a16 scope)")
     ap.add_argument("--out", help="output dir (fp8, w8a16)")
     ap.add_argument("--dst", help="output dir (w4a8-marlin)")
-    ap.add_argument("--output-path", help="output dir (turboquant)")
     ap.add_argument("--group-size", type=int, default=128)
-    ap.add_argument("--bits", type=int, default=3, choices=[2, 3, 4])
     args = ap.parse_args()
 
     qcls = QUANTIZERS[args.format]
     if args.format in ("w8a16",):
         quantizer = qcls(group_size=args.group_size)
-    elif args.format == "turboquant":
-        quantizer = qcls(bits=args.bits, group_size=args.group_size)
     else:
         quantizer = qcls()
 
@@ -620,8 +483,8 @@ def main() -> None:
         quantizer.selfcheck()
         return
 
-    src = args.bf16 or args.src or args.model_path
-    out = args.out or args.dst or args.output_path
+    src = args.bf16 or args.src
+    out = args.out or args.dst
     if not (src and out):
         ap.error(f"--format {args.format} requires source + output args")
 
