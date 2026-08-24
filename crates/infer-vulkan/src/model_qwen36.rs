@@ -42,29 +42,6 @@ pub const QWEN36_MOE_OPS: &[Qwen36MoeOp] = &[
     Qwen36MoeOp::ExpertWeightedSum,
 ];
 
-pub fn qwen36_moe_launcher_kind(op: Qwen36MoeOp) -> Qwen36MoeLauncherKind {
-    match op {
-        Qwen36MoeOp::RouterGemv => Qwen36MoeLauncherKind::RouterGemv,
-        Qwen36MoeOp::TopK | Qwen36MoeOp::NormalizeTopK => Qwen36MoeLauncherKind::HostTopK,
-        Qwen36MoeOp::RoutedExpertGate
-        | Qwen36MoeOp::RoutedExpertUp
-        | Qwen36MoeOp::RoutedExpertDown
-        | Qwen36MoeOp::SharedExpertGate
-        | Qwen36MoeOp::SharedExpertUp
-        | Qwen36MoeOp::SharedExpertDown => Qwen36MoeLauncherKind::QuantizedExpertGemv,
-        Qwen36MoeOp::SwiGlu => Qwen36MoeLauncherKind::SwiGlu,
-        Qwen36MoeOp::ExpertWeightedSum => Qwen36MoeLauncherKind::ExpertWeightedAdd,
-    }
-}
-
-pub fn qwen36_moe_launcher_sequence() -> Vec<Qwen36MoeLauncherKind> {
-    QWEN36_MOE_OPS
-        .iter()
-        .copied()
-        .map(qwen36_moe_launcher_kind)
-        .collect()
-}
-
 #[cfg(feature = "vulkan")]
 pub fn qwen36_kernel_for_launcher(kind: Qwen36MoeLauncherKind) -> Option<vulkan_kernels::Kernel> {
     Some(match kind {
@@ -145,12 +122,6 @@ impl Qwen36MoeShape {
             shared_expert_intermediate_size: config.shared_expert_intermediate_size,
         })
     }
-}
-
-pub fn qwen36_sparse_layers(config: &qwen35_spec::Qwen35Config) -> Vec<usize> {
-    (0..config.num_hidden_layers)
-        .filter(|&layer_idx| config.is_moe_layer(layer_idx))
-        .collect()
 }
 
 pub const QWEN36_MUTATED_MOE_BUFFERS: &[&str] = &[
@@ -292,19 +263,6 @@ mod tests {
         assert_eq!(QWEN36_MUTATED_MOE_BUFFERS.len(), 9);
         assert!(QWEN36_MUTATED_MOE_BUFFERS.contains(&"scratch.router_logits"));
         assert!(QWEN36_MUTATED_MOE_BUFFERS.contains(&"scratch.expert_mix"));
-    }
-
-    #[test]
-    fn moe_launcher_sequence_marks_host_topk_and_device_experts() {
-        let kinds = qwen36_moe_launcher_sequence();
-        assert_eq!(kinds[0], Qwen36MoeLauncherKind::RouterGemv);
-        assert!(kinds.contains(&Qwen36MoeLauncherKind::HostTopK));
-        assert!(kinds.contains(&Qwen36MoeLauncherKind::QuantizedExpertGemv));
-        assert!(kinds.contains(&Qwen36MoeLauncherKind::SwiGlu));
-        assert_eq!(
-            kinds.last(),
-            Some(&Qwen36MoeLauncherKind::ExpertWeightedAdd)
-        );
     }
 
     #[test]

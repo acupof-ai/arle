@@ -356,17 +356,6 @@ extern "C" CUresult dsv4_deepgemm_swiglu_quantize_w13_cuda(
       intermediate_dim, scale_stride_m, scale_k_blocks, limit);
   return (CUresult)cudaGetLastError();
 }
-
-extern "C" CUresult dsv4_deepgemm_unpad_grouped_bf16_cuda(
-    const uint16_t* grouped,
-    uint16_t* compact,
-    const int32_t* active_experts,
-    const int32_t* active_offsets,
-    const int32_t* active_counts,
-    int active_count,
-    int max_m,
-    int hidden_dim,
-    CUstream stream) {
   if (active_count < 0 || max_m <= 0 || hidden_dim <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }

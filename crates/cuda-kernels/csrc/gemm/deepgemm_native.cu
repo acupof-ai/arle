@@ -2263,28 +2263,6 @@ extern "C" CUresult dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
     return CUDA_ERROR_UNKNOWN;
   }
 }
-
-extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
-    const unsigned char* q,
-    const unsigned char* kv_cache,
-    const float* kv_cache_scales,
-    const float* weights,
-    const int* context_lens,
-    const int* block_table,
-    const int* schedule_meta,
-    float* logits,
-    int batch_size,
-    int next_n,
-    int num_heads,
-    int head_dim,
-    int num_kv_blocks,
-    int block_kv,
-    int max_context_len,
-    int logits_stride,
-    int block_table_stride,
-    int kv_cache_stride_bytes,
-    int num_sms,
-    CUstream stream) {
   try {
     return launch_sm90_fp8_paged_mqa_logits(
         q, kv_cache, kv_cache_scales, weights, context_lens, block_table, schedule_meta,

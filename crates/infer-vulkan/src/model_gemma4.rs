@@ -134,14 +134,6 @@ pub fn gemma4_launcher_sequence(config: &gemma_spec::Gemma4TextConfig) -> Vec<Ge
         .collect()
 }
 
-pub fn gemma4_effective_norm_weight(raw_weight: f32) -> f32 {
-    if GEMMA4_RMS_NORM_ADDS_ONE {
-        raw_weight + 1.0
-    } else {
-        raw_weight
-    }
-}
-
 #[cfg(feature = "vulkan")]
 pub fn gemma4_kernel_for_launcher(kind: Gemma4LauncherKind) -> vulkan_kernels::Kernel {
     match kind {

@@ -78,38 +78,6 @@ const MODEL_WEIGHTS_FILENAME: &str = "model.safetensors";
 const ADAPTER_WEIGHTS_FILENAME: &str = "adapter_model.safetensors";
 const ADAPTER_CONFIG_FILENAME: &str = "adapter_config.json";
 
-pub fn save_step_checkpoint<F>(
-    spec: Qwen35StepCheckpoint<'_>,
-    save_weights: F,
-) -> Result<PathBuf, Qwen35CheckpointError>
-where
-    F: FnOnce(&Path) -> Result<(), Qwen35CheckpointError>,
-{
-    save_step_checkpoint_with_artifact(spec, MODEL_WEIGHTS_FILENAME, save_weights)
-}
-
-fn save_step_checkpoint_with_artifact<F>(
-    spec: Qwen35StepCheckpoint<'_>,
-    artifact_filename: &'static str,
-    save_artifact: F,
-) -> Result<PathBuf, Qwen35CheckpointError>
-where
-    F: FnOnce(&Path) -> Result<(), Qwen35CheckpointError>,
-{
-    let step_basename = format!("step_{:06}", spec.step);
-    save_named_checkpoint_with_artifact(
-        Qwen35NamedCheckpoint {
-            out_dir: spec.out_dir,
-            dirname: &step_basename,
-            tokenizer_path: spec.tokenizer_path,
-            config_json: spec.config_json,
-            generation_config: spec.generation_config,
-        },
-        artifact_filename,
-        save_artifact,
-    )
-}
-
 pub fn save_named_qwen35_student_checkpoint<'a>(
     spec: Qwen35NamedCheckpoint<'_>,
     student: &Qwen35Model,

@@ -781,17 +781,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn dsv4_deepgemm_unpad_grouped_bf16_cuda(
-        grouped: *const Half,
-        compact: *mut Half,
-        active_experts: *const i32,
-        active_offsets: *const i32,
-        active_counts: *const i32,
-        active_count: i32,
-        max_m: i32,
-        hidden_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn dsv4_deepgemm_native_preflight_cuda(
         out: *mut std::ffi::c_char,
@@ -911,28 +900,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
-        q: *const u8,
-        kv_cache: *const u8,
-        kv_cache_scales: *const f32,
-        weights: *const f32,
-        context_lens: *const i32,
-        block_table: *const i32,
-        schedule_meta: *const i32,
-        logits: *mut f32,
-        batch_size: i32,
-        next_n: i32,
-        num_heads: i32,
-        head_dim: i32,
-        num_kv_blocks: i32,
-        block_kv: i32,
-        max_context_len: i32,
-        logits_stride: i32,
-        block_table_stride: i32,
-        kv_cache_stride_bytes: i32,
-        num_sms: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
         q: *const u8,

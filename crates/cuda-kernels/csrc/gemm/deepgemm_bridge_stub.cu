@@ -161,28 +161,6 @@ extern "C" CUresult dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
     CUstream) {
   return CUDA_ERROR_NOT_SUPPORTED;
 }
-
-extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
-    const unsigned char*,
-    const unsigned char*,
-    const float*,
-    const float*,
-    const int*,
-    const int*,
-    const int*,
-    float*,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    CUstream) {
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 

@@ -2,18 +2,6 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub fn dsv4_swiglu_clamped_routes_cuda(
-        gate: *const Half,
-        up: *const Half,
-        out: *mut Half,
-        route_meta: *const i32,
-        num_routes: i32,
-        hidden_dim: i32,
-        local_expert_start: i32,
-        experts_per_rank: i32,
-        limit: f32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn dsv4_scale_route_outputs_by_meta_cuda(
         expert_out: *const Half,
@@ -184,23 +172,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn dsv4_pack_local_experts_with_slots_and_indices_cuda(
-        hidden: *const Half,
-        indices: *const i32,
-        weights: *const f32,
-        offsets: *const i32,
-        cursors: *mut i32,
-        packed_hidden: *mut Half,
-        packed_route_slot: *mut i32,
-        packed_weight: *mut f32,
-        packed_m_indices: *mut i32,
-        num_tokens: i32,
-        hidden_dim: i32,
-        topk: i32,
-        local_expert_start: i32,
-        experts_per_rank: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn dsv4_init_padded_route_slots_cuda(
         packed_token: *mut i32,
