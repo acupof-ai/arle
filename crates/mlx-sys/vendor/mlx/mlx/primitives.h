@@ -1694,6 +1694,8 @@ class GatherQMM : public UnaryPrimitive {
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
 
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
   DEFINE_VMAP()
   DEFINE_GRADS()
   DEFINE_NAME(GatherQMM)
@@ -2038,6 +2040,8 @@ class Slice : public UnaryPrimitive {
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
 
   DEFINE_VMAP()
   DEFINE_GRADS()

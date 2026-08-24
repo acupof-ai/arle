@@ -3687,6 +3687,20 @@ bool GatherQMM::is_equivalent(const Primitive& other) const {
       mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_;
 }
 
+std::vector<Shape> GatherQMM::output_shapes(const std::vector<array>& inputs) {
+  // Mirrors the shape computation in gather_qmm() (ops.cpp):
+  //   out = broadcast(lhs_indices, rhs_indices) + [x.shape(-2), N]
+  // where N = transpose ? w.shape(-2) : w.shape(-1) * 32 / bits.
+  const array& x = inputs[0];
+  const array& w = inputs[1];
+  const array& lhs_indices = inputs[inputs.size() - 2];
+  int N = transpose_ ? w.shape(-2) : w.shape(-1) * 32 / bits_;
+  Shape out_shape = lhs_indices.shape();
+  out_shape.push_back(x.shape(-2));
+  out_shape.push_back(N);
+  return {out_shape};
+}
+
 std::pair<std::vector<array>, std::vector<int>> RandomBits::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
@@ -4931,6 +4945,31 @@ bool DynamicSlice::is_equivalent(const Primitive& other) const {
 
 std::vector<Shape> DynamicSlice::output_shapes(const std::vector<array>&) {
   return {slice_size_};
+}
+
+std::vector<Shape> Slice::output_shapes(const std::vector<array>& inputs) {
+  // Mirrors normalize_slice() in ops.cpp — needed so shapeless=true compile
+  // can infer the output shape without evaluating the primitive.
+  const auto& in_shape = inputs[0].shape();
+  Shape out_shape(in_shape.size());
+  for (size_t i = 0; i < in_shape.size(); ++i) {
+    auto n = in_shape[i];
+    auto s = start_indices_[i] < 0 ? start_indices_[i] + n : start_indices_[i];
+    auto e = end_indices_[i] < 0 ? end_indices_[i] + n : end_indices_[i];
+    if (strides_[i] < 0) {
+      auto st = std::min(s, n - 1);
+      auto ed = e > -1 ? e : -1;
+      ed = ed > st ? st : ed;
+      auto str = -strides_[i];
+      out_shape[i] = (st - ed + str - 1) / str;
+    } else {
+      auto st = std::max(static_cast<ShapeElem>(0), std::min(s, n));
+      auto ed = std::max(static_cast<ShapeElem>(0), std::min(e, n));
+      ed = ed < st ? st : ed;
+      out_shape[i] = (ed - st + strides_[i] - 1) / strides_[i];
+    }
+  }
+  return {out_shape};
 }
 
 std::pair<std::vector<array>, std::vector<int>> DynamicSliceUpdate::vmap(

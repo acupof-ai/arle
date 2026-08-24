@@ -1261,8 +1261,7 @@ pub(crate) fn prepare_draft_block(
         // (9) while only verifying tokens the model is confident about.
         let actual_bs = if let Some(conf_head) = &runtime.confidence_head {
             let all_latents = mlx::concatenate_axis(&latent_arrays, 0);
-            let conf_input =
-                mlx::concatenate_axis(&[draft_hidden, all_latents], -1);
+            let conf_input = mlx::concatenate_axis(&[draft_hidden, all_latents], -1);
             let conf_logits = mlx::add(
                 &mlx::matmul(&conf_input, &conf_head.weight),
                 &conf_head.bias,
