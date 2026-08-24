@@ -685,18 +685,21 @@ impl Qwen35Model {
         let tail_t0 = Instant::now();
         let norm = loader.load_vec(&ctx, m.norm_tensor_name())?;
         // Norm convention auto-detect: Qwen3.5/3.6 stores `weight - 1` (RMS ≈ 0),
-        // standard RMSNorm stores `weight` (RMS ≈ 1). The kernel applies `1+w`,
-        // so a weight RMS ≈ 1 means the model expects the standard convention.
-        {
-            let host = norm.to_host(&ctx)?;
+        // standard RMSNorm stores `weight` (RMS ≈ 1). Check the first in-layer
+        // norm — the final norm's weights are near 1 either way, so it can't
+        // distinguish the conventions.
+        if let Some(first_layer) = layers.first() {
+            let host = first_layer.input_layernorm.to_host(&ctx)?;
             let rms = (host.iter().map(|&x| x * x).sum::<f32>() / host.len() as f32).sqrt();
             if rms > 0.5 {
                 log::warn!(
-                    "Qwen3.5 norm weight RMS={rms:.4} — looks like standard RMSNorm (w), \
+                    "Qwen3.5 in-layer norm RMS={rms:.4} — looks like standard RMSNorm (w), \
                      but the kernel applies (1+w). Check the model's norm convention."
                 );
             } else {
-                log::info!("Qwen3.5 norm weight RMS={rms:.4} — (1+w) offset convention confirmed");
+                log::info!(
+                    "Qwen3.5 in-layer norm RMS={rms:.4} — (1+w) offset convention confirmed"
+                );
             }
         }
 
