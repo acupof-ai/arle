@@ -24,7 +24,7 @@ with concrete evidence.
 |---|---|---|---|---|
 | **KV cache** | BF16 | production | `--kv-cache-dtype bf16` | Reference fallback. CUDA-paged + Metal. The only value DSv4 accepts. |
 | KV cache | INT8 | production (Metal default + CUDA) | `--kv-cache-dtype int8`; Metal `auto` resolves to int8 | Metal stores full-attention K/V as MLX affine 8-bit packed triples (`uint32 data + bf16 scale/bias`, group 128/64/32 by head_dim). CUDA uses per-(token, head) scales for K and V (/127); decode on `paged_attention_quantized_fa3.cu`. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
-| KV cache | FP8 E4M3 | production (CUDA) | `--kv-cache-dtype fp8` | Per-(token, head) scales for K and V (/448). Same code shape as INT8 modulo quant range. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
+| KV cache | FP8 E4M3 | production (CUDA, opt-in) | `--kv-cache-dtype fp8` | Per-(token, head) scales for K and V (/448). Same code shape as INT8 modulo quant range. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
 | KV cache | TurboQuant TQ4 | deferred (CUDA) | `--kv-cache-dtype tq4` (the clap enum accepts `auto\|bf16\|int8\|fp8\|tq4` — there is no `tq2`/`tq3`, `args.rs:927`) | No runtime arm: engine construction bails with an explicit-deferral message (`infer-cuda/src/executor.rs:100`). |
 | **Weights** | DenseBF16 | production | default | No quantization. |
 | Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4_gemv` + Marlin W4 prefill. |
@@ -160,11 +160,10 @@ Default behavior unchanged when env unset.
 
 ```bash
 # KV cache
---kv-cache-dtype <auto|bf16|int8>
+--kv-cache-dtype <auto|bf16|int8|fp8|tq4>
  # Metal: auto → int8, bf16 → reference fallback, int8 → explicit default path.
- # CUDA rewrite: dtype plumbing is backend-owned; unsupported flags fail closed.
- # Legacy CUDA kernel formats fp8/tq{2,3,4} remain documented above but are not
- # exposed by the rewrite CLI in this Metal tranche.
+ # CUDA: int8/fp8 on the Qwen3.5-family paged path; tq4 accepted but fails loud
+ # at engine construction (deferred); DSv4 accepts bf16 only (MLA KV is FP8-packed).
 
 # Weight quantization
 # Format is autodetected from safetensors metadata. No CLI flag needed.
