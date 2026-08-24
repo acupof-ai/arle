@@ -111,6 +111,7 @@ pub(crate) enum GraphSlot {
     Embeddings,
     NormedAttn,
     AttnOut,
+    OprojLatent,
     AttnStream,
     NormedFfn,
     MoeWithShared,
