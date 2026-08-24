@@ -579,7 +579,7 @@ impl Qwen35Model {
             .alloc_zeros::<f32>(scale_rows * scale_cols)
             .map_err(|e| anyhow!("layer {layer_idx} {label}: fp8 scale alloc: {e}"))?;
         cuda_ql::quantize_bf16_to_fp8_block_scaled(
-            &ctx,
+            ctx,
             &dense,
             &mut qweight,
             &mut scales,
@@ -665,7 +665,7 @@ impl Qwen35Model {
             })?;
             // From here every re-merge rides the proven FP8 lane; the engine
             // serves FP8 rather than NVFP4 once a LoRA has been merged in.
-            Self::install_fp8_merge_slots(matrix, &ctx, dense, layer_idx, label)?;
+            Self::install_fp8_merge_slots(matrix, &ctx, dense, layer_idx, &*label)?;
             return Ok(());
         }
         // Per-channel FP8's resident form is also the Marlin layout (the repack
@@ -700,7 +700,7 @@ impl Qwen35Model {
             .map_err(|e| {
                 anyhow!("layer {layer_idx} {label}: FP8-marlin→BF16 promotion dequant failed: {e}")
             })?;
-            Self::install_fp8_merge_slots(matrix, &ctx, dense, layer_idx, label)?;
+            Self::install_fp8_merge_slots(matrix, &ctx, dense, layer_idx, &*label)?;
             return Ok(());
         }
         ensure!(
