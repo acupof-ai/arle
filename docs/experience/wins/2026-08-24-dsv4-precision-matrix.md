@@ -155,11 +155,12 @@ the FP8 checkpoint of the same model, on the same code path, still allocated
 quantization axis, and the run that would have caught it was the one this
 matrix ran.
 
-Open: the slot budget's missing prefill-transient reserve (`budget.rs:600`),
-and the compressor's BF16 full-history retention (5.5 GB/slot at 1M): decode
+Open: the compressor's BF16 full-history retention (5.5 GB/slot at 1M): decode
 already attends the FP8-packed rows in the paged pool, but
 `flashmla_prefill_attention` reads the BF16 history, so a ring there is a
-prefill numerics change behind the needle gate, not host bookkeeping.
+prefill numerics change behind the needle gate, not host bookkeeping. The
+prefill-transient reserve landed as `94a15d415` — see
+`2026-08-24-dsv4-budget-prefill-reserve.md`.
 
 ## Artifacts
 
