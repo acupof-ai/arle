@@ -2732,8 +2732,10 @@ pub(crate) struct TrainMathOpdArgs {
     #[arg(long, default_value_t = 64.0)]
     pub(crate) lora_alpha: f32,
 
-    /// LoRA target set.
-    #[arg(long, default_value = "all-linear")]
+    /// LoRA target set: `attention-qv`, `attention-full` (q/k/v/o + linear-attn), or `all-linear`.
+    /// Defaults to attention-qv: all-linear's BF16 promotion (~2x base bytes, permanent for the
+    /// merged frozen base) does not fit a 27B quantized student on one GPU.
+    #[arg(long, default_value = "attention-qv")]
     pub(crate) lora_target_set: String,
 
     /// Merge LoRA into the FP8 student weights on save.
