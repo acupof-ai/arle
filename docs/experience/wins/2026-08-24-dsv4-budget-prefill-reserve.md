@@ -38,6 +38,10 @@ reserve it plans **17 slots** (state-affordable 18) and c=8 over 16 prompts of
 28568 tokens completes **16/16 with 0 OOM and 0 preempts**. One slot of
 capacity bought the whole config's stability.
 
+**Final gate on the same build** (FP8, GPUs 0-3 / 1,2,3,5): c=1 decode 60.1
+tok/s (68 captures, 0 alloc nodes) against the 60.0-60.4 baseline, and MMLU
+200 = 0.860 (172/200, invalid 0) — identical to the pre-fix accuracy.
+
 ## Rule
 
 A budget planner that admits N units must first reserve the transient working
