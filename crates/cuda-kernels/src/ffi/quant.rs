@@ -16,16 +16,4 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn turboquant_lloyd_max(
-        centroids: *mut f32,
-        boundaries: *mut f32,
-        num_levels: i32,
-        head_dim: i32,
-        max_iters: i32,
-    );
-
-    pub fn turboquant_generate_rotation(Pi: *mut f32, head_dim: i32, seed: u64);
-
-    pub fn turboquant_generate_signs(signs: *mut i8, head_dim: i32, seed: u64);
-
 }

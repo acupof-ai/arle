@@ -1008,37 +1008,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn turboquant_weight_gemv_cuda(
-        packed: *const u8,
-        scales: *const Half, // f16
-        signs: *const i8,
-        centroids: *const f32,
-        x: *const Half, // bf16
-        y: *mut Half,   // bf16
-        N: i32,
-        K: i32,
-        group_size: i32,
-        packed_cols: i32,
-        num_groups: i32,
-        bits: i32,
-        stream: CUstream,
-    );
-
-    pub fn turboquant_weight_dequant_cuda(
-        packed: *const u8,
-        scales: *const Half,
-        signs: *const i8,
-        centroids: *const f32,
-        out: *mut Half, // bf16
-        N: i32,
-        K: i32,
-        group_size: i32,
-        packed_cols: i32,
-        num_groups: i32,
-        bits: i32,
-        stream: CUstream,
-    );
-
 }
 #[cfg(test)]
 #[path = "gemm_tests.rs"]

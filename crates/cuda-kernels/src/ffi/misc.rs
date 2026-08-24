@@ -28,16 +28,6 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
-    pub fn dsv4_mhc_pre_cuda(
-        residual: *const super::Half,
-        pre: *const f32,
-        out: *mut super::Half,
-        num_tokens: i32,
-        hidden_size: i32,
-        hc_mult: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
     pub fn dsv4_mhc_pre_rms_norm_cuda(
         residual: *const super::Half,
         pre: *const f32,
@@ -47,61 +37,6 @@ unsafe extern "C" {
         hidden_size: i32,
         hc_mult: i32,
         eps: f32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
-    /// Fused [`dsv4_mhc_params_cuda`] + [`dsv4_mhc_pre_rms_norm_cuda`]: one
-    /// launch per token computes pre/post/comb AND the pre-mixed rms-normed
-    /// row (`pre` consumed from shared memory). Requires the wide-stream
-    /// layout `residual_hidden_dim == hidden_size * hc_mult`.
-    pub fn dsv4_mhc_params_pre_rms_norm_cuda(
-        residual: *const super::Half,
-        mixes: *const super::Half,
-        base: *const super::Half,
-        scale: *const super::Half,
-        weight: *const super::Half,
-        pre: *mut f32,
-        post: *mut f32,
-        comb: *mut f32,
-        out: *mut super::Half,
-        num_tokens: i32,
-        hidden_size: i32,
-        mix_dim: i32,
-        hc_mult: i32,
-        params_eps: f32,
-        sinkhorn_iters: i32,
-        norm_eps: f32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
-    pub fn dsv4_mhc_params_bench_cuda(
-        residual: *const super::Half,
-        mixes: *const super::Half,
-        base: *const super::Half,
-        scale: *const super::Half,
-        pre: *mut f32,
-        post: *mut f32,
-        comb: *mut f32,
-        num_tokens: i32,
-        residual_hidden_dim: i32,
-        mix_dim: i32,
-        hc_mult: i32,
-        eps: f32,
-        sinkhorn_iters: i32,
-        block_dim: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
-    pub fn dsv4_mhc_pre_rms_norm_bench_cuda(
-        residual: *const super::Half,
-        pre: *const f32,
-        weight: *const super::Half,
-        out: *mut super::Half,
-        num_tokens: i32,
-        hidden_size: i32,
-        hc_mult: i32,
-        eps: f32,
-        block_dim: i32,
         stream: super::CUstream,
     ) -> super::CUresult;
 
@@ -535,30 +470,6 @@ unsafe extern "C" {
         stride_indices_s_q: i32,
         stride_indices_h_kv: i32,
         num_sm: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
-    // SGLang sparse_mla_q8kv8_prefill_sm90: native FP8 (q8 x kv8) sparse MLA
-    // prefill. q/kv are fp8 device pointers (per-tensor scale 1.0); out is
-    // bf16. d_qk ∈ {512, 576}, d_v = 512, h_kv = 1. See
-    // csrc/attention/arle_q8kv8_prefill_shim.cu.
-    pub fn arle_q8kv8_sparse_prefill_fwd(
-        q: *const u8,
-        kv: *const u8,
-        indices: *const i32,
-        q_scale: *const f32,
-        kv_scale: *const f32,
-        attn_sink: *const f32,
-        topk_length: *const i32,
-        out: *mut super::Half,
-        max_logits: *mut f32,
-        lse: *mut f32,
-        s_q: i32,
-        s_kv: i32,
-        h_q: i32,
-        d_qk: i32,
-        topk: i32,
-        sm_scale: f32,
         stream: super::CUstream,
     ) -> super::CUresult;
 

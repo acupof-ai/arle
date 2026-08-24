@@ -3247,19 +3247,12 @@ extern "C" cudaError_t w4a16_gemv_batch_cuda_marlin(
     const __nv_bfloat16* input, __nv_bfloat16* output,
     int B, int N, int K, int group_size, cudaStream_t stream);
 
-extern "C" cudaError_t w4a16_gemm_wmma_cuda(
-    const uint8_t* weight, const __nv_bfloat16* scales,
-    const __nv_bfloat16* input, __nv_bfloat16* output,
-    int M, int N, int K, int group_size, cudaStream_t stream);
-
 cudaError_t w4a16_gemv_batch_cuda(
     const uint8_t* weight, const __nv_bfloat16* scales,
     const __nv_bfloat16* input, __nv_bfloat16* output,
     int B, int N, int K, int group_size, cudaStream_t stream)
 {
-    // Marlin GEMV for all batch sizes. The WMMA tensor-core path is under
-    // development (correctness issues); fall back to the known-good marlin
-    // GEMV which uses uint4 loads and FP16 FMA.
+    // Marlin GEMV for all batch sizes — uint4 loads and FP16 FMA.
     return w4a16_gemv_batch_cuda_marlin(weight, scales, input, output, B, N, K, group_size, stream);
 }
 

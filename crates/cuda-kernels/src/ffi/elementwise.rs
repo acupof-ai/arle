@@ -2,13 +2,6 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub fn add_bf16_into_f32_cuda(
-        out: *mut f32,
-        r#in: *const Half,
-        n: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,
@@ -41,17 +34,6 @@ unsafe extern "C" {
         out: *mut Half,
         hidden_dim: i32,
         token_idx: i32,
-        scale: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn add_scaled_row_segment_cuda(
-        row: *const Half,
-        out: *mut Half,
-        row_len: i32,
-        out_hidden_dim: i32,
-        token_idx: i32,
-        segment_offset: i32,
         scale: f32,
         stream: CUstream,
     ) -> CUresult;
