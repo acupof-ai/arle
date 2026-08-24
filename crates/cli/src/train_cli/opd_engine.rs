@@ -225,7 +225,14 @@ pub(super) fn load_agent_opd_serve_student(
     // The engine's RoPE table is a hard ceiling on token positions; a pool
     // budget above it is rejected at engine load (qwen35_load OOB guard).
     if let Some(ceiling) = hf_config.rope_cache_len_hint {
+        let before = cc_total_pages;
         cc_total_pages = cc_total_pages.min(ceiling / 16);
+        if cc_total_pages < before {
+            eprintln!(
+                "[arle train opd] rollout pool clamped to RoPE ceiling: {before} -> {cc_total_pages} \
+                 pages (rope_len={ceiling}); concurrent-session sizing reduced"
+            );
+        }
     }
 
     // Shared frozen-base pointers alias engine weight buffers that a student

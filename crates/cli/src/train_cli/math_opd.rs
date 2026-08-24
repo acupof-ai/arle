@@ -93,8 +93,10 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
         model_id: cc_model_id,
         dump_dir,
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
-        timeout_secs: args.cc_timeout,
         max_tokens: args.max_tokens,
+        agent: ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(args.cc_timeout))
+            .build(),
     };
 
     let lora_adapter_config = agent_opd_adapter_config(student_dir, target_set, lora);
@@ -160,10 +162,8 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
 
                 let mut batch = rolled.trajectories;
                 pre_filter_seq(&mut batch, max_update_seq);
-                if args.writeback_cap.is_some() {
-                    batch.truncate(cap_left);
-                    cap_left -= batch.len();
-                }
+                batch.truncate(cap_left);
+                cap_left = cap_left.saturating_sub(batch.len());
                 if batch.is_empty() {
                     continue;
                 }
@@ -171,7 +171,8 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
                 log_opd_vram("math-opd pre-writeback", &train_backend);
                 do_update(
                     &batch,
-                    serde_json::json!({"groups": 1, "behavior_version": behavior_version}),
+                    1,
+                    behavior_version,
                     &update_preset,
                     &student,
                     &all_params,
@@ -222,16 +223,15 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
                 merged.extend(rolled.trajectories);
             }
             pre_filter_seq(&mut merged, max_update_seq);
-            if args.writeback_cap.is_some() {
-                merged.truncate(cap_left);
-                cap_left -= merged.len();
-            }
+            merged.truncate(cap_left);
+            cap_left = cap_left.saturating_sub(merged.len());
             if !merged.is_empty() {
                 quiesce_and_release_engines(&infer_student)?;
                 log_opd_vram("math-opd pre-writeback", &train_backend);
                 do_update(
                     &merged,
-                    serde_json::json!({"groups": g, "behavior_version": behavior_version}),
+                    g,
+                    behavior_version,
                     &update_preset,
                     &student,
                     &all_params,
@@ -378,13 +378,9 @@ fn roll_one_group(
         train::cc_convert::convert_cc_dumps(&harness.dump_dir, &harness.tokenizer, &windows)?;
 
     // Records carry "{task_id}#{sample}#r{seq}" labels; one request per window.
+    let prefix = format!("{task_id}#");
     let sample_of = |label: &str| -> Option<usize> {
-        label
-            .strip_prefix(&format!("{task_id}#"))?
-            .split('#')
-            .next()?
-            .parse()
-            .ok()
+        label.strip_prefix(&prefix)?.split('#').next()?.parse().ok()
     };
     let correct_lens: Vec<usize> = records
         .iter()
@@ -397,7 +393,7 @@ fn roll_one_group(
 
     let mut sample_rewards = vec![0.0f32; rollout.samples.len()];
     let mut trajectories = Vec::with_capacity(records.len());
-    for record in &records {
+    for record in records {
         let Some(s) = sample_of(&record.label) else {
             continue;
         };
@@ -411,12 +407,11 @@ fn roll_one_group(
         sample_rewards[s] = reward;
         let sample = &rollout.samples[s];
         trajectories.push(train::update_strategy::ScoredTrajectory {
-            prompt_ids: record.prompt_ids.clone(),
-            response_ids: record.response_ids.clone(),
-            response_mask: record.response_mask.clone(),
+            prompt_ids: record.prompt_ids,
+            response_ids: record.response_ids,
+            response_mask: record.response_mask,
             reward,
-            behavior_logprobs: (!record.gen_logprobs.is_empty())
-                .then(|| record.gen_logprobs.clone()),
+            behavior_logprobs: (!record.gen_logprobs.is_empty()).then_some(record.gen_logprobs),
             group_id,
             truncated: sample.timed_out || sample.capped,
         });
@@ -508,7 +503,8 @@ fn trim_memory_pool(store: &mut autograd::TensorStore) {
 #[allow(clippy::too_many_arguments)]
 fn do_update<O: autograd::Optimizer>(
     batch: &[train::update_strategy::ScoredTrajectory],
-    extra: serde_json::Value,
+    groups: usize,
+    behavior_version: u64,
     preset: &train::update_strategy::UpdatePreset,
     student: &train::qwen35::Qwen35Model,
     all_params: &[autograd::TensorId],
@@ -543,12 +539,9 @@ fn do_update<O: autograd::Optimizer>(
         "adv_mean": report.adv_mean,
         "adv_std": report.adv_std,
         "update_secs": started.elapsed().as_secs_f64(),
+        "groups": groups,
+        "behavior_version": behavior_version,
     });
-    if let serde_json::Value::Object(extra) = extra {
-        row.as_object_mut()
-            .expect("update row is an object")
-            .extend(extra);
-    }
     metrics.append(&row);
     if report.trained > 0 && report.tokens == 0 {
         bail!(

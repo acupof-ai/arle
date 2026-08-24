@@ -11,6 +11,7 @@ use super::*;
 use StudentLoraProjection::*;
 use cuda_kernels::quant_linear as cuda_ql;
 use cuda_kernels::tensor::cache_ptr;
+use cudarc::driver::CudaSlice;
 
 /// Block-scale grid metadata of an FP8 LoRA target, as the dequant/requant
 /// launchers consume it.
@@ -556,6 +557,57 @@ impl Qwen35Model {
         Ok(())
     }
 
+    /// Install the 128×128 block-scaled FP8 slots the merge lane expects and
+    /// park the Marlin tiles, after a quantized weight has been promoted to
+    /// `dense` BF16. Shared by the NVFP4 and per-channel-FP8 promote arms.
+    fn install_fp8_merge_slots(
+        matrix: &mut DeviceMatrix,
+        ctx: &DeviceContext,
+        dense: CudaSlice<bf16>,
+        layer_idx: usize,
+        label: &str,
+    ) -> Result<()> {
+        const FP8_BLOCK: usize = 128;
+        let scale_rows = matrix.rows.div_ceil(FP8_BLOCK);
+        let scale_cols = matrix.cols.div_ceil(FP8_BLOCK);
+        let mut qweight = ctx
+            .stream
+            .alloc_zeros::<u8>(matrix.rows * matrix.cols)
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: fp8 slot alloc: {e}"))?;
+        let mut scales = ctx
+            .stream
+            .alloc_zeros::<f32>(scale_rows * scale_cols)
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: fp8 scale alloc: {e}"))?;
+        cuda_ql::quantize_bf16_to_fp8_block_scaled(
+            &ctx,
+            &dense,
+            &mut qweight,
+            &mut scales,
+            matrix.rows,
+            matrix.cols,
+            FP8_BLOCK,
+            FP8_BLOCK,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} {label}: BF16→FP8 pristine requant: {e}"))?;
+        matrix.qweight_u8 = Some(qweight);
+        matrix.scale_f32 = Some(scales);
+        matrix.quant_block_m = FP8_BLOCK;
+        matrix.quant_block_k = FP8_BLOCK;
+        matrix.quant_scale_rows = scale_rows;
+        matrix.quant_scale_cols = scale_cols;
+        matrix.data = dense;
+        matrix.weight_format = WeightFormat::DenseBf16;
+        // Park the tiles instead of freeing them: a share-frozen-base student
+        // aliases the packed bytes. Out of `marlin_packed` the FP8 arm this
+        // weight requants into can no longer pick them up and read the tiles
+        // as FP8.
+        matrix.retired_marlin = match (matrix.marlin_packed.take(), matrix.marlin_scales.take()) {
+            (Some(packed), Some(scales)) => Some((packed, scales)),
+            _ => None,
+        };
+        Ok(())
+    }
+
     /// Promote FP8-block-scaled LoRA targets to dense BF16 on first touch.
     /// Replaces the former host remerge lane (O(rows·cols·rank) triple loop +
     /// re-quant + full-W upload, 60-83s/round) with a one-time kernel; every
@@ -611,51 +663,9 @@ impl Qwen35Model {
             .map_err(|e| {
                 anyhow!("layer {layer_idx} {label}: NVFP4→BF16 promotion dequant failed: {e}")
             })?;
-            // Give the matrix the FP8 slots the merge lane expects. Without
-            // them `requant_merged_matrix` finds no `qweight_u8`, returns
-            // early, and the weight stays dense BF16 forever -- 4x the NVFP4
-            // bytes per touched projection, which OOMs a 27B all-linear merge.
             // From here every re-merge rides the proven FP8 lane; the engine
             // serves FP8 rather than NVFP4 once a LoRA has been merged in.
-            const FP8_BLOCK: usize = 128;
-            let scale_rows = matrix.rows.div_ceil(FP8_BLOCK);
-            let scale_cols = matrix.cols.div_ceil(FP8_BLOCK);
-            let mut qweight = ctx
-                .stream
-                .alloc_zeros::<u8>(matrix.rows * matrix.cols)
-                .map_err(|e| anyhow!("layer {layer_idx} {label}: NVFP4 fp8 slot alloc: {e}"))?;
-            let mut scales = ctx
-                .stream
-                .alloc_zeros::<f32>(scale_rows * scale_cols)
-                .map_err(|e| anyhow!("layer {layer_idx} {label}: NVFP4 fp8 scale alloc: {e}"))?;
-            cuda_ql::quantize_bf16_to_fp8_block_scaled(
-                &ctx,
-                &dense,
-                &mut qweight,
-                &mut scales,
-                matrix.rows,
-                matrix.cols,
-                FP8_BLOCK,
-                FP8_BLOCK,
-            )
-            .map_err(|e| anyhow!("layer {layer_idx} {label}: NVFP4→FP8 pristine requant: {e}"))?;
-            matrix.qweight_u8 = Some(qweight);
-            matrix.scale_f32 = Some(scales);
-            matrix.quant_block_m = FP8_BLOCK;
-            matrix.quant_block_k = FP8_BLOCK;
-            matrix.quant_scale_rows = scale_rows;
-            matrix.quant_scale_cols = scale_cols;
-            matrix.data = dense;
-            matrix.weight_format = WeightFormat::DenseBf16;
-            // Park the tiles instead of freeing them: a share-frozen-base
-            // student aliases the packed bytes. Out of `marlin_packed` the FP8
-            // arm this weight requants into can no longer pick them up and read
-            // FP4 tiles as FP8.
-            matrix.retired_marlin = match (matrix.marlin_packed.take(), matrix.marlin_scales.take())
-            {
-                (Some(packed), Some(global)) => Some((packed, global)),
-                _ => None,
-            };
+            Self::install_fp8_merge_slots(matrix, &ctx, dense, layer_idx, label)?;
             return Ok(());
         }
         // Per-channel FP8's resident form is also the Marlin layout (the repack
@@ -676,7 +686,6 @@ impl Qwen35Model {
             let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
                 anyhow!("layer {layer_idx} {label}: FP8-marlin LoRA target missing its per-channel scale")
             })?;
-            let dense = dense;
             // SAFETY: `dense` covers rows*cols and lives across the launch.
             unsafe {
                 cuda_ql::dequantize_fp8_marlin_to_bf16(
@@ -691,51 +700,7 @@ impl Qwen35Model {
             .map_err(|e| {
                 anyhow!("layer {layer_idx} {label}: FP8-marlin→BF16 promotion dequant failed: {e}")
             })?;
-            // Same FP8-slot pattern as the NVFP4 arm above: without them
-            // `requant_merged_matrix` finds no `qweight_u8` and the weight stays
-            // dense BF16 forever. The engine serves block-scaled FP8 once a
-            // LoRA has been merged in.
-            const FP8_BLOCK: usize = 128;
-            let scale_rows = matrix.rows.div_ceil(FP8_BLOCK);
-            let scale_cols = matrix.cols.div_ceil(FP8_BLOCK);
-            let mut qweight = ctx
-                .stream
-                .alloc_zeros::<u8>(matrix.rows * matrix.cols)
-                .map_err(|e| {
-                    anyhow!("layer {layer_idx} {label}: FP8-marlin fp8 slot alloc: {e}")
-                })?;
-            let mut fp8_scales = ctx
-                .stream
-                .alloc_zeros::<f32>(scale_rows * scale_cols)
-                .map_err(|e| {
-                    anyhow!("layer {layer_idx} {label}: FP8-marlin fp8 scale alloc: {e}")
-                })?;
-            cuda_ql::quantize_bf16_to_fp8_block_scaled(
-                &ctx,
-                &dense,
-                &mut qweight,
-                &mut fp8_scales,
-                matrix.rows,
-                matrix.cols,
-                FP8_BLOCK,
-                FP8_BLOCK,
-            )
-            .map_err(|e| {
-                anyhow!("layer {layer_idx} {label}: FP8-marlin→FP8 pristine requant: {e}")
-            })?;
-            matrix.qweight_u8 = Some(qweight);
-            matrix.scale_f32 = Some(fp8_scales);
-            matrix.quant_block_m = FP8_BLOCK;
-            matrix.quant_block_k = FP8_BLOCK;
-            matrix.quant_scale_rows = scale_rows;
-            matrix.quant_scale_cols = scale_cols;
-            matrix.data = dense;
-            matrix.weight_format = WeightFormat::DenseBf16;
-            matrix.retired_marlin = match (matrix.marlin_packed.take(), matrix.marlin_scales.take())
-            {
-                (Some(packed), Some(scales)) => Some((packed, scales)),
-                _ => None,
-            };
+            Self::install_fp8_merge_slots(matrix, &ctx, dense, layer_idx, label)?;
             return Ok(());
         }
         ensure!(
