@@ -2,11 +2,12 @@ use super::*;
 use crate::qwen35::alloc_recurrent_block;
 use std::cmp::Ordering;
 
-/// A sidecar blob whose `to_bytes()` serialization completed on a background thread.
+/// A sidecar blob whose `to_bytes()` + chunking completed on a background thread.
 struct SidecarBlob {
     pos: usize,
     key: u64,
-    bytes: Vec<u8>,
+    chunks: usize,
+    entries: Vec<(u64, Vec<u8>)>,
     prefix_pages: Vec<u32>,
 }
 
@@ -319,11 +320,28 @@ impl Qwen35CudaExecutor {
         std::thread::spawn(move || {
             for (pos, key, snap) in work {
                 let bytes = snap.to_bytes();
+                let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
+                let manifest_key = tier_key(NS_SIDECAR, key);
+                let manifest = chunk_manifest(chunks, bytes.len());
+                let mut entries = Vec::with_capacity(chunks + 1);
+                entries.push((manifest_key, manifest));
+                entries.extend(
+                    bytes
+                        .chunks(BLOB_CHUNK_BYTES)
+                        .enumerate()
+                        .map(|(idx, chunk)| {
+                            (
+                                tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
+                                chunk.to_vec(),
+                            )
+                        }),
+                );
                 if tx
                     .send(SidecarBlob {
                         pos,
                         key,
-                        bytes,
+                        chunks,
+                        entries,
                         prefix_pages: pages.clone(),
                     })
                     .is_err()
@@ -338,16 +356,29 @@ impl Qwen35CudaExecutor {
     /// Drain completed background serializations into `slot_tier` / `sidecar_page_key`.
     pub(crate) fn poll_sidecar_serializations(&mut self) {
         while let Ok(blob) = self.sidecar_rx.try_recv() {
-            self.store_sidecar_blob(blob.pos, blob.key, blob.bytes, &blob.prefix_pages);
+            self.store_sidecar_blob(
+                blob.pos,
+                blob.key,
+                blob.chunks,
+                blob.entries,
+                &blob.prefix_pages,
+            );
         }
     }
 
     /// Insert a sidecar blob and coordinate its eviction off the last radix page it
     /// covers: leaves evict deepest-first, so the blob drops as its own prefix erodes.
-    fn store_sidecar_blob(&mut self, pos: usize, key: u64, bytes: Vec<u8>, prefix_pages: &[u32]) {
+    fn store_sidecar_blob(
+        &mut self,
+        pos: usize,
+        key: u64,
+        chunks: usize,
+        entries: Vec<(u64, Vec<u8>)>,
+        prefix_pages: &[u32],
+    ) {
         if !self
             .slot_tier
-            .insert_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key, &bytes)
+            .insert_prechunked(NS_SIDECAR, key, chunks, entries)
         {
             return;
         }
