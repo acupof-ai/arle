@@ -304,6 +304,10 @@ pub unsafe fn marlin_fp8_to_e4m3(
 /// held per-channel scales apply (`dequantize_fp8_block_scaled_to_bf16` with a
 /// 1×K block shape). Composes the two existing kernels; the E4M3 scratch is
 /// freed on return. This is the FP8 analog of `dequantize_fp4_marlin_to_bf16`.
+///
+/// # Safety
+/// `packed` must be the layout `repack_for_marlin_fp8` produced, and `output`
+/// must cover n*k bf16 on this stream (caller's contract).
 pub unsafe fn dequantize_fp8_marlin_to_bf16(
     ctx: &DeviceContext,
     packed: &impl DevicePtr<u8>,
@@ -326,7 +330,7 @@ pub unsafe fn dequantize_fp8_marlin_to_bf16(
     // SAFETY: lengths checked above; `packed` is the layout `repack_for_marlin_fp8`
     // produced, and `output` covers n*k bf16 on this stream (caller's contract).
     unsafe {
-        marlin_fp8_to_e4m3(ctx, packed, cache_ptr(&scratch, &ctx), n, k)
+        marlin_fp8_to_e4m3(ctx, packed, cache_ptr(&scratch, ctx), n, k)
             .map_err(|e| anyhow!("marlin_fp8_to_e4m3 in dequantize_fp8_marlin_to_bf16: {e}"))?;
         dequantize_fp8_block_scaled_to_bf16(
             ctx,
