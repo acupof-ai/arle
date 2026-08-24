@@ -2,12 +2,18 @@ use super::*;
 use crate::qwen35::alloc_recurrent_block;
 use std::cmp::Ordering;
 
-/// A sidecar blob whose `to_bytes()` + chunking completed on a background thread.
+/// A sidecar blob whose `to_bytes()` + chunking completed on the serialization thread.
 struct SidecarBlob {
     pos: usize,
     key: u64,
     chunks: usize,
     entries: Vec<(u64, Vec<u8>)>,
+    prefix_pages: Vec<u32>,
+}
+
+/// A batch of snapshots to serialize on the dedicated thread.
+struct SidecarWork {
+    items: Vec<(usize, u64, crate::qwen35::Qwen35RecurrentSnapshot)>,
     prefix_pages: Vec<u32>,
 }
 
@@ -178,9 +184,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// MTP spec-decode state (`--spec-type mtp`): the spec state plus the seed
     /// (pending token + hidden) for the next spec step.
     pub(crate) mtp: Option<MtpExec>,
-    /// Background sidecar serialization: `to_bytes()` runs off the engine's
-    /// critical path; results drain in `poll_sidecar_serializations`.
-    sidecar_tx: std::sync::mpsc::Sender<SidecarBlob>,
+    /// Dedicated sidecar serialization thread: snapshots go in via `sidecar_work_tx`,
+    /// serialized blobs come out via `sidecar_rx` (drained in `poll_sidecar_serializations`).
+    /// One thread (not spawn-per-call) bounds memory-bandwidth contention at c=1.
+    sidecar_work_tx: std::sync::mpsc::Sender<SidecarWork>,
     sidecar_rx: std::sync::mpsc::Receiver<SidecarBlob>,
 }
 
@@ -315,40 +322,9 @@ impl Qwen35CudaExecutor {
         if work.is_empty() {
             return Ok(());
         }
-        let tx = self.sidecar_tx.clone();
-        let pages = prefix_pages.to_vec();
-        std::thread::spawn(move || {
-            for (pos, key, snap) in work {
-                let bytes = snap.to_bytes();
-                let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
-                let manifest_key = tier_key(NS_SIDECAR, key);
-                let manifest = chunk_manifest(chunks, bytes.len());
-                let mut entries = Vec::with_capacity(chunks + 1);
-                entries.push((manifest_key, manifest));
-                entries.extend(
-                    bytes
-                        .chunks(BLOB_CHUNK_BYTES)
-                        .enumerate()
-                        .map(|(idx, chunk)| {
-                            (
-                                tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
-                                chunk.to_vec(),
-                            )
-                        }),
-                );
-                if tx
-                    .send(SidecarBlob {
-                        pos,
-                        key,
-                        chunks,
-                        entries,
-                        prefix_pages: pages.clone(),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
+        let _ = self.sidecar_work_tx.send(SidecarWork {
+            items: work,
+            prefix_pages: prefix_pages.to_vec(),
         });
         Ok(())
     }
@@ -877,7 +853,40 @@ impl Qwen35CudaExecutor {
         // graph-capturable. Eager fallback disarms on any capture failure.
         let decode_graph_armed = crate::runtime_flags::qwen35_decode_graph()
             && model.decode_graph_unsupported_reason().is_none();
-        let (sidecar_tx, sidecar_rx) = std::sync::mpsc::channel();
+        let (sidecar_tx, sidecar_rx) = std::sync::mpsc::channel::<SidecarBlob>();
+        let (sidecar_work_tx, sidecar_work_rx) = std::sync::mpsc::channel::<SidecarWork>();
+        std::thread::spawn(move || {
+            while let Ok(work) = sidecar_work_rx.recv() {
+                for (pos, key, snap) in work.items {
+                    let bytes = snap.to_bytes();
+                    let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
+                    let manifest_key = tier_key(NS_SIDECAR, key);
+                    let manifest = chunk_manifest(chunks, bytes.len());
+                    let mut entries = Vec::with_capacity(chunks + 1);
+                    entries.push((manifest_key, manifest));
+                    entries.extend(bytes.chunks(BLOB_CHUNK_BYTES).enumerate().map(
+                        |(idx, chunk)| {
+                            (
+                                tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
+                                chunk.to_vec(),
+                            )
+                        },
+                    ));
+                    if sidecar_tx
+                        .send(SidecarBlob {
+                            pos,
+                            key,
+                            chunks,
+                            entries,
+                            prefix_pages: work.prefix_pages.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
         let executor = Self {
             model,
             slots,
@@ -905,7 +914,7 @@ impl Qwen35CudaExecutor {
                 rejects: 0,
                 chains: 0,
             }),
-            sidecar_tx,
+            sidecar_work_tx,
             sidecar_rx,
         };
         cuda_startup_log(
