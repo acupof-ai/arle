@@ -27,6 +27,8 @@ pub mod infer_student;
 pub mod lora;
 #[path = "loss.rs"]
 pub mod loss;
+#[path = "math_harness.rs"]
+pub mod math_harness;
 #[path = "model_family.rs"]
 pub mod model_family;
 #[path = "opd.rs"]

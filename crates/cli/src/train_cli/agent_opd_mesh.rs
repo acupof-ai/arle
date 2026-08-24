@@ -127,7 +127,7 @@ pub(super) fn run_agent_opd_cp_follower(
     let cp = train::context_parallel::CpContext::from_env();
     let update_preset = args.update_preset();
 
-    let mut fleet = load_agent_opd_serve_student(args, lora, target_set, serve_port)?;
+    let mut fleet = load_agent_opd_serve_student(&args.serve_args(), lora, target_set, serve_port)?;
     let vocab = fleet.vocab;
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let mut value_critic = build_value_critic(

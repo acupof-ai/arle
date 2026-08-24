@@ -1,10 +1,7 @@
 #[cfg(feature = "cuda")]
 use {
-    super::{
-        cc_eval::agent_opd_eval_out_dir,
-        opd_runtime::{apply_tape_dtype, build_opd_store, log_opd_vram, trainable_param_ids},
-    },
-    crate::args::TrainAgentOpdArgs,
+    super::opd_runtime::{apply_tape_dtype, build_opd_store, log_opd_vram, trainable_param_ids},
+    crate::args::ServeStudentArgs,
     anyhow::{Context, Result, anyhow, bail},
     autograd::TensorId,
     qwen35_spec::Qwen35Config,
@@ -163,9 +160,10 @@ pub(super) fn shared_frozen_base_entries(
         .collect())
 }
 
-/// Rollout engine + cc serve + autograd student for one agent-opd rank. Every
+/// Rollout engine + cc serve + autograd student for one OPD rank. Every
 /// mesh rank loads this (the cp fleet serves one group's samples in parallel);
-/// rank 0 additionally owns the harness, filtering, and saves.
+/// rank 0 additionally owns the harness, filtering, and saves. Shared by
+/// `agent-opd` and `math-opd` via [`ServeStudentArgs`].
 #[cfg(feature = "cuda")]
 pub(super) struct AgentOpdServeStudent {
     pub(super) store: autograd::TensorStore,
@@ -182,7 +180,7 @@ pub(super) struct AgentOpdServeStudent {
 
 #[cfg(feature = "cuda")]
 pub(super) fn load_agent_opd_serve_student(
-    args: &TrainAgentOpdArgs,
+    args: &ServeStudentArgs<'_>,
     lora: train::lora::LoraConfig,
     target_set: train::lora::LoraTargetSet,
     serve_port: u16,
@@ -196,7 +194,7 @@ pub(super) fn load_agent_opd_serve_student(
         qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
     };
 
-    let student_dir = args.student_model.as_path();
+    let student_dir = args.student_model;
     let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
     apply_tape_dtype(&mut store, args.tape_dtype)?;
     // Vocab from the checkpoint config (not the autograd student) so the rollout
@@ -205,7 +203,7 @@ pub(super) fn load_agent_opd_serve_student(
     let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
         .with_context(|| format!("read config.json from {}", student_dir.display()))?;
     let vocab = hf_config.vocab_size;
-    let eval_out_dir = agent_opd_eval_out_dir(args);
+    let eval_out_dir = args.eval_out_dir.clone();
     // Rollout engine (student) doubles as the cc serve. KV budget for cc
     // traffic: K concurrent cc streams × the measured session ceiling, +25%
     // headroom, page_size 16.
@@ -352,7 +350,7 @@ pub(super) fn load_agent_opd_serve_student(
 
     // Resume: overlay a saved adapter onto the fresh student (both load branches
     // merge here) BEFORE the handoff fence, so its A/B uploads drain with the base.
-    if let Some(dir) = args.lora_adapters.as_deref() {
+    if let Some(dir) = args.lora_adapters {
         load_qwen35_lora_adapters(&student, &mut store, dir)
             .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
         eprintln!("[agent-opd] resumed adapter from {}", dir.display());
