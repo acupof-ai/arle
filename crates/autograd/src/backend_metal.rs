@@ -12,10 +12,10 @@ use crate::{
 use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
     mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_broadcast_to,
-    mlx_concatenate_axis, mlx_contiguous, mlx_erf, mlx_eval, mlx_exp, mlx_fast_rms_norm,
-    mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative, mlx_reciprocal,
-    mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_sqrt,
-    mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
+    mlx_concatenate_axis, mlx_contiguous, mlx_eval, mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis,
+    mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative, mlx_reciprocal, mlx_reshape,
+    mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_sqrt, mlx_subtract,
+    mlx_sum_axis, mlx_take_axis, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::MutexGuard;
