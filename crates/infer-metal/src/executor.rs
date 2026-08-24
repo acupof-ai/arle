@@ -1396,9 +1396,25 @@ impl RealMetalExecutor {
         // hurting (below 2 tokens/block → worse than no-draft 138 tok/s).
         let accepted = accepted_inputs as f32;
         slot.dflash_ewma_accept = slot.dflash_ewma_accept * 0.75 + accepted * 0.25;
+        // Consecutive-rejection circuit breaker: 3 blocks with zero draft
+        // acceptance → disable DSpark for the rest of the session.
+        if accepted_inputs <= 1 {
+            slot.dflash_consecutive_rejects += 1;
+            if slot.dflash_consecutive_rejects >= 3 {
+                log::warn!(
+                    "DSpark disabled after {} consecutive rejections (slot {})",
+                    slot.dflash_consecutive_rejects,
+                    row.slot
+                );
+                slot.dflash_skip_remaining = u32::MAX;
+            }
+        } else {
+            slot.dflash_consecutive_rejects = 0;
+        }
         // Skip when acceptance is below the break-even point (~3.66 tokens/block
         // at 27ms/block vs 7.2ms/token no-draft). 3.5 gives a small margin.
-        if slot.dflash_ewma_accept < 3.5 {
+        // Don't override the permanent disable (u32::MAX) from the circuit breaker.
+        if slot.dflash_ewma_accept < 3.5 && slot.dflash_skip_remaining != u32::MAX {
             slot.dflash_skip_remaining = 4;
         }
         slot.last_sampled = None;
