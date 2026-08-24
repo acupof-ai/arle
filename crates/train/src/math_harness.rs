@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -49,27 +49,9 @@ pub fn load_tasks(path: &Path, limit: Option<usize>) -> Result<Vec<MathTask>> {
 /// LAST `\boxed{...}` with brace nesting; None when absent or unbalanced.
 pub fn last_boxed(text: &str) -> Option<String> {
     const TAG: &str = "\\boxed{";
-    let mut last: Option<usize> = None;
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(TAG) {
-        last = Some(from + rel);
-        from += rel + 1;
-    }
-    let open = last?;
-    let mut depth = 0usize;
-    for (idx, ch) in text[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(text[open + TAG.len()..open + idx].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    let open = text.rfind(TAG)?;
+    let close = matching_brace(text, open + TAG.len() - 1)?;
+    Some(text[open + TAG.len()..close].to_owned())
 }
 
 /// One normalization pass: unwrap text-font wrappers, strip spacing/left/right
@@ -231,8 +213,8 @@ pub struct MathHarness {
     pub model_id: String,
     pub dump_dir: PathBuf,
     pub tokenizer: tokenizers::Tokenizer,
-    pub timeout_secs: u64,
     pub max_tokens: usize,
+    pub agent: ureq::Agent,
 }
 
 #[derive(Debug, Clone)]
@@ -322,9 +304,7 @@ impl MathHarness {
             "messages": [{"role": "user", "content": task.text}],
             "thinking": {"type": "enabled", "budget_tokens": self.max_tokens},
         });
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .build();
+        let agent = &self.agent;
         let t_start_ms = epoch_ms();
         let outcome = agent
             .post(&format!("{}/v1/messages", self.base_url))
