@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 deepseek-spec = { path = "../deepseek-spec" }
-gemma-spec = { path = "../gemma-spec" }
 infer-gguf = { path = "../infer-gguf" }
 infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }

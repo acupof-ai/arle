@@ -172,7 +172,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-
     pub fn dsv4_init_padded_route_slots_cuda(
         packed_token: *mut i32,
         packed_route_slot: *mut i32,

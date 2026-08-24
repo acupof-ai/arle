@@ -189,12 +189,6 @@ pub fn hybrid_counts(layer_types: &[qwen35_spec::LayerType]) -> Qwen35HybridCoun
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Qwen35LinearStateShape {
-    pub recurrent_f32: usize,
-    pub conv_bf16: usize,
-}
-
 pub const QWEN35_MUTATED_RECURRENT_BUFFERS: &[&str] = &[
     "slot.linear.gated_delta_state_f32",
     "slot.linear.conv4_ring_bf16",

@@ -692,10 +692,10 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let cfg = dense_qwen35_config();
 
-        let step_dir = save_step_checkpoint(
-            Qwen35StepCheckpoint {
+        let step_dir = save_named_checkpoint_with_artifact(
+            Qwen35NamedCheckpoint {
                 out_dir: tmp.path(),
-                step: 3,
+                dirname: "step_000003",
                 tokenizer_path: None,
                 config_json: ConfigJsonSource::Synthesize {
                     cfg: &cfg,
@@ -706,6 +706,7 @@ mod tests {
                     eos_token_id: cfg.eos_token_id,
                 },
             },
+            MODEL_WEIGHTS_FILENAME,
             |weights_path| {
                 fs::write(weights_path, b"weights").expect("write weights");
                 Ok(())
@@ -741,10 +742,10 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let cfg = dense_qwen35_config();
 
-        let err = save_step_checkpoint(
-            Qwen35StepCheckpoint {
+        let err = save_named_checkpoint_with_artifact(
+            Qwen35NamedCheckpoint {
                 out_dir: tmp.path(),
-                step: 4,
+                dirname: "step_000004",
                 tokenizer_path: None,
                 config_json: ConfigJsonSource::Synthesize {
                     cfg: &cfg,
@@ -755,6 +756,7 @@ mod tests {
                     eos_token_id: cfg.eos_token_id,
                 },
             },
+            MODEL_WEIGHTS_FILENAME,
             |_weights_path| Err(Qwen35CheckpointError::Custom("weight write failed".into())),
         )
         .expect_err("failing weight writer should fail checkpoint save");
@@ -779,10 +781,10 @@ mod tests {
         fs::write(step_dir.join("marker.txt"), "keep").expect("write marker");
         let mut save_artifact_called = false;
 
-        let err = save_step_checkpoint(
-            Qwen35StepCheckpoint {
+        let err = save_named_checkpoint_with_artifact(
+            Qwen35NamedCheckpoint {
                 out_dir: tmp.path(),
-                step: 6,
+                dirname: "step_000006",
                 tokenizer_path: None,
                 config_json: ConfigJsonSource::Synthesize {
                     cfg: &cfg,
@@ -793,6 +795,7 @@ mod tests {
                     eos_token_id: cfg.eos_token_id,
                 },
             },
+            MODEL_WEIGHTS_FILENAME,
             |_weights_path| {
                 save_artifact_called = true;
                 Ok(())
@@ -836,10 +839,10 @@ mod tests {
         )
         .expect("write source config");
 
-        let step_dir = save_step_checkpoint(
-            Qwen35StepCheckpoint {
+        let step_dir = save_named_checkpoint_with_artifact(
+            Qwen35NamedCheckpoint {
                 out_dir: tmp.path(),
-                step: 5,
+                dirname: "step_000005",
                 tokenizer_path: None,
                 config_json: ConfigJsonSource::CopyFrom(&source_config),
                 generation_config: GenerationConfigSource::CopyOrSynthesize {
@@ -847,6 +850,7 @@ mod tests {
                     fallback_config_path: &source_config,
                 },
             },
+            MODEL_WEIGHTS_FILENAME,
             |weights_path| {
                 fs::write(weights_path, b"weights").expect("write weights");
                 Ok(())

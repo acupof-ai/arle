@@ -57,34 +57,11 @@ pub struct MultimodalImage {
 /// marker logic without the server depending on backend types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultimodalKind {
-    /// Gemma4 SigLIP vision tower (`<|image|>` markers, pooled soft tokens).
-    Gemma4,
     /// DeepSeek-OCR DeepEncoder (`<image>` markers, 1024x1024 base view).
     DeepseekOcr,
 }
 
 impl DiffusionGenerationConfig {
-    /// DiffusionGemma defaults from the public model config.
-    #[must_use]
-    pub fn diffusion_gemma(max_new_tokens: usize, vocab_size: u32) -> Self {
-        Self {
-            canvas_length: DEFAULT_DIFFUSION_CANVAS_LENGTH,
-            max_denoising_steps: DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
-            max_new_tokens,
-            vocab_size,
-            // 1 = `<eos>`, 106 = `<end_of_turn>`, 50 = the model's extra stop id
-            // (same fallback as `infer-metal`'s config loader).
-            stop_token_ids: vec![1, 106, 50],
-            pad_token_id: 0,
-            entropy_bound: DEFAULT_DIFFUSION_ENTROPY_BOUND,
-            confidence_threshold: DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
-            t_min: DEFAULT_DIFFUSION_T_MIN,
-            t_max: DEFAULT_DIFFUSION_T_MAX,
-            stability_threshold: DEFAULT_DIFFUSION_STABILITY_THRESHOLD,
-            seed: 0,
-        }
-    }
-
     fn validate(&self) -> Result<(), DiffusionGenerateError> {
         if self.canvas_length == 0 {
             return Err(DiffusionGenerateError::InvalidConfig(

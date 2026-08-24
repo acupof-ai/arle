@@ -445,10 +445,7 @@ mod backend {
     #[cfg(feature = "hip")]
     use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
-    use infer_metal::{
-        MetalDeepseekOcrModel, MetalDiffusionGemmaModel, MetalExecutor, MetalGemma4Model,
-        MetalKvPool,
-    };
+    use infer_metal::{MetalDeepseekOcrModel, MetalExecutor, MetalKvPool};
     #[cfg(feature = "cuda")]
     use infer_seam::BackendExecutor;
     #[cfg(feature = "metal")]

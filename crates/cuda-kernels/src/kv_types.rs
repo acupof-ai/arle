@@ -29,7 +29,6 @@ pub enum KVFormat {
 }
 
 impl KVFormat {
-
     pub fn default_page_size(self) -> usize {
         match self {
             Self::BF16 => 16,
