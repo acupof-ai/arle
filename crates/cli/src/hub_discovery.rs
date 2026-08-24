@@ -76,15 +76,10 @@ fn snapshot_is_servable(path: &Path) -> bool {
                     .any(|s| s.as_str().is_some_and(|s| s.contains(needle)))
             })
     };
-    let is_diffusion = matches!(model_type, "diffusion_gemma" | "gemma4")
-        || arch_contains("DiffusionGemma")
-        || arch_contains("Gemma4");
-
     let mut servable = false;
     #[cfg(feature = "metal")]
     {
-        servable |= is_diffusion
-            || matches!(model_type, "qwen3_5" | "qwen3_5_moe")
+        servable |= matches!(model_type, "qwen3_5" | "qwen3_5_moe")
             || arch_contains("Qwen3_5")
             // DeepSeek-OCR VLM (Metal-only) — the `arle ocr` model.
             || model_type == "deepseekocr"
@@ -92,15 +87,13 @@ fn snapshot_is_servable(path: &Path) -> bool {
     }
     #[cfg(feature = "cuda")]
     {
-        servable |= is_diffusion
-            || model_type == "deepseek_v4"
+        servable |= model_type == "deepseek_v4"
             || arch_contains("DeepseekV4")
             || (model_type.starts_with("qwen3") && model_type != "qwen3_5_mtp")
             || arch_contains("Qwen3");
     }
     #[cfg(not(any(feature = "metal", feature = "cuda")))]
     {
-        let _ = is_diffusion;
         servable |= (model_type.starts_with("qwen3") && model_type != "qwen3_5_mtp")
             || arch_contains("Qwen3");
     }
