@@ -127,7 +127,7 @@ constraints.
 | GLM-5.2 | DSv4 adapter, verification pending | DSv4 policy with separate GLM load and model gates |
 | OPD CUDA | Supported training path | Autograd CUDA backend and OPD orchestration |
 | Qwen3-MoE public schema | Unsupported | Load-time classification failure remains |
-| Gemma4/DiffusionGemma CUDA | Unsupported forward | Executor construction failure remains |
+| DeepSeek-OCR CUDA | Unsupported forward | Executor construction failure remains |
 
 Schema similarity never grants model support. Each model route needs its own
 load, correctness, and performance evidence.

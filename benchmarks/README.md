@@ -25,9 +25,7 @@ wins: [2026-06-14-bench-metal-m4pro-local-model-ladder](../docs/experience/wins/
 | Qwen3.5-9B | 50.0 tok/s | 20.01 ms | 1448.8 ms |
 | Qwen3.6-35B-A3B · MoE (~3B active) | 85.3 tok/s | 11.73 ms | 1231.0 ms |
 
-Plus **DiffusionGemma-26B-A4B 4-bit** (block-diffusion, `ARLE_DIFFUSION_MAX_DENOISING_STEPS=4` fast path): **55.7 tok/s end-to-end** (it isn't autoregressive, so per-token decode/TPOT aren't comparable to the table above — e2e is the meaningful number).
-
-**Not served (fail closed)** — every other locally-cached checkpoint was attempted and rejected at validation; the Metal serve path is **Qwen3.5/3.6 family + DiffusionGemma** only:
+**Not served (fail closed)** — every other locally-cached checkpoint was attempted and rejected at validation; the Metal serve path is **Qwen3.5/3.6 family** only:
 
 | Model | Why it fails closed |
 |---|---|

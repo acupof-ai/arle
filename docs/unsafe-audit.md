@@ -31,7 +31,7 @@ Every FFI family is wrapped at the boundary: raw C functions are only called ins
 | CUDA kernels (`ffi::*_cuda`, `crates/cuda-kernels/src/ffi/`) | `cuda-kernels/src/{attention,moe,tensor_ops,quant_linear,sampling,kv_quant}.rs` | `Result` return; lengths checked before launch |
 | cudarc driver/runtime | `infer-cuda/src/{attention,graph,tp}.rs`, `autograd/src/backend_cuda/*` | cudarc `Result`; stream-ordered on the engine thread's stream |
 | NCCL | `cuda-kernels/src/collective.rs`, `infer-cuda/src/tp.rs` | `nccl::check` |
-| MLX C bridge (`mlx_sys::*`) | `infer-metal/src/{mlx,qwen35,gemma4,deepseek_ocr,diffusion_gemma}.rs`, `autograd/src/backend_metal.rs` | `panic_if_mlx_error` / `mlx_last_error` after each call; `mlx_guard()` serializes calls |
+| MLX C bridge (`mlx_sys::*`) | `infer-metal/src/{mlx,qwen35,deepseek_ocr}.rs`, `autograd/src/backend_metal.rs` | `panic_if_mlx_error` / `mlx_last_error` after each call; `mlx_guard()` serializes calls |
 | Vulkan (ash) | `vulkan-sys/src/lib.rs` | ash `Result` |
 | HIP / ROCm | `hip-sys/src/lib.rs`, `infer-hip/src/model.rs` | `check(...)` wrapper |
 | xgrammar / DeepEP | `xgrammar-sys/src/lib.rs`, `deepep-sys/src/lib.rs` | status codes checked |
@@ -71,7 +71,7 @@ All are `Send` or `Sync` for FFI handle types. Each carries a SAFETY comment.
 | `RawDevicePtr<T>` | Send (all T) | `cuda-kernels/src/tensor.rs:299` | u64 address, never dereferenced in Rust; single inference thread |
 | `CudaGraphState` | Send | `infer-cuda/src/graph.rs:42` | Capture and replay run on the inference thread |
 | `MlxArray` | Send | `infer-metal/src/mlx.rs:136` | Owns its handle; MLX process-global state serialized via `mlx_guard` |
-| `Cpp{Gemma4,DiffusionGemma,DeepseekOcr}Model` | Send | `infer-metal/src/{gemma4,diffusion_gemma,deepseek_ocr}.rs` | C++ model handles, engine-thread confined |
+| `Cpp{DeepseekOcr}Model` | Send | `infer-metal/src/{deepseek_ocr}.rs` | C++ model handles, engine-thread confined |
 | `Buffer` (DeepEP) | Send | `deepep-sys/src/lib.rs:397` | NVSHMEM buffer handle |
 | `RawLogits` | Send | `infer-api/src/types.rs:54` | Caller must not share the mutable device allocation across threads |
 | `ServeHandle<E,K>` | Send (E,K unconstrained) | `infer-server/src/lib.rs:595` | Field-by-field Send proof in the comment |

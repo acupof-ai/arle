@@ -15,7 +15,6 @@ RESULTS=/tmp/metal_bench_supplement.jsonl
 # label : model-path : ready-timeout : extra-env
 MODELS=(
   "qwen36-35b-a3b-mtp-4bit:mlx-community/Qwen3.6-35B-A3B-MTP-4bit:360:"
-  "diffusiongemma-26b-a4b-it-4bit:mlx-community/diffusiongemma-26B-A4B-it-4bit:300:ARLE_DIFFUSION_MAX_DENOISING_STEPS=4"
   "zlab-qwen35-4b-dflash:z-lab/Qwen3.5-4B-DFlash:180:"
   "zlab-qwen36-35b-a3b-dflash:z-lab/Qwen3.6-35B-A3B-DFlash:360:"
   "qwen25-0.5b-bf16:mlx-community/Qwen2.5-0.5B-Instruct-bf16:90:"

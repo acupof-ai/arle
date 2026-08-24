@@ -30,16 +30,16 @@ authority rather than defining a second equal architecture.
 | `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll core + opt-in capability default-methods: stop ids, row/request caps, prefix reuse, KV page-tier and slot-tier hooks, OPD weight offload) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `KvBatchDescriptor` + `ResourceGovernor` + the backend-neutral `HostPagedKvPool`. No device types. | Concrete kernels, scheduler, model code |
 | `infer-core` | The one device-neutral `Engine<E,K>`: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry. No backend dependency. | Device kernels, HTTP, CLI |
 | `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, GLM-5.2 (`glm_moe_dsa`, on the DSv4 path; forward landed, verification pending-remote), Qwen3.5/3.6 hybrid+MoE (FP8 MoE via DeepGEMM, batched paged decode), Qwen3.8 NVFP4 (Marlin W4A16 `marlin_fp4_gemm`, repacked at load; prefill m≥512 dequantizes to FP8 for DeepGEMM), opt-in DSv4 whole-step decode CUDA graph (`ARLE_DSV4_DECODE_GRAPH=1`, below eager today), over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
-| `infer-metal` | Metal MLX `BackendExecutor` over `mlx-sys`: target-only Qwen execution is single-row; a loaded DFlash/NextN runtime enables configurable multi-row prefill, mixed, and decode plans. Supports Qwen3.5/3.6 hybrid+MoE, LFM2.5-8B-A1B hybrid (gated short-conv + full attention, behind the `CompiledMetalModel` trait), Gemma4, DeepSeek-OCR, and DiffusionGemma; `MetalKvPool` is a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
+| `infer-metal` | Metal MLX `BackendExecutor` over `mlx-sys`: target-only Qwen execution is single-row; a loaded DFlash/NextN runtime enables configurable multi-row prefill, mixed, and decode plans. Supports Qwen3.5/3.6 hybrid+MoE, LFM2.5-8B-A1B hybrid (gated short-conv + full attention, behind the `CompiledMetalModel` trait), DeepSeek-OCR; `MetalKvPool` is a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
 | `infer-hip` | HIP/ROCm `BackendExecutor` + KV pool (experimental AIPC lane, #76/#77): DSv4-Flash GGUF 2-bit shim-portable forward over `hip-sys`/`hip-kernels`; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP, datacenter CUDA paths (FlashMLA/DeepGEMM/DeepEP) |
-| `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4, Gemma4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP |
+| `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP |
 | `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
 | `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single facade for all backends) + tokenizer; `ServeHandle<E,K>` engine thread; relay protocol for both single-process (`LocalChannel*`) and multi-process (TCP) | Terminal UX, agent-session orchestration |
 | `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, `RawLogits`, OPD-teacher surface. Backends plug in behind it. | Terminal UX, REPL logic |
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant, Marlin W4A16 fp4 GEMM, unified quantized paged attention `paged_attention_quantized_fa3`) | Model code, scheduler logic, tokenizer |
-| `mlx-sys` | MLX C++ bridge for the Metal backend (Qwen3.5/3.6, Gemma4, LFM2.5 compiled models) | Anything that is not the Metal bridge |
+| `mlx-sys` | MLX C++ bridge for the Metal backend (Qwen3.5/3.6, LFM2.5 compiled models) | Anything that is not the Metal bridge |
 | `deepep-sys` | DeepEP/NVSHMEM FFI (`internode_ll` dispatch/combine) for EP collectives | Routing policy, scheduler |
 | `xgrammar-sys` | Grammar-constrained decode FFI (xgrammar) | Sampling policy, scheduler |
 | `hip-sys` / `hip-kernels` | Thin hand-declared HIP runtime FFI (stubs off-box) / HIP kernel build + FFI layer (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus, hipcc-gated) | Model code, scheduler logic |
@@ -48,7 +48,6 @@ authority rather than defining a second equal architecture.
 | `kv-native-sys` | `KvMmapStore` (sparse mmap page-slot store): memcpy writes, zero-copy reads. WAL/shm/mm/descriptors unused — kept for future shared-memory tier. | Tier policy, scheduler, GPU code |
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
-| `gemma-spec` | Gemma4 config spec (consumer today: `infer-vulkan` order pin; unranked in the model queue — ratification pending, roadmap §6) | Implementation code |
 | `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
 | `train` | Runtime-led post-training substrate (teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward). Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see OPD-only product boundary. Two families share it: **OPD** (`opd`/`self-opd`, teacher/EMA + KL) and **RFT** (`agent-opd`/`rubric-opd`, reward-selected + masked CE, no teacher/KL). "OPD-only" is the positioning, not that every subcommand is distillation. | GPU kernels, scheduler |
 
@@ -73,7 +72,7 @@ infer-cuda -> infer-plan, infer-seam, infer-topo, infer-moe, cuda-kernels, [deep
 infer-metal -> infer-plan, infer-seam, [mlx-sys]
 infer-gguf -> deepseek-spec (neutral GGUF host substrate leaf; spec crates never depend back)
 infer-hip -> infer-plan, infer-seam, deepseek-spec, infer-gguf, [hip-sys, hip-kernels]
-infer-vulkan -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
+infer-vulkan -> infer-plan, infer-seam, deepseek-spec, qwen3-spec, qwen35-spec,
  infer-gguf, [vulkan-sys, vulkan-kernels]
 
 infer-server -> infer-core, infer-seam, infer-plan
@@ -146,7 +145,7 @@ pre-split speculatively.
 | `infer-plan` | The data contract: `ForwardPlan`, `ForwardMode{Prefill,Decode,Mixed,Idle,Verify,Draft}`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device — the sole engine↔executor bridge. |
 | `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + the `KvPool` split (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `HostPagedKvPool`, the shared production host page allocator. No device types. |
 | `infer-core` | The one device-neutral scheduler: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry, `Engine<E,K>`. No backend dependency. |
-| `infer-metal` | Metal MLX Qwen3.5/3.6 hybrid+MoE forward plus LFM2.5-8B-A1B hybrid (gated short-conv + full attention, `CompiledMetalModel` trait), Gemma4, DeepSeek-OCR, and DiffusionGemma as a thin `BackendExecutor`. Target-only Qwen execution is single-row; loaded DFlash/NextN enables configurable multi-row prefill, mixed, and decode plans. `MetalKvPool` names the shared host allocator for compatibility. |
+| `infer-metal` | Metal MLX Qwen3.5/3.6 hybrid+MoE forward plus LFM2.5-8B-A1B hybrid (gated short-conv + full attention, `CompiledMetalModel` trait), DeepSeek-OCR as a thin `BackendExecutor`. Target-only Qwen execution is single-row; loaded DFlash/NextN enables configurable multi-row prefill, mixed, and decode plans. `MetalKvPool` names the shared host allocator for compatibility. |
 | `infer-cuda` | CUDA executor as a thin seam impl over `cuda-kernels`: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, GLM-5.2 (DSv4 path, verification pending-remote), Qwen3.5/3.6 hybrid+MoE (FP8 MoE via DeepGEMM), Qwen3.8 NVFP4 (Marlin W4A16, repacked at load), opt-in DSv4 decode CUDA graph (`ARLE_DSV4_DECODE_GRAPH=1`). |
 | `infer-topo` | TP/EP sharding helpers: `head_shard`, column/row shard. |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig`. |
