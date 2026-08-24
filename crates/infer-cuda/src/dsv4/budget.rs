@@ -172,16 +172,36 @@ impl Dsv4Model {
         let hidden = self.config.hidden_size;
         let stream_dim = hidden * self.config.hc_mult;
         let n = self.layers.len();
-        // attention(per-layer): Σ over layers + the start_pos scalar.
+        // attention(per-layer): Σ over layers + the start_pos scalar. The
+        // per-component sum is logged once: the total alone cannot say whether a
+        // buffer is worth quantizing, which is the number every KV-precision
+        // question has needed and nobody had.
         let mut total = std::mem::size_of::<i32>();
+        let mut per_component: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
         for layer in &self.layers {
-            total =
-                total.saturating_add(crate::attention::Dsv4LayerAttentionState::device_bytes_for(
+            for (name, bytes) in
+                crate::attention::Dsv4LayerAttentionState::device_bytes_for_breakdown(
                     &self.config,
                     layer.mode,
                     layer.compress_ratio,
                     max_seq_len,
-                )?);
+                )?
+            {
+                total = total.saturating_add(bytes);
+                *per_component.entry(name).or_default() += bytes;
+            }
+        }
+        if !per_component.is_empty() {
+            log::info!(
+                "[dsv4-slot-ledger] max_seq_len={max_seq_len} attn_total={:.1}MB {}",
+                total as f64 / (1024.0 * 1024.0),
+                per_component
+                    .iter()
+                    .map(|(k, v)| format!("{k}={:.1}MB", *v as f64 / (1024.0 * 1024.0)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
         if self.spec_decode_on {
             let ring = crate::attention::Dsv4SpecRingSnapshot::device_bytes_for(

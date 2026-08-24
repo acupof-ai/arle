@@ -863,17 +863,37 @@ impl Dsv4LayerAttentionState {
         compress_ratio: usize,
         max_seq_len: usize,
     ) -> Result<usize> {
+        Ok(
+            Self::device_bytes_for_breakdown(config, mode, compress_ratio, max_seq_len)?
+                .iter()
+                .map(|(_, bytes)| bytes)
+                .sum(),
+        )
+    }
+
+    /// The same static prediction as [`Self::device_bytes_for`], itemized. That
+    /// function is its sum, so the two cannot drift — the previous shape kept a
+    /// second copy of the arithmetic behind a "MUST mirror `new`" comment.
+    pub(crate) fn device_bytes_for_breakdown(
+        config: &DeepSeekV4Config,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        max_seq_len: usize,
+    ) -> Result<Vec<(&'static str, usize)>> {
         let bf16 = std::mem::size_of::<half::bf16>();
         // sw_window_cache[sliding_window * head_dim] bf16 — always present.
-        let mut total = config.sliding_window * config.head_dim * bf16;
+        let mut out = vec![("sw_window", config.sliding_window * config.head_dim * bf16)];
         if mode.has_compressor() {
-            total += Dsv4CompressorState::device_bytes_for(
-                config.head_dim,
-                compress_ratio,
-                compress_ratio < 16,
-                max_seq_len,
-                false,
-            );
+            out.push((
+                "compressor",
+                Dsv4CompressorState::device_bytes_for(
+                    config.head_dim,
+                    compress_ratio,
+                    compress_ratio < 16,
+                    max_seq_len,
+                    false,
+                ),
+            ));
         }
         let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
             1
@@ -881,24 +901,33 @@ impl Dsv4LayerAttentionState {
             compress_ratio
         };
         if mode.has_indexer() {
-            total += Dsv4CompressorState::device_bytes_for(
-                config.index_head_dim,
-                index_ratio,
-                true,
-                max_seq_len,
-                mode == DeepSeekV4AttentionMode::SparseIndexed,
-            );
+            out.push((
+                "indexer",
+                Dsv4CompressorState::device_bytes_for(
+                    config.index_head_dim,
+                    index_ratio,
+                    true,
+                    max_seq_len,
+                    mode == DeepSeekV4AttentionMode::SparseIndexed,
+                ),
+            ));
             // dsa_official: only the transient `rotated_keys` staging (its slot's
             // key-cache band lives in `Dsv4LayerKvLayout`, budgeted separately).
-            total += dsv4_dsa_rotated_keys_bytes(config, index_ratio, max_seq_len);
+            out.push((
+                "dsa_rotated",
+                dsv4_dsa_rotated_keys_bytes(config, index_ratio, max_seq_len),
+            ));
         }
         if cuda_kernels::HAS_FLASHMLA {
-            total += Dsv4FlashMlaDecodeState::device_bytes_estimate();
+            out.push(("flashmla", Dsv4FlashMlaDecodeState::device_bytes_estimate()));
         }
         if super::dsv4_fused_wqkv_decode_enabled()? {
-            total += Dsv4FusedWqkvDecodeScratch::device_bytes_for(config);
+            out.push((
+                "fused_wqkv",
+                Dsv4FusedWqkvDecodeScratch::device_bytes_for(config),
+            ));
         }
-        Ok(total)
+        Ok(out)
     }
 
     /// Per-component byte breakdown for the VRAM ledger log.

@@ -22,10 +22,10 @@ with concrete evidence.
 
 | Axis | Format | Status | Enable | Notes |
 |---|---|---|---|---|
-| **KV cache** | BF16 | production | `--kv-cache-dtype bf16` | Reference fallback. CUDA-paged + Metal. |
-| KV cache | INT8 | production (Metal default + CUDA) | `--kv-cache-dtype int8`; Metal `auto` resolves to int8 | Metal stores full-attention K/V as MLX affine 8-bit packed triples (`uint32 data + bf16 scale/bias`, group 128/64/32 by head_dim). CUDA uses per-(token, head) scales for K and V (/127); decode on `paged_attention_quantized_fa3.cu`. |
-| KV cache | FP8 E4M3 | production (CUDA) | `--kv-cache-dtype fp8` | Per-(token, head) scales for K and V (/448). Same code shape as INT8 modulo quant range. |
-| KV cache | TurboQuant TQ2/3/4 | experimental (CUDA) | `--kv-cache-dtype tq{2,3,4}` | FWHT-rotated packed indices + FP16 group norms. Page-size-1 path bypasses the batched paged prefill kernel. **Decode requires sm_80+**; sm_70 V100 build returns `CUDA_ERROR_NOT_SUPPORTED`. sm_80 audit pending. |
+| **KV cache** | BF16 | production | `--kv-cache-dtype bf16` | Reference fallback. CUDA-paged + Metal. The only value DSv4 accepts. |
+| KV cache | INT8 | production (Metal default + CUDA) | `--kv-cache-dtype int8`; Metal `auto` resolves to int8 | Metal stores full-attention K/V as MLX affine 8-bit packed triples (`uint32 data + bf16 scale/bias`, group 128/64/32 by head_dim). CUDA uses per-(token, head) scales for K and V (/127); decode on `paged_attention_quantized_fa3.cu`. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
+| KV cache | FP8 E4M3 | production (CUDA) | `--kv-cache-dtype fp8` | Per-(token, head) scales for K and V (/448). Same code shape as INT8 modulo quant range. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
+| KV cache | TurboQuant TQ4 | experimental (CUDA) | `--kv-cache-dtype tq4` (the clap enum accepts `auto\|bf16\|int8\|fp8\|tq4` — there is no `tq2`/`tq3`, `args.rs:944`) | FWHT-rotated packed indices + FP16 group norms. Page-size-1 path bypasses the batched paged prefill kernel. **Decode requires sm_80+**; sm_70 V100 build returns `CUDA_ERROR_NOT_SUPPORTED`. sm_80 audit pending. |
 | **Weights** | DenseBF16 | production | default | No quantization. |
 | Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4_gemv` + Marlin W4 prefill. |
 | Weights | MarlinW4A8 | production (CUDA), Tier-1 | env `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` for the prefill-graph win path (–92.5% TTFT p50). |

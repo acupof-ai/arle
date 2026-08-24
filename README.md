@@ -201,7 +201,7 @@ Agent and RL workloads re-process the same prompt + history + tool output every 
 
 **KV stays hot across turns.** Prior-turn KV stays on GPU; prefix pages are shared across requests via the host radix cache, demote to host RAM under memory pressure, and promote back on next hit — no re-prefill.
 
-**Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV behind `--kv-cache-dtype`. Correctness-gated, opt-in (default BF16).
+**Quantized KV on CUDA.** INT8/FP8 paged-KV behind `--kv-cache-dtype`, Qwen3.5/3.6 family only. Correctness-gated, opt-in (default BF16). DSv4 rejects the flag: its MLA KV is already FP8-packed.
 
 **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code. The OPD teacher *is* the production server.
 

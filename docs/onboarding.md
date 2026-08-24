@@ -129,7 +129,7 @@ Runtime 改动**必须**有 bench wins/errors 条目（[`AGENTS.md`](../AGENTS.m
 | `crates/cuda-kernels/csrc/` | `cargo test --release -p infer-cuda --features cuda` | `scripts/bench_throughput.py` + nsys |
 | `crates/infer-core/`（Engine/调度） | `cargo test --release -p infer-core` | native fixed-concurrency benchmark |
 | `crates/infer-cuda/`（model/qwen35） | `cargo test --release -p infer-cuda --features cuda` | native fixed-concurrency benchmark |
-| KV quant / dtype | Seam-level `--kv-cache-dtype` dispatch (BF16 default; INT8/FP8 LICENSED correctness-gated, opt-in). See [wins #68](experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md) | native benchmark + needle gate |
+| KV quant / dtype | Seam-level `--kv-cache-dtype` dispatch (BF16 default; INT8/FP8 LICENSED correctness-gated, opt-in, **Qwen3.5/3.6 family only** — DSv4 rejects it). See [wins #68](experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md) | native benchmark + needle gate |
 | `crates/infer-metal/` | `cargo test --release -p infer-metal --no-default-features --features metal,no-cuda` | Metal Qwen3.6 bench（见 AGENTS.md §Metal canonical model） |
 | `crates/agent/`、`crates/cli/` | `cargo test --release -p agent -p cli -p chat` | — |
 | `crates/train/` OPD | `cargo test --release -p train` | OPD smoke on CUDA GPU |
