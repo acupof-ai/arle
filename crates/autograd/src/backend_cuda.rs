@@ -13,9 +13,9 @@ use crate::{
         CudaBf16Storage, CudaFp4E2M1GroupStorage, CudaFp8BlockScaledStorage, CudaStorage,
         LinearAttentionDeviceParams, cpu_causal_sdpa_recompute_backward,
         dequantize_fp8_block_scaled_host, matmul_bt_output_shape, matmul_output_shape,
-        validate_broadcast, validate_decode_gqa_cache_shapes, validate_decode_gqa_shapes,
-        validate_fp8_block_scaled, validate_qwen_decode_prepare_kv_shapes,
-        validate_qwen_decode_prepare_q_shapes, validate_slice_shape,
+        validate_broadcast, validate_decode_gqa_cache_shapes, validate_fp8_block_scaled,
+        validate_qwen_decode_prepare_kv_shapes, validate_qwen_decode_prepare_q_shapes,
+        validate_slice_shape,
     },
 };
 use crate::{
@@ -1347,26 +1347,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn all_to_all_device(
-        &self,
-        x: &DeviceHandle,
-        in_shape: &[usize],
-        scatter_axis: usize,
-        gather_axis: usize,
-        axis: CommAxis,
-    ) -> Result<(DeviceHandle, Vec<usize>)> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (x, in_shape, scatter_axis, gather_axis, axis);
-            todo!("GPU required: cuda all_to_all_device is unavailable under feature no-cuda")
-        }
-
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_all_to_all_device(self, x, in_shape, scatter_axis, gather_axis, axis)
-        }
-    }
-
     /// Returns an unevaluated handle per the batched-eval contract.
     fn mul_scalar_backward_device(
         &self,
@@ -1658,18 +1638,6 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_unary_1d(self, a, "neg_f32")
-        }
-    }
-
-    fn gelu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = a;
-            todo!("GPU required: cuda gelu is unavailable under feature no-cuda")
-        }
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_unary_1d(self, a, "gelu_f32")
         }
     }
 
@@ -2060,27 +2028,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn causal_sdpa_decode_gqa(
-        &self,
-        q: &DeviceHandle,
-        q_shape: &[usize],
-        k: &DeviceHandle,
-        k_shape: &[usize],
-        v: &DeviceHandle,
-        v_shape: &[usize],
-        q_start: usize,
-    ) -> Result<(DeviceHandle, Vec<usize>)> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (q, q_shape, k, k_shape, v, v_shape, q_start);
-            todo!("GPU required: cuda causal_sdpa_decode_gqa is unavailable under feature no-cuda")
-        }
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_causal_sdpa_decode_gqa(self, q, q_shape, k, k_shape, v, v_shape, q_start)
-        }
-    }
-
     fn causal_sdpa_decode_gqa_cache(
         &self,
         q: &DeviceHandle,
@@ -2233,28 +2180,6 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_slice_backward_device(self, upstream, input_shape, starts, ends)
-        }
-    }
-
-    fn permute_seq_blocks_device(
-        &self,
-        x: &DeviceHandle,
-        batch: usize,
-        num_blocks: usize,
-        block_elems: usize,
-        perm: &[usize],
-    ) -> Result<DeviceHandle> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (x, batch, num_blocks, block_elems, perm);
-            todo!(
-                "GPU required: cuda permute_seq_blocks_device is unavailable under feature no-cuda"
-            )
-        }
-
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_permute_seq_blocks_device(self, x, batch, num_blocks, block_elems, perm)
         }
     }
 
@@ -2450,24 +2375,6 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_silu_backward_device(self, upstream, x, shape)
-        }
-    }
-
-    /// Device-resident backward for `gelu(x)` (erf form).
-    fn gelu_backward_device(
-        &self,
-        upstream: &DeviceHandle,
-        x: &DeviceHandle,
-        shape: &[usize],
-    ) -> Result<DeviceHandle> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (upstream, x, shape);
-            todo!("GPU required: cuda gelu_backward_device is unavailable under feature no-cuda")
-        }
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_gelu_backward_device(self, upstream, x, shape)
         }
     }
 

@@ -72,7 +72,7 @@ pub(super) fn cuda_copy_range<T: DeviceRepr>(
 
 /// Concat N f32 device tensors along `axis`, on-device. `cuda_concat_parts` only
 /// does the outermost axis, so transpose `axis`→0, concat, transpose back
-/// (identity when axis==0). Shared by `all_to_all_device` assembly and `concat`.
+/// (identity when axis==0). Used by `concat`.
 #[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_concat_axis(
     backend: &CudaBackend,

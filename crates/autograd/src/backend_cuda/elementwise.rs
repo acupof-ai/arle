@@ -565,23 +565,6 @@ pub(super) fn cuda_silu_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_gelu_backward_device(
-    backend: &CudaBackend,
-    upstream: &DeviceHandle,
-    x: &DeviceHandle,
-    shape: &[usize],
-) -> Result<DeviceHandle> {
-    cuda_elementwise_backward_with_saved(
-        backend,
-        upstream,
-        x,
-        shape,
-        "gelu_backward_f32",
-        "gelu_backward_device",
-    )
-}
-
-#[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_sigmoid_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,

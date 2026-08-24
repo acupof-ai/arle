@@ -7,11 +7,10 @@ use autograd::{
     CpuBackend,
     backend::{
         Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gather_last_dim_forward,
-        cpu_gelu_forward, cpu_log_softmax_forward_last_axis, cpu_matmul_backward,
-        cpu_matmul_bt_forward, cpu_matmul_forward, cpu_mean_last_axis_forward, cpu_mul_forward,
-        cpu_mul_scalar_forward, cpu_neg_forward, cpu_rms_norm_forward, cpu_rope_forward,
-        cpu_scatter_add_rows_forward, cpu_silu_forward, cpu_softmax_forward_last_axis,
-        cpu_sum_last_axis_forward,
+        cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_matmul_bt_forward,
+        cpu_matmul_forward, cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward,
+        cpu_neg_forward, cpu_rms_norm_forward, cpu_rope_forward, cpu_scatter_add_rows_forward,
+        cpu_silu_forward, cpu_softmax_forward_last_axis, cpu_sum_last_axis_forward,
     },
 };
 
@@ -25,7 +24,6 @@ fn _touch_refs() {
     let _ = cpu_mul_scalar_forward;
     let _ = cpu_exp_forward;
     let _ = cpu_neg_forward;
-    let _ = cpu_gelu_forward;
     let _ = cpu_silu_forward;
     let _ = cpu_rms_norm_forward;
     let _ = cpu_embedding_forward;
@@ -606,18 +604,6 @@ fn cuda_backend_neg_matches_cpu() {
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 #[test]
-fn cuda_backend_gelu_matches_cpu() {
-    use autograd::backend::Backend;
-    use autograd::backend_cuda::CudaBackend;
-    let backend = CudaBackend::new(0).expect("cuda ctx");
-    let a = make_rows(&[4, 128], 9);
-    let got = backend.gelu_forward(&a).expect("cuda gelu");
-    let want = cpu_gelu_forward(&a).unwrap();
-    assert_close(&got, &want, 1e-4, "cuda gelu");
-}
-
-#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
-#[test]
 fn cuda_backend_silu_matches_cpu() {
     use autograd::backend::Backend;
     use autograd::backend_cuda::CudaBackend;
@@ -787,18 +773,6 @@ fn metal_backend_neg_matches_cpu() {
     let got = backend.neg_forward(&a).expect("metal neg");
     let want = cpu_neg_forward(&a).unwrap();
     assert_close(&got, &want, 1e-6, "metal neg");
-}
-
-#[cfg(feature = "metal")]
-#[test]
-fn metal_backend_gelu_matches_cpu() {
-    use autograd::backend::Backend;
-    use autograd::backend_metal::MetalBackend;
-    let backend = MetalBackend;
-    let a = make_rows(&[4, 128], 9);
-    let got = backend.gelu_forward(&a).expect("metal gelu");
-    let want = cpu_gelu_forward(&a).unwrap();
-    assert_close(&got, &want, 1e-3, "metal gelu");
 }
 
 #[cfg(feature = "metal")]

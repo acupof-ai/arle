@@ -24,11 +24,6 @@ pub enum SavedContext {
     Tensors(SmallVec<[TensorId; 4]>),
     TensorAndScalar(TensorId, f32),
     Shape(Vec<usize>),
-    AllToAllCtx {
-        in_shape: Vec<usize>,
-        scatter_axis: usize,
-        gather_axis: usize,
-    },
     MatmulCtx {
         a: TensorId,
         b: TensorId,
@@ -53,16 +48,6 @@ pub enum SavedContext {
         indices: Vec<usize>,
         logits_shape: Vec<usize>,
         top_k: usize,
-    },
-    MoeGatherRowsCtx {
-        rows: Vec<usize>,
-        input_shape: Vec<usize>,
-    },
-    MoeWeightedScatterCtx {
-        routes: Vec<ops::moe::MoeRoute>,
-        values_shape: Vec<usize>,
-        weights_shape: Vec<usize>,
-        out_rows: usize,
     },
     MoeGroupedLinearCtx {
         input: TensorId,
@@ -94,9 +79,6 @@ pub enum SavedContext {
     SigmoidCtx {
         y: TensorId,
     },
-    GeluCtx {
-        x: TensorId,
-    },
     RoPECtx {
         cos: TensorId,
         sin: TensorId,
@@ -114,11 +96,6 @@ pub enum SavedContext {
     },
     CatHeadsCtx {
         head_counts: Vec<usize>,
-    },
-    PermuteSeqBlocksCtx {
-        /// Destination block `i` took source block `perm[i]`.
-        perm: Vec<usize>,
-        block_rows: usize,
     },
     CatSeqCtx {
         seq_counts: Vec<usize>,
@@ -261,20 +238,16 @@ pub enum BackwardOp {
     LogSoftmax,
     Gather,
     MoeTopKSoftmax,
-    MoeGatherRows,
-    MoeWeightedScatter,
     MoeGroupedLinear,
     MoeGroupedWeightedScatter,
     Mean,
     RMSNorm,
     Silu,
     Sigmoid,
-    Gelu,
     RoPE,
     Reshape,
     BroadcastExpand,
     Slice,
-    PermuteSeqBlocks,
     CatHeads,
     CatSeq,
     Cat,
@@ -293,8 +266,6 @@ pub enum BackwardOp {
     CausalSdpaRecompute,
     AllReduceSum,
     AllGatherSeq,
-    ReduceScatterSum,
-    AllToAll,
     RingAttention,
     Checkpoint,
     SeqChunkedRecompute,
@@ -315,20 +286,16 @@ impl BackwardOp {
             BackwardOp::LogSoftmax => "LogSoftmax",
             BackwardOp::Gather => "Gather",
             BackwardOp::MoeTopKSoftmax => "MoeTopKSoftmax",
-            BackwardOp::MoeGatherRows => "MoeGatherRows",
-            BackwardOp::MoeWeightedScatter => "MoeWeightedScatter",
             BackwardOp::MoeGroupedLinear => "MoeGroupedLinear",
             BackwardOp::MoeGroupedWeightedScatter => "MoeGroupedWeightedScatter",
             BackwardOp::Mean => "Mean",
             BackwardOp::RMSNorm => "RMSNorm",
             BackwardOp::Silu => "Silu",
             BackwardOp::Sigmoid => "Sigmoid",
-            BackwardOp::Gelu => "Gelu",
             BackwardOp::RoPE => "RoPE",
             BackwardOp::Reshape => "Reshape",
             BackwardOp::BroadcastExpand => "BroadcastExpand",
             BackwardOp::Slice => "Slice",
-            BackwardOp::PermuteSeqBlocks => "PermuteSeqBlocks",
             BackwardOp::CatHeads => "CatHeads",
             BackwardOp::CatSeq => "CatSeq",
             BackwardOp::Cat => "Cat",
@@ -343,8 +310,6 @@ impl BackwardOp {
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
-            BackwardOp::ReduceScatterSum => "ReduceScatterSum",
-            BackwardOp::AllToAll => "AllToAll",
             BackwardOp::RingAttention => "RingAttention",
             BackwardOp::Checkpoint => "Checkpoint",
             BackwardOp::SeqChunkedRecompute => "SeqChunkedRecompute",
@@ -794,12 +759,6 @@ impl Tape {
                     BackwardOp::MoeTopKSoftmax => {
                         ops::moe_topk_softmax_backward(&entry, output_grad_id, store)?
                     }
-                    BackwardOp::MoeGatherRows => {
-                        ops::moe_gather_rows_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::MoeWeightedScatter => {
-                        ops::moe_weighted_scatter_backward(&entry, output_grad_id, store)?
-                    }
                     BackwardOp::MoeGroupedLinear => {
                         ops::moe_grouped_linear_backward(&entry, output_grad_id, store)?
                     }
@@ -810,7 +769,6 @@ impl Tape {
                     BackwardOp::RMSNorm => ops::rmsnorm_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Silu => ops::silu_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Sigmoid => ops::sigmoid_backward(&entry, output_grad_id, store)?,
-                    BackwardOp::Gelu => ops::gelu_backward(&entry, output_grad_id, store)?,
                     BackwardOp::RoPE => ops::rope_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Reshape => ops::reshape_backward(&entry, output_grad_id, store)?,
                     BackwardOp::BroadcastExpand => {
@@ -850,9 +808,6 @@ impl Tape {
                             }
                             _ => ops::slice_backward(&entry, output_grad_id, store)?,
                         }
-                    }
-                    BackwardOp::PermuteSeqBlocks => {
-                        ops::permute_seq_blocks_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::CatHeads => ops::cat_heads_backward(&entry, output_grad_id, store)?,
                     BackwardOp::CatSeq => ops::cat_seq_backward(&entry, output_grad_id, store)?,
@@ -915,12 +870,6 @@ impl Tape {
                     }
                     BackwardOp::AllGatherSeq => {
                         ops::all_gather_seq_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::ReduceScatterSum => {
-                        ops::reduce_scatter_sum_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::AllToAll => {
-                        ops::all_to_all_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::RingAttention => ops::ring_attention::cp_ring_attention_backward(
                         &entry,

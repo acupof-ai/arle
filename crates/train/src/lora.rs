@@ -278,27 +278,6 @@ impl LinearWithLora {
         self.weight = weight;
     }
 
-    pub fn set_base_weight_to_fp8_block_scaled(
-        &mut self,
-        weight: &[u8],
-        scales: &[f32],
-        block_m: usize,
-        block_k: usize,
-        store: &mut TensorStore,
-    ) -> Result<()> {
-        let shape = store
-            .get(self.weight)
-            .ok_or(AutogradError::InvalidTensorId(self.weight))?
-            .shape
-            .clone();
-        let handle = store
-            .backend()
-            .upload_fp8_block_scaled(weight, scales, &shape, block_m, block_k)?;
-        store.replace_device_handle(self.weight, handle)?;
-        store.set_requires_grad(self.weight, false)?;
-        Ok(())
-    }
-
     pub fn parameter_name_map(&self) -> HashMap<&'static str, TensorId> {
         HashMap::from([(self.base_name, self.weight)])
     }

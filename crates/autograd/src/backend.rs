@@ -1530,32 +1530,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         ))
     }
 
-    /// All-to-all: split `scatter_axis` across ranks, concatenate each rank's
-    /// slice along `gather_axis`. Returns `(handle, out_shape)` — the shape
-    /// changes (`[seq/N,b,hidden]` → `[seq,b,hidden/N]`), so the caller can't
-    /// derive it. Single-rank / CPU / no-communicator semantics are identity
-    /// (out_shape == in_shape); the default returns the input unchanged.
-    fn all_to_all_device(
-        &self,
-        x: &DeviceHandle,
-        in_shape: &[usize],
-        scatter_axis: usize,
-        gather_axis: usize,
-        axis: CommAxis,
-    ) -> Result<(DeviceHandle, Vec<usize>)> {
-        let _ = (scatter_axis, gather_axis, axis);
-        let host = self.readback(x)?;
-        let size = shape_size(in_shape);
-        if host.len() != size {
-            return Err(crate::AutogradError::DataLengthMismatch {
-                len: host.len(),
-                shape: in_shape.to_vec(),
-                size,
-            });
-        }
-        Ok((self.upload(&host, in_shape)?, in_shape.to_vec()))
-    }
-
     /// Sum of squares for a device handle, returned on host as `f64`.
     /// CUDA overrides with a partial-reduction kernel so gradient clipping
     /// can stay device-resident.
@@ -1887,11 +1861,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_neg_forward(a)
     }
 
-    /// Elementwise GELU (tanh approximation), matches `ops::activation::gelu`.
-    fn gelu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
-        cpu_gelu_forward(a)
-    }
-
     /// Elementwise SiLU (Swish) — `out = a * sigmoid(a)`.
     fn silu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         cpu_silu_forward(a)
@@ -2034,21 +2003,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         }
         host[index] = src_host[0];
         self.upload(&host, &[len])
-    }
-
-    /// Lazy GELU (erf form), matching `ops::activation::gelu`'s CPU body:
-    /// `0.5 * x * (1 + erf(x / sqrt(2)))`. NOT the tanh-approx variant
-    /// exposed by `gelu_forward` — those two formulas differ at the ~1e-3
-    /// level, and `gelu_backward` hard-codes the erf-derivative via the
-    /// saved input, so forward must stay on the erf form for the
-    /// saved-input derivative to be consistent.
-    fn gelu(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
-        let host = self.readback(x)?;
-        let out: Vec<f32> = host
-            .iter()
-            .map(|&value| 0.5 * value * (1.0 + libm::erff(value * 0.707_106_77)))
-            .collect();
-        self.upload(&out, shape)
     }
 
     /// Reduce-sum over the last axis. Output has length `product(shape[..-1])`
@@ -2270,37 +2224,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&dst_host, dst_shape)
     }
 
-    /// Decode-time GQA causal attention for a one-token query:
-    /// `out = softmax(q @ k^T / sqrt(D)) @ v`.
-    ///
-    /// Shapes:
-    /// - `q`: `[batch, query_heads, 1, head_dim]`
-    /// - `k`/`v`: `[batch, kv_heads, kv_len, head_dim]`
-    ///
-    /// This is the narrow OPD rollout fast path. `query_heads` may be a
-    /// multiple of `kv_heads`; each query head maps to `kv_head =
-    /// query_head / (query_heads / kv_heads)`. The default fallback keeps
-    /// non-CUDA backends correct by using the CPU reference.
-    fn causal_sdpa_decode_gqa(
-        &self,
-        q: &DeviceHandle,
-        q_shape: &[usize],
-        k: &DeviceHandle,
-        k_shape: &[usize],
-        v: &DeviceHandle,
-        v_shape: &[usize],
-        q_start: usize,
-    ) -> Result<(DeviceHandle, Vec<usize>)> {
-        let q_host = self.readback(q)?;
-        let k_host = self.readback(k)?;
-        let v_host = self.readback(v)?;
-        let (data, out_shape) = cpu_causal_sdpa_decode_gqa(
-            &q_host, q_shape, &k_host, k_shape, &v_host, v_shape, q_start,
-        )?;
-        let handle = self.upload(&data, &out_shape)?;
-        Ok((handle, out_shape))
-    }
-
     /// Fused causal SDPA prefill forward (flash-style online softmax — no
     /// `[seq, seq]` score transient). `q` is `[1, q_heads, q_len, head_dim]`,
     /// `k`/`v` `[1, kv_heads, kv_len, head_dim]` with `kv_len = q_start +
@@ -2474,37 +2397,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             grad[input_index] += grad_value;
         }
         self.upload(&grad, input_shape)
-    }
-
-    /// Reorder whole seq blocks: destination block `i` takes source block
-    /// `perm[i]`. Blocks are contiguous element ranges, so a backend can move
-    /// them without materializing one tensor per block.
-    fn permute_seq_blocks_device(
-        &self,
-        x: &DeviceHandle,
-        batch: usize,
-        num_blocks: usize,
-        block_elems: usize,
-        perm: &[usize],
-    ) -> Result<DeviceHandle> {
-        let src = self.readback(x)?;
-        let total = batch * num_blocks * block_elems;
-        if src.len() != total || perm.len() != num_blocks {
-            return Err(crate::AutogradError::DataLengthMismatch {
-                len: src.len(),
-                shape: vec![batch, num_blocks, block_elems],
-                size: total,
-            });
-        }
-        let mut out = vec![0.0f32; total];
-        for b in 0..batch {
-            for (i, &from) in perm.iter().enumerate() {
-                let d = (b * num_blocks + i) * block_elems;
-                let s = (b * num_blocks + from) * block_elems;
-                out[d..d + block_elems].copy_from_slice(&src[s..s + block_elems]);
-            }
-        }
-        self.upload(&out, &[total])
     }
 
     /// Add `upstream` into `dest`'s slice region. Unlike `write_slice_device`,
@@ -2819,42 +2711,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             .map(|(&xv, &up)| {
                 let sigmoid = 1.0 / (1.0 + (-xv).exp());
                 let deriv = sigmoid + (xv * sigmoid * (1.0 - sigmoid));
-                up * deriv
-            })
-            .collect();
-        self.upload(&grad, shape)
-    }
-
-    /// Elementwise `grad_x[i] = upstream[i] * gelu'(x[i])` where
-    /// `gelu'(x) = 0.5*(1 + erf(x/√2)) + x * (1/√(2π)) * exp(-x²/2)`.
-    /// (erf form, matches the autograd `gelu_host_eager` forward.)
-    ///
-    /// CUDA overrides with a 1D NVRTC kernel. Returned handle is unevaluated.
-    fn gelu_backward_device(
-        &self,
-        upstream: &DeviceHandle,
-        x: &DeviceHandle,
-        shape: &[usize],
-    ) -> Result<DeviceHandle> {
-        const INV_SQRT_2: f32 = 0.707_106_77;
-        const INV_SQRT_2PI: f32 = 0.398_942_3;
-        let upstream_host = self.readback(upstream)?;
-        let x_host = self.readback(x)?;
-        let size = shape_size(shape);
-        if upstream_host.len() != size || x_host.len() != size {
-            return Err(crate::AutogradError::DataLengthMismatch {
-                len: upstream_host.len().min(x_host.len()),
-                shape: shape.to_vec(),
-                size,
-            });
-        }
-        let grad: Vec<f32> = x_host
-            .iter()
-            .zip(upstream_host.iter())
-            .map(|(&xv, &up)| {
-                let erf_term = libm::erff(xv * INV_SQRT_2);
-                let exp_term = (-0.5 * xv * xv).exp();
-                let deriv = 0.5 * (1.0 + erf_term) + (xv * INV_SQRT_2PI * exp_term);
                 up * deriv
             })
             .collect();
