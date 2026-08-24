@@ -231,28 +231,13 @@ impl OpenAiTokenizer {
     }
 
     pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.render_chat_with_kwargs(messages, None)
-    }
-
-    /// Render chat messages, passing optional `chat_template_kwargs` (e.g.
-    /// `enable_thinking`) into the Jinja template context. `None` kwargs render
-    /// byte-identically to [`Self::render_chat`]. Builtin (non-Jinja) renderers
-    /// have no template variables and ignore the kwargs.
-    ///
-    /// Thin wrapper over [`Self::render_chat_full`] with no tools and
-    /// thinking-off — the byte-identical legacy path for tool-less callers.
-    pub fn render_chat_with_kwargs(
-        &self,
-        messages: &[ChatMessage],
-        chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<String> {
-        self.render_chat_full(messages, chat_template_kwargs, &[], false, None)
+        self.render_chat_full(messages, None, &[], false, None)
     }
 
     /// Full chat render: threads tool definitions, per-message tool calls, and
     /// the thinking / reasoning-effort switches into whichever renderer the
     /// checkpoint resolved to. Tool-less, thinking-off calls render
-    /// byte-identically to the legacy [`Self::render_chat_with_kwargs`].
+    /// byte-identically to the legacy [`Self::render_chat`].
     pub fn render_chat_full(
         &self,
         messages: &[ChatMessage],

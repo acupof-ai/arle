@@ -92,10 +92,9 @@ pub use serve_engine::ServeInferenceEngine;
 // the `infer-api` surface without depending on `infer-server` directly (mirrors
 // the `infer-cuda` re-export pattern above).
 pub use infer_server::{
-    BuildIdentity, PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator,
-    RelayEnvelope, RelayWorker, SamplingDefaults, ServeShutdown, TcpChannel, WireRequest,
-    WireStats, build_identity, coordinator_local_router, set_messages_dump_dir,
-    set_sampling_defaults,
+    BuildIdentity, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker,
+    SamplingDefaults, ServeShutdown, WireStats, build_identity, coordinator_local_router,
+    set_messages_dump_dir, set_sampling_defaults,
 };
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface.

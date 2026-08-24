@@ -4,14 +4,6 @@ use std::ops::Range;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
-/// Borrowed ChatML message used by callers that only need raw role/content
-/// rendering without tool or default-system handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChatMlMessage<'a> {
-    pub role: &'a str,
-    pub content: &'a str,
-}
-
 /// Byte spans for a rendered ChatML turn.
 ///
 /// `turn` covers the full `<|im_start|>role\ncontent<|im_end|>\n` slice.
@@ -33,15 +25,12 @@ pub struct RenderedChatMl {
 /// OpenAI `tool_choice` semantics applied during prompt construction.
 ///
 /// Mirrors the OpenAI wire format: `Auto` lets the model decide, `None`
-/// suppresses tool emission entirely, `Required` forces some tool call, and
-/// `Function` forces one named tool.
+/// suppresses tool emission entirely.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ToolChoiceMode {
     #[default]
     Auto,
     None,
-    Required,
-    Function(String),
 }
 
 struct PromptRenderer<'a> {
@@ -54,24 +43,6 @@ struct PromptRenderer<'a> {
     /// `enable_thinking=False` chat template). Scoped: callers that never pass
     /// `/no_think` (e.g. the interactive agent) keep thinking enabled.
     no_think: bool,
-}
-
-fn append_chatml_message_with_span(prompt: &mut String, role: &str, content: &str) -> ChatMlSpan {
-    let turn_start = prompt.len();
-    prompt.push_str("<|im_start|>");
-    prompt.push_str(role);
-    prompt.push('\n');
-
-    let supervised_start = prompt.len();
-    prompt.push_str(content);
-    prompt.push_str("<|im_end|>");
-    let supervised_end = prompt.len();
-    prompt.push('\n');
-
-    ChatMlSpan {
-        turn: turn_start..prompt.len(),
-        supervised: supervised_start..supervised_end,
-    }
 }
 
 fn append_structured_chatml_message_with_span(
@@ -226,15 +197,9 @@ fn append_tool_call_block(prompt: &mut String, tool_call: &ToolCall) {
     prompt.push_str(TOOL_CALL_BLOCK.close);
 }
 
-/// Thin `Auto` wrapper over [`build_tool_block_with_choice`].
-pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
-    build_tool_block_with_choice(tools, &ToolChoiceMode::Auto)
-}
-
 /// `None` returns an empty block (no tools are advertised, so the model
-/// answers as plain text); `Required`/`Function` append a directive that
-/// forces tool emission.
-pub fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoiceMode) -> String {
+/// answers as plain text).
+fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoiceMode) -> String {
     if matches!(choice, ToolChoiceMode::None) || tools.is_empty() {
         return String::new();
     }
@@ -273,35 +238,11 @@ Reminder:\n\
 </IMPORTANT>",
     );
 
-    match choice {
-        ToolChoiceMode::Required => {
-            out.push_str(
-                "\nYou MUST respond by emitting a <tool_call> for one of the available tools; \
-do not answer in plain prose.",
-            );
-        }
-        ToolChoiceMode::Function(name) => {
-            out.push_str(&format!(
-                "\nYou MUST call the `{name}` tool via <tool_call> and no other tool; \
-do not answer in plain prose."
-            ));
-        }
-        ToolChoiceMode::Auto | ToolChoiceMode::None => {}
-    }
-
     out
 }
 
 pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
-    messages_to_prompt_with_tool_choice(messages, tools, &ToolChoiceMode::Auto)
-}
-
-pub fn messages_to_prompt_with_tool_choice(
-    messages: &[ChatMessage],
-    tools: &[ToolDefinition],
-    choice: &ToolChoiceMode,
-) -> String {
-    let tool_block = build_tool_block_with_choice(tools, choice);
+    let tool_block = build_tool_block_with_choice(tools, &ToolChoiceMode::Auto);
     let mut renderer = PromptRenderer::new(&tool_block);
     for message in messages {
         renderer.push_message(message);
@@ -317,27 +258,6 @@ pub fn render_structured_chatml_with_spans(
     let spans: Vec<_> = messages
         .iter()
         .map(|message| append_structured_chatml_message_with_span(&mut prompt, message))
-        .collect();
-    if add_generation_prompt {
-        prompt.push_str("<|im_start|>assistant\n");
-    }
-
-    RenderedChatMl { prompt, spans }
-}
-
-/// Raw ChatML rendering without tool or default-system injection.
-pub fn render_chatml(messages: &[ChatMlMessage<'_>], add_generation_prompt: bool) -> String {
-    render_chatml_with_spans(messages, add_generation_prompt).prompt
-}
-
-pub fn render_chatml_with_spans(
-    messages: &[ChatMlMessage<'_>],
-    add_generation_prompt: bool,
-) -> RenderedChatMl {
-    let mut prompt = String::new();
-    let spans: Vec<_> = messages
-        .iter()
-        .map(|message| append_chatml_message_with_span(&mut prompt, message.role, message.content))
         .collect();
     if add_generation_prompt {
         prompt.push_str("<|im_start|>assistant\n");
