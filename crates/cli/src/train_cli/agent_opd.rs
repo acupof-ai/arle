@@ -717,8 +717,16 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         // Don't let failures (rejected inside `update`) burn budget.
                         batch.retain(|t| t.reward >= 1.0);
                     }
-                    batch.truncate(cap_left);
-                    cap_left -= batch.len();
+                    // A group the preset discards must not spend a budget reserved
+                    // for trainable trajectories: a zero-variance group took the
+                    // whole round's cap and left the one group carrying signal
+                    // truncated to nothing (errors/2026-08-24).
+                    if group_trained {
+                        batch.truncate(cap_left);
+                        cap_left -= batch.len();
+                    } else {
+                        batch.clear();
+                    }
                 }
                 // Append a replacement for a dead group (grow `work` now so the
                 // last-window sync check stays correct; launch is deferred to
