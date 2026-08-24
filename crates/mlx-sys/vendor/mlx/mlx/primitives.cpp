@@ -5151,6 +5151,20 @@ std::pair<std::vector<array>, std::vector<int>> Split::vmap(
   return {std::move(output), std::move(output_axes)};
 }
 
+std::vector<Shape> Split::output_shapes(const std::vector<array>& inputs) {
+  // Mirrors split() in ops.cpp — needed so shapeless=true compile can infer
+  // output shapes without evaluating the primitive.
+  const auto& in_shape = inputs[0].shape();
+  auto ax = axis_ < 0 ? axis_ + static_cast<int>(in_shape.size()) : axis_;
+  std::vector<Shape> shapes(indices_.size() + 1, in_shape);
+  shapes[0][ax] = indices_[0];
+  for (int i = 1; i < static_cast<int>(indices_.size()); i++) {
+    shapes[i][ax] = indices_[i] - indices_[i - 1];
+  }
+  shapes.back()[ax] = in_shape[ax] - indices_.back();
+  return shapes;
+}
+
 std::vector<array> Split::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
