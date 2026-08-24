@@ -200,6 +200,8 @@ TEMP_PID=""
 if [ "${LEVER_GATE_SKIP_TEMP:-0}" != "1" ]; then
     PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" temp &
     TEMP_PID=$!
+else
+    echo "[gate] temp coherence arm SKIP (LEVER_GATE_SKIP_TEMP=1)"
 fi
 # Concurrent needle arm: catches cross-row state mix-up in batched decode that
 # a single-request ladder cannot see. Conservative defaults keep it fast.
@@ -211,6 +213,8 @@ if [ "${LEVER_GATE_SKIP_CONCURRENT:-0}" != "1" ]; then
         [ -z "$TEMP_PID" ] || kill "$TEMP_PID" 2>/dev/null
         exit 1
     }
+else
+    echo "[gate] concurrent needle arm SKIP (LEVER_GATE_SKIP_CONCURRENT=1)"
 fi
 if [ -n "$TEMP_PID" ]; then
     wait "$TEMP_PID" || { echo "[gate] temp coherence arm FAIL"; exit 1; }

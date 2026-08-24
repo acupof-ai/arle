@@ -692,7 +692,6 @@ name = "deepep-sys"
 version = "0.5.8"
 dependencies = [
  "anyhow",
- "libc",
  "thiserror 1.0.69",
 ]
 
@@ -1597,7 +1596,6 @@ dependencies = [
  "deepep-sys",
  "deepseek-spec",
  "half",
- "infer-core",
  "infer-moe",
  "infer-plan",
  "infer-seam",
@@ -1643,7 +1641,6 @@ dependencies = [
  "deepseek-ocr-spec",
  "gemma-spec",
  "hf-hub",
- "infer-core",
  "infer-plan",
  "infer-seam",
  "kv-native-sys",
@@ -3880,7 +3877,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vulkan-kernels"
 version = "0.5.8"
 dependencies = [
- "ash",
  "infer-gguf",
  "vulkan-sys",
 ]

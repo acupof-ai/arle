@@ -24,7 +24,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -40,16 +40,16 @@ jobs:
     runs-on: macos-14
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       # Same key prefix as metal-ci.yml so tag builds restore the warm cache
       # written by main-branch Metal CI runs (tag refs can read default-branch
       # caches; the old macos-arm64-cargo prefix had no writer left).
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -74,7 +74,7 @@ jobs:
           target/release/arle
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-arm64
           path: arle-${{ github.ref_name }}-macos-arm64.tar.gz
@@ -86,13 +86,13 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Install CUDA toolkit 12.8
-        uses: Jimver/cuda-toolkit@v0.2.36
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: '12.8.0'
           method: network
@@ -113,7 +113,7 @@ jobs:
           fi
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -144,7 +144,7 @@ jobs:
           tar -czf arle-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist .
 
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-x86_64
           path: arle-${{ github.ref_name }}-linux-x86_64.tar.gz
@@ -163,12 +163,12 @@ jobs:
       # No `name` → downloads every uploaded artifact; merge-multiple flattens
       # them into the workspace.
       - name: Download all build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           merge-multiple: true
 
       - name: Check out repo (for install.sh)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: src
 
@@ -179,12 +179,12 @@ jobs:
         run: sha256sum arle-${{ github.ref_name }}-*.tar.gz > SHA256SUMS.txt
 
       - name: Attest artifact provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: arle-${{ github.ref_name }}-*.tar.gz
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           generate_release_notes: true
           files: |
@@ -202,7 +202,7 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') && needs.create-release.result == 'success' }}  # skip pre-releases; run only when create-release succeeded
     steps:
       - name: Update Formula/arle.rb in cklxx/homebrew-tap
-        uses: mislav/bump-homebrew-formula-action@v4
+        uses: mislav/bump-homebrew-formula-action@f865c8b0dbebd6e263cc06782a0e974c61cf12d2 # v4
         with:
           formula-name: arle
           formula-path: Formula/arle.rb

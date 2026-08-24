@@ -75,7 +75,7 @@ jobs:
     outputs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Bundles are content-addressed by tracked kernel-input content; an
       # existing asset pair is byte-identical to what a rebuild would produce
@@ -114,16 +114,16 @@ jobs:
           cp /tmp/gh_2.80.0_linux_amd64/bin/gh /usr/local/bin/
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       # TileLang artifact cache (per-kernel source × SM × toolchain identity).
       # Restores unchanged kernels' codegen output; build.rs validates the
       # identity before reuse, so a mismatch falls back to regeneration.
       - name: Cache TileLang artifacts
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/arle-cuda-kernels
           key: tilelang-artifacts-${{ github.run_id }}
@@ -133,10 +133,10 @@ jobs:
       # Local disk cache, not the GHA backend — that flooded the 10 GB quota
       # with 2581 per-object entries (ci.yml, 2026-07-02).
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Cache sccache (nvcc)
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/sccache
           key: sccache-cuda-${{ github.run_id }}
@@ -169,7 +169,7 @@ jobs:
         run: scripts/kernel_artifacts.sh publish
 
       - name: Upload exact candidate
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: kernel-bundle-candidate
           path: |
@@ -189,13 +189,13 @@ jobs:
       - name: Install deps
         run: apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates jq
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Download exact candidate artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: kernel-bundle-candidate
           path: /tmp/kernel-bundle-candidate
@@ -221,7 +221,7 @@ jobs:
     if: ${{ needs.validate-mode.outputs.qualify == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Download named candidate and evidence fragments
         env:
@@ -257,7 +257,7 @@ jobs:
           scripts/kernel_artifacts.sh qualify-publish "${candidates[0]}" /tmp/aggregate-qualification.json
 
       - name: Attest immutable candidate and qualification
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
             /tmp/kernel-candidate/arle-kernels-t1-*.tar.gz

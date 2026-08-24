@@ -10,7 +10,6 @@ anyhow = "1.0"
 deepseek-ocr-spec = { path = "../deepseek-ocr-spec", optional = true }
 gemma-spec = { path = "../gemma-spec", optional = true }
 hf-hub = { version = "0.5", features = ["tokio"], optional = true }
-infer-core = { path = "../infer-core" }
 infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }
 kv-native-sys = { path = "../kv-native-sys", optional = true }

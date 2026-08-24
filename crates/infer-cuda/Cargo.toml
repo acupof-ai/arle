@@ -16,7 +16,6 @@ cudarc = { version = "0.19", features = [
 deepep-sys = { path = "../deepep-sys", optional = true }
 deepseek-spec = { path = "../deepseek-spec", optional = true }
 half = { version = "2.4", features = ["num-traits"], optional = true }
-infer-core = { path = "../infer-core" }
 infer-moe = { path = "../infer-moe" }
 infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }
