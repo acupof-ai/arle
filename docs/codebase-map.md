@@ -9,7 +9,7 @@ and crate-admission governance see [architecture.md](architecture.md);
 support status by surface lives in [support-matrix.md](support-matrix.md).
 Qwen3.6 now serves on CUDA (FP8 MoE + batched paged decode — no longer
 Metal-only); the in-flight model additions are GLM-5.2 (wired on the DSv4 CUDA
-path, verification pending-remote) and the Metal VLMs (Gemma4, DeepSeek-OCR).
+path, verification pending-remote) and the Metal VLMs (DeepSeek-OCR).
 
 ## 1. Workspace at a glance
 
@@ -272,7 +272,7 @@ host-only seam with zero device coupling.
  (`RelayCoordinator`; TCP channels for multi-process, `LocalChannel*` in-process
  for single-process).
 - `crates/infer-server/src/multimodal.rs`: image extract / preprocess helpers for
- vision backends (Gemma4, DeepSeek-OCR, DiffusionGemma) routed via
+ vision backends (DeepSeek-OCR) routed via
  `LocalMultimodalTx` in-process channel to `run_on_executor`.
 - `crates/infer-server/src/tokenizer.rs`: tokenizer wiring.
 
@@ -330,7 +330,7 @@ pending.
  roadmap tranche R1 done).
 - `crates/infer-vulkan/src/{executor,kv_pool,model_*.rs}`: seam-correct
  skeleton — `VulkanExecutor` + `VulkanKvPool` implement the seam; forward
- order pinned for Qwen3/3.5/3.6, DSv4, and Gemma4; device execution pending
+ order pinned for Qwen3/3.5/3.6, DSv4; device execution pending
  the shader ABI. Re-exports `infer-gguf`'s GGUF host modules
  (`deepseek4`/`dequant`/`gguf`).
 

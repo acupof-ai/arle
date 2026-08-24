@@ -259,7 +259,7 @@ Deep dive: [docs/onboarding.md](docs/onboarding.md) (30 min) · [docs/architectu
 | | CUDA | Metal | OPD Train |
 |---|---|---|---|
 | **Stability** | Stable | Beta | Beta |
-| **Models** | Qwen3.5/3.6/3.8, DeepSeek-V4-Flash, GLM-5.2 | Qwen3-dense, Qwen3.5/3.6, Gemma4, DeepSeek-OCR, DiffusionGemma | CUDA models |
+| **Models** | Qwen3.5/3.6/3.8, DeepSeek-V4-Flash, GLM-5.2 | Qwen3-dense, Qwen3.5/3.6, DeepSeek-OCR | CUDA models |
 
 Full tiers: [docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md).
 

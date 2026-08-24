@@ -40,9 +40,6 @@ MODEL_PATTERNS = [
     ("DSv4", re.compile(r"\b(?:dsv4|deepseek-?v4)\b", re.IGNORECASE)),
     ("GLM-5.2", re.compile(r"\bglm-?5\.2\b|\bglm52\b", re.IGNORECASE)),
     ("ThinkingCap-27B", re.compile(r"\bthinkingcap\b|\btc-27b\b", re.IGNORECASE)),
-    ("DiffusionGemma", re.compile(r"\bdiffusiongemma\b", re.IGNORECASE)),
-    ("Gemma4", re.compile(r"\bgemma4\b", re.IGNORECASE)),
-    ("Gemma", re.compile(r"\bgemma\b", re.IGNORECASE)),
     (
         "Qwen3.6-35B",
         re.compile(r"\bqwen3\.6-35b\b|\bqwen36-35b\b", re.IGNORECASE),

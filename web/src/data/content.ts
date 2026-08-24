@@ -612,14 +612,14 @@ const ARCH_ROWS: ArchRow[] = [
 
 const ARCH_FOOT_EN: string[] = [
   "<b>pure leaves</b> · infer-topo · infer-moe · infer-util",
-  "<b>specs</b> · qwen3 · qwen35 · deepseek · gemma",
+  "<b>specs</b> · qwen3 · qwen35 · deepseek",
   "<b>ffi</b> · deepep-sys · xgrammar-sys",
   "<b>train</b> · autograd + train — OPD-only since 2026-05-18",
 ];
 
 const ARCH_FOOT_ZH: string[] = [
   "<b>纯叶子</b> · infer-topo · infer-moe · infer-util",
-  "<b>specs</b> · qwen3 · qwen35 · deepseek · gemma",
+  "<b>specs</b> · qwen3 · qwen35 · deepseek",
   "<b>ffi</b> · deepep-sys · xgrammar-sys",
   "<b>train</b> · autograd + train — 2026-05-18 起仅 OPD",
 ];
