@@ -2790,9 +2790,18 @@ pub(crate) struct TrainMathOpdArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) dp_size: usize,
 
-    /// Within-group length penalty: reward = correct - alpha * (len - len_min) / (len_max - len_min).
-    #[arg(long, default_value_t = 0.3, value_name = "A")]
+    /// Correct-sample length penalty: reward = max(0, 1 - alpha * len / length_target).
+    #[arg(long, default_value_t = 0.5, value_name = "A")]
     pub(crate) length_penalty: f32,
+
+    /// Target length L0 for the absolute penalty (tokens).
+    #[arg(long, default_value_t = 4096, value_name = "TOKENS")]
+    pub(crate) length_target: usize,
+
+    /// Wrong-sample length penalty: reward = -beta * len / length_target. Gives
+    /// every sample a length gradient, not just correct ones.
+    #[arg(long, default_value_t = 0.05, value_name = "B")]
+    pub(crate) wrong_length_penalty: f32,
 
     /// Max generation tokens per sample (also the thinking budget).
     #[arg(long, default_value_t = 8192)]
