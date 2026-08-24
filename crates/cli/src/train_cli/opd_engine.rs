@@ -221,7 +221,12 @@ pub(super) fn load_agent_opd_serve_student(
     let cc_pages = (width * CC_SESSION_TOKENS)
         .max(CC_MAX_SESSION_TOKENS)
         .div_ceil(16);
-    let cc_total_pages = cc_pages + cc_pages / 4;
+    let mut cc_total_pages = cc_pages + cc_pages / 4;
+    // The engine's RoPE table is a hard ceiling on token positions; a pool
+    // budget above it is rejected at engine load (qwen35_load OOB guard).
+    if let Some(ceiling) = hf_config.rope_cache_len_hint {
+        cc_total_pages = cc_total_pages.min(ceiling / 16);
+    }
 
     // Shared frozen-base pointers alias engine weight buffers that a student
     // offload frees mid-step — refuse the combination at load time.
