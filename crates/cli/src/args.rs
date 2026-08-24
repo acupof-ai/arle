@@ -2194,6 +2194,13 @@ pub(crate) struct ServeStudentArgs<'a> {
     pub(crate) lora_skip_experts: bool,
     pub(crate) lora_adapters: Option<&'a Path>,
     pub(crate) lora_merge_fp8: bool,
+    /// Per-session token cap (prompt + generation). `None` sizes the request
+    /// caps from the whole KV pool (agent-opd: long sessions, pool-sharing with
+    /// preemption). `Some` bounds `max_total_tokens` so the engine's
+    /// `max_seq_len` (= `max_total_tokens`) stays small and the KV budget funds
+    /// many concurrent slots — math-opd sessions are ~`max_tokens` + a short
+    /// prompt, so a 262144-token pool with a 262144 `max_seq_len` would fund 1.
+    pub(crate) session_token_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -2608,6 +2615,7 @@ impl TrainAgentOpdArgs {
             lora_skip_experts: self.lora_skip_experts,
             lora_adapters: self.lora_adapters.as_deref(),
             lora_merge_fp8: self.lora_merge_fp8,
+            session_token_cap: None,
         }
     }
 }
@@ -2837,6 +2845,7 @@ impl TrainMathOpdArgs {
             lora_skip_experts: self.lora_skip_experts,
             lora_adapters: self.lora_adapters.as_deref(),
             lora_merge_fp8: self.lora_merge_fp8,
+            session_token_cap: Some(self.max_tokens + 2048),
         }
     }
 }

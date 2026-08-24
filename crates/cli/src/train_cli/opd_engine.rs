@@ -284,8 +284,14 @@ pub(super) fn load_agent_opd_serve_student(
             // CC_SESSION_TOKENS silently aborted cc mid-conversation (a
             // tripwire — sidecars showed prompt>22K → gen 0). The pool bounds
             // memory and the engine preempts under KV pressure (#162).
-            max_prompt_tokens: cc_total_pages * 16 - 256,
-            max_total_tokens: cc_total_pages * 16,
+            // math-opd sets a per-session cap: its sessions are ~max_tokens +
+            // a short prompt, and max_total_tokens = max_seq_len is the KV
+            // budget's per-slot denominator — a pool-sized cap funds 1 slot.
+            max_prompt_tokens: args
+                .session_token_cap
+                .unwrap_or(cc_total_pages * 16)
+                .saturating_sub(256),
+            max_total_tokens: args.session_token_cap.unwrap_or(cc_total_pages * 16),
             chunked_prefill_size: Some(CC_SESSION_TOKENS),
             mem_fraction_static: args.runtime.rollout_mem_fraction,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
