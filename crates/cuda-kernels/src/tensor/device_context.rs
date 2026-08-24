@@ -3,7 +3,7 @@
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtrMut, DeviceRepr, DriverError,
-    PinnedHostSlice, ValidAsZeroBits,
+    PinnedHostSlice,
 };
 use std::any::type_name;
 use std::collections::BTreeMap;

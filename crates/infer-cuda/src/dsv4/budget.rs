@@ -284,6 +284,7 @@ impl Dsv4Model {
     /// - Attention (`attention.rs` `mla_attention_prepare`/`_fwd`): normed +
     ///   attn_out [H, chunk], q_prepared + local_attn [local_width, chunk],
     ///   O-LoRA latent [o_lora_rank, chunk], all bf16.
+    ///
     /// Freed buffers go back to the retained mempool between layers, so the
     /// peak is one layer's live set, not a sum over layers.
     fn prefill_transient_reserve_bytes(&self) -> usize {

@@ -1670,11 +1670,6 @@ pub unsafe fn dsv4_deepgemm_paged_mqa_logits_metadata(
     Ok(())
 }
 
-/// Official DeepGEMM FP8 paged-MQA logits for the DSv4 DSA indexer.
-///
-/// This computes logits only. Query/cache FP8 packing and top-k are separate
-/// official/OSS adoption pieces.
-
 /// Official DeepGEMM FP8 paged-MQA logits over SGLang's fused DSA cache layout:
 /// `[page][64][128 FP8 values | 64 FP32 scales]` as one byte buffer.
 ///
