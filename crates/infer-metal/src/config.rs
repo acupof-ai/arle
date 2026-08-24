@@ -152,38 +152,6 @@ pub(crate) struct MetalModelConfig {
     pub(crate) arch: MetalQwen35ArchConfig,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct MetalDiffusionGemmaConfig {
-    pub(crate) config: gemma_spec::DiffusionGemmaConfig,
-    pub(crate) generation: DiffusionGenerationConfig,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct MetalGemma4Config {
-    pub(crate) text: gemma_spec::Gemma4TextConfig,
-    pub(crate) generation: DiffusionGenerationConfig,
-    pub(crate) image_token_id: Option<u32>,
-    pub(crate) vision_soft_tokens_per_image: Option<usize>,
-    pub(crate) vision: Option<MetalGemma4VisionConfig>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct MetalGemma4VisionConfig {
-    pub(crate) hidden_size: usize,
-    pub(crate) intermediate_size: usize,
-    pub(crate) num_hidden_layers: usize,
-    pub(crate) num_attention_heads: usize,
-    pub(crate) num_key_value_heads: usize,
-    pub(crate) head_dim: usize,
-    pub(crate) patch_size: usize,
-    pub(crate) pooling_kernel_size: usize,
-    pub(crate) default_output_length: usize,
-    pub(crate) position_embedding_size: usize,
-    pub(crate) rope_theta: f32,
-    pub(crate) rms_norm_eps: f32,
-    pub(crate) use_clipped_linears: bool,
-}
-
 /// DeepSeek-OCR (`deepseekocr` / `UnlimitedOCRForCausalLM`) Metal config.
 ///
 /// The text decoder + DeepEncoder + projector are parsed by `deepseek-ocr-spec`.
@@ -283,7 +251,20 @@ fn deepseek_ocr_generation_from_config(
         .and_then(|value| value.get("max_new_tokens"))
         .and_then(serde_json::Value::as_u64)
         .map_or(8192, |n| n as usize);
-    let mut generation = DiffusionGenerationConfig::diffusion_gemma(max_new_tokens, vocab_size);
+    let mut generation = DiffusionGenerationConfig {
+        canvas_length: 1,
+        max_denoising_steps: 1,
+        max_new_tokens,
+        vocab_size,
+        stop_token_ids: Vec::new(),
+        pad_token_id: 0,
+        entropy_bound: 0.1,
+        confidence_threshold: 0.005,
+        t_min: 0.4,
+        t_max: 0.8,
+        stability_threshold: 1,
+        seed: 0,
+    };
     generation.canvas_length = 1;
     generation.max_denoising_steps = 1;
     generation.pad_token_id = generation_json
@@ -293,132 +274,6 @@ fn deepseek_ocr_generation_from_config(
         .map_or(0, |n| n as u32);
     generation.stop_token_ids = resolve_stop_token_ids(model_dir, root, root)?;
     Ok(generation)
-}
-
-pub(crate) fn load_diffusion_gemma_config(model_dir: &Path) -> Result<MetalDiffusionGemmaConfig> {
-    let path = model_dir.join("config.json");
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
-    diffusion_gemma_config_from_value(&value)
-}
-
-pub(crate) fn load_gemma4_config(model_dir: &Path) -> Result<MetalGemma4Config> {
-    let path = model_dir.join("config.json");
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
-    let root = value
-        .as_object()
-        .context("config.json root must be a JSON object")?;
-    let text_config = root
-        .get("text_config")
-        .and_then(serde_json::Value::as_object);
-    let model = text_config.unwrap_or(root);
-    anyhow::ensure!(
-        is_gemma4_config(root, model) && !is_diffusion_gemma_config(root, model),
-        "config.json is not a normal Gemma4 autoregressive checkpoint"
-    );
-    let text = gemma_spec::Gemma4TextConfig::from_json_value(&value)
-        .map_err(|err| anyhow::anyhow!("{err}"))?;
-    let generation = gemma4_generation_from_config(model_dir, root, model, &text)?;
-    let image_token_id = root
-        .get("image_token_id")
-        .and_then(serde_json::Value::as_u64)
-        .map(|id| id as u32);
-    let vision_soft_tokens_per_image = root
-        .get("vision_soft_tokens_per_image")
-        .and_then(serde_json::Value::as_u64)
-        .map(|n| n as usize);
-    let vision = gemma4_vision_config_from_root(root, vision_soft_tokens_per_image)?;
-    Ok(MetalGemma4Config {
-        text,
-        generation,
-        image_token_id,
-        vision_soft_tokens_per_image,
-        vision,
-    })
-}
-
-fn gemma4_vision_config_from_root(
-    root: &serde_json::Map<String, serde_json::Value>,
-    root_soft_tokens: Option<usize>,
-) -> Result<Option<MetalGemma4VisionConfig>> {
-    let Some(vision) = root
-        .get("vision_config")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(None);
-    };
-    let get_usize = |key: &str, default: usize| -> usize {
-        vision
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .map_or(default, |n| n as usize)
-    };
-    let get_f32 = |key: &str, default: f32| -> f32 {
-        vision
-            .get(key)
-            .and_then(serde_json::Value::as_f64)
-            .map_or(default, |n| n as f32)
-    };
-    let rope_theta = vision
-        .get("rope_parameters")
-        .and_then(|value| value.get("rope_theta"))
-        .and_then(serde_json::Value::as_f64)
-        .map_or(100.0, |n| n as f32);
-    let hidden_size = get_usize("hidden_size", 768);
-    let num_attention_heads = get_usize("num_attention_heads", 12);
-    anyhow::ensure!(
-        num_attention_heads > 0,
-        "Gemma4 vision num_attention_heads must be positive"
-    );
-    Ok(Some(MetalGemma4VisionConfig {
-        hidden_size,
-        intermediate_size: get_usize("intermediate_size", hidden_size * 4),
-        num_hidden_layers: get_usize("num_hidden_layers", 0),
-        num_attention_heads,
-        num_key_value_heads: get_usize("num_key_value_heads", num_attention_heads),
-        head_dim: get_usize("head_dim", hidden_size / num_attention_heads),
-        patch_size: get_usize("patch_size", 16),
-        pooling_kernel_size: get_usize("pooling_kernel_size", 3),
-        default_output_length: get_usize("default_output_length", root_soft_tokens.unwrap_or(280)),
-        position_embedding_size: get_usize("position_embedding_size", 10240),
-        rope_theta,
-        rms_norm_eps: get_f32("rms_norm_eps", 1e-6),
-        use_clipped_linears: vision
-            .get("use_clipped_linears")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    }))
-}
-
-pub fn model_dir_is_diffusion_gemma(model_dir: &Path) -> bool {
-    let Some(value) = try_read_config_json(model_dir) else {
-        return false;
-    };
-    let Some(root) = value.as_object() else {
-        return false;
-    };
-    let model = root
-        .get("text_config")
-        .and_then(serde_json::Value::as_object)
-        .unwrap_or(root);
-    is_diffusion_gemma_config(root, model)
-}
-
-pub fn model_dir_is_gemma4(model_dir: &Path) -> bool {
-    let Some(value) = try_read_config_json(model_dir) else {
-        return false;
-    };
-    let Some(root) = value.as_object() else {
-        return false;
-    };
-    let model = root
-        .get("text_config")
-        .and_then(serde_json::Value::as_object)
-        .unwrap_or(root);
-    is_gemma4_config(root, model) && !is_diffusion_gemma_config(root, model)
 }
 
 fn try_read_config_json(model_dir: &Path) -> Option<serde_json::Value> {
@@ -480,26 +335,6 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         .get("text_config")
         .and_then(serde_json::Value::as_object);
     let model = text_config.unwrap_or(root);
-    if is_diffusion_gemma_config(root, model) {
-        let diffusion = diffusion_gemma_config_from_value(&value)?;
-        anyhow::bail!(
-            "DiffusionGemma cannot be loaded by the autoregressive Qwen Metal executor: \
-             parsed text hidden_size={} layers={} canvas={} vocab={}; use the \
-             infer-api MetalDiffusionGemma route, which owns the block-diffusion \
-             generate loop and dedicated MLX Gemma4/DiffusionGemma bridge",
-            diffusion.config.text_config.hidden_size,
-            diffusion.config.text_config.num_hidden_layers,
-            diffusion.generation.canvas_length,
-            diffusion.generation.vocab_size,
-        );
-    }
-    if is_gemma4_config(root, model) {
-        anyhow::bail!(
-            "Gemma4 cannot be loaded by the Qwen Metal executor: use the \
-             infer-api MetalGemma4 route, which owns the Gemma4 MLX forward path \
-             and weight mapping"
-        );
-    }
 
     let get_usize =
         |obj: &serde_json::Map<String, serde_json::Value>, key: &str, default: usize| -> usize {
@@ -737,113 +572,6 @@ fn extend_unique(target: &mut Vec<u32>, src: Vec<u32>) {
             target.push(id);
         }
     }
-}
-
-pub(crate) fn diffusion_gemma_config_from_value(
-    value: &serde_json::Value,
-) -> Result<MetalDiffusionGemmaConfig> {
-    let config = gemma_spec::DiffusionGemmaConfig::from_json_value(value)
-        .map_err(|err| anyhow::anyhow!("{err}"))?;
-    let generation = diffusion_generation_from_config(&config)?;
-    Ok(MetalDiffusionGemmaConfig { config, generation })
-}
-
-fn diffusion_generation_from_config(
-    config: &gemma_spec::DiffusionGemmaConfig,
-) -> Result<DiffusionGenerationConfig> {
-    let text = &config.text_config;
-    let vocab_size =
-        u32::try_from(text.vocab_size).context("DiffusionGemma vocab_size does not fit in u32")?;
-    let generation_config = &config.generation_config;
-    let max_new_tokens = generation_config
-        .max_new_tokens
-        .unwrap_or(config.canvas_length);
-    let mut generation = DiffusionGenerationConfig::diffusion_gemma(max_new_tokens, vocab_size);
-    generation.canvas_length = config.canvas_length;
-    generation.max_denoising_steps = generation_config
-        .max_denoising_steps
-        .unwrap_or(generation.max_denoising_steps);
-    generation.pad_token_id = generation_config
-        .pad_token_id
-        .unwrap_or(generation.pad_token_id);
-    generation.confidence_threshold = generation_config
-        .confidence_threshold
-        .unwrap_or(generation.confidence_threshold);
-    generation.entropy_bound = generation_config
-        .sampler_config
-        .as_ref()
-        .and_then(|sampler| sampler.entropy_bound)
-        .unwrap_or(generation.entropy_bound);
-    generation.stability_threshold = generation_config
-        .stability_threshold
-        .unwrap_or(generation.stability_threshold);
-    generation.t_min = generation_config.t_min.unwrap_or(generation.t_min);
-    generation.t_max = generation_config.t_max.unwrap_or(generation.t_max);
-    generation.stop_token_ids = generation_config
-        .eos_token_id
-        .as_ref()
-        .or(config.eos_token_id.as_ref())
-        .map(parse_eos_field)
-        .filter(|ids| !ids.is_empty())
-        // Diffusion-Gemma default stop/EOS token-id set when the config carries
-        // none: 1 = `<eos>`, 106 = `<end_of_turn>`, 50 = the model's extra stop
-        // id (mirrors the same fallback in `infer-plan`'s
-        // `DiffusionGenerationConfig::diffusion_gemma`).
-        .unwrap_or_else(|| vec![1, 106, 50]);
-    Ok(generation)
-}
-
-fn gemma4_generation_from_config(
-    model_dir: &Path,
-    root: &serde_json::Map<String, serde_json::Value>,
-    text_config: &serde_json::Map<String, serde_json::Value>,
-    text: &gemma_spec::Gemma4TextConfig,
-) -> Result<DiffusionGenerationConfig> {
-    let vocab_size =
-        u32::try_from(text.vocab_size).context("Gemma4 vocab_size does not fit in u32")?;
-    let generation_json = match std::fs::read_to_string(model_dir.join("generation_config.json")) {
-        Ok(content) => Some(
-            serde_json::from_str::<serde_json::Value>(&content)
-                .context("generation_config.json parse")?,
-        ),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err.into()),
-    };
-    let max_new_tokens = generation_json
-        .as_ref()
-        .and_then(|value| value.get("max_new_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .map_or(512, |n| n as usize);
-    let mut generation = DiffusionGenerationConfig::diffusion_gemma(max_new_tokens, vocab_size);
-    generation.canvas_length = 1;
-    generation.max_denoising_steps = 1;
-    generation.pad_token_id = generation_json
-        .as_ref()
-        .and_then(|value| value.get("pad_token_id"))
-        .and_then(serde_json::Value::as_u64)
-        .map_or(0, |n| n as u32);
-    generation.stop_token_ids = resolve_stop_token_ids(model_dir, root, text_config)?;
-    Ok(generation)
-}
-
-fn is_diffusion_gemma_config(
-    root: &serde_json::Map<String, serde_json::Value>,
-    model: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    model_type_is(root, "diffusion_gemma")
-        || model_type_is(model, "diffusion_gemma")
-        || architectures_contain(root, "DiffusionGemma")
-        || architectures_contain(model, "DiffusionGemma")
-}
-
-fn is_gemma4_config(
-    root: &serde_json::Map<String, serde_json::Value>,
-    model: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    model_type_is(root, "gemma4")
-        || model_type_is(model, "gemma4")
-        || architectures_contain(root, "Gemma4")
-        || architectures_contain(model, "Gemma4")
 }
 
 fn model_type_is(obj: &serde_json::Map<String, serde_json::Value>, expected: &str) -> bool {

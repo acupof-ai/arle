@@ -265,7 +265,7 @@ where
                     Some(infer_plan::MultimodalKind::DeepseekOcr) => {
                         infer_server::multimodal::preprocess_deepseek_ocr_image(&image.data)
                     }
-                    _ => infer_server::multimodal::preprocess_gemma4_image(&image.data),
+                    _ => anyhow::bail!("image content requires a VLM backend (DeepSeek-OCR)"),
                 }
                 .map_err(|err| anyhow!("preprocess image {} failed: {err}", image.source))
             })
@@ -284,13 +284,7 @@ where
                 let prompt = infer_server::multimodal::build_deepseek_ocr_prompt(&server_messages);
                 infer_server::multimodal::expand_deepseek_ocr_image_markers(&prompt, &images)
             }
-            _ => {
-                let prompt = self
-                    .tokenizer
-                    .render_chat(&server_messages)
-                    .map_err(|err| anyhow!("render multimodal chat prompt failed: {err}"))?;
-                infer_server::multimodal::expand_gemma4_image_markers(&prompt, &images)
-            }
+            _ => anyhow::bail!("image content requires a VLM backend (DeepSeek-OCR)"),
         }
         .map_err(|err| anyhow!("expand image prompt markers failed: {err}"))?;
         let prompt_token_ids = self

@@ -19,7 +19,6 @@ pub enum VulkanModelKind {
     Dsv4,
     Qwen35Hybrid,
     Qwen36Moe,
-    Gemma4,
 }
 
 pub fn classify_vulkan_architecture(
@@ -31,9 +30,6 @@ pub fn classify_vulkan_architecture(
     let name = model_name.unwrap_or_default().to_ascii_lowercase();
     if arch.contains("deepseek4") || arch.contains("deepseek_v4") {
         return VulkanModelKind::Dsv4;
-    }
-    if arch.contains("gemma4") || name.contains("gemma-4") || name.contains("gemma4") {
-        return VulkanModelKind::Gemma4;
     }
     // MoE first: `qwen35moe` / `qwen3moe` archs and anything with experts. Note
     // `qwen35moe.contains("qwen35")` is true, so this MUST precede the dense
@@ -77,7 +73,6 @@ pub enum VulkanLoadedModel {
     Dsv4(Box<crate::model_dsv4::VulkanDsv4Model>),
     Qwen35(Box<crate::model_qwen35::VulkanQwen35Model>),
     Qwen36(Box<crate::model_qwen36::VulkanQwen36Model>),
-    Gemma4(Box<crate::model_gemma4::VulkanGemma4Model>),
 }
 
 #[cfg(feature = "vulkan")]
@@ -94,7 +89,6 @@ impl VulkanLoadedModel {
             Self::Dsv4(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen35(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen36(model) => model.forward_token(slot, epoch, token, start_pos),
-            Self::Gemma4(model) => model.forward_token(slot, epoch, token, start_pos),
         }
     }
 }
@@ -381,10 +375,7 @@ mod tests {
             classify_vulkan_architecture("qwen3moe", Some("Qwen3.5-MoE-A2B"), 64),
             VulkanModelKind::Qwen36Moe
         );
-        assert_eq!(
-            classify_vulkan_architecture("gemma4", None, 0),
-            VulkanModelKind::Gemma4
-        );
+        assert_eq!();
         assert_eq!(
             classify_vulkan_architecture("qwen3", None, 0),
             VulkanModelKind::Qwen3Dense

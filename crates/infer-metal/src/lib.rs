@@ -22,10 +22,6 @@ mod deepseek_ocr;
 #[cfg(feature = "metal")]
 mod dflash;
 #[cfg(feature = "metal")]
-mod diffusion_gemma;
-#[cfg(feature = "metal")]
-mod gemma4;
-#[cfg(feature = "metal")]
 mod lfm2;
 #[cfg(feature = "metal")]
 mod loader;
@@ -45,16 +41,8 @@ mod wired_limit;
 #[cfg(feature = "metal")]
 pub use config::model_dir_is_deepseek_ocr;
 #[cfg(feature = "metal")]
-pub use config::{model_dir_is_diffusion_gemma, model_dir_is_gemma4};
-#[cfg(feature = "metal")]
 pub use deepseek_ocr::{LoadedMetalDeepseekOcr, MetalDeepseekOcrModel};
-#[cfg(feature = "metal")]
-pub use diffusion_gemma::{LoadedMetalDiffusionGemma, MetalDiffusionGemmaModel};
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
-#[cfg(feature = "metal")]
-pub use executor::{default_t2_budget_bytes, paged_kv_read_fallbacks, paged_kv_read_hits};
-#[cfg(feature = "metal")]
-pub use gemma4::{LoadedMetalGemma4, MetalGemma4Model};
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
 pub use mlx::{

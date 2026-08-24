@@ -9,7 +9,6 @@ members = [
     "crates/deepep-sys",
     "crates/deepseek-ocr-spec",
     "crates/deepseek-spec",
-    "crates/gemma-spec",
     "crates/hip-kernels",
     "crates/hip-sys",
     "crates/infer-api",

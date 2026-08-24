@@ -47,13 +47,6 @@ pub const DENSE_QWEN3_LAYER_OPS: &[Qwen3Op] = &[
     Qwen3Op::MlpResidual,
 ];
 
-pub fn dense_qwen3_forward_ops(num_layers: usize) -> Vec<Qwen3Op> {
-    std::iter::once(Qwen3Op::Embedding)
-        .chain((0..num_layers).flat_map(|_| DENSE_QWEN3_LAYER_OPS.iter().copied()))
-        .chain([Qwen3Op::FinalRmsNorm, Qwen3Op::LmHead])
-        .collect()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen3ResidencyPlan {
     pub num_layers: usize,

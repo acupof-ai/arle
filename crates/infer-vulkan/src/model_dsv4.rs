@@ -173,13 +173,6 @@ pub fn dsv4_forward_kernel_sequence(num_layers: usize) -> Vec<Option<vulkan_kern
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Dsv4LayerRope {
-    pub layer_idx: usize,
-    pub compress_ratio: usize,
-    pub rope_theta: f32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LauncherWrites {
     pub launcher: &'static str,
