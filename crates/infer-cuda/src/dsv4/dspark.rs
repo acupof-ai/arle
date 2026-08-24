@@ -258,8 +258,6 @@ impl Dsv4Model {
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
         {
             let attn_heads = scratch.attn_heads.get(ctx, local_heads * head_dim, block)?;
-            // SAFETY: uninit device scratch; fully written by the wo_a lane.
-            let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a().rows, block)? };
             crate::attention::mla_oproj(
                 ctx,
                 attention,
@@ -267,7 +265,6 @@ impl Dsv4Model {
                 None,
                 attn_heads,
                 block,
-                &mut latent,
                 &mut keepalive,
                 &mut attn_out,
             )?;
