@@ -822,7 +822,10 @@ int32_t lfm2_compiled_step_session(
         m->current_paged_v.clear();
 
         auto inputs = build_forward_inputs(m, *to_arr(token_id), cache_pos);
-        auto outputs = m->forward(inputs);
+        // Use the compiled verify path for single-token decode too — the
+        // shapeless-compiled forward fuses element-wise ops across layers,
+        // cutting kernel launch overhead ~2ms/token vs the eager forward().
+        auto outputs = m->forward_verify(inputs);
         extract_forward_outputs(m, outputs, out_logits);
         return 0;
     } catch (const std::exception& e) {

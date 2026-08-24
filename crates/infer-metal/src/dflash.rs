@@ -1224,10 +1224,38 @@ pub(crate) fn prepare_draft_block(
         //
         // All Markov steps stay on the GPU (take_axis accepts array indices);
         // a single materialize at the end avoids 9 GPU-CPU syncs.
+        //
+        // DSPARK_NO_MARKOV=1: skip the Markov correction and use raw backbone
+        // argmax — diagnostic for whether the head helps or hurts on 4-bit.
+        let no_markov = std::env::var("DSPARK_NO_MARKOV").is_ok();
         let vocab = *draft_logits
             .shape()
             .get(1)
             .context("DSpark draft logits missing vocab dim")?;
+        if no_markov {
+            let next = mlx::argmax_axis(&draft_logits, -1);
+            let draft_tokens = materialize_i32_tokens(&next)?;
+            for (i, &token) in draft_tokens.iter().enumerate() {
+                ensure!(
+                    token >= 0,
+                    "DSpark draft emitted a negative token id: {token}"
+                );
+                ensure!(
+                    token as u32 != runtime.mask_token_id(),
+                    "DSpark draft emitted mask_token_id {} at step {}; refusing to verify a masked draft token",
+                    runtime.mask_token_id(),
+                    i
+                );
+            }
+            let actual_bs = runtime.block_size;
+            let draft_tokens = &draft_tokens[..actual_bs];
+            let mut block = Vec::with_capacity(actual_bs + 1);
+            block.push(current_token);
+            block.extend(draft_tokens.iter().map(|&t| t as u32));
+            draft_state.trim(runtime.block_size);
+            draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
+            return Ok(tokens_to_array(&block));
+        }
         let mut prev = MlxArray::from_slice_i32(&[current_token as i32], &[1]);
         let mut token_arrays: Vec<MlxArray> = Vec::with_capacity(runtime.block_size);
         let mut latent_arrays: Vec<MlxArray> = Vec::with_capacity(runtime.block_size);

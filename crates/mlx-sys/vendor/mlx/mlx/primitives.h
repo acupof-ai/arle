@@ -2189,6 +2189,8 @@ class Split : public Primitive {
   DEFINE_GRADS()
   DEFINE_NAME(Split)
   bool is_equivalent(const Primitive& other) const override;
+  // Shapeless-compile support: infer output shapes without evaluating.
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
   std::pair<Shape, int> state() const {
     return {indices_, axis_};
   };
