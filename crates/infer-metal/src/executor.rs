@@ -1238,7 +1238,6 @@ impl RealMetalExecutor {
                 )
             })?
             .clone();
-        let block_size = runtime.block_size();
         let old_cache_len = slot.cache_len;
         let layer_ids = runtime.target_layer_ids();
 

@@ -273,12 +273,6 @@ struct MarkovHead {
 }
 
 impl MarkovHead {
-    /// Bigram bias `[1, vocab]` for the given previous token (GPU array index).
-    fn bias(&self, prev_token: &MlxArray) -> MlxArray {
-        let latent = mlx::take_axis(&self.w1, prev_token, 0); // [1, rank]
-        mlx::matmul(&latent, &self.w2) // [1, vocab]
-    }
-
     /// Markov latent `[1, rank]` — the w1 embedding used by the confidence head.
     fn latent(&self, prev_token: &MlxArray) -> MlxArray {
         mlx::take_axis(&self.w1, prev_token, 0) // [1, rank]
