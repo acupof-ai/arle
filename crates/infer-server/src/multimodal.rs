@@ -4,12 +4,12 @@ use infer_plan::MultimodalImage;
 use crate::schema::{ChatContent, ChatMessage};
 
 /// The `<image>` placeholder the DeepSeek-OCR chat/template path emits.
-pub const DEEPSEEK_OCR_IMAGE_MARKER: &str = "<image>";
+const DEEPSEEK_OCR_IMAGE_MARKER: &str = "<image>";
 /// DeepSeek-OCR begin-of-sentence string (encodes to token id 0 even with
 /// `add_special_tokens=false`). The reference processor always prepends BOS;
 /// the server's `encode` never adds special tokens, so the manually-built
 /// prompt must carry it explicitly or the decoder runs without position-0 BOS.
-pub const DEEPSEEK_OCR_BOS_MARKER: &str = "<｜begin▁of▁sentence｜>";
+const DEEPSEEK_OCR_BOS_MARKER: &str = "<｜begin▁of▁sentence｜>";
 const DEEPSEEK_OCR_BASE_SIZE: usize = 1024;
 const DEEPSEEK_OCR_PATCH_SIZE: usize = 16;
 const DEEPSEEK_OCR_DOWNSAMPLE: usize = 4;

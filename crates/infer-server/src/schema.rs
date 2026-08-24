@@ -359,25 +359,14 @@ impl ChatCompletionRequest {
     }
 
     /// Map the OpenAI `tool_choice` wire value to [`chat::ToolChoiceMode`].
-    /// Absent → `Auto`; a forced-function object collapses to `Function(name)`
-    /// (treated as `Required` when the name is missing).
+    /// Absent or anything but `"none"` maps to `Auto`; only `"none"` suppresses
+    /// tool emission (tool-forcing wire values are accepted but not wired to
+    /// the renderer).
     pub(crate) fn tool_choice_mode(&self) -> chat::ToolChoiceMode {
         use chat::ToolChoiceMode;
         match self.tool_choice.as_ref() {
-            None => ToolChoiceMode::Auto,
-            Some(serde_json::Value::String(choice)) => match choice.as_str() {
-                "none" => ToolChoiceMode::None,
-                "required" => ToolChoiceMode::Required,
-                _ => ToolChoiceMode::Auto,
-            },
-            Some(serde_json::Value::Object(object)) => object
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map_or(ToolChoiceMode::Required, |name| {
-                    ToolChoiceMode::Function(name.to_string())
-                }),
-            Some(_) => ToolChoiceMode::Auto,
+            Some(serde_json::Value::String(choice)) if choice == "none" => ToolChoiceMode::None,
+            _ => ToolChoiceMode::Auto,
         }
     }
 

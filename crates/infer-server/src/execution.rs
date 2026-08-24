@@ -22,9 +22,6 @@ use infer_seam::{BackendExecutor, KvPool};
 
 use crate::ServeShutdown;
 
-type TickBroadcast<'a> =
-    Option<&'a dyn Fn(u64, Vec<crate::multiproc_relay::WireRequest>) -> anyhow::Result<()>>;
-
 /// How long the engine thread parks on the submit channel when fully idle.
 ///
 /// Short enough that a freshly-submitted request is picked up promptly, long
@@ -113,39 +110,11 @@ pub(crate) struct Submission {
 }
 
 pub(crate) fn engine_loop<E, K>(
-    engine: Engine<E, K>,
-    submit_rx: Receiver<Submission>,
-    control_rx: Receiver<ControlMessage<E, K>>,
-    counters: CounterHandle,
-    shutdown: ServeShutdown,
-) where
-    E: BackendExecutor,
-    K: KvPool,
-{
-    let broadcast_tick = |seq, requests| crate::multiproc_relay::broadcast_tick(seq, requests);
-    let tick_broadcast: TickBroadcast<'_> = if crate::multiproc_relay::tick_broadcaster_installed()
-    {
-        Some(&broadcast_tick)
-    } else {
-        None
-    };
-    engine_loop_with_tick_broadcaster(
-        engine,
-        submit_rx,
-        control_rx,
-        counters,
-        shutdown,
-        tick_broadcast,
-    );
-}
-
-fn engine_loop_with_tick_broadcaster<E, K>(
     mut engine: Engine<E, K>,
     submit_rx: Receiver<Submission>,
     control_rx: Receiver<ControlMessage<E, K>>,
     counters: CounterHandle,
     shutdown: ServeShutdown,
-    tick_broadcast: TickBroadcast<'_>,
 ) where
     E: BackendExecutor,
     K: KvPool,
@@ -185,16 +154,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
         }));
     }
 
-    // Multiproc lockstep state (rank-0 coordinator only; resolved once — the
-    // coordinator installs the broadcaster at boot, before this engine spawns).
-    // `tick_seq` pairs exactly one `TickAdmissions` with every engine step so
-    // worker ranks admit the same requests at the same step index; see
-    // `multiproc_relay::set_tick_broadcaster` for the desync proof this closes.
-    let lockstep = tick_broadcast.is_some();
-    let mut tick_seq: u64 = 0;
-    let mut next_request_id: u64 = 1;
-    // Submission picked up by the idle park below, admitted on the next pass so
-    // it flows through the same per-tick broadcast as the drained batch.
+    // Submission picked up by the idle park below, admitted on the next pass.
     let mut carry: Vec<Submission> = Vec::new();
 
     loop {
@@ -254,42 +214,6 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             continue;
         }
 
-        // 2. Lockstep tick barrier: exactly one `TickAdmissions` precedes every
-        //    engine step (and every admission batch). Empty-request envelopes on
-        //    pure-decode ticks cost one localhost TCP write per worker (~µs)
-        //    against a ≥25 ms step. `engine.is_idle()` here is the pre-admission
-        //    state; if it is idle AND nothing was drained, no step follows and
-        //    no envelope is sent (workers park on recv symmetrically).
-        if lockstep && (!drained.is_empty() || !engine.is_idle()) {
-            let requests = drained
-                .iter()
-                .map(|submission| crate::multiproc_relay::WireRequest {
-                    request_id: {
-                        let id = next_request_id;
-                        next_request_id += 1;
-                        id
-                    },
-                    prompt_tokens: submission.prompt.clone(),
-                    max_tokens: submission.max_tokens,
-                    sampling: submission.sampling.clone(),
-                    // Workers mirror rank-0 tokens; the constraint is applied
-                    // once, on the rank that owns the matcher.
-                    response_format: None,
-                })
-                .collect();
-            if let Some(broadcast_tick) = tick_broadcast
-                && let Err(err) = broadcast_tick(tick_seq, requests)
-            {
-                log::error!(
-                    "infer-server multiproc tick #{tick_seq} broadcast failed; \
-                     stopping rank-0 engine before local admission/step: {err:#}"
-                );
-                abort_pending(&mut pending, &streamers);
-                publish_counters(&engine, &counters);
-                return;
-            }
-            tick_seq += 1;
-        }
         let admitted = drained.len();
         for submission in drained {
             admit_submission(&mut engine, &mut pending, &streamers, submission);
@@ -322,20 +246,15 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                 std::process::exit(75);
             }
             // Cancel requests whose stream receiver hung up mid-decode so the
-            // row frees its KV slot instead of decoding to max_tokens. Local
-            // lane only: in lockstep mode a cancellation must arrive on every
-            // rank via the rank-synchronized `CancelRequest` broadcast, or the
-            // scheduler states desync.
+            // row frees its KV slot instead of decoding to max_tokens.
             let dropped = std::mem::take(&mut *dropped_streams.borrow_mut());
-            if !lockstep {
-                for handle in dropped {
-                    streamers.borrow_mut().remove(&handle);
-                    if engine.cancel_request(handle) {
-                        log::info!(
-                            "[serve-engine] cancelled request {} (stream receiver dropped)",
-                            handle.id()
-                        );
-                    }
+            for handle in dropped {
+                streamers.borrow_mut().remove(&handle);
+                if engine.cancel_request(handle) {
+                    log::info!(
+                        "[serve-engine] cancelled request {} (stream receiver dropped)",
+                        handle.id()
+                    );
                 }
             }
             deliver_completions(&engine, &mut pending, &streamers);
@@ -407,9 +326,6 @@ fn admit_submission<E, K>(
     E: BackendExecutor,
     K: KvPool,
 {
-    // Multiproc lockstep: the per-tick `TickAdmissions` broadcast already
-    // happened in the engine loop (step 2) before this admission batch, so
-    // worker ranks admit these same requests at the same step index.
     let handle = engine.submit_request_with_options(
         submission.prompt,
         submission.max_tokens,

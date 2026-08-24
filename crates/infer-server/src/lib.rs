@@ -43,8 +43,9 @@ mod schema;
 mod sse_util;
 mod tokenizer;
 
+pub(crate) use execution::CounterSnapshot;
+pub use execution::StreamItem;
 use execution::{ControlMessage, Submission, engine_loop};
-pub use execution::{CounterSnapshot, StreamItem};
 
 pub use anthropic::messages_body_to_chat_request;
 pub use coordinator::{
@@ -64,8 +65,7 @@ pub struct LocalMultimodalRequest {
 pub type LocalMultimodalTx = std::sync::mpsc::SyncSender<LocalMultimodalRequest>;
 pub(crate) type LocalMultimodalRx = std::sync::mpsc::Receiver<LocalMultimodalRequest>;
 pub use multiproc_relay::{
-    PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
-    RelayWorker, TcpChannel, WireRequest, WireStats,
+    RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker, WireStats,
 };
 pub use schema::{
     ChatContent, ChatContentPart, ChatMessage, CompletionRequest, SamplingDefaults,

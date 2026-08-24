@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -24,48 +24,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use infer_plan::SamplingParams;
 use serde::{Deserialize, Serialize};
-
-/// Process-global per-tick admission broadcaster: the rank-0 multiproc
-/// coordinator installs a closure here that ships a
-/// [`RelayEnvelope::TickAdmissions`] to every worker rank. The rank-0 engine
-/// loop ([`crate::execution`]) calls [`broadcast_tick`] exactly once before
-/// every engine step (with the submissions drained for that tick — possibly
-/// none), so admission is PART of the lockstep instead of racing it.
-///
-/// Why per-tick and not per-request: with a free-running async relay, a request
-/// lands in rank 0's queue at T and in a worker's at T+δ; whichever rank's
-/// tick-top drain straddles T plans it one forward earlier than the others →
-/// divergent NCCL collective sequences → deadlock (measured 2026-06-10: tick-9
-/// fingerprints, `errors/2026-06-10-dsv4-c2-layer2-lockstep-admission-deadlock.md`).
-/// Per-tick broadcast is the SGLang `recv_requests` + `broadcast_pyobj` shape:
-/// every rank admits the same requests at the same step index by construction.
-/// Soundness preconditions (all hold on the CUDA path): executor `submit` is
-/// synchronous and `poll` always `Ready` (one forward per `Engine::step`),
-/// sampling is `(seed, position)`-deterministic, and plan-building is a pure
-/// function of engine state.
-///
-/// Single-process serving (`world_size == 1`) never installs a broadcaster, so
-/// [`tick_broadcaster_installed`] is false and the default serve path is
-/// byte-identical to before.
-type TickBroadcaster = Box<dyn Fn(u64, Vec<WireRequest>) -> Result<()> + Send + Sync>;
-
-static TICK_BROADCASTER: OnceLock<TickBroadcaster> = OnceLock::new();
-
-#[must_use]
-pub fn tick_broadcaster_installed() -> bool {
-    TICK_BROADCASTER.get().is_some()
-}
-
-/// Invoke the installed tick broadcaster. Called by the rank-0 engine loop
-/// exactly once per engine step, BEFORE the drained submissions are admitted
-/// locally. `seq` is the loop's monotonic tick counter; workers verify
-/// contiguity and treat a gap as a fatal protocol violation.
-pub fn broadcast_tick(seq: u64, requests: Vec<WireRequest>) -> Result<()> {
-    if let Some(broadcaster) = TICK_BROADCASTER.get() {
-        broadcaster(seq, requests)?;
-    }
-    Ok(())
-}
 
 /// Bound on one blocking `send()` syscall on a relay socket. Shorter than the
 /// coordinator's `ACK_STALL_TIMEOUT` (120s, tolerates a legitimately slow
@@ -137,7 +95,7 @@ impl RelayChannel for TcpChannel {
 
 /// Free-port picker. Binds 127.0.0.1:0, reads the assigned port, drops the
 /// listener. Caller races to use the port (negligible window on single host).
-pub fn pick_free_port() -> Result<u16> {
+pub(crate) fn pick_free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").context("relay port reservation")?;
     let port = listener.local_addr().context("relay port read")?.port();
     drop(listener);
@@ -191,7 +149,7 @@ impl RelayChannel for LocalChannelRecv {
 /// - `coord_recv`: coordinator ← engine (receive Completion/StatsResponse)
 /// - `engine_recv`: engine ← coordinator (receive TickAdmissions/StatsQuery)
 /// - `engine_tx`: engine → coordinator (send Completion/StatsResponse; Clone-able)
-pub fn local_relay_pair() -> (
+pub(crate) fn local_relay_pair() -> (
     LocalChannelSend,
     LocalChannelRecv,
     LocalChannelRecv,
@@ -808,7 +766,7 @@ impl WireRequest {
 /// Reader threads record each rank's acks; the coordinator lockstep loop reads
 /// [`Self::min_acked`] to cap unacked ticks at a fixed window.
 #[derive(Debug)]
-pub struct TickAckLedger {
+pub(crate) struct TickAckLedger {
     /// `(rank, acked tick count)` per connected rank; the count is
     /// `last_acked_seq + 1`, so 0 means "never acked".
     per_rank: Vec<(usize, AtomicU64)>,
@@ -862,7 +820,6 @@ impl TickAckLedger {
 }
 
 pub struct RelayCoordinator {
-    port: u16,
     workers: BTreeMap<usize, Box<dyn RelayChannel>>,
     completion_sinks:
         Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>>,
@@ -1015,7 +972,6 @@ impl PendingRelayCoordinator {
             );
         }
         Ok(RelayCoordinator {
-            port: self.port,
             workers,
             completion_sinks,
             stats_sinks,
@@ -1094,7 +1050,6 @@ impl RelayCoordinator {
         );
 
         let relay = Self {
-            port: 0,
             workers,
             completion_sinks,
             stats_sinks,
@@ -1104,11 +1059,6 @@ impl RelayCoordinator {
         };
 
         (relay, engine_recv, engine_tx)
-    }
-
-    #[must_use]
-    pub fn port(&self) -> u16 {
-        self.port
     }
 
     #[must_use]
@@ -1311,12 +1261,6 @@ impl RelayWorker {
 
     pub fn send(&mut self, envelope: &RelayEnvelope) -> Result<()> {
         self.channel.send(envelope)
-    }
-
-    pub fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            channel: self.channel.try_clone_channel()?,
-        })
     }
 }
 
