@@ -14,9 +14,9 @@ pub(super) fn run_math_opd_impl(_args: TrainMathOpdArgs) -> Result<()> {
 }
 
 /// Math-OPD RFT loop: K samples per problem against the in-process serve,
-/// reward = correctness minus a within-group length penalty, GSPO writeback.
-/// Trains SHORTER correct reasoning; the grader is boxed-answer exact match
-/// after the shared canonicalization. Single-GPU only.
+/// reward = correctness with an absolute length penalty (wrong samples also
+/// penalized), GSPO writeback. Trains SHORTER correct reasoning; the grader
+/// is boxed-answer exact match after the shared canonicalization. Single-GPU.
 #[cfg(feature = "cuda")]
 pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
     use autograd::optim::AdamW;
@@ -105,6 +105,8 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
     let k = args.samples_per_prompt;
     let g = args.prompts_per_update.max(1);
     let alpha = args.length_penalty;
+    let l0 = args.length_target as f32;
+    let beta = args.wrong_length_penalty;
     let max_update_seq = args.runtime.max_update_seq;
 
     // Round-0 BASELINE held-out eval BEFORE any training.
@@ -150,6 +152,8 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
                     k,
                     args.rollout_temperature,
                     alpha,
+                    l0,
+                    beta,
                     &metrics,
                 )?;
                 rollouts += rolled.samples;
@@ -211,6 +215,8 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
                     k,
                     args.rollout_temperature,
                     alpha,
+                    l0,
+                    beta,
                     &metrics,
                 )?;
                 rollouts += rolled.samples;
@@ -349,8 +355,12 @@ struct RolledGroup {
 }
 
 /// Roll one task group: K concurrent samples → grade → dump convert →
-/// within-group length-shaped rewards → scored trajectories. The reward is
-/// computed AFTER convert, so `len` is the engine's own generated-token count.
+/// length-shaped rewards → scored trajectories. The reward is computed AFTER
+/// convert, so `len` is the engine's own generated-token count.
+///
+/// Reward: correct → `max(0, 1 - α·len/L0)`, wrong → `-β·len/L0`. The wrong
+/// arm gives every sample a length gradient (the model learns to stop early
+/// on unsolved tasks, not just on solved ones).
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn roll_one_group(
@@ -363,6 +373,8 @@ fn roll_one_group(
     k: usize,
     temperature: f32,
     alpha: f32,
+    l0: f32,
+    beta: f32,
     metrics: &JsonlSink,
 ) -> Result<RolledGroup> {
     let rollout = harness.run_group(task, k, temperature, train::math_harness::next_nonce());
@@ -380,27 +392,17 @@ fn roll_one_group(
     let sample_of = |label: &str| -> Option<usize> {
         label.strip_prefix(&prefix)?.split('#').next()?.parse().ok()
     };
-    let correct_lens: Vec<usize> = records
-        .iter()
-        .filter(|r| sample_of(&r.label).is_some_and(|s| passed[s]))
-        .map(|r| r.response_ids.len())
-        .collect();
-    let len_min = correct_lens.iter().copied().min().unwrap_or(0);
-    let len_max = correct_lens.iter().copied().max().unwrap_or(0);
-    let span = (len_max - len_min) as f32;
-
     let mut sample_rewards = vec![0.0f32; rollout.samples.len()];
     let mut trajectories = Vec::with_capacity(records.len());
     for record in records {
         let Some(s) = sample_of(&record.label) else {
             continue;
         };
+        let len = record.response_ids.len() as f32;
         let reward = if !passed[s] {
-            0.0
-        } else if span == 0.0 {
-            1.0
+            -beta * len / l0
         } else {
-            1.0 - alpha * (record.response_ids.len() - len_min) as f32 / (span + 1e-6)
+            (1.0 - alpha * len / l0).max(0.0)
         };
         sample_rewards[s] = reward;
         let sample = &rollout.samples[s];
