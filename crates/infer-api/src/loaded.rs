@@ -498,21 +498,6 @@ mod backend {
         /// Metal backend (Apple Silicon, MLX). Fully wired and runnable.
         #[cfg(feature = "metal")]
         Metal(ServeInferenceEngine<MetalExecutor, MetalKvPool>),
-        /// Metal DiffusionGemma backend. The block-diffusion model is adapted
-        /// to the shared autoregressive engine by a buffered executor.
-        #[cfg(feature = "metal")]
-        MetalDiffusionGemma(
-            ServeInferenceEngine<
-                BufferedDiffusionExecutor<MetalDiffusionGemmaModel>,
-                HostPagedKvPool,
-            >,
-        ),
-        /// Metal Gemma4 backend. The Gemma4 MLX bridge owns generation and is
-        /// adapted to the shared autoregressive engine by a buffered executor.
-        #[cfg(feature = "metal")]
-        MetalGemma4(
-            ServeInferenceEngine<BufferedDiffusionExecutor<MetalGemma4Model>, HostPagedKvPool>,
-        ),
         /// Metal DeepSeek-OCR VLM backend. The DeepEncoder + DeepSeek-MoE MLX
         /// bridge owns generation and is adapted to the shared autoregressive
         /// engine by a buffered executor (single image, 1024x1024 base view).
@@ -604,9 +589,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => "metal",
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => "metal-diffusion-gemma",
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => "metal-gemma4",
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(_) => "metal-deepseek-ocr",
                 #[cfg(feature = "cuda")]
@@ -637,26 +620,6 @@ mod backend {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => {
-                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
                 }
@@ -676,8 +639,6 @@ mod backend {
                 Self::Cuda(engine) => engine.forward_training_taps(input_ids, target_layer_ids),
                 #[cfg(feature = "metal")]
                 Self::Metal(_)
-                | Self::MetalDiffusionGemma(_)
-                | Self::MetalGemma4(_)
                 | Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("forward_training_taps is CUDA-only")
                 }
@@ -698,8 +659,6 @@ mod backend {
                 Self::Cuda(engine) => engine.update_dspark_markov_weights(w1.to_vec(), w2.to_vec()),
                 #[cfg(feature = "metal")]
                 Self::Metal(_)
-                | Self::MetalDiffusionGemma(_)
-                | Self::MetalGemma4(_)
                 | Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("update_dspark_markov_weights is CUDA-only")
                 }
@@ -731,26 +690,6 @@ mod backend {
                     anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => {
-                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
                 }
@@ -774,26 +713,6 @@ mod backend {
                     anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => {
-                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
                 }
@@ -816,26 +735,6 @@ mod backend {
                     anyhow::bail!("complete_batch is CUDA-only for OPD")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => {
-                    anyhow::bail!("complete_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    anyhow::bail!("complete_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("complete_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    anyhow::bail!("complete_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("complete_batch is CUDA-only for OPD")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     anyhow::bail!("complete_batch is CUDA-only for OPD")
                 }
@@ -854,19 +753,8 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => {
-                    anyhow::bail!("offload_engine_weights is only available on CUDA")
-                }
+                Self::MetalDeepseekOcr(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    anyhow::bail!("offload_engine_weights is only available on CUDA")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("offload_engine_weights is only available on CUDA")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
                     anyhow::bail!("offload_engine_weights is only available on CUDA")
@@ -885,9 +773,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.quiesce_admissions(),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.quiesce_admissions(),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.quiesce_admissions(),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.quiesce_admissions(),
                 #[cfg(feature = "cuda")]
@@ -907,9 +793,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.ensure_kv_pool_and_resume_admissions(),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.ensure_kv_pool_and_resume_admissions(),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.ensure_kv_pool_and_resume_admissions(),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.ensure_kv_pool_and_resume_admissions(),
                 #[cfg(feature = "cuda")]
@@ -932,19 +816,8 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => {
-                    anyhow::bail!("reload_engine_weights is only available on CUDA")
-                }
+                Self::MetalDeepseekOcr(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    anyhow::bail!("reload_engine_weights is only available on CUDA")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("reload_engine_weights is only available on CUDA")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
                     anyhow::bail!("reload_engine_weights is only available on CUDA")
@@ -965,9 +838,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => Ok(()),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => Ok(()),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => Ok(()),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(_) => Ok(()),
                 #[cfg(feature = "hip")]
@@ -990,9 +861,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => Ok(()),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => Ok(()),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => Ok(()),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(_) => Ok(()),
                 #[cfg(feature = "hip")]
@@ -1013,9 +882,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => Ok(()),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => Ok(()),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => Ok(()),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(_) => Ok(()),
                 #[cfg(feature = "hip")]
@@ -1052,37 +919,6 @@ mod backend {
                     anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is Metal")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => {
-                    let _ = update;
-                    anyhow::bail!(
-                        "student LoRA re-merge is CUDA-only; active backend is Metal DiffusionGemma"
-                    )
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    let _ = update;
-                    anyhow::bail!(
-                        "student LoRA re-merge is CUDA-only; active backend is Metal Gemma4"
-                    )
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    let _ = update;
-                    anyhow::bail!(
-                        "student LoRA re-merge is CUDA-only; active backend is Metal DeepSeek-OCR"
-                    )
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    let _ = update;
-                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is HIP")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    let _ = update;
-                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is Vulkan")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     let _ = update;
                     anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is CPU")
@@ -1118,13 +954,7 @@ mod backend {
                     anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is Metal")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => anyhow::bail!(
-                    "frozen-base FP8 sharing is CUDA-only; active backend is Metal DiffusionGemma"
-                ),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => anyhow::bail!(
-                    "frozen-base FP8 sharing is CUDA-only; active backend is Metal Gemma4"
-                ),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(_) => anyhow::bail!(
                     "frozen-base FP8 sharing is CUDA-only; active backend is Metal DeepSeek-OCR"
@@ -1158,13 +988,7 @@ mod backend {
                     anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is Metal")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => anyhow::bail!(
-                    "frozen-base BF16 sharing is CUDA-only; active backend is Metal DiffusionGemma"
-                ),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => anyhow::bail!(
-                    "frozen-base BF16 sharing is CUDA-only; active backend is Metal Gemma4"
-                ),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(_) => anyhow::bail!(
                     "frozen-base BF16 sharing is CUDA-only; active backend is Metal DeepSeek-OCR"
@@ -1203,26 +1027,7 @@ mod backend {
                     anyhow::bail!("local router is CUDA-only; active backend is Metal")
                 }
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(_) => anyhow::bail!(
-                    "local router is CUDA-only; active backend is Metal DiffusionGemma"
-                ),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(_) => {
-                    anyhow::bail!("local router is CUDA-only; active backend is Metal Gemma4")
-                }
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("local router is CUDA-only; active backend is Metal DeepSeek-OCR")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    anyhow::bail!("local router is CUDA-only; active backend is HIP")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("local router is CUDA-only; active backend is Vulkan")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     anyhow::bail!("local router is CUDA-only; active backend is CPU")
                 }
@@ -1232,28 +1037,6 @@ mod backend {
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             let resolved = infer_metal::resolve_model_path(model_path)?;
-            if infer_metal::model_dir_is_diffusion_gemma(&resolved) {
-                let (serve, tokenizer, model_id) = metal_diffusion_gemma_serve_handle(
-                    model_path,
-                    &resolved,
-                    config,
-                    infer_server::ServeShutdown::new(),
-                )?;
-                return Ok(Self::MetalDiffusionGemma(ServeInferenceEngine::new(
-                    model_id, tokenizer, serve,
-                )));
-            }
-            if infer_metal::model_dir_is_gemma4(&resolved) {
-                let (serve, tokenizer, model_id) = metal_gemma4_serve_handle(
-                    model_path,
-                    &resolved,
-                    config,
-                    infer_server::ServeShutdown::new(),
-                )?;
-                return Ok(Self::MetalGemma4(ServeInferenceEngine::new(
-                    model_id, tokenizer, serve,
-                )));
-            }
             if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
                 let (serve, tokenizer, model_id) = metal_deepseek_ocr_serve_handle(
                     model_path,
@@ -1535,28 +1318,6 @@ mod backend {
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let resolved = infer_metal::resolve_model_path(model_path)?;
-        if infer_metal::model_dir_is_diffusion_gemma(&resolved) {
-            let (serve, tokenizer, model_id) =
-                metal_diffusion_gemma_serve_handle(model_path, &resolved, config, shutdown)?;
-            return Ok(infer_server::coordinator_local_router(
-                Arc::new(serve),
-                tokenizer,
-                model_id,
-                config.max_thinking_tokens,
-                Some(infer_plan::MultimodalKind::Gemma4),
-            ));
-        }
-        if infer_metal::model_dir_is_gemma4(&resolved) {
-            let (serve, tokenizer, model_id) =
-                metal_gemma4_serve_handle(model_path, &resolved, config, shutdown)?;
-            return Ok(infer_server::coordinator_local_router(
-                Arc::new(serve),
-                tokenizer,
-                model_id,
-                config.max_thinking_tokens,
-                Some(infer_plan::MultimodalKind::Gemma4),
-            ));
-        }
         if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
             let (serve, tokenizer, model_id) =
                 metal_deepseek_ocr_serve_handle(model_path, &resolved, config, shutdown)?;
@@ -1576,165 +1337,6 @@ mod backend {
             config.max_thinking_tokens,
             None,
         ))
-    }
-
-    #[cfg(feature = "metal")]
-    fn metal_diffusion_gemma_serve_handle(
-        model_path: &str,
-        resolved: &std::path::Path,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(
-        ServeHandle<BufferedDiffusionExecutor<MetalDiffusionGemmaModel>, HostPagedKvPool>,
-        infer_server::OpenAiTokenizer,
-        String,
-    )> {
-        use infer_server::OpenAiTokenizer;
-
-        if config.mtp_enabled() {
-            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-        }
-        anyhow::ensure!(
-            !config.kv_ssd_requested(),
-            "--kv-disk: DiffusionGemma Metal owns no page-addressable KV tier store"
-        );
-
-        let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
-        let model_source = resolved.to_string_lossy().to_string();
-        let mut scheduler = config.scheduler_config();
-        scheduler.num_slots = 1;
-        scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
-        let page_size = config.page_size.max(1);
-        let total_pages = config.total_pages.max(1);
-        let low_impact = config.low_impact;
-        let resource_plan = infer_metal::plan_weight_only_resource_budget(
-            resolved,
-            infer_metal::MetalWeightOnlyResourceRequest {
-                low_impact,
-                memory_budget_bytes: config.memory_budget_bytes,
-                system_reserve_bytes: config.system_reserve_bytes,
-                allow_swap: config.allow_swap,
-            },
-        )?;
-        let cancel = shutdown.cancel_flag();
-        let max_denoising_steps = config.diffusion_max_denoising_steps.filter(|&s| s > 0);
-
-        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
-            move || {
-                let loaded = infer_metal::MetalDiffusionGemmaModel::load_with_resource_plan(
-                    std::path::Path::new(&model_source),
-                    Some(resource_plan),
-                )?;
-                let mut generation = loaded.generation;
-                if let Some(steps) = max_denoising_steps {
-                    generation.max_denoising_steps = steps;
-                }
-                let executor =
-                    BufferedDiffusionExecutor::new_with_cancel(loaded.model, generation, cancel);
-                let kv = HostPagedKvPool::new(1, total_pages, page_size);
-                if low_impact {
-                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
-                        max_tokens: scheduler.chunked_prefill_size.max(1),
-                        max_micros: 20_000,
-                    })
-                    .with_yield_every_ticks(8);
-                    infer_core::Engine::with_config_and_governor(
-                        executor,
-                        kv,
-                        scheduler,
-                        Box::new(governor),
-                    )
-                } else {
-                    infer_core::Engine::with_config(executor, kv, scheduler)
-                }
-            },
-            shutdown,
-        )?;
-        Ok((serve, tokenizer, model_id))
-    }
-
-    #[cfg(feature = "metal")]
-    fn metal_gemma4_serve_handle(
-        model_path: &str,
-        resolved: &std::path::Path,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(
-        ServeHandle<BufferedDiffusionExecutor<MetalGemma4Model>, HostPagedKvPool>,
-        infer_server::OpenAiTokenizer,
-        String,
-    )> {
-        use infer_server::OpenAiTokenizer;
-
-        if config.mtp_enabled() {
-            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-        }
-        anyhow::ensure!(
-            !config.kv_ssd_requested(),
-            "--kv-disk: Gemma4 Metal owns no page-addressable KV tier store"
-        );
-
-        let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
-        let model_source = resolved.to_string_lossy().to_string();
-        let mut scheduler = config.scheduler_config();
-        scheduler.num_slots = 1;
-        scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
-        let page_size = config.page_size.max(1);
-        let total_pages = config.total_pages.max(1);
-        let low_impact = config.low_impact;
-        let resource_plan = infer_metal::plan_weight_only_resource_budget(
-            resolved,
-            infer_metal::MetalWeightOnlyResourceRequest {
-                low_impact,
-                memory_budget_bytes: config.memory_budget_bytes,
-                system_reserve_bytes: config.system_reserve_bytes,
-                allow_swap: config.allow_swap,
-            },
-        )?;
-        let cancel = shutdown.cancel_flag();
-        let max_denoising_steps = config.diffusion_max_denoising_steps.filter(|&s| s > 0);
-
-        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
-            move || {
-                let loaded = infer_metal::MetalGemma4Model::load_with_resource_plan(
-                    std::path::Path::new(&model_source),
-                    Some(resource_plan),
-                )?;
-                if loaded.image_token_id.is_some() {
-                    log::info!(
-                        "Gemma4 VLM ids detected: image_token_id={:?}, vision_soft_tokens_per_image={:?}; Metal image soft-token bridge enabled",
-                        loaded.image_token_id,
-                        loaded.vision_soft_tokens_per_image
-                    );
-                }
-                let mut generation = loaded.generation;
-                if let Some(steps) = max_denoising_steps {
-                    generation.max_denoising_steps = steps;
-                }
-                let executor =
-                    BufferedDiffusionExecutor::new_with_cancel(loaded.model, generation, cancel);
-                let kv = HostPagedKvPool::new(1, total_pages, page_size);
-                if low_impact {
-                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
-                        max_tokens: scheduler.chunked_prefill_size.max(1),
-                        max_micros: 20_000,
-                    })
-                    .with_yield_every_ticks(8);
-                    infer_core::Engine::with_config_and_governor(
-                        executor,
-                        kv,
-                        scheduler,
-                        Box::new(governor),
-                    )
-                } else {
-                    infer_core::Engine::with_config(executor, kv, scheduler)
-                }
-            },
-            shutdown,
-        )?;
-        Ok((serve, tokenizer, model_id))
     }
 
     #[cfg(feature = "metal")]
@@ -2775,9 +2377,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.model_id(),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.model_id(),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.model_id(),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.model_id(),
                 #[cfg(feature = "cuda")]
@@ -2796,9 +2396,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.complete(req),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.complete(req),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.complete(req),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.complete(req),
                 #[cfg(feature = "cuda")]
@@ -2820,9 +2418,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.complete_multimodal_chat(req),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.complete_multimodal_chat(req),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.complete_multimodal_chat(req),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.complete_multimodal_chat(req),
                 #[cfg(feature = "cuda")]
@@ -2845,9 +2441,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "cuda")]
@@ -2866,9 +2460,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.tokenize(text),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.tokenize(text),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.tokenize(text),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.tokenize(text),
                 #[cfg(feature = "cuda")]
@@ -2887,9 +2479,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "cuda")]
@@ -2908,9 +2498,7 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.telemetry(),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.telemetry(),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.telemetry(),
                 #[cfg(feature = "metal")]
                 Self::MetalDeepseekOcr(engine) => engine.telemetry(),
                 #[cfg(feature = "cuda")]
