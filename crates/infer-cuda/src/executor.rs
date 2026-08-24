@@ -833,7 +833,9 @@ impl RealCudaExecutor {
     }
 }
 
-use kv_native_sys::{BLOB_CHUNK_BYTES, KvTierStore, default_t1_budget_bytes};
+use kv_native_sys::{
+    BLOB_CHUNK_BYTES, KvTierStore, chunk_manifest, chunk_sub, default_t1_budget_bytes, tier_key,
+};
 
 /// Placeholder, not measurement-derived — dormant until `demote` is wired.
 ///

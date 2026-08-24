@@ -195,7 +195,7 @@ pub fn chunk_sub(key: u64, idx: usize) -> u64 {
     (key << CHUNK_IDX_BITS) | idx as u64
 }
 
-fn chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
+pub fn chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
     format!("DSCHUNK {chunks} {bytes}\n").into_bytes()
 }
 
@@ -1699,6 +1699,28 @@ impl KvTierStore {
                 .enumerate()
                 .map(|(idx, chunk)| (tier_key(ns_chunk, chunk_sub(key, idx)), chunk.to_vec())),
         );
+        let inserted = self.insert_many(entries);
+        if inserted {
+            self.discount_disk_useful_write(manifest_key, manifest_bytes);
+        }
+        inserted
+    }
+
+    /// Insert pre-chunked entries (manifest first, then chunks) produced off-thread
+    /// by [`chunk_manifest`] + `tier_key`/`chunk_sub`. Same capacity and dedup
+    /// guards as `insert_chunked`; the expensive `to_vec` chunking ran elsewhere.
+    pub fn insert_prechunked(
+        &mut self,
+        ns: u64,
+        key: u64,
+        chunks: usize,
+        entries: Vec<(u64, Vec<u8>)>,
+    ) -> bool {
+        if chunks > (1 << CHUNK_IDX_BITS) || self.available_pages() <= chunks {
+            return false;
+        }
+        let manifest_key = tier_key(ns, key);
+        let manifest_bytes = entries.first().map(|(_, v)| v.len()).unwrap_or(0);
         let inserted = self.insert_many(entries);
         if inserted {
             self.discount_disk_useful_write(manifest_key, manifest_bytes);
