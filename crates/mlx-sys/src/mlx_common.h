@@ -111,39 +111,6 @@ array verify_quantized_matmul_cpp(
     int32_t bits,
     bool transpose = true);
 
-extern "C" mlx_array* qwen35_moe_block_forward(
-    mlx_array* hidden,
-    mlx_array* router_w,
-    mlx_array* router_scales,
-    mlx_array* router_biases,
-    int32_t router_bits,
-    int32_t router_group_size,
-    mlx_array* expert_gate_w,
-    mlx_array* expert_gate_scales,
-    mlx_array* expert_gate_biases,
-    mlx_array* expert_up_w,
-    mlx_array* expert_up_scales,
-    mlx_array* expert_up_biases,
-    mlx_array* expert_down_w,
-    mlx_array* expert_down_scales,
-    mlx_array* expert_down_biases,
-    int32_t expert_bits,
-    int32_t expert_group_size,
-    mlx_array* shared_gate_w,
-    mlx_array* shared_gate_scales,
-    mlx_array* shared_gate_biases,
-    mlx_array* shared_up_w,
-    mlx_array* shared_up_scales,
-    mlx_array* shared_up_biases,
-    mlx_array* shared_down_w,
-    mlx_array* shared_down_scales,
-    mlx_array* shared_down_biases,
-    mlx_array* shared_gate_router_w,
-    mlx_array* shared_gate_router_scales,
-    mlx_array* shared_gate_router_biases,
-    int32_t num_experts,
-    int32_t top_k,
-    bool norm_topk_prob);
 // Shape = mlx::core::Shape (SmallVector<int> in v0.31+)
 
 static inline array* to_arr(mlx_array* h) {

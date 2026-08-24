@@ -671,43 +671,6 @@ impl CppLfm2Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
-    // paged Metal decode path; wired with the DSpark draft
-    #[allow(dead_code)]
-    pub(crate) fn step_session_paged_bf16(
-        &self,
-        token: &MlxArray,
-        cache_pos: i32,
-        k_full_per_layer: &[MlxArray],
-        v_full_per_layer: &[MlxArray],
-    ) -> Result<MlxArray> {
-        anyhow::ensure!(
-            k_full_per_layer.len() == v_full_per_layer.len(),
-            "paged session step requires matching K/V layer counts"
-        );
-        let mut k_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            k_full_per_layer.iter().map(MlxArray::as_raw).collect();
-        let mut v_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            v_full_per_layer.iter().map(MlxArray::as_raw).collect();
-        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-        // SAFETY: FFI over live session arrays.
-        let rc = unsafe {
-            mlx_sys::lfm2_compiled_step_session_paged(
-                self.raw,
-                token.as_raw(),
-                cache_pos,
-                k_ptrs.as_mut_ptr(),
-                v_ptrs.as_mut_ptr(),
-                k_ptrs.len() as i32,
-                &raw mut out_logits,
-            )
-        };
-        if rc != 0 {
-            return Err(crate::mlx::check_mlx_error().unwrap_err());
-        }
-        // SAFETY: the bridge wrote a valid owned handle on success.
-        Ok(unsafe { MlxArray::from_raw(out_logits) })
-    }
-
     /// DSpark block-verification forward: runs `block_len` tokens in one pass
     /// with FULL logits (all positions) and hidden/conv capture enabled. The
     /// captured tails are read back via `drain_captured_hidden` /
@@ -851,23 +814,5 @@ impl CompiledMetalModel for CppLfm2Model {
     }
     fn session_step(&self, token: &MlxArray, cache_pos: i32) -> Result<MlxArray> {
         self.step_session(token, cache_pos)
-    }
-    fn session_step_paged_bf16(
-        &self,
-        token: &MlxArray,
-        cache_pos: i32,
-        k: &[MlxArray],
-        v: &[MlxArray],
-    ) -> Result<MlxArray> {
-        self.step_session_paged_bf16(token, cache_pos, k, v)
-    }
-    fn session_step_paged_int8(
-        &self,
-        _token: &MlxArray,
-        _cache_pos: i32,
-        _k: &[MlxArray],
-        _v: &[MlxArray],
-    ) -> Result<MlxArray> {
-        anyhow::bail!("INT8 KV cache is not supported for LFM2 models")
     }
 }

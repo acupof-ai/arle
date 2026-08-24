@@ -22,7 +22,7 @@ crates/mlx-sys/
     ├── lib.rs           — extern "C" declarations (no mlx-c intermediate)
     ├── mlx_bridge.cpp   — C++ wrappers for mlx::core API
     ├── mlx_qwen35_model.cpp     — dedicated C++ Qwen3.5 step model (per-layer hot path)
-    ├── mlx_qwen35_moe_block.cpp — Qwen3.5 / Qwen3.6 SparseMoeBlock forward composed in C++; wired from `mlx_qwen35_model.cpp` and exposed as `qwen35_moe_block_forward` FFI
+    ├── mlx_qwen35_moe_block.cpp — Qwen3.5 / Qwen3.6 SparseMoeBlock forward composed in C++; wired from `mlx_qwen35_model.cpp`
     ├── mlx_dflash_draft_model.cpp — Metal DFlash draft-model step (the C++ side of the speculative-draft path consumed by `infer::backend::metal::dflash`)
     ├── mlx_metal_capture.mm     — env-gated `MTLCaptureManager` hook around `qwen35_compiled_step_session` (default OFF; see Debugging hooks)
     └── mlx_common.h             — shared C header (dtype constants, struct layouts)

@@ -146,8 +146,6 @@ fn main() -> anyhow::Result<()> {
     let mut measured_completion_tokens_total = 0usize;
     for run_idx in 0..warmup_runs.saturating_add(repeat) {
         let is_warmup = run_idx < warmup_runs;
-        let hit_before = infer_metal::paged_kv_read_hits();
-        let fallback_before = infer_metal::paged_kv_read_fallbacks();
         let start = Instant::now();
         let output = engine.complete(CompletionRequest {
             prompt: prompt.clone(),
@@ -172,8 +170,6 @@ fn main() -> anyhow::Result<()> {
                 "wall_ms": wall_ms,
                 "completion_tokens": completion_tokens,
                 "ms_per_completion_token": ms_per_completion_token,
-                "paged_kv_read_hits": infer_metal::paged_kv_read_hits().saturating_sub(hit_before),
-                "paged_kv_read_fallbacks": infer_metal::paged_kv_read_fallbacks().saturating_sub(fallback_before),
                 "allocator_after_request": {
                     "active_bytes": after_request.active_bytes,
                     "peak_bytes": after_request.peak_bytes,
@@ -205,8 +201,6 @@ fn main() -> anyhow::Result<()> {
                 "avg_wall_ms": avg_wall_ms,
                 "avg_ms_per_completion_token": avg_ms_per_completion_token,
                 "measured_completion_tokens_total": measured_completion_tokens_total,
-                "paged_kv_read_hits_total": infer_metal::paged_kv_read_hits(),
-                "paged_kv_read_fallbacks_total": infer_metal::paged_kv_read_fallbacks(),
             },
             "runs": runs,
             "allocator": {

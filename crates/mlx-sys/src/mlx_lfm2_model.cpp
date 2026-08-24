@@ -48,12 +48,6 @@ bool use_prefill_last_logits_only() {
     return enabled;
 }
 
-bool keep_prefill_intermediates() {
-    static const bool enabled =
-        parse_env_bool("AGENT_INFER_LFM2_CPP_KEEP_PREFILL_INTERMEDIATES", false);
-    return enabled;
-}
-
 std::optional<array> bias_if_affine(const array& biases, int mode) {
     return mode == 0 ? std::optional(biases) : std::nullopt;
 }
@@ -242,9 +236,6 @@ struct Lfm2CompiledModel {
     // Lazily-compiled verify forward (shapeless=true, dynamic KV cache length).
     mutable std::function<std::vector<array>(const std::vector<array>&)> compiled_verify;
     bool current_last_logits_only = false;
-    bool current_has_paged_prefix = false;
-    std::vector<array> current_paged_k;
-    std::vector<array> current_paged_v;
     std::vector<array> prev_outputs;
 
     // Compiled verify forward (shapeless; shapes are fixed for spec decode).
@@ -327,11 +318,9 @@ struct Lfm2CompiledModel {
         const array& x, const Lfm2AttnLayer& lw,
         const array& k_cache, const array& v_cache,
         const array& cache_pos,
-        int full_layer_idx,
         array& new_k_cache, array& new_v_cache) const {
         int B = current_batch_size;
         int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
-        int S = current_seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
 
         auto q = reshape(lw.q_proj.apply(x), {B, -1, nh, hd});
@@ -353,22 +342,9 @@ struct Lfm2CompiledModel {
         new_k_cache = concatenate({k_cache, k}, 2);
         new_v_cache = concatenate({v_cache, v}, 2);
 
-        array k_full(0), v_full(0);
-        if (current_has_paged_prefix) {
-            if (S != 1 || B != 1) {
-                throw std::runtime_error("paged KV read supports only single-token decode");
-            }
-            if (full_layer_idx < 0 || full_layer_idx >= (int)current_paged_k.size()
-                || full_layer_idx >= (int)current_paged_v.size()) {
-                throw std::runtime_error("paged KV read missing layer input");
-            }
-            k_full = concatenate(std::vector<array>{current_paged_k[full_layer_idx], k}, 2);
-            v_full = concatenate(std::vector<array>{current_paged_v[full_layer_idx], v}, 2);
-        } else {
-            // Cache is already exactly [1, nkv, cache_pos+S, hd] after concat.
-            k_full = new_k_cache;
-            v_full = new_v_cache;
-        }
+        // Cache is already exactly [1, nkv, cache_pos+S, hd] after concat.
+        array k_full = new_k_cache;
+        array v_full = new_v_cache;
 
         // Causal mask is correct for S=1 too (single token attends to itself),
         // so hardcode it to avoid baking a C++ conditional into the compiled graph.
@@ -421,7 +397,7 @@ struct Lfm2CompiledModel {
             } else {
                 int si = 1 + 2 * full_idx;
                 attn_out = full_attn_step(
-                    xn, layer.attn, inputs[si], inputs[si + 1], cache_pos, full_idx,
+                    xn, layer.attn, inputs[si], inputs[si + 1], cache_pos,
                     new_kv[2 * full_idx], new_kv[2 * full_idx + 1]);
                 full_idx++;
             }
@@ -846,9 +822,6 @@ int32_t lfm2_compiled_step_session(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
-        m->current_has_paged_prefix = false;
-        m->current_paged_k.clear();
-        m->current_paged_v.clear();
 
         auto inputs = build_forward_inputs(m, *to_arr(token_id), cache_pos);
         // Use the compiled verify path for single-token decode too — the
@@ -878,63 +851,12 @@ int32_t lfm2_eager_step_session(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
-        m->current_has_paged_prefix = false;
-        m->current_paged_k.clear();
-        m->current_paged_v.clear();
 
         auto inputs = build_forward_inputs(m, *to_arr(token_id), cache_pos);
         auto outputs = m->forward(inputs);
         extract_forward_outputs(m, outputs, out_logits);
         return 0;
     } catch (const std::exception& e) {
-        mlx_set_error(e.what());
-        return -1;
-    }
-}
-
-int32_t lfm2_compiled_step_session_paged(
-    void* model, mlx_array* token_id, int32_t cache_pos,
-    mlx_array** k_full_per_layer, mlx_array** v_full_per_layer, int32_t n_layers,
-    mlx_array** out_logits) {
-    auto* m = static_cast<Lfm2CompiledModel*>(model);
-    try {
-        mlx_clear_error();
-        if (!m->session_active) {
-            throw std::runtime_error("lfm2_compiled_step_session_paged requires an active session");
-        }
-        if (n_layers != m->n_full_attn) {
-            throw std::runtime_error("lfm2_compiled_step_session_paged layer count mismatch");
-        }
-        m->current_cache_pos = cache_pos;
-        m->current_batch_size = 1;
-        m->current_seq_len = 1;
-        m->current_last_logits_only = false;
-        m->current_has_paged_prefix = true;
-        m->current_paged_k.clear();
-        m->current_paged_v.clear();
-        m->current_paged_k.reserve(n_layers);
-        m->current_paged_v.reserve(n_layers);
-        for (int32_t i = 0; i < n_layers; ++i) {
-            if (!k_full_per_layer[i] || !v_full_per_layer[i]) {
-                throw std::runtime_error("lfm2_compiled_step_session_paged received null layer input");
-            }
-            m->current_paged_k.push_back(*to_arr(k_full_per_layer[i]));
-            m->current_paged_v.push_back(*to_arr(v_full_per_layer[i]));
-        }
-
-        auto inputs = build_forward_inputs(m, *to_arr(token_id), cache_pos);
-        auto outputs = m->forward(inputs);
-
-        m->current_has_paged_prefix = false;
-        m->current_paged_k.clear();
-        m->current_paged_v.clear();
-
-        extract_forward_outputs(m, outputs, out_logits);
-        return 0;
-    } catch (const std::exception& e) {
-        m->current_has_paged_prefix = false;
-        m->current_paged_k.clear();
-        m->current_paged_v.clear();
         mlx_set_error(e.what());
         return -1;
     }
@@ -953,9 +875,6 @@ int32_t lfm2_compiled_prefill_session(
         m->current_batch_size = 1;
         m->current_seq_len = prompt_len;
         m->current_last_logits_only = use_prefill_last_logits_only();
-        m->current_has_paged_prefix = false;
-        m->current_paged_k.clear();
-        m->current_paged_v.clear();
 
         auto inputs = build_forward_inputs(m, *to_arr(token_ids), cache_pos);
         auto outputs = m->forward(inputs);
@@ -994,9 +913,6 @@ int32_t lfm2_compiled_verify_block_session(
         m->current_batch_size = 1;
         m->current_seq_len = block_len;
         m->current_last_logits_only = false;  // full logits for verification
-        m->current_has_paged_prefix = false;
-        m->current_paged_k.clear();
-        m->current_paged_v.clear();
 
         auto inputs = build_forward_inputs(m, *to_arr(token_ids), cache_pos);
         auto outputs = m->forward_verify(inputs);

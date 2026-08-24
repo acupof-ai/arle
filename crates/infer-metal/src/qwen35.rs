@@ -609,24 +609,6 @@ impl crate::executor::CompiledMetalModel for CppQwen35Model {
     fn session_step(&self, token: &MlxArray, cache_pos: i32) -> anyhow::Result<MlxArray> {
         self.step_session(token, cache_pos)
     }
-    fn session_step_paged_bf16(
-        &self,
-        token: &MlxArray,
-        cache_pos: i32,
-        k: &[MlxArray],
-        v: &[MlxArray],
-    ) -> anyhow::Result<MlxArray> {
-        self.step_session_paged_bf16(token, cache_pos, k, v)
-    }
-    fn session_step_paged_int8(
-        &self,
-        token: &MlxArray,
-        cache_pos: i32,
-        k: &[MlxArray],
-        v: &[MlxArray],
-    ) -> anyhow::Result<MlxArray> {
-        self.step_session_paged_int8(token, cache_pos, k, v)
-    }
 }
 
 impl CppQwen35Model {
@@ -973,93 +955,6 @@ impl CppQwen35Model {
                 self.raw,
                 token.as_raw(),
                 cache_pos,
-                &raw mut out_logits,
-            )
-        };
-        if rc != 0 {
-            return Err(mlx::check_mlx_error().unwrap_err());
-        }
-        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
-        Ok(unsafe { MlxArray::from_raw(out_logits) })
-    }
-
-    // paged Metal decode path; wired with the DSpark draft
-    #[allow(dead_code)]
-    pub(crate) fn step_session_paged_bf16(
-        &self,
-        token: &MlxArray,
-        cache_pos: i32,
-        k_full_per_layer: &[MlxArray],
-        v_full_per_layer: &[MlxArray],
-    ) -> Result<MlxArray> {
-        anyhow::ensure!(
-            k_full_per_layer.len() == v_full_per_layer.len(),
-            "paged session step requires matching K/V layer counts"
-        );
-        let mut k_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            k_full_per_layer.iter().map(MlxArray::as_raw).collect();
-        let mut v_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            v_full_per_layer.iter().map(MlxArray::as_raw).collect();
-        let mut empty_int8_k: Vec<*mut mlx_sys::mlx_array> = Vec::new();
-        let mut empty_int8_v: Vec<*mut mlx_sys::mlx_array> = Vec::new();
-        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
-        let rc = unsafe {
-            mlx_sys::qwen35_compiled_step_session_paged(
-                self.raw,
-                token.as_raw(),
-                cache_pos,
-                k_ptrs.as_mut_ptr(),
-                v_ptrs.as_mut_ptr(),
-                k_ptrs.len() as i32,
-                empty_int8_k.as_mut_ptr(),
-                empty_int8_v.as_mut_ptr(),
-                0,
-                &raw mut out_logits,
-            )
-        };
-        if rc != 0 {
-            return Err(mlx::check_mlx_error().unwrap_err());
-        }
-        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
-        Ok(unsafe { MlxArray::from_raw(out_logits) })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn step_session_paged_int8(
-        &self,
-        token: &MlxArray,
-        cache_pos: i32,
-        k_int8_full_per_layer: &[MlxArray],
-        v_int8_full_per_layer: &[MlxArray],
-    ) -> Result<MlxArray> {
-        anyhow::ensure!(
-            k_int8_full_per_layer.len() == v_int8_full_per_layer.len(),
-            "paged INT8 session step requires matching K/V triple counts"
-        );
-        anyhow::ensure!(
-            k_int8_full_per_layer.len().is_multiple_of(3),
-            "paged INT8 session step requires q/scale/bias triples"
-        );
-        let mut empty_bf16_k: Vec<*mut mlx_sys::mlx_array> = Vec::new();
-        let mut empty_bf16_v: Vec<*mut mlx_sys::mlx_array> = Vec::new();
-        let mut k_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            k_int8_full_per_layer.iter().map(MlxArray::as_raw).collect();
-        let mut v_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            v_int8_full_per_layer.iter().map(MlxArray::as_raw).collect();
-        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
-        let rc = unsafe {
-            mlx_sys::qwen35_compiled_step_session_paged(
-                self.raw,
-                token.as_raw(),
-                cache_pos,
-                empty_bf16_k.as_mut_ptr(),
-                empty_bf16_v.as_mut_ptr(),
-                0,
-                k_ptrs.as_mut_ptr(),
-                v_ptrs.as_mut_ptr(),
-                (k_ptrs.len() / 3) as i32,
                 &raw mut out_logits,
             )
         };
