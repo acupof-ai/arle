@@ -2000,6 +2000,7 @@ mod tests {
                     rms_norm_eps: 1e-6,
                 },
                 moe: None,
+                lfm2: None,
             },
         };
         let arrays = allocate_kv_flat(&config, MetalKvCacheDtype::Int8, 256);
