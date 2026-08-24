@@ -28,7 +28,8 @@ python3 scripts/bench_throughput.py \
 ```
 
 - Baseline: `16857e541` (previous session, synchronous `to_bytes` + `insert_chunked`)
-- Treatment: `e00580c83` (binary `78b5f584…`, background `to_bytes` + chunking, main-thread `insert_many`)
+- Treatment 1: `e00580c83` (spawn-per-call background `to_bytes` + chunking, main-thread `insert_many`)
+- Treatment 2: `6856f164b` (dedicated serialization thread, same pre-chunked pipeline)
 - Prompt tokens: ~32k per prompt (128 lines, 16×8 grid)
 - Completion tokens: ≤214 per request
 - Trials: 1 run per arm, 32 requests per concurrency level
@@ -46,36 +47,43 @@ python3 scripts/bench_throughput.py \
 | concurrency | arm | decode tok/s | ITL p50 ms | ITL p99 ms | p99 delta |
 |---:|---|---:|---:|---:|---:|
 | 1 | baseline | 73.5 | 13.5 | 14.3 | — |
-| 1 | treatment | 43.2 | 18.1 | 47.4 | +231% |
+| 1 | spawn-per-call | 43.2 | 18.1 | 47.4 | +231% |
+| 1 | dedicated thread | 55.1 | 17.8 | 35.5 | +148% |
 | 4 | baseline | 40.3 | 18.8 | 220.8 | — |
-| 4 | treatment | 36.6 | 24.6 | 59.4 | **-73%** |
+| 4 | spawn-per-call | 36.6 | 24.6 | 59.4 | **-73%** |
+| 4 | dedicated thread | 36.6 | 24.7 | 59.2 | **-73%** |
 | 8 | baseline | 24.1 | 24.5 | 764.1 | — |
-| 8 | treatment | 26.4 | 30.3 | 350.9 | **-54%** |
+| 8 | spawn-per-call | 26.4 | 30.3 | 350.9 | **-54%** |
+| 8 | dedicated thread | 27.1 | 30.2 | 305.1 | **-60%** |
 | 16 | baseline | 13.8 | 38.0 | 749.3 | — |
-| 16 | treatment | 17.6 | 40.3 | 377.3 | **-50%** |
+| 16 | spawn-per-call | 17.6 | 40.3 | 377.3 | **-50%** |
+| 16 | dedicated thread | 18.2 | 40.3 | 348.9 | **-53%** |
 
-p90/p50 ratio (treatment): c=4: 1.01, c=8: 1.01, c=16: 1.02 — the tail is
+p90/p50 ratio (dedicated thread): c=4: 1.01, c=8: 1.01, c=16: 1.02 — the tail is
 no longer dominated by serialization stalls.
 
 Raw artifacts: `/tmp/sidecar-prechunk-bench.json` (pod), `/tmp/sidecar-prechunk.log` (server).
 
 ## Problems
 
-c=1 regressed (p99 14.3→47.4ms, decode 73.5→43.2 tok/s). At c=1 there is
-no serialization contention benefit; the background thread's memory-intensive
-work (146.8 MiB to_bytes + chunking) competes with the engine for host memory
-bandwidth. The baseline binary was also from a prior session with intervening
-commits, so the c=1 delta may include unrelated changes.
+c=1 regressed vs baseline (p99 14.3→35.5ms, decode 73.5→55.1 tok/s). The
+dedicated thread improved c=1 over spawn-per-call (p99 47.4→35.5ms, -25%) by
+eliminating thread creation overhead, but the background thread's
+memory-intensive work (146.8 MiB to_bytes + chunking) still competes with the
+engine for host memory bandwidth at c=1. The baseline binary was also from a
+prior session with intervening commits, so part of the c=1 delta may be
+unrelated.
 
-Remaining p99 tail at c≥8 (350-377ms) comes from `snapshot_recurrent()`
+Remaining p99 tail at c≥8 (305-349ms) comes from `snapshot_recurrent()`
 (D2H copy, ~6ms per blob, still synchronous) and background thread memory
 bandwidth contention at high concurrency.
 
 ## Learnings
 
-PASS for the stated goal: p99 ITL reduced 50-73% at c≥4. The two-stage
+PASS for the stated goal: p99 ITL reduced 53-73% at c≥4. The two-stage
 backgrounding (to_bytes + chunking off-thread, BTreeMap inserts on-thread)
-is the correct architecture for sidecar serialization. The remaining tail
-is bounded by `snapshot_recurrent()` D2H copies and memory bandwidth
-contention — a dedicated serialization thread (instead of spawn-per-call)
-would reduce contention at c≥8.
+is the correct architecture for sidecar serialization. A dedicated
+serialization thread (vs spawn-per-call) further improved c=1 p99 by 25%
+and c≥8 p99 by 8-13% by bounding memory bandwidth contention. The remaining
+tail is bounded by `snapshot_recurrent()` D2H copies and memory bandwidth
+contention.
