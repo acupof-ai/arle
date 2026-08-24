@@ -301,23 +301,3 @@ pub fn build_attn_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
         })
         .collect()
 }
-
-/// SGLang `parallel_state.py:1903-1919`.
-#[must_use]
-pub fn build_moe_ep_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    if cfg.ep_size == cfg.tp_size {
-        return build_tp_groups(cfg);
-    }
-    let n = cfg.world_size() / cfg.tp_size;
-    let moe_tp = cfg.moe_tp_size();
-    (0..n)
-        .flat_map(|g| {
-            (0..cfg.moe_dp_size).flat_map(move |d| {
-                (0..moe_tp).map(move |t| {
-                    let st = g * cfg.tp_size + d * cfg.ep_size * moe_tp + t;
-                    (st..st + cfg.ep_size * moe_tp).step_by(moe_tp).collect()
-                })
-            })
-        })
-        .collect()
-}

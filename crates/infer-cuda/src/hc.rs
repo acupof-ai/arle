@@ -119,46 +119,7 @@ pub(crate) fn gen_mhc_params(
     Ok(MhcParams { pre, post, comb })
 }
 
-// Kept as the unfused primitive; current DSv4 decode uses `mhc_pre_rms_norm`.
-#[allow(dead_code)]
-pub(crate) fn hc_pre(
-    ctx: &DeviceContext,
-    stream: &HiddenStates,
-    pre: &CudaSlice<f32>,
-    hidden_size: usize,
-    hc_mult: usize,
-    out: &mut HiddenStates,
-) -> Result<()> {
-    ensure!(
-        stream.hidden_dim == hidden_size * hc_mult,
-        "DSv4 HC pre stream dim {} != hidden_size {hidden_size} * hc_mult {hc_mult}",
-        stream.hidden_dim
-    );
-    ensure!(
-        pre.len() >= stream.seq_len * hc_mult,
-        "DSv4 HC pre len {} < seq {} * hc_mult {hc_mult}",
-        pre.len(),
-        stream.seq_len
-    );
-    ensure!(
-        out.hidden_dim == hidden_size && out.seq_len == stream.seq_len,
-        "DSv4 HC pre out shape {}x{} != {hidden_size}x{}",
-        out.hidden_dim,
-        out.seq_len,
-        stream.seq_len
-    );
-    tensor_ops::dsv4_mhc_pre(
-        ctx,
-        &stream.data,
-        pre,
-        &mut out.data,
-        stream.seq_len,
-        hidden_size,
-        hc_mult,
-    )
-}
-
-/// Fused [`hc_pre`] + rms-norm: mix the stream into one lane and normalize in
+/// Fused pre-mix + rms-norm: mix the stream into one lane and normalize in
 /// a single kernel (one boundary, no intermediate tensor). Drop-in for the
 /// `hc_pre(...) ; rms_norm_batch(...)` pair on every layer's attn/ffn prologue.
 pub(crate) fn mhc_pre_rms_norm(
