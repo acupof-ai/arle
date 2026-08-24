@@ -1397,16 +1397,28 @@ impl Qwen35CudaExecutor {
             cp: None,
             cp_decode,
         };
-        model.forward_tokens_recall(
-            &mut slots[slot],
-            workspace,
-            &[row.last_token],
-            row.kv_seq_len,
-            &row.params,
-            position,
-            penalty_of(&row.penalty_history, row.penalty_prompt_len),
-            &mut rc,
-        )
+        model
+            .forward_tokens_recall(
+                &mut slots[slot],
+                workspace,
+                &[row.last_token],
+                row.kv_seq_len,
+                &row.params,
+                position,
+                penalty_of(&row.penalty_history, row.penalty_prompt_len),
+                &mut rc,
+            )
+            .map(|(token, logprob)| {
+                // Keep the DSpark seed fresh so the next 1-row step can draft without
+                // a warm decode. The draft KV cache is stale by the plain-decode
+                // tokens; the seeding check tolerates a gap ≤ block_size.
+                if let Some(ds) = self.dspark.as_mut()
+                    && let Some(df) = ds.slots[slot].as_mut()
+                {
+                    df.pending = Some(token);
+                }
+                (token, logprob)
+            })
     }
 
     /// One MTP spec-decode row: the spec step when the slot is seeded, else a warm
@@ -1783,16 +1795,14 @@ impl Qwen35CudaExecutor {
             // A logprobs capture vetoes spec (no full per-position distributions
             // in the verify); the row falls to its warm step below.
             let slot_state = ds.slots[row.slot].as_ref();
+            let block_size = ds.head.block_size();
             let seeded_now = row.params.top_logprobs.is_none()
                 && self.full_attn_paged()
-                && speculative_chain_fits(
-                    row.kv_seq_len,
-                    ds.head.block_size(),
-                    self.model.max_seq_len(),
-                )
+                && speculative_chain_fits(row.kv_seq_len, block_size, self.model.max_seq_len())
                 && matches!(
                     slot_state,
-                    Some(s) if s.pending == Some(row.last_token) && s.ctx_end == row.kv_seq_len
+                    Some(s) if s.pending == Some(row.last_token)
+                        && row.kv_seq_len.saturating_sub(s.ctx_end) <= block_size
                 );
             if !seeded_now
                 && let Some(s) = slot_state
@@ -2021,6 +2031,11 @@ impl Qwen35CudaExecutor {
                 host_kv.truncate_slot(c.slot, len)?;
                 let need = len.div_ceil(pool.page_size);
                 pool.mirror_slot(c.slot, &host_kv.page_indices(c.slot)[..need], len)?;
+            }
+            // Plain decode steps don't update the draft KV cache; rebase if
+            // the context is behind so append stays contiguous.
+            if df.ctx_end != c.start {
+                df.rebase(c.start);
             }
             model.dspark_append_ctx(&ds.head, df, &mut ds.scratch, c.row0, k + 1, c.start)?;
             df.pending = Some(bonus);
@@ -2859,6 +2874,14 @@ impl Qwen35CudaExecutor {
             sampled.len(),
             rows.len()
         );
+        // Keep DSpark seeds fresh (see decode_row_paged_default).
+        if let Some(ds) = self.dspark.as_mut() {
+            for (i, &slot) in slot_indices.iter().enumerate() {
+                if let Some(df) = ds.slots[slot].as_mut() {
+                    df.pending = Some(sampled[i].0);
+                }
+            }
+        }
         Ok(slot_indices
             .into_iter()
             .zip(sampled)
