@@ -1012,6 +1012,12 @@ unsafe extern "C" {
         cache_pos: i32,
         out_logits: *mut *mut mlx_array,
     ) -> i32;
+    pub fn lfm2_eager_step_session(
+        model: *mut std::ffi::c_void,
+        token_id: *mut mlx_array,
+        cache_pos: i32,
+        out_logits: *mut *mut mlx_array,
+    ) -> i32;
     pub fn lfm2_compiled_step_session_paged(
         model: *mut std::ffi::c_void,
         token_id: *mut mlx_array,
