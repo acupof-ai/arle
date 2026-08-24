@@ -429,7 +429,8 @@ struct Lfm2CompiledModel {
                         moe.dense_gate_w, moe.dense_up_w, moe.dense_down_w,
                         moe.num_experts, moe.top_k, moe.norm_topk_prob);
                 } else {
-                    if (!moe.compiled_moe) {
+                    static bool eager_moe = getenv("LFM2_EAGER_MOE") != nullptr;
+                    if (!moe.compiled_moe && !eager_moe) {
                         auto router_w = moe.router_w;
                         auto expert_bias = moe.expert_bias;
                         auto gw = moe.switch_gate.w, gs = moe.switch_gate.scales, gb = moe.switch_gate.biases;
