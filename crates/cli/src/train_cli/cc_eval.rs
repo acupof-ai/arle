@@ -104,11 +104,11 @@ pub(super) fn run_cc_eval(
 /// Pure function of args so every fleet rank derives the same shared dump dir.
 #[cfg(feature = "cuda")]
 pub(super) fn agent_opd_eval_out_dir(args: &TrainAgentOpdArgs) -> PathBuf {
-    args.eval_out_dir
-        .clone()
-        .or_else(|| args.save_lora_adapters.clone())
-        .or_else(|| args.save_checkpoint.clone())
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::args::resolve_eval_out_dir(
+        args.eval_out_dir.as_deref(),
+        args.save_lora_adapters.as_deref(),
+        args.save_checkpoint.as_deref(),
+    )
 }
 
 /// Write failures log and never abort training.

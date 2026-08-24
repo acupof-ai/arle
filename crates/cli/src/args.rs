@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
@@ -1179,6 +1179,9 @@ pub(crate) enum TrainCommand {
     // Boxed: the largest command variant — keeps `TrainCommand` compact
     // (clippy::large_enum_variant).
     AgentOpd(Box<TrainAgentOpdArgs>),
+    /// Math-OPD: per-problem K samples, reward = correctness minus a
+    /// within-group length penalty, GSPO toward shorter correct reasoning.
+    MathOpd(Box<TrainMathOpdArgs>),
     /// Convert captured `/v1/messages` dumps (`arle serve --dump-messages-dir`)
     /// into verl-style token records for the agent-OPD masked-CE replay
     /// (`agent-opd --replay-records`).
@@ -2158,6 +2161,41 @@ pub(crate) struct TrainRubricOpdArgs {
     pub(crate) json: bool,
 }
 
+/// Resolve the eval/dump output dir: explicit `--eval-out-dir`, else the
+/// LoRA adapter dir, else the checkpoint dir, else cwd. Pure so every fleet
+/// rank derives the same shared dump dir.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn resolve_eval_out_dir(
+    eval_out_dir: Option<&Path>,
+    save_lora_adapters: Option<&Path>,
+    save_checkpoint: Option<&Path>,
+) -> PathBuf {
+    eval_out_dir
+        .or(save_lora_adapters)
+        .or(save_checkpoint)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Borrowed view of the student/serve fields the OPD rollout loader needs;
+/// `agent-opd` and `math-opd` both build one via `serve_args()`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) struct ServeStudentArgs<'a> {
+    pub(crate) student_model: &'a Path,
+    pub(crate) backend: OpdBackendArg,
+    pub(crate) tape_dtype: TapeDtypeArg,
+    pub(crate) eval_out_dir: PathBuf,
+    pub(crate) prompts_per_update: usize,
+    pub(crate) samples_per_prompt: usize,
+    pub(crate) no_share_frozen_base: bool,
+    pub(crate) runtime: &'a OpdRuntimeArgs,
+    pub(crate) rollout_temperature: f32,
+    pub(crate) lora_layer_start: Option<usize>,
+    pub(crate) lora_skip_experts: bool,
+    pub(crate) lora_adapters: Option<&'a Path>,
+    pub(crate) lora_merge_fp8: bool,
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
     after_help = "Agent-OPD: the student drives the read/write/replace/bash tool loop against a\nper-task repo sandbox (SWE-bench-Pro). The reward is EXECUTION — `git diff` is the\ncandidate patch, the hidden test_patch + fail_to_pass tests are run, exit-0 = pass.\nNo text judge/teacher is loaded; passing trajectories are written back as CE targets\n(verl-style response_mask keeps tool/environment tokens out of the loss).\n\n  arle train agent-opd --student-model <qwen3.6-27b-dir> \\\n    --dataset <swe-bench-pro.jsonl> --staged-root <repos-checked-out-at-base_commit> \\\n    --rounds 3 --samples-per-prompt 4"
@@ -2546,6 +2584,257 @@ impl TrainAgentOpdArgs {
             }
             UpdateStrategyArg::Gspo => UpdatePreset::gspo(),
             UpdateStrategyArg::Cispo => UpdatePreset::cispo(),
+        }
+    }
+
+    /// Borrowed view for the shared rollout loader.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn serve_args(&self) -> ServeStudentArgs<'_> {
+        ServeStudentArgs {
+            student_model: &self.student_model,
+            backend: self.backend,
+            tape_dtype: self.tape_dtype,
+            eval_out_dir: resolve_eval_out_dir(
+                self.eval_out_dir.as_deref(),
+                self.save_lora_adapters.as_deref(),
+                self.save_checkpoint.as_deref(),
+            ),
+            prompts_per_update: self.prompts_per_update,
+            samples_per_prompt: self.samples_per_prompt,
+            no_share_frozen_base: self.no_share_frozen_base,
+            runtime: &self.runtime,
+            rollout_temperature: self.rollout_temperature,
+            lora_layer_start: self.lora_layer_start,
+            lora_skip_experts: self.lora_skip_experts,
+            lora_adapters: self.lora_adapters.as_deref(),
+            lora_merge_fp8: self.lora_merge_fp8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Math-OPD: the student answers K samples per math problem; reward is correctness\nminus a within-group length penalty, and GSPO updates toward SHORTER correct\nreasoning. Every request enables thinking explicitly (Qwen templates default\noff); the grader canonicalizes LaTeX wrappers (\\text, \\textbf, \\mathrm, ...)\non both gold and completion before matching.\n\n  arle train math-opd --student-model <qwen3.8-27b-dir> \\\n    --dataset <train.jsonl> --eval-dataset <eval.jsonl> \\\n    --rounds 3 --samples-per-prompt 4"
+)]
+pub(crate) struct TrainMathOpdArgs {
+    #[command(flatten)]
+    pub(crate) runtime: OpdRuntimeArgs,
+
+    /// Student model directory (HF safetensors layout). The trained LoRA student.
+    #[arg(long, alias = "student")]
+    pub(crate) student_model: PathBuf,
+
+    /// Math problems (JSONL: {"text","answer","source"?}).
+    #[arg(long, value_name = "FILE", required = true)]
+    pub(crate) dataset: PathBuf,
+
+    /// Held-out problems for the greedy accuracy eval.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) eval_dataset: Option<PathBuf>,
+
+    /// Cap the train/eval problem count (debug).
+    #[arg(long, value_name = "N")]
+    pub(crate) task_limit: Option<usize>,
+
+    /// Number of held-out problems per eval (default: all).
+    #[arg(long, value_name = "N")]
+    pub(crate) eval_n: Option<usize>,
+
+    /// Run the held-out eval every N rounds.
+    #[arg(long, default_value_t = 5)]
+    pub(crate) eval_every: usize,
+
+    /// Concurrent greedy requests in the held-out eval.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) eval_concurrency: usize,
+
+    /// Dir for eval metrics + cc dumps (default: the adapter/checkpoint dir, else cwd).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) eval_out_dir: Option<PathBuf>,
+
+    /// Metrics JSONL path (default: <eval_out_dir>/metrics.jsonl).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) metrics_out: Option<PathBuf>,
+
+    /// Samples per problem (K).
+    #[arg(long, default_value_t = 4)]
+    pub(crate) samples_per_prompt: usize,
+
+    /// Problems per update step.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) prompts_per_update: usize,
+
+    /// Port for the per-rank cc rollout serve.
+    #[arg(long, default_value_t = 8000)]
+    pub(crate) serve_port: u16,
+
+    /// Rollout sampling temperature.
+    #[arg(long, default_value_t = 1.0, value_name = "T")]
+    pub(crate) rollout_temperature: f32,
+
+    /// Per-request timeout for the cc serve (seconds).
+    #[arg(long, default_value_t = 600)]
+    pub(crate) cc_timeout: u64,
+
+    /// When to sync LoRA weights back into the rollout engine.
+    #[arg(long, value_enum, default_value_t = SyncArg::EveryGroup)]
+    pub(crate) sync: SyncArg,
+
+    /// Number of rollout/update rounds over the dataset.
+    #[arg(long, default_value_t = 3)]
+    pub(crate) rounds: usize,
+
+    /// Max trained sequences per update (writeback budget).
+    #[arg(long, value_name = "N")]
+    pub(crate) writeback_cap: Option<usize>,
+
+    /// Max tokens per trained sequence in the writeback window.
+    #[arg(long, default_value_t = 2048)]
+    pub(crate) writeback_window: usize,
+
+    /// Update strategy (GSPO: group std-normalized advantage, per-sequence IS).
+    #[arg(long, value_enum, default_value_t = UpdateStrategyArg::Gspo)]
+    pub(crate) update_strategy: UpdateStrategyArg,
+
+    /// SAO epsilon low (sao-* strategies only).
+    #[arg(long, default_value_t = 0.8)]
+    pub(crate) sao_eps_low: f32,
+
+    /// SAO epsilon high (sao-* strategies only).
+    #[arg(long, default_value_t = 3.0)]
+    pub(crate) sao_eps_high: f32,
+
+    /// SAO gamma (sao-value only).
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) sao_gamma: f32,
+
+    /// SAO lambda (sao-value only).
+    #[arg(long, default_value_t = 0.95)]
+    pub(crate) sao_lambda: f32,
+
+    /// Learning rate for the SAO value critic.
+    #[arg(long, default_value_t = 1.0e-3)]
+    pub(crate) value_lr: f32,
+
+    /// Do not share the frozen base between train store and rollout engine.
+    #[arg(long, default_value_t = false)]
+    pub(crate) no_share_frozen_base: bool,
+
+    /// LoRA learning rate.
+    #[arg(long, default_value_t = 1.0e-5)]
+    pub(crate) lr: f32,
+
+    /// LoRA rank.
+    #[arg(long, default_value_t = 32)]
+    pub(crate) lora_rank: usize,
+
+    /// LoRA alpha.
+    #[arg(long, default_value_t = 64.0)]
+    pub(crate) lora_alpha: f32,
+
+    /// LoRA target set.
+    #[arg(long, default_value = "all-linear")]
+    pub(crate) lora_target_set: String,
+
+    /// Merge LoRA into the FP8 student weights on save.
+    #[arg(long, default_value_t = true)]
+    pub(crate) lora_merge_fp8: bool,
+
+    /// First layer index to attach LoRA to (default: all).
+    #[arg(long, value_name = "N")]
+    pub(crate) lora_layer_start: Option<usize>,
+
+    /// Skip MoE expert linears when attaching LoRA.
+    #[arg(long, default_value_t = false)]
+    pub(crate) lora_skip_experts: bool,
+
+    /// Save a full merged student checkpoint to this dir at the end.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_checkpoint: Option<PathBuf>,
+
+    /// Save a checkpoint every N rounds (0 = only at the end).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) save_every: usize,
+
+    /// Save LoRA adapters to this dir (also the default eval/dump dir).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_lora_adapters: Option<PathBuf>,
+
+    /// Resume from saved LoRA adapters.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) lora_adapters: Option<PathBuf>,
+
+    /// Compute backend for autograd.
+    #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
+    pub(crate) backend: OpdBackendArg,
+
+    /// Storage dtype for tape-saved activations.
+    #[arg(long, value_enum, default_value_t = TapeDtypeArg::F32)]
+    pub(crate) tape_dtype: TapeDtypeArg,
+
+    /// Context-parallel rank count (math-opd is single-GPU; >1 rejected).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) cp_size: usize,
+
+    /// Data-parallel rank count (math-opd is single-GPU; >1 rejected).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) dp_size: usize,
+
+    /// Within-group length penalty: reward = correct - alpha * (len - len_min) / (len_max - len_min).
+    #[arg(long, default_value_t = 0.3, value_name = "A")]
+    pub(crate) length_penalty: f32,
+
+    /// Max generation tokens per sample (also the thinking budget).
+    #[arg(long, default_value_t = 8192)]
+    pub(crate) max_tokens: usize,
+}
+
+impl TrainMathOpdArgs {
+    /// The `--update-strategy` preset; the sao-* flags override the SAO presets'
+    /// clip/GAE fields (their clap defaults ARE the preset defaults).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn update_preset(&self) -> train::update_strategy::UpdatePreset {
+        use train::update_strategy::UpdatePreset;
+        match self.update_strategy {
+            UpdateStrategyArg::RejectionCe => UpdatePreset::rejection_ce(),
+            UpdateStrategyArg::SaoDis => UpdatePreset::sao_dis(self.sao_eps_low, self.sao_eps_high),
+            UpdateStrategyArg::SaoValue => UpdatePreset::sao_value(
+                self.sao_eps_low,
+                self.sao_eps_high,
+                self.sao_gamma,
+                self.sao_lambda,
+            ),
+            UpdateStrategyArg::Grpo => UpdatePreset::grpo(),
+            UpdateStrategyArg::Dapo => UpdatePreset::dapo(),
+            // Dr.GRPO's fixed normalizer = the rollout generation budget
+            // (per-sample token cap; cc owns the analog for agent-opd).
+            UpdateStrategyArg::DrGrpo => UpdatePreset::dr_grpo(self.max_tokens),
+            UpdateStrategyArg::Gspo => UpdatePreset::gspo(),
+            UpdateStrategyArg::Cispo => UpdatePreset::cispo(),
+        }
+    }
+
+    /// Borrowed view for the shared rollout loader.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn serve_args(&self) -> ServeStudentArgs<'_> {
+        ServeStudentArgs {
+            student_model: &self.student_model,
+            backend: self.backend,
+            tape_dtype: self.tape_dtype,
+            eval_out_dir: resolve_eval_out_dir(
+                self.eval_out_dir.as_deref(),
+                self.save_lora_adapters.as_deref(),
+                self.save_checkpoint.as_deref(),
+            ),
+            prompts_per_update: self.prompts_per_update,
+            samples_per_prompt: self.samples_per_prompt,
+            no_share_frozen_base: self.no_share_frozen_base,
+            runtime: &self.runtime,
+            rollout_temperature: self.rollout_temperature,
+            lora_layer_start: self.lora_layer_start,
+            lora_skip_experts: self.lora_skip_experts,
+            lora_adapters: self.lora_adapters.as_deref(),
+            lora_merge_fp8: self.lora_merge_fp8,
         }
     }
 }

@@ -18,6 +18,8 @@ mod agent_opd_window;
 mod capacity_report;
 #[path = "train_cli/cc_eval.rs"]
 mod cc_eval;
+#[path = "train_cli/math_opd.rs"]
+mod math_opd;
 #[path = "train_cli/model_probe.rs"]
 mod model_probe;
 #[path = "train_cli/nll_eval.rs"]
@@ -72,6 +74,10 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::AgentOpd(args) => {
             train::apply_runtime_flags(&args.runtime.to_flags());
             exit_from_result(agent_opd::run_agent_opd_impl(*args))
+        }
+        TrainCommand::MathOpd(args) => {
+            train::apply_runtime_flags(&args.runtime.to_flags());
+            exit_from_result(math_opd::run_math_opd_impl(*args))
         }
         TrainCommand::CcConvert(args) => {
             exit_from_result(replay_records::run_cc_convert_impl(args))

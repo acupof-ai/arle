@@ -272,7 +272,7 @@ pub(super) fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         cc_model_id,
         all_params,
         trainable,
-    } = load_agent_opd_serve_student(&args, lora, target_set, serve_port)?;
+    } = load_agent_opd_serve_student(&args.serve_args(), lora, target_set, serve_port)?;
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let mut value_critic = build_value_critic(
