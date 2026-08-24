@@ -1782,19 +1782,34 @@ impl Qwen35CudaExecutor {
                 .expect("dspark_decode_batch without dspark");
             // A logprobs capture vetoes spec (no full per-position distributions
             // in the verify); the row falls to its warm step below.
-            seeded.push(
-                row.params.top_logprobs.is_none()
-                    && self.full_attn_paged()
-                    && speculative_chain_fits(
-                        row.kv_seq_len,
-                        ds.head.block_size(),
-                        self.model.max_seq_len(),
-                    )
-                    && matches!(
-                        ds.slots[row.slot].as_ref(),
-                        Some(s) if s.pending == Some(row.last_token) && s.ctx_end == row.kv_seq_len
-                    ),
-            );
+            let slot_state = ds.slots[row.slot].as_ref();
+            let seeded_now = row.params.top_logprobs.is_none()
+                && self.full_attn_paged()
+                && speculative_chain_fits(
+                    row.kv_seq_len,
+                    ds.head.block_size(),
+                    self.model.max_seq_len(),
+                )
+                && matches!(
+                    slot_state,
+                    Some(s) if s.pending == Some(row.last_token) && s.ctx_end == row.kv_seq_len
+                );
+            if !seeded_now
+                && let Some(s) = slot_state
+                && s.pending.is_some()
+            {
+                log::info!(
+                    "[dspark-seed] slot={} pending={:?} last_token={} ctx_end={} kv_seq_len={} match_pending={} match_ctx={}",
+                    row.slot,
+                    s.pending,
+                    row.last_token,
+                    s.ctx_end,
+                    row.kv_seq_len,
+                    s.pending == Some(row.last_token),
+                    s.ctx_end == row.kv_seq_len,
+                );
+            }
+            seeded.push(seeded_now);
         }
 
         // Draft: no trunk/pool state touched, and weight-bound at block rows, so every
