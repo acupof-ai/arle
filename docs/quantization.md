@@ -25,14 +25,13 @@ with concrete evidence.
 | **KV cache** | BF16 | production | `--kv-cache-dtype bf16` | Reference fallback. CUDA-paged + Metal. The only value DSv4 accepts. |
 | KV cache | INT8 | production (Metal default + CUDA) | `--kv-cache-dtype int8`; Metal `auto` resolves to int8 | Metal stores full-attention K/V as MLX affine 8-bit packed triples (`uint32 data + bf16 scale/bias`, group 128/64/32 by head_dim). CUDA uses per-(token, head) scales for K and V (/127); decode on `paged_attention_quantized_fa3.cu`. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
 | KV cache | FP8 E4M3 | production (CUDA) | `--kv-cache-dtype fp8` | Per-(token, head) scales for K and V (/448). Same code shape as INT8 modulo quant range. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
-| KV cache | TurboQuant TQ4 | experimental (CUDA) | `--kv-cache-dtype tq4` (the clap enum accepts `auto\|bf16\|int8\|fp8\|tq4` — there is no `tq2`/`tq3`, `args.rs:944`) | FWHT-rotated packed indices + FP16 group norms. Page-size-1 path bypasses the batched paged prefill kernel. **Decode requires sm_80+**; sm_70 V100 build returns `CUDA_ERROR_NOT_SUPPORTED`. sm_80 audit pending. |
+| KV cache | TurboQuant TQ4 | deferred (CUDA) | `--kv-cache-dtype tq4` (the clap enum accepts `auto\|bf16\|int8\|fp8\|tq4` — there is no `tq2`/`tq3`, `args.rs:927`) | No runtime arm: engine construction bails with an explicit-deferral message (`infer-cuda/src/executor.rs:100`). |
 | **Weights** | DenseBF16 | production | default | No quantization. |
 | Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4_gemv` + Marlin W4 prefill. |
 | Weights | MarlinW4A8 | production (CUDA), Tier-1 | env `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` for the prefill-graph win path (–92.5% TTFT p50). |
 | Weights | W8A16 (per-group INT8) | production (CUDA) | safetensors metadata | GEMV + GEMM path. |
 | Weights | W2A16 (per-group packed INT2) | experimental (CUDA) | safetensors metadata | Scaffolding lives in `tensor.rs::from_quantized_int2`; not gate-validated. |
 | Weights | GGUF Q3_K / Q4_K / Q5_K / Q6_K | production (CUDA & Metal) | `.gguf` extension | Packed superblock kernels in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`. |
-| Weights | TurboQuant (packed + FP16 norms + Hadamard) | experimental (CUDA) | safetensors with TQ metadata | Tensor-local correctness only — full-model logits parity is **not** gated (`2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`). |
 | Weights | DSv4 FP8 E4M3 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp8BlockScaled` format; CUDA V4 attention/MoE/MTP kernels are the runtime blocker. |
 | Weights | DSv4 FP4 E2M1 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp4BlockScaled`; same DSv4 dependency chain. |
 
@@ -92,24 +91,11 @@ hardware FP8 conversion.
  INT8; format selects the dequant idiom).
 - **Status**: production (CUDA); same gate as INT8.
 
-### 1.4 TurboQuant TQ2 / TQ3 / TQ4
+### 1.4 TurboQuant TQ4
 
-- **Storage**: packed indices (2/3/4 bits per element) + FP16 per-group
- norms + Hadamard sign bits.
-- **Scale**: FWHT-rotated absmax norm per group; bit-pair-combined
- during dequant. Pool allocates `page_size = 1` (one token per page).
-- **Quantize kernels**:
- `crates/cuda-kernels/csrc/quant/turboquant_*` — pack/unpack pair.
-- **Decode-attn kernel**:
- `decode_attention_turboquant_*` — fused dequant inline.
-- **Prefill path**: `page_size = 1` triggers the contiguous BF16
- prefill path rather than the batched paged kernel that BF16/INT8/FP8 use.
-- **Status**: experimental; no `CudaKvCacheDtype` arm resolves to it
- (`tq4` fails loud at engine construction).
-- **Quality gate**: greedy token-trajectory match against BF16 is *not*
- a meaningful gate for TQ (tensor-local fixes license only their own
- gate, not full-model logits parity —
- `2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`).
+Deferred. `--kv-cache-dtype tq4` is accepted by the CLI but fails loud at
+engine construction (`infer-cuda/src/executor.rs:100`); the pack/unpack and
+decode-attention kernels were removed with the TurboQuant weight format.
 
 ---
 
@@ -130,7 +116,6 @@ safetensors load runs in the CUDA weight loader (`crates/infer-cuda/src/loader.r
 | `GgufQ4K` | 4 packed (superblock) | embedded | `q4k_gemv_kernel` + packed fast path | production (CUDA + Metal) |
 | `GgufQ5K` | 5 packed (superblock) | embedded | `gguf_q5k_gemv` | production (CUDA + Metal) |
 | `GgufQ6K` | 6 packed (superblock) | embedded | `gguf_q6k_gemv` | production (CUDA + Metal) |
-| `TurboQuant` | 2/3/4 packed + Hadamard | per-group FP16 | `turboquant_gemv` | experimental (tensor-local gate only) |
 | `Dsv4Fp8BlockScaled` | 8 (E4M3) | per-block FP8 E8M0 | DSv4-specific | in progress (DSv4 dependency) |
 | `Dsv4Fp4BlockScaled` | 4 packed (E2M1) | per-block FP8 E8M0 | DSv4-specific | in progress (DSv4 dependency) |
 

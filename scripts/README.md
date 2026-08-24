@@ -41,11 +41,10 @@ directory unless noted.
 
 | Script | Purpose |
 |---|---|
-| `quantize.py` | Unified quantization entry: `--format fp8\|w8a16\|w4a8-marlin\|turboquant`. Wraps the per-format scripts below. |
+| `quantize.py` | Unified quantization entry: `--format fp8\|w8a16\|w4a8-marlin`. Wraps the per-format scripts below. |
 | `fp8_block_cast.py` | BF16 → DeepSeek-style FP8 block-scaled (128×128). |
 | `w8a16_quant.py` | BF16 → W8A16 per-group signed INT8. |
 | `quantize_qwen3_w4a8.py` | Quantize Qwen to W4A8 (pack_w4a8 + Marlin). |
-| `turboquant_weights.py` | TurboQuant 4-bit quantization. |
 | `qwen35_tq4_dense_parity.py` | Verify Qwen3.5 TQ4 dense parity. |
 | `qwen36_dense_to_nvfp4.py` | Convert Qwen3.6 dense to NVFP4 format. |
 | `requant_dspark_mxfp4_to_fp8.py` | Re-quantize DSpark MXFP4 to FP8. |
