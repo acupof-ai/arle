@@ -197,10 +197,8 @@ fn append_tool_call_block(prompt: &mut String, tool_call: &ToolCall) {
     prompt.push_str(TOOL_CALL_BLOCK.close);
 }
 
-/// `None` returns an empty block (no tools are advertised, so the model
-/// answers as plain text).
-fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoiceMode) -> String {
-    if matches!(choice, ToolChoiceMode::None) || tools.is_empty() {
+fn build_tool_block(tools: &[ToolDefinition]) -> String {
+    if tools.is_empty() {
         return String::new();
     }
 
@@ -242,7 +240,7 @@ Reminder:\n\
 }
 
 pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
-    let tool_block = build_tool_block_with_choice(tools, &ToolChoiceMode::Auto);
+    let tool_block = build_tool_block(tools);
     let mut renderer = PromptRenderer::new(&tool_block);
     for message in messages {
         renderer.push_message(message);

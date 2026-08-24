@@ -42,9 +42,9 @@ mod wired_limit;
 pub use config::model_dir_is_deepseek_ocr;
 #[cfg(feature = "metal")]
 pub use deepseek_ocr::{LoadedMetalDeepseekOcr, MetalDeepseekOcrModel};
-#[cfg(feature = "metal")]
-pub use executor::default_t2_budget_bytes;
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
+#[cfg(feature = "metal")]
+pub use kv_native_sys::default_t2_budget_bytes;
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
 pub use mlx::{
