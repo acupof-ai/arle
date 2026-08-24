@@ -187,6 +187,8 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Dedicated sidecar serialization thread: snapshots go in via `sidecar_work_tx`,
     /// serialized blobs come out via `sidecar_rx` (drained in `poll_sidecar_serializations`).
     /// One thread (not spawn-per-call) bounds memory-bandwidth contention at c=1.
+    /// `ARLE_SIDECAR_SYNC=1` bypasses the thread and serializes inline (A/B control).
+    sidecar_sync: bool,
     sidecar_work_tx: std::sync::mpsc::Sender<SidecarWork>,
     sidecar_rx: std::sync::mpsc::Receiver<SidecarBlob>,
 }
@@ -320,6 +322,29 @@ impl Qwen35CudaExecutor {
             work.push((mat_len, key, snap));
         }
         if work.is_empty() {
+            return Ok(());
+        }
+        if self.sidecar_sync {
+            for (pos, key, snap) in work {
+                let bytes = snap.to_bytes();
+                let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
+                let manifest_key = tier_key(NS_SIDECAR, key);
+                let manifest = chunk_manifest(chunks, bytes.len());
+                let mut entries = Vec::with_capacity(chunks + 1);
+                entries.push((manifest_key, manifest));
+                entries.extend(
+                    bytes
+                        .chunks(BLOB_CHUNK_BYTES)
+                        .enumerate()
+                        .map(|(idx, chunk)| {
+                            (
+                                tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
+                                chunk.to_vec(),
+                            )
+                        }),
+                );
+                self.store_sidecar_blob(pos, key, chunks, entries, prefix_pages);
+            }
             return Ok(());
         }
         let _ = self.sidecar_work_tx.send(SidecarWork {
@@ -853,40 +878,43 @@ impl Qwen35CudaExecutor {
         // graph-capturable. Eager fallback disarms on any capture failure.
         let decode_graph_armed = crate::runtime_flags::qwen35_decode_graph()
             && model.decode_graph_unsupported_reason().is_none();
+        let sidecar_sync = std::env::var("ARLE_SIDECAR_SYNC").is_ok_and(|v| v == "1");
         let (sidecar_tx, sidecar_rx) = std::sync::mpsc::channel::<SidecarBlob>();
         let (sidecar_work_tx, sidecar_work_rx) = std::sync::mpsc::channel::<SidecarWork>();
-        std::thread::spawn(move || {
-            while let Ok(work) = sidecar_work_rx.recv() {
-                for (pos, key, snap) in work.items {
-                    let bytes = snap.to_bytes();
-                    let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
-                    let manifest_key = tier_key(NS_SIDECAR, key);
-                    let manifest = chunk_manifest(chunks, bytes.len());
-                    let mut entries = Vec::with_capacity(chunks + 1);
-                    entries.push((manifest_key, manifest));
-                    entries.extend(bytes.chunks(BLOB_CHUNK_BYTES).enumerate().map(
-                        |(idx, chunk)| {
-                            (
-                                tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
-                                chunk.to_vec(),
-                            )
-                        },
-                    ));
-                    if sidecar_tx
-                        .send(SidecarBlob {
-                            pos,
-                            key,
-                            chunks,
-                            entries,
-                            prefix_pages: work.prefix_pages.clone(),
-                        })
-                        .is_err()
-                    {
-                        return;
+        if !sidecar_sync {
+            std::thread::spawn(move || {
+                while let Ok(work) = sidecar_work_rx.recv() {
+                    for (pos, key, snap) in work.items {
+                        let bytes = snap.to_bytes();
+                        let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
+                        let manifest_key = tier_key(NS_SIDECAR, key);
+                        let manifest = chunk_manifest(chunks, bytes.len());
+                        let mut entries = Vec::with_capacity(chunks + 1);
+                        entries.push((manifest_key, manifest));
+                        entries.extend(bytes.chunks(BLOB_CHUNK_BYTES).enumerate().map(
+                            |(idx, chunk)| {
+                                (
+                                    tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
+                                    chunk.to_vec(),
+                                )
+                            },
+                        ));
+                        if sidecar_tx
+                            .send(SidecarBlob {
+                                pos,
+                                key,
+                                chunks,
+                                entries,
+                                prefix_pages: work.prefix_pages.clone(),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
         let executor = Self {
             model,
             slots,
@@ -914,6 +942,7 @@ impl Qwen35CudaExecutor {
                 rejects: 0,
                 chains: 0,
             }),
+            sidecar_sync,
             sidecar_work_tx,
             sidecar_rx,
         };
