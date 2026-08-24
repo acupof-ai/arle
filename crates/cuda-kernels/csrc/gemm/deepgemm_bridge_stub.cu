@@ -161,8 +161,6 @@ extern "C" CUresult dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
     CUstream) {
   return CUDA_ERROR_NOT_SUPPORTED;
 }
-  return CUDA_ERROR_NOT_SUPPORTED;
-}
 
 // Dense FP8 GEMM (a, sfa, b, sfb, d, m, n, k, sfa_aligned_m, stream).
 extern "C" CUresult dsv4_deepgemm_fp8_gemm_nt_cuda(
