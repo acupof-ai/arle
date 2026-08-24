@@ -48,13 +48,6 @@ pub enum WeightFormat {
 
 /// Shape/layout constraints expected by the matching CUDA kernels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WeightKernelAlignment {
-    pub weight_layout: &'static str,
-    pub scale_layout: &'static str,
-    pub k_multiple: usize,
-    pub n_multiple: usize,
-    pub group_size: usize,
-}
 
 impl WeightFormat {
     #[must_use]

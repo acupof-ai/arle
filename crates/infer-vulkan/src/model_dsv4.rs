@@ -180,28 +180,6 @@ pub struct Dsv4LayerRope {
     pub rope_theta: f32,
 }
 
-pub fn layer_rope_thetas(config: &deepseek_spec::v4::DeepSeekV4Config) -> Vec<Dsv4LayerRope> {
-    config
-        .compress_ratios
-        .iter()
-        .copied()
-        .take(config.num_hidden_layers)
-        .enumerate()
-        .map(|(layer_idx, compress_ratio)| {
-            let rope_theta = if compress_ratio > 0 {
-                config.compress_rope_theta
-            } else {
-                config.rope_theta
-            };
-            Dsv4LayerRope {
-                layer_idx,
-                compress_ratio,
-                rope_theta,
-            }
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LauncherWrites {
     pub launcher: &'static str,

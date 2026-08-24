@@ -586,24 +586,6 @@ pub(crate) fn decode_f8_e4m3fn(byte: u8) -> f32 {
     sign * (1.0 + mant as f32 / 8.0) * 2.0f32.powi(exp as i32 - BIAS)
 }
 
-pub(crate) fn decode_fp4_e2m1(nibble: u8) -> f32 {
-    let nibble = nibble & 0x0f;
-    let sign = if nibble & 0x08 != 0 { -1.0 } else { 1.0 };
-    let code = nibble & 0x07;
-    let value = match code {
-        0 => 0.0,
-        1 => 0.5,
-        2 => 1.0,
-        3 => 1.5,
-        4 => 2.0,
-        5 => 3.0,
-        6 => 4.0,
-        7 => 6.0,
-        _ => unreachable!(),
-    };
-    sign * value
-}
-
 fn tensor_by_name<'a>(
     tensors: &'a BTreeMap<String, TensorHeader>,
     name: &str,

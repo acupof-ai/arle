@@ -564,13 +564,6 @@ mod device {
             self.shape.max_seq_len
         }
 
-        pub fn slot_seq_len(&self, slot: usize) -> usize {
-            self.slots
-                .get(slot)
-                .and_then(|s| s.as_ref())
-                .map_or(0, |s| s.seq_len)
-        }
-
         /// Reset a slot whose host epoch moved (slot recycled by engine-core).
         pub fn reset_slot_if_epoch_changed(&mut self, slot: usize, epoch: u64) {
             if let Some(Some(state)) = self.slots.get(slot)

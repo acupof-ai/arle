@@ -1169,88 +1169,7 @@ pub unsafe fn dsv4_fill_m_indices_from_counts(
     Ok(())
 }
 
-///
-/// # Safety
-/// All pointers must be valid on `stream`; `packed_m_indices` has the same row
-/// capacity as `packed_hidden`.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn dsv4_pack_local_experts_with_slots_and_indices(
-    hidden: RawDevicePtr<bf16>,
-    indices: RawDevicePtr<i32>,
-    weights: RawDevicePtr<f32>,
-    offsets: RawDevicePtr<i32>,
-    cursors: RawDevicePtr<i32>,
-    packed_hidden: RawDevicePtr<bf16>,
-    packed_route_slot: RawDevicePtr<i32>,
-    packed_weight: RawDevicePtr<f32>,
-    packed_m_indices: RawDevicePtr<i32>,
-    num_tokens: usize,
-    hidden_dim: usize,
-    topk: usize,
-    local_expert_start: usize,
-    experts_per_rank: usize,
-    stream: CUstream,
-) -> Result<()> {
-    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
-    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
-    unsafe {
-        ffi::dsv4_pack_local_experts_with_slots_and_indices_cuda(
-            hidden.as_ptr() as *const Half,
-            indices.as_ptr(),
-            weights.as_ptr(),
-            offsets.as_ptr(),
-            cursors.as_mut_ptr(),
-            packed_hidden.as_mut_ptr() as *mut Half,
-            packed_route_slot.as_mut_ptr(),
-            packed_weight.as_mut_ptr(),
-            packed_m_indices.as_mut_ptr(),
-            i32::try_from(num_tokens)?,
-            i32::try_from(hidden_dim)?,
-            i32::try_from(topk)?,
-            i32::try_from(local_expert_start)?,
-            i32::try_from(experts_per_rank)?,
-            stream,
-        )
-        .result()?;
-    }
-    Ok(())
-}
 
-///
-/// # Safety
-/// `gate` / `up` / `out` / `route_meta` must be valid on `stream` for the shape.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn dsv4_swiglu_clamped_routes(
-    gate: RawDevicePtr<bf16>,
-    up: RawDevicePtr<bf16>,
-    out: RawDevicePtr<bf16>,
-    route_meta: RawDevicePtr<i32>,
-    num_routes: usize,
-    hidden_dim: usize,
-    local_expert_start: usize,
-    experts_per_rank: usize,
-    limit: f32,
-    stream: CUstream,
-) -> Result<()> {
-    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
-    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
-    unsafe {
-        ffi::dsv4_swiglu_clamped_routes_cuda(
-            gate.as_ptr() as *const Half,
-            up.as_ptr() as *const Half,
-            out.as_mut_ptr() as *mut Half,
-            route_meta.as_ptr(),
-            i32::try_from(num_routes)?,
-            i32::try_from(hidden_dim)?,
-            i32::try_from(local_expert_start)?,
-            i32::try_from(experts_per_rank)?,
-            limit,
-            stream,
-        )
-        .result()?;
-    }
-    Ok(())
-}
 
 ///
 /// # Safety
@@ -1757,63 +1676,6 @@ pub unsafe fn dsv4_deepgemm_paged_mqa_logits_metadata(
 ///
 /// This computes logits only. Query/cache FP8 packing and top-k are separate
 /// official/OSS adoption pieces.
-///
-/// # Safety
-/// All pointers must be valid on `stream`. Layouts must match the DeepGEMM
-/// contract: `q=[B,next_n,H,D]` E4M3, `kv_cache=[blocks,64,1,D+4]` byte
-/// storage split into FP8 values and FP32 scales, `weights=[B*next_n,H]`.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn dsv4_deepgemm_fp8_paged_mqa_logits(
-    q: RawDevicePtr<u8>,
-    kv_cache: RawDevicePtr<u8>,
-    kv_cache_scales: RawDevicePtr<f32>,
-    weights: RawDevicePtr<f32>,
-    context_lens: RawDevicePtr<i32>,
-    block_table: RawDevicePtr<i32>,
-    schedule_meta: RawDevicePtr<i32>,
-    logits: RawDevicePtr<f32>,
-    batch_size: usize,
-    next_n: usize,
-    num_heads: usize,
-    head_dim: usize,
-    num_kv_blocks: usize,
-    block_kv: usize,
-    max_context_len: usize,
-    logits_stride: usize,
-    block_table_stride: usize,
-    kv_cache_stride_bytes: usize,
-    num_sms: usize,
-    stream: CUstream,
-) -> Result<()> {
-    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
-    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
-    unsafe {
-        ffi::dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
-            q.as_ptr(),
-            kv_cache.as_ptr(),
-            kv_cache_scales.as_ptr(),
-            weights.as_ptr(),
-            context_lens.as_ptr(),
-            block_table.as_ptr(),
-            schedule_meta.as_ptr(),
-            logits.as_mut_ptr(),
-            i32::try_from(batch_size)?,
-            i32::try_from(next_n)?,
-            i32::try_from(num_heads)?,
-            i32::try_from(head_dim)?,
-            i32::try_from(num_kv_blocks)?,
-            i32::try_from(block_kv)?,
-            i32::try_from(max_context_len)?,
-            i32::try_from(logits_stride)?,
-            i32::try_from(block_table_stride)?,
-            i32::try_from(kv_cache_stride_bytes)?,
-            i32::try_from(num_sms)?,
-            stream,
-        )
-        .result()?;
-    }
-    Ok(())
-}
 
 /// Official DeepGEMM FP8 paged-MQA logits over SGLang's fused DSA cache layout:
 /// `[page][64][128 FP8 values | 64 FP32 scales]` as one byte buffer.
@@ -1961,43 +1823,6 @@ pub unsafe fn dsv4_deepgemm_silu_mul_masked_quant(
             i32::try_from(expected_m)?,
             i32::try_from(hidden_dim)?,
             swiglu_limit,
-            stream,
-        )
-        .result()?;
-    }
-    Ok(())
-}
-
-/// Unpad the padded `[num_groups * max_m, hidden]` grouped GEMM output back to
-/// the compact `[total_routes, hidden]` row layout (per-group `active_offsets`).
-/// Wraps [`ffi::dsv4_deepgemm_unpad_grouped_bf16_cuda`].
-///
-/// # Safety
-/// All pointers must be valid on `stream` for the given shape.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn dsv4_deepgemm_unpad_grouped_bf16(
-    grouped: RawDevicePtr<bf16>,
-    compact: RawDevicePtr<bf16>,
-    active_experts: RawDevicePtr<i32>,
-    active_offsets: RawDevicePtr<i32>,
-    active_counts: RawDevicePtr<i32>,
-    active_count: usize,
-    max_m: usize,
-    hidden_dim: usize,
-    stream: CUstream,
-) -> Result<()> {
-    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
-    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
-    unsafe {
-        ffi::dsv4_deepgemm_unpad_grouped_bf16_cuda(
-            grouped.as_ptr() as *const Half,
-            compact.as_mut_ptr() as *mut Half,
-            active_experts.as_ptr(),
-            active_offsets.as_ptr(),
-            active_counts.as_ptr(),
-            i32::try_from(active_count)?,
-            i32::try_from(max_m)?,
-            i32::try_from(hidden_dim)?,
             stream,
         )
         .result()?;

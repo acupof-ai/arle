@@ -153,25 +153,6 @@ mod ffi {
     }
 }
 
-pub fn compiled_backend_version() -> &'static str {
-    #[cfg(feature = "real")]
-    {
-        // SAFETY: The shim returns a process-lifetime string literal.
-        let ptr = unsafe { ffi::arle_xgrammar_version() };
-        if ptr.is_null() {
-            return "mlc-ai/xgrammar real backend";
-        }
-        // SAFETY: Non-null pointer is owned by the C++ library for process lifetime.
-        unsafe { CStr::from_ptr(ptr) }
-            .to_str()
-            .unwrap_or("mlc-ai/xgrammar")
-    }
-    #[cfg(not(feature = "real"))]
-    {
-        "stub"
-    }
-}
-
 pub fn bitmask_size(vocab_size: usize) -> Result<usize> {
     let vocab_i32 =
         i32::try_from(vocab_size).map_err(|_| XGrammarError::VocabTooLarge(vocab_size))?;
@@ -276,34 +257,6 @@ impl GrammarCompiler {
                     self.inner.as_ptr(),
                     schema.as_ptr(),
                     u8::from(strict_mode),
-                    &mut out,
-                    &mut error,
-                )
-            };
-            check_status(status, error)?;
-            CompiledGrammar::from_raw(out, self.vocab_size)
-        }
-    }
-
-    pub fn compile_ebnf(&mut self, grammar: &str, root_rule_name: &str) -> Result<CompiledGrammar> {
-        #[cfg(not(feature = "real"))]
-        {
-            let _ = grammar;
-            let _ = root_rule_name;
-            Err(XGrammarError::Unavailable)
-        }
-        #[cfg(feature = "real")]
-        {
-            let grammar = CString::new(grammar)?;
-            let root = CString::new(root_rule_name)?;
-            let mut out = ptr::null_mut();
-            let mut error = ptr::null_mut();
-            // SAFETY: `self.inner` is live; grammar/root C strings are valid for the call.
-            let status = unsafe {
-                ffi::arle_xgrammar_compile_ebnf(
-                    self.inner.as_ptr(),
-                    grammar.as_ptr(),
-                    root.as_ptr(),
                     &mut out,
                     &mut error,
                 )

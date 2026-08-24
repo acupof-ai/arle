@@ -195,17 +195,6 @@ pub struct Qwen35LinearStateShape {
     pub conv_bf16: usize,
 }
 
-pub fn linear_state_shape(config: &qwen35_spec::Qwen35Config) -> Qwen35LinearStateShape {
-    Qwen35LinearStateShape {
-        recurrent_f32: config.linear_num_value_heads
-            * config.linear_key_head_dim
-            * config.linear_value_head_dim,
-        conv_bf16: (2 * config.linear_num_key_heads * config.linear_key_head_dim
-            + config.linear_num_value_heads * config.linear_value_head_dim)
-            * config.linear_conv_kernel_dim.saturating_sub(1),
-    }
-}
-
 pub const QWEN35_MUTATED_RECURRENT_BUFFERS: &[&str] = &[
     "slot.linear.gated_delta_state_f32",
     "slot.linear.conv4_ring_bf16",

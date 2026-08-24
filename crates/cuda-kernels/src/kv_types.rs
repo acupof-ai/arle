@@ -29,45 +29,6 @@ pub enum KVFormat {
 }
 
 impl KVFormat {
-    /// Stable wire-level discriminant used in persisted KV fingerprints.
-    /// **These values must not change once written to disk.** Adding a
-    /// new variant without assigning a unique tag here is a
-    /// compile-time-adjacent error: the match must stay exhaustive and
-    /// every `TurboQuant` bit-pair combination that ships to production
-    /// gets its own explicit arm. Unknown bit-pairs return `None` so
-    /// callers can fail fast instead of stamping a collision-prone
-    /// fallback onto the disk format (M4 review finding A4 — the old
-    /// `saturating_add` fallback could collapse two distinct bit-pairs
-    /// onto the same tag).
-    pub fn stable_tag(&self) -> Option<u8> {
-        let tag = match *self {
-            Self::BF16 => 1,
-            Self::INT8 => 3,
-            Self::FP8E4M3 => 5,
-            Self::TurboQuant {
-                key_bits: 2,
-                val_bits: 2,
-            } => 10,
-            Self::TurboQuant {
-                key_bits: 3,
-                val_bits: 3,
-            } => 11,
-            Self::TurboQuant {
-                key_bits: 4,
-                val_bits: 4,
-            } => 12,
-            Self::TurboQuant { .. } => return None,
-            // Canonical DSv4 MLA latent record (448 B FP8 NoPE + 64×2 B BF16
-            // RoPE + 8 B e8m0 scale). Other record widths get their own tag
-            // when a production shape ships — same policy as TurboQuant
-            // bit-pairs above.
-            Self::PackedBytes {
-                bytes_per_token: 584,
-            } => 13,
-            Self::PackedBytes { .. } => return None,
-        };
-        Some(tag)
-    }
 
     pub fn default_page_size(self) -> usize {
         match self {

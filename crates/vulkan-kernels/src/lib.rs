@@ -426,18 +426,6 @@ impl KernelParams {
         }
     }
 
-    pub fn push_u32(&mut self, value: u32) {
-        self.words.push(value);
-    }
-
-    pub fn push_i32(&mut self, value: i32) {
-        self.words.push(value as u32);
-    }
-
-    pub fn push_f32(&mut self, value: f32) {
-        self.words.push(value.to_bits());
-    }
-
     pub fn len_bytes(&self) -> usize {
         self.words.len() * std::mem::size_of::<u32>()
     }
@@ -1057,30 +1045,6 @@ macro_rules! launcher_fns {
             $call(Kernel::MmvqQ2K, ctx, buffers, dispatch)
         }
 
-        pub fn q4_k_gemv(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::GemvQ4K, ctx, buffers, dispatch)
-        }
-
-        pub fn q5_k_gemv(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::GemvQ5K, ctx, buffers, dispatch)
-        }
-
-        pub fn q6_k_gemv(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::GemvQ6K, ctx, buffers, dispatch)
-        }
-
         // The `mul_mat_vecq` GEMV requires the 13-uint push-constant block from
         // `mul_mat_vec_base.glsl` (ncols/strides/row-count). The no-push
         // launchers above are insufficient on their own — use these
@@ -1095,24 +1059,6 @@ macro_rules! launcher_fns {
             params: &KernelParams,
         ) -> Result<()> {
             $call_params(Kernel::GemvQ4K, ctx, buffers, dispatch, params)
-        }
-
-        pub fn q5_k_gemv_with_params(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-            params: &KernelParams,
-        ) -> Result<()> {
-            $call_params(Kernel::GemvQ5K, ctx, buffers, dispatch, params)
-        }
-
-        pub fn q6_k_gemv_with_params(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-            params: &KernelParams,
-        ) -> Result<()> {
-            $call_params(Kernel::GemvQ6K, ctx, buffers, dispatch, params)
         }
 
         pub fn q8_0_gemv(
@@ -1143,24 +1089,6 @@ macro_rules! launcher_fns {
             params: &KernelParams,
         ) -> Result<()> {
             $call_params(Kernel::GemvIdQ4K, ctx, buffers, dispatch, params)
-        }
-
-        pub fn q5_k_gemv_id_with_params(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-            params: &KernelParams,
-        ) -> Result<()> {
-            $call_params(Kernel::GemvIdQ5K, ctx, buffers, dispatch, params)
-        }
-
-        pub fn q6_k_gemv_id_with_params(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-            params: &KernelParams,
-        ) -> Result<()> {
-            $call_params(Kernel::GemvIdQ6K, ctx, buffers, dispatch, params)
         }
 
         pub fn q8_0_gemv_id_with_params(
@@ -1243,14 +1171,6 @@ macro_rules! launcher_fns {
             dispatch: Dispatch,
         ) -> Result<()> {
             $call(Kernel::Add, ctx, buffers, dispatch)
-        }
-
-        pub fn embedding_get_rows(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::GetRows, ctx, buffers, dispatch)
         }
 
         pub fn soft_max(
@@ -1381,7 +1301,7 @@ macro_rules! fused_launcher_fns {
 
 #[cfg(feature = "vulkan")]
 mod real {
-    use super::{Dispatch, FlashAttentionSpec, Kernel, Result};
+    use super::{Dispatch, Kernel, Result};
 
     pub fn launch(
         kernel: Kernel,
@@ -1444,23 +1364,6 @@ mod real {
             specialization_u32,
         )
     }
-
-    pub fn flash_attn_with_params_and_spec(
-        ctx: &vulkan_sys::VulkanContext,
-        buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-        dispatch: Dispatch,
-        params: &super::KernelParams,
-        spec: &FlashAttentionSpec,
-    ) -> Result<()> {
-        launch_with_params_and_specialization(
-            Kernel::FlashAttn,
-            ctx,
-            buffers,
-            dispatch,
-            params,
-            spec.specialization_u32(),
-        )
-    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -1470,7 +1373,7 @@ fused_launcher_fns!(real::launch_with_params);
 
 #[cfg(not(feature = "vulkan"))]
 mod stub {
-    use super::{FlashAttentionSpec, Kernel, KernelError, Result};
+    use super::{Kernel, KernelError, Result};
 
     pub fn launch(
         _kernel: Kernel,
@@ -1490,24 +1393,9 @@ mod stub {
     ) -> Result<()> {
         Err(KernelError::NotCompiled)
     }
-
-    pub fn flash_attn_with_params_and_spec(
-        _ctx: &vulkan_sys::VulkanContext,
-        _buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-        _dispatch: super::Dispatch,
-        _params: &super::KernelParams,
-        _spec: &FlashAttentionSpec,
-    ) -> Result<()> {
-        Err(KernelError::NotCompiled)
-    }
 }
 
 #[cfg(not(feature = "vulkan"))]
 launcher_fns!(stub::launch, stub::launch_with_params);
 #[cfg(not(feature = "vulkan"))]
 fused_launcher_fns!(stub::launch_with_params);
-
-#[cfg(feature = "vulkan")]
-pub use real::flash_attn_with_params_and_spec;
-#[cfg(not(feature = "vulkan"))]
-pub use stub::flash_attn_with_params_and_spec;

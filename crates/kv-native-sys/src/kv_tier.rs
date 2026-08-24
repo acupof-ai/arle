@@ -243,13 +243,6 @@ enum DiskStore {
 }
 
 impl DiskStore {
-    fn is_direct(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        return matches!(self, Self::Direct(_));
-        #[cfg(not(target_os = "linux"))]
-        false
-    }
-
     fn num_slots(&self) -> u32 {
         match self {
             Self::Mmap(store) => store.num_slots(),
@@ -1000,21 +993,6 @@ impl KvTierStore {
         )
     }
 
-    pub fn set_disk_durable(
-        &mut self,
-        root: PathBuf,
-        budget_bytes: usize,
-        bytes_per_page: usize,
-        epoch: String,
-        format_tag: u8,
-        world_size: usize,
-        rank: usize,
-    ) -> bool {
-        let namespace =
-            Self::durable_namespace(root, &epoch, format_tag, world_size, rank, bytes_per_page);
-        self.attach_disk(namespace, budget_bytes, bytes_per_page, true, epoch)
-    }
-
     fn attach_disk(
         &mut self,
         namespace: PathBuf,
@@ -1657,21 +1635,6 @@ impl KvTierStore {
             .into_iter()
             .map(|value| value.expect("every requested key resolved"))
             .collect())
-    }
-
-    pub fn read_many_concat(&mut self, keys: &[u64]) -> Result<Vec<u8>> {
-        if self
-            .disk
-            .as_ref()
-            .is_some_and(|disk| disk.store.is_direct())
-        {
-            return Ok(self.read_many(keys)?.into_iter().flatten().collect());
-        }
-        let mut values = Vec::with_capacity(keys.len().saturating_mul(self.bytes_per_page));
-        for key in keys {
-            values.extend_from_slice(&self.read(*key)?);
-        }
-        Ok(values)
     }
 
     /// Rank-LOCAL chunked-blob insert: one manifest page under
