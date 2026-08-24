@@ -25,6 +25,10 @@ pub struct MetalSlotState {
     pub(super) dflash_ewma_accept: f32,
     /// Blocks to skip before retrying the draft (adaptive fallback).
     pub(super) dflash_skip_remaining: u32,
+    /// Consecutive blocks where all draft tokens were rejected. When this
+    /// reaches 3, DSpark is disabled for the rest of the session (the draft
+    /// model is producing garbage, e.g. missing conv states).
+    pub(super) dflash_consecutive_rejects: u32,
 }
 
 #[cfg(feature = "metal")]
@@ -86,6 +90,7 @@ impl MetalSlotState {
             dflash_draft_state: None,
             dflash_ewma_accept: 4.0,
             dflash_skip_remaining: 0,
+            dflash_consecutive_rejects: 0,
         }
     }
 
@@ -109,6 +114,7 @@ impl MetalSlotState {
             dflash_draft_state: None,
             dflash_ewma_accept: 4.0,
             dflash_skip_remaining: 0,
+            dflash_consecutive_rejects: 0,
         }
     }
 
