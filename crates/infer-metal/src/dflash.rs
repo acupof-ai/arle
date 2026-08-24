@@ -1252,8 +1252,9 @@ pub(crate) fn prepare_draft_block(
             let mut block = Vec::with_capacity(runtime.block_size + 1);
             block.push(current_token);
             block.extend(draft_tokens.iter().map(|&t| t as u32));
-            draft_state.trim(runtime.block_size);
-            draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
+            // Reset (not trim+window): stale draft KV from previous blocks
+            // causes acceptance to degrade over long generations.
+            draft_state.reset();
             return Ok(tokens_to_array(&block));
         }
         let mut prev = MlxArray::from_slice_i32(&[current_token as i32], &[1]);
@@ -1315,8 +1316,9 @@ pub(crate) fn prepare_draft_block(
         let mut block = Vec::with_capacity(actual_bs + 1);
         block.push(current_token);
         block.extend(draft_tokens.iter().map(|&t| t as u32));
-        draft_state.trim(runtime.block_size);
-        draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
+        // Reset (not trim+window): stale draft KV from previous blocks
+        // causes acceptance to degrade over long generations.
+        draft_state.reset();
         let block_arr = tokens_to_array(&block);
         let t_argmax = Instant::now();
         if draft_trace {

@@ -650,6 +650,27 @@ impl CppLfm2Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// Eager single-token decode for the DSpark adaptive-skip fallback.
+    /// The compiled forward_verify traces with S=5 and bakes slice/reshape
+    /// indices that fail on S=1; the eager path reads S at runtime.
+    pub(crate) fn eager_step_session(&self, token: &MlxArray, cache_pos: i32) -> Result<MlxArray> {
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // SAFETY: FFI over live session arrays.
+        let rc = unsafe {
+            mlx_sys::lfm2_eager_step_session(
+                self.raw,
+                token.as_raw(),
+                cache_pos,
+                &raw mut out_logits,
+            )
+        };
+        if rc != 0 {
+            return Err(crate::mlx::check_mlx_error().unwrap_err());
+        }
+        // SAFETY: the bridge wrote a valid owned handle on success.
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
     // paged Metal decode path; wired with the DSpark draft
     #[allow(dead_code)]
     pub(crate) fn step_session_paged_bf16(

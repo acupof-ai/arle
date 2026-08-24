@@ -180,6 +180,8 @@ struct Lfm2MoeFFN {
     // Cuts ~23 eager kernel launches per MoE layer × 22 layers.
     // mutable: lazily initialized in const forward_impl.
     mutable std::function<std::vector<array>(const std::vector<array>&)> compiled_moe;
+    // The seq_len the MoE was compiled for (shapeless=false specializes on S).
+    mutable int compiled_moe_seq_len = 0;
 };
 
 struct Lfm2Layer {
@@ -300,8 +302,11 @@ struct Lfm2CompiledModel {
         // 2-frame conv state at any accepted position (avoids a re-run on
         // partial acceptance).
         if (captured_conv_inputs) captured_conv_inputs->push_back(conv_input);
+        // Slice the last n_keep frames using the runtime shape (not S, which
+        // the compiled graph bakes in from the first trace).
+        int total_frames = conv_input.shape(1);
         conv_state_out = contiguous(slice(
-            conv_input, {0, S, 0}, {B, S + n_keep, H}));
+            conv_input, {0, total_frames - n_keep, 0}, {B, total_frames, H}));
         auto conv_out = conv1d(conv_input, lw.conv_w, 1, 0, 1, H);  // [B, S, H]
 
         auto y = gate_c * conv_out;
@@ -319,18 +324,18 @@ struct Lfm2CompiledModel {
         int S = current_seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
 
-        auto q = reshape(lw.q_proj.apply(x), {B, S, nh, hd});
+        auto q = reshape(lw.q_proj.apply(x), {B, -1, nh, hd});
         q = fast::rms_norm(q, lw.q_norm_w, rms_eps);
         q = transpose(q, {0, 2, 1, 3});
 
-        auto k = reshape(lw.k_proj.apply(x), {B, S, nkv, hd});
+        auto k = reshape(lw.k_proj.apply(x), {B, -1, nkv, hd});
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
 
         q = fast::rope(q, hd, false, rope_theta, 1.0f, cache_pos);
         k = fast::rope(k, hd, false, rope_theta, 1.0f, cache_pos);
 
-        auto v = transpose(reshape(lw.v_proj.apply(x), {B, S, nkv, hd}), {0, 2, 1, 3});
+        auto v = transpose(reshape(lw.v_proj.apply(x), {B, -1, nkv, hd}), {0, 2, 1, 3});
 
         // Grow KV cache via concatenate (cache is pre-trimmed to cache_pos by
         // the caller). This avoids slice_update whose Shape indices would bake
@@ -355,9 +360,10 @@ struct Lfm2CompiledModel {
             v_full = new_v_cache;
         }
 
-        std::string mask_mode = (S > 1) ? "causal" : "";
-        auto attn = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, mask_mode);
-        attn = reshape(transpose(attn, {0, 2, 1, 3}), {B, S, nh * hd});
+        // Causal mask is correct for S=1 too (single token attends to itself),
+        // so hardcode it to avoid baking a C++ conditional into the compiled graph.
+        auto attn = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, "causal");
+        attn = reshape(transpose(attn, {0, 2, 1, 3}), {B, -1, nh * hd});
         return lw.o_proj.apply(attn);
     }
 
@@ -376,7 +382,7 @@ struct Lfm2CompiledModel {
         auto cache_pos = inputs[1 + 2 * F + C];
 
         auto x = take(embed_tokens, flatten(token_id), 0);
-        x = reshape(x, {B, S, hidden_size});
+        x = reshape(x, {B, -1, hidden_size});
 
         std::vector<array> new_kv(2 * F, array(0));
         std::vector<array> new_conv(C, array(0));
@@ -441,8 +447,20 @@ struct Lfm2CompiledModel {
                                     egs, eb, ne, tk, ntp)};
                             };
                         moe.compiled_moe = mlx::core::compile(fn, false /* shapeless */);
+                        moe.compiled_moe_seq_len = S;
                     }
-                    x = residual2 + moe.compiled_moe({xn2})[0];
+                    // shapeless=false specializes on S; eager fallback for other S.
+                    if (moe.compiled_moe_seq_len == S) {
+                        x = residual2 + moe.compiled_moe({xn2})[0];
+                    } else {
+                        x = residual2 + lfm2_moe_block_forward_cpp(
+                            xn2, moe.router_w, moe.expert_bias,
+                            moe.switch_gate.w, moe.switch_gate.scales, moe.switch_gate.biases,
+                            moe.switch_up.w, moe.switch_up.scales, moe.switch_up.biases,
+                            moe.switch_down.w, moe.switch_down.scales, moe.switch_down.biases,
+                            moe.expert_group_size, moe.expert_bits,
+                            moe.num_experts, moe.top_k, moe.norm_topk_prob);
+                    }
                 }
             } else if (layer.is_conv) {
                 x = residual2 + dense_mlp(xn2, layer.conv.gate_up,
@@ -826,6 +844,35 @@ int32_t lfm2_compiled_step_session(
         // shapeless-compiled forward fuses element-wise ops across layers,
         // cutting kernel launch overhead ~2ms/token vs the eager forward().
         auto outputs = m->forward_verify(inputs);
+        extract_forward_outputs(m, outputs, out_logits);
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+// Eager single-token decode for the DSpark adaptive-skip fallback. The compiled
+// forward_verify traces with S=5 (verify block) and bakes slice/reshape indices
+// that fail on S=1; the eager path reads S at runtime.
+int32_t lfm2_eager_step_session(
+    void* model, mlx_array* token_id, int32_t cache_pos, mlx_array** out_logits) {
+    auto* m = static_cast<Lfm2CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if (!m->session_active) {
+            throw std::runtime_error("lfm2_eager_step_session requires an active session");
+        }
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->current_has_paged_prefix = false;
+        m->current_paged_k.clear();
+        m->current_paged_v.clear();
+
+        auto inputs = build_forward_inputs(m, *to_arr(token_id), cache_pos);
+        auto outputs = m->forward(inputs);
         extract_forward_outputs(m, outputs, out_logits);
         return 0;
     } catch (const std::exception& e) {

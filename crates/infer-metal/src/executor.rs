@@ -1242,6 +1242,51 @@ impl RealMetalExecutor {
         let old_cache_len = slot.cache_len;
         let layer_ids = runtime.target_layer_ids();
 
+        // Adaptive draft skipping: when the rolling acceptance rate is too low,
+        // fall back to single-token decode (~7ms vs ~26ms per block). The target
+        // hidden is still captured so the rolling history stays fresh for when
+        // the draft resumes.
+        if slot.dflash_skip_remaining > 0 {
+            slot.dflash_skip_remaining -= 1;
+            // Reset EWMA on the last skip block so the draft gets a fair retry
+            // (otherwise the stale low EWMA immediately re-triggers skipping).
+            if slot.dflash_skip_remaining == 0 {
+                slot.dflash_ewma_accept = 4.0;
+            }
+            let t0 = std::time::Instant::now();
+            slot.ensure_session_active(model)?;
+            self.weights.set_capture_layers(layer_ids)?;
+            let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
+            let logits = model.eager_step_session(&token_arr, slot.cache_len as i32)?;
+            let captured = self.weights.drain_captured_hidden()?;
+            self.weights.clear_capture_layers();
+            slot.drain_session(model)?;
+            slot.cache_len += 1;
+            slot.committed_len = slot.cache_len;
+            let updated = dflash::build_target_hidden_from_captures(&captured, layer_ids.len(), 1)?;
+            slot.roll_target_hidden(updated);
+            slot.last_sampled = None;
+            self.active_session_slot = None;
+            let next_token = dflash::materialize_i32_tokens(&mlx::argmax(&logits))?[0] as u32;
+            if dflash::dflash_draft_trace_enabled() {
+                log::info!(
+                    "DSpark skip slot={} cache_len={} ms={:.2}",
+                    row.slot,
+                    slot.cache_len,
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(StepOutput {
+                tokens: vec![SlotToken {
+                    slot: row.slot,
+                    token: next_token,
+                    logprob: None,
+                    top_logprobs: Vec::new(),
+                    finish: None,
+                }],
+            });
+        }
+
         // 1. Draft block (DSpark: backbone once + Markov head refinement).
         let t_step = std::time::Instant::now();
         let t_draft = std::time::Instant::now();
@@ -1252,6 +1297,11 @@ impl RealMetalExecutor {
                     row.slot
                 )
             })?;
+            // Draft KV is reset each block (stale KV degrades acceptance);
+            // set the absolute RoPE offset for the target context so the
+            // draft's Q/K align with the target's positions.
+            let target_hidden_len = target_hidden.shape().first().copied().unwrap_or(0) as i32;
+            draft_state.set_rope_offset(old_cache_len as i32 - target_hidden_len);
             dflash::prepare_draft_block(
                 runtime,
                 row.last_token,
@@ -1334,12 +1384,22 @@ impl RealMetalExecutor {
             layer_ids.len(),
             accepted_inputs as i32,
         )?;
+        // Rolling target-hidden history: the draft's attention uses
+        // target_hidden_proj as KV context. A single block's accepted positions
+        // (1-5 rows) starve the 5-layer draft; keep the last 64 rows instead.
+        slot.roll_target_hidden(updated_target_hidden);
         let hidden_ms = t_hidden.elapsed().as_secs_f64() * 1000.0;
         // 6. Close session + update cache length.
         slot.drain_session(model)?;
         slot.cache_len = old_cache_len + accepted_inputs;
         slot.committed_len = slot.cache_len;
-        slot.dflash_target_hidden = Some(updated_target_hidden);
+        // Update rolling acceptance rate; skip the draft when it's clearly
+        // hurting (below 2 tokens/block → worse than no-draft 138 tok/s).
+        let accepted = accepted_inputs as f32;
+        slot.dflash_ewma_accept = slot.dflash_ewma_accept * 0.75 + accepted * 0.25;
+        if slot.dflash_ewma_accept < 2.0 {
+            slot.dflash_skip_remaining = 8;
+        }
         slot.last_sampled = None;
         self.active_session_slot = None;
         let total_ms = t_step.elapsed().as_secs_f64() * 1000.0;

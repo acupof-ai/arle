@@ -21,6 +21,10 @@ pub struct MetalSlotState {
     pub(super) last_sampled: Option<mlx::MlxArray>,
     pub(super) dflash_target_hidden: Option<mlx::MlxArray>,
     pub(super) dflash_draft_state: Option<dflash::DFlashDraftState>,
+    /// EWMA of accepted tokens per draft block (0..block_size).
+    pub(super) dflash_ewma_accept: f32,
+    /// Blocks to skip before retrying the draft (adaptive fallback).
+    pub(super) dflash_skip_remaining: u32,
 }
 
 #[cfg(feature = "metal")]
@@ -80,6 +84,8 @@ impl MetalSlotState {
             last_sampled: None,
             dflash_target_hidden: None,
             dflash_draft_state: None,
+            dflash_ewma_accept: 4.0,
+            dflash_skip_remaining: 0,
         }
     }
 
@@ -101,7 +107,25 @@ impl MetalSlotState {
             last_sampled: None,
             dflash_target_hidden: None,
             dflash_draft_state: None,
+            dflash_ewma_accept: 4.0,
+            dflash_skip_remaining: 0,
         }
+    }
+
+    /// Append captured rows to the rolling target-hidden history (last 64).
+    pub(super) fn roll_target_hidden(&mut self, new_rows: mlx::MlxArray) {
+        let old = self
+            .dflash_target_hidden
+            .take()
+            .unwrap_or_else(|| new_rows.clone());
+        let combined = mlx::concatenate_axis(&[old, new_rows], 0);
+        let len = combined.shape().first().copied().unwrap_or(0) as i32;
+        self.dflash_target_hidden = Some(if len > 64 {
+            let dim = combined.shape().get(1).copied().unwrap_or(0) as i32;
+            mlx::slice(&combined, &[len - 64, 0], &[len, dim], &[1, 1])
+        } else {
+            combined
+        });
     }
 
     pub(super) fn ensure_session_active(
