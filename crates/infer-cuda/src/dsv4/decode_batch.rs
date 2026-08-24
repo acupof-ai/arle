@@ -210,18 +210,11 @@ impl Dsv4Model {
         // inert; premature-free hazard under disabled event tracking).
         let mut ptr_keepalive: Vec<CudaSlice<u64>> = Vec::new();
 
-        // c=1 is the captured lane: per-layer activations alias persistent graph
-        // buffers so the capture records no alloc nodes (86 on FP8 before this).
-        let graph_mode = self.graph_mode() && n == 1;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
 
-            let mut normed = self.step_hidden(
-                graph_mode,
-                (layer_idx, GraphSlot::NormedAttn),
-                hidden_size,
-                seq_len,
-            )?;
+            // SAFETY: uninit device scratch; fully written before first read.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let attn_mhc = self.hc_pre_norm(
                 layer,
                 HcHalf::Attn,
@@ -234,14 +227,9 @@ impl Dsv4Model {
             )?;
             keepalive.keep_hidden(&normed);
 
-            // Every [r*hidden, (r+1)*hidden) span of attn_out is written by the
-            // copy-out below before attn_out is read by hc_post.
-            let mut attn_out = self.step_hidden(
-                graph_mode,
-                (layer_idx, GraphSlot::AttnOut),
-                hidden_size,
-                seq_len,
-            )?;
+            // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
+            // the copy-out below before attn_out is read by hc_post.
+            let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             // Batched FlashMLA decode lane: per row PREPARE (wq/wkv+RoPE,
             // compressor, CSA indexer top-k) → pack KV → gather Q; then ONE
             // `sparse_decode_fwd(b=N)`; then the per-row finish tail. Only the
@@ -1126,12 +1114,6 @@ impl Dsv4Model {
                         if full_flatten {
                             // local_attn_batched is [local_width, n], read token-major.
                             let slot = &mut slots[slot_ids[0]];
-                            let mut latent = self.step_hidden(
-                                graph_mode,
-                                (layer_idx, GraphSlot::OprojLatent),
-                                layer.attention.wo_a().rows,
-                                n,
-                            )?;
                             crate::attention::mla_oproj(
                                 &self.ctx,
                                 &layer.attention,
@@ -1142,7 +1124,6 @@ impl Dsv4Model {
                                 None,
                                 &local_attn_batched,
                                 n,
-                                &mut latent,
                                 &mut keepalive,
                                 &mut attn_out,
                             )?;
@@ -1150,10 +1131,6 @@ impl Dsv4Model {
                             for r in 0..n {
                                 let row_src = &prepared[r].local_attn;
                                 let slot = &mut slots[slot_ids[r]];
-                                // SAFETY: uninit device scratch; fully written by the wo_a lane.
-                                let mut latent = unsafe {
-                                    HiddenStates::uninit(&self.ctx, layer.attention.wo_a().rows, 1)?
-                                };
                                 crate::attention::mla_oproj(
                                     &self.ctx,
                                     &layer.attention,
@@ -1161,7 +1138,6 @@ impl Dsv4Model {
                                     None,
                                     row_src,
                                     1,
-                                    &mut latent,
                                     &mut keepalive,
                                     &mut attn_out_row,
                                 )?;
