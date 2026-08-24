@@ -92,7 +92,6 @@ pub enum Kernel {
     RopeNeox,
     RopeNorm,
     Silu,
-    Gelu,
     GeGlu,
     SwiGlu,
     Add,
@@ -180,7 +179,6 @@ impl Kernel {
         Self::RopeNeox,
         Self::RopeNorm,
         Self::Silu,
-        Self::Gelu,
         Self::GeGlu,
         Self::SwiGlu,
         Self::Add,
@@ -223,7 +221,6 @@ impl Kernel {
             Kernel::RopeNeox => "rope_neox",
             Kernel::RopeNorm => "rope_norm",
             Kernel::Silu => "silu",
-            Kernel::Gelu => "gelu",
             Kernel::GeGlu => "geglu",
             Kernel::SwiGlu => "swiglu",
             Kernel::Add => "add",
@@ -269,7 +266,6 @@ impl Kernel {
             Kernel::RopeNeox
             | Kernel::RopeNorm
             | Kernel::Silu
-            | Kernel::Gelu
             | Kernel::GeGlu
             | Kernel::SwiGlu
             | Kernel::Add
@@ -1139,14 +1135,6 @@ macro_rules! launcher_fns {
             dispatch: Dispatch,
         ) -> Result<()> {
             $call(Kernel::Silu, ctx, buffers, dispatch)
-        }
-
-        pub fn gelu(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::Gelu, ctx, buffers, dispatch)
         }
 
         pub fn geglu(

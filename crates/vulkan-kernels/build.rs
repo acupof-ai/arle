@@ -252,11 +252,6 @@ const LOCAL: &[ShaderSpec] = &[
         defines: &[],
     },
     ShaderSpec {
-        name: "gelu",
-        source: "crates/vulkan-kernels/shaders/gelu.comp",
-        defines: &[],
-    },
-    ShaderSpec {
         name: "geglu",
         source: "crates/vulkan-kernels/shaders/geglu.comp",
         defines: &[],
