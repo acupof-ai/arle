@@ -18,19 +18,6 @@ pub trait LrSchedule: Send + Sync {
     fn describe(&self) -> String;
 }
 
-// Blanket forward so training binaries can store a `Box<dyn LrSchedule>` as
-// the `S` parameter of `Trainer<O, C, S>` (trait expects methods on the type
-// itself, not on a `&dyn` projection).
-impl<T: LrSchedule + ?Sized> LrSchedule for Box<T> {
-    fn lr(&self, step: u64) -> f32 {
-        (**self).lr(step)
-    }
-
-    fn describe(&self) -> String {
-        (**self).describe()
-    }
-}
-
 /// Linear warmup to `base_lr`, then half-cosine decay to `min_lr`; clamped to
 /// `min_lr` after `total_steps`.
 #[derive(Debug, Clone, Copy)]

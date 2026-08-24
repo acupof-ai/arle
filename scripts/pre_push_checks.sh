@@ -16,6 +16,11 @@
 # The snapshot lives OUTSIDE the repo on purpose: inside the repo tree,
 # git commands run by the hygiene check would discover the parent repo
 # and operate on it instead of the snapshot.
+#
+# Compile skip: when the pushed range contains no .rs files, all cargo
+# steps are skipped (docs/config-only pushes can't break compilation).
+# Fast checks (hygiene, fmt, shell tests) run in parallel with the
+# cargo steps to hide their latency.
 
 set -euo pipefail
 
@@ -54,34 +59,65 @@ export CARGO_TARGET_DIR="${REPO_ROOT}/target/pre-push-quick"
 # typecheck works on hosts without nvcc.
 export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
 
-run python3 scripts/check_repo_hygiene.py
-run cargo fmt --all -- --check
-for test in \
-    test_cuda_prebuilt_export.sh \
-    test_lever_gate.sh \
-    test_kernel_artifact_qualification.sh \
-    test_validate_release.sh \
-    test_pod_flow.sh; do
-    run bash "scripts/tests/${test}"
+# --- Determine whether cargo steps can skip -------------------------------
+# Pre-push stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>.
+# If the pushed range has zero .rs files, compilation cannot catch anything
+# new — skip it. Empty stdin (manual run) or a new branch (zero remote_sha)
+# defaults to compiling.
+SKIP_CARGO=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    if [[ "$remote_sha" =~ ^0{40}$ ]]; then
+        break
+    fi
+    if ! git -C "${REPO_ROOT}" diff --name-only "${remote_sha}..${local_sha}" | grep -q '\.rs$'; then
+        SKIP_CARGO=1
+        info "no .rs files in pushed range; skipping cargo steps"
+    fi
+    break
 done
-run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
-# Clippy (not check) on the cuda lane: catches clippy lints (missing_safety_doc,
-# needless_borrow) that plain check misses — the gap that let quant_linear.rs
-# clippy errors pass the hook and fail CI. Debug profile shares the cache with
-# the arle check above; the old --release forced a second full compilation.
-run cargo clippy -p infer-api --no-default-features --features cuda,no-cuda --lib -- -D warnings
-run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys
-run cargo test \
-    -p infer-core -p infer-server -p infer-plan -p infer-seam \
-    -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
-run cargo clippy -p kv-native-sys --all-targets -- -D warnings
 
-# Metal lib check (default-on, Mac only): catches dead-code/unused lints in
-# infer-metal that CI's Metal lane runs with -D warnings. The full binary
-# build + needle gate stays opt-in (ARLE_PRE_PUSH_METAL=1) below.
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib
+# --- Fast checks (parallel with cargo) ------------------------------------
+run_fast_checks() {
+    run python3 scripts/check_repo_hygiene.py
+    run cargo fmt --all -- --check
+    for test in \
+        test_cuda_prebuilt_export.sh \
+        test_lever_gate.sh \
+        test_kernel_artifact_qualification.sh \
+        test_validate_release.sh \
+        test_pod_flow.sh; do
+        run bash "scripts/tests/${test}"
+    done
+}
+run_fast_checks &
+FAST_PID=$!
+
+# --- Cargo steps (serial — cargo locks the target dir) ---------------------
+if [[ "${SKIP_CARGO}" == "0" ]]; then
+    run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
+    # Clippy (not check) on the cuda lane: catches clippy lints (missing_safety_doc,
+    # needless_borrow) that plain check misses — the gap that let quant_linear.rs
+    # clippy errors pass the hook and fail CI. Debug profile shares the cache with
+    # the arle check above; the old --release forced a second full compilation.
+    run cargo clippy -p infer-api --no-default-features --features cuda,no-cuda --lib -- -D warnings
+    run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys
+    run cargo test \
+        -p infer-core -p infer-server -p infer-plan -p infer-seam \
+        -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
+    run cargo clippy -p kv-native-sys --all-targets -- -D warnings
+
+    # Metal lib check (default-on, Mac only): catches dead-code/unused lints in
+    # infer-metal that CI's Metal lane runs with -D warnings. The full binary
+    # build + needle gate stays opt-in (ARLE_PRE_PUSH_METAL=1) below.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib
+    fi
+else
+    info "skipping cargo steps (docs/config-only push)"
 fi
+
+# --- Wait for fast checks ---------------------------------------------------
+wait "${FAST_PID}"
 
 METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 

@@ -92,7 +92,6 @@ infer-core = { path = "../infer-core" }
 infer-metal = { path = "../infer-metal", default-features = false }
 infer-server = { path = "../infer-server" }
 tempfile = "3"
-tokenizers = { workspace = true }
 
 [lints]
 workspace = true

@@ -71,13 +71,6 @@ pub trait CudaAllocTraceExt {
     ///
     /// Same as [`CudaStream::alloc`]: the returned memory is uninitialized.
     unsafe fn alloc_traced<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>, DriverError>;
-
-    /// Allocate zeroed memory and attribute the call site when
-    /// `ARLE_CUDA_ALLOC_TRACE=1`.
-    fn alloc_zeros_traced<T: DeviceRepr + ValidAsZeroBits>(
-        &self,
-        len: usize,
-    ) -> Result<CudaSlice<T>, DriverError>;
 }
 
 impl CudaAllocTraceExt for Arc<CudaStream> {
@@ -89,20 +82,7 @@ impl CudaAllocTraceExt for Arc<CudaStream> {
         record_cuda_alloc::<T>("alloc", "CudaStream::alloc", len);
         Ok(out)
     }
-
-    #[track_caller]
-    fn alloc_zeros_traced<T: DeviceRepr + ValidAsZeroBits>(
-        &self,
-        len: usize,
-    ) -> Result<CudaSlice<T>, DriverError> {
-        // SAFETY: the uninitialized allocation is zeroed by the stream-ordered
-        // `memset_zeros` below before the slice is returned, so no caller can
-        // observe uninitialized bytes.
-        let mut out = unsafe { self.alloc(len)? };
-        record_cuda_alloc::<T>("alloc_zeros", "CudaStream::alloc_zeros", len);
-        self.memset_zeros(&mut out)?;
-        Ok(out)
-    }
+}
 }
 
 /// CUDA device context holding compute stream and optional copy stream.

@@ -295,20 +295,6 @@ impl TokenKVPool {
         self.seq_lens[slot] % self.page_size
     }
 
-    fn slot_last_page_len(&self, slot: usize) -> usize {
-        let seq_len = self.seq_lens[slot];
-        if seq_len == 0 {
-            0
-        } else {
-            let hot_tail_len = self.slot_hot_tail_len(slot);
-            if hot_tail_len == 0 {
-                self.page_size
-            } else {
-                hot_tail_len
-            }
-        }
-    }
-
     fn slot_hot_tail_page(&self, slot: usize) -> Option<u32> {
         if self.slot_hot_tail_len(slot) == 0 {
             None
@@ -1508,71 +1494,11 @@ impl TokenKVPool {
         &mut self.k_data[layer]
     }
 
-    // Convenience accessors that mirror the old PagedKVPool API so callers can
-    // transition incrementally.
-
-    /// Build TileLang paged-KV indptr array for a batch of slots.
-    /// `indptr[i+1] - indptr[i]` = page count for request `i`.
-    pub fn build_indptr(&self, slots: &[usize]) -> Vec<i32> {
-        let mut indptr = Vec::with_capacity(slots.len() + 1);
-        self.fill_indptr(slots, &mut indptr);
-        indptr
-    }
-
-    pub fn fill_indptr<'a>(&self, slots: &[usize], scratch: &'a mut Vec<i32>) -> &'a [i32] {
-        scratch.clear();
-        scratch.reserve(slots.len() + 1);
-        scratch.push(0);
-        for &slot in slots {
-            let last = *scratch
-                .last()
-                .expect("invariant: indptr always has at least one element (initialized with 0)");
-            scratch.push(last + self.page_indices[slot].len() as i32);
-        }
-        scratch.as_slice()
-    }
-
     pub fn build_indices(&self, slots: &[usize]) -> Vec<i32> {
         slots
             .iter()
             .flat_map(|&slot| self.page_indices[slot].iter().map(|&idx| idx as i32))
             .collect()
-    }
-
-    /// Build the token-row index of the newest token in each slot.
-    ///
-    /// For `page_size=1` this is identical to the last physical page id. For
-    /// paged quantized pools (`page_size=16`), the quantize-single fast path
-    /// needs the exact token row, not just the page id.
-    pub fn build_last_indices(&self, slots: &[usize]) -> Vec<i32> {
-        slots
-            .iter()
-            .map(|&slot| {
-                let seq_len = self.seq_lens[slot];
-                debug_assert!(seq_len > 0, "slot has no live tokens");
-                let last_pos = seq_len - 1;
-                let page = self.page_indices[slot][last_pos / self.page_size];
-                (page as usize * self.page_size + (last_pos % self.page_size)) as i32
-            })
-            .collect()
-    }
-
-    pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
-        slots
-            .iter()
-            .map(|&slot| self.slot_last_page_len(slot) as i32)
-            .collect()
-    }
-
-    pub fn fill_last_page_lens<'a>(&self, slots: &[usize], scratch: &'a mut Vec<i32>) -> &'a [i32] {
-        scratch.clear();
-        scratch.reserve(slots.len());
-        scratch.extend(
-            slots
-                .iter()
-                .map(|&slot| self.slot_last_page_len(slot) as i32),
-        );
-        scratch.as_slice()
     }
 }
 
