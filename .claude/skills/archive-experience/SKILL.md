@@ -67,6 +67,28 @@ The entry's content is never edited — sealed means byte-identical.
 - Do not verify or repair links *out of* a sealed entry; it is a historical
   snapshot, not current authority.
 
+## Delete vs archive (the dsh consolidation rule)
+
+Deletion is narrow: an entry leaves the tree only when it has **no unique
+value left**. Two cases:
+
+- **Fully superseded** — a newer entry on the same axis owns every still-true
+  fact. Merge the old entry's unique facts (measured bounds, root causes,
+  rules, reintroduction conditions) into the owner first, then delete with
+  retargeting:
+  `python3 scripts/archive_experience.py --delete <old.md> --retarget-to <owner.md> --write`
+  Every inbound link (CHANGELOG, docs, other entries) is rewritten to the
+  owner. The script refuses when inbound links exist and no owner is given.
+- **Obsolete record** — an entry whose fact is no longer true and whose
+  warning no longer prevents a plausible mistake (a workaround for a since
+  removed system, a bench snapshot on a deleted code path). Delete without
+  an owner only when nothing links to it.
+
+Everything else retired is **archived**, not deleted: a closed decision with
+historical value stays in the frozen tree. Partial supersession stays live
+and cross-linked. Never delete to make a quota — the cap forces archival, and
+archival is what relieves it.
+
 ## Commit
 
 Seal + link rewrites + manifest update are one commit:

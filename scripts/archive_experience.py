@@ -8,9 +8,15 @@ rewritten to its archived path in the same change.
 
 Usage:
     python3 scripts/archive_experience.py [--write] <entry.md>...
+    python3 scripts/archive_experience.py --delete <entry.md> [--retarget-to <owner.md>] [--write]
 
-Default is a dry-run plan; --write performs the seal. All entries are
+Default is a dry-run plan; --write performs the change. All entries are
 validated before anything touches disk — one bad entry aborts the whole run.
+
+Seal mode moves an entry into the frozen archive. Delete mode removes a
+fully-superseded live entry: every unique fact must already live in the
+owner entry, and every inbound link is retargeted to the owner. Sealed
+entries are never deleted.
 """
 
 from __future__ import annotations
@@ -86,12 +92,67 @@ def inbound_links(old_rel: str, new_rel: str) -> list[tuple[Path, str, str]]:
     return rewrites
 
 
+def validate_live_entry(arg: str) -> Path:
+    src = Path(arg)
+    if not src.is_absolute():
+        src = ROOT / src
+    rel = src.relative_to(ROOT).as_posix()
+    parts = Path(rel).parts
+    if len(parts) != 4 or parts[0] != "docs" or parts[1] != "experience" or parts[2] not in CLASSES:
+        sys.exit(f"archive: entries must live under docs/experience/{{wins,errors}}/: {rel}")
+    if not NAME_RE.fullmatch(Path(rel).name):
+        sys.exit(f"archive: entry name must be YYYY-MM-DD-slug.md: {rel}")
+    if not src.is_file():
+        sys.exit(f"archive: no such entry: {rel}")
+    return src
+
+
 def main() -> int:
-    args = [a for a in sys.argv[1:] if a != "--write"]
-    write = "--write" in sys.argv[1:]
+    write = False
+    delete = False
+    retarget_to = None
+    args = []
+    it = iter(sys.argv[1:])
+    for a in it:
+        if a == "--write":
+            write = True
+        elif a == "--delete":
+            delete = True
+        elif a == "--retarget-to":
+            retarget_to = next(it, None)
+        else:
+            args.append(a)
     if not args:
         print(__doc__)
         return 1
+
+    if delete:
+        if len(args) != 1:
+            sys.exit("archive: --delete takes exactly one entry")
+        src = validate_live_entry(args[0])
+        old_rel = src.relative_to(ROOT).as_posix()
+        owner_rel = None
+        if retarget_to:
+            owner = validate_live_entry(retarget_to)
+            owner_rel = owner.relative_to(ROOT).as_posix()
+        rewrites = inbound_links(old_rel, owner_rel or old_rel)
+        if rewrites and not owner_rel:
+            print(f"archive: {old_rel} has inbound links; pass --retarget-to <owner.md>:", file=sys.stderr)
+            for path, _, _ in rewrites:
+                print(f"  {path.relative_to(ROOT)}", file=sys.stderr)
+            return 1
+        print(f"delete {old_rel}")
+        for path, _, new_rel in rewrites:
+            print(f"  link retarget -> {Path(new_rel).name} ({path.relative_to(ROOT)})")
+        if not write:
+            print("\narchive: dry-run, entry would be deleted (pass --write to apply)")
+            return 0
+        for path, old, new in rewrites:
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace(old, new), encoding="utf-8")
+        src.unlink()
+        print(f"\narchive: deleted {old_rel}")
+        return 0
 
     plan = []
     for arg in args:
