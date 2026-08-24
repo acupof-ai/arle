@@ -208,12 +208,6 @@ pub(crate) struct Qwen35Model {
     /// dequantizing the kept-alive FP8 qweight/scales, so they are not cached
     /// here. Only small BF16 projections use this cache — no OOM risk.
     lora_base_dev: HashMap<LoraBaseKey, DeviceVec>,
-    /// Cheap model/weights-version tag (hash of the checkpoint's safetensors
-    /// file names + lengths + mtimes). Stamps the durable KV-recall manifest so
-    /// a restart after an OPD weight update (which rewrites the checkpoint, so
-    /// the mtimes/lengths shift) discards the now-stale recalled KV.
-    #[allow(dead_code)] // WIP: durable KV-recall manifest weight-version stamp, not yet wired
-    weights_epoch: String,
 }
 
 /// Host-resident snapshot of one transformer block's device weight buffers,

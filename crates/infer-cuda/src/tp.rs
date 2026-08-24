@@ -65,10 +65,8 @@ impl TpComm {
 pub struct TpRuntime {
     config: TpConfig,
     comm: TpComm,
-    /// Aliases [`TpComm::Single`] when attn_dp=1 (the default TP8/EP8 route).
+    /// Aliases [`TpComm::Single`] when attn_tp=1 (the default TP8/EP8 route).
     attn_tp: TpComm,
-    /// Aliases [`TpComm::Single`] when `ep_size == tp_size` (default TP8/EP8).
-    moe_ep: TpComm,
     /// Aliases [`TpComm::Single`] when attn_cp=1 (the default).
     attn_cp: TpComm,
     /// True when the attn_cp partition IS the single global group (attn_tp=1,
@@ -137,7 +135,6 @@ impl TpRuntime {
             config: TpConfig::single(),
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
-            moe_ep: TpComm::single(),
             attn_cp: TpComm::single(),
             attn_cp_uses_global: false,
             attn_cp_rank: 0,
@@ -156,7 +153,6 @@ impl TpRuntime {
         Self {
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
-            moe_ep: TpComm::single(),
             attn_cp: TpComm::single(),
             attn_cp_uses_global: false,
             attn_cp_rank: 0,
@@ -184,10 +180,7 @@ impl TpRuntime {
     pub fn from_env_with_nccl(
         unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
     ) -> anyhow::Result<Self> {
-        use infer_topo::{
-            MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_tp_groups,
-            build_moe_ep_groups,
-        };
+        use infer_topo::{MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_tp_groups};
 
         let config = resolve_tp_config_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         if config.is_single() {
@@ -204,10 +197,8 @@ impl TpRuntime {
         let cfg = MultiAxisConfig::current_route_from_env_with_defaults(world_size, world_size)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // attn_tp then moe_ep then attn_cp, unconditionally in this order on every
-        // rank.
+        // attn_tp then attn_cp, unconditionally in this order on every rank.
         let attn_tp = Self::split_sub_comm(&backend, &build_attn_tp_groups(cfg), rank)?;
-        let moe_ep = Self::split_sub_comm(&backend, &build_moe_ep_groups(cfg), rank)?;
         // attn_cp=1 yields per-rank singleton groups (not the global group), so the
         // skip must key off `cfg` — still identical on every rank.
         let (attn_cp, attn_cp_uses_global) = if cfg.attn_cp_size == 1 {
@@ -245,7 +236,6 @@ impl TpRuntime {
             config,
             comm: TpComm::Nccl(Box::new(backend)),
             attn_tp,
-            moe_ep,
             attn_cp,
             attn_cp_uses_global,
             attn_cp_rank: coord.attn_cp_rank,
@@ -296,12 +286,6 @@ impl TpRuntime {
     #[must_use]
     pub fn attn_tp(&self) -> &TpComm {
         &self.attn_tp
-    }
-
-    #[must_use]
-    #[allow(dead_code)] // consumed once MoE EP dispatch moves onto the split comm
-    pub fn moe_ep(&self) -> &TpComm {
-        &self.moe_ep
     }
 
     /// The comm the attn_cp collectives run on: the split sub-comm, or the
@@ -915,61 +899,6 @@ impl TpRuntime {
             TpComm::Single => Ok(input.to_vec()),
             TpComm::Nccl(backend) => backend.all_gather_bytes(ctx, input, per_rank_bytes),
         }
-    }
-
-    /// Element-wise reduce `values` in place across `comm`; identity on
-    /// single-rank.
-    ///
-    /// One H2D, an in-place device all-reduce, one D2H. The all-gather form this
-    /// replaced moved `world_size ×` the payload back to the host and reduced it
-    /// there — for KV-recall's ~2 MB envelope that was ~18 MB of copying per
-    /// call, and a ring all-reduce also puts `2(W−1)/W · N` on the wire against
-    /// all-gather's `(W−1)·N`.
-    #[cfg(feature = "cuda")]
-    #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
-    pub fn reduce_f32_over(
-        &self,
-        comm: &TpComm,
-        ctx: &cuda_kernels::prelude::DeviceContext,
-        values: &mut [f32],
-        op: cuda_kernels::collective::ReduceOp,
-    ) -> anyhow::Result<()> {
-        #[cfg(all(feature = "cuda", feature = "nccl"))]
-        {
-            use cuda_kernels::collective::{CollectiveBackend, DType};
-            use cudarc::driver::DevicePtrMut;
-
-            let TpComm::Nccl(backend) = comm else {
-                return Ok(());
-            };
-            if values.is_empty() {
-                return Ok(());
-            }
-            let mut dev = ctx
-                .stream
-                .clone_htod(values)
-                .map_err(|e| anyhow::anyhow!("reduce_f32_over h2d: {e}"))?;
-            {
-                let count = values.len();
-                let (ptr, _guard) = dev.device_ptr_mut(&ctx.stream);
-                // SAFETY: `ptr` is a valid device allocation of `count` f32 on
-                // this context's device, and the stream belongs to it. `_guard`
-                // keeps the slice borrowed across the FFI call.
-                unsafe {
-                    backend.all_reduce(
-                        ptr as *mut std::ffi::c_void,
-                        count,
-                        DType::F32,
-                        op,
-                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
-                    )?;
-                }
-            }
-            ctx.stream
-                .memcpy_dtoh(&dev, values)
-                .map_err(|e| anyhow::anyhow!("reduce_f32_over d2h: {e}"))?;
-        }
-        Ok(())
     }
 
     #[cfg(all(feature = "cuda", feature = "nccl"))]

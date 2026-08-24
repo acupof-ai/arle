@@ -779,13 +779,7 @@ impl Qwen35Model {
             lora_delta_scratch: None,
             lora_dirty: HashSet::new(),
             lora_base_dev: HashMap::new(),
-            weights_epoch: kv_native_sys::weights_epoch_tag(model_path),
         })
-    }
-
-    #[allow(dead_code)] // WIP: durable KV-recall manifest weight-version stamp, not yet wired
-    pub(crate) fn weights_epoch(&self) -> &str {
-        &self.weights_epoch
     }
 
     pub(crate) fn offload_engine_weights(&mut self) -> Result<usize> {

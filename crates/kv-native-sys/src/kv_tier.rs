@@ -1772,50 +1772,6 @@ impl KvTierStore {
     }
 }
 
-/// Cheap content-version tag for a model checkpoint directory.
-pub fn weights_epoch_tag(model_path: &Path) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    let mut mix = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    };
-    let mut any = false;
-    if let Ok(entries) = std::fs::read_dir(model_path) {
-        let mut files: Vec<std::fs::DirEntry> = entries.flatten().collect();
-        files.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in files {
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            if !name_str.ends_with(".safetensors") {
-                continue;
-            }
-            any = true;
-            mix(name_str.as_bytes());
-            if let Ok(meta) = entry.metadata() {
-                mix(&meta.len().to_le_bytes());
-                if let Ok(modified) = meta.modified()
-                    && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
-                {
-                    mix(&dur.as_secs().to_le_bytes());
-                    mix(&dur.subsec_nanos().to_le_bytes());
-                }
-            }
-        }
-    }
-    if any {
-        format!("st-{hash:016x}")
-    } else {
-        mix(model_path.to_string_lossy().as_bytes());
-        format!("path-{hash:016x}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
