@@ -865,15 +865,12 @@ fn handle_repl_input(
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn is_direct_chat_backend(backend_name: &str) -> bool {
-    matches!(
-        backend_name,
-        "metal-diffusion-gemma" | "metal-gemma4" | "metal-deepseek-ocr"
-    )
+    matches!(backend_name, "metal-deepseek-ocr")
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn supports_cli_images(backend_name: &str) -> bool {
-    matches!(backend_name, "metal-gemma4" | "metal-deepseek-ocr")
+    matches!(backend_name, "metal-deepseek-ocr")
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]

@@ -472,12 +472,6 @@ fn resolve_max_tokens(model_path: &str, requested: usize) -> usize {
     if requested > 0 {
         return requested;
     }
-    if let Some(n) = read_model_generation_max_tokens(model_path) {
-        log::info!(
-            "max-tokens: auto-resolved to {n} from {model_path}/config.json (generation_config.max_new_tokens)"
-        );
-        return n;
-    }
     match read_model_max_context(model_path) {
         Some(n) => {
             log::info!(
@@ -547,30 +541,6 @@ fn read_model_config(model_path: &str) -> Option<serde_json::Value> {
 fn read_model_config_from_dir(dir: &std::path::Path) -> Option<serde_json::Value> {
     let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
     serde_json::from_str(&raw).ok()
-}
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn read_model_generation_max_tokens(model_path: &str) -> Option<usize> {
-    let cfg = read_model_config(model_path)?;
-    let model_type = cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-    let arch_is_diffusion = cfg
-        .get("architectures")
-        .and_then(|a| a.as_array())
-        .is_some_and(|archs| {
-            archs
-                .iter()
-                .filter_map(|v| v.as_str())
-                .any(|name| name.contains("DiffusionGemma") || name.contains("Gemma4"))
-        });
-    if !(matches!(model_type, "diffusion_gemma" | "gemma4") || arch_is_diffusion) {
-        return None;
-    }
-    cfg.get("generation_config")
-        .and_then(|v| v.get("max_new_tokens"))
-        .and_then(|v| v.as_u64())
-        .or_else(|| cfg.get("canvas_length").and_then(|v| v.as_u64()))
-        .map(|n| n as usize)
-        .filter(|&n| n > 0)
 }
 
 /// Tries `max_position_embeddings` (HF transformers convention) then
