@@ -636,10 +636,6 @@ impl Backend for MetalBackend {
         mlx_unary_flat(a, UnaryOp::Neg)
     }
 
-    fn gelu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
-        mlx_unary_flat(a, UnaryOp::Gelu)
-    }
-
     fn silu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         mlx_unary_flat(a, UnaryOp::Silu)
     }
@@ -717,18 +713,6 @@ impl Backend for MetalBackend {
             ));
         };
         mlx_rope_lazy(x_handle.as_ptr(), x_shape, cos, sin)
-    }
-
-    // Lazy erf-form GELU — must stay erf, NOT the tanh approx used by the
-    // eager `gelu_forward`: `gelu_backward` uses the erf derivative, so a
-    // tanh forward would be inconsistent by ~1e-3 per element.
-    fn gelu(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
-        let DeviceHandle::Metal(x_handle) = x else {
-            return Err(AutogradError::TapeInvariant(
-                "metal backend cannot gelu a non-metal device handle",
-            ));
-        };
-        mlx_gelu_erf_lazy(x_handle.as_ptr())
     }
 
     // Lazy embedding gather: the tiny `[seq]` int32 ids upload per call
@@ -1599,7 +1583,6 @@ fn mlx_softmax_like(x: &[f32], shape: &[usize], kind: SoftmaxKind) -> Result<Vec
 enum UnaryOp {
     Exp,
     Neg,
-    Gelu,
     Silu,
     MulScalar(f32),
 }
@@ -1651,7 +1634,6 @@ fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
                 mlx_array_free(scalar);
                 out
             }
-            UnaryOp::Gelu => gelu_tanh(input)?,
             UnaryOp::Silu => {
                 let sig = mlx_sigmoid(input);
                 if sig.is_null() {
@@ -1679,76 +1661,6 @@ fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
             });
         }
         Ok(host)
-    }
-}
-
-// Tanh-approx GELU via MLX primitives; matches `cpu_gelu_forward` within
-// f32 precision. `input` is borrowed; the returned array is freshly owned.
-//
-// Safety: caller holds `mlx_guard()`; `input` is a live MLX array; every
-// intermediate we allocate here is freed before returning.
-unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_array> {
-    const K: f32 = 0.797_884_6_f32; // sqrt(2/pi)
-    // SAFETY: caller guarantees `input` is live and holds mlx_guard(); we free
-    // every intermediate before returning (see function-level safety doc).
-    unsafe {
-        let xsq = mlx_multiply(input, input);
-        if xsq.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: xsq null"));
-        }
-        let xcube = mlx_multiply(xsq, input);
-        mlx_array_free(xsq);
-        if xcube.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: xcube null"));
-        }
-
-        let coef = mlx_array_new_float32(0.044_715_f32);
-        let coef_times_cube = mlx_multiply(coef, xcube);
-        mlx_array_free(coef);
-        mlx_array_free(xcube);
-        if coef_times_cube.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: coef*cube null"));
-        }
-        let inner_sum = mlx_add(input, coef_times_cube);
-        mlx_array_free(coef_times_cube);
-        if inner_sum.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: inner_sum null"));
-        }
-        let k_scalar = mlx_array_new_float32(K);
-        let inner = mlx_multiply(k_scalar, inner_sum);
-        mlx_array_free(k_scalar);
-        mlx_array_free(inner_sum);
-        if inner.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: inner null"));
-        }
-
-        let tanh_val = mlx_tanh(inner);
-        mlx_array_free(inner);
-        if tanh_val.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: tanh null"));
-        }
-        let one = mlx_array_new_float32(1.0_f32);
-        let one_plus = mlx_add(one, tanh_val);
-        mlx_array_free(one);
-        mlx_array_free(tanh_val);
-        if one_plus.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: 1+tanh null"));
-        }
-
-        let half = mlx_array_new_float32(0.5_f32);
-        let half_x = mlx_multiply(half, input);
-        mlx_array_free(half);
-        if half_x.is_null() {
-            mlx_array_free(one_plus);
-            return Err(AutogradError::TapeInvariant("gelu: half*x null"));
-        }
-        let out = mlx_multiply(half_x, one_plus);
-        mlx_array_free(half_x);
-        mlx_array_free(one_plus);
-        if out.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu: final null"));
-        }
-        Ok(out)
     }
 }
 
@@ -1945,63 +1857,6 @@ fn mlx_rms_norm_lazy(
             ));
         }
         Ok(DeviceHandle::Metal(MlxHandle::from_raw(out_arr)))
-    }
-}
-
-fn mlx_gelu_erf_lazy(x_ptr: *mut mlx_array) -> Result<DeviceHandle> {
-    // Lazy erf-form GELU; formula mirrors `ops::activation::gelu`'s CPU body
-    // exactly (same constant, same op order). `mlx_erf` matches `libm::erff`
-    // within MLX's f32 ULP range — parity test gates at 1e-4.
-    const INV_SQRT_2: f32 = 0.707_106_77_f32;
-    let _guard = mlx_guard();
-
-    // Safety: `x_ptr` is borrowed for the duration of this call. Every
-    // intermediate we allocate is freed before the fn returns. The final
-    // returned handle owns the last `mlx_multiply` result.
-    unsafe {
-        let k_arr = mlx_array_new_float32(INV_SQRT_2);
-        if k_arr.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu lazy: k scalar null"));
-        }
-        let scaled = mlx_multiply(k_arr, x_ptr);
-        mlx_array_free(k_arr);
-        if scaled.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu lazy: scaled null"));
-        }
-        let erf_val = mlx_erf(scaled);
-        mlx_array_free(scaled);
-        if erf_val.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu lazy: erf null"));
-        }
-        let one = mlx_array_new_float32(1.0_f32);
-        if one.is_null() {
-            mlx_array_free(erf_val);
-            return Err(AutogradError::TapeInvariant("gelu lazy: one null"));
-        }
-        let one_plus = mlx_add(one, erf_val);
-        mlx_array_free(one);
-        mlx_array_free(erf_val);
-        if one_plus.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu lazy: 1+erf null"));
-        }
-        let half = mlx_array_new_float32(0.5_f32);
-        if half.is_null() {
-            mlx_array_free(one_plus);
-            return Err(AutogradError::TapeInvariant("gelu lazy: half null"));
-        }
-        let half_x = mlx_multiply(half, x_ptr);
-        mlx_array_free(half);
-        if half_x.is_null() {
-            mlx_array_free(one_plus);
-            return Err(AutogradError::TapeInvariant("gelu lazy: half*x null"));
-        }
-        let out = mlx_multiply(half_x, one_plus);
-        mlx_array_free(half_x);
-        mlx_array_free(one_plus);
-        if out.is_null() {
-            return Err(AutogradError::TapeInvariant("gelu lazy: final null"));
-        }
-        Ok(DeviceHandle::Metal(MlxHandle::from_raw(out)))
     }
 }
 
