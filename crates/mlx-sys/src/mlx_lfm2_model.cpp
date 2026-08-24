@@ -297,7 +297,17 @@ struct Lfm2CompiledModel {
         auto h = gate_b * conv_in;
 
         int n_keep = conv_kernel - 1;
-        auto conv_input = concatenate({conv_state_in, h}, 1);  // [B, S+n_keep, H]
+        // Pad conv state if it has fewer than n_keep frames (e.g. the DSpark
+        // draft model doesn't carry conv states). Left-pad with zeros so the
+        // conv1d has enough context.
+        array state = conv_state_in;
+        if (state.ndim() < 3 || state.shape(1) < n_keep) {
+            int have = (state.ndim() >= 3) ? state.shape(1) : 0;
+            int pad = n_keep - have;
+            array zeros = mlx::core::zeros({B, pad, H}, state.dtype());
+            state = concatenate({zeros, state}, 1);
+        }
+        auto conv_input = concatenate({state, h}, 1);  // [B, S+n_keep, H]
         // DSpark: save the full conv window so the spec loop can slice the
         // 2-frame conv state at any accepted position (avoids a re-run on
         // partial acceptance).
