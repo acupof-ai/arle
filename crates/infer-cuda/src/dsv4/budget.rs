@@ -272,6 +272,45 @@ impl Dsv4Model {
     /// the same construction point (collective). A rank that cannot query its
     /// memory contributes `i32::MAX` (does not bind) instead of skipping the
     /// collective.
+    /// Peak transient working set of ONE prefill chunk, itemized from the
+    /// allocation sites. `DSV4_PREFILL_QUERY_CHUNK` (4096) is the ceiling of
+    /// `chunked_prefill_size` (`loaded.rs` clamps the flag to [128, 4096]), so
+    /// this bounds any admissible chunk. Terms:
+    /// - MoE masked-tail (`moe/dsv4.rs` `dsv4_moe_forward_masked_tail` +
+    ///   `deepgemm_grouped_experts`): packed_hidden [H, rows] bf16, activation
+    ///   FP8 copy [rows, H], w13_out [2I, rows] bf16, act FP8 [rows, I],
+    ///   out_compact [H, rows] bf16, route_out [H, routes] bf16 — where
+    ///   routes = chunk×top_k and rows is the 128-aligned contiguous cap.
+    /// - Attention (`attention.rs` `mla_attention_prepare`/`_fwd`): normed +
+    ///   attn_out [H, chunk], q_prepared + local_attn [local_width, chunk],
+    ///   O-LoRA latent [o_lora_rank, chunk], all bf16.
+    /// Freed buffers go back to the retained mempool between layers, so the
+    /// peak is one layer's live set, not a sum over layers.
+    fn prefill_transient_reserve_bytes(&self) -> usize {
+        const BF16: usize = 2;
+        let chunk = crate::attention::DSV4_PREFILL_QUERY_CHUNK;
+        let h = self.config.hidden_size;
+        let i_dim = self.config.moe_intermediate_size;
+        let routes = chunk.saturating_mul(self.moe_config.top_k);
+        let rows = crate::moe::deepgemm_contig_rows_cap(
+            routes.max(1),
+            self.split.experts_per_rank,
+            crate::moe::DEEPGEMM_CONTIG_ALIGN,
+        );
+        let local_width = (self.config.num_attention_heads / self.tp.config().world_size.max(1))
+            .saturating_mul(self.config.head_dim);
+        let moe = rows.saturating_mul(h * BF16)        // packed_hidden
+            + rows.saturating_mul(h)                   // input_fp8
+            + rows.saturating_mul(2 * i_dim * BF16)    // w13_out
+            + rows.saturating_mul(i_dim)               // act_fp8
+            + rows.saturating_mul(h * BF16)            // out_compact
+            + routes.saturating_mul(h * BF16); // route_out
+        let attn = chunk.saturating_mul(2 * h * BF16)  // normed + attn_out
+            + chunk.saturating_mul(2 * local_width * BF16) // q_prepared + local_attn
+            + chunk.saturating_mul(self.config.o_lora_rank * BF16); // latent
+        moe.saturating_add(attn)
+    }
+
     pub(crate) fn kv_budget_plan(
         &self,
         requested: usize,
@@ -471,6 +510,19 @@ impl Dsv4Model {
             i32::try_from((budget_bytes_local >> 20).min(i32::MAX as usize)).unwrap_or(i32::MAX),
         )? as usize)
             << 20;
+        // Prefill-transient reserve: one chunk's peak working set, itemized
+        // from the allocation sites, subtracted BEFORE the slot solve. Without
+        // it the solve hands every budget byte to slot state + pool and the
+        // first admitted long prefill OOMs mid-serve (18 slots x 1049MB filled
+        // a 19.7GB budget; c=8 died at CUDA_ERROR_OUT_OF_MEMORY, 2026-08-24).
+        // Deterministic from config ⇒ rank-identical, no reduce needed.
+        let prefill_reserve = self.prefill_transient_reserve_bytes();
+        let budget_bytes = budget_bytes.saturating_sub(prefill_reserve);
+        log::info!(
+            "DSv4 KV budget: prefill-transient reserve {}MB (chunk {} tokens)",
+            prefill_reserve >> 20,
+            crate::attention::DSV4_PREFILL_QUERY_CHUNK,
+        );
         // Reject-below-fixed guard (parity with Metal's fits_fixed): a
         // cross-rank-min affordable of 0 means post-weights free VRAM cannot
         // hold even one slot's KV arena + selector/compressor state at this
