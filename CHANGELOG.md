@@ -8,6 +8,8 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **GSPO `math-opd` lane — end-to-end on `Qwen3.8-27B-NVFP4` (single H20).** Boxed-answer grader + length-shaped reward (`1 - α·(len-len_min)/(len_max-len_min+ε)`, α=0.3) on the agent-opd GSPO loop. Three blockers fixed at root: RoPE clamp for the CC KV pool, an FP8-Marlin LoRA promote arm composing `marlin_fp8_to_e4m3` + `dequantize_fp8_block_scaled_to_bf16` (no new CUDA), and the `--lora-target-set` default flipped `all-linear` → `attention-qv` (all-linear's permanent BF16 promotion does not fit a 27B quantized student on one GPU). Smoke: 2 rounds, 8/8 groups `capped==0`, `is_ratio` ≈1.001, `clip_frac` <1, eval 0.875 → 0.875, both syncs clean. See `docs/experience/wins/2026-08-24-gspo-math-opd-smoke.md`.
+
 - **Repo cleaning machinery adopted from deepseek-harness** — frozen wins/errors archive with sha256 manifest gate (`scripts/archive_experience.py`), residue sweeper (`scripts/clean_repo.py`), archive skill, all 22 CI actions SHA-pinned, cargo-machete nightly (first sweep removed 4 dead deps, incl. `infer-core` from both backends), loud lever-gate skips. See `docs/experience/wins/2026-08-24-repo-cleaning-machinery.md`.
 
 - `Qwen3.8-27B-NVFP4` passes every probe that `ThinkingCap-Qwen3.6-27B-NVFP4` fails (tool calls included), at 52.3 tok/s with a 33%-acceptance MTP head — so NVFP4 training is viable and the corruption is a property of that one checkpoint, not the FP4 path.
