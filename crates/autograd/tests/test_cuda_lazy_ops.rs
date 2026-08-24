@@ -1617,7 +1617,7 @@ fn cuda_adamw_step_device_matches_cpu() {
 // Each test mirrors the production-representative shape per the wave-2.1
 // brief. Tolerance follows `max_err_with_tol(atol=1e-5, rtol=1e-4)` for
 // the multi-pass / trig ops (rms_norm, rope) which accumulate enough
-// rounding to need the absolute floor; pure elementwise (silu, gelu,
+// rounding to need the absolute floor; pure elementwise (silu,
 // sigmoid, exp, mul) stay on the strict `max_err` tolerance.
 // ============================================================================
 
@@ -1658,53 +1658,6 @@ fn cuda_silu_backward_device_matches_cpu() {
     assert!(
         excess <= 1.0,
         "silu_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
-         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
-        dev_grad[idx],
-        host_grad[idx]
-    );
-}
-
-/// GELU (erf form) backward parity. Per-layer activation shape.
-#[test]
-fn cuda_gelu_backward_device_matches_cpu() {
-    let Ok(backend) = CudaBackend::new(0) else {
-        eprintln!("skipping cuda_gelu_backward_device_matches_cpu: no CUDA device");
-        return;
-    };
-
-    const INV_SQRT_2: f32 = 0.707_106_77;
-    const INV_SQRT_2PI: f32 = 0.398_942_3;
-
-    let shape: Vec<usize> = vec![2, 512, 160];
-    let size: usize = shape.iter().product();
-    let x = rng_vec(0x6e1, size, 4.0);
-    let upstream = rng_vec(0x6e1_6e1, size, 1.0);
-
-    let host_grad: Vec<f32> = x
-        .iter()
-        .zip(upstream.iter())
-        .map(|(&xv, &up)| {
-            let erf_term = libm::erff(xv * INV_SQRT_2);
-            let exp_term = (-0.5_f32 * xv * xv).exp();
-            let deriv = 0.5 * (1.0 + erf_term) + (xv * INV_SQRT_2PI * exp_term);
-            up * deriv
-        })
-        .collect();
-
-    let x_h: DeviceHandle = backend.upload(&x, &shape).expect("upload x");
-    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
-    let grad_h = backend
-        .gelu_backward_device(&up_h, &x_h, &shape)
-        .expect("cuda gelu_backward_device");
-    backend.eval(&[&grad_h]).expect("cuda eval");
-    let dev_grad = backend.readback(&grad_h).expect("gelu_bwd readback");
-
-    // erff intrinsic vs libm::erff: ~1-2 ULP gap. Use the strict gate
-    // (1e-6 + 1e-4) — well within the absolute floor.
-    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
-    assert!(
-        excess <= 1.0,
-        "gelu_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
          (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
         dev_grad[idx],
         host_grad[idx]

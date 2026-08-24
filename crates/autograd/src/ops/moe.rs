@@ -119,12 +119,6 @@ impl MoeGroupedLinearProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MoeRoute {
-    pub token: usize,
-    pub slot: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeGroupedRoute {
     pub expert: usize,
     pub row: usize,

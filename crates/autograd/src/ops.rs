@@ -213,7 +213,7 @@ pub fn gather_last_dim(
     gather::gather_last_dim(src, indices, store, tape)
 }
 
-pub use moe::{MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute, MoeRoute, MoeTopK};
+pub use moe::{MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute, MoeTopK};
 
 pub fn moe_topk_softmax(
     logits: TensorId,
