@@ -991,8 +991,7 @@ impl Backend for MetalBackend {
         // We run the composition inside a single closure so `?` cleanup
         // drops intermediates correctly — but every step below allocates
         // arrays that we must explicitly free via `mlx_array_free` if the
-        // next allocation fails. Follows the same free-on-null pattern as
-        // `mlx_gelu_erf_lazy` in this file.
+        // next allocation fails.
         unsafe {
             let grad_arr = mlx_array_from_data(
                 grad.as_ptr() as *const c_void,

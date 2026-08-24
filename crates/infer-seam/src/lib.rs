@@ -347,10 +347,10 @@ pub trait BackendExecutor {
 
     /// Cross-TP-rank min-reduce of a per-rank-local scalar. Single-rank/no-TP
     /// backends (default) return `local` unchanged. TP backends MUST call
-    /// this symmetrically on every rank, every tick that reaches it — same
-    /// discipline as the prefix-reuse reduce. Skipping
-    /// the sync on one rank while another still calls it desyncs the admission
-    /// collective permanently (2026-07-05 TP=4 admission livelock — see
+    /// this symmetrically on every rank, every tick that reaches it.
+    /// Skipping the sync on one rank while another still calls it desyncs
+    /// the admission collective permanently (2026-07-05 TP=4 admission
+    /// livelock — see
     /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
     fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
         Ok(local)

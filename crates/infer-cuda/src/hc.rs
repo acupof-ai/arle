@@ -120,8 +120,8 @@ pub(crate) fn gen_mhc_params(
 }
 
 /// Fused pre-mix + rms-norm: mix the stream into one lane and normalize in
-/// a single kernel (one boundary, no intermediate tensor). Drop-in for the
-/// `hc_pre(...) ; rms_norm_batch(...)` pair on every layer's attn/ffn prologue.
+/// a single kernel (one boundary, no intermediate tensor). Runs on every
+/// layer's attn/ffn prologue.
 pub(crate) fn mhc_pre_rms_norm(
     ctx: &DeviceContext,
     stream: &HiddenStates,
