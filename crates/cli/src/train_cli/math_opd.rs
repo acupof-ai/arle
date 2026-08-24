@@ -94,9 +94,7 @@ pub(super) fn run_math_opd_impl(args: TrainMathOpdArgs) -> Result<()> {
         dump_dir,
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
         max_tokens: args.max_tokens,
-        agent: ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(args.cc_timeout))
-            .build(),
+        agent: train::math_harness::MathHarness::build_agent(args.cc_timeout),
     };
 
     let lora_adapter_config = agent_opd_adapter_config(student_dir, target_set, lora);

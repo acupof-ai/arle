@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -256,6 +256,15 @@ fn epoch_ms() -> u64 {
 }
 
 impl MathHarness {
+    /// Shared HTTP agent with connection pooling; built once per harness so
+    /// the K rollout samples and eval tasks reuse one TCP pool. Lives in the
+    /// train crate because `ureq` is not a cli dependency.
+    pub fn build_agent(timeout_secs: u64) -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+    }
+
     pub fn run_group(
         &self,
         task: &MathTask,
