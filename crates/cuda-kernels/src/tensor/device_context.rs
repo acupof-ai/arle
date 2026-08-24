@@ -83,7 +83,6 @@ impl CudaAllocTraceExt for Arc<CudaStream> {
         Ok(out)
     }
 }
-}
 
 /// CUDA device context holding compute stream and optional copy stream.
 ///
