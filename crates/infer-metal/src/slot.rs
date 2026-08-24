@@ -125,9 +125,9 @@ impl MetalSlotState {
             .take()
             .unwrap_or_else(|| new_rows.clone());
         let combined = mlx::concatenate_axis(&[old, new_rows], 0);
-        let len = combined.shape().first().copied().unwrap_or(0) as i32;
+        let len = combined.shape().first().copied().unwrap_or(0);
         self.dflash_target_hidden = Some(if len > 64 {
-            let dim = combined.shape().get(1).copied().unwrap_or(0) as i32;
+            let dim = combined.shape().get(1).copied().unwrap_or(0);
             mlx::slice(&combined, &[len - 64, 0], &[len, dim], &[1, 1])
         } else {
             combined
