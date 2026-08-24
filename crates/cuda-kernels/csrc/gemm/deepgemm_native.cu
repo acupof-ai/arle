@@ -2263,18 +2263,6 @@ extern "C" CUresult dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
     return CUDA_ERROR_UNKNOWN;
   }
 }
-  try {
-    return launch_sm90_fp8_paged_mqa_logits(
-        q, kv_cache, kv_cache_scales, weights, context_lens, block_table, schedule_meta,
-        logits, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv,
-        max_context_len, logits_stride, block_table_stride, kv_cache_stride_bytes, num_sms,
-        stream);
-  } catch (const std::exception& err) {
-    std::fprintf(stderr, "DeepGEMM FP8 paged MQA logits bridge failed: %s\n", err.what());
-    return CUDA_ERROR_UNKNOWN;
-  }
-}
-
 extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
     const unsigned char* q,
     const unsigned char* kv_cache_with_scale,

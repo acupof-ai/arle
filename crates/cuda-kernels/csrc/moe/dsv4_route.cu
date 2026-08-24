@@ -67,19 +67,6 @@ __global__ void dsv4_swiglu_clamped_routes_kernel(
   }
   out[idx] = dsv4_swiglu_clamped_one(gate[idx], up[idx], limit);
 }
-  if (num_routes < 0 || hidden_dim <= 0 || local_expert_start < 0 ||
-      experts_per_rank <= 0 || !(limit > 0.0f)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  int total = num_routes * hidden_dim;
-  if (total == 0) return CUDA_SUCCESS;
-  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
-  dsv4_swiglu_clamped_routes_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
-      gate, up, out, route_meta, num_routes, hidden_dim, local_expert_start,
-      experts_per_rank, limit);
-  return (CUresult)cudaGetLastError();
-}
-
 __global__ void dsv4_scale_route_outputs_by_meta_kernel(
     const uint16_t *__restrict__ expert_out,
     uint16_t *__restrict__ route_out,
@@ -884,19 +871,6 @@ __global__ void dsv4_pack_local_experts_with_slots_and_indices_kernel(
     packed_hidden[dst_base + col] = hidden[src_base + col];
   }
 }
-  if (num_tokens < 0 || hidden_dim <= 0 || topk <= 0 ||
-      local_expert_start < 0 || experts_per_rank <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  int total_routes = num_tokens * topk;
-  if (total_routes == 0) return CUDA_SUCCESS;
-  dsv4_pack_local_experts_with_slots_and_indices_kernel<<<total_routes, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
-      hidden, indices, weights, offsets, cursors, packed_hidden, packed_route_slot,
-      packed_weight, packed_m_indices, num_tokens, hidden_dim, topk, local_expert_start,
-      experts_per_rank);
-  return (CUresult)cudaGetLastError();
-}
-
 __global__ void dsv4_init_padded_route_slots_kernel(
     int32_t *__restrict__ packed_token,
     int32_t *__restrict__ packed_route_slot,
