@@ -488,14 +488,12 @@ struct Lfm2CompiledModel {
     // argpartition/slice shape inference issue. The conv state slice is the
     // remaining risk; if compile fails, fall back to eager.
     std::vector<array> forward_verify(const std::vector<array>& inputs) {
+        static bool eager = getenv("LFM2_EAGER_VERIFY") != nullptr;
+        if (eager) { return forward_impl(inputs); }
         if (!compiled_verify) {
-            try {
-                compiled_verify = mlx::core::compile(
-                    [this](const std::vector<array>& ins) { return this->forward_impl(ins); },
-                    true /* shapeless */);
-            } catch (const std::exception&) {
-                return forward(inputs);  // fall back to eager
-            }
+            compiled_verify = mlx::core::compile(
+                [this](const std::vector<array>& ins) { return this->forward_impl(ins); },
+                true /* shapeless */);
         }
         return compiled_verify(inputs);
     }

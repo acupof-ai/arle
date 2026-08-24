@@ -366,7 +366,10 @@ impl CcHarness {
             )
             .env("PYTHONDONTWRITEBYTECODE", "1")
             // CC writes config and history into HOME; root's is unreadable now.
-            .env("HOME", crate::sandbox::agent_home(&self.work_root, &task_name))
+            .env(
+                "HOME",
+                crate::sandbox::agent_home(&self.work_root, &task_name),
+            )
             .uid(self.rollout_user.uid)
             .gid(self.rollout_user.gid);
 
