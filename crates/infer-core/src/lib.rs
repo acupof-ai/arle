@@ -29,14 +29,6 @@ impl RequestHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub enum RequestPriority {
-    Low = 0,
-    #[default]
-    Normal = 1,
-    High = 2,
-}
-
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub num_slots: usize,
@@ -128,9 +120,6 @@ impl std::fmt::Debug for GrammarHook {
 /// Options accepted at request ingress.
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
-    pub priority: RequestPriority,
-    /// Cooperative cancellation observed before queue insertion.
-    pub cancelled: bool,
     /// Default: greedy / argmax.
     pub sampling: SamplingParams,
     pub grammar: Option<GrammarHook>,
@@ -333,7 +322,6 @@ struct RequestState {
     handle: RequestHandle,
     prompt_tokens: Vec<u32>,
     generated_tokens: Vec<u32>,
-    priority: RequestPriority,
     max_tokens: usize,
     sampling: SamplingParams,
     phase: RequestPhase,
@@ -372,7 +360,6 @@ impl RequestState {
     fn new(
         handle: RequestHandle,
         prompt_tokens: Vec<u32>,
-        priority: RequestPriority,
         max_tokens: usize,
         sampling: SamplingParams,
     ) -> Self {
@@ -381,7 +368,6 @@ impl RequestState {
             handle,
             prompt_tokens,
             generated_tokens: Vec::new(),
-            priority,
             max_tokens,
             sampling,
             phase: RequestPhase::Prefilling { progress: 0 },
@@ -769,7 +755,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             NormalizedRequest::Completed(request) => {
                 self.record_completed(handle, request.into());
             }
-            NormalizedRequest::Skipped => {}
         }
         handle
     }
@@ -1138,10 +1123,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         max_tokens: usize,
         options: RequestOptions,
     ) -> NormalizedRequest {
-        if options.cancelled {
-            return NormalizedRequest::Skipped;
-        }
-
         if prompt_tokens.is_empty() || prompt_tokens.len() > self.config.max_prompt_tokens {
             // A silent Abort reads as an empty completion to the client — say why.
             log::warn!(
@@ -1150,7 +1131,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 self.config.max_prompt_tokens
             );
             return NormalizedRequest::Completed(
-                RequestState::new(handle, prompt_tokens, options.priority, 0, options.sampling)
+                RequestState::new(handle, prompt_tokens, 0, options.sampling)
                     .complete_immediately(FinishReason::Abort),
             );
         }
@@ -1165,20 +1146,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         sampling.max_new_tokens = Some(max_tokens);
         if max_tokens == 0 {
             return NormalizedRequest::Completed(
-                RequestState::new(handle, prompt_tokens, options.priority, 0, sampling)
+                RequestState::new(handle, prompt_tokens, 0, sampling)
                     .complete_immediately(FinishReason::Length),
             );
         }
 
         NormalizedRequest::Waiting(
-            RequestState::new(
-                handle,
-                prompt_tokens,
-                options.priority,
-                max_tokens,
-                sampling,
-            )
-            .with_grammar(options.grammar),
+            RequestState::new(handle, prompt_tokens, max_tokens, sampling)
+                .with_grammar(options.grammar),
         )
     }
 
@@ -1494,8 +1469,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         // TP-synced: a rank-local `free_pages()` can differ across ranks (e.g.
         // per-rank KV-tier host-demote residuals), and this value gates the
-        // same Admit/Throttle decision as the `cached_prefix_match_len`
-        // collective below — a diverging decision means one rank stops
+        // same Admit/Throttle decision as the radix prefix-match clamp
+        // below — a diverging decision means one rank stops
         // calling that collective while another keeps calling it every tick,
         // a permanent cross-rank admission livelock (2026-07-05 TP=4 hang,
         // docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
@@ -1579,32 +1554,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if self.config.enable_prefix_cache && self.executor.kv_shard_spec().is_none() {
                 let committed = candidate.committed_cow();
                 let matched = self.radix.peek_longest_prefix_match(&committed);
-                let prefix_match = Self::clamp_prefix_to_backend(
+                Self::clamp_prefix_to_backend(
                     &mut self.executor,
                     self.radix.block_size(),
                     matched,
                     &committed,
-                );
-                // Backends without page-radix reuse (DSv4) may still hold a
-                // position-0 whole-slot prefix image. The page route reports
-                // `matched_len == 0` for them, so budget the prefill/pages against
-                // the executor's cached prefix length when it is longer. This only
-                // affects budgeting; the actual restore happens at attach below.
-                // Skipped for swap re-admissions: they restore the FULL sequence
-                // via `restore_swapped_slot` (consuming the slot) and never take
-                // the cached-prefix attach path, so the cached length is
-                // irrelevant to their prefill (which is 0).
-                let cached = if candidate.swap_key.is_none() {
-                    match self.executor.prefix_reuse() {
-                        Some(reuse) => reuse
-                            .cached_prefix_match_len(&committed)?
-                            .min(committed.len()),
-                        None => 0,
-                    }
-                } else {
-                    0
-                };
-                prefix_match.matched_len.max(cached)
+                )
+                .matched_len
             } else {
                 0
             };
@@ -1885,32 +1841,18 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 enum NormalizedRequest {
     Waiting(RequestState),
     Completed(RequestState),
-    Skipped,
 }
 
 fn waiting_insert_position(
     waiting: &VecDeque<RequestState>,
-    incoming: &RequestState,
+    _incoming: &RequestState,
     bias: WaitingInsertBias,
 ) -> usize {
-    waiting
-        .iter()
-        .position(|queued| waiting_request_precedes(incoming, queued, bias))
-        .unwrap_or(waiting.len())
-}
-
-fn waiting_request_precedes(
-    incoming: &RequestState,
-    queued: &RequestState,
-    bias: WaitingInsertBias,
-) -> bool {
-    // Higher priority sorts first; on a tie the bias decides whether `incoming`
-    // precedes an equal `queued`. (Reuse-based tiebreaks were dead: the reuse
-    // hint is only known post-admit, so every waiter compares as default here.)
-    match incoming.priority.cmp(&queued.priority) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
+    // Priority is always default; the bias alone decides insertion at head or tail.
+    if matches!(bias, WaitingInsertBias::BeforeEqual) {
+        0
+    } else {
+        waiting.len()
     }
 }
 
@@ -1963,13 +1905,7 @@ mod think_state_tests {
         sampling.think_end_token_id = Some(128822);
         sampling.think_start_token_id = Some(128821);
         sampling.max_thinking_tokens = Some(budget);
-        RequestState::new(
-            RequestHandle(0),
-            Vec::new(),
-            RequestPriority::default(),
-            100,
-            sampling,
-        )
+        RequestState::new(RequestHandle(0), Vec::new(), 100, sampling)
     }
 
     #[test]
@@ -2014,13 +1950,7 @@ mod think_state_tests {
 
     #[test]
     fn no_think_config_is_noop() {
-        let mut s = RequestState::new(
-            RequestHandle(0),
-            Vec::new(),
-            RequestPriority::default(),
-            100,
-            SamplingParams::default(),
-        );
+        let mut s = RequestState::new(RequestHandle(0), Vec::new(), 100, SamplingParams::default());
         s.update_think_state(128822);
         assert!(!s.in_thinking);
         assert!(s.sampling.force_next_token.is_none());

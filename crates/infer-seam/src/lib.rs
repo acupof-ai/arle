@@ -348,7 +348,7 @@ pub trait BackendExecutor {
     /// Cross-TP-rank min-reduce of a per-rank-local scalar. Single-rank/no-TP
     /// backends (default) return `local` unchanged. TP backends MUST call
     /// this symmetrically on every rank, every tick that reaches it — same
-    /// discipline as [`PrefixReuse::cached_prefix_match_len`]'s reduce. Skipping
+    /// discipline as the prefix-reuse reduce. Skipping
     /// the sync on one rank while another still calls it desyncs the admission
     /// collective permanently (2026-07-05 TP=4 admission livelock — see
     /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
@@ -446,36 +446,6 @@ pub trait PrefixReuse {
     /// entries ride the radix lifetime ([`Self::release_prefix_pages`]) and
     /// are untouched.
     fn release_provisional_prefix_pages(&mut self, pages: &[u32]);
-
-    /// Length of the longest leading prefix of `tokens` for which the backend
-    /// holds a position-0-anchored cached KV snapshot it can restore into a fresh
-    /// slot.
-    ///
-    /// This is the cross-request prefix-reuse seam for backends whose KV cannot
-    /// be page-reattached at arbitrary positions (DSv4's RoPE-rotated K, the
-    /// sliding-window ring indexed by `abs_pos % window`, and the DSA indexer
-    /// keys are all position-locked). The only safe reuse is a prefix captured
-    /// at absolute positions `[0, len)` and reattached as the leading prefix of
-    /// a new request that also starts at position 0. Returning `0` means the
-    /// backend has no such store and the engine never calls the capture/restore
-    /// hooks — the page-radix reuse path stays byte-for-byte unchanged.
-    fn cached_prefix_match_len(&self, tokens: &[u32]) -> anyhow::Result<usize>;
-
-    /// Restore the cached position-0 prefix snapshot for `tokens[..matched_len]`
-    /// into `slot`, setting the slot's materialized length to `matched_len`.
-    ///
-    /// `matched_len` is the value returned by [`Self::cached_prefix_match_len`].
-    /// The engine has already allocated `matched_len` tokens of host KV pages on
-    /// `slot` and resumes prefill from absolute position `matched_len` right
-    /// after, so every byte of restored KV/side state MUST land before
-    /// returning. Only called when `cached_prefix_match_len > 0`.
-    fn restore_cached_prefix(
-        &mut self,
-        slot: usize,
-        tokens: &[u32],
-        matched_len: usize,
-        slot_pages: &[u32],
-    ) -> anyhow::Result<()>;
 
     /// Restore the sidecar side state for `slot` when reusing a page-radix prefix
     /// of length `matched_len`, returning the ABSOLUTE token length actually

@@ -469,9 +469,7 @@ mod tests {
     //! park ping-pong), and previously had no fast local guard.
 
     use super::*;
-    use crate::{
-        Engine, RequestHandle, RequestPhase, RequestPriority, RequestState, SchedulerConfig,
-    };
+    use crate::{Engine, RequestHandle, RequestPhase, RequestState, SchedulerConfig};
     use infer_plan::SamplingParams;
     use infer_seam::{
         BackendExecutor, HostPagedKvPool, KvAllocator, KvPool, KvQuery, KvSlotTier, PollResult,
@@ -546,7 +544,6 @@ mod tests {
         let mut req = RequestState::new(
             RequestHandle(handle),
             vec![1u32; prompt],
-            RequestPriority::default(),
             prompt + generated + 100,
             SamplingParams::default(),
         );
@@ -564,7 +561,6 @@ mod tests {
         let mut req = RequestState::new(
             RequestHandle(0),
             vec![1u32; 200],
-            RequestPriority::default(),
             300,
             SamplingParams::default(),
         );
