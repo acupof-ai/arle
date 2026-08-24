@@ -12,7 +12,7 @@ A clear description of the bug.
 ## Surface
 
 - **Backend**: (e.g. CUDA, Metal, CPU)
-- **Route / command**: (e.g. `POST /v1/chat/completions`, `arle train eval`)
+- **Route / command**: (e.g. `POST /v1/chat/completions`, `arle serve`)
 - **Regression?**: (e.g. yes/no, last known good commit if known)
 
 ## Steps to Reproduce
@@ -37,7 +37,7 @@ What actually happens. Include error messages or logs.
 - **arle version/commit**: 
 - **OS**: 
 - **Model**: (e.g. Qwen3-4B)
-- **Command / server flags**: (e.g. `infer --num-slots 4 --cuda-graph true`)
+- **Command / server flags**: (e.g. `arle serve --max-running-requests 4 --port 8000`)
 - **Relevant env vars**: (e.g. `TORCH_CUDA_ARCH_LIST="9.0"`)
 
 ## Evidence

@@ -33,12 +33,11 @@ crates/autograd/
 │   ├── lr_schedule.rs  — `LrSchedule` trait + `ConstantLr`, `LinearWarmup`,
 │   │                     `CosineWithWarmup`, `parse_lr_schedule`. Pure step→f32
 │   │                     functions (no persisted state).
-│   ├── module.rs       — parameter iteration for optimizers
 │   └── safetensors_io.rs (feature = "safetensors")
 ├── tests/
 │   ├── test_backend.rs         — backend parity (CPU reference vs Metal/CUDA, 1e-3 tol)
 │   ├── test_device_handle.rs   — upload/eval/readback + M5.3a eval-count acceptance
-│   ├── m0_ops.rs / m1_*.rs     — tape/op numerical grad_check suites
+│   ├── test_*.rs               — CPU/Metal/CUDA parity + tape grad-check suites
 │   └── helpers.rs              — num_grad, seeded RNG
 └── AGENTS.md           — this file
 ```
@@ -127,7 +126,7 @@ still cause on their inputs:
 
 ```
 forward:  lazy ops build graph via Backend::matmul / Backend::add
-          (no eval). CPU-only ops (sum, softmax, rmsnorm, gelu, ...)
+          (no eval). CPU-only ops (sum, softmax, rmsnorm, ...)
           call store.ensure_host(input) which evals + readbacks the
           input once. Output of a CPU op is Dirty::Host.
 backward: Tape::backward() materializes any still-Dirty::Device output
@@ -142,7 +141,7 @@ readback: store.to_host(id) on anything the optimizer / training loop
 ### When an op forces a host readback
 
 Unlike matmul + add, most ops (`sum`, `mean`, `softmax`, `log_softmax`,
-`gelu`, `silu`, `exp`, `neg`, `mul`, `mul_scalar`, `rms_norm`, `rope`,
+`silu`, `exp`, `neg`, `mul`, `mul_scalar`, `rms_norm`, `rope`,
 `embedding`, `gather_last_dim`, `scatter_add_rows`) are CPU-only today.
 They call `store.ensure_host(input)` on every device-resident input,
 which runs one eval per call. This is the gap M5.3b closes — port each
@@ -185,8 +184,8 @@ that strengthens the runtime spine). It must stay narrow:
 
 ## Tests and benches
 
-- `cargo test -p autograd --release` — CPU-only, ~14 tests.
-- `cargo test -p autograd --release --features metal` — adds ~48 tests.
+- `cargo test -p autograd --release` — CPU-only, ~40 tests.
+- `cargo test -p autograd --release --features metal` — adds ~50 tests.
 - `cargo check -p autograd --no-default-features --features cuda,no-cuda` —
   Mac typecheck gate for CUDA.
 - `examples/bench_step_matmul.rs` — per-step wall-clock sweep CPU vs
@@ -244,8 +243,7 @@ that strengthens the runtime spine). It must stay narrow:
 
 ## Related memories
 
-- [`feedback_no_half_states.md`](../../.claude/projects/-Users-user-code-arle/memory/feedback_no_half_states.md)
-- [`feedback_m2b_claude_writes.md`](../../.claude/projects/-Users-user-code-arle/memory/feedback_m2b_claude_writes.md)
-- [`feedback_matched_ab_for_small_bench_effects.md`](../../.claude/projects/-Users-user-code-arle/memory/feedback_matched_ab_for_small_bench_effects.md)
+- [`feedback_no_half_states.md`](~/.claude/projects/-Users-bytedance-code-agent-infer/memory/feedback_no_half_states.md)
+- [`feedback_matched_ab_for_small_bench_effects.md`](~/.claude/projects/-Users-bytedance-code-agent-infer/memory/feedback_matched_ab_for_small_bench_effects.md)
 </content>
 </invoke>

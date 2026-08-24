@@ -1,6 +1,6 @@
 # Workspace crates
 
-This folder hosts the reusable crates around `infer`. The canonical workspace
+This folder hosts the reusable crates around the inference runtime. The canonical workspace
 map lives in [`../docs/codebase-map.md`](../docs/codebase-map.md); new
 contributors should start at [`../docs/onboarding.md`](../docs/onboarding.md).
 
@@ -16,13 +16,14 @@ Backend bridges and kernel layer:
 - `cuda-kernels`: extracted CUDA kernel layer (CUDA C / TileLang sources, Rust
   FFI, `DeviceContext` / `DeviceVec` / `HiddenStates`, `PagedKVPool` /
   `TileLangDecodeMetadata`, `graph_pool`). Extracted 2026-04-15 by commit
-  `a4e12f5`; the dependency edge is one-way: `infer → cuda-kernels`, never
+  `a4e12f5`; the dependency edge is one-way: `infer-cuda → cuda-kernels`, never
   the reverse. See [`cuda-kernels/AGENTS.md`](cuda-kernels/AGENTS.md)
   for the proto-API / prelude discipline.
 - `mlx-sys`: MLX C++ bridge and vendored MLX Metal qmv kernels used by the
   Metal backend
-- `kv-native-sys`: pure-Rust persistence substrate for the `infer/src/kv_tier/`
-  disk and shared-memory transport paths
+- `kv-native-sys`: pure-Rust persistence substrate — `KvTierStore`, the
+  backend-neutral two-level KV-tier store shared by the CUDA and Metal
+  executors
 
 Shared model contract:
 
@@ -42,8 +43,6 @@ Train-side runtime extension (OPD-only since 2026-05-18 pivot):
 
 The 2026-04-15 Route-A refactor folded the experimental `infer-core`,
 `infer-engine`, `infer-observability`, and `infer-policy` crates back into
-`infer` as in-tree modules (`types`, `events`, and `scheduler::policy`). The
-old `agent_engine` adapter was also collapsed: its trait and types merged into
-`infer::server_engine` (`InferenceEngine`, `LoadedInferenceEngine`,
-`CompletionRequest`, `CompletionOutput`, `TokenUsage`, …), so the HTTP server
-and the agent CLI now share a single engine contract.
+`infer` as in-tree modules; the monolith was itself deleted in the 2026-06-04
+rewrite. `infer-api` (`LoadedInferenceEngine`) is now the single programmatic
+engine entry point.
