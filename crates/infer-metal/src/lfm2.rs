@@ -350,6 +350,7 @@ impl CppLfm2Model {
         }
 
         let add_weight = |weight: &WeightTensor| -> Option<i32> {
+            // SAFETY: live model handle; weight array handles are borrowed from the owned weights.
             let id = unsafe {
                 match weight {
                     WeightTensor::Dense(w) => {
@@ -389,6 +390,7 @@ impl CppLfm2Model {
                 match $expr {
                     Some(id) => id,
                     None => {
+                        // SAFETY: live model; explicit free on the failure path (no Self to Drop it).
                         unsafe { mlx_sys::lfm2_compiled_free(model) };
                         return None;
                     }
@@ -401,6 +403,7 @@ impl CppLfm2Model {
             };
         }
 
+        // SAFETY: live model handle from lfm2_compiled_new.
         unsafe {
             mlx_sys::lfm2_compiled_set_config(
                 model,
@@ -415,6 +418,7 @@ impl CppLfm2Model {
         }
 
         let lm_head_id = add_or_free!(&weights.lm_head);
+        // SAFETY: live model handle; embedding/norm handles are borrowed from the owned weights.
         unsafe {
             mlx_sys::lfm2_compiled_set_embed(
                 model,
@@ -426,6 +430,7 @@ impl CppLfm2Model {
         // Tied lm_head: run the 6-bit quantized embedding as the output projection.
         if let Some(embed_quantized) = &weights.embed_quantized {
             let embed_id = add_or_free!(embed_quantized);
+            // SAFETY: live model handle; embed_id was just registered successfully.
             unsafe {
                 mlx_sys::lfm2_compiled_set_embed_as_linear(model, embed_id);
             }
@@ -447,6 +452,7 @@ impl CppLfm2Model {
 
             match layer {
                 Lfm2Layer::Conv(c) => unsafe {
+                    // SAFETY: live model handle; weight ids are registered above, array handles borrowed.
                     mlx_sys::lfm2_compiled_push_conv_layer(
                         model,
                         op_norm.as_raw(),
@@ -460,6 +466,7 @@ impl CppLfm2Model {
                     );
                 },
                 Lfm2Layer::Attn(a) => unsafe {
+                    // SAFETY: live model handle; weight ids are registered above, array handles borrowed.
                     mlx_sys::lfm2_compiled_push_attn_layer(
                         model,
                         op_norm.as_raw(),
@@ -480,6 +487,7 @@ impl CppLfm2Model {
             if let Lfm2Ffn::Moe(moe) = ffn {
                 let WeightTensor::Dense(router_w) = &moe.router else {
                     log::warn!("C++ LFM2 MoE registration requires a dense router weight");
+                    // SAFETY: live model; explicit free on the failure path (no Self to Drop it).
                     unsafe { mlx_sys::lfm2_compiled_free(model) };
                     return None;
                 };
@@ -487,6 +495,7 @@ impl CppLfm2Model {
                     (&moe.dense_gate, &moe.dense_up, &moe.dense_down)
                 {
                     // BF16 dense expert path
+                    // SAFETY: live model handle; expert weight handles are borrowed from the owned weights.
                     unsafe {
                         mlx_sys::lfm2_compiled_set_last_moe_dense(
                             model,
@@ -513,6 +522,7 @@ impl CppLfm2Model {
                         };
                         add_weight(&wt)
                     };
+                    // SAFETY: live model handle; stacked expert ids are registered above, handles borrowed.
                     unsafe {
                         mlx_sys::lfm2_compiled_set_last_moe(
                             model,
@@ -531,15 +541,18 @@ impl CppLfm2Model {
                 }
                 if let Err(err) = crate::mlx::check_mlx_error() {
                     log::warn!("C++ LFM2 MoE registration failed: {err}");
+                    // SAFETY: live model; explicit free on the failure path (no Self to Drop it).
                     unsafe { mlx_sys::lfm2_compiled_free(model) };
                     return None;
                 }
             }
         }
 
+        // SAFETY: live model handle; all weights are registered by this point.
         let rc = unsafe { mlx_sys::lfm2_compiled_finalize(model) };
         if rc != 0 {
             log::warn!("C++ LFM2 model finalize failed");
+            // SAFETY: live model; explicit free on the failure path (no Self to Drop it).
             unsafe { mlx_sys::lfm2_compiled_free(model) };
             return None;
         }

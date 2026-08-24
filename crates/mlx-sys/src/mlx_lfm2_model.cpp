@@ -248,7 +248,7 @@ struct Lfm2CompiledModel {
     std::vector<int> capture_layer_ids;
     bool capture_conv_inputs = false;
 
-    static const bool mlp_compile() {
+    static bool mlp_compile() {
         static const bool on = std::getenv("INFER_METAL_NO_MLP_COMPILE") == nullptr;
         return on;
     }

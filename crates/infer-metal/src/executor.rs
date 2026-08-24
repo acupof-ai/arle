@@ -1230,7 +1230,7 @@ impl RealMetalExecutor {
             // Draft KV is reset each block (stale KV degrades acceptance);
             // set the absolute RoPE offset for the target context so the
             // draft's Q/K align with the target's positions.
-            let target_hidden_len = target_hidden.shape().first().copied().unwrap_or(0) as i32;
+            let target_hidden_len = target_hidden.shape().first().copied().unwrap_or(0);
             draft_state.set_rope_offset(old_cache_len as i32 - target_hidden_len);
             dflash::prepare_draft_block(
                 runtime,
@@ -1368,8 +1368,8 @@ impl RealMetalExecutor {
             );
         }
         let mut tokens = Vec::with_capacity(accepted_inputs);
-        for i in 1..=matched {
-            tokens.push(draft_tokens[i] as u32);
+        for &token in draft_tokens.iter().take(matched + 1).skip(1) {
+            tokens.push(token as u32);
         }
         tokens.push(next_token);
         Ok(StepOutput {
