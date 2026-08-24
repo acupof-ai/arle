@@ -31,8 +31,12 @@ Validation on the new box (GPUs 1,3,6,7; GPU1 shared with a ~21GB sft job):
   Decode 10.9 tok/s per request is contention with the co-located sft job,
   not a perf claim.
 
-The exact original FP8 config on 4 clean GPUs is still worth one run when the
-box frees up; the mechanism is validated on both sides above.
+**Exact original config on 4 clean GPUs (3,5,6,7, run after the sft job
+ended):** FP8 TP=4 `--max-total-tokens 131072`, no `--max-running-requests`.
+Pre-fix this planned 18 slots and OOMed on every rank at tick 4432; with the
+reserve it plans **17 slots** (state-affordable 18) and c=8 over 16 prompts of
+28568 tokens completes **16/16 with 0 OOM and 0 preempts**. One slot of
+capacity bought the whole config's stability.
 
 ## Rule
 
@@ -43,4 +47,4 @@ idle engine. Reserve terms are itemized from allocation sites, never a factor.
 ## Artifacts
 
 - `/root/arle-ops/runs/budgetval/serve.log` (reject), `budgetval-nvfp4/`
-  (bench-c8, serve.log), build `budget-v2` (head `0c31d5cde`)
+  (bench-c8, serve.log), `budgetval-fp8clean/` (exact-config run), build `budget-v2` (head `0c31d5cde`)
