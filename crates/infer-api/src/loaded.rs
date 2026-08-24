@@ -2054,8 +2054,13 @@ mod backend {
         if kv_dtype != infer_cuda::CudaKvCacheDtype::Bf16 && !matches!(kind, CudaModelKind::Qwen35)
         {
             anyhow::bail!(
-                "--kv-cache-dtype {} is not supported for {kind:?}; \
-                 only Qwen35 supports quantized paged KV",
+                "--kv-cache-dtype {} is not supported for {kind:?}. The flag selects the \
+                 Qwen3.5/3.6 two-plane paged quant pool (separate 1-byte K and V planes \
+                 with per-(token, kv_head) f32 scales). DSv4 MLA KV is already FP8-packed \
+                 unconditionally at 584 B/token, a layout the vendored FlashMLA decode \
+                 kernel fixes by reinterpreting the KV pointer as fp8*, so `fp8` would be \
+                 a no-op and `int8` would need that kernel forked for no byte saving. \
+                 Drop the flag rather than adding it.",
                 kv_dtype.label()
             );
         }

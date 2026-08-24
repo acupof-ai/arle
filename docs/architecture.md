@@ -191,7 +191,7 @@ parity in another.
 | Continuous batching scheduler | Yes (one `Engine<E,K>` in `infer-core`) | Same `Engine<E,K>`; target-only Qwen is single-row, loaded DFlash/NextN enables configurable multi-row/mixed plans | No | Seam impl (single-stream MVP) | Seam impl (skeleton) |
 | Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No | Host KV pool (DSv4 slot shape) | Host KV pool (bookkeeping) |
 | Chunked prefill + decode-priority | Yes | Partial | No | No | No |
-| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
+| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ4), Qwen3.5/3.6 only — DSv4 MLA KV is already FP8-packed and rejects the flag | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
 | Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots; T2 local-SSD write-through) | No | No | No |
 | Speculative decode | MTP for DSv4/Qwen3.6 (depth-2 ~1.03× net-win on H20); else plumbing only | Beta (DFlash for Qwen3.5; NextN/MTP shipped for Qwen3.6, +44% tok/s) | No | No | No |
 | Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No | No | No |
