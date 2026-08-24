@@ -32,8 +32,6 @@ pub enum WeightFormat {
     GgufQ5K,
     /// GGUF Q6_K packed superblocks, scales embedded in each 256-wide block.
     GgufQ6K,
-    /// TurboQuant packed indices + FP16 group norms + Hadamard signs.
-    TurboQuant,
     /// DeepSeek V4 row-major FP8 E4M3 weights with FP8 E8M0 block scales.
     Dsv4Fp8BlockScaled,
     /// DeepSeek V4 row-major packed FP4 E2M1 weights with FP8 E8M0 block scales.
@@ -57,7 +55,7 @@ impl WeightFormat {
         ensure!(cols > 0, "{self} requires cols > 0");
         match self {
             Self::DenseBf16 => Ok(()),
-            Self::W8A16 | Self::W4A16 | Self::W2A16 | Self::TurboQuant => {
+            Self::W8A16 | Self::W4A16 | Self::W2A16 => {
                 ensure!(group_size > 0, "{self} requires group_size > 0");
                 ensure!(
                     cols.is_multiple_of(group_size),
@@ -133,7 +131,6 @@ impl std::fmt::Display for WeightFormat {
             Self::GgufQ4K => f.write_str("gguf_q4_k"),
             Self::GgufQ5K => f.write_str("gguf_q5_k"),
             Self::GgufQ6K => f.write_str("gguf_q6_k"),
-            Self::TurboQuant => f.write_str("turboquant"),
             Self::Dsv4Fp8BlockScaled => f.write_str("dsv4_fp8_block_scaled"),
             Self::Dsv4Fp4BlockScaled => f.write_str("dsv4_fp4_block_scaled"),
             Self::Fp8BlockScaled => f.write_str("fp8_block_scaled"),

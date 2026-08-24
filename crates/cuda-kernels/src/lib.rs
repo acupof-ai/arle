@@ -31,8 +31,6 @@ pub mod sampling;
 pub mod tensor;
 #[cfg(feature = "cuda")]
 pub mod tensor_ops;
-#[cfg(feature = "cuda")]
-pub mod turboquant_state;
 
 #[cfg(feature = "cuda")]
 pub use kv_types::KVFormat;

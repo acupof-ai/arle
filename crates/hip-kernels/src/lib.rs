@@ -94,10 +94,6 @@ macro_rules! basic_op_launchers {
             row: *const u16, out: *mut u16, hidden_dim: i32, token_idx: i32,
             scale: f32, stream: *mut c_void,
         ));
-        $decl!(add_scaled_row_segment_cuda(
-            row: *const u16, out: *mut u16, row_len: i32, out_hidden_dim: i32,
-            token_idx: i32, segment_offset: i32, scale: f32, stream: *mut c_void,
-        ));
         $decl!(add_cuda(
             a: *const u16, b: *const u16, out: *mut u16, n: i32,
             stream: *mut c_void,
@@ -119,25 +115,9 @@ macro_rules! basic_op_launchers {
             x: *const u16, weight: *const u16, out: *mut u16, n: i32,
             eps: f32, stream: *mut c_void,
         ));
-        $decl!(fused_add_rms_norm_cuda(
-            hidden: *mut u16, residual: *const u16, weight: *const u16,
-            out: *mut u16, n: i32, eps: f32, stream: *mut c_void,
-        ));
-        $decl!(fused_add_rms_norm_batched_cuda(
-            hidden: *mut u16, residual: *const u16, weight: *const u16,
-            out: *mut u16, hidden_dim: i32, seq_len: i32, eps: f32,
-            stream: *mut c_void,
-        ));
         $decl!(rms_norm_batched_cuda(
             x: *const u16, weight: *const u16, out: *mut u16,
             hidden_dim: i32, seq_len: i32, eps: f32, stream: *mut c_void,
-        ));
-        $decl!(rms_norm_batched_f32_in_cuda(
-            x: *const f32, weight: *const u16, out: *mut u16,
-            hidden_dim: i32, seq_len: i32, eps: f32, stream: *mut c_void,
-        ));
-        $decl!(add_bf16_into_f32_cuda(
-            out: *mut f32, input: *const u16, n: i32, stream: *mut c_void,
         ));
         $decl!(cast_bf16_to_f32_cuda(
             input: *const u16, out: *mut f32, n: i32, stream: *mut c_void,
@@ -148,10 +128,6 @@ macro_rules! basic_op_launchers {
         $decl!(rms_norm_offset_cuda(
             x: *const u16, weight: *const u16, out: *mut u16, n: i32,
             eps: f32, stream: *mut c_void,
-        ));
-        $decl!(fused_add_rms_norm_offset_cuda(
-            hidden: *mut u16, residual: *const u16, weight: *const u16,
-            out: *mut u16, n: i32, eps: f32, stream: *mut c_void,
         ));
         $decl!(rms_norm_batched_offset_cuda(
             x: *const u16, weight: *const u16, out: *mut u16,
@@ -262,11 +238,6 @@ macro_rules! basic_op_launchers {
             scale: *const u16, pre: *mut f32, post: *mut f32, comb: *mut f32,
             num_tokens: i32, residual_hidden_dim: i32, mix_dim: i32,
             hc_mult: i32, eps: f32, sinkhorn_iters: i32, stream: *mut c_void,
-        ));
-        $decl!(dsv4_mhc_pre_cuda(
-            residual: *const u16, pre: *const f32, out: *mut u16,
-            num_tokens: i32, hidden_size: i32, hc_mult: i32,
-            stream: *mut c_void,
         ));
         $decl!(dsv4_mhc_pre_rms_norm_cuda(
             residual: *const u16, pre: *const f32, weight: *const u16,

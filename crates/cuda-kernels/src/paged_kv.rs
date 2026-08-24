@@ -6,9 +6,8 @@
 //! pages**. This matches TileLang's HND paged layout:
 //!   `[max_pages, num_kv_heads, page_size, head_dim]`.
 //!
-//! BF16 / INT8 / FP8 E4M3 now all use `page_size = 16`. TurboQuant remains
-//! token-granular (`page_size = 1`) until its decode and migration kernels are
-//! rewritten around paged layout. `PackedBytes` (MLA latent records) uses
+//! BF16 / INT8 / FP8 E4M3 now all use `page_size = 16`.
+//! `PackedBytes` (MLA latent records) uses
 //! `page_size = 64` — the FlashMLA block size — and stores one opaque
 //! `bytes_per_token` record per token in the K plane only.
 
@@ -19,7 +18,6 @@ use log::info;
 use super::tensor::DeviceContext;
 use crate::kv_quant::paged_attention_quantized_fa3_workspace_bytes;
 use crate::kv_types::{KVCacheDtype, KVFormat};
-use crate::turboquant_state::TurboQuantLayerState;
 
 /// Logical-page marker for a page that has been **evict-dropped** out of HBM
 /// under the write-through tiered KV model ([`TokenKVPool::evict_slot_page`]).
@@ -70,13 +68,6 @@ pub struct TokenKVPool {
     /// Workspace for split-KV fused-dequant attention (INT8 only).
     pub quantized_attn_workspace: Option<CudaSlice<u8>>,
     pub quantized_attn_workspace_bytes: usize,
-    /// Per-head per-token f16 norms (TurboQuant only). `[max_total_tokens, num_kv_heads]`
-    pub k_norms: Vec<CudaSlice<u16>>,
-    pub v_norms: Vec<CudaSlice<u16>>,
-    /// TurboQuant per-layer state: rotation matrices + codebook (K and V).
-    /// Only populated when format is TurboQuant.
-    pub tq_k_state: Option<TurboQuantLayerState>,
-    pub tq_v_state: Option<TurboQuantLayerState>,
 
     /// Free physical pages (stack-based allocator, LIFO).
     free_pages: Vec<u32>,
@@ -142,18 +133,12 @@ fn compute_budget_breakdown(
     } else {
         0
     };
-    let norm_bytes_per_token = if format.has_norms() {
-        num_kv_heads * 2 * 2 // f16 per-head, K+V
-    } else {
-        0
-    };
     let data_bytes_per_token = match format.packed_record_bytes_per_token() {
         // Single packed plane (K only) — the MLA latent record has no V plane.
         Some(record_bytes) => record_bytes,
         None => kv_dim * format.bytes_per_element() * 2, // K+V
     };
-    let storage_bytes_per_token =
-        (data_bytes_per_token + scale_bytes_per_token + norm_bytes_per_token) * num_layers;
+    let storage_bytes_per_token = (data_bytes_per_token + scale_bytes_per_token) * num_layers;
     let work_bytes_per_token = if format.needs_work_buffer() {
         kv_dim * 2 * 2 // K+V bf16 working buffers for one layer
     } else {
@@ -215,12 +200,7 @@ impl TokenKVPool {
         } else {
             0
         };
-        let norm_bytes = if self.format.has_norms() {
-            self.num_kv_heads * std::mem::size_of::<u16>() * 2
-        } else {
-            0
-        };
-        (data_bytes + scale_bytes + norm_bytes) * self.num_layers
+        (data_bytes + scale_bytes) * self.num_layers
     }
 
     pub fn storage_bytes_for_tokens(&self, token_count: usize) -> usize {
@@ -236,14 +216,8 @@ impl TokenKVPool {
     /// Exact requested device bytes this pool owns: Σ over every `CudaSlice<T>`
     /// field of `slice.len() * size_of::<T>()`. This is the *requested* byte
     /// count, NOT the cudaMalloc-rounded physical reservation. Covers the
-    /// per-layer K/V data planes, per-token scales (FP8/INT8), per-token norms
-    /// (TurboQuant), the 1-layer bf16 work buffers, the split-KV attention
-    /// workspace.
-    ///
-    /// `tq_k_state`/`tq_v_state` (TurboQuant rotation/codebook device buffers)
-    /// are NOT summed here — they are always `None` for the DSv4 FlashMLA pool
-    /// (`KVFormat::PackedBytes`, single-plane) and the DSv4 ledger this method
-    /// feeds never exercises TurboQuant.
+    /// per-layer K/V data planes, per-token scales (FP8/INT8), the 1-layer
+    /// bf16 work buffers, the split-KV attention workspace.
     pub fn device_bytes(&self) -> usize {
         let mut total = 0usize;
         for s in &self.k_data {
@@ -257,12 +231,6 @@ impl TokenKVPool {
         }
         for s in &self.v_scales {
             total += s.len() * std::mem::size_of::<f32>();
-        }
-        for s in &self.k_norms {
-            total += s.len() * std::mem::size_of::<u16>();
-        }
-        for s in &self.v_norms {
-            total += s.len() * std::mem::size_of::<u16>();
         }
         if let Some(s) = &self.k_work {
             total += s.len(); // u8
@@ -439,8 +407,6 @@ impl TokenKVPool {
         let mut v_data = Vec::new();
         let mut k_scales = Vec::new();
         let mut v_scales = Vec::new();
-        let mut k_norms = Vec::new();
-        let mut v_norms = Vec::new();
         let mut k_work = None;
         let mut v_work = None;
 
@@ -473,22 +439,6 @@ impl TokenKVPool {
                         ctx.stream
                             .alloc_zeros::<f32>(scale_elements)
                             .map_err(|e| anyhow!("TokenKVPool V scales alloc failed: {e}"))?,
-                    );
-                }
-            }
-
-            // Norm buffers (TurboQuant only): f16 per-head per-token
-            if format.has_norms() {
-                for _ in 0..num_layers {
-                    k_norms.push(
-                        ctx.stream
-                            .alloc_zeros::<u16>(scale_elements)
-                            .map_err(|e| anyhow!("TokenKVPool K norms alloc failed: {e}"))?,
-                    );
-                    v_norms.push(
-                        ctx.stream
-                            .alloc_zeros::<u16>(scale_elements)
-                            .map_err(|e| anyhow!("TokenKVPool V norms alloc failed: {e}"))?,
                     );
                 }
             }
@@ -546,20 +496,12 @@ impl TokenKVPool {
                 (None, 0)
             };
 
-        let (tq_k_state, tq_v_state) = if let KVFormat::TurboQuant { key_bits, val_bits } = format {
-            let k_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, key_bits, 42)?;
-            let v_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, val_bits, 137)?;
-            (Some(k_state), Some(v_state))
-        } else {
-            (None, None)
-        };
-
         // Legacy dtype mapping. PackedBytes carries no per-head quant
         // dispatch — BF16 is the inert legacy mapping (P2's FlashMLA
         // consumer reads the packed record directly, never this field).
         let dtype = match format {
             KVFormat::BF16 | KVFormat::PackedBytes { .. } => KVCacheDtype::BF16,
-            KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::TurboQuant { .. } => KVCacheDtype::INT8,
+            KVFormat::FP8E4M3 | KVFormat::INT8 => KVCacheDtype::INT8,
         };
 
         Ok(Self {
@@ -571,10 +513,6 @@ impl TokenKVPool {
             v_work,
             quantized_attn_workspace,
             quantized_attn_workspace_bytes,
-            k_norms,
-            v_norms,
-            tq_k_state,
-            tq_v_state,
             free_pages,
             page_indices,
             seq_lens,
@@ -966,8 +904,8 @@ impl TokenKVPool {
                             .clone_dtoh(&self.k_data[layer].slice(data_start..data_end))
                             .map_err(|e| anyhow!("paged_kv copy K page dtoh failed: {e}"))?,
                     );
-                    // Packed records have no V plane (scale/norm branches
-                    // below skip themselves via has_scales/has_norms).
+                    // Packed records have no V plane (the scale branch
+                    // below skips itself via has_scales).
                     if !single_plane {
                         out.extend_from_slice(
                             &ctx.stream
@@ -988,23 +926,6 @@ impl TokenKVPool {
                             .stream
                             .clone_dtoh(&self.v_scales[layer].slice(scale_start..scale_end))
                             .map_err(|e| anyhow!("paged_kv copy V scales dtoh failed: {e}"))?
-                        {
-                            out.extend_from_slice(&value.to_le_bytes());
-                        }
-                    }
-
-                    if self.format.has_norms() {
-                        for value in ctx
-                            .stream
-                            .clone_dtoh(&self.k_norms[layer].slice(scale_start..scale_end))
-                            .map_err(|e| anyhow!("paged_kv copy K norms dtoh failed: {e}"))?
-                        {
-                            out.extend_from_slice(&value.to_le_bytes());
-                        }
-                        for value in ctx
-                            .stream
-                            .clone_dtoh(&self.v_norms[layer].slice(scale_start..scale_end))
-                            .map_err(|e| anyhow!("paged_kv copy V norms dtoh failed: {e}"))?
                         {
                             out.extend_from_slice(&value.to_le_bytes());
                         }
@@ -1062,8 +983,8 @@ impl TokenKVPool {
                         .map_err(|e| anyhow!("paged_kv copy K page htod failed: {e}"))?;
                     cursor += token_bytes;
 
-                    // Packed records have no V plane (scale/norm branches
-                    // below skip themselves via has_scales/has_norms).
+                    // Packed records have no V plane (the scale branch
+                    // below skips itself via has_scales).
                     if !single_plane {
                         let mut v_view = self.v_data[layer].slice_mut(data_start..data_end);
                         stream
@@ -1100,34 +1021,6 @@ impl TokenKVPool {
                         stream
                             .memcpy_htod(&v_scales, &mut v_scale_view)
                             .map_err(|e| anyhow!("paged_kv copy V scales htod failed: {e}"))?;
-                    }
-
-                    if self.format.has_norms() {
-                        let k_norms: Vec<u16> = payload
-                            [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|c| u16::from_le_bytes(*c))
-                            .collect();
-                        cursor += scale_len * std::mem::size_of::<u16>();
-                        let mut k_norm_view = self.k_norms[layer].slice_mut(scale_start..scale_end);
-                        stream
-                            .memcpy_htod(&k_norms, &mut k_norm_view)
-                            .map_err(|e| anyhow!("paged_kv copy K norms htod failed: {e}"))?;
-
-                        let v_norms: Vec<u16> = payload
-                            [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|c| u16::from_le_bytes(*c))
-                            .collect();
-                        cursor += scale_len * std::mem::size_of::<u16>();
-                        let mut v_norm_view = self.v_norms[layer].slice_mut(scale_start..scale_end);
-                        stream
-                            .memcpy_htod(&v_norms, &mut v_norm_view)
-                            .map_err(|e| anyhow!("paged_kv copy V norms htod failed: {e}"))?;
                     }
                 }
             }

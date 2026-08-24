@@ -11,10 +11,6 @@ pub enum KVFormat {
     BF16,
     FP8E4M3,
     INT8,
-    TurboQuant {
-        key_bits: u8,
-        val_bits: u8,
-    },
     /// Opaque packed single-plane record format (MLA-style latent KV): one
     /// `bytes_per_token` record per token, stored in the K plane only — no V
     /// plane and no separate scale/norm buffers (everything is embedded in
@@ -33,7 +29,6 @@ impl KVFormat {
         match self {
             Self::BF16 => 16,
             Self::FP8E4M3 | Self::INT8 => 16,
-            Self::TurboQuant { .. } => 1,
             // FlashMLA block size — block-table entries are 64-token pages.
             Self::PackedBytes { .. } => 64,
         }
@@ -43,10 +38,6 @@ impl KVFormat {
         match self {
             Self::BF16 => 2,
             Self::FP8E4M3 | Self::INT8 => 1,
-            Self::TurboQuant { key_bits, .. } => {
-                let effective = if key_bits == 3 { 4 } else { key_bits as usize };
-                effective.div_ceil(8)
-            }
             // Per-(kv_dim)-element sizing is meaningless for an opaque packed
             // record; every sizing path must route through
             // `packed_record_bytes_per_token` instead.
@@ -68,10 +59,6 @@ impl KVFormat {
 
     pub fn has_scales(self) -> bool {
         matches!(self, Self::FP8E4M3 | Self::INT8)
-    }
-
-    pub fn has_norms(self) -> bool {
-        matches!(self, Self::TurboQuant { .. })
     }
 
     pub fn needs_work_buffer(self) -> bool {
