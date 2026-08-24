@@ -733,36 +733,6 @@ impl infer_seam::PrefixReuse for CudaExecutor {
         }
     }
 
-    fn cached_prefix_match_len(&self, tokens: &[u32]) -> anyhow::Result<usize> {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = tokens;
-                Ok(0)
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.cached_prefix_match_len(tokens),
-        }
-    }
-
-    fn restore_cached_prefix(
-        &mut self,
-        slot: usize,
-        tokens: &[u32],
-        matched_len: usize,
-        slot_pages: &[u32],
-    ) -> anyhow::Result<()> {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = (slot, tokens, matched_len, slot_pages);
-                anyhow::bail!("placeholder CUDA executor has no position-0 prefix store")
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => {
-                real.restore_cached_prefix(slot, tokens, matched_len, slot_pages)
-            }
-        }
-    }
-
     fn restore_prefix_sidecar(
         &mut self,
         slot: usize,

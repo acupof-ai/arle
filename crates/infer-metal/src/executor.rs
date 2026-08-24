@@ -564,20 +564,6 @@ impl infer_seam::PrefixReuse for MetalExecutor {
 
     fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
 
-    fn cached_prefix_match_len(&self, _tokens: &[u32]) -> anyhow::Result<usize> {
-        Ok(0)
-    }
-
-    fn restore_cached_prefix(
-        &mut self,
-        _slot: usize,
-        _tokens: &[u32],
-        _matched_len: usize,
-        _slot_pages: &[u32],
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("Metal backend has no position-0 prefix store")
-    }
-
     fn restore_prefix_sidecar(
         &mut self,
         _slot: usize,

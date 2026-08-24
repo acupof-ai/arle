@@ -410,11 +410,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// No arm implements a position-0 prefix store; always no match.
-    pub(crate) fn cached_prefix_match_len(&self, _tokens: &[u32]) -> Result<usize> {
-        Ok(0)
-    }
-
     /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
     /// this (2026-07-05 TP=4 admission livelock).
     pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
@@ -431,17 +426,6 @@ impl RealCudaExecutor {
             Self::Qwen35(q) => q.kv_shard_spec(),
             Self::Dsv4(_) => None,
         }
-    }
-
-    pub(crate) fn restore_cached_prefix(
-        &mut self,
-        _slot: usize,
-        _tokens: &[u32],
-        _matched_len: usize,
-        _slot_pages: &[u32],
-    ) -> Result<()> {
-        // Never called: cached_prefix_match_len always returns 0 today.
-        anyhow::bail!("backend has no position-0 prefix store")
     }
 
     /// Restore backend side state for `slot` when reusing a prefix of length
