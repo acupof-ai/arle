@@ -126,8 +126,6 @@ if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
     }
     DSV4_CLAIMS="$INFER_CUDA_DEVICES"
     export ARLE_DSV4_MOE_TRANSPORT="${ARLE_DSV4_MOE_TRANSPORT:-allreduce}"
-    export ARLE_DSV4_INCREMENTAL_KV=1
-    export ARLE_DSV4_EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
     DSV4_FLAGS=(--max-total-tokens "${MAX_TOTAL_TOKENS:-16384}")
 elif [ "${GATE_PROFILE:-dsv4}" = "metal" ]; then
     BACKEND="metal"

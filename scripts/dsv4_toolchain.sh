@@ -25,7 +25,6 @@ DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 # The runtime reads ARLE_DSV4_MOE_TRANSPORT only.
 MOE_BACKEND="${ARLE_DSV4_MOE_TRANSPORT:-allreduce}"
-EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 SPEC_TYPE="${SPEC_TYPE:-none}"
 MTP_DRAFT_TOKENS="${MTP_DRAFT_TOKENS:-}"
@@ -76,7 +75,7 @@ Options:
 Environment:
   CUDA_HOME, ARLE_DEEPGEMM_ROOT, ARLE_DEEPGEMM_LIBRARY_ROOT,
   ARLE_DEEPGEMM_CUTLASS_INCLUDE,
-  ARLE_DSV4_MODEL_PATH, ARLE_DSV4_MOE_TRANSPORT, ARLE_DSV4_EXPERT_BACKEND,
+  ARLE_DSV4_MODEL_PATH, ARLE_DSV4_MOE_TRANSPORT,
   ARLE_DEEPEP_DIR, ARTIFACT_ROOT, PORT, SERVER_BIN, MAX_TOKENS, PROMPT.
   NSYS_DELAY_SECONDS, NSYS_DURATION_SECONDS.
   MAX_RUNNING_REQUESTS, SPEC_TYPE, MTP_DRAFT_TOKENS, MTP_DRAFT_TOPK.
@@ -257,15 +256,6 @@ export_runtime_env() {
     export RUST_LOG="${RUST_LOG:-info}"
     export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
     export ARLE_DSV4_MOE_TRANSPORT="$MOE_BACKEND"
-    export ARLE_DSV4_INCREMENTAL_KV="${ARLE_DSV4_INCREMENTAL_KV:-1}"
-    export ARLE_DSV4_EXPERT_BACKEND="$EXPERT_BACKEND"
-    # 2026-05-27 SLO unblock: grouped local expert path uses M-blind
-    # dsv4_fp8_grouped_gemv_batch_kernel (grid Y = max_count, no weight reuse) —
-    # catastrophic at prefill (29K-token TTFT = 325s). Disabling routes
-    # prefill (seq_len>1) through the per-expert loop where expert.forward()
-    # picks dsv4_fp8_gemv_batch_cuda → _tiled_kernel with DSV4_BATCH_TILE=32
-    # weight reuse. Refs: docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md
-    export ARLE_DSV4_LOCAL_GROUPED_EXPERTS="${ARLE_DSV4_LOCAL_GROUPED_EXPERTS:-0}"
     export ARLE_DEEPGEMM_LIBRARY_ROOT="$DEEPGEMM_LIBRARY_ROOT"
     export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$DEEPGEMM_CUTLASS_INCLUDE"
     # native-deepep needs the source tree available at runtime too (the
@@ -309,7 +299,6 @@ env_check() {
     echo "ARLE_DSV4_MODEL_PATH=$MODEL_PATH"
     echo "CUDA_VISIBLE_DEVICES=$DEVICES"
     echo "ARLE_DSV4_MOE_TRANSPORT=$MOE_BACKEND"
-    echo "ARLE_DSV4_EXPERT_BACKEND=$EXPERT_BACKEND"
     echo "MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-auto}"
     echo "SPEC_TYPE=$SPEC_TYPE"
     echo "MTP_DRAFT_TOKENS=${MTP_DRAFT_TOKENS:-unset}"
@@ -489,7 +478,6 @@ nsys_profile() {
 
     wait_ready "$server_log"
     ARLE_DSV4_MOE_TRANSPORT="$ARLE_DSV4_MOE_TRANSPORT" \
-    ARLE_DSV4_EXPERT_BACKEND="$ARLE_DSV4_EXPERT_BACKEND" \
     ARLE_DEEPGEMM_LIBRARY_ROOT="$ARLE_DEEPGEMM_LIBRARY_ROOT" \
         "$ROOT/scripts/profile_nsys_bench.sh" \
         dsv4-toolchain \

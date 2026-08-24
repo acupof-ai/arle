@@ -148,7 +148,7 @@ below is the one-glance view — for any change, edit
 | TurboQuant KV 2/3/4-bit (CUDA) | experimental | `--kv-cache-dtype tq{2,3,4}`; FWHT + packed indices; page_size=1 bypasses the paged prefill kernel; no `CudaKvCacheDtype` arm resolves to it. |
 | Weights — W4A16 / W8A16 / W2A16 | production / experimental (W2) | Native GEMV + Marlin W4 prefill; safetensors auto-detect. |
 | Weights — MarlinW4A8 prefill-graph | production, **Tier-1 wins** | `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` → engine TTFT p50 –92.5%, +632% throughput (`a56b7a9`/`c44788f`). |
-| Weights — GGUF Q3/Q4/Q5/Q6_K | production (CUDA & Metal) | Packed superblock kernels; `.gguf` auto-detect. Metal-native-q4 opt-in via `AGENT_INFER_METAL_GGUF_NATIVE_Q4=all`. |
+| Weights — GGUF Q3/Q4/Q5/Q6_K | production (CUDA & Metal) | Packed superblock kernels; `.gguf` auto-detect. |
 | Weights — TurboQuant | experimental | Tensor-local gate only (`errors/2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`). |
 | Weights — DSv4 FP8/FP4 block-scaled | in progress | `Dsv4Fp8BlockScaled` / `Dsv4Fp4BlockScaled`; pending CUDA V4 attention/MoE/MTP kernels. |
 | Weights — NVFP4 (Fp4E2M1Group) | production (CUDA) | compressed-tensors `U8` packed FP4 + FP8 per-group scales + F32 global/input scales; auto-detect. **One serving path**: Marlin `kFE2M1f` below the DeepGEMM prefill floor, and above it the same layout widened to E4M3 in scratch for DeepGEMM's native FP8 MMA (84 → 265 TFLOPS effective). `repack_for_marlin_fp4` releases the pre-repack bytes itself. Requires sm_80+, `group_size = 16`, `K % 64`, `N % 64` — anything else fails at load with the reason; there is no fallback arm. |

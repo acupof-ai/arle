@@ -2076,32 +2076,3 @@ fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
         .map(|(a, b)| f64::from(*a) * f64::from(*b))
         .sum::<f64>() as f32
 }
-
-fn validate_routes(
-    routes: &[MoeRoute],
-    value_rows: usize,
-    weight_rows: usize,
-    top_k: usize,
-) -> Result<()> {
-    if routes.len() != value_rows {
-        return Err(AutogradError::InvalidIndicesLen {
-            expected: value_rows,
-            got: routes.len(),
-        });
-    }
-    for route in routes {
-        if route.token >= weight_rows {
-            return Err(AutogradError::IndexOutOfBounds {
-                index: route.token,
-                upper: weight_rows,
-            });
-        }
-        if route.slot >= top_k {
-            return Err(AutogradError::IndexOutOfBounds {
-                index: route.slot,
-                upper: top_k,
-            });
-        }
-    }
-    Ok(())
-}

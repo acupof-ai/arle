@@ -701,9 +701,8 @@ impl Qwen35Config {
         Ok(())
     }
 
-    /// Shared train-side contract for LoRA / frozen-eval Qwen3.5/Qwen3.6. This
-    /// is intentionally broader than the scratch-pretrain path: dense full-attn,
-    /// hybrid linear-attn, and MoE configs are allowed here because the base is
+    /// Train-side contract for LoRA / frozen-eval Qwen3.5/Qwen3.6: dense full-attn,
+    /// hybrid linear-attn, and MoE configs are allowed because the base is
     /// frozen and only LoRA adapters train.
     pub fn validate_train_lora_or_frozen_contract(&self) -> Result<()> {
         self.validate()?;

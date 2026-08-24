@@ -31,7 +31,7 @@ with concrete evidence.
 | Weights | MarlinW4A8 | production (CUDA), Tier-1 | env `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` for the prefill-graph win path (–92.5% TTFT p50). |
 | Weights | W8A16 (per-group INT8) | production (CUDA) | safetensors metadata | GEMV + GEMM path. |
 | Weights | W2A16 (per-group packed INT2) | experimental (CUDA) | safetensors metadata | Scaffolding lives in `tensor.rs::from_quantized_int2`; not gate-validated. |
-| Weights | GGUF Q3_K / Q4_K / Q5_K / Q6_K | production (CUDA & Metal) | `.gguf` extension | Packed superblock kernels in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`. Q4_K_M Metal-Q4-native opt-in via `AGENT_INFER_METAL_GGUF_NATIVE_Q4=all`. |
+| Weights | GGUF Q3_K / Q4_K / Q5_K / Q6_K | production (CUDA & Metal) | `.gguf` extension | Packed superblock kernels in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`. |
 | Weights | TurboQuant (packed + FP16 norms + Hadamard) | experimental (CUDA) | safetensors with TQ metadata | Tensor-local correctness only — full-model logits parity is **not** gated (`2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`). |
 | Weights | DSv4 FP8 E4M3 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp8BlockScaled` format; CUDA V4 attention/MoE/MTP kernels are the runtime blocker. |
 | Weights | DSv4 FP4 E2M1 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp4BlockScaled`; same DSv4 dependency chain. |
@@ -148,12 +148,6 @@ Path B.2 bucketing fix (`a56b7a9` / `c44788f`) delivers on matched
 - +632% throughput, closes the +76.6% SGLang gap
 
 Default behavior unchanged when env unset.
-
-### 2.2 GGUF + Metal opt-in native-Q4
-
-Default GGUF Q4_K_M on Metal goes through the exact GGUF affine/packed
-kernel. Opt-in lossy conversion to MLX-native q4 group64 via
-`AGENT_INFER_METAL_GGUF_NATIVE_Q4=all`. Faster.
 
 ---
 

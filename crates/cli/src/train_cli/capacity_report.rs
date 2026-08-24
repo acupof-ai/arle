@@ -1,18 +1,14 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use qwen35_spec::{LayerType, Qwen35Config};
+use qwen35_spec::LayerType;
 use serde::Serialize;
-use train::tokenizer::ChatTokenizer;
 
 use super::model_probe::{
     ResolvedModelConfig, inspect_model_source, inspect_resolved_model_dir, mul_u64,
-    qwen35_param_count, resolve_local_tokenizer_path,
 };
 use crate::{
-    args::{
-        ModelFamilyArg, PretrainPresetArg, SaveDtypeArg, TrainEnvArgs, TrainEstimateMemoryArgs,
-    },
+    args::{SaveDtypeArg, TrainEnvArgs, TrainEstimateMemoryArgs},
     hardware, hub_discovery,
 };
 
@@ -61,11 +57,11 @@ pub(super) fn run_train_env(args: TrainEnvArgs) -> Result<()> {
 }
 
 pub(super) fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
-    let report = if let Some(model_source) = args.model.as_deref() {
-        estimate_from_model_dir(model_source, &args)?
-    } else {
-        estimate_from_scratch(&args)?
-    };
+    let model_source = args
+        .model
+        .as_deref()
+        .ok_or_else(|| anyhow!("estimate-memory requires --model"))?;
+    let report = estimate_from_model_dir(model_source, &args)?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -141,55 +137,6 @@ fn estimate_from_model_dir(
         checkpoint_bytes,
         adapter_checkpoint_bytes: Some(adapter_checkpoint_bytes),
         activation_floor_bytes: activation_floor_bytes(summary.hidden_size, args.batch, args.seq),
-        save_dtype: args.save_dtype.as_train_dtype().to_string(),
-    })
-}
-
-fn estimate_from_scratch(args: &TrainEstimateMemoryArgs) -> Result<EstimateMemoryReport> {
-    let tokenizer_source = args
-        .tokenizer
-        .as_deref()
-        .ok_or_else(|| anyhow!("estimate-memory requires either --model or --tokenizer"))?;
-    let tokenizer_path = resolve_local_tokenizer_path(tokenizer_source)?;
-    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
-    let mut shape = ScratchShape::default();
-    if let Some(preset) = args.preset {
-        shape.apply_preset(preset);
-    }
-    shape.apply_overrides(
-        args.hidden,
-        args.layers,
-        args.heads,
-        args.kv_heads,
-        args.head_dim,
-        args.intermediate,
-        args.max_pos,
-        args.linear_attn_every,
-    );
-    let vocab_size = args.vocab_size.unwrap_or_else(|| tokenizer.vocab_size());
-    let family = args
-        .model_family
-        .unwrap_or(ModelFamilyArg::Qwen35)
-        .as_train_family()
-        .to_string();
-    let param_count = qwen35_param_count(&shape.qwen35_config(vocab_size));
-    let hidden_size = shape.hidden;
-    Ok(EstimateMemoryReport {
-        mode: "scratch-pretrain".to_string(),
-        family,
-        model_dir: None,
-        tokenizer_path: Some(tokenizer_path.display().to_string()),
-        vocab_size: Some(vocab_size),
-        batch: args.batch,
-        seq: args.seq,
-        param_count,
-        trainable_param_count: param_count,
-        weight_bytes_fp32: bytes_for_params(param_count, 4),
-        gradient_bytes_fp32: bytes_for_params(param_count, 4),
-        adam_state_bytes_fp32: bytes_for_params(param_count, 8),
-        checkpoint_bytes: bytes_for_params(param_count, args.save_dtype.bytes_per_param()),
-        adapter_checkpoint_bytes: None,
-        activation_floor_bytes: activation_floor_bytes(hidden_size, args.batch, args.seq),
         save_dtype: args.save_dtype.as_train_dtype().to_string(),
     })
 }
@@ -298,152 +245,6 @@ fn default_train_backend() -> &'static str {
     #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     {
         "cpu"
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ScratchShape {
-    hidden: usize,
-    layers: usize,
-    heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    intermediate: usize,
-    max_pos: usize,
-    linear_attn_every: usize,
-}
-
-impl Default for ScratchShape {
-    fn default() -> Self {
-        Self {
-            hidden: 256,
-            layers: 4,
-            heads: 4,
-            kv_heads: 2,
-            head_dim: 64,
-            intermediate: 512,
-            max_pos: 512,
-            linear_attn_every: 0,
-        }
-    }
-}
-
-impl ScratchShape {
-    fn apply_preset(&mut self, preset: PretrainPresetArg) {
-        match preset {
-            PretrainPresetArg::Tiny3m => {
-                self.hidden = 96;
-                self.layers = 2;
-                self.heads = 3;
-                self.kv_heads = 3;
-                self.head_dim = 32;
-                self.intermediate = 192;
-                self.max_pos = 256;
-                self.linear_attn_every = 0;
-            }
-            PretrainPresetArg::Small25m => {
-                self.hidden = 160;
-                self.layers = 2;
-                self.heads = 5;
-                self.kv_heads = 5;
-                self.head_dim = 32;
-                self.intermediate = 320;
-                self.max_pos = 512;
-                self.linear_attn_every = 0;
-            }
-            PretrainPresetArg::Small30m => {
-                self.hidden = 192;
-                self.layers = 2;
-                self.heads = 6;
-                self.kv_heads = 3;
-                self.head_dim = 32;
-                self.intermediate = 384;
-                self.max_pos = 512;
-                self.linear_attn_every = 0;
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn apply_overrides(
-        &mut self,
-        hidden: Option<usize>,
-        layers: Option<usize>,
-        heads: Option<usize>,
-        kv_heads: Option<usize>,
-        head_dim: Option<usize>,
-        intermediate: Option<usize>,
-        max_pos: Option<usize>,
-        linear_attn_every: Option<usize>,
-    ) {
-        if let Some(hidden) = hidden {
-            self.hidden = hidden;
-        }
-        if let Some(layers) = layers {
-            self.layers = layers;
-        }
-        if let Some(heads) = heads {
-            self.heads = heads;
-        }
-        if let Some(kv_heads) = kv_heads {
-            self.kv_heads = kv_heads;
-        }
-        if let Some(head_dim) = head_dim {
-            self.head_dim = head_dim;
-        }
-        if let Some(intermediate) = intermediate {
-            self.intermediate = intermediate;
-        }
-        if let Some(max_pos) = max_pos {
-            self.max_pos = max_pos;
-        }
-        if let Some(linear_attn_every) = linear_attn_every {
-            self.linear_attn_every = linear_attn_every;
-        }
-    }
-
-    fn qwen35_config(&self, vocab_size: usize) -> Qwen35Config {
-        let mut layer_types = vec![LayerType::FullAttention; self.layers];
-        if self.linear_attn_every > 0 {
-            for (layer_idx, layer_type) in layer_types.iter_mut().enumerate().take(self.layers) {
-                if (layer_idx + 1) % self.linear_attn_every == 0 {
-                    *layer_type = LayerType::LinearAttention;
-                }
-            }
-        }
-        Qwen35Config {
-            hidden_size: self.hidden,
-            intermediate_size: self.intermediate,
-            num_hidden_layers: self.layers,
-            vocab_size,
-            rms_norm_eps: 1.0e-6,
-            stop_token_ids: vec![vocab_size.saturating_sub(1) as u32],
-            bos_token_id: Some(1),
-            eos_token_id: vocab_size.saturating_sub(1) as u32,
-            tie_word_embeddings: true,
-            num_attention_heads: self.heads,
-            num_key_value_heads: self.kv_heads,
-            head_dim: self.head_dim,
-            linear_num_key_heads: self.heads,
-            linear_key_head_dim: self.head_dim,
-            linear_num_value_heads: self.heads,
-            linear_value_head_dim: self.head_dim,
-            linear_conv_kernel_dim: 4,
-            rope_theta: 1_000_000.0,
-            rope_scaling: None,
-            partial_rotary_factor: 1.0,
-            rotary_dim: self.head_dim,
-            rope_cache_len_hint: Some(self.max_pos),
-            layer_types,
-            num_experts: 0,
-            num_experts_per_tok: 0,
-            decoder_sparse_step: 1,
-            moe_intermediate_size: 0,
-            shared_expert_intermediate_size: 0,
-            norm_topk_prob: true,
-            mlp_only_layers: Vec::new(),
-            full_attn_gated: true,
-        }
     }
 }
 
