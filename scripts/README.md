@@ -63,7 +63,6 @@ directory unless noted.
 | `lever_gate.sh` | Model/backend-neutral correctness gate: boots serve, runs needle ladder + temp + concurrent arms, validates against baseline envelope. |
 | `sampling_gate.py` | End-to-end sampling-parameter gate (penalties, logit_bias, liveness). |
 | `longctx_numerical_gate.py` | Long-context numerical quality gate. |
-| `kv_recall_quality_eval.py` | KV-recall (importance-based block recall) quality evaluation (Metal). |
 | `dsv4_batched_decode_validate.py` | DSv4 batched decode correctness. |
 | `dsv4_multigpu_parity.sh` | DSv4 multi-GPU parity test. |
 | `assert_kernel_fired.sh` | Assert a specific CUDA kernel was launched. |

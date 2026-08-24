@@ -173,21 +173,6 @@ pub(crate) enum ServeBackendArg {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum ModelFamilyArg {
-    Auto,
-    Qwen35,
-}
-
-impl ModelFamilyArg {
-    pub(crate) fn as_train_family(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Qwen35 => "qwen35",
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum SaveDtypeArg {
     F32,
     Bf16,
@@ -258,16 +243,6 @@ impl SaveDtypeArg {
             Self::Bf16 => "bf16",
         }
     }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum PretrainPresetArg {
-    #[value(name = "tiny-3m")]
-    Tiny3m,
-    #[value(name = "small-25m")]
-    Small25m,
-    #[value(name = "small-30m")]
-    Small30m,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1497,24 +1472,12 @@ pub(crate) struct TrainEnvArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Examples:\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m\n  arle train estimate-memory --model checkpoints/base --lora-rank 32 --json"
+    after_help = "Examples:\n  arle train estimate-memory --model checkpoints/base --lora-rank 32 --json"
 )]
 pub(crate) struct TrainEstimateMemoryArgs {
     /// Existing model directory to inspect for LoRA adaptation / eval-style runs.
     #[arg(long, alias = "model-path")]
     pub(crate) model: Option<PathBuf>,
-
-    /// Scratch tokenizer source (`tokenizer.json` or a local model dir containing it).
-    #[arg(long)]
-    pub(crate) tokenizer: Option<PathBuf>,
-
-    /// Optional scratch preset for OPD-side scratch estimates.
-    #[arg(long, value_enum)]
-    pub(crate) preset: Option<PretrainPresetArg>,
-
-    /// Override the scratch model family.
-    #[arg(long, value_enum)]
-    pub(crate) model_family: Option<ModelFamilyArg>,
 
     /// Token batch width used for the rough activation estimate.
     #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
@@ -1531,42 +1494,6 @@ pub(crate) struct TrainEstimateMemoryArgs {
     /// Save dtype used for checkpoint-size estimates.
     #[arg(long, value_enum, default_value_t = SaveDtypeArg::Bf16)]
     pub(crate) save_dtype: SaveDtypeArg,
-
-    /// Scratch vocab size override.
-    #[arg(long)]
-    pub(crate) vocab_size: Option<usize>,
-
-    /// Scratch hidden width override.
-    #[arg(long)]
-    pub(crate) hidden: Option<usize>,
-
-    /// Scratch transformer layer count override.
-    #[arg(long)]
-    pub(crate) layers: Option<usize>,
-
-    /// Scratch attention head count override.
-    #[arg(long)]
-    pub(crate) heads: Option<usize>,
-
-    /// Scratch KV head count override.
-    #[arg(long)]
-    pub(crate) kv_heads: Option<usize>,
-
-    /// Scratch per-head dimension override.
-    #[arg(long)]
-    pub(crate) head_dim: Option<usize>,
-
-    /// Scratch MLP intermediate width override.
-    #[arg(long)]
-    pub(crate) intermediate: Option<usize>,
-
-    /// Scratch maximum position embeddings override.
-    #[arg(long)]
-    pub(crate) max_pos: Option<usize>,
-
-    /// For Qwen3.5 scratch estimates, insert one linear-attention layer every N layers.
-    #[arg(long)]
-    pub(crate) linear_attn_every: Option<usize>,
 
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]

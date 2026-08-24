@@ -6,7 +6,10 @@ use std::{
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "cuda")]
+use anyhow::bail;
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
@@ -165,6 +168,7 @@ fn resolve_model_dir_local_only(source: &Path) -> Option<PathBuf> {
     infer_util::hf_hub::resolve_local_model_path(&source_text)
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) fn resolve_local_tokenizer_path(source: &Path) -> Result<PathBuf> {
     if source.is_file() {
         return Ok(source.to_path_buf());
