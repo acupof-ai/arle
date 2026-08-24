@@ -1396,8 +1396,10 @@ impl RealMetalExecutor {
         // hurting (below 2 tokens/block → worse than no-draft 138 tok/s).
         let accepted = accepted_inputs as f32;
         slot.dflash_ewma_accept = slot.dflash_ewma_accept * 0.75 + accepted * 0.25;
-        if slot.dflash_ewma_accept < 2.0 {
-            slot.dflash_skip_remaining = 8;
+        // Skip when acceptance is below the break-even point (~3.66 tokens/block
+        // at 27ms/block vs 7.2ms/token no-draft). 3.5 gives a small margin.
+        if slot.dflash_ewma_accept < 3.5 {
+            slot.dflash_skip_remaining = 4;
         }
         slot.last_sampled = None;
         self.active_session_slot = None;
