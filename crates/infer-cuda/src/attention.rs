@@ -4829,6 +4829,9 @@ fn dsv4_wo_a_grouped_linear(
     local_attn: &HiddenStates,
     shape: Dsv4OProjGroupShape,
     latent: &mut HiddenStates,
+    // M=1 decode: the fixed staging, so the capture records no alloc nodes
+    // (the FP8 re-serialized checkpoint's dense-BF16 wo_a lands here at TP<o_groups).
+    staging: Option<&mut Dsv4FusedWqkvDecodeScratch>,
 ) -> Result<()> {
     ensure!(
         local_attn.hidden_dim == shape.groups * shape.cols_per_group
@@ -4854,10 +4857,14 @@ fn dsv4_wo_a_grouped_linear(
         let cols = shape.cols_per_group;
         let rows = shape.rows_per_group;
         let wo_a = attention.wo_a();
-        // SAFETY: uninit device scratch; fully written before first read.
-        let mut in_g = unsafe { HiddenStates::uninit(ctx, cols, seq)? };
-        // SAFETY: uninit device scratch; fully written before first read.
-        let mut out_g = unsafe { HiddenStates::uninit(ctx, rows, seq)? };
+        let mut fixed = staging.filter(|_| seq == 1);
+        let (mut in_g, mut out_g) = match fixed.as_deref_mut() {
+            Some(s) => s.take_oproj_staging(ctx, cols, rows)?,
+            // SAFETY: uninit device scratch; fully written before first read.
+            None => (unsafe { HiddenStates::uninit(ctx, cols, seq)? }, unsafe {
+                HiddenStates::uninit(ctx, rows, seq)?
+            }),
+        };
         // Cache raw pointers once: per-iteration mutable + immutable `device_ptr` calls
         // would falsely collide on SyncOnDrop (the buffers are not reallocated here).
         let (wo_a_base, _wg) = wo_a.data.device_ptr(&ctx.stream);
@@ -4904,6 +4911,10 @@ fn dsv4_wo_a_grouped_linear(
                 )
                 .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA scatter failed: {e}"))?;
             }
+        }
+        drop((_ig, _og));
+        if let Some(s) = fixed {
+            s.put_oproj_staging(in_g, out_g);
         }
         return Ok(());
     }
@@ -5053,35 +5064,10 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     let cols = shape.cols_per_group;
     let rows = shape.rows_per_group;
     // n == 1 (the decode graph lane) uses the scratch's fixed staging so the
-    // capture's addresses stay valid; batched rows stage transiently. The fixed
-    // buffers are moved out for the GEMM borrow and put back below.
-    // The constructor sizes the fixed staging from config; the loaded TP-local
-    // table decides the true group dims, so resize once on the eager warm step
-    // (which precedes any capture).
+    // capture's addresses stay valid; batched rows stage transiently.
     let use_fixed = n == 1;
-    if use_fixed
-        && (scratch
-            .oproj_in
-            .as_ref()
-            .is_none_or(|b| b.hidden_dim != cols)
-            || scratch
-                .oproj_out
-                .as_ref()
-                .is_none_or(|b| b.hidden_dim != rows))
-    {
-        // SAFETY: uninit device scratch; fully written before first read.
-        scratch.oproj_in = Some(unsafe { HiddenStates::uninit(ctx, cols, 1)? });
-        // SAFETY: uninit device scratch; fully written before first read.
-        scratch.oproj_out = Some(unsafe { HiddenStates::uninit(ctx, rows, 1)? });
-    }
     let (mut in_g, mut out_g) = if use_fixed {
-        // `take` leaves None rather than a placeholder buffer: the two
-        // `uninit(1, 1)` allocations a `mem::replace` needed here recorded
-        // 2 alloc nodes per layer (86 on 43) into every capture.
-        let (Some(a), Some(b)) = (scratch.oproj_in.take(), scratch.oproj_out.take()) else {
-            bail!("DSv4 grouped O-LoRA decode staging missing")
-        };
-        (a, b)
+        scratch.take_oproj_staging(ctx, cols, rows)?
     } else {
         // SAFETY: uninit device scratch; fully written before first read.
         (unsafe { HiddenStates::uninit(ctx, cols, n)? }, unsafe {
@@ -5092,10 +5078,42 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         ctx, scratch, caches, local_attn, shape, latent, &mut in_g, &mut out_g,
     );
     if use_fixed {
-        scratch.oproj_in = Some(in_g);
-        scratch.oproj_out = Some(out_g);
+        scratch.put_oproj_staging(in_g, out_g);
     }
     res
+}
+
+impl Dsv4FusedWqkvDecodeScratch {
+    /// The fixed `[cols,1]` / `[rows,1]` O-LoRA group staging for the M=1 decode
+    /// lane, moved out for the GEMM borrow (`take` leaves `None` rather than a
+    /// placeholder: two `uninit(1,1)` placeholders per layer recorded 86 alloc
+    /// nodes into every capture). The constructor sizes it from config; the
+    /// loaded TP-local table decides the true group dims, so it is resized once
+    /// on the eager warm step, which precedes any capture.
+    fn take_oproj_staging(
+        &mut self,
+        ctx: &DeviceContext,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(HiddenStates, HiddenStates)> {
+        if self.oproj_in.as_ref().is_none_or(|b| b.hidden_dim != cols)
+            || self.oproj_out.as_ref().is_none_or(|b| b.hidden_dim != rows)
+        {
+            // SAFETY: uninit device scratch; fully written before first read.
+            self.oproj_in = Some(unsafe { HiddenStates::uninit(ctx, cols, 1)? });
+            // SAFETY: uninit device scratch; fully written before first read.
+            self.oproj_out = Some(unsafe { HiddenStates::uninit(ctx, rows, 1)? });
+        }
+        let (Some(a), Some(b)) = (self.oproj_in.take(), self.oproj_out.take()) else {
+            bail!("DSv4 grouped O-LoRA decode staging missing")
+        };
+        Ok((a, b))
+    }
+
+    fn put_oproj_staging(&mut self, in_g: HiddenStates, out_g: HiddenStates) {
+        self.oproj_in = Some(in_g);
+        self.oproj_out = Some(out_g);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5357,7 +5375,14 @@ pub(crate) fn mla_oproj(
     } else {
         crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, &mut latent)
+                dsv4_wo_a_grouped_linear(
+                    ctx,
+                    attention,
+                    local_attn,
+                    shape,
+                    &mut latent,
+                    state.fused_wqkv.as_mut().filter(|_| token_count == 1),
+                )
             })
         })?;
     }
@@ -5508,7 +5533,14 @@ fn mla_oproj_decode(
     } else {
         crate::profile::profile_op(ctx, "linear/wo_a", None, 1, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, latent)
+                dsv4_wo_a_grouped_linear(
+                    ctx,
+                    attention,
+                    local_attn,
+                    shape,
+                    latent,
+                    state.fused_wqkv.as_mut(),
+                )
             })
         })?;
     }
