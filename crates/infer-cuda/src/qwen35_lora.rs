@@ -676,7 +676,7 @@ impl Qwen35Model {
             let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
                 anyhow!("layer {layer_idx} {label}: FP8-marlin LoRA target missing its per-channel scale")
             })?;
-            let mut dense = dense;
+            let dense = dense;
             // SAFETY: `dense` covers rows*cols and lives across the launch.
             unsafe {
                 cuda_ql::dequantize_fp8_marlin_to_bf16(
