@@ -44,7 +44,7 @@ Current workspace members (ownership and boundaries are listed in
 - **control plane / helpers:** `crates/agent`, `crates/chat`, `crates/cli`,
  `crates/tools`
 - **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
- `crates/gemma-spec`, `crates/deepseek-ocr-spec`
+ `crates/deepseek-ocr-spec`
 - **training:** `crates/autograd`, `crates/train`, `crates/spec-train`
 - **substrate:** `crates/infer-gguf`, `crates/kv-native-sys`,
  `crates/xgrammar-sys`
@@ -358,7 +358,6 @@ These crates sit around the runtime graph:
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
 - `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries (`DeepSeekV4AttentionLayerPlan` — consumed by `infer-hip` today; making it the single DSv4 forward-order authority is roadmap tranche R3), and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority**
-- `crates/gemma-spec`: Gemma4 config spec (config load + validation). In-tree consumer today: `infer-vulkan`'s `model_gemma4` order pin. **Unranked** in the model priority queue — ratification pending
 - `crates/autograd`: from-scratch autograd + optimizer + lr-schedule + AdamW codec (OPD substrate)
 - `crates/train`: train-side control plane + OPD stack (post-2026-05-18 pivot)
 
@@ -402,7 +401,7 @@ infer-hip
  (+ hip-sys, hip-kernels under "hip") (never infer-core)
 
 infer-vulkan
- -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
+ -> infer-plan, infer-seam, deepseek-spec, qwen3-spec, qwen35-spec,
  infer-gguf
  (+ vulkan-sys, vulkan-kernels under "vulkan") (never infer-core)
 ```
