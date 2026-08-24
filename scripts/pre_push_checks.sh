@@ -65,12 +65,23 @@ for test in \
     run bash "scripts/tests/${test}"
 done
 run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
-run cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
-run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys --release
-run cargo test --release \
+# Clippy (not check) on the cuda lane: catches clippy lints (missing_safety_doc,
+# needless_borrow) that plain check misses — the gap that let quant_linear.rs
+# clippy errors pass the hook and fail CI. Debug profile shares the cache with
+# the arle check above; the old --release forced a second full compilation.
+run cargo clippy -p infer-api --no-default-features --features cuda,no-cuda --lib -- -D warnings
+run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys
+run cargo test \
     -p infer-core -p infer-server -p infer-plan -p infer-seam \
     -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
-run cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
+run cargo clippy -p kv-native-sys --all-targets -- -D warnings
+
+# Metal lib check (default-on, Mac only): catches dead-code/unused lints in
+# infer-metal that CI's Metal lane runs with -D warnings. The full binary
+# build + needle gate stays opt-in (ARLE_PRE_PUSH_METAL=1) below.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib
+fi
 
 METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 
