@@ -33,11 +33,6 @@ pub fn tiny_qwen35_scratch_config(max_seq_len: usize) -> Qwen35Config {
 }
 
 #[allow(dead_code)]
-pub fn tiny_hybrid_qwen35_scratch_config(max_seq_len: usize) -> Qwen35Config {
-    tiny_hybrid_qwen35_scratch_config_with_vocab(max_seq_len, 16)
-}
-
-#[allow(dead_code)]
 pub fn tiny_qwen35_scratch_config_with_vocab(
     max_seq_len: usize,
     vocab_size: usize,

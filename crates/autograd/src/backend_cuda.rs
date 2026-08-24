@@ -325,18 +325,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn linear_attention_head_geometry_supported(&self, h: usize, hg: usize) -> bool {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (h, hg);
-            true
-        }
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            crate::backend_cuda::linear_attention_backward::flashqla_gdr_symbols(h, hg).is_ok()
-        }
-    }
-
     fn device_mem_info(&self) -> Option<(usize, usize)> {
         self.mem_get_info().ok()
     }

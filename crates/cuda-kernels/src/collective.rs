@@ -123,10 +123,6 @@ pub trait CollectiveBackend: Send + Sync {
 
     fn group_start(&self) -> Result<()>;
     fn group_end(&self) -> Result<()>;
-
-    /// Whether this backend's collectives are safe to capture inside a CUDA
-    /// graph. NCCL: false (F8 will revisit). CustomAR / SymmMem: true.
-    fn supports_graph_capture(&self) -> bool;
 }
 
 #[cfg(feature = "nccl")]
@@ -551,10 +547,6 @@ mod nccl_backend {
             // SAFETY: no arguments; flushes the thread-local group opened by
             // `group_start`, whose buffers the caller keeps live until this returns.
             nccl::check(unsafe { nccl::ncclGroupEnd() })
-        }
-
-        fn supports_graph_capture(&self) -> bool {
-            false
         }
     }
 

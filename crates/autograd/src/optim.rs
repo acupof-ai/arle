@@ -485,11 +485,6 @@ pub trait Optimizer: Send {
     fn step(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()>;
     fn zero_grad(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<()>;
     fn set_lr(&mut self, lr: f32);
-    fn lr(&self) -> f32;
-
-    /// Schema tag for the on-disk state doc. e.g. `"adamw-v1"`. Used by the
-    /// checkpoint codec to validate on import.
-    fn state_schema(&self) -> &'static str;
 
     /// Export moments + scalars keyed by caller-supplied name.
     fn export_state(&self, names: &[(TensorId, String)]) -> AdamWState;
@@ -514,14 +509,6 @@ impl Optimizer for AdamW {
 
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
-    }
-
-    fn lr(&self) -> f32 {
-        self.lr
-    }
-
-    fn state_schema(&self) -> &'static str {
-        "adamw-v1"
     }
 
     fn export_state(&self, names: &[(TensorId, String)]) -> AdamWState {
