@@ -17,7 +17,6 @@ pub mod executor;
 pub mod forward;
 pub mod kv_pool;
 pub mod loader;
-pub mod model_dsv4;
 pub mod model_qwen3;
 pub mod model_qwen35;
 pub mod model_qwen36;

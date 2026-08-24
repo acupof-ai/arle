@@ -70,7 +70,6 @@ pub fn classify_vulkan_gguf(gguf: &infer_gguf::gguf::GgufFile) -> Result<VulkanM
 #[cfg(feature = "vulkan")]
 pub enum VulkanLoadedModel {
     Qwen3(Box<crate::model_qwen3::VulkanQwen3Model>),
-    Dsv4(Box<crate::model_dsv4::VulkanDsv4Model>),
     Qwen35(Box<crate::model_qwen35::VulkanQwen35Model>),
     Qwen36(Box<crate::model_qwen36::VulkanQwen36Model>),
 }
@@ -86,7 +85,6 @@ impl VulkanLoadedModel {
     ) -> Result<Vec<f32>> {
         match self {
             Self::Qwen3(model) => model.forward_token(slot, epoch, token, start_pos),
-            Self::Dsv4(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen35(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen36(model) => model.forward_token(slot, epoch, token, start_pos),
         }
