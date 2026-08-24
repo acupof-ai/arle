@@ -1951,7 +1951,9 @@ impl Qwen35Model {
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
         crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
-            super::rms_norm_offset(
+            // DFlash draft norms use the standard w convention (weights centered
+            // near 1, not 0) — do NOT apply the trunk's (1+w) offset here.
+            rms_norm_batch(
                 &self.ctx,
                 hidden,
                 &self.norm,
