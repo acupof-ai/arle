@@ -4765,6 +4765,8 @@ fn mla_attention_fwd(
     // Row-parallel: the all-reduce-sum is the model's concern. GLM takes the plain-o
     // early return in mla_oproj.
     // SAFETY: dsv4_linear writes the full latent buffer.
+    // SAFETY: uninit device scratch; fully written by the wo_a lane.
+    let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a().rows, token_count)? };
     mla_oproj(
         ctx,
         attention,
@@ -4772,6 +4774,7 @@ fn mla_attention_fwd(
         prefill_shared,
         &local_attn,
         token_count,
+        &mut latent,
         keepalive,
         out,
     )
@@ -5214,6 +5217,9 @@ pub(crate) fn mla_oproj(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     local_attn: &HiddenStates,
     token_count: usize,
+    // wo_a output [o_lora_rank, token_count]; caller-owned so the c=1 decode
+    // graph can alias a persistent buffer instead of recording an alloc node.
+    latent: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
     out: &mut HiddenStates,
 ) -> Result<()> {
@@ -5251,8 +5257,13 @@ pub(crate) fn mla_oproj(
         local_attn.hidden_dim,
         token_count,
     )?;
-    // SAFETY: uninit device scratch; fully written before first read.
-    let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a().rows, token_count)? };
+    ensure!(
+        latent.hidden_dim == attention.wo_a().rows && latent.seq_len == token_count,
+        "DSv4 O-LoRA latent {}x{} != wo_a rows {} x tokens {token_count}",
+        latent.hidden_dim,
+        latent.seq_len,
+        attention.wo_a().rows
+    );
     // Captured before any branch consumes `prefill_shared` (the wo_b prefill lane
     // moves it); drives the batched-O-LoRA active_counts restore at the end.
     let is_decode = prefill_shared.is_none();
@@ -5290,7 +5301,7 @@ pub(crate) fn mla_oproj(
         let wo_a_cols = attention.wo_a().cols;
         crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent, wo_a_cols)
+                decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, latent, wo_a_cols)
             })
         })?;
     } else if wo_a_group_decode_dg {
@@ -5310,7 +5321,7 @@ pub(crate) fn mla_oproj(
                     wo_a_caches,
                     local_attn,
                     shape,
-                    &mut latent,
+                    latent,
                 )
             })
         })?;
@@ -5325,7 +5336,7 @@ pub(crate) fn mla_oproj(
                 .as_deref_mut()
                 .expect("wo prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                prefill_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent)
+                prefill_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, latent)
             })
         })?;
     } else if wo_a_group_prefill_dg {
@@ -5344,24 +5355,24 @@ pub(crate) fn mla_oproj(
                     wo_a_caches,
                     local_attn,
                     shape,
-                    &mut latent,
+                    latent,
                 )
             })
         })?;
     } else if shape.groups == 1 {
         crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                dsv4_linear(ctx, attention.wo_a(), local_attn, &mut latent)
+                dsv4_linear(ctx, attention.wo_a(), local_attn, latent)
             })
         })?;
     } else {
         crate::profile::profile_op(ctx, "linear/wo_a", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, &mut latent)
+                dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, latent)
             })
         })?;
     }
-    keepalive.keep_hidden(&latent);
+    keepalive.keep_hidden(latent);
 
     // wo_b is always a single-group [hidden, o_lora_rank] GEMM, so its DeepGEMM lane
     // is M-parametric like wo_a: M=token_count.
@@ -5382,7 +5393,7 @@ pub(crate) fn mla_oproj(
         let wo_b_cols = attention.wo_b().cols;
         crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-                decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, wo_b_cols)
+                decode_proj_deepgemm(ctx, scratch, wo_b_cache, latent, out, wo_b_cols)
             })
         })?;
     } else if wo_b_prefill_dg {
@@ -5393,13 +5404,13 @@ pub(crate) fn mla_oproj(
         crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
             let scratch = prefill_shared.expect("wo_b prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-                prefill_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out)
+                prefill_proj_deepgemm(ctx, scratch, wo_b_cache, latent, out)
             })
         })?;
     } else {
         crate::profile::profile_op(ctx, "linear/wo_b", None, token_count, || {
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-                dsv4_linear(ctx, attention.wo_b(), &latent, out)
+                dsv4_linear(ctx, attention.wo_b(), latent, out)
             })
         })?;
     }
