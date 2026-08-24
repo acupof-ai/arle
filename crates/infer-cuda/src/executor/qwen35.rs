@@ -2248,8 +2248,8 @@ impl Qwen35CudaExecutor {
         // pins. FP8/INT8 capture the split-KV lane instead: its grid is
         // `(num_splits, total_q_heads)` and `choose_decode_num_splits` takes no KV
         // length, so the grid is fixed at B=1; the true length is read on device
-        // from `kv_indptr`, and the workspace is pool-owned. INT4/TurboQuant have
-        // no such decode kernel and stay eager.
+        // from `kv_indptr`, and the workspace is pool-owned. Other formats
+        // have no such decode kernel and stay eager.
         let capturable = match self.full_attn_kv.as_ref().map(|p| p.format) {
             Some(KVFormat::BF16) => self.model.paged_decode_fa3_active(),
             Some(KVFormat::FP8E4M3 | KVFormat::INT8) => true,

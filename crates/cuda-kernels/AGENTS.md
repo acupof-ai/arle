@@ -35,8 +35,8 @@ crates/cuda-kernels/
 │   ├── attention/       — TileLang prep/dispatch, DSv4 MLA/DSA/MHC + TP-repack, FA3/FlashMLA shims, quant decode
 │   ├── gemm/            — gemv, quantized gemv, DeepGEMM, Marlin repack/preprocess, fused_mlp
 │   ├── moe/             — DSv4 + Qwen3.6 expert routing
-│   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_metadata, transfer (KV-tier)
-│   ├── quant/           — dtype convert + TurboQuant kernels
+│   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_metadata
+│   ├── quant/           — dtype convert
 │   ├── comm/            — TP custom all-reduce (CAR)
 │   ├── sampling/        — argmax + DSpark chain-rejection sampling
 │   ├── norm/            — rms_norm variants
@@ -53,7 +53,6 @@ crates/cuda-kernels/
 │   ├── collective.rs    — `CollectiveBackend` trait + `NcclBackend` skeleton (F0 multi-GPU). F7 adds CustomAR / mscclpp / quick_ar / symm_mem behind the same trait. Method set is taken from actual F1+ callers (LayerCommunicator AR, PP send/recv, MoE all-to-all via group_start/end).
 │   ├── kv_quant.rs      — KV quant state/dispatch
 │   ├── kv_types.rs      — KVCacheDtype, KVFormat (always-on enum)
-│   └── turboquant_state.rs — TurboQuant calibration state
 └── tools/tilelang/      — TileLang Python kernels (AOT compiled by build.rs)
 ```
 
@@ -69,11 +68,11 @@ than ~3 functions.
 | `elementwise.rs` | add/silu_mul/extract_vec/etc. batched scalars |
 | `embedding.rs` | embedding_batch / embedding_decode |
 | `gemm.rs` | gemv, gemm, fused_mlp, Marlin W4 |
-| `kv.rs` | kv_cache_to_paged, paged_kv_metadata, KV-tier transfer, KV quant |
+| `kv.rs` | kv_cache_to_paged, paged_kv_metadata, KV quant |
 | `mla.rs` | DeepSeek V4 MLA decode/prep (P0'', design-ready, partial wiring) |
 | `misc.rs` | catch-all |
 | `nccl.rs` | NCCL collective primitives consumed by `collective.rs` |
-| `norm.rs` | rms_norm, fused_add_rms_norm |
+| `norm.rs` | rms_norm |
 | `quant.rs` | weight + activation quant kernels |
 | `recurrent.rs` | gated_delta_rule prefill/decode (Qwen3.5 hybrid) |
 | `sampling.rs` | argmax / argmax_with_logprob / gpu_sample |
