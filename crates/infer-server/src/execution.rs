@@ -332,7 +332,6 @@ fn admit_submission<E, K>(
         RequestOptions {
             sampling: submission.sampling,
             grammar: submission.grammar,
-            ..RequestOptions::default()
         },
     );
     // If the submitter dropped its ticket before we replied, just don't track it.

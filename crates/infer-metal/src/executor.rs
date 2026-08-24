@@ -25,11 +25,6 @@ const KV_CACHE_CHUNK: i32 = 256;
 #[cfg(feature = "metal")]
 const DFLASH_DISABLED: u32 = u32::MAX;
 
-/// Machine-derived **L3 (NVMe)** spill budget for the Metal disk tier
-/// (unified with the CUDA policy — same probe, same clamp).
-#[cfg(feature = "metal")]
-pub use kv_native_sys::default_t2_budget_bytes;
-
 /// Metal KV-cache storage dtype. The host `MetalKvPool` remains a logical page
 /// allocator; this controls the MLX arrays inside each Metal slot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

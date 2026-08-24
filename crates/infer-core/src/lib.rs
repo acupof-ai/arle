@@ -1158,8 +1158,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     }
 
     fn enqueue_waiting_request(&mut self, request: RequestState, bias: WaitingInsertBias) {
-        let insert_at = waiting_insert_position(&self.waiting, &request, bias);
-        self.waiting.insert(insert_at, request);
+        // Priority is always default; the bias alone decides insertion at head or tail.
+        if matches!(bias, WaitingInsertBias::BeforeEqual) {
+            self.waiting.push_front(request);
+        } else {
+            self.waiting.push_back(request);
+        }
     }
 
     fn apply_output(&mut self, plan: &ForwardPlan, output: StepOutput) -> Result<()> {
@@ -1841,19 +1845,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 enum NormalizedRequest {
     Waiting(RequestState),
     Completed(RequestState),
-}
-
-fn waiting_insert_position(
-    waiting: &VecDeque<RequestState>,
-    _incoming: &RequestState,
-    bias: WaitingInsertBias,
-) -> usize {
-    // Priority is always default; the bias alone decides insertion at head or tail.
-    if matches!(bias, WaitingInsertBias::BeforeEqual) {
-        0
-    } else {
-        waiting.len()
-    }
 }
 
 fn finish_reason_for(

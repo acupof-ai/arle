@@ -23,7 +23,7 @@
 //!   lfm2_compiled_push_attn_layer(model, ...)  // ×6
 //!   lfm2_compiled_set_last_moe(model, ...)     // ×22 (after the layer push)
 //!   lfm2_compiled_finalize(model)
-//!   lfm2_session_begin/end, lfm2_compiled_prefill/step[_paged]_session
+//!   lfm2_session_begin/end, lfm2_compiled_prefill/step_session
 //!   lfm2_compiled_free(model)
 
 #include "mlx_common.h"
@@ -276,7 +276,6 @@ struct Lfm2CompiledModel {
         array& conv_state_out,
         std::vector<array>* captured_conv_inputs) const {
         int B = current_batch_size;
-        int S = current_seq_len;
         int H = hidden_size;
 
         // Pre-split projections (computed at setup time, avoiding slice on
