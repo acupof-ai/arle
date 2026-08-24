@@ -299,6 +299,57 @@ pub unsafe fn marlin_fp8_to_e4m3(
     }
 }
 
+/// Dequantize a per-channel FP8 Marlin-packed weight to dense BF16. The tiles
+/// reproduce the checkpoint's own E4M3 bytes (`marlin_fp8_to_e4m3`), then the
+/// held per-channel scales apply (`dequantize_fp8_block_scaled_to_bf16` with a
+/// 1×K block shape). Composes the two existing kernels; the E4M3 scratch is
+/// freed on return. This is the FP8 analog of `dequantize_fp4_marlin_to_bf16`.
+pub unsafe fn dequantize_fp8_marlin_to_bf16(
+    ctx: &DeviceContext,
+    packed: &impl DevicePtr<u8>,
+    scales: &impl DevicePtr<f32>,
+    output: RawDevicePtr<bf16>,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let nk = extent(n, k, "dequantize_fp8_marlin_to_bf16 weight")?;
+    ensure!(
+        packed.len() >= nk && scales.len() >= n && output.len() >= nk,
+        "dequantize_fp8_marlin_to_bf16 buffers do not cover [n,k]=[{n},{k}]: packed={} scales={} \
+         output={}",
+        packed.len(),
+        scales.len(),
+        output.len()
+    );
+    let mut scratch = ctx
+        .stream
+        .alloc_zeros::<u8>(nk)
+        .map_err(|e| anyhow!("dequantize_fp8_marlin_to_bf16 scratch alloc: {e}"))?;
+    // SAFETY: lengths checked above; `packed` is the layout `repack_for_marlin_fp8`
+    // produced, and `output` covers n*k bf16 on this stream.
+    unsafe {
+        marlin_fp8_to_e4m3(ctx, packed, &mut scratch, n, k)
+            .map_err(|e| anyhow!("marlin_fp8_to_e4m3 in dequantize_fp8_marlin_to_bf16: {e}"))?;
+        dequantize_fp8_block_scaled_to_bf16(
+            ctx,
+            &scratch,
+            scales,
+            output,
+            n,
+            k,
+            Fp8ScaleShape {
+                scale_rows: i32::try_from(n)?,
+                scale_cols: 1,
+                block_m: 1,
+                block_k: i32::try_from(k)?,
+            },
+        )
+        .map_err(|e| {
+            anyhow!("dequantize_fp8_block_scaled_to_bf16 in dequantize_fp8_marlin_to_bf16: {e}")
+        })
+    }
+}
+
 /// NVFP4 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). The S0E5M3
 /// group scales sit in the tail of `packed`, after the `n*k/2` tile bytes
 /// (`repack_for_marlin_fp4`); `global` is the single BF16 that carries the

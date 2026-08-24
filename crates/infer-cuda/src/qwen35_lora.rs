@@ -658,10 +658,90 @@ impl Qwen35Model {
             };
             return Ok(());
         }
+        // Per-channel FP8's resident form is also the Marlin layout (the repack
+        // released `qweight_u8` at load), so it promotes the same way as NVFP4:
+        // tiles -> E4M3 -> BF16, then FP8 slots for the merge lane and Marlin
+        // parked. `scale_f32` is the held per-channel scale the dequant applies.
+        if matrix.weight_format() == WeightFormat::Fp8BlockScaled && matrix.marlin_packed.is_some()
+        {
+            let dense = ctx
+                .stream
+                .alloc_zeros::<bf16>(matrix.rows * matrix.cols)
+                .map_err(|e| {
+                    anyhow!(
+                        "layer {layer_idx} {label}: FP8-marlin BF16 promotion alloc failed: {e}"
+                    )
+                })?;
+            let packed = matrix.marlin_packed.as_ref().expect("checked above");
+            let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: FP8-marlin LoRA target missing its per-channel scale")
+            })?;
+            let mut dense = dense;
+            // SAFETY: `dense` covers rows*cols and lives across the launch.
+            unsafe {
+                cuda_ql::dequantize_fp8_marlin_to_bf16(
+                    &ctx,
+                    packed,
+                    scales,
+                    cache_ptr(&dense, &ctx),
+                    matrix.rows,
+                    matrix.cols,
+                )
+            }
+            .map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: FP8-marlin→BF16 promotion dequant failed: {e}")
+            })?;
+            // Same FP8-slot pattern as the NVFP4 arm above: without them
+            // `requant_merged_matrix` finds no `qweight_u8` and the weight stays
+            // dense BF16 forever. The engine serves block-scaled FP8 once a
+            // LoRA has been merged in.
+            const FP8_BLOCK: usize = 128;
+            let scale_rows = matrix.rows.div_ceil(FP8_BLOCK);
+            let scale_cols = matrix.cols.div_ceil(FP8_BLOCK);
+            let mut qweight = ctx
+                .stream
+                .alloc_zeros::<u8>(matrix.rows * matrix.cols)
+                .map_err(|e| {
+                    anyhow!("layer {layer_idx} {label}: FP8-marlin fp8 slot alloc: {e}")
+                })?;
+            let mut fp8_scales = ctx
+                .stream
+                .alloc_zeros::<f32>(scale_rows * scale_cols)
+                .map_err(|e| {
+                    anyhow!("layer {layer_idx} {label}: FP8-marlin fp8 scale alloc: {e}")
+                })?;
+            cuda_ql::quantize_bf16_to_fp8_block_scaled(
+                &ctx,
+                &dense,
+                &mut qweight,
+                &mut fp8_scales,
+                matrix.rows,
+                matrix.cols,
+                FP8_BLOCK,
+                FP8_BLOCK,
+            )
+            .map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: FP8-marlin→FP8 pristine requant: {e}")
+            })?;
+            matrix.qweight_u8 = Some(qweight);
+            matrix.scale_f32 = Some(fp8_scales);
+            matrix.quant_block_m = FP8_BLOCK;
+            matrix.quant_block_k = FP8_BLOCK;
+            matrix.quant_scale_rows = scale_rows;
+            matrix.quant_scale_cols = scale_cols;
+            matrix.data = dense;
+            matrix.weight_format = WeightFormat::DenseBf16;
+            matrix.retired_marlin = match (matrix.marlin_packed.take(), matrix.marlin_scales.take())
+            {
+                (Some(packed), Some(scales)) => Some((packed, scales)),
+                _ => None,
+            };
+            return Ok(());
+        }
         ensure!(
             matrix.weight_format() == WeightFormat::Fp8BlockScaled,
             "layer {layer_idx} {label}: LoRA merge supports dense BF16, FP8 block-scaled, or \
-             Marlin-repacked NVFP4 weights; got {:?}",
+             Marlin-repacked NVFP4/FP8 weights; got {:?}",
             matrix.weight_format()
         );
         ensure!(
@@ -670,18 +750,6 @@ impl Qwen35Model {
                 && matrix.quant_scale_rows > 0
                 && matrix.quant_scale_cols > 0,
             "layer {layer_idx} {label}: FP8 LoRA target missing block-scale metadata"
-        );
-        // The merge rewrites `qweight_u8`/`scale_f32` and nothing else, so a
-        // target that also carries a Marlin layout would keep serving the
-        // un-merged bytes on every arm that reads it. Refuse instead: this used
-        // to be unreachable because the repack released the source, and holding
-        // the source for the DeepGEMM prefill arm must not turn a loud refusal
-        // into a silent disagreement between prefill and decode.
-        ensure!(
-            matrix.marlin_packed.is_none(),
-            "layer {layer_idx} {label}: LoRA merge cannot rewrite the Marlin layout this weight \
-             was repacked into at load, so decode would keep serving the un-merged base. Load a \
-             LoRA-merging engine on a build/card where the repack does not run."
         );
         let dense = ctx
             .stream
