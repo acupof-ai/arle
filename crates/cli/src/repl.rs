@@ -927,7 +927,7 @@ fn run_direct_chat_completion(
             max_tokens,
             sampling,
             // The checkpoint template and diffusion config own EOS handling. A
-            // ChatML stop string here is wrong for DiffusionGemma.
+            // ChatML stop string here is wrong for DeepSeek-OCR.
             stop: None,
         })?
     } else {

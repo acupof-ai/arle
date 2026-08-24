@@ -598,8 +598,8 @@ unsafe impl<E: BackendExecutor, K: KvPool> Send for ServeHandle<E, K> {}
 ///
 /// Identical route surface as [`coordinator_router`] (single HTTP implementation);
 /// request handling goes through the relay protocol over an in-process channel
-/// rather than TCP. Pass `multimodal_kind` for VLM backends (Gemma4, DeepseekOcr,
-/// DiffusionGemma); text-only backends pass `None`.
+/// rather than TCP. Pass `multimodal_kind` for VLM backends (DeepseekOcr,
+///; text-only backends pass `None`.
 pub fn coordinator_local_router<E, K>(
     serve: Arc<ServeHandle<E, K>>,
     tokenizer: tokenizer::OpenAiTokenizer,

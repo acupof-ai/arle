@@ -678,7 +678,7 @@ pub trait MultimodalGenerate {
 
     /// Which VLM image-preprocessing/marker convention this backend expects.
     /// The serving layer dispatches preprocessing on this so a second VLM
-    /// (DeepSeek-OCR) doesn't run Gemma4's resize/marker logic.
+    /// (DeepSeek-OCR) has its own resize/marker logic.
     fn multimodal_kind(&self) -> Option<MultimodalKind>;
 }
 

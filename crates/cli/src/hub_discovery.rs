@@ -52,9 +52,9 @@ pub(crate) fn hub_cache_root() -> Option<PathBuf> {
 /// The authoritative signal is `config.json#model_type` + `architectures`, NOT
 /// the model-id name — a substring family match let non-servable look-alikes
 /// through (Qwen3-0.6B is `model_type=qwen3`, the MTP draft is `qwen3_5_mtp`)
-/// and hid `diffusion_gemma`. The per-backend sets are the serve-path truth:
+/// (Metal only). The per-backend sets are the serve-path truth:
 /// Metal requires the Qwen3.5 `layer_types` config (`infer-metal/config.rs`) so
-/// only `qwen3_5` / `qwen3_5_moe` / DiffusionGemma load; CUDA serves the
+/// only `qwen3_5` / `qwen3_5_moe` load; CUDA serves the
 /// Qwen3 / Qwen3.5 dense+MoE families and DeepSeek-V4 (mirrors
 /// `infer_api::classify_cuda_model`). Measured 2026-06-14: `benchmarks/README.md`.
 /// Best-effort: unreadable / unparseable config → `false` (don't offer what we

@@ -156,7 +156,7 @@ pub(crate) struct MetalModelConfig {
 ///
 /// The text decoder + DeepEncoder + projector are parsed by `deepseek-ocr-spec`.
 /// `generation` flattens the diffusion plumbing to autoregressive
-/// (`canvas_length=1`, `max_denoising_steps=1`) the same way Gemma4 does, and
+/// (`canvas_length=1`, `max_denoising_steps=1`), and
 /// `image_token_id` is the `<image>` placeholder id resolved from the tokenizer.
 #[derive(Debug, Clone)]
 pub(crate) struct MetalDeepseekOcrConfig {

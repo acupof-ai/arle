@@ -4,7 +4,7 @@
 //! (SAM-base + CLIP-large + 16x conv compressor + linear projector) feeding a
 //! DeepSeek-MoE text decoder. This crate parses `config.json` into typed config
 //! the Metal builder consumes; it carries no MLX/runtime dependency, mirroring
-//! `gemma-spec`.
+//! DeepSeek-OCR spec.
 
 use std::fs;
 use std::path::Path;

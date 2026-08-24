@@ -386,7 +386,7 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 
-/// DiffusionGemma entropy-bound acceptance mask.
+/// DeepSeek-OCR entropy-bound acceptance mask.
 ///
 /// Sort positions by entropy, accept positions whose cumulative entropy
 /// excluding the current maximum remains within the bound.
