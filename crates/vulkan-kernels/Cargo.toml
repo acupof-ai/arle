@@ -6,7 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-ash = { version = "0.38.0", default-features = false, features = ["loaded"], optional = true }
 vulkan-sys = { path = "../vulkan-sys", default-features = false }
 
 [dev-dependencies]
@@ -18,7 +17,7 @@ infer-gguf = { path = "../infer-gguf" }
 default = []
 # Compile and launch Vulkan kernels through vulkan-sys. Off by default so the
 # workspace typechecks on machines without a Vulkan loader or glslc.
-vulkan = ["dep:ash", "vulkan-sys/vulkan"]
+vulkan = ["vulkan-sys/vulkan"]
 
 [lints]
 workspace = true

@@ -1,14 +1,14 @@
-name: Fmt Nightly
+name: Nightly Drift Sweep
 
-# Periodic full-workspace fmt sweep. Catches drift on files no commit
-# happens to touch (the scoped fmt check in ci.yml only flags the files
-# changed in each push). Runs daily at 09:00 UTC, plus manual dispatch.
+# Periodic full-workspace drift sweeps. Catches drift on files no commit
+# happens to touch (the scoped checks in ci.yml only flag the files changed
+# in each push). Runs daily at 09:00 UTC, plus manual dispatch.
 #
 # If this fails:
 #   - It is NOT a regression on the latest commit (those passed the
-#     scoped check).
-#   - Open an issue or open a tidy-up PR running `cargo fmt --all` on
-#     the offending paths.
+#     scoped checks).
+#   - Open an issue or open a tidy-up PR: `cargo fmt --all` on the
+#     offending paths, or drop the unused dependency cargo-machete found.
 
 on:
   schedule:
@@ -23,12 +23,27 @@ jobs:
     name: Workspace-wide fmt sweep
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
 
       - name: cargo fmt (full workspace)
         run: cargo fmt --all -- --check
+
+  unused-deps:
+    name: Unused dependency sweep (cargo-machete)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+
+      - name: cargo machete
+        run: cargo machete

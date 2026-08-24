@@ -6,11 +6,14 @@ This checker stays intentionally lightweight:
 - workspace-members <-> codebase-map truth-surface sync (refactor roadmap R0.2)
 - repo-wide banned-marker scan on tracked text files
 - docs/experience entry inventory caps
+- frozen docs/experience/archived seal (manifest hash drift = fail)
 - no external dependencies
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -384,6 +387,59 @@ def check_experience_doc_inventory() -> list[str]:
     return errors
 
 
+ARCHIVED_ROOT = Path("docs/experience/archived")
+ARCHIVED_MANIFEST = ARCHIVED_ROOT / "manifest.json"
+ARCHIVED_NAME_RE = re.compile(r"\d{4}-\d{2}-\d{2}-[a-z0-9-]+\.md")
+ARCHIVED_CLASSES = ("wins", "errors")
+
+
+def check_archived_experience() -> list[str]:
+    """Sealed entries are frozen: every archived file must match its manifest
+    hash, every manifest row must exist on disk, and the tree may hold nothing
+    except wins/errors entries named YYYY-MM-DD-slug.md."""
+    archived = ROOT / ARCHIVED_ROOT
+    if not archived.is_dir():
+        return []
+    manifest_path = ROOT / ARCHIVED_MANIFEST
+    if not manifest_path.is_file():
+        return [f"{ARCHIVED_MANIFEST}: missing (seal entries with scripts/archive_experience.py)"]
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return [f"{ARCHIVED_MANIFEST}: invalid JSON: {exc}"]
+    if manifest.get("version") != 1 or not isinstance(manifest.get("files"), dict):
+        return [f"{ARCHIVED_MANIFEST}: expected {{'version': 1, 'files': {{...}}}}"]
+
+    sealed: dict[str, str] = manifest["files"]
+    on_disk: set[str] = set()
+    errors: list[str] = []
+    for path in sorted(archived.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(archived).as_posix()
+        if rel == "manifest.json":
+            continue
+        parts = path.relative_to(archived).parts
+        if len(parts) != 2 or parts[0] not in ARCHIVED_CLASSES:
+            errors.append(f"{ARCHIVED_ROOT / rel}: only wins/ and errors/ entries may live in the archive")
+            continue
+        if not ARCHIVED_NAME_RE.fullmatch(parts[1]):
+            errors.append(f"{ARCHIVED_ROOT / rel}: archived entry name must be YYYY-MM-DD-slug.md")
+            continue
+        on_disk.add(rel)
+        expected = sealed.get(rel)
+        if expected is None:
+            errors.append(
+                f"{ARCHIVED_ROOT / rel}: unsealed file in archive "
+                f"(seal it with scripts/archive_experience.py --write)"
+            )
+        elif "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            errors.append(f"{ARCHIVED_ROOT / rel}: sealed entry modified — frozen entries never change")
+    for rel in sorted(set(sealed) - on_disk):
+        errors.append(f"{ARCHIVED_ROOT / rel}: sealed entry missing from the tree")
+    return errors
+
+
 # Entries before this date are grandfathered; perf-claim entries on/after it
 # must cite a baseline (a git hash) or carry an explicit waiver line.
 WINS_BASELINE_CUTOFF = "2026-08-23"
@@ -426,6 +482,7 @@ def main() -> int:
     errors.extend(check_template(Path(".github/ISSUE_TEMPLATE/feature_request.md"), FEATURE_TEMPLATE_REQUIRED_FIELDS))
     errors.extend(check_git_tracked_junk())
     errors.extend(check_experience_doc_inventory())
+    errors.extend(check_archived_experience())
     errors.extend(check_wins_baseline_citations())
     errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
@@ -441,8 +498,8 @@ def main() -> int:
     print("[repo-hygiene] OK")
     print(
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
-        "repo-wide marker bans, experience entry caps, workspace "
-        "truth-surface, CUDA launcher-boundary, and registry-coverage checks all passed"
+        "repo-wide marker bans, experience entry caps, frozen archive seal, "
+        "workspace truth-surface, CUDA launcher-boundary, and registry-coverage checks all passed"
     )
     return 0
 

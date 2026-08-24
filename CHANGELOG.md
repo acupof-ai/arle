@@ -8,6 +8,8 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Repo cleaning machinery adopted from deepseek-harness** — frozen wins/errors archive with sha256 manifest gate (`scripts/archive_experience.py`), residue sweeper (`scripts/clean_repo.py`), archive skill, all 22 CI actions SHA-pinned, cargo-machete nightly (first sweep removed 4 dead deps, incl. `infer-core` from both backends), loud lever-gate skips. See `docs/experience/wins/2026-08-24-repo-cleaning-machinery.md`.
+
 - `Qwen3.8-27B-NVFP4` passes every probe that `ThinkingCap-Qwen3.6-27B-NVFP4` fails (tool calls included), at 52.3 tok/s with a 33%-acceptance MTP head — so NVFP4 training is viable and the corruption is a property of that one checkpoint, not the FP4 path.
 - Note that the DSpark drafter RoPE fix (`7130f0b8b`) corrected a real dropped-config defect but did not move draft acceptance (13% before and after); the Qwen3.8 acceptance collapse is unexplained, see `docs/experience/errors/2026-08-23-dspark-rope-fix-was-not-the-cause.md`.
 - Record the agent-OPD baseline for `Qwen3.8-27B-FP8` on the localized swe-smith corpus — 4/10 solved, 0.617 mean partial credit, every task control-validated; see `docs/experience/wins/2026-08-23-agent-opd-qwen38-baseline.md`.
