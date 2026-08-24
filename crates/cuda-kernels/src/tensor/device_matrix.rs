@@ -88,10 +88,9 @@ type OptHostBuf<T> = Option<Vec<T>>;
 ///
 /// Captures the full quant-format-agnostic set of side tensors (dense bf16,
 /// INT8/INT4 qweight + scales, Marlin packed/scales, hybrid W4A8/W4-FP8
-/// sidecars, TurboQuant packed storage) so offload→reload is bit-exact for any
-/// weight format. The scalar shape/format fields are restored from the live
-/// `DeviceMatrix` they were detached from, so this snapshot only carries the
-/// raw buffer bytes.
+/// sidecars) so offload→reload is bit-exact for any weight format. The
+/// scalar shape/format fields are restored from the live `DeviceMatrix` they
+/// were detached from, so this snapshot only carries the raw buffer bytes.
 pub struct HostMatrixSnapshot {
     data: Vec<bf16>,
     qweight: OptHostBuf<i8>,

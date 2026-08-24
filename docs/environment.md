@@ -15,16 +15,15 @@ Current truth is simple: prefer `ARLE_*` for the `arle` front door, keep
 debug/diagnostic runtime overrides.**
 
 **Tuning knobs go on structs**, not env vars. The canonical example is
-`SchedulerConfig` in `crates/infer-core/src/lib.rs`: prefix-cache
-watermarks (`prefix_cache_high_water`, `prefix_cache_low_water`,
-`prefix_cache_retain_hard_cap`), keepalive ticks
-(`prefix_cache_keepalive_ticks`, `t1_host_pinned_keepalive_ticks`), and
-chunking caps are struct fields with `validate()` guards. Callers that
-want to tune them construct a `SchedulerConfig::runtime_defaults(..)`
-and assign directly — **there is no `INFER_PREFIX_HIGH_WATER`** or
-any other magic env var for runtime tuning. If you want an env-var
-escape hatch for a specific tuning knob, justify it as a debug aid and
-document the debug-only status here.
+`SchedulerConfig` in `crates/infer-core/src/lib.rs`: slot and batching caps
+(`num_slots`, `max_running_requests`, `max_num_batched_tokens`,
+`max_prefill_tokens`), the prefix-cache watermark
+(`prefix_cache_low_water_pages`), and chunking caps are plain struct fields
+with `Default` / `for_slots` constructors. Callers that want to tune them
+construct the struct and assign directly — **there is no
+`INFER_PREFIX_HIGH_WATER`** or any other magic env var for runtime tuning.
+If you want an env-var escape hatch for a specific tuning knob, justify it
+as a debug aid and document the debug-only status here.
 
 **Converted to CLI flags (2026-07-10)** — these env vars no longer exist; the
 flag is the single surface (serve flags ride `EngineLoadConfig`, so multiproc
@@ -305,7 +304,7 @@ model load so bad jobs fail with actionable context. Expected shape:
 ```text
 multi_gpu_config:
  cuda_devices=[0,1]
- tp_size=2 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1 moe_dp=1
+ tp_size=2 pp_size=1 attn_dp=1 attn_cp=1
  world_size=2 nccl_port=29500
  status=accepted
 ```
@@ -315,7 +314,7 @@ For today's single-rank runtime, the equivalent effective topology is:
 ```text
 multi_gpu_config:
  cuda_devices=[INFER_CUDA_DEVICE or 0]
- tp_size=1 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1
+ tp_size=1 pp_size=1 attn_dp=1 attn_cp=1
  world_size=1 status=single-rank
 ```
 
@@ -578,10 +577,6 @@ docs promote them more clearly:
  Q/K norm variant during Qwen3.5 GDR execution; default off because the
  native MLX `fast::rms_norm(...) * scale` lowering is faster on the
  Qwen3.5-0.8B MLX 4bit single-request path
-- `AGENT_INFER_METAL_GGUF_NATIVE_Q4` — controls Qwen3.5 Metal GGUF
- load-time conversion for packed K-quant tensors. Default is `off`, keeping
- exact GGUF affine/packed behavior for correctness. Set to `all` / `1` /
- `true` for the lossy MLX native q4 group64 speed path
 - `AGENT_INFER_QWEN35_CPP_GDR_TG_Y` /
  `AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y` /
  `AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y` — Gated Delta Rule tile-Y

@@ -1,27 +1,29 @@
 # `cuda-kernels` — Agent Guide
 
-Extracted CUDA kernel crate: CUDA C kernels + TileLang AOT + FFI + the seven
-tensor/pool/metadata types that `infer` proper consumes. **This is the
-proto-public API for the eventual Option-B split.** Load this file before
-touching anything under `crates/cuda-kernels/`.
+Extracted CUDA kernel crate: CUDA C kernels + TileLang AOT + FFI + the eight
+tensor/pool/metadata types that `infer-cuda` (plus `autograd`, `train`, and
+`infer-api`) consumes. **This is the proto-public API for the eventual
+Option-B split.** Load this file before touching anything under
+`crates/cuda-kernels/`.
 
 ## Refactor posture
 
 - Keep kernel-crate code simple and uniform. Prefer deletion-style refactors:
   remove stale shims, collapse duplicate FFI/kernel entry paths, and keep one
-  canonical ownership boundary between `infer` and `cuda-kernels`.
+  canonical ownership boundary between the serving crates and `cuda-kernels`.
 
 ## Why this crate exists
 
 See `docs/architecture.md`.
 Short version: the 2026-04-15 Route-A revert turned the old four-shell
-split into one kernel crate. `infer/src/backend/cuda.rs` is now a ~15-line
-`pub use` shim over this crate, so the 60+ existing `crate::backend::cuda::…`
-call sites still resolve while we wait for the final extraction trigger
-(FA-3 H100, MLA, NCCL, FP8 GEMM, spec-decode GPU, or a second consumer).
+split into one kernel crate. `infer-cuda` is the primary consumer (with
+`autograd`, `train`, and `infer-api` also depending on this crate); the
+crate stays extraction-ready per `docs/architecture.md` §Crate-Split
+Governance.
 
-**Invariant:** the dependency edge is `infer → cuda-kernels`, **never
-the reverse**. Nothing in this crate may depend on `infer` — no tokenizer,
+**Invariant:** the dependency edge is `infer-cuda → cuda-kernels` (also
+`autograd` / `train` / `infer-api` → `cuda-kernels`), **never the reverse**.
+Nothing in this crate may depend on a serving crate — no tokenizer,
 no scheduler, no model-specific weight struct, no `EngineOptions`.
 
 ## Crate layout
@@ -36,7 +38,6 @@ crates/cuda-kernels/
 │   ├── gemm/            — gemv, quantized gemv, DeepGEMM, Marlin repack/preprocess, fused_mlp
 │   ├── moe/             — DSv4 + Qwen3.6 expert routing
 │   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_metadata
-│   ├── quant/           — dtype convert
 │   ├── comm/            — TP custom all-reduce (CAR)
 │   ├── sampling/        — argmax + DSpark chain-rejection sampling
 │   ├── norm/            — rms_norm variants
@@ -45,7 +46,7 @@ crates/cuda-kernels/
 │   └── deepep_sidecar/  — out-of-process NVSHMEM DeepEP sidecar (.cpp, no .cu)
 ├── src/
 │   ├── lib.rs           — pub module declarations, feature gating
-│   ├── prelude.rs       — **the proto-API contract** (7 types; see Prelude discipline)
+│   ├── prelude.rs       — **the proto-API contract** (8 symbols; see Prelude discipline)
 │   ├── ffi.rs + ffi/    — extern "C" declarations, grouped by domain (see FFI domain layout below)
 │   ├── tilelang.rs      — TileLang metadata staging
 │   ├── paged_kv.rs      — PagedKVPool, TokenKVPool
@@ -68,8 +69,7 @@ than ~3 functions.
 | `elementwise.rs` | add/silu_mul/extract_vec/etc. batched scalars |
 | `embedding.rs` | embedding_batch / embedding_decode |
 | `gemm.rs` | gemv, gemm, fused_mlp, Marlin W4 |
-| `kv.rs` | kv_cache_to_paged, paged_kv_metadata, KV quant |
-| `mla.rs` | DeepSeek V4 MLA decode/prep (P0'', design-ready, partial wiring) |
+| `kv.rs` | KV quant (INT8 / FP8 paged) |
 | `misc.rs` | catch-all |
 | `nccl.rs` | NCCL collective primitives consumed by `collective.rs` |
 | `norm.rs` | rms_norm |
@@ -79,37 +79,41 @@ than ~3 functions.
 
 ## Prelude discipline (enforce strictly — this is the public surface)
 
-`src/prelude.rs` currently exports exactly 7 symbols:
+`src/prelude.rs` currently exports exactly 8 symbols:
 
 ```rust
-TileLangDecodeMetadata
+EVICTED_PAGE
 PagedKVPool
 DeviceContext
 DeviceMatrix
 DeviceVec
 HiddenStates
+HiddenStatesView
 RawDevicePtr
 ```
 
 **Adding a symbol requires three justifications in writing on the PR:**
 
-1. **Consumed by ≥3 files outside `backend/cuda/`.** Two-file helpers stay
-   on direct module paths. Example: `TokenKVPool` has exactly 3 callers
-   and **does not** belong in the prelude — it lives at
-   `infer_cuda_kernels::TokenKVPool` (re-exported at crate root).
+1. **Consumed by ≥3 files outside `cuda-kernels` itself** (in `infer-cuda` /
+   `autograd` / `train` / `infer-api`). Two-file helpers stay on direct
+   module paths. Example: `TokenKVPool` has exactly 3 callers and **does
+   not** belong in the prelude — it lives at `cuda_kernels::TokenKVPool`
+   (re-exported at crate root).
 2. **Stable.** Name, layout, and method signatures will not change in the
    next 6 months. Internal types in active design must not be in the prelude.
 3. **Removing it would not break the kernel-crate extraction plan.** If
-   exporting a symbol forces some currently-private `infer` type to become
-   `pub` cross-crate, the symbol does not belong here — it belongs in
-   `infer` proper.
+   exporting a symbol forces some currently-private serving-crate type to
+   become `pub` cross-crate, the symbol does not belong here — it belongs
+   in `infer-cuda` / `infer-core`, not in the kernel layer.
 
 **What the prelude deliberately does NOT contain:**
 
 - Anything from `ffi::*` — consumers that need `extern "C"` symbols use
   `cuda_kernels::ffi::xxx` directly.
-- `EngineOptions` / runtime configs — owned by `infer::server_engine`.
-- Model-specific state (`Qwen35Model`, etc.) — application types, stay in `infer::model::*`.
+- Runtime configs (`EngineLoadConfig`, `ServeHttpOptions`, …) — owned by
+  `infer-api`, not kernel types.
+- Model-specific state (`Qwen35Model`, etc.) — application types, stay in
+  the backend crates (`infer-cuda` / `infer-metal`).
 - `CollectiveBackend` / `NcclBackend` — multi-GPU collective trait lives at
   `cuda_kernels::collective::*`. It will graduate to the prelude only once
   more than two callers exist outside the F0–F2 distributed scaffold.
@@ -199,7 +203,7 @@ With `--features cuda,no-cuda`:
 
 ## State-mutating change — enumerate every device buffer (事无巨细)
 
-Root `AGENTS.md` §0.1 in GPU terms. Any kernel / cache / scratch / rollback /
+Any kernel / cache / scratch / rollback /
 quant change that mutates device state: **list EVERY buffer it writes, prove each
 is reverted / self-heals / snapshotted with the EXACT precondition** — no "should
 be fine". A partial fix that covers the obvious buffers and misses one is the
@@ -292,6 +296,5 @@ the full enumeration forced it).
 ## Pointers
 
 - `src/prelude.rs` — the full discipline rule, in-code comments.
-- `docs/architecture.md` §Future Evolution — Option A → Option B story.
-- `docs/experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md` —
-  what the ffi split + prelude landed, and why.
+- `docs/architecture.md` §Crate-Split Governance — kernel-crate extraction
+  rules.

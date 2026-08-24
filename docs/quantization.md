@@ -30,7 +30,7 @@ with concrete evidence.
 | Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4_gemv` + Marlin W4 prefill. |
 | Weights | MarlinW4A8 | production (CUDA), Tier-1 | env `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` for the prefill-graph win path (–92.5% TTFT p50). |
 | Weights | W8A16 (per-group INT8) | production (CUDA) | safetensors metadata | GEMV + GEMM path. |
-| Weights | W2A16 (per-group packed INT2) | experimental (CUDA) | safetensors metadata | Scaffolding lives in `tensor.rs::from_quantized_int2`; not gate-validated. |
+| Weights | W2A16 (per-group packed INT2) | experimental (CUDA) | safetensors metadata | Enum variant `WeightFormat::W2A16` exists; no load or kernel scaffolding is wired; not gate-validated. |
 | Weights | GGUF Q3_K / Q4_K / Q5_K / Q6_K | production (CUDA & Metal) | `.gguf` extension | Packed superblock kernels in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`. |
 | Weights | DSv4 FP8 E4M3 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp8BlockScaled` format; CUDA V4 attention/MoE/MTP kernels are the runtime blocker. |
 | Weights | DSv4 FP4 E2M1 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp4BlockScaled`; same DSv4 dependency chain. |
@@ -44,8 +44,9 @@ with concrete evidence.
 
 ## 1. KV-cache quantization (CUDA-paged)
 
-All four KV formats live in the same Rust enum: see
-`crates/cuda-kernels/src/kv_types.rs::KVFormat`. The underlying CUDA kernels
+The BF16/INT8/FP8 KV formats live in the same Rust enum: see
+`crates/cuda-kernels/src/kv_types.rs::KVFormat` (its fourth variant is the
+DSv4 MLA opaque record; TQ4 has no runtime arm — §1.4). The underlying CUDA kernels
 are in `crates/cuda-kernels/csrc/{kv,attention}/`; the runtime dispatch is the
 Qwen3.5/3.6 full-attention path in `crates/infer-cuda/src/qwen35_attention.rs`.
 
@@ -111,7 +112,7 @@ safetensors load runs in the CUDA weight loader (`crates/infer-cuda/src/loader.r
 | `W8A16` | 8 | per-group BF16 | `gemv_w8a16` | production |
 | `W4A16` | 4 packed | per-group BF16 | `w4_gemv_kernel` + Marlin W4 prefill | production |
 | `MarlinW4A8` | 4 packed + dyn INT8 act | per-group BF16 | Marlin W4 + INT8 act prefill | production, **Tier-1 wins via prefill-graph capture** |
-| `W2A16` | 2 packed | per-group BF16 | `gemv_w2a16` | experimental |
+| `W2A16` | 2 packed | per-group BF16 | none (enum variant only) | experimental |
 | `GgufQ3K` | 3 packed (superblock) | embedded | `gguf_q3k_gemv` | production (CUDA + Metal) |
 | `GgufQ4K` | 4 packed (superblock) | embedded | `q4k_gemv_kernel` + packed fast path | production (CUDA + Metal) |
 | `GgufQ5K` | 5 packed (superblock) | embedded | `gguf_q5k_gemv` | production (CUDA + Metal) |

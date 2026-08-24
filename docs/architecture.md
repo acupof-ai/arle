@@ -38,7 +38,7 @@ authority rather than defining a second equal architecture.
 | `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single facade for all backends) + tokenizer; `ServeHandle<E,K>` engine thread; relay protocol for both single-process (`LocalChannel*`) and multi-process (TCP) | Terminal UX, agent-session orchestration |
 | `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, `RawLogits`, OPD-teacher surface. Backends plug in behind it. | Terminal UX, REPL logic |
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
-| `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant, Marlin W4A16 fp4 GEMM, unified quantized paged attention `paged_attention_quantized_fa3`) | Model code, scheduler logic, tokenizer |
+| `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / tensor / kv_quant, Marlin W4A16 fp4 GEMM, unified quantized paged attention `paged_attention_quantized_fa3`) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend (Qwen3.5/3.6, LFM2.5 compiled models) | Anything that is not the Metal bridge |
 | `deepep-sys` | DeepEP/NVSHMEM FFI (`internode_ll` dispatch/combine) for EP collectives | Routing policy, scheduler |
 | `xgrammar-sys` | Grammar-constrained decode FFI (xgrammar) | Sampling policy, scheduler |
@@ -190,7 +190,7 @@ parity in another.
 | Continuous batching scheduler | Yes (one `Engine<E,K>` in `infer-core`) | Same `Engine<E,K>`; target-only Qwen is single-row, loaded DFlash/NextN enables configurable multi-row/mixed plans | No | Seam impl (single-stream MVP) | Seam impl (skeleton) |
 | Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No | Host KV pool (DSv4 slot shape) | Host KV pool (bookkeeping) |
 | Chunked prefill + decode-priority | Yes | Partial | No | No | No |
-| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ4), Qwen3.5/3.6 only — DSv4 MLA KV is already FP8-packed and rejects the flag | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
+| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8; TQ4 accepted by the CLI but deferred), Qwen3.5/3.6 only — DSv4 MLA KV is already FP8-packed and rejects the flag | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
 | Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots; T2 local-SSD write-through) | No | No | No |
 | Speculative decode | MTP for DSv4/Qwen3.6 (depth-2 ~1.03× net-win on H20); else plumbing only | Beta (DFlash for Qwen3.5; NextN/MTP shipped for Qwen3.6, +44% tok/s) | No | No | No |
 | Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No | No | No |

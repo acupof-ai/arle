@@ -1,9 +1,9 @@
 # N-D parallel OPD training — design (DP · PP · CP · TP · EP)
 
-> Status: **all five axes have a landed, CPU-verified core; the multi-rank NCCL
+> Status: **CP/TP/DP have a landed, CPU-verified core; the multi-rank NCCL
 > data-planes are pending-remote.** "Core" = the correctness-load-bearing
-> math/config (adjoints, coordinate derivation, shard tiling, the `all_to_all` and
-> ring collectives, zigzag `SeqShard`, the linear-attn CP wrapper), gated by local
+> math/config (adjoints, coordinate derivation, shard tiling, the ring
+> collectives, zigzag `SeqShard`, the linear-attn CP wrapper), gated by local
 > unit tests. "Pending-remote" = the wire transport + model-level parity, which
 > need a pod (≥2 GPU + NCCL) and are not locally verifiable.
 > Scope: >3 files + architectural → approach-first per the agent contract.
@@ -12,8 +12,8 @@
 > on 2026-07-30: a source review found our first cut diverged on two algorithmic
 > points — contiguous (not zigzag load-balanced) attention sharding, and a planned
 > serial carry-ring (not all-to-all-to-head) for linear attention. Both are now
-> corrected and landed (§4): zigzag `SeqShard` (§4.2), the linear-attn CP
-> all-to-all-to-head wrapper (§4.3), and the `all_to_all` transport, all CPU-gated.
+> corrected and landed (§4): zigzag `SeqShard` (§4.2) and the linear-attn CP
+> chunked zigzag ring carry (§4.3), all CPU-gated.
 > A second source review confirmed our fused-qkv + packed-conv1d
 > `linear_attention_core` already *is* Megatron's gated-delta-net CP contract — no
 > core-interface refactor needed. See §4.
@@ -27,9 +27,8 @@ private duplicate configs.
 | Axis | Core landed + CPU-gated | Pending-remote (pod NCCL) |
 |---|---|---|
 | **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`TpContext`/`DpContext` are derived views, one source of truth | — |
-| **CP** | ring attention is the CP full-attn path (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — device fwd-merge + finalize + bwd kernels (`ring_block_attention.cu`), wired in `qwen35.rs`, replacing the option-B all-gather (deleted). Sequence sharded **zigzag** load-balanced (`SeqShard`, front+back chunk pair); the ring masks causally by per-row absolute position so the two chunks attend the right prefix. Linear-attn CP is **all-to-all-to-head** (`linear_attention_core_cp`, fused-qkv per GDN): each rank runs the full-sequence recurrence for 1/N of the value-heads, exact, no cross-rank dependency. `all_to_all` (self-adjoint seq↔head, world==1 identity) + `cat` re-fuse landed + CPU-gated. world==1 ring taped grad matches `causal_sdpa_recompute`; multi-block merge+bwd matches the full-seq reference; head-split linear-attn reconstructs the full-seq recurrence on CPU | multi-rank ring transport (`ring_send_recv_kv` + all-to-all NCCL); >65535 local-seq parity; 256K liveness; zigzag load-balance c-sweep. Device per-row-position ring kernel (zigzag on GPU) is pending-remote — the device path errors loudly on `positions.is_some()`, never silently mis-attends |
+| **CP** | ring attention is the CP full-attn path (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — device fwd-merge + finalize + bwd kernels (`ring_block_attention.cu`), wired in `qwen35.rs`, replacing the option-B all-gather (deleted). Sequence sharded **zigzag** load-balanced (`SeqShard`, front+back chunk pair); the ring masks causally by per-row absolute position so the two chunks attend the right prefix. Linear-attn CP is a **chunked zigzag ring carry** (`linear_attention_core_cp`, `cp_chunked_forward`, `CpChunkGeometry`): the recurrent state is carried chunk-by-chunk over a ring, exact, no cross-rank dependency in the steady state. world==1 ring taped grad matches `causal_sdpa_recompute`; multi-block merge+bwd matches the full-seq reference; head-split linear-attn reconstructs the full-seq recurrence on CPU | multi-rank ring transport (`ring_send_recv_kv`); >65535 local-seq parity; 256K liveness; zigzag load-balance c-sweep. Device per-row-position ring kernel (zigzag on GPU) is pending-remote — the device path errors loudly on `positions.is_some()`, never silently mis-attends |
 | **TP** | attention-TP and **MoE-TP** ops built (column/row-parallel experts+shared); model-agnostic core is `train::tensor_parallel` (`TpContext` + `divide` + `maybe_all_reduce`, mirror of `CpContext`/`DpContext`); qwen35 shard dims are a `Qwen35TpDims` impl. Production construct uses `TpContext::single()` — no model runs TP-sharded yet | MoE finite-diff on ≥2 GPU |
-| **EP** | tape op built — `ep_dispatch_op`/`ep_combine_op` (`BackwardOp::EpDispatch`/`EpCombine`), backward = the transpose; dropped token gets zero grad. Zero callers — not wired into any model | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
 | **DP** | **wired end-to-end** — `DpContext` threaded into `masked_writeback_step`; global count all-reduce for `inv_n`; grad-reduce gate `(cp‖dp)`; `--dp-size` launcher; world==1 byte-identical | multi-rank correctness (≥2 GPU); combined CP×DP (`ncclCommSplit` subgroups) |
 
 PP was deleted (`pipeline_parallel.rs`, `PpContext` — 1F1B is a wrong fit for single-pass writeback); it is not a live axis.
@@ -50,17 +49,13 @@ The device mesh **already exists** and already carries all five axes — do NOT
 build a new `DeviceMesh`. Converge the train side onto it.
 
 `crates/infer-topo/src/topology.rs`:
-- `struct MultiAxisConfig` (L12): `tp_size` L13, `pp_size` L14, `ep_size` L15,
-  `attn_dp_size` L16, `attn_cp_size` L17, `moe_dp_size` L18. `world_size()=tp*pp`
-  (L242); `validate()` (L201) enforces `tp % (attn_dp*attn_cp) == 0` (L219) and
-  `tp % (ep*moe_dp) == 0` (L228).
-- `struct RankCoord` (L275): per-rank `tp_rank`/`pp_rank`/`attn_tp_rank`/
-  `attn_dp_rank`/`attn_cp_rank`/`moe_tp_rank`/`moe_ep_rank`/`moe_dp_rank`
-  (L277-284). CP rank math at L303.
-- Group builders (rank-list `Vec<Vec<usize>>`, pure math, no NCCL types):
-  `build_tp_groups` L325, `build_pp_groups` L334, `build_attn_cp_groups` L342,
-  `build_attn_tp_groups` L363, `build_attn_dp_groups` L382, `build_moe_dp_groups`
-  L426, `build_moe_ep_groups` L448, `build_moe_tp_groups` L468.
+- `struct MultiAxisConfig` (L11): `tp_size`, `pp_size`, `attn_dp_size`, `attn_cp_size`. `world_size()=tp*pp`; `validate()` enforces `tp % (attn_dp*attn_cp) == 0`.
+- `struct RankCoord` (L116): per-rank `attn_tp_rank`/`attn_dp_rank`/`attn_cp_rank`.
+- Group builders (rank-list `Vec<Vec<usize>>`, pure math, no NCCL types): `build_tp_groups` L145, `build_attn_cp_groups` L154, `build_attn_tp_groups` L175.
+
+The EP/moe_dp axis was removed from the mesh in the 2026-08 sweep (expert
+placement follows the TP worker set); the MoE sub-mesh language in this doc is
+historical.
 
 This is Megatron's actual shape, and it is already correct: **attention** shards
 on `attn_{dp,cp,tp}`; **MoE FFN** shards on `moe_{dp,ep,tp}` — two sub-meshes over
@@ -72,17 +67,15 @@ may depend on it without breaching backend isolation.
 
 | Axis | Train-side state (file:line) | Gap to "supported" |
 |---|---|---|
-| **CP** | ring attention on LOCAL shards: `cp.is_enabled()` branch qwen35.rs → `cp_causal_sdpa(q,k,v,cp.size,cp.rank,Some(positions))` on `[b,heads,seq/N,hd]`, never materializing full KV. Sequence sharded **zigzag** load-balanced (`SeqShard.shard`, front+back chunk pair); `positions` are threaded from opd.rs (the shard's absolute rows, the same slice that builds RoPE cos/sin), so the ring masks by true absolute position with one source of truth — not re-derived from `(seq_len, cp)`. Linear-attn CP is **all-to-all-to-head** (`linear_attention_core_cp`, `forward_linear_attention` `cp` param): full-seq recurrence per rank on 1/N value-heads, exact | multi-rank ring/all-to-all transport; device per-row-position ring kernel (zigzag on GPU); >65535 local-seq parity; load-balance c-sweep |
+| **CP** | ring attention on LOCAL shards: `cp.is_enabled()` branch qwen35.rs → `cp_causal_sdpa(q,k,v,cp.size,cp.rank,Some(positions))` on `[b,heads,seq/N,hd]`, never materializing full KV. Sequence sharded **zigzag** load-balanced (`SeqShard.shard`, front+back chunk pair); `positions` are threaded from opd.rs (the shard's absolute rows, the same slice that builds RoPE cos/sin), so the ring masks by true absolute position with one source of truth — not re-derived from `(seq_len, cp)`. Linear-attn CP is a **chunked zigzag ring carry** (`linear_attention_core_cp`, `forward_linear_attention` `cp` param): the recurrent state is carried chunk-by-chunk over a ring, exact | multi-rank ring transport; device per-row-position ring kernel (zigzag on GPU); >65535 local-seq parity; load-balance c-sweep |
 | **TP** | attention-TP proven `a2_qwen35_tp_lora_fd.rs` L181/L191; `tensor_parallel::maybe_all_reduce` | **MoE MLP rejects TP** ("requires single-rank TP" L1256/L1282/L1319). MoE-TP unbuilt. |
 | **EP** | **train side has none.** DeepEP dispatch/combine exist only in *serving* (`infer-cuda/moe.rs` `dsv4_moe_forward_deepep` L3781); train MoE uses grouped-linear on token rows (qwen35.rs L1355-1401), no all-to-all | Bring differentiable all-to-all into train MoE + its backward. **Real work, not wiring.** |
 | **DP** | CP's post-backward weight all-reduce (`all_reduce_cp_grads`, opd.rs L3238) is already DP-semantics | Batch-shard dataloader on `attn_dp_size>1`. Near-free once mesh drives it. |
 | **PP** | none | 1F1B over layers. Worst fit for single-pass OPD writeback (no throughput loop to amortize the bubble). Last. |
 
 Reusable autograd primitives that already exist (differentiable, with adjoints):
-`all_gather_seq` (collective.rs L94), `reduce_scatter_sum` (L170),
-`all_reduce_sum` (L14), `all_to_all` (seq↔head swap, self-adjoint with axes
-swapped — the linear-attn CP transport); `cp_causal_sdpa` + its device ring
-(`ring_attention.rs`, `ring_block_attention.cu`); NCCL peer
+`all_gather_seq` (collective.rs L94), `all_reduce_sum` (L14); the ring
+collectives live in `ring_attention.rs` / `ring_block_attention.cu`; NCCL peer
 `send`/`recv`/`group_start`/`group_end` (collective.rs) feeding `ring_send_recv_kv`.
 
 ## 2. Convergence (delete-style — the structural cost we pay once)
@@ -104,15 +97,15 @@ pair mismatched shapes and NCCL wedges silently. The group builders already retu
 Seam converges once; axes land only as they become the binding constraint. "Five
 axes supported" = **mesh-pluggable**, not five impls written at once.
 
-- **P0 — CP ring + zigzag + linear-attn all-to-all.** Not a memory wall (the
+- **P0 — CP ring + zigzag + linear-attn ring carry.** Not a memory wall (the
   ladder disproved that) but the correctness + load-balance core, and the fix for
-  the >65535 local-seq boundary. Ring, the `all_to_all` primitive, zigzag
-  `SeqShard`, and the linear-attn CP wrapper are all built + CPU-gated; multi-rank
-  pod parity pending throughout.
+  the >65535 local-seq boundary. Ring, zigzag `SeqShard`, and the linear-attn CP
+  chunked ring carry are all built + CPU-gated; multi-rank pod parity pending
+  throughout.
 - **P1 — MoE-TP + DP.** TP unblocks the rejected MoE path (L1256); DP is near-free
   batch sharding on the same mesh.
-- **P2 — EP (train all-to-all) + PP.** Both are real builds, not wiring; neither
-  is a 256K wall for a 27 GB-weight LoRA run, so they follow.
+- **P2 — PP.** A real build, not wiring; not a 256K wall for a
+  27 GB-weight LoRA run, so it follows.
 
 Per-axis "done =": N=1 degenerates bit-identical (identity collective) **and** an
 N≥2 parity within the correct-inference envelope (not byte-identity — MoE is
@@ -162,6 +155,13 @@ per-row absolute position (`cp_causal_sdpa` takes `positions`, `ring_forward_til
 are independent, no causal imbalance to balance.
 
 ### 4.3 Linear attention — all-to-all to the head axis (Megatron gated-delta-net)
+
+> **Superseded (2026-08).** The `all_to_all` op and the all-to-all-to-head
+> wrapper were deleted in the dead-code sweep. The live linear-attn CP path is
+> `linear_attention_core_cp` as a chunked zigzag ring carry (`cp_chunked_forward`,
+> `CpChunkGeometry` with `recv_from`/`send_to` peers,
+> `BackwardOp::LinearAttentionCpChunked`). The section below is the original
+> design rationale, kept for the Megatron calibration record.
 
 The gated-delta recurrence is Markovian along the sequence: a contiguous shard
 would need rank r's state seeded by rank r−1's, which serializes the ranks and
@@ -257,10 +257,10 @@ Named so "five axes supported" doesn't silently omit them; none blocks P0.
 axes (per-axis table up top). CP's ring flash-2 fwd-merge/finalize/bwd
 (`ring_block_attention.cu`) is wired in `qwen35.rs` with the old all-gather
 deleted; the sequence shards **zigzag** load-balanced (`SeqShard`, §4.2) with the
-ring masking by per-row absolute position; linear-attn CP is **all-to-all-to-head**
-(`linear_attention_core_cp`, §4.3) over the `all_to_all` (self-adjoint seq↔head,
-world==1 identity) + `cat` re-fuse ops. Plus MoE-TP, EP dispatch/combine adjoint,
-DP global-mean, PP layer partition.
+ring masking by per-row absolute position; linear-attn CP is a **chunked zigzag
+ring carry** (`linear_attention_core_cp`, §4.3) over the ring transport. Plus
+MoE-TP, DP global-mean. (EP dispatch/combine adjoint and PP layer partition
+were removed with the EP axis in the 2026-08 sweep.)
 
 **Pending-remote (the gating work now):** the multi-rank NCCL data-planes and
 model-level parity — ring `ring_send_recv_kv` + all-to-all transport, the device
