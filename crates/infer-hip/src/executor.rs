@@ -195,13 +195,7 @@ pub fn load_dsv4_gguf(
             }
             Err(_) => requested_pages, // probe miss → pure requested floor, no num_slots multiply
         };
-        let pool = HipKvPool::new(
-            &config,
-            num_slots,
-            total_pages,
-            DEFAULT_PAGE_SIZE,
-            max_seq_len,
-        );
+        let pool = HipKvPool::new(num_slots, total_pages, DEFAULT_PAGE_SIZE);
         let tensors = crate::loader::upload::upload_plan(&gguf, &plan)
             .map_err(|e| anyhow!("DSv4 GGUF upload failed: {e}"))?;
         let model = crate::model::HipDsv4Model::new(
