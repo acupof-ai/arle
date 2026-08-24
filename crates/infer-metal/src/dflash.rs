@@ -1227,7 +1227,8 @@ pub(crate) fn prepare_draft_block(
         //
         // DSPARK_NO_MARKOV=1: skip the Markov correction and use raw backbone
         // argmax — diagnostic for whether the head helps or hurts on 4-bit.
-        let no_markov = std::env::var("DSPARK_NO_MARKOV").is_ok();
+        static NO_MARKOV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_markov = *NO_MARKOV.get_or_init(|| std::env::var("DSPARK_NO_MARKOV").is_ok());
         let vocab = *draft_logits
             .shape()
             .get(1)
@@ -1247,9 +1248,8 @@ pub(crate) fn prepare_draft_block(
                     i
                 );
             }
-            let actual_bs = runtime.block_size;
-            let draft_tokens = &draft_tokens[..actual_bs];
-            let mut block = Vec::with_capacity(actual_bs + 1);
+            let draft_tokens = &draft_tokens[..runtime.block_size];
+            let mut block = Vec::with_capacity(runtime.block_size + 1);
             block.push(current_token);
             block.extend(draft_tokens.iter().map(|&t| t as u32));
             draft_state.trim(runtime.block_size);
