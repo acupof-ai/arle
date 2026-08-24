@@ -46,9 +46,6 @@ pub enum WeightFormat {
     Fp4E2M1Group,
 }
 
-/// Shape/layout constraints expected by the matching CUDA kernels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-
 impl WeightFormat {
     #[must_use]
     pub fn is_quantized(self) -> bool {
