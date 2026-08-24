@@ -334,8 +334,6 @@ pub(crate) enum CudaModelKind {
     Qwen35,
     /// DeepSeek-V4-Flash (multi-GPU only).
     Dsv4,
-    /// DiffusionGemma/Gemma4 block-diffusion checkpoint. Not a CUDA AR path.
-    DiffusionGemma,
     /// Vanilla public Qwen3-MoE (`model_type=qwen3_moe`,
     /// `Qwen3MoeForCausalLM`) — NOT ARLE's Qwen3.5/3.6 (`qwen3_5*`). The
     /// qwen35 CUDA loader is hardwired for gated-attn + `model.language_model`
@@ -368,13 +366,6 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     // the expert-count→Qwen35 branch below, else GLM's 256 experts misroute.
     if model_type == "glm_moe_dsa" || arch_contains("GlmMoeDsa") {
         return CudaModelKind::Dsv4;
-    }
-    if model_type == "diffusion_gemma"
-        || model_type == "gemma4"
-        || arch_contains("DiffusionGemma")
-        || arch_contains("Gemma4")
-    {
-        return CudaModelKind::DiffusionGemma;
     }
     // Vanilla public Qwen3-MoE (`model_type=qwen3_moe`) is a different schema
     // and a different forward from ARLE's Qwen3.5/3.6 (`qwen3_5*`): no gated
@@ -638,8 +629,7 @@ mod backend {
             match self {
                 Self::Cuda(engine) => engine.forward_training_taps(input_ids, target_layer_ids),
                 #[cfg(feature = "metal")]
-                Self::Metal(_)
-                | Self::MetalDeepseekOcr(_) => {
+                Self::Metal(_) | Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("forward_training_taps is CUDA-only")
                 }
                 #[cfg(feature = "hip")]
@@ -658,8 +648,7 @@ mod backend {
             match self {
                 Self::Cuda(engine) => engine.update_dspark_markov_weights(w1.to_vec(), w2.to_vec()),
                 #[cfg(feature = "metal")]
-                Self::Metal(_)
-                | Self::MetalDeepseekOcr(_) => {
+                Self::Metal(_) | Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("update_dspark_markov_weights is CUDA-only")
                 }
                 #[cfg(feature = "hip")]
@@ -753,7 +742,9 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+                Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("offload_engine_weights is only available on CUDA")
+                }
                 #[cfg(feature = "metal")]
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
@@ -816,7 +807,9 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+                Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("reload_engine_weights is only available on CUDA")
+                }
                 #[cfg(feature = "metal")]
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
@@ -1500,7 +1493,7 @@ mod backend {
         if matches!(kind, CudaModelKind::Qwen35 | CudaModelKind::Dsv4) {
             return paged_pool_pages.max(1);
         }
-        // DiffusionGemma | Qwen3MoeUnsupported | DenseQwen3Unsupported
+        // Qwen3MoeUnsupported | DenseQwen3Unsupported
         let capacity_tokens = config.total_pages.saturating_mul(ps);
         capacity_tokens.div_ceil(ps).max(config.total_pages)
     }
@@ -1629,13 +1622,6 @@ mod backend {
         // land in the statics before any CUDA context/executor exists.
         infer_cuda::apply_runtime_flags(&config.cuda);
         let kind = detect_cuda_model_kind(model_path)?;
-        if matches!(kind, CudaModelKind::DiffusionGemma) {
-            anyhow::bail!(
-                "DiffusionGemma CUDA loading is not wired: the repository has the \
-                 backend-neutral block-diffusion generate loop, but no CUDA Gemma4/\
-                 DiffusionGemma forward path or weight mapping"
-            );
-        }
         if matches!(kind, CudaModelKind::Qwen3MoeUnsupported) {
             anyhow::bail!(
                 "vanilla Qwen3-MoE (Qwen3MoeForCausalLM) is not supported on the \
@@ -1776,9 +1762,7 @@ mod backend {
                 config.dspark_sps_bias_ms,
                 config.dspark_sps_row_ms,
             )?,
-            CudaModelKind::DiffusionGemma
-            | CudaModelKind::Qwen3MoeUnsupported
-            | CudaModelKind::DenseQwen3Unsupported => {
+            CudaModelKind::Qwen3MoeUnsupported | CudaModelKind::DenseQwen3Unsupported => {
                 unreachable!("checked before CUDA executor build")
             }
         };
