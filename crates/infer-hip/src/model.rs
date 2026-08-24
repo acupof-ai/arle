@@ -20,9 +20,9 @@
 //!   → shared expert (same shape) → add → mhc_post
 //! } → mhc_head_pre → rms_norm(output_norm) → gemv(lm_head) → host f32 logits.
 //!
-//! §0.1 mutated-buffer enumeration: see [`ATTENTION_LAUNCHER_WRITES`]; only
-//! the four ring/compressed families plus the SW window ring persist across
-//! steps — everything else is per-step scratch fully rewritten before read.
+//! §0.1 mutated-buffer discipline: only the four ring/compressed families
+//! plus the SW window ring persist across steps — everything else is per-step
+//! scratch fully rewritten before read.
 //! The CUDA-only `dsv4_update_window_cache` / `arle_dsv4_output_inverse_rope`
 //! launchers are FlashMLA adjuncts (callers at attention.rs:3195/3866) and
 //! never run on this path: SW/hybrid kernels update the ring and inverse-rope
@@ -116,55 +116,6 @@ pub fn validate_matmul_residency<'a>(
     }
     Ok(())
 }
-
-pub struct LauncherWrites {
-    pub launcher: &'static str,
-    pub writes: &'static [&'static str],
-}
-
-/// §0.1 mutated-buffer table for every attention-path launcher this lane
-/// uses, sourced from the CUDA call sites (attention.rs:4372 prepare_qk,
-/// :4472 swa, :5024 compressor ×2 — main + indexer, :5224 csa_select,
-/// :4735 hybrid). `slot.*` buffers persist across steps; `scratch.*` are
-/// fully rewritten before every read.
-pub const ATTENTION_LAUNCHER_WRITES: &[LauncherWrites] = &[
-    LauncherWrites {
-        launcher: "dsv4_prepare_qk_start_pos_ptr_cuda",
-        writes: &["scratch.q_prepared", "scratch.k_prepared"],
-    },
-    LauncherWrites {
-        launcher: "dsv4_swa_attention_start_pos_ptr_cuda(write_window_cache=1)",
-        writes: &["scratch.attn_local", "slot.sw_window_ring"],
-    },
-    LauncherWrites {
-        launcher: "dsv4_compressor_update_start_pos_ptr_cuda(compressor)",
-        writes: &[
-            "slot.compressor.pending_kv",
-            "slot.compressor.pending_score",
-            "slot.compressor.prev_overlap_kv",
-            "slot.compressor.prev_overlap_score",
-            "slot.compressor.compressed",
-        ],
-    },
-    LauncherWrites {
-        launcher: "dsv4_compressor_update_start_pos_ptr_cuda(indexer)",
-        writes: &[
-            "slot.indexer.pending_kv",
-            "slot.indexer.pending_score",
-            "slot.indexer.prev_overlap_kv",
-            "slot.indexer.prev_overlap_score",
-            "slot.indexer.compressed",
-        ],
-    },
-    LauncherWrites {
-        launcher: "dsv4_csa_select_start_pos_ptr_cuda",
-        writes: &["scratch.selected"],
-    },
-    LauncherWrites {
-        launcher: "dsv4_hybrid_attention_start_pos_ptr_cuda(write_window_cache=1)",
-        writes: &["scratch.attn_local", "slot.sw_window_ring"],
-    },
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompressorOffsets {

@@ -111,13 +111,6 @@ impl Dsv4SlotShape {
     }
 }
 
-#[cfg(feature = "hip")]
-struct SlotDeviceState {
-    /// One bf16 arena per slot covering all per-layer buffers (laid out in
-    /// `Dsv4SlotShape::layers` order). Allocation only — pending-remote.
-    _arena: hip_sys::DeviceBuffer,
-}
-
 pub struct HipKvPool {
     page_size: usize,
     total_pages: usize,
@@ -126,19 +119,10 @@ pub struct HipKvPool {
     slot_len: Vec<usize>,
     slot_epoch: Vec<u64>,
     page_refs: HashMap<u32, u32>,
-    shape: Dsv4SlotShape,
-    #[cfg(feature = "hip")]
-    slot_device: Vec<Option<SlotDeviceState>>,
 }
 
 impl HipKvPool {
-    pub fn new(
-        config: &DeepSeekV4Config,
-        num_slots: usize,
-        total_pages: usize,
-        page_size: usize,
-        max_seq_len: usize,
-    ) -> Self {
+    pub fn new(num_slots: usize, total_pages: usize, page_size: usize) -> Self {
         let page_size = page_size.max(1);
         let free: Vec<u32> = (0..total_pages as u32).rev().collect();
         Self {
@@ -149,29 +133,7 @@ impl HipKvPool {
             slot_len: vec![0; num_slots],
             slot_epoch: vec![0; num_slots],
             page_refs: HashMap::new(),
-            shape: Dsv4SlotShape::new(config, max_seq_len),
-            #[cfg(feature = "hip")]
-            slot_device: (0..num_slots).map(|_| None).collect(),
         }
-    }
-
-    pub fn slot_shape(&self) -> &Dsv4SlotShape {
-        &self.shape
-    }
-
-    /// Allocate the per-slot device arena sized from the shape. Real run
-    /// pending-remote (#77 on-box).
-    #[cfg(feature = "hip")]
-    pub fn ensure_slot_device(&mut self, slot: usize) -> anyhow::Result<()> {
-        if slot >= self.slot_device.len() {
-            anyhow::bail!("slot {slot} out of range");
-        }
-        if self.slot_device[slot].is_none() {
-            let arena = hip_sys::DeviceBuffer::alloc(self.shape.total_bytes())
-                .map_err(|e| anyhow::anyhow!("slot {slot} arena alloc failed: {e}"))?;
-            self.slot_device[slot] = Some(SlotDeviceState { _arena: arena });
-        }
-        Ok(())
     }
 
     fn pages_for_tokens(&self, tokens: usize) -> usize {
