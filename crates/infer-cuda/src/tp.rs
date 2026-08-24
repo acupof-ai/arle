@@ -194,7 +194,7 @@ impl TpRuntime {
         // `cfg` is identical on every rank, so the skip-if-single-group decision (and
         // thus the `split` collective sequence) matches across ranks — required for
         // `ncclCommSplit` ordering correctness.
-        let cfg = MultiAxisConfig::current_route_from_env_with_defaults(world_size, world_size)
+        let cfg = MultiAxisConfig::current_route_from_env_with_defaults(world_size)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // attn_tp then attn_cp, unconditionally in this order on every rank.

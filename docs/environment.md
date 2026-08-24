@@ -255,8 +255,9 @@ export INFER_CUDA_DEVICE=1 # bind default context to GPU 1
 
 Status: documented contract for the single-node multi-GPU line.
 `INFER_CUDA_DEVICE` remains the default single-rank runtime selector. DeepSeek
-V4 distributed HTTP serving now consumes `INFER_CUDA_DEVICES` and the TP/EP
-axis size overrides below; generic Qwen TP/PP/EP serving remains staged unless
+V4 distributed HTTP serving now consumes `INFER_CUDA_DEVICES` and the TP
+axis size overrides below (expert placement follows the TP worker set);
+generic Qwen TP/PP serving remains staged unless
 a model path explicitly wires the corresponding collectives.
 
 | Variable | Parsed at startup today | Accepted range / format | Current behavior |
@@ -265,22 +266,18 @@ a model path explicitly wires the corresponding collectives.
 | `INFER_CUDA_DEVICES` | yes, by distributed CUDA worker bootstrap | comma-separated ordinals such as `0,1,2,3`; unique, non-empty | Maps local rank threads to CUDA devices for distributed serving. |
 | `INFER_TP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Tensor-parallel axis size. Unset DSv4 HTTP runs use the worker world size. |
 | `INFER_PP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 multi-axis contract. Non-`1` is fail-closed until PP execution is wired. |
-| `INFER_EP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Expert-parallel axis size. DSv4 also accepts `ARLE_EP_SIZE`; unset DSv4 HTTP runs use the worker world size. |
 | `INFER_ATTN_DP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 SGLang-path contract. Non-`1` is fail-closed until attention-DP communicators and token ownership are wired. |
 | `INFER_ATTN_CP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 SGLang-path contract. Non-`1` is fail-closed until attention-CP communicators are wired. |
-| `INFER_MOE_DP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 SGLang-path contract. Non-`1` is fail-closed until MoE-DP token ownership is wired. |
 | `INFER_NCCL_PORT` | no, reserved F1+ | TCP port `1..=65535` | Future convenience alias for `MASTER_PORT` during single-node rendezvous. |
 
 Current DSv4 parser acceptance rules:
 
 - `INFER_CUDA_DEVICES` length must be at least the local rank count.
 - For SGLang-style axes, `world_size = INFER_TP_SIZE * INFER_PP_SIZE`.
- `INFER_ATTN_DP_SIZE * INFER_ATTN_CP_SIZE` must divide `INFER_TP_SIZE`, and
- `INFER_EP_SIZE * INFER_MOE_DP_SIZE` must divide `INFER_TP_SIZE`.
-- Current ARLE DSv4 execution also preserves legacy TP-only and EP-only
- overrides where each of `INFER_TP_SIZE` and `INFER_EP_SIZE` is either `1` or
- the CUDA worker count.
-- Today's executable DSv4 path accepts only global TP/EP-style layouts for
+ `INFER_ATTN_DP_SIZE * INFER_ATTN_CP_SIZE` must divide `INFER_TP_SIZE`.
+- Current ARLE DSv4 execution also preserves the legacy TP-only override
+ where `INFER_TP_SIZE` is either `1` or the CUDA worker count.
+- Today's executable DSv4 path accepts only global TP-style layouts for
  execution. Rich SGLang axes are parsed so that explicit path claims can fail
  closed with a clear error instead of silently running the replicated-token
  route.
