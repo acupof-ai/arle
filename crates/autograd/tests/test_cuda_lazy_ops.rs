@@ -1705,46 +1705,6 @@ fn cuda_sigmoid_backward_device_matches_cpu() {
     );
 }
 
-/// Exp backward parity: consumes the saved output `y = exp(x)`.
-#[test]
-fn cuda_exp_backward_device_matches_cpu() {
-    let Ok(backend) = CudaBackend::new(0) else {
-        eprintln!("skipping cuda_exp_backward_device_matches_cpu: no CUDA device");
-        return;
-    };
-
-    let shape: Vec<usize> = vec![2, 512, 160];
-    let size: usize = shape.iter().product();
-    // Bound x so exp doesn't overflow into the inf band that would make
-    // the parity check pointless (any test value > ~88 returns inf in f32).
-    let x = rng_vec(0xE17, size, 2.0);
-    let y: Vec<f32> = x.iter().map(|&v| v.exp()).collect();
-    let upstream = rng_vec(0xE17_E17, size, 1.0);
-
-    let host_grad: Vec<f32> = y
-        .iter()
-        .zip(upstream.iter())
-        .map(|(&yv, &up)| up * yv)
-        .collect();
-
-    let y_h: DeviceHandle = backend.upload(&y, &shape).expect("upload y");
-    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
-    let grad_h = backend
-        .exp_backward_device(&up_h, &y_h, &shape)
-        .expect("cuda exp_backward_device");
-    backend.eval(&[&grad_h]).expect("cuda eval");
-    let dev_grad = backend.readback(&grad_h).expect("exp_bwd readback");
-
-    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
-    assert!(
-        excess <= 1.0,
-        "exp_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
-         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
-        dev_grad[idx],
-        host_grad[idx]
-    );
-}
-
 /// Mul backward parity: `grad_a = upstream * b`, `grad_b = upstream * a`.
 #[test]
 fn cuda_mul_backward_device_matches_cpu() {

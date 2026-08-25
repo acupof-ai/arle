@@ -1628,13 +1628,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
-    /// Lazy on backends with a native `exp` graph node (Metal: `mlx_exp`).
-    fn exp(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
-        let host = self.readback(x)?;
-        let out = self.exp_forward(&host)?;
-        self.upload(&out, shape)
-    }
-
     /// Elementwise `out = 1 / (1 + exp(-a))`.
     fn sigmoid_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         cpu_sigmoid_forward(a)
@@ -1826,11 +1819,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let src_host = self.readback(src)?;
         let out = self.broadcast_expand_forward(&src_host, src_shape, target_shape)?;
         self.upload(&out, target_shape)
-    }
-
-    /// Elementwise `out = exp(a)`.
-    fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
-        cpu_exp_forward(a)
     }
 
     /// Elementwise `out = -a`.
@@ -2746,34 +2734,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             .iter()
             .zip(upstream_host.iter())
             .map(|(&xv, &up)| up * cpu_sign(xv))
-            .collect();
-        self.upload(&grad, shape)
-    }
-
-    /// Consumes the saved output `y = exp(x)`:
-    /// `grad_x[i] = upstream[i] * y[i]`.
-    ///
-    /// CUDA overrides with a 1D NVRTC kernel.
-    fn exp_backward_device(
-        &self,
-        upstream: &DeviceHandle,
-        y: &DeviceHandle,
-        shape: &[usize],
-    ) -> Result<DeviceHandle> {
-        let upstream_host = self.readback(upstream)?;
-        let y_host = self.readback(y)?;
-        let size = shape_size(shape);
-        if upstream_host.len() != size || y_host.len() != size {
-            return Err(crate::AutogradError::DataLengthMismatch {
-                len: upstream_host.len().min(y_host.len()),
-                shape: shape.to_vec(),
-                size,
-            });
-        }
-        let grad: Vec<f32> = y_host
-            .iter()
-            .zip(upstream_host.iter())
-            .map(|(&yv, &up)| up * yv)
             .collect();
         self.upload(&grad, shape)
     }

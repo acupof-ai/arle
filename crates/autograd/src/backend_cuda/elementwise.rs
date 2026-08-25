@@ -599,23 +599,6 @@ pub(super) fn cuda_abs_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_exp_backward_device(
-    backend: &CudaBackend,
-    upstream: &DeviceHandle,
-    y: &DeviceHandle,
-    shape: &[usize],
-) -> Result<DeviceHandle> {
-    cuda_elementwise_backward_with_saved(
-        backend,
-        upstream,
-        y,
-        shape,
-        "exp_backward_f32",
-        "exp_backward_device",
-    )
-}
-
-#[cfg(not(feature = "no-cuda"))]
 pub(super) fn cuda_mul_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,

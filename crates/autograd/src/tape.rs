@@ -230,7 +230,6 @@ pub enum BackwardOp {
     Mul,
     MulScalar,
     Abs,
-    Exp,
     Sum,
     Matmul,
     MatmulBT,
@@ -277,7 +276,6 @@ impl BackwardOp {
             BackwardOp::Mul => "Mul",
             BackwardOp::MulScalar => "MulScalar",
             BackwardOp::Abs => "Abs",
-            BackwardOp::Exp => "Exp",
             BackwardOp::Sum => "Sum",
             BackwardOp::Matmul => "Matmul",
             BackwardOp::MatmulBT => "MatmulBT",
@@ -743,7 +741,6 @@ impl Tape {
                         ops::mul_scalar_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::Abs => ops::abs_backward(&entry, output_grad_id, store)?,
-                    BackwardOp::Exp => ops::exp_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Sum => ops::sum_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Matmul => ops::matmul_backward(&entry, output_grad_id, store)?,
                     BackwardOp::MatmulBT => ops::matmul_bt_backward(&entry, output_grad_id, store)?,

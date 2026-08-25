@@ -6,7 +6,7 @@
 use autograd::{
     CpuBackend,
     backend::{
-        Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gather_last_dim_forward,
+        Backend, cpu_embedding_forward, cpu_gather_last_dim_forward,
         cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_matmul_bt_forward,
         cpu_matmul_forward, cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward,
         cpu_neg_forward, cpu_rms_norm_forward, cpu_rope_forward, cpu_scatter_add_rows_forward,
@@ -22,7 +22,6 @@ fn _touch_refs() {
     let _ = cpu_log_softmax_forward_last_axis;
     let _ = cpu_mul_forward;
     let _ = cpu_mul_scalar_forward;
-    let _ = cpu_exp_forward;
     let _ = cpu_neg_forward;
     let _ = cpu_silu_forward;
     let _ = cpu_rms_norm_forward;
@@ -580,18 +579,6 @@ fn cuda_backend_mul_scalar_matches_cpu() {
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 #[test]
-fn cuda_backend_exp_matches_cpu() {
-    use autograd::backend::Backend;
-    use autograd::backend_cuda::CudaBackend;
-    let backend = CudaBackend::new(0).expect("cuda ctx");
-    let a = make_rows(&[2, 128], 3);
-    let got = backend.exp_forward(&a).expect("cuda exp");
-    let want = cpu_exp_forward(&a).unwrap();
-    assert_close(&got, &want, 1e-4, "cuda exp");
-}
-
-#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
-#[test]
 fn cuda_backend_neg_matches_cpu() {
     use autograd::backend::Backend;
     use autograd::backend_cuda::CudaBackend;
@@ -749,18 +736,6 @@ fn metal_backend_mul_scalar_matches_cpu() {
         .expect("metal mul_scalar");
     let want = cpu_mul_scalar_forward(&a, -0.5).unwrap();
     assert_close(&got, &want, 1e-6, "metal mul_scalar");
-}
-
-#[cfg(feature = "metal")]
-#[test]
-fn metal_backend_exp_matches_cpu() {
-    use autograd::backend::Backend;
-    use autograd::backend_metal::MetalBackend;
-    let backend = MetalBackend;
-    let a = make_rows(&[2, 128], 3);
-    let got = backend.exp_forward(&a).expect("metal exp");
-    let want = cpu_exp_forward(&a).unwrap();
-    assert_close(&got, &want, 1e-3, "metal exp");
 }
 
 #[cfg(feature = "metal")]
