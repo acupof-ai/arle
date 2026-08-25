@@ -68,15 +68,6 @@ impl CudaGraphState {
         self
     }
 
-    /// Re-arm `n` eager warm runs without dropping the captured graph. Called
-    /// at request boundaries (slot reset): the next step runs eagerly so
-    /// host-side per-request work (ring bootstrap, compressed bulk pack) can
-    /// execute, then replay resumes — capture cost is paid once per slot, not
-    /// once per request.
-    pub fn rearm_warm(&mut self, n: u32) {
-        self.warm_remaining = self.warm_remaining.max(n);
-    }
-
     #[must_use]
     pub fn is_captured(&self) -> bool {
         self.graph.is_some()
@@ -102,10 +93,8 @@ impl CudaGraphState {
         if self.bypass {
             return kernels();
         }
-        // Warm runs take precedence over replay: a captured graph can be
-        // re-armed (`rearm_warm`) so the next call(s) run eagerly — the
-        // per-request boundary hook (slot reset) uses this to run bootstrap /
-        // bulk host work once per request while KEEPING the captured graph.
+        // Warm runs take precedence over replay: the constructor arms one
+        // eager run so lazy first-use initialization lands outside capture.
         if self.warm_remaining > 0 {
             self.warm_remaining -= 1;
             return kernels();
@@ -200,23 +189,6 @@ impl CudaGraphState {
                 .map_err(|e| anyhow::anyhow!("CUDA Graph upload failed: {e}"))?;
         }
         Ok(())
-    }
-}
-
-/// One captured decode graph keyed by its decode batch size. Wraps a
-/// [`CudaGraphState`] so a later stage can carry per-bucket buffers alongside it.
-pub struct CapturedDecodeGraph {
-    pub batch_size: usize,
-    pub state: CudaGraphState,
-}
-
-impl CapturedDecodeGraph {
-    #[must_use]
-    pub fn new(batch_size: usize, stream: Arc<CudaStream>) -> Self {
-        Self {
-            batch_size,
-            state: CudaGraphState::new(stream),
-        }
     }
 }
 

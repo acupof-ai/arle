@@ -130,16 +130,6 @@ pub fn apply_dense_gemm_row_envelope(decode_rows: usize, prefill_rows: usize) {
 }
 
 #[cfg(feature = "cuda")]
-pub fn reset_dsv4_linear_profile() {
-    linear_profile::reset();
-}
-
-#[cfg(feature = "cuda")]
-pub fn print_dsv4_linear_profile(tag: &str) {
-    linear_profile::print_rank0(tag);
-}
-
-#[cfg(feature = "cuda")]
 pub fn reset_dsv4_stage_profile() {
     stage_profile::reset();
 }
