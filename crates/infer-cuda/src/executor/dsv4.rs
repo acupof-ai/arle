@@ -461,110 +461,16 @@ impl Dsv4CudaExecutor {
             return Ok(out);
         }
 
-        // The concurrency gate drafts spec only at or below `--spec-max-batch`;
-        // above it spec is a compute-bound loss and decode takes the plain
-        // batched path that scales.
-        use super::spec_decode::{DecodeRoute, SpecKind, route_decode};
-        let spec_on = self.spec_requested();
-        let any_penalty = batch.rows.iter().any(|row| row.params.has_penalty());
-        // The batched MTP verify commits a device argmax over raw target logits.
-        let all_raw_argmax = batch.rows.iter().all(|row| row.params.is_raw_argmax());
-        let spec_kind = if self.dspark.is_some() {
-            SpecKind::Dspark
-        } else if spec_on {
-            SpecKind::Mtp
-        } else {
-            SpecKind::None
-        };
-        // DSv4 drafts per slot: the sequential draft tax at c>1 exceeds the
-        // batched-verify savings (−32% at c=8, −47.7% at c=16). Pin to c=1.
-        let route = route_decode(
-            spec_kind,
-            batch.rows.len(),
-            crate::runtime_flags::spec_max_batch().min(1),
-            any_penalty,
-        );
-
-        if route == DecodeRoute::Dspark {
-            // The batched verify needs FlashMLA's sparse-prefill chain-verify
-            // lane; without it, per-slot dispatch is correct but slower.
-            if cuda_kernels::HAS_FLASHMLA {
-                let tokens = self.dspark_decode_tokens_batched(&batch.rows)?;
-                let mut out = Vec::with_capacity(batch.rows.len());
-                for (row, toks) in batch.rows.iter().zip(tokens) {
-                    out.extend(
-                        toks.into_iter()
-                            .map(|token| Self::slot_token(row.slot, token)),
-                    );
-                }
-                return Ok(out);
-            }
-            let mut out = Vec::new();
-            for row in &batch.rows {
-                out.extend(self.forward_decode_row(row)?);
-            }
-            return Ok(out);
-        }
-        if route == DecodeRoute::Mtp && all_raw_argmax {
-            // Self-heal an un-seeded / desynced MTP stream (#140): warm-step
-            // EVERY row for one tick to re-seed pending+hidden — cheaper than
-            // splitting the batch, and batched MTP resumes next tick.
-            let needs_seed = batch
-                .rows
-                .iter()
-                .any(|row| !self.mtp_pending_matches(row.slot, row.last_token));
-            if needs_seed {
-                let mut tokens = Vec::with_capacity(batch.rows.len());
-                for row in &batch.rows {
-                    if let Some(pending) = self.spec_slots[row.slot].pending
-                        && pending != row.last_token
-                    {
-                        log::warn!(
-                            "DSv4 MTP batched stream desync (slot {}): pending {pending} != \
-                                 last_token {}; re-seeding",
-                            row.slot,
-                            row.last_token
-                        );
-                    }
-                    let token = self.forward_mtp_warm_step(
-                        row.slot,
-                        &[row.last_token],
-                        row.start_pos,
-                        &row.params,
-                        row.position,
-                        penalty_of(&row.penalty_history, row.penalty_prompt_len),
-                    )?;
-                    tokens.push(Self::slot_token(row.slot, token));
-                }
-                return Ok(tokens);
-            }
-            let committed = self.spec_step_batched(&batch.slot_ids, &batch.start_positions)?;
-            ensure!(
-                committed.len() == batch.rows.len(),
-                "DSv4 batched MTP returned {} chains for {} rows",
-                committed.len(),
-                batch.rows.len()
-            );
-            let tokens: Vec<SlotToken> = batch
-                .slot_ids
-                .iter()
-                .zip(committed)
-                .flat_map(|(&slot, chain)| {
-                    chain
-                        .into_iter()
-                        .map(move |token| Self::slot_token(slot, token))
-                })
-                .collect();
-            return Ok(tokens);
-        }
-
-        // Reached when spec was requested but this batch routed to Plain; drop
-        // the per-row spec state so a later c=1 tick re-seeds cleanly.
-        if spec_on {
+        // B>1 always takes the plain batched path: DSv4 drafts per slot, and
+        // the sequential draft tax at c>1 exceeds the batched-verify savings
+        // (−32% at c=8, −47.7% at c=16). Drop per-row spec state so a later
+        // c=1 tick re-seeds cleanly.
+        if self.spec_requested() {
             for row in &batch.rows {
                 self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
             }
         }
+
         let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
         let penalties: Vec<infer_plan::PenaltyHistory<'_>> = batch
             .rows
