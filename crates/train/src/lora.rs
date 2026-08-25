@@ -412,3 +412,116 @@ pub(crate) fn leak_name(name: String) -> &'static str {
 fn tape_invariant(message: String) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(message.into_boxed_str()))
 }
+
+/// Cadence for LoRA consolidation: fires every K steps, or when the adapter
+/// norm crosses a threshold. Pure host logic — the consolidation itself
+/// (merge + re-quant) is the caller's job.
+pub struct ConsolidationCadence {
+    every_k: Option<usize>,
+    norm_threshold: Option<f32>,
+    step: usize,
+}
+
+impl ConsolidationCadence {
+    #[must_use]
+    pub fn new(every_k: Option<usize>, norm_threshold: Option<f32>) -> Self {
+        Self {
+            every_k,
+            norm_threshold,
+            step: 0,
+        }
+    }
+
+    /// Advance the step counter; returns true when consolidation should fire.
+    pub fn should_consolidate(&mut self, adapter_norm: f32) -> bool {
+        self.step += 1;
+        let k_fire = self.every_k.is_some_and(|k| self.step.is_multiple_of(k));
+        let norm_fire = self.norm_threshold.is_some_and(|t| adapter_norm >= t);
+        k_fire || norm_fire
+    }
+}
+
+/// Snapshot of a base weight tensor's host data, for consolidation rollback.
+/// The merge folds the adapter into the base; if the post-merge gate fails,
+/// `restore` rewinds the base to its pre-merge state.
+pub struct BaseWeightSnapshot {
+    data: Vec<f32>,
+    shape: Vec<usize>,
+}
+
+impl BaseWeightSnapshot {
+    /// Capture the base weight's host data. The tensor must be host-resident.
+    pub fn capture(weight: TensorId, store: &mut TensorStore) -> Result<Self> {
+        let tensor = store
+            .get(weight)
+            .ok_or(AutogradError::InvalidTensorId(weight))?;
+        let shape = tensor.shape.clone();
+        let data = store.to_host(weight)?;
+        Ok(Self { data, shape })
+    }
+
+    /// Restore the base weight to its snapshotted state. Marks the tensor
+    /// dirty so the next device sync refreshes the device copy.
+    pub fn restore(&self, weight: TensorId, store: &mut TensorStore) -> Result<()> {
+        let tensor = store
+            .get_mut(weight)
+            .ok_or(AutogradError::InvalidTensorId(weight))?;
+        if tensor.shape != self.shape {
+            return Err(AutogradError::TapeInvariant(Box::leak(
+                format!(
+                    "BaseWeightSnapshot shape mismatch: live {:?} vs snapshot {:?}",
+                    tensor.shape, self.shape
+                )
+                .into_boxed_str(),
+            )));
+        }
+        tensor.data.copy_from_slice(&self.data);
+        tensor.dirty = autograd::tensor::Dirty::Host;
+        tensor.device_handle = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod consolidation_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn cadence_fires_every_k() {
+        let mut c = ConsolidationCadence::new(Some(3), None);
+        assert!(!c.should_consolidate(0.0));
+        assert!(!c.should_consolidate(0.0));
+        assert!(c.should_consolidate(0.0));
+        assert!(!c.should_consolidate(0.0));
+        assert!(!c.should_consolidate(0.0));
+        assert!(c.should_consolidate(0.0));
+    }
+
+    #[test]
+    fn cadence_fires_on_norm_threshold() {
+        let mut c = ConsolidationCadence::new(None, Some(1.0));
+        assert!(!c.should_consolidate(0.5));
+        assert!(c.should_consolidate(1.0));
+        assert!(c.should_consolidate(2.0));
+    }
+
+    #[test]
+    fn cadence_fires_on_either_condition() {
+        let mut c = ConsolidationCadence::new(Some(10), Some(1.0));
+        assert!(!c.should_consolidate(0.0));
+        assert!(c.should_consolidate(1.5)); // norm fires before K
+        assert!(!c.should_consolidate(0.0));
+    }
+
+    #[test]
+    fn base_weight_snapshot_restore_roundtrip() {
+        let mut store = TensorStore::with_backend(Arc::new(autograd::CpuBackend));
+        let id = store.alloc(Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap());
+        let snap = BaseWeightSnapshot::capture(id, &mut store).unwrap();
+        // Mutate the base (simulating a merge).
+        store.get_mut(id).unwrap().data = vec![10.0, 20.0, 30.0, 40.0];
+        snap.restore(id, &mut store).unwrap();
+        assert_eq!(store.to_host(id).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+}
