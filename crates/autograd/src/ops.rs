@@ -50,7 +50,7 @@ use crate::{
 pub(crate) use activation::{exp_backward, sigmoid_backward, silu_backward};
 pub(crate) use attention::{cat_heads_backward, cat_seq_backward, causal_sdpa_recompute_backward};
 pub(crate) use broadcast::add_broadcast_backward;
-pub(crate) use collective::{all_gather_seq_backward, all_reduce_sum_backward};
+pub(crate) use collective::all_reduce_sum_backward;
 pub(crate) use elementwise::{abs_backward, add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
 pub(crate) use fused_linear_distill::{fused_linear_distill_backward, generalized_jsd_backward};
@@ -77,15 +77,6 @@ pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 
 pub fn all_reduce_sum(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     collective::all_reduce_sum(x, store, tape)
-}
-
-pub fn all_gather_seq(
-    x: TensorId,
-    full_shape: Vec<usize>,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    collective::all_gather_seq(x, full_shape, store, tape)
 }
 
 pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {

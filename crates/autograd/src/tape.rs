@@ -265,7 +265,6 @@ pub enum BackwardOp {
     LinearAttentionCpChunked,
     CausalSdpaRecompute,
     AllReduceSum,
-    AllGatherSeq,
     RingAttention,
     Checkpoint,
     SeqChunkedRecompute,
@@ -309,7 +308,6 @@ impl BackwardOp {
             BackwardOp::LinearAttentionCpChunked => "LinearAttentionCpChunked",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
-            BackwardOp::AllGatherSeq => "AllGatherSeq",
             BackwardOp::RingAttention => "RingAttention",
             BackwardOp::Checkpoint => "Checkpoint",
             BackwardOp::SeqChunkedRecompute => "SeqChunkedRecompute",
@@ -867,9 +865,6 @@ impl Tape {
                     }
                     BackwardOp::AllReduceSum => {
                         ops::all_reduce_sum_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::AllGatherSeq => {
-                        ops::all_gather_seq_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::RingAttention => ops::ring_attention::cp_ring_attention_backward(
                         &entry,
