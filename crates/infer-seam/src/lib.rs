@@ -334,6 +334,13 @@ pub trait BackendExecutor {
         StepLimits::default()
     }
 
+    /// Drop any captured decode graph so the next step re-captures. Called
+    /// inside the re-merge control closure after a live weight update: a
+    /// graph that baked the old weight pointers would replay stale data
+    /// (C1 graph-pointer staleness, #97). Default no-op for backends without
+    /// a captured decode graph.
+    fn invalidate_decode_graph(&mut self) {}
+
     fn stats(&self) -> BackendStats {
         BackendStats::default()
     }
