@@ -27,6 +27,15 @@ fn stats() -> &'static Mutex<BTreeMap<&'static str, Stat>> {
     STATS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+pub(crate) fn reset() {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut guard) = stats().lock() {
+        guard.clear();
+    }
+}
+
 pub(crate) fn profile<T>(
     ctx: &DeviceContext,
     label: &'static str,
