@@ -10,4 +10,4 @@ Copy-paste paths for the public surfaces. Set `ARLE_MODEL` (and `ARLE_BASE_URL`)
 | [`metal_local.sh`](metal_local.sh) | Apple Silicon local serving smoke. |
 | [`train_tiny_fixture.sh`](train_tiny_fixture.sh) | Build and run the canonical tiny train fixture. |
 
-Server-side prerequisite for all of the above: a running `arle serve …` (or `infer …`) instance — see [Quick Start](../README.md#quick-start).
+Server-side prerequisite for all of the above: a running `arle serve …` instance — see [Quick Start](../README.md#quick-start).
