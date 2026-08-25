@@ -1286,26 +1286,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn reduce_scatter_sum_device(
-        &self,
-        x: &DeviceHandle,
-        local_shape: &[usize],
-        axis: CommAxis,
-    ) -> Result<DeviceHandle> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (x, local_shape, axis);
-            todo!(
-                "GPU required: cuda reduce_scatter_sum_device is unavailable under feature no-cuda"
-            )
-        }
-
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_reduce_scatter_sum_device(self, x, local_shape, axis)
-        }
-    }
-
     fn ring_send_recv_kv(
         &self,
         block: &DeviceHandle,

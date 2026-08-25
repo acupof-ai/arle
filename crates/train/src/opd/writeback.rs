@@ -478,8 +478,8 @@ pub fn masked_writeback_step<O: Optimizer>(
         WritebackLoss::Ce => {
             // A CP sequence shard can legitimately own ZERO masked targets (e.g. a
             // prompt-heavy prefix shard), which the fused CE rejects. That rank must
-            // still backprop through `hidden` so the forward's all_gather_seq KV
-            // gather fires its reduce_scatter adjoint — else the CP group deadlocks.
+            // still backprop through `hidden` so the forward's CP ring-attention
+            // KV exchange fires its adjoint — else the CP group deadlocks.
             // A zero loss that depends on hidden (sum·0) yields exactly that: value
             // 0, grad 0, collectives in lockstep, and the post-backward grad
             // all-reduce sums a genuine zero contribution from this rank.

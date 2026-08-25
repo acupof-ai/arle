@@ -1466,29 +1466,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&host, local_shape)
     }
 
-    /// Reduce-scatter sum: sum the full-sequence `[1, S, H]` across ranks, keep
-    /// this rank's `[1, S/N, H]` row slice — the adjoint of `all_gather_seq`.
-    /// `local_shape` is this rank's output shard. Single-rank / CPU / no-communicator
-    /// semantics are identity, so the default re-uploads the (already local) input.
-    fn reduce_scatter_sum_device(
-        &self,
-        x: &DeviceHandle,
-        local_shape: &[usize],
-        axis: CommAxis,
-    ) -> Result<DeviceHandle> {
-        let _ = axis;
-        let host = self.readback(x)?;
-        let size = shape_size(local_shape);
-        if host.len() != size {
-            return Err(crate::AutogradError::DataLengthMismatch {
-                len: host.len(),
-                shape: local_shape.to_vec(),
-                size,
-            });
-        }
-        self.upload(&host, local_shape)
-    }
-
     /// One context-parallel ring step: send this rank's KV block to the next rank
     /// and return the block received from the previous rank (a ring rotation of
     /// `[1, kv_heads, block, head_dim]` blocks). `block_shape` is one block's shape
