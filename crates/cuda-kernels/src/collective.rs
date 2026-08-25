@@ -152,7 +152,7 @@ mod nccl_backend {
     impl NcclBackend {
         /// Construct from an externally-acquired unique_id (rank 0 calls
         /// `ncclGetUniqueId` and broadcasts via the TCP rendezvous in
-        /// `infer::distributed::init_method`).
+        /// `infer-cuda::loader`).
         pub fn init_rank(
             unique_id: nccl::ncclUniqueId,
             world_size: usize,

@@ -47,10 +47,10 @@
 //! - Anything from `super::ffi::*` — the FFI submodule tree is its own
 //!   namespace; consumers that need `extern "C"` symbols use
 //!   `cuda_kernels::ffi::xxx` directly.
-//! - `EngineOptions` / `InferenceEngineOptions` — these are runtime
-//!   configuration types owned by `infer::server_engine`, not kernel types.
+//! - `EngineLoadConfig` / `ServeHttpOptions` — these are runtime
+//!   configuration types owned by `infer-api`, not kernel types.
 //! - Any model-specific state (`Qwen35Model`, etc.) — those are application
-//!   types and stay inside `infer::model::*`.
+//!   types and stay in the backend crates (`infer-cuda` / `infer-metal`).
 
 pub use super::paged_kv::{EVICTED_PAGE, PagedKVPool};
 pub use super::tensor::{
