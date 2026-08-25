@@ -1892,10 +1892,12 @@ mod think_state_tests {
     use super::*;
 
     fn state_with_budget(budget: usize) -> RequestState {
-        let mut sampling = SamplingParams::default();
-        sampling.think_end_token_id = Some(128822);
-        sampling.think_start_token_id = Some(128821);
-        sampling.max_thinking_tokens = Some(budget);
+        let sampling = SamplingParams {
+            think_end_token_id: Some(128822),
+            think_start_token_id: Some(128821),
+            max_thinking_tokens: Some(budget),
+            ..Default::default()
+        };
         RequestState::new(RequestHandle(0), Vec::new(), 100, sampling)
     }
 
