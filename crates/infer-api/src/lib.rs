@@ -85,7 +85,7 @@ pub use serve::{
     feature = "vulkan",
     feature = "cpu"
 ))]
-pub use serve::{ServeThread, bind_and_serve, serve_router_on_thread};
+pub use serve::{ServeThread, serve_router_on_thread};
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
 // the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
