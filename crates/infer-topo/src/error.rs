@@ -12,10 +12,6 @@ impl TopoError {
     pub(crate) fn new(msg: impl Into<String>) -> Self {
         Self(msg.into())
     }
-
-    pub fn message(&self) -> &str {
-        &self.0
-    }
 }
 
 impl fmt::Display for TopoError {

@@ -56,11 +56,6 @@ impl<M> BufferedDiffusionExecutor<M> {
         }
     }
 
-    #[must_use]
-    pub fn into_inner(self) -> M {
-        self.model
-    }
-
     fn config_for_row(
         base: &DiffusionGenerationConfig,
         params: &infer_plan::SamplingParams,
