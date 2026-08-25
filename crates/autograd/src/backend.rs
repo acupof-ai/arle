@@ -713,12 +713,13 @@ pub struct LinearAttentionDeviceBackwardResult {
     pub d_initial_conv_window: Option<DeviceHandle>,
 }
 
-/// Communicator group: `Seq` = CP subgroup, `Expert` = EP group (both == `World`
-/// off a composed mesh).
+/// Communicator group: `Seq` = CP subgroup, `Dp` = DP subgroup, `Expert` = EP
+/// group (all == `World` off a composed mesh).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommAxis {
     World,
     Seq,
+    Dp,
     Expert,
 }
 

@@ -524,7 +524,7 @@ fn do_update<O: autograd::Optimizer>(
         batch, student, all_params, trainable, optimizer, critic, vocab, window, store,
     )?;
     losses.push(report.loss);
-    let mut row = serde_json::json!({
+    let row = serde_json::json!({
         "kind": "update",
         "round": round,
         "preset": preset_name,
