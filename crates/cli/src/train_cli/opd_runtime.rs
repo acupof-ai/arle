@@ -238,12 +238,17 @@ pub(super) fn build_opd_store(
                     let world_rank = train::context_parallel::world_rank(cp, dp);
                     let seq_group =
                         (cp.is_enabled() && dp.is_enabled()).then_some((dp.rank, cp.size, cp.rank));
+                    // DP subgroup: ranks sharing a CP rank (color = cp.rank),
+                    // one per replica. Used by the count/loss reduce (#224).
+                    let dp_group =
+                        (cp.is_enabled() && dp.is_enabled()).then_some((cp.rank, dp.size, dp.rank));
                     let backend = autograd::backend_cuda::CudaBackend::new_with_mesh(
                         ordinal,
                         uid,
                         cp.size * dp.size,
                         world_rank,
                         seq_group,
+                        dp_group,
                     )
                     .context("init CUDA+NCCL backend for the CP×DP mesh")?;
                     if !backend.has_collective() {

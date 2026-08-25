@@ -233,22 +233,29 @@ fn try_clip_grad_norm_device(
     Ok(true)
 }
 
-/// Sum a per-rank integer count across the collective group (DP global-target
-/// count for the mean-CE `inv_n`). Uploads the local count as a 1-elem tensor,
-/// all-reduce-sums it, reads it back. world==1 is identity (the backend's
-/// `all_reduce_sum_device` no-ops without an NCCL comm), so single-card returns
-/// `local` unchanged — byte-identical.
-pub fn dp_group_sum_count(local: usize, store: &mut TensorStore) -> Result<usize, AutogradError> {
-    dp_group_sum_scalar(local as f32, store).map(|v| v.round() as usize)
+/// Sum a per-rank integer count across the given collective group (DP
+/// global-target count for the mean-CE `inv_n`). Uploads the local count as a
+/// 1-elem tensor, all-reduce-sums it, reads it back. world==1 is identity (the
+/// backend's `all_reduce_sum_device` no-ops without an NCCL comm), so
+/// single-card returns `local` unchanged — byte-identical.
+pub fn dp_group_sum_count(
+    local: usize,
+    store: &mut TensorStore,
+    axis: CommAxis,
+) -> Result<usize, AutogradError> {
+    dp_group_sum_scalar(local as f32, store, axis).map(|v| v.round() as usize)
 }
 
-/// Sum a host scalar over the world comm. Callers on a CP subgroup contribute
-/// from cp rank 0 only so replica-shared values aren't multiplied by cp_size.
-pub fn dp_group_sum_scalar(local: f32, store: &mut TensorStore) -> Result<f32, AutogradError> {
+/// Sum a host scalar over the given comm axis. For a DP-subgroup count
+/// (`CommAxis::Dp`), every rank contributes its local value — the subgroup
+/// reduce sums one CP rank per replica, so no host zero-masking is needed.
+pub fn dp_group_sum_scalar(
+    local: f32,
+    store: &mut TensorStore,
+    axis: CommAxis,
+) -> Result<f32, AutogradError> {
     let handle = store.backend().upload(&[local], &[1])?;
-    let reduced = store
-        .backend()
-        .all_reduce_sum_device(&handle, &[1], CommAxis::World)?;
+    let reduced = store.backend().all_reduce_sum_device(&handle, &[1], axis)?;
     let summed = store.backend().readback(&reduced)?;
     Ok(summed.first().copied().unwrap_or(local))
 }

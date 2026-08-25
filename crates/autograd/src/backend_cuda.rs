@@ -231,6 +231,10 @@ pub struct CudaBackend {
     /// Seq-collective comm: split subgroup when composed, else same as `nccl`.
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl_seq: Option<Arc<NcclBackend>>,
+    /// DP-collective comm: split subgroup when composed, else falls back to
+    /// `nccl` (DP subgroup == World without CP).
+    #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+    nccl_dp: Option<Arc<NcclBackend>>,
 }
 
 impl std::fmt::Debug for CudaBackend {

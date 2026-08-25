@@ -328,13 +328,14 @@ pub fn masked_writeback_step<O: Optimizer>(
 
     // inv_n override under CP or DP (single-card keeps the fused op's local default,
     // byte-identical). CP shares ONE trajectory so total_targets is already global;
-    // DP sums per-replica counts. The count reduce runs over the WORLD comm, so only
-    // cp rank 0 contributes — every cp rank carries the same replica-global count and
-    // would over-count by cp_size (G3: losses came back exactly /world).
+    // DP sums per-replica counts over the DP subgroup (CommAxis::Dp — a real
+    // ncclCommSplit subgroup under DP×CP, World without CP). Every rank contributes
+    // its local count: the DP subgroup holds one CP rank per replica, so no
+    // zero-masking is needed (#224).
     let inv_n_override = if dp.is_enabled() {
-        let contribution = if cp.rank == 0 { total_targets } else { 0 };
         let global =
-            crate::grad_clip::dp_group_sum_count(contribution, store).map_err(OpdError::from)?;
+            crate::grad_clip::dp_group_sum_count(total_targets, store, autograd::CommAxis::Dp)
+                .map_err(OpdError::from)?;
         crate::context_parallel::global_inv_n(global)
     } else if cp.is_enabled() {
         Some(1.0_f32 / total_targets as f32)
@@ -548,7 +549,8 @@ pub fn masked_writeback_step<O: Optimizer>(
     // Grads are unaffected: they already sum to the exact global mean via
     // all_reduce_cp_grads.
     let loss_value = if cp.is_enabled() || dp.is_enabled() {
-        crate::grad_clip::dp_group_sum_scalar(loss_value, store).map_err(OpdError::from)?
+        crate::grad_clip::dp_group_sum_scalar(loss_value, store, autograd::CommAxis::World)
+            .map_err(OpdError::from)?
     } else {
         loss_value
     };

@@ -33,6 +33,8 @@ impl CudaBackend {
                 nccl: None,
                 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
                 nccl_seq: None,
+                #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+                nccl_dp: None,
             })
         }
     }
@@ -72,6 +74,7 @@ impl CudaBackend {
         world_size: usize,
         world_rank: usize,
         seq_group: Option<(usize, usize, usize)>,
+        dp_group: Option<(usize, usize, usize)>,
     ) -> Result<Self> {
         let mut backend = Self::new_with_nccl(ordinal, unique_id, world_size, world_rank)?;
         if let Some((color, size, rank)) = seq_group {
@@ -87,6 +90,18 @@ impl CudaBackend {
                 })?;
             backend.nccl_seq = Some(Arc::new(seq));
         }
+        if let Some((color, size, rank)) = dp_group {
+            let world_comm = backend.nccl.as_ref().expect("new_with_nccl sets nccl");
+            let dp = world_comm
+                .split(color as i32, rank as i32, size, rank)
+                .map_err(|err| {
+                    AutogradError::TapeInvariant(Box::leak(
+                        format!("ncclCommSplit for the dp subgroup failed: {err:#}")
+                            .into_boxed_str(),
+                    ))
+                })?;
+            backend.nccl_dp = Some(Arc::new(dp));
+        }
         Ok(backend)
     }
 
@@ -95,6 +110,9 @@ impl CudaBackend {
         match axis {
             CommAxis::World | CommAxis::Expert => self.nccl.as_ref(),
             CommAxis::Seq => self.nccl_seq.as_ref(),
+            // Falls back to World when no DP split exists (DP subgroup == World
+            // without CP); a composed DP×CP mesh sets nccl_dp via new_with_mesh.
+            CommAxis::Dp => self.nccl_dp.as_ref().or(self.nccl.as_ref()),
         }
     }
 
@@ -118,8 +136,11 @@ impl CudaBackend {
         world_size: usize,
         world_rank: usize,
         seq_group: Option<(usize, usize, usize)>,
+        dp_group: Option<(usize, usize, usize)>,
     ) -> Result<Self> {
-        let _ = (ordinal, unique_id, world_size, world_rank, seq_group);
+        let _ = (
+            ordinal, unique_id, world_size, world_rank, seq_group, dp_group,
+        );
         todo!("GPU required: CudaBackend::new_with_mesh is unavailable under feature no-cuda")
     }
 
