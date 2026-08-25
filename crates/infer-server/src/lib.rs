@@ -20,9 +20,9 @@
 //! and parks on the submit channel (`recv_timeout`) when fully idle instead of
 //! busy-looping.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -120,6 +120,74 @@ fn product_binary_sha256() -> Result<String> {
     Ok(id)
 }
 
+/// Entry queue for live requests: over-capacity submits block until a slot
+/// frees, instead of failing "server is busy". `shutdown` wakes every waiter
+/// so ServeHandle drop can never strand a queued submit.
+pub(crate) struct LiveRequestGate {
+    state: Mutex<GateState>,
+    free: Condvar,
+}
+
+struct GateState {
+    live: usize,
+    max: usize,
+    shutdown: bool,
+}
+
+impl LiveRequestGate {
+    fn new(max: usize) -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                live: 0,
+                max: max.max(1),
+                shutdown: false,
+            }),
+            free: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.shutdown && state.live >= state.max {
+            state = self
+                .free
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        anyhow::ensure!(!state.shutdown, "server is shutting down");
+        state.live += 1;
+        Ok(())
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.live = state.live.saturating_sub(1);
+        self.free.notify_one();
+    }
+
+    fn shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.shutdown = true;
+        self.free.notify_all();
+    }
+
+    fn live_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live
+    }
+}
+
 /// Handle to a running engine thread.
 ///
 /// Owns the engine thread's `JoinHandle` and the submit channel. Dropping the
@@ -142,7 +210,7 @@ pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     /// Backend-requested frontend live-request cap.
     max_live_requests: usize,
     /// Request tickets currently handed out and not yet dropped.
-    live_requests: Arc<AtomicUsize>,
+    live_gate: Arc<LiveRequestGate>,
     _backend: std::marker::PhantomData<fn() -> (E, K)>,
 }
 
@@ -189,7 +257,7 @@ impl Default for ServeShutdown {
 pub struct RequestTicket {
     handle: RequestHandle,
     completion_rx: Receiver<CompletedRequest>,
-    live_requests: Arc<AtomicUsize>,
+    live_gate: Arc<LiveRequestGate>,
 }
 
 impl RequestTicket {
@@ -212,7 +280,7 @@ impl RequestTicket {
 
 impl Drop for RequestTicket {
     fn drop(&mut self) {
-        self.live_requests.fetch_sub(1, Ordering::AcqRel);
+        self.live_gate.release();
     }
 }
 
@@ -260,7 +328,7 @@ where
             join: Some(join),
             counters,
             max_live_requests,
-            live_requests: Arc::new(AtomicUsize::new(0)),
+            live_gate: Arc::new(LiveRequestGate::new(max_live_requests)),
             _backend: std::marker::PhantomData,
         }
     }
@@ -317,15 +385,18 @@ where
             .recv()
             .map_err(|_| anyhow!("engine thread exited before signalling readiness"))?
         {
-            Ok(max_live_requests) => Ok(Self {
-                submit_tx: Some(submit_tx),
-                control_tx: Some(control_tx),
-                join: Some(join),
-                counters,
-                max_live_requests: max_live_requests.max(1),
-                live_requests: Arc::new(AtomicUsize::new(0)),
-                _backend: std::marker::PhantomData,
-            }),
+            Ok(max_live_requests) => {
+                let max_live_requests = max_live_requests.max(1);
+                Ok(Self {
+                    submit_tx: Some(submit_tx),
+                    control_tx: Some(control_tx),
+                    join: Some(join),
+                    counters,
+                    live_gate: Arc::new(LiveRequestGate::new(max_live_requests)),
+                    max_live_requests,
+                    _backend: std::marker::PhantomData,
+                })
+            }
             Err(err) => {
                 let _ = join.join();
                 // {err:#} keeps the full context chain: "{err}" flattened it and
@@ -420,14 +491,14 @@ where
             log::info!(
                 "[serve-submit] mode={mode} handle={} wait_ms={wait_ms:.1} live={} max_live={}",
                 handle.id(),
-                self.live_requests.load(Ordering::Acquire),
+                self.live_gate.live_count(),
                 self.max_live_requests
             );
         }
         Ok(RequestTicket {
             handle,
             completion_rx,
-            live_requests: Arc::clone(&self.live_requests),
+            live_gate: Arc::clone(&self.live_gate),
         })
     }
 
@@ -454,25 +525,11 @@ where
     }
 
     fn acquire_live_request(&self) -> Result<()> {
-        loop {
-            let current = self.live_requests.load(Ordering::Acquire);
-            anyhow::ensure!(
-                current < self.max_live_requests,
-                "server is busy: backend allows at most {} live request(s)",
-                self.max_live_requests
-            );
-            if self
-                .live_requests
-                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
+        self.live_gate.acquire()
     }
 
     fn release_live_request(&self) {
-        self.live_requests.fetch_sub(1, Ordering::AcqRel);
+        self.live_gate.release();
     }
 
     /// Run `f` against the engine-thread-owned [`Engine`] and return its result.
@@ -576,6 +633,8 @@ where
 
 impl<E: BackendExecutor, K: KvPool> Drop for ServeHandle<E, K> {
     fn drop(&mut self) {
+        // Wake every queued submit so it errors instead of blocking forever.
+        self.live_gate.shutdown();
         // Close the submit + control channels so the engine loop can observe
         // shutdown, then join so the engine thread fully drains before we return.
         self.submit_tx.take();
@@ -738,7 +797,7 @@ fn serve_handle_relay_driver<E, K>(
     // Pre-spawn a fixed pool of relay worker threads — one per engine slot.
     // This replaces per-request thread::spawn which created O(c) threads in
     // a burst and triggered ELKEID SIGKILL at c=1024.
-    // Ticket held alongside rx so live_requests is decremented only after the
+    // Ticket held alongside rx so the live-gate slot is released only after the
     // worker finishes, not the moment submit_streaming returns.
     type WorkItem = (
         u64,
@@ -772,7 +831,7 @@ fn serve_handle_relay_driver<E, K>(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&request_id);
-                    // _ticket drops here — live_requests decremented after relay completes
+                    // _ticket drops here — live-gate slot released after relay completes
                 }
             })
             .expect("spawn relay worker");
@@ -912,5 +971,66 @@ fn serve_handle_relay_driver<E, K>(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod live_gate_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn gate_acquires_up_to_capacity() {
+        let gate = LiveRequestGate::new(2);
+        gate.acquire().unwrap();
+        gate.acquire().unwrap();
+        assert_eq!(gate.live_count(), 2);
+        gate.release();
+        gate.acquire().unwrap();
+        assert_eq!(gate.live_count(), 2);
+    }
+
+    #[test]
+    fn gate_queues_over_capacity_until_release() {
+        let gate = Arc::new(LiveRequestGate::new(1));
+        gate.acquire().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let _ = tx.send(gate.acquire().is_ok());
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            rx.try_recv().is_err(),
+            "over-capacity submit must block, not fail"
+        );
+        gate.release();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "waiter unblocks on release"
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn gate_shutdown_wakes_waiters() {
+        let gate = Arc::new(LiveRequestGate::new(1));
+        gate.acquire().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let _ = tx.send(gate.acquire().is_err());
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        gate.shutdown();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "shutdown must wake queued waiters with an error"
+        );
+        waiter.join().unwrap();
     }
 }
