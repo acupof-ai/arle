@@ -128,10 +128,6 @@ kernel_bundle_id() {
     (cd "$ROOT" && kernel_bundle_identity) | cuda_prebuilt_hash_stream
 }
 
-bundle_name() {
-    printf 'arle-kernels-%s-%s.tar.gz\n' "$LANE" "$(kernel_bundle_id)"
-}
-
 write_tree_checksums() {
     local root="$1"
     (

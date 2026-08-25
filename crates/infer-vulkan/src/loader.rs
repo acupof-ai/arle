@@ -87,20 +87,6 @@ impl Qwen35TensorKind {
             Self::FfnGateExps | Self::FfnUpExps | Self::FfnDownExps
         )
     }
-
-    /// RMS-norm weight (1-D, F32) — consumed by the rms_norm kernel.
-    pub fn is_norm(self) -> bool {
-        matches!(
-            self,
-            Self::OutputNorm
-                | Self::AttnNorm
-                | Self::PostAttentionNorm
-                | Self::AttnQNorm
-                | Self::AttnKNorm
-                | Self::SsmNorm
-                | Self::FfnNorm
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -48,21 +48,6 @@ impl TpConfig {
         }
         Ok(())
     }
-
-    /// Primary names match the serving binary; `ARLE_*` aliases keep the
-    /// lower-level runtime scripts usable while DSv4 bring-up is still moving.
-    ///
-    /// # Errors
-    /// Errors on a non-`usize` env value or an invalid `(world_size, rank)` pair.
-    pub fn from_env() -> Result<Self> {
-        Self::from_lookup(|key| std::env::var(key).ok())
-    }
-
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
-        let world_size = parse_parallel_env_usize("INFER_TP_SIZE", None, 1, &mut lookup)?;
-        let rank = parse_parallel_env_usize("INFER_TP_RANK", None, 0, &mut lookup)?;
-        Self::new(world_size, rank)
-    }
 }
 
 impl Default for TpConfig {
@@ -88,11 +73,6 @@ impl ShardingSpec {
     #[must_use]
     pub fn range(&self) -> std::ops::Range<usize> {
         self.offset..self.end()
-    }
-
-    #[must_use]
-    pub fn is_full(&self) -> bool {
-        self.offset == 0 && self.size == self.total
     }
 }
 
