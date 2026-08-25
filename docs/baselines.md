@@ -711,6 +711,63 @@ c=16 produced 131204 errors in 60 s with `[coordinator] lockstep stalled`. The
 TP lockstep proposal path deadlocks at world_size=1 — needs a TP=1 fast path
 before this arm is retried.
 
+## Qwen3.8-27B-Q4_K_M · Radeon 8060S (gfx1151) · Vulkan — STRIX HALO ANCHOR
+
+**`9bbc13eca` (2026-08-26)** — first Vulkan row. Batched coopmat prefill.
+`arle serve --backend vulkan`, `ARLE_VULKAN_PREFILL_CHUNK=256`, greedy.
+
+**Fingerprint additions for this box.** Beyond the usual list, an ARMOURY CRATE
+OPERATING MODE change re-anchors every row here. The same binary on the same
+file reads 37.0 tok/s prefill in Silent and 129.9 in Performance — 3.5x — and
+Silent additionally makes the chunk-width curve go FLAT, which reads as
+"saturated" and is not. Record the mode with every number. All rows below:
+**Performance mode, on AC**, `powercfg` scheme `27fa6203-…`.
+
+| metric | ARLE | llama.cpp `726704a16` | gap |
+| --- | ---: | ---: | ---: |
+| prefill (pp256) | 129.9 tok/s | 250.88 ± 2.91 | **1.93x** |
+| decode (tg128) | 8.81 tok/s | 12.50 ± 0.02 | **1.42x** |
+
+Same box, same GGUF, same Vulkan driver (26.7.1 LLPC), same session.
+llama.cpp run as `llama-bench -p 256,512 -n 128 -ngl 99 -fa 1`.
+
+Decode roofline is 256 GB/s ÷ 15.93 GiB = **15.0 tok/s** at one token per weight
+sweep. ARLE is at **59%** of it, llama.cpp at **83%** — so the decode gap is real
+headroom, not a wall.
+
+Prefill by chunk width (Performance; rises monotonically, do not read the Silent
+sweep which was flat):
+
+| width | 32 | 64 | 96 | 128 | 256 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tok/s | 86.9 | 113.4 | 113.9 | 124.3 | 125.9 |
+
+GEMM route A/B at width 256: coopmat 129.9 vs `mul_mmq` 81.2 = **1.60x**, routes
+agree token-for-token.
+
+### Device budget (this box, measured `vulkaninfo`)
+
+| heap | size | budget free | flags |
+| --- | ---: | ---: | --- |
+| 0 | 37.22 GiB | 35.36 GiB | (host) |
+| 1 | **74.43 GiB** | 70.71 GiB | DEVICE_LOCAL |
+
+An earlier entry recorded 63.6 GB unified; the device-local heap is 74.43 GiB.
+This is what decides whether a 63.65 GiB checkpoint fits.
+
+### llama.cpp reference rows on this box (not ARLE — competitor anchors)
+
+| model | size | pp512 | tg128 |
+| --- | ---: | ---: | ---: |
+| qwen35 27B Q8_0 (dense) | 26.62 GiB | 140.96 ± 4.32 | 7.24 ± 0.02 |
+| qwen35moe 35B.A3B Q4_K_M | 20.60 GiB | 822.71 ± 41.05 | 47.29 ± 0.41 |
+| qwen35moe 122B.A10B Q4_K_M | 63.65 GiB | 200.28 ± 9.04 | 23.41 ± 0.19 |
+
+The 122B row is the target for the next ARLE arch (`qwen35moe`, 256 experts /
+8 active). It fits the 74.43 GiB device-local heap with ~7 GiB headroom.
+
+---
+
 ---
 
 # Training baselines — OPD writeback
