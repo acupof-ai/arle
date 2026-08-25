@@ -376,6 +376,9 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
         self.serve.run_on_engine(move |engine| {
             engine.executor_mut().remerge_student_lora(update)?;
             engine.invalidate_prefix_cache();
+            // The captured decode graph baked the old weight pointers; drop it
+            // so the next step re-captures against the merged weights (#97 C1).
+            engine.executor_mut().invalidate_decode_graph();
             Ok(())
         })?
     }

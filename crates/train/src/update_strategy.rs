@@ -690,3 +690,111 @@ fn update_ce<O: Optimizer>(
         ..UpdateReport::default()
     })
 }
+
+/// Streaming channel for live agent trajectories into the OPD data buffer
+/// (#97 4b). The agent/tools side emits [`ScoredTrajectory`]s; the OPD loop
+/// drains them into a training batch.
+pub struct TrajectoryChannel {
+    tx: std::sync::mpsc::SyncSender<ScoredTrajectory>,
+    rx: std::sync::mpsc::Receiver<ScoredTrajectory>,
+}
+
+impl Default for TrajectoryChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrajectoryChannel {
+    #[must_use]
+    pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+        Self { tx, rx }
+    }
+
+    /// Sending half — cloneable so multiple agent tasks can emit.
+    #[must_use]
+    pub fn emitter(&self) -> TrajectoryEmitter {
+        TrajectoryEmitter {
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Drain all currently-queued trajectories into a batch (up to `max`).
+    /// Non-blocking: returns an empty vec when the channel is idle.
+    pub fn drain_batch(&self, max: usize) -> Vec<ScoredTrajectory> {
+        let mut batch = Vec::new();
+        while batch.len() < max {
+            match self.rx.try_recv() {
+                Ok(traj) => batch.push(traj),
+                Err(_) => break,
+            }
+        }
+        batch
+    }
+}
+
+/// Sending half of a [`TrajectoryChannel`].
+pub struct TrajectoryEmitter {
+    tx: std::sync::mpsc::SyncSender<ScoredTrajectory>,
+}
+
+impl TrajectoryEmitter {
+    /// Emit a trajectory. Blocks if the channel buffer is full (backpressure
+    /// on the agent side).
+    pub fn emit(&self, traj: ScoredTrajectory) -> Result<()> {
+        self.tx.send(traj).map_err(|_| {
+            OpdError::InvalidInput("TrajectoryChannel receiver dropped".to_string())
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod trajectory_channel_tests {
+    use super::*;
+
+    fn dummy_trajectory(reward: f32) -> ScoredTrajectory {
+        ScoredTrajectory {
+            prompt_ids: vec![1, 2, 3],
+            response_ids: vec![4, 5],
+            response_mask: vec![1, 1],
+            reward,
+            behavior_logprobs: None,
+            group_id: 0,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn drain_collects_emitted_trajectories() {
+        let ch = TrajectoryChannel::new();
+        let emitter = ch.emitter();
+        emitter.emit(dummy_trajectory(1.0)).unwrap();
+        emitter.emit(dummy_trajectory(2.0)).unwrap();
+        let batch = ch.drain_batch(8);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].reward, 1.0);
+        assert_eq!(batch[1].reward, 2.0);
+    }
+
+    #[test]
+    fn drain_respects_max() {
+        let ch = TrajectoryChannel::new();
+        let emitter = ch.emitter();
+        for _ in 0..5 {
+            emitter.emit(dummy_trajectory(1.0)).unwrap();
+        }
+        let batch = ch.drain_batch(3);
+        assert_eq!(batch.len(), 3);
+        // Remaining 2 still queued.
+        let rest = ch.drain_batch(8);
+        assert_eq!(rest.len(), 2);
+    }
+
+    #[test]
+    fn drain_empty_channel_returns_empty() {
+        let ch = TrajectoryChannel::new();
+        assert!(ch.drain_batch(8).is_empty());
+    }
+}
