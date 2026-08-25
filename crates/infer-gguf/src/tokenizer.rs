@@ -140,6 +140,19 @@ impl GgufTokenizer {
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.inner.id_to_token(id)
     }
+
+    /// Hand the reconstructed [`Tokenizer`] to a caller that needs the real
+    /// thing rather than this wrapper's narrow encode/decode pair — the serving
+    /// tokenizer wraps it in its own chat-template machinery, and the grammar
+    /// compiler needs `get_vocab`.
+    ///
+    /// Consuming rather than borrowing: the wrapper's remaining fields are the
+    /// special-token ids, which the caller reads off before converting, and a
+    /// half-moved wrapper is a worse API than a move.
+    #[must_use]
+    pub fn into_tokenizer(self) -> Tokenizer {
+        self.inner
+    }
 }
 
 fn str_array(g: &GgufFile, key: &str) -> Result<Vec<String>> {

@@ -10,7 +10,7 @@
 //! by magic); only the pre-v2 v1 used u32 lengths and is unsupported.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
@@ -144,6 +144,12 @@ impl GgmlType {
             Self::Q6K => 210,
             Self::Q8K => 292,
             Self::Iq2Xxs => 66,
+            // block_mxfp4 { uint8_t e /* E8M0 */; uint8_t qs[QK_MXFP4/2] }
+            // with QK_MXFP4 = 32 (ggml-common.h l.205-209 static_assert).
+            // Unsloth's "UD-Q*_XL" dynamic quants put the routed experts in
+            // MXFP4, so this is 90% of a 122B-A10B checkpoint's elements, not a
+            // corner case.
+            Self::Mxfp4 => 17,
             _ => return None,
         })
     }
@@ -301,19 +307,121 @@ impl<'a> Reader<'a> {
 }
 
 #[derive(Debug)]
-pub struct GgufFile {
+/// One physical `.gguf` file's weight blob. A single-file checkpoint has
+/// exactly one of these; a split checkpoint has `split.count` of them.
+struct Shard {
     mmap: memmap2::Mmap,
+    /// Where this shard's tensor data begins, after its own header + padding.
+    /// Split shards each carry a full GGUF header, so this is per-shard and
+    /// NOT a property of the logical model.
+    data_start: usize,
+}
+
+/// Sibling path for part `no` (0-based) of a `count`-way split.
+///
+/// llama.cpp's naming is `<base>-<NNNNN>-of-<NNNNN>.gguf`, 1-based and
+/// zero-padded to five digits. Rewriting only the matched suffix keeps any
+/// other hyphens in the base name (`...-UD-Q4_K_XL-00001-of-00003.gguf`)
+/// intact. Returns `None` when the name does not carry the suffix, which the
+/// caller reports rather than guessing at a filename.
+fn split_part_path(first: &Path, no: u64, count: u64) -> Option<PathBuf> {
+    let name = first.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    // Expect the LAST 17 chars to be "-NNNNN-of-NNNNN".
+    let (base, suffix) = stem.split_at(stem.len().checked_sub(15)?);
+    let (lhs, rhs) = suffix.split_once("-of-")?;
+    let lhs = lhs.strip_prefix('-')?;
+    if lhs.len() != 5
+        || rhs.len() != 5
+        || !lhs.bytes().chain(rhs.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(first.with_file_name(format!("{base}-{:05}-of-{:05}.gguf", no + 1, count)))
+}
+
+pub struct GgufFile {
+    /// Shard 0 is always the file the caller named. For a split checkpoint the
+    /// rest follow in `split.no` order.
+    shards: Vec<Shard>,
     pub version: u32,
     metadata: HashMap<String, GgufValue>,
     tensors: Vec<TensorInfo>,
+    /// Which shard each entry of `tensors` lives in, parallel to `tensors`.
+    /// Kept beside `TensorInfo` rather than inside it: the offset in
+    /// `TensorInfo` is what the file declares, and callers that reason about
+    /// GGUF layout should not have to know the model was split.
+    tensor_shard: Vec<usize>,
     index: HashMap<String, usize>,
     pub alignment: u64,
+    /// Shard 0's data start, retained as public API. For a split checkpoint
+    /// shard 0 typically holds NO tensors (llama.cpp writes all metadata to
+    /// part 1 and the weights to parts 2..N), so this is a header offset, not
+    /// a useful base for tensor addressing — use [`GgufFile::tensor_data`].
     pub data_start: usize,
 }
 
 impl GgufFile {
+    /// Open a checkpoint. If `path` is part of a SPLIT GGUF, the sibling parts
+    /// are opened too and the result behaves as one logical model.
+    ///
+    /// llama.cpp's `gguf-split` writes `<base>-00001-of-0000N.gguf`, putting
+    /// every KV pair in part 1 and every tensor in parts 2..N — part 1 has
+    /// `tensor_count == 0`. Reading only the named file therefore yields a
+    /// model with full metadata and no weights, which surfaces far downstream
+    /// as a confusing "GGUF has neither <arch>.vocab_size nor
+    /// token_embd.weight/output.weight dims". Follow the split here instead.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let mut model = Self::open_one(path)?;
+
+        let shard_count = model
+            .get("split.count")
+            .and_then(GgufValue::as_u64)
+            .unwrap_or(0);
+        if shard_count <= 1 {
+            return Ok(model);
+        }
+        let named_no = model
+            .get("split.no")
+            .and_then(GgufValue::as_u64)
+            .unwrap_or(0);
+        ensure!(
+            named_no == 0,
+            "open the FIRST part of a split GGUF ({}): this is part {} of {}, and only              part 1 carries the model metadata",
+            path.display(),
+            named_no + 1,
+            shard_count
+        );
+
+        let expected_tensors = model
+            .get("split.tensors.count")
+            .and_then(GgufValue::as_u64)
+            .unwrap_or(0);
+        for no in 1..shard_count {
+            let sibling = split_part_path(path, no, shard_count).with_context(|| {
+                format!(
+                    "{} declares split.count={shard_count} but its name does not match the                      -00001-of-{shard_count:05} convention, so the sibling parts cannot be located",
+                    path.display()
+                )
+            })?;
+            let part = Self::open_one(&sibling)
+                .with_context(|| format!("open split part {} of {shard_count}", no + 1))?;
+            model.absorb_shard(part, &sibling)?;
+        }
+        if expected_tensors > 0 {
+            let got = model.tensors.len() as u64;
+            ensure!(
+                got == expected_tensors,
+                "split GGUF {}: assembled {got} tensors but split.tensors.count says                  {expected_tensors}",
+                path.display()
+            );
+        }
+        Ok(model)
+    }
+
+    /// Open exactly one `.gguf` file, following no split.
+    fn open_one(path: &Path) -> Result<Self> {
         let file =
             std::fs::File::open(path).with_context(|| format!("open GGUF {}", path.display()))?;
         // SAFETY: read-only mmap of an immutable model artifact file;
@@ -321,6 +429,42 @@ impl GgufFile {
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("mmap GGUF {}", path.display()))?;
         Self::from_mmap(mmap)
+    }
+
+    /// Fold `part`'s tensors (and its mmap) into `self` as a new shard.
+    ///
+    /// Metadata is NOT merged: the trailing parts carry only the three
+    /// `split.*` keys, and part 1 is authoritative for everything else.
+    fn absorb_shard(&mut self, part: Self, path: &Path) -> Result<()> {
+        let shard = self.shards.len();
+        let Self {
+            shards: part_shards,
+            tensors: part_tensors,
+            data_start: part_data_start,
+            ..
+        } = part;
+        self.shards.push(Shard {
+            mmap: part_shards
+                .into_iter()
+                .next()
+                .expect("a parsed GgufFile always has shard 0")
+                .mmap,
+            data_start: part_data_start,
+        });
+        for tensor in part_tensors {
+            let name = tensor.name.clone();
+            if let Some(&prev) = self.index.get(&name) {
+                bail!(
+                    "split GGUF: tensor {name} appears in shard {} and again in {}",
+                    self.tensor_shard[prev],
+                    path.display()
+                );
+            }
+            self.index.insert(name, self.tensors.len());
+            self.tensors.push(tensor);
+            self.tensor_shard.push(shard);
+        }
+        Ok(())
     }
 
     fn from_mmap(mmap: memmap2::Mmap) -> Result<Self> {
@@ -376,9 +520,10 @@ impl GgufFile {
         );
 
         Ok(Self {
-            mmap,
+            shards: vec![Shard { mmap, data_start }],
             version,
             metadata,
+            tensor_shard: vec![0; tensors.len()],
             tensors,
             index,
             alignment,
@@ -428,23 +573,73 @@ impl GgufFile {
     }
 
     pub fn tensor_data(&self, name: &str) -> Result<&[u8]> {
-        let info = self
-            .tensor(name)
+        let idx = *self
+            .index
+            .get(name)
             .ok_or_else(|| anyhow!("tensor {name} not in GGUF"))?;
+        let info = &self.tensors[idx];
         let len = info.byte_len().ok_or_else(|| {
             anyhow!(
                 "tensor {name}: unpinned dtype {:?} or unaligned ne0",
                 info.ggml_type
             )
         })?;
-        let start = self
+        // `info.offset` is relative to the data blob of the shard the tensor
+        // was declared in, not to the model as a whole.
+        let shard = &self.shards[self.tensor_shard[idx]];
+        let start = shard
             .data_start
             .checked_add(usize::try_from(info.offset).map_err(|_| anyhow!("offset overflow"))?)
             .ok_or_else(|| anyhow!("tensor {name}: offset overflow"))?;
         let end = start
             .checked_add(usize::try_from(len).map_err(|_| anyhow!("len overflow"))?)
-            .filter(|&e| e <= self.mmap.len())
+            .filter(|&e| e <= shard.mmap.len())
             .ok_or_else(|| anyhow!("tensor {name}: data out of file bounds"))?;
-        Ok(&self.mmap[start..end])
+        Ok(&shard.mmap[start..end])
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_part_path;
+    use std::path::{Path, PathBuf};
+
+    /// The real on-box name: the base carries its own hyphens (`-UD-Q4_K_XL`),
+    /// so only the trailing `-NNNNN-of-NNNNN` may be rewritten.
+    #[test]
+    fn rewrites_only_the_split_suffix() {
+        let first = Path::new(r"C:\models\Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf");
+        assert_eq!(
+            split_part_path(first, 1, 3),
+            Some(PathBuf::from(
+                r"C:\models\Qwen3.5-122B-A10B-UD-Q4_K_XL-00002-of-00003.gguf"
+            ))
+        );
+        assert_eq!(
+            split_part_path(first, 2, 3),
+            Some(PathBuf::from(
+                r"C:\models\Qwen3.5-122B-A10B-UD-Q4_K_XL-00003-of-00003.gguf"
+            ))
+        );
+    }
+
+    /// A single-file checkpoint must not be mistaken for part 1 of a split —
+    /// returning `None` makes the caller report the mismatch instead of
+    /// silently probing for a file that was never written.
+    #[test]
+    fn rejects_names_without_the_suffix() {
+        for name in [
+            "model.gguf",
+            "Qwen3.8-27B-Q4_K_M.gguf",
+            "weird-1-of-3.gguf",         // not zero-padded to five
+            "weird-00001-of-3.gguf",     // right-hand side too short
+            "weird-0000X-of-00003.gguf", // non-digit
+        ] {
+            assert_eq!(
+                split_part_path(Path::new(name), 1, 3),
+                None,
+                "{name} should not parse as a split part"
+            );
+        }
     }
 }

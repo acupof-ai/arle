@@ -756,7 +756,6 @@ mod backend {
                 Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("offload_engine_weights is only available on CUDA")
                 }
-                #[cfg(feature = "metal")]
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
                     anyhow::bail!("offload_engine_weights is only available on CUDA")
@@ -821,7 +820,6 @@ mod backend {
                 Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("reload_engine_weights is only available on CUDA")
                 }
-                #[cfg(feature = "metal")]
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
                     anyhow::bail!("reload_engine_weights is only available on CUDA")

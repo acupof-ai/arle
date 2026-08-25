@@ -150,13 +150,32 @@ const VENDORED: &[ShaderSpec] = &[
             ("USE_SUBGROUP_ADD", "1"),
         ],
     },
+    // MXFP4 (E8M0 shared exponent + 16 packed E2M1 nibbles per 32 values,
+    // 17 B/block). Unsloth's "UD-Q*_XL" dynamic quants store the routed
+    // experts and most attention projections in MXFP4 — 90% of a
+    // Qwen3.5-122B-A10B's elements — so without this variant that checkpoint
+    // has no GEMV at all. The vendored shader already carries the
+    // `DATA_A_MXFP4` arms (`mul_mat_vecq_funcs.glsl:19,115,135`,
+    // `types.glsl:1717`), so this is a define, not a new kernel.
+    ShaderSpec {
+        name: "mul_mat_vecq_mxfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_MXFP4", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
     // Fused MoE expert GEMV (`mul_mat_vec_id`) — the same `mul_mat_vecq.comp`
     // body compiled with `MUL_MAT_ID=1`, which swaps the batch-offset push tail
     // for the expert-id contract (`nei0/ne11/expert_i1/nbi1` + a 6th `IDS`
     // binding) so ONE dispatch runs a token through ALL its top-k routed experts
     // (gl_WorkGroupID.y = expert slot, expert_id = data_ids[...]). Collapses the
     // per-layer 8×3 per-expert GEMVs into 3 dispatches. The expert tensors in the
-    // 35B-A3B are Q4_K/Q5_K/Q6_K/Q8_0, so register those four DATA_A variants.
+    // 35B-A3B are Q4_K/Q5_K/Q6_K/Q8_0; the 122B-A10B adds MXFP4.
     ShaderSpec {
         name: "mul_mat_vec_id_q4_k",
         source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
@@ -203,6 +222,22 @@ const VENDORED: &[ShaderSpec] = &[
             ("FLOAT_TYPE", "float"),
             ("FLOAT_TYPEV2", "vec2"),
             ("DATA_A_Q8_0", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
+    // The routed experts themselves. In the 122B-A10B every `ffn_gate_exps` /
+    // `ffn_up_exps` (48 layers) and most `ffn_down_exps` are MXFP4, so this is
+    // the variant the MoE hot path actually dispatches.
+    ShaderSpec {
+        name: "mul_mat_vec_id_mxfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_MXFP4", "1"),
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
             ("MUL_MAT_ID", "1"),

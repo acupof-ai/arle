@@ -83,6 +83,10 @@ pub enum Kernel {
     GemvQ5K,
     GemvQ6K,
     GemvQ8_0,
+    /// MXFP4 (E8M0 exponent + 16 packed E2M1 nibbles per 32 values). Carries
+    /// the routed experts and most attention projections of Unsloth's
+    /// "UD-Q*_XL" dynamic quants — 90% of a Qwen3.5-122B-A10B's elements.
+    GemvMxfp4,
     /// Fused MoE expert GEMV (`mul_mat_vec_id`): one dispatch runs a token
     /// through ALL its top-k routed experts. Same `mul_mat_vecq` body + q8_1
     /// activation as the plain GEMV, but the `MUL_MAT_ID` push tail + a 6th
@@ -91,6 +95,9 @@ pub enum Kernel {
     GemvIdQ5K,
     GemvIdQ6K,
     GemvIdQ8_0,
+    /// The variant the 122B-A10B MoE hot path actually dispatches: every
+    /// `ffn_gate_exps`/`ffn_up_exps` and most `ffn_down_exps` are MXFP4.
+    GemvIdMxfp4,
     /// Batched prefill GEMM (`mul_mmq`): `D[n, m] = A[m, k] · Bᵀ[n, k]` with a
     /// quantized `A` and `block_q8_1_x4` `B` — the SAME activation format the
     /// decode GEMVs consume, so one `QuantizeQ8_1` dispatch feeds both. Tile
@@ -197,10 +204,12 @@ impl Kernel {
         Self::GemvQ5K,
         Self::GemvQ6K,
         Self::GemvQ8_0,
+        Self::GemvMxfp4,
         Self::GemvIdQ4K,
         Self::GemvIdQ5K,
         Self::GemvIdQ6K,
         Self::GemvIdQ8_0,
+        Self::GemvIdMxfp4,
         Self::MmqQ4K,
         Self::MmqQ5K,
         Self::MmqQ6K,
@@ -247,10 +256,12 @@ impl Kernel {
             Kernel::GemvQ5K => "mul_mat_vecq_q5_k",
             Kernel::GemvQ6K => "mul_mat_vecq_q6_k",
             Kernel::GemvQ8_0 => "mul_mat_vecq_q8_0",
+            Kernel::GemvMxfp4 => "mul_mat_vecq_mxfp4",
             Kernel::GemvIdQ4K => "mul_mat_vec_id_q4_k",
             Kernel::GemvIdQ5K => "mul_mat_vec_id_q5_k",
             Kernel::GemvIdQ6K => "mul_mat_vec_id_q6_k",
             Kernel::GemvIdQ8_0 => "mul_mat_vec_id_q8_0",
+            Kernel::GemvIdMxfp4 => "mul_mat_vec_id_mxfp4",
             Kernel::MmqQ4K => "mul_mmq_q4_k",
             Kernel::MmqQ5K => "mul_mmq_q5_k",
             Kernel::MmqQ6K => "mul_mmq_q6_k",
@@ -301,7 +312,9 @@ impl Kernel {
             | Kernel::GemvIdQ4K
             | Kernel::GemvIdQ5K
             | Kernel::GemvIdQ6K
-            | Kernel::GemvIdQ8_0 => SPEC_GEMV_K_Q8_1,
+            | Kernel::GemvIdQ8_0
+            | Kernel::GemvMxfp4
+            | Kernel::GemvIdMxfp4 => SPEC_GEMV_K_Q8_1,
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,

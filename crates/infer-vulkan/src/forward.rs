@@ -1965,6 +1965,7 @@ fn gemv_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
         GgmlType::Q5K => Kernel::GemvQ5K,
         GgmlType::Q6K => Kernel::GemvQ6K,
         GgmlType::Q8_0 => Kernel::GemvQ8_0,
+        GgmlType::Mxfp4 => Kernel::GemvMxfp4,
         other => bail!("{name}: no registered GEMV kernel for packed type {other:?}"),
     })
 }
@@ -1984,6 +1985,7 @@ fn gemv_id_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
         GgmlType::Q5K => Kernel::GemvIdQ5K,
         GgmlType::Q6K => Kernel::GemvIdQ6K,
         GgmlType::Q8_0 => Kernel::GemvIdQ8_0,
+        GgmlType::Mxfp4 => Kernel::GemvIdMxfp4,
         other => bail!("{name}: no registered fused expert GEMV for packed type {other:?}"),
     })
 }

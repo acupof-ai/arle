@@ -184,8 +184,17 @@ pub fn plan_residency(kind: Qwen35TensorKind, ty: GgmlType) -> Residency {
     }
     match ty {
         // Quant tiers with a registered device GEMV stay packed (raw bytes):
-        // K-quants via `mul_mat_vecq`, Q8_0 via `q8_0_gemv`.
-        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0 => Residency::KeepQuant(ty),
+        // K-quants and MXFP4 via `mul_mat_vecq`, Q8_0 via `q8_0_gemv`.
+        //
+        // MXFP4 is not optional here the way the others are. Unsloth's
+        // "UD-Q4_K_XL" dynamic quants store the routed experts in MXFP4 — 90%
+        // of a 122B-A10B's elements — and 17 packed bytes per 32 values
+        // expands to 64 as F16. Falling through to `DequantF16` plans 213 GiB
+        // against a 74.43 GiB device-local heap, so the default arm does not
+        // merely waste memory, it makes the model unloadable.
+        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0 | GgmlType::Mxfp4 => {
+            Residency::KeepQuant(ty)
+        }
         GgmlType::F32 => Residency::DequantF32,
         _ => Residency::DequantF16,
     }
