@@ -203,10 +203,10 @@ impl KvQuery for HipKvPool {
 
 impl KvAllocator for HipKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
-        if self.seq_len(slot) + tokens > self.shape.max_seq_len {
+        let max_seq_len = self.total_pages * self.page_size;
+        if self.seq_len(slot) + tokens > max_seq_len {
             anyhow::bail!(
-                "HipKvPool slot {slot} exceeds max_seq_len {} (have {}, append {tokens})",
-                self.shape.max_seq_len,
+                "HipKvPool slot {slot} exceeds max_seq_len {max_seq_len} (have {}, append {tokens})",
                 self.seq_len(slot)
             );
         }
