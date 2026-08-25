@@ -1408,10 +1408,6 @@ pub(crate) struct TrainW2sArgs {
     /// (supports TP / large models that would OOM the train process).
     #[arg(long, value_enum, default_value_t = W2sAuxBackendArg::InProcess)]
     pub(crate) aux_backend: W2sAuxBackendArg,
-
-    /// Render output as JSON.
-    #[arg(long, default_value_t = false)]
-    pub(crate) json: bool,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -2082,10 +2078,6 @@ pub(crate) struct TrainRubricOpdArgs {
     /// Storage dtype for tape-saved activations (f32 default is byte-identical).
     #[arg(long, value_enum, default_value_t = TapeDtypeArg::F32)]
     pub(crate) tape_dtype: TapeDtypeArg,
-
-    /// Render output as JSON for scripts and CI.
-    #[arg(long, default_value_t = false)]
-    pub(crate) json: bool,
 }
 
 /// Resolve the eval/dump output dir: explicit `--eval-out-dir`, else the
@@ -2454,10 +2446,6 @@ pub(crate) struct TrainAgentOpdArgs {
     /// enabling multiple writebacks per round without --writeback-cap.
     #[arg(long, default_value_t = false)]
     pub(crate) lora_skip_experts: bool,
-
-    /// Render output as JSON for scripts and CI.
-    #[arg(long, default_value_t = false)]
-    pub(crate) json: bool,
 
     /// GKD mode for --replay-records: distil a TEACHER's per-position
     /// distribution on the trajectory tokens (forward-KL) instead of masked
