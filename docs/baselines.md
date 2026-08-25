@@ -763,8 +763,23 @@ This is what decides whether a 63.65 GiB checkpoint fits.
 | qwen35moe 35B.A3B Q4_K_M | 20.60 GiB | 822.71 ± 41.05 | 47.29 ± 0.41 |
 | qwen35moe 122B.A10B Q4_K_M | 63.65 GiB | 200.28 ± 9.04 | 23.41 ± 0.19 |
 
-The 122B row is the target for the next ARLE arch (`qwen35moe`, 256 experts /
-8 active). It fits the 74.43 GiB device-local heap with ~7 GiB headroom.
+### Qwen3.5-122B-A10B · same box · Vulkan — MoE BRING-UP (2026-08-26)
+
+`332e345ba` — first load. Per-token prefill (the MoE lane has no batched path).
+
+| metric | ARLE | llama.cpp | gap |
+| --- | ---: | ---: | ---: |
+| decode | ~12.5 tok/s | 23.41 ± 0.19 | **1.87x** |
+| prefill | ~7.3 tok/s | 200.28 ± 9.04 | **27x** |
+
+The prefill gap is not a kernel problem: `forward_tokens_batched` and the
+resident-sequence prefix reuse are `Qwen35`-only arms
+(`crates/infer-vulkan/src/executor.rs:115-155`), so the MoE lane falls to the
+per-token GEMV loop the dense lane left behind in `2ff2672cc`. Wiring the MoE
+model into the existing batched path is the next lever and needs no new kernel.
+
+63.65 GiB of weights plan to ~63 GiB device-resident (MXFP4 kept packed) against
+the 74.43 GiB device-local heap.
 
 ---
 
