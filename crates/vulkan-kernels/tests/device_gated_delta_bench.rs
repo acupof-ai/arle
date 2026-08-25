@@ -45,6 +45,14 @@
 //! that rewrite: it must show state GB dropping by ~the chunk size, not just
 //! ms going down.
 //!
+//! Opt-in, like the other benches here: it allocates a 150 MB state arena and
+//! holds the GPU under sustained load for ~6 s per shape, which does not belong
+//! in a correctness gate. It is not part of one:
+//!
+//! ```text
+//! ARLE_GDN_BENCH=1 cargo test -p vulkan-kernels --features vulkan //!     --test device_gated_delta_bench --release -- --nocapture
+//! ```
+//!
 //! Runs only with `--features vulkan` + a working device; skips cleanly
 //! otherwise.
 #![cfg(feature = "vulkan")]
@@ -168,6 +176,10 @@ fn time_dispatch_over_layers<'a>(
 
 #[test]
 fn gated_delta_throughput_at_prefill_shape() {
+    if std::env::var("ARLE_GDN_BENCH").is_err() {
+        eprintln!("set ARLE_GDN_BENCH=1 to run the gated-delta throughput bench; skipping");
+        return;
+    }
     let ctx = match VulkanContext::create() {
         Ok(c) => c,
         Err(e) => {
