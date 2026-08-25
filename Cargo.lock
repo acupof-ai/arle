@@ -1709,7 +1709,6 @@ name = "infer-vulkan"
 version = "0.5.8"
 dependencies = [
  "anyhow",
- "deepseek-spec",
  "infer-gguf",
  "infer-plan",
  "infer-seam",

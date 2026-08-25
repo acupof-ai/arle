@@ -789,10 +789,6 @@ impl Qwen35Config {
         Self::from_text_config(text, stop_token_ids)
     }
 
-    pub fn from_file(model_path: &str) -> Result<Self> {
-        Self::from_model_dir(model_path)
-    }
-
     fn from_text_config(text: TextConfig, stop_token_ids: Vec<u32>) -> Result<Self> {
         let rotary_dim = text.rope_parameters.rotary_dim(text.head_dim)?;
         let rope_scaling = text.rope_parameters.rope_scaling()?;

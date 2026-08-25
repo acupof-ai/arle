@@ -180,20 +180,6 @@ pub fn compute_scaled_inv_freq(
     }
 }
 
-/// YARN attention-score scaling, applied to logits before softmax
-/// (Peng et al. 2023 §3.4). Returns `1.0` for None / Linear / NtkAware.
-pub fn compute_attention_factor(scaling: Option<&RopeScalingConfig>) -> f32 {
-    match scaling {
-        Some(RopeScalingConfig::Yarn {
-            factor,
-            attention_factor,
-            mscale,
-            ..
-        }) => attention_factor.unwrap_or_else(|| 1.0 + 0.1 * mscale * factor.ln()),
-        _ => 1.0,
-    }
-}
-
 /// Fallback when neither a top-level `rope_theta` nor a nested
 /// `rope_parameters.rope_theta` is present; every shipped Qwen3 config uses 1e6.
 pub const DEFAULT_ROPE_THETA: f32 = 1_000_000.0;
