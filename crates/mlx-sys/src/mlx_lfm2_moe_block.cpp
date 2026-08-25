@@ -38,14 +38,6 @@ inline array swiglu(const array& gate, const array& up) {
     return compiled_swiglu()({gate, up})[0];
 }
 
-// Quantized linear: y = x @ dequantize(w).T — matches QWeight::apply() in
-// mlx_qwen35_model.cpp.
-array qmm(const array& x, const array& w, const array& scales,
-          const array& biases, int group_size, int bits) {
-    return verify_quantized_matmul_cpp(
-        x, w, scales, biases, group_size, bits, /*transpose=*/true);
-}
-
 struct SortedSwitchInputs {
     array x;
     array indices;
