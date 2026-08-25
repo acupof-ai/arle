@@ -387,3 +387,180 @@ pub fn bfcl_agentic_rubric() -> Rubric {
         ],
     }
 }
+
+/// Induces a prompt-specific rubric by contrasting teacher (strong) and
+/// student (weak) sample solutions. The judge generates the rubric; the
+/// caller parses it with [`Rubricator::parse_induction`].
+pub struct Rubricator;
+
+impl Rubricator {
+    /// Render the rubric-induction prompt. `teacher_samples` are strong
+    /// solutions (the rubric should capture what makes them correct);
+    /// `student_samples` are weaker rollouts (the rubric should distinguish
+    /// them from the teacher).
+    #[must_use]
+    pub fn induce_prompt(
+        problem: &str,
+        teacher_samples: &[String],
+        student_samples: &[String],
+    ) -> String {
+        let teacher = teacher_samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("### Teacher sample {}\n{s}\n", i + 1))
+            .collect::<String>();
+        let student = student_samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("### Student sample {}\n{s}\n", i + 1))
+            .collect::<String>();
+        format!(
+            "You are a rubric designer. Given a PROBLEM and contrasting solution samples \
+             (teacher = strong, student = weaker), induce a grading rubric that separates \
+             the teacher solutions from the student ones.\n\n\
+             PROBLEM:\n{problem}\n\n\
+             TEACHER SAMPLES (strong):\n{teacher}\n\
+             STUDENT SAMPLES (weaker):\n{student}\n\
+             Design 2-4 criteria. Each criterion has a short snake_case key, a one-sentence \
+             description, and a kind: \"factual\" (correctness — ALL factual criteria must pass \
+             for acceptance) or \"process\" (quality — logged but not gating).\n\n\
+             On the FINAL line output ONLY a JSON object:\n\
+             {{\"task\": \"<short task name>\", \"criteria\": [{{\"key\": \"...\", \
+             \"description\": \"...\", \"kind\": \"factual\"|\"process\"}}]}}\n"
+        )
+    }
+
+    /// Parse a rubric-induction judge output. Returns `None` on parse failure
+    /// (never a partial rubric — a malformed induction is a retry, not a
+    /// silent default).
+    #[must_use]
+    pub fn parse_induction(output: &str) -> Option<Rubric> {
+        let obj = last_json_object(output)?;
+        let value: serde_json::Value = serde_json::from_str(&obj).ok()?;
+        let task = value.get("task")?.as_str()?.to_string();
+        let criteria: Vec<Criterion> = value
+            .get("criteria")?
+            .as_array()?
+            .iter()
+            .map(|c| {
+                let key = c.get("key")?.as_str()?;
+                let description = c.get("description")?.as_str()?;
+                let kind = match c.get("kind")?.as_str()? {
+                    "factual" => CriterionKind::Factual,
+                    "process" => CriterionKind::Process,
+                    _ => return None,
+                };
+                Some(Criterion {
+                    key: key.to_string(),
+                    description: description.to_string(),
+                    kind,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if criteria.is_empty() {
+            return None;
+        }
+        Some(Rubric { task, criteria })
+    }
+}
+
+#[cfg(test)]
+mod rubric_tests {
+    use super::*;
+
+    fn test_rubric() -> Rubric {
+        Rubric {
+            task: "math".to_string(),
+            criteria: vec![
+                Criterion::factual("answer_correct", "The answer is correct."),
+                Criterion::process("steps_valid", "Steps follow logically."),
+            ],
+        }
+    }
+
+    #[test]
+    fn parse_verdict_accepts_all_factual_pass() {
+        let rubric = test_rubric();
+        let v =
+            rubric.parse_verdict(r#"reasoning... {"answer_correct": true, "steps_valid": true}"#);
+        assert!(!v.parse_error);
+        assert!(v.accepted);
+        assert_eq!(v.passed.len(), 2);
+    }
+
+    #[test]
+    fn parse_verdict_rejects_on_factual_fail() {
+        let rubric = test_rubric();
+        let v = rubric.parse_verdict(r#"{"answer_correct": false, "steps_valid": true}"#);
+        assert!(!v.parse_error);
+        assert!(!v.accepted);
+    }
+
+    #[test]
+    fn parse_verdict_process_only_fail_still_accepts() {
+        let rubric = test_rubric();
+        let v = rubric.parse_verdict(r#"{"answer_correct": true, "steps_valid": false}"#);
+        assert!(!v.parse_error);
+        assert!(v.accepted); // process failure does not gate
+    }
+
+    #[test]
+    fn parse_verdict_malformed_is_parse_error() {
+        let rubric = test_rubric();
+        let v = rubric.parse_verdict("no json here");
+        assert!(v.parse_error);
+        assert!(!v.accepted);
+    }
+
+    #[test]
+    fn parse_verdict_missing_key_is_never_accepted() {
+        let rubric = test_rubric();
+        let v = rubric.parse_verdict(r#"{"answer_correct": true}"#); // missing steps_valid
+        assert!(v.parse_error);
+        assert!(!v.accepted);
+    }
+
+    #[test]
+    fn select_counts_accepted_distinct_and_parse_errors() {
+        let rubric = test_rubric();
+        let rollouts = vec![
+            "answer 42".to_string(),
+            "answer 42".to_string(), // duplicate
+            "answer 7".to_string(),
+            "garbage".to_string(),
+        ];
+        let verdicts = vec![
+            rubric.parse_verdict(r#"{"answer_correct": true, "steps_valid": true}"#),
+            rubric.parse_verdict(r#"{"answer_correct": true, "steps_valid": true}"#),
+            rubric.parse_verdict(r#"{"answer_correct": false, "steps_valid": true}"#),
+            rubric.parse_verdict("no json"),
+        ];
+        let sel = select(&rollouts, &verdicts);
+        assert_eq!(sel.accepted, vec![0, 1]);
+        assert_eq!(sel.distinct_accepted, 1); // duplicate rollout
+        assert_eq!(sel.parse_errors, 1);
+    }
+
+    #[test]
+    fn rubricator_parses_valid_induction() {
+        let output = r#"Here is the rubric:
+{"task": "arithmetic", "criteria": [{"key": "answer_correct", "description": "Final answer is right.", "kind": "factual"}, {"key": "shows_work", "description": "Shows the work.", "kind": "process"}]}"#;
+        let rubric = Rubricator::parse_induction(output).expect("parse");
+        assert_eq!(rubric.task, "arithmetic");
+        assert_eq!(rubric.criteria.len(), 2);
+        assert_eq!(rubric.criteria[0].kind, CriterionKind::Factual);
+        assert_eq!(rubric.criteria[1].kind, CriterionKind::Process);
+    }
+
+    #[test]
+    fn rubricator_rejects_empty_criteria() {
+        let output = r#"{"task": "x", "criteria": []}"#;
+        assert!(Rubricator::parse_induction(output).is_none());
+    }
+
+    #[test]
+    fn rubricator_rejects_malformed_induction() {
+        assert!(Rubricator::parse_induction("no json").is_none());
+        assert!(Rubricator::parse_induction(r#"{"task": "x"}"#).is_none());
+    }
+}
