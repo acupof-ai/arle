@@ -424,6 +424,51 @@ mod real {
             )
         }
 
+        /// AMD shader-core topology, or `None` off an AMD driver.
+        ///
+        /// Returns `(compute_units, simd_per_cu, wavefronts_per_simd,
+        /// wavefront_size, vgprs_per_simd)`.
+        ///
+        /// Why this is worth a query: on RDNA the scheduling unit is the WGP
+        /// (Work Group Processor) = 2 CUs = 4 SIMD32, and a workgroup is
+        /// resident on ONE of them. Reasoning in "40 CUs" hides the fact that
+        /// the part is really 20 WGPs / 80 SIMDs, so a kernel launching e.g. 48
+        /// workgroups is not "48 of 40" but ~2.4 per WGP — and the wave-per-SIMD
+        /// occupancy that actually hides memory latency is a third number
+        /// again. Nothing in ARLE printed any of this, which is how a launch
+        /// geometry gets chosen against an imagined machine.
+        ///
+        /// `vgprs_per_simd` is the other half of the same story: it is the
+        /// budget that decides how many waves fit, and it is what made
+        /// llama.cpp's coopmat warptile run at 0.57x here (32 live accumulators
+        /// ~= 128 VGPR/lane). See [`vulkan_kernels::MmSpec`].
+        pub fn amd_shader_core(&self) -> Option<(u32, u32, u32, u32, u32)> {
+            if !self.device_name().contains("AMD") && !self.device_name().contains("Radeon") {
+                return None;
+            }
+            let mut core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
+            // SAFETY: `physical_device` is owned by this context and alive;
+            // `props2` (with its pushed `core`) outlives the call and is only
+            // read afterwards. Querying an unsupported extension struct leaves
+            // it zeroed rather than failing, which the check below catches.
+            unsafe {
+                self.instance
+                    .get_physical_device_properties2(self.physical_device, &mut props2);
+            }
+            (core.compute_units_per_shader_array != 0).then(|| {
+                (
+                    core.compute_units_per_shader_array
+                        * core.shader_arrays_per_engine_count
+                        * core.shader_engine_count,
+                    core.simd_per_compute_unit,
+                    core.wavefronts_per_simd,
+                    core.wavefront_size,
+                    core.vgprs_per_simd,
+                )
+            })
+        }
+
         pub fn memory_heaps(&self) -> Vec<(u64, bool)> {
             let props = unsafe {
                 self.instance
