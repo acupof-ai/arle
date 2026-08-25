@@ -1261,13 +1261,6 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn too_many_requests(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message: message.into(),
-        }
-    }
-
     pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
@@ -1295,9 +1288,6 @@ impl ApiError {
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
         let message = value.to_string();
-        if message.starts_with("server is busy:") {
-            return Self::too_many_requests(message);
-        }
         // Internal failures (tokenizer decode, chat-template render, multimodal
         // extraction) are server errors, not client bad-request.
         Self {
