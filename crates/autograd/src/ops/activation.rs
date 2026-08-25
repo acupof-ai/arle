@@ -6,64 +6,6 @@ use crate::{
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
-pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Route Dirty::Device through the lazy `backend.exp` (one `mlx_exp`
-    // node, no eval); Dirty::Host / Dirty::Both stay host-side to avoid an
-    // upload+compute+readback. Backward reads the saved output via
-    // `tape.backward`'s pre-walk flush, so `exp_backward` always sees
-    // Dirty::Host even when the forward stays lazy.
-    let dirty = store.tensor(x)?.dirty.clone();
-    match dirty {
-        Dirty::Device => exp_device_lazy(x, store, tape),
-        Dirty::Host | Dirty::Both => exp_host_eager(x, store, tape),
-    }
-}
-
-fn exp_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // Defensive `ensure_device`: the caller already routed a Dirty::Device
-    // tensor, but re-calling guards a future Dirty::Both path from silent
-    // drift (mirrors `silu_device_lazy`).
-    store.ensure_device(x)?;
-    let input_shape = store.tensor(x)?.shape.clone();
-    let input_handle = store
-        .tensor(x)?
-        .device_handle
-        .as_ref()
-        .ok_or(AutogradError::TapeInvariant(
-            "exp: ensure_device left tensor without a device handle",
-        ))?
-        .clone();
-
-    let out_handle = store.backend().exp(&input_handle, &input_shape)?;
-    let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
-
-    TapeEntry {
-        op: BackwardOp::Exp,
-        output_id,
-        input_ids: smallvec![x],
-        saved: SavedContext::Tensor(output_id),
-    }
-    .record(store, tape)?;
-
-    Ok(output_id)
-}
-
-fn exp_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor_host(x)?;
-    let output = store.backend().exp_forward(&input.data)?;
-    let output_id = store.alloc(Tensor::new(output, input.shape.clone(), false)?);
-
-    TapeEntry {
-        op: BackwardOp::Exp,
-        output_id,
-        input_ids: smallvec![x],
-        saved: SavedContext::Tensor(output_id),
-    }
-    .record(store, tape)?;
-
-    Ok(output_id)
-}
-
 pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     // Route Dirty::Device through the lazy `backend.silu` (composes
     // `mlx_multiply(x, mlx_sigmoid(x))` with no eval); Dirty::Host /
@@ -178,73 +120,6 @@ fn sigmoid_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> 
     .record(store, tape)?;
 
     Ok(output_id)
-}
-
-pub(crate) fn exp_backward(
-    entry: &TapeEntry,
-    output_grad_id: TensorId,
-    store: &mut TensorStore,
-) -> Result<GradPairs> {
-    let x = *entry
-        .input_ids
-        .first()
-        .ok_or(AutogradError::TapeInvariant("exp missing input"))?;
-    if !store.tensor(x)?.requires_grad {
-        return Ok(GradPairs::new());
-    }
-
-    let SavedContext::Tensor(y_id) = entry.saved.clone() else {
-        return Err(AutogradError::TapeInvariant(
-            "exp backward missing saved output",
-        ));
-    };
-
-    // Route the (upstream, saved-output) pair through `exp_backward_device`
-    // when both are device-resident. A host path (`tensor_host`'s
-    // `ensure_host`) would demote the saved output Dirty::Device →
-    // Dirty::Both, poisoning every downstream op that re-reads `y`.
-    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
-    let y_shape = store.tensor(y_id)?.shape.clone();
-    if y_shape != upstream_shape {
-        return Err(AutogradError::ShapeMismatch {
-            expected: y_shape,
-            got: upstream_shape,
-        });
-    }
-    let device_path_ok = {
-        let upstream = store.tensor(output_grad_id)?;
-        let saved = store.tensor(y_id)?;
-        upstream.dirty != Dirty::Host
-            && upstream.device_handle.is_some()
-            && saved.dirty != Dirty::Host
-            && saved.device_handle.is_some()
-    };
-    if device_path_ok {
-        let upstream_handle = store
-            .tensor(output_grad_id)?
-            .device_handle
-            .as_ref()
-            .expect("checked above")
-            .clone();
-        let y_handle = store
-            .tensor(y_id)?
-            .device_handle
-            .as_ref()
-            .expect("checked above")
-            .clone();
-        let grad_handle =
-            store
-                .backend()
-                .exp_backward_device(&upstream_handle, &y_handle, &y_shape)?;
-        let grad_id = store.alloc_device_tensor(y_shape, grad_handle)?;
-        return Ok(smallvec![(x, grad_id)]);
-    }
-
-    let output = store.tensor_host(y_id)?;
-    let upstream = store.tensor_host(output_grad_id)?;
-    let grad = store.backend().mul_forward(&output.data, &upstream.data)?;
-    let grad_id = store.alloc(Tensor::new(grad, output.shape, false)?);
-    Ok(smallvec![(x, grad_id)])
 }
 
 pub(crate) fn silu_backward(

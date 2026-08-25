@@ -12,7 +12,7 @@ use crate::{
 use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
     mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_broadcast_to,
-    mlx_concatenate_axis, mlx_contiguous, mlx_eval, mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis,
+    mlx_concatenate_axis, mlx_contiguous, mlx_eval, mlx_fast_rms_norm, mlx_logsumexp_axis,
     mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative, mlx_reciprocal, mlx_reshape,
     mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_sqrt, mlx_subtract,
     mlx_sum_axis, mlx_take_axis, mlx_transpose_axes,
@@ -460,29 +460,6 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy `mlx_exp` in the graph; no `mlx_eval`.
-    fn exp(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
-        let DeviceHandle::Metal(x_handle) = x else {
-            return Err(AutogradError::TapeInvariant(
-                "metal backend cannot exp a non-metal device handle",
-            ));
-        };
-
-        let _guard = mlx_guard();
-
-        // Safety: `x_handle` is a live MLX array borrowed for this call;
-        // the `out_arr` result is transferred into the returned `MlxHandle`.
-        let out = unsafe {
-            let out_arr = mlx_exp(x_handle.as_ptr());
-            if out_arr.is_null() {
-                return Err(AutogradError::TapeInvariant("mlx_exp returned null (exp)"));
-            }
-            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
-        };
-
-        Ok(out)
-    }
-
     // Lazy `mlx_sigmoid` in the graph; no `mlx_eval`.
     fn sigmoid(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
@@ -626,10 +603,6 @@ impl Backend for MetalBackend {
         b_shape: &[usize],
     ) -> Result<Vec<f32>> {
         mlx_add_broadcast(a, a_shape, b, b_shape)
-    }
-
-    fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
-        mlx_unary_flat(a, UnaryOp::Exp)
     }
 
     fn neg_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
@@ -1580,7 +1553,6 @@ fn mlx_softmax_like(x: &[f32], shape: &[usize], kind: SoftmaxKind) -> Result<Vec
 
 #[derive(Copy, Clone)]
 enum UnaryOp {
-    Exp,
     Neg,
     Silu,
     MulScalar(f32),
@@ -1619,7 +1591,6 @@ fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
         }
 
         let out_arr = match op {
-            UnaryOp::Exp => mlx_exp(input),
             UnaryOp::Neg => mlx_negative(input),
             UnaryOp::MulScalar(s) => {
                 let scalar = mlx_array_new_float32(s);

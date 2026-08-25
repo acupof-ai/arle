@@ -844,10 +844,6 @@ pub(crate) fn linear_to_coords(mut linear: usize, shape: &[usize]) -> Vec<usize>
     coords
 }
 
-pub fn cpu_exp_forward(a: &[f32]) -> Result<Vec<f32>> {
-    Ok(a.iter().map(|x| x.exp()).collect())
-}
-
 pub fn cpu_neg_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| -x).collect())
 }

@@ -1597,18 +1597,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = a;
-            todo!("GPU required: cuda exp is unavailable under feature no-cuda")
-        }
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_unary_1d(self, a, "exp_f32")
-        }
-    }
-
     fn neg_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -2393,25 +2381,6 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_abs_backward_device(self, upstream, x, shape)
-        }
-    }
-
-    /// Device-resident backward for `exp(x)`; consumes the saved output
-    /// `y = exp(x)` (not the input).
-    fn exp_backward_device(
-        &self,
-        upstream: &DeviceHandle,
-        y: &DeviceHandle,
-        shape: &[usize],
-    ) -> Result<DeviceHandle> {
-        #[cfg(feature = "no-cuda")]
-        {
-            let _ = (upstream, y, shape);
-            todo!("GPU required: cuda exp_backward_device is unavailable under feature no-cuda")
-        }
-        #[cfg(not(feature = "no-cuda"))]
-        {
-            cuda_exp_backward_device(self, upstream, y, shape)
         }
     }
 

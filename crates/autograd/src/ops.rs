@@ -47,7 +47,7 @@ use crate::{
     tensor::{TensorId, TensorStore},
 };
 
-pub(crate) use activation::{exp_backward, sigmoid_backward, silu_backward};
+pub(crate) use activation::{sigmoid_backward, silu_backward};
 pub(crate) use attention::{cat_heads_backward, cat_seq_backward, causal_sdpa_recompute_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use collective::all_reduce_sum_backward;
@@ -70,10 +70,6 @@ pub(crate) use rope::rope_backward;
 pub(crate) use softmax::{log_softmax_backward, softmax_backward};
 
 pub use checkpoint::{checkpoint, checkpoint_seq_chunked, checkpoint_sequential};
-
-pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    activation::exp(x, store, tape)
-}
 
 pub fn all_reduce_sum(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     collective::all_reduce_sum(x, store, tape)
