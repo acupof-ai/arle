@@ -59,11 +59,10 @@ arle serve --backend cuda --model-path /path/to/Qwen3.5-4B --port 8000
 # Apple Silicon (Metal)
 arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8000
 
-# DSpark block-drafter decode + in-process Markov-head training (CUDA)
+# DSpark block-drafter speculative decode (CUDA)
 arle serve --backend cuda \
  --model-path /path/to/Qwen3.6-27B \
- --spec-type dspark --mtp-draft-model /path/to/dspark-draft \
- --dspark-train --port 8000
+ --spec-type dspark --mtp-draft-model /path/to/dspark-draft --port 8000
 ```
 
 ### Use
@@ -88,7 +87,7 @@ print(client.chat.completions.create(
 |---|---|
 | `arle` | Interactive REPL + local agent (Eli-compatible). |
 | `arle run --prompt "…"` | One-shot agent execution. `--no-tools` to disable tools. |
-| `arle serve --backend …` | OpenAI-compatible HTTP server. `--spec-type dspark --dspark-train` enables DSpark block-drafter decode + in-process Markov-head training. |
+| `arle serve --backend …` | OpenAI-compatible HTTP server. `--spec-type dspark` enables DSpark block-drafter decode. |
 | `arle train opd` | **On-Policy Distillation** — teacher runs on the serving runtime. |
 | `arle --doctor` | Backend / hardware / model self-check. |
 
@@ -205,8 +204,6 @@ Agent and RL workloads re-process the same prompt + history + tool output every 
 
 **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code. The OPD teacher *is* the production server.
 
-**DSpark trains while serving.** `--spec-type dspark --dspark-train` runs the DSpark block-drafter for faster decode *and* trains its Markov head in-process: the hot path captures (draft, target, accepted) tuples, a background thread runs acceptance-weighted policy gradient + probability matching, and updated weights hot-swap back into the running engine — no restart, no separate training job. Seeds from the loaded checkpoint so acceptance never regresses at startup.
-
 ---
 
 ## Architecture
@@ -217,7 +214,6 @@ flowchart TD
   OPD["OPD / self-OPD<br/>student rollout + teacher rescoring<br/>KL / reverse-KL / beta-JSD"]
   RUBRIC["Rubric-OPD<br/>sample -> judge -> accepted CE"]
   AGENT["Agent-OPD<br/>tool trajectory -> reward<br/>UpdatePreset"]
-  DSPARK["DSpark online training<br/>verify-logit capture -> Markov-head update"]
   STUDENT["Qwen3.5 / Qwen3.6 train model<br/>crates/train/src/qwen35.rs"]
   TEACHER["infer-api or EMA teacher<br/>BF16 logits boundary"]
   LOSS["Loss graph<br/>CE / KL / JSD / weighted PG"]
@@ -231,7 +227,6 @@ flowchart TD
   CLI --> OPD
   CLI --> RUBRIC
   CLI --> AGENT
-  CLI --> DSPARK
   OPD --> STUDENT
   OPD --> TEACHER
   RUBRIC --> STUDENT
@@ -244,8 +239,6 @@ flowchart TD
   OPT --> SYNC
   OPT --> ART
   CODEC -. "no production call edge" .-> ART
-  DSPARK -->|"two BF16 vocab-wide D2H copies"| DSPCPU["CpuBackend + host AdamW"]
-  DSPCPU -->|"BF16 saved head / host hot-swap"| SYNC
 ```
 
 The training stack shares the production model/runtime authority: serving or EMA teachers score student trajectories, one autograd substrate drives OPD and RFT objectives, and LoRA updates merge back into the live inference engine. The current device-residency and restart gaps are documented in the [training architecture and kernel audit](docs/research/2026-07-26-training-architecture-algorithm-kernel-audit.md).

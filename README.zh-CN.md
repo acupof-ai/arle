@@ -44,7 +44,7 @@ docker run --rm --gpus all -p 8000:8000 -v /path/to/Qwen3.5-4B:/model:ro \
 
 # 启动服务
 arle serve --backend cuda --model-path /path/to/Qwen3.5-4B --port 8000
-arle serve --backend metal --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit --port 8000
+arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8000
 ```
 
 ```python
@@ -129,7 +129,7 @@ sm_90 没有 FP4 张量核,所以真正的 GEMM 必须先把 nibble 展宽,唯�
 agent 与 RL 工作负载每轮都在重复处理同样的 prompt + 历史 + 工具输出。ARLE 把这件事解决一次,serving 与训练共享:
 
 - **跨轮 KV 常驻。** 上一轮 KV 留在 GPU,只 prefill 新 token;前缀页经 host radix cache 跨请求共享,内存压力下下沉到 host-RAM 层(可选盘 spill),下次命中再提回,不重复 prefill。([support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix))
-- **CUDA 量化 KV。** INT8/FP8/INT4 paged-KV kernel,`--kv-cache-dtype` serve flag —— 正确性 gate 过、opt-in(默认仍 BF16)。
+- **CUDA 量化 KV。** INT8/FP8 paged-KV kernel,`--kv-cache-dtype` serve flag —— 正确性 gate 过、opt-in(默认仍 BF16)。
 - **一套运行时、三个表面。** serving、本地 agent、OPD 训练共用同一套 Rust + 模型代码 —— OPD teacher 就是生产 server。
 
 ```mermaid
