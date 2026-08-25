@@ -2611,9 +2611,8 @@ impl Qwen35CudaExecutor {
                 bd.invalidate_staged_pointers();
             }
             // The capture bakes this slot's recurrent-block addresses and `baked`
-            // tracks
-            // only workspace ptrs, so drop it — `rearm_warm` alone would replay freed
-            // mem.
+            // tracks only workspace ptrs, so rebuild the graph — keeping the
+            // captured graph would replay freed mem.
             if let Some(dg) = self.decode_graph.as_mut() {
                 dg.graphs[row.slot] =
                     crate::graph::CudaGraphState::new(self.model.ctx.stream.clone())

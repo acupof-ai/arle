@@ -129,23 +129,6 @@ impl Drop for SymmetricIpcBuffer {
 }
 
 impl TpRuntime {
-    #[must_use]
-    pub fn single() -> Self {
-        Self {
-            config: TpConfig::single(),
-            comm: TpComm::single(),
-            attn_tp: TpComm::single(),
-            attn_cp: TpComm::single(),
-            attn_cp_uses_global: false,
-            attn_cp_rank: 0,
-            attn_cp_size: 1,
-            attn_tp_rank: 0,
-            attn_tp_size: 1,
-            #[cfg(all(feature = "cuda", feature = "nccl"))]
-            oneshot: None,
-        }
-    }
-
     /// A `world_size > 1` config here performs no collectives (NCCL is wired
     /// separately).
     #[must_use]
@@ -276,11 +259,6 @@ impl TpRuntime {
     #[must_use]
     pub fn config(&self) -> &TpConfig {
         &self.config
-    }
-
-    #[must_use]
-    pub fn comm(&self) -> &TpComm {
-        &self.comm
     }
 
     #[must_use]
