@@ -10,7 +10,7 @@ mod planner;
 mod prefix;
 mod radix;
 
-pub use radix::{BlockId, PrefixMatch, RadixCache};
+use radix::{BlockId, PrefixMatch, RadixCache};
 
 use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
@@ -36,10 +36,8 @@ pub struct SchedulerConfig {
     pub max_running_requests: Option<usize>,
     pub max_num_batched_tokens: usize,
     pub max_prefill_tokens: usize,
-    pub prefill_max_requests: Option<usize>,
     pub max_prompt_tokens: usize,
     pub max_total_tokens: usize,
-    pub prefix_cache_low_water_pages: usize,
     pub chunked_prefill_size: usize,
     /// Cross-request prompt-prefix reuse via the host radix cache.
     pub enable_prefix_cache: bool,
@@ -59,9 +57,7 @@ impl SchedulerConfig {
     }
 
     fn max_concurrent_prefill(&self) -> usize {
-        self.prefill_max_requests
-            .unwrap_or_else(|| self.running_cap())
-            .max(1)
+        self.running_cap()
     }
 
     fn running_cap(&self) -> usize {
@@ -87,10 +83,8 @@ impl Default for SchedulerConfig {
             max_running_requests: None,
             max_num_batched_tokens: 16_384,
             max_prefill_tokens: 16_384,
-            prefill_max_requests: None,
             max_prompt_tokens: 16_384,
             max_total_tokens: 32_768,
-            prefix_cache_low_water_pages: 0,
             chunked_prefill_size: 2_048,
             enable_prefix_cache: true,
             slot_oversubscription: false,
@@ -567,11 +561,6 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
 pub type TokenObserver = Box<dyn FnMut(RequestHandle, &SlotToken)>;
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
-    /// Create an engine with permissive resource governance.
-    pub fn new(executor: E, kv: K, max_slots: usize) -> Result<Self> {
-        Self::with_config(executor, kv, SchedulerConfig::for_slots(max_slots))
-    }
-
     /// Create an engine with explicit scheduler config.
     pub fn with_config(executor: E, kv: K, config: SchedulerConfig) -> Result<Self> {
         Self::with_config_and_governor(executor, kv, config, Box::new(PermissiveGovernor))
@@ -1350,7 +1339,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // to free, then reclaim_page (page_refs absent → 0) pushed again.
         self.free_slot_pages(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
-        self.evict_prefix_cache_if_below_low_water();
         self.record_completed(request.handle, request.into());
     }
 
@@ -1479,7 +1467,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // a permanent cross-rank admission livelock (2026-07-05 TP=4 hang,
         // docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
         let mut remaining_pages = self.executor.tp_sync_min(self.kv.free_pages())?;
-        self.evict_prefix_cache_if_below_low_water();
         // Nothing to admit — both loops below are waiter-driven, so skip the
         // per-tick free-slot scan. Placed AFTER the collective so every rank
         // still issues it on every tick.
@@ -1831,14 +1818,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         });
         plan.mode = planner::plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
-    }
-
-    fn evict_prefix_cache_if_below_low_water(&mut self) -> usize {
-        let low_water = self.config.prefix_cache_low_water_pages;
-        if low_water <= self.kv.free_pages() {
-            return 0;
-        }
-        self.evict_prefix_cache_for_pages(low_water - self.kv.free_pages())
     }
 }
 

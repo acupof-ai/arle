@@ -17,8 +17,7 @@ debug/diagnostic runtime overrides.**
 **Tuning knobs go on structs**, not env vars. The canonical example is
 `SchedulerConfig` in `crates/infer-core/src/lib.rs`: slot and batching caps
 (`num_slots`, `max_running_requests`, `max_num_batched_tokens`,
-`max_prefill_tokens`), the prefix-cache watermark
-(`prefix_cache_low_water_pages`), and chunking caps are plain struct fields
+`max_prefill_tokens`) and chunking caps are plain struct fields
 with `Default` / `for_slots` constructors. Callers that want to tune them
 construct the struct and assign directly — **there is no
 `INFER_PREFIX_HIGH_WATER`** or any other magic env var for runtime tuning.

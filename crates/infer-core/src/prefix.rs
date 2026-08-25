@@ -10,7 +10,8 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use infer_seam::{BackendExecutor, KvPool, KvTierLocation, PrefixBlock};
 
-use crate::{BlockId, Engine, PrefixMatch, RequestPhase, RequestState};
+use crate::radix::{BlockId, PrefixMatch};
+use crate::{Engine, RequestPhase, RequestState};
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub(crate) fn request_pages_needed_after_prefix(
