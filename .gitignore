@@ -29,6 +29,9 @@ bench-output/
 # docs/baselines.md; the raw dump is scratch.
 /bench_throughput.csv
 /bench_throughput.json
+# serve stdout/stderr redirects from profiling runs
+/prof*.err
+/prof*.log
 opd-output/
 runs/
 observe-data/

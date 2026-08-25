@@ -2219,7 +2219,7 @@ fused_launcher_fns!(real::launch_with_params);
 
 #[cfg(not(feature = "vulkan"))]
 mod stub {
-    use super::{Kernel, KernelError, Result};
+    use super::{FlashAttentionSpec, Kernel, KernelError, Result};
 
     pub fn launch(
         _kernel: Kernel,
