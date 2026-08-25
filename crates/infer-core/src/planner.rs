@@ -473,6 +473,7 @@ mod tests {
     use infer_plan::SamplingParams;
     use infer_seam::{
         BackendExecutor, HostPagedKvPool, KvAllocator, KvPool, KvQuery, KvSlotTier, PollResult,
+        PrefixBlock, PrefixReuse,
     };
 
     #[derive(Default)]
@@ -504,6 +505,60 @@ mod tests {
 
     struct MockExecutor {
         slot_tier: Option<MockSlotTier>,
+        reuse: PagesOnlyReuse,
+    }
+
+    /// Pages-only reuse policy: every resident block is a complete restore
+    /// boundary (no backend side state).
+    struct PagesOnlyReuse;
+
+    impl PrefixReuse for PagesOnlyReuse {
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            infer_seam::pages_only_reusable_prefix_blocks(blocks, |_| true)
+        }
+
+        fn reusable_prefix_blocks_for_prompt(
+            &self,
+            blocks: &[PrefixBlock],
+            _tokens: &[u32],
+        ) -> usize {
+            self.reusable_prefix_blocks(blocks)
+        }
+
+        fn release_prefix_pages(&mut self, _pages: &[u32]) {}
+
+        fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
+
+        fn restore_prefix_sidecar(
+            &mut self,
+            _slot: usize,
+            _pages: &[u32],
+            _start: usize,
+            _tokens: &[u32],
+        ) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        fn capture_finish_frontier(
+            &mut self,
+            _slot: usize,
+            _tokens: &[u32],
+            _page_indices: &[u32],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn save_prefix_sidecar(
+            &mut self,
+            _slot: usize,
+            _tokens: &[u32],
+            _start: usize,
+            _prompt_tokens: &[u32],
+            _page_indices: &[u32],
+            _sidecar_pages: &[u32],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     impl BackendExecutor for MockExecutor {
@@ -523,6 +578,10 @@ mod tests {
         fn kv_slot_tier(&mut self) -> Option<&mut dyn KvSlotTier> {
             self.slot_tier.as_mut().map(|t| t as &mut dyn KvSlotTier)
         }
+
+        fn prefix_reuse(&mut self) -> Option<&mut dyn PrefixReuse> {
+            Some(&mut self.reuse)
+        }
     }
 
     /// 16 tokens/page keeps the page arithmetic below exact.
@@ -534,7 +593,10 @@ mod tests {
         let mut config = SchedulerConfig::for_slots(4);
         config.slot_oversubscription = oversubscription;
         Engine::with_config(
-            MockExecutor { slot_tier },
+            MockExecutor {
+                slot_tier,
+                reuse: PagesOnlyReuse,
+            },
             HostPagedKvPool::new(4, pages, 16),
             config,
         )
@@ -644,6 +706,19 @@ mod tests {
         assert!(engine.active.contains_key(&0));
         assert_eq!(engine.waiting.len(), 0);
         assert_eq!(engine.kv.free_pages(), 5); // 8 - 3 allocated
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_prefix_cache_drains_all_cached_blocks() -> anyhow::Result<()> {
+        let mut engine = engine_with_pool(8, None, false)?;
+        engine.kv.alloc(0, 32)?; // 2 pages at 16 tokens/page
+        let tokens: Vec<u32> = (0..32).collect();
+        let published = engine.publish_prefix_blocks(0, &tokens);
+        assert!(!published.is_empty());
+        assert!(engine.prefix_cache_stats().cached_pages > 0);
+        engine.invalidate_prefix_cache();
+        assert_eq!(engine.prefix_cache_stats().cached_pages, 0);
         Ok(())
     }
 
