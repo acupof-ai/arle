@@ -1247,6 +1247,11 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
