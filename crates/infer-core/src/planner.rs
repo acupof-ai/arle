@@ -428,7 +428,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     let prefix_match = if self.config.enable_prefix_cache {
                         self.lookup_prefix_for_attach(&committed)?
                     } else {
-                        crate::PrefixMatch::empty()
+                        crate::radix::PrefixMatch::empty()
                     };
                     self.attach_prefix_to_request(slot, request, &committed, prefix_match)?;
                 }
