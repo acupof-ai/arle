@@ -373,7 +373,6 @@ mod tests {
             classify_vulkan_architecture("qwen3moe", Some("Qwen3.5-MoE-A2B"), 64),
             VulkanModelKind::Qwen36Moe
         );
-        assert_eq!();
         assert_eq!(
             classify_vulkan_architecture("qwen3", None, 0),
             VulkanModelKind::Qwen3Dense

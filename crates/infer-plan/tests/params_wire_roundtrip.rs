@@ -15,8 +15,10 @@ fn roundtrip(params: &SamplingParams) -> SamplingParams {
 
 #[test]
 fn logit_bias_survives_the_relay_wire_format() {
-    let mut params = SamplingParams::default();
-    params.logit_bias = vec![(0, -1.5), (73233, 100.0), (u32::MAX, 0.25)];
+    let params = SamplingParams {
+        logit_bias: vec![(0, -1.5), (73233, 100.0), (u32::MAX, 0.25)],
+        ..Default::default()
+    };
 
     let back = roundtrip(&params);
     assert_eq!(back.logit_bias, params.logit_bias);
@@ -25,12 +27,14 @@ fn logit_bias_survives_the_relay_wire_format() {
 
 #[test]
 fn penalties_and_stop_tokens_survive_the_relay_wire_format() {
-    let mut params = SamplingParams::default();
-    params.repetition_penalty = 1.5;
-    params.frequency_penalty = -2.0;
-    params.presence_penalty = 0.75;
-    params.stop_token_ids = vec![1, 2, u32::MAX];
-    params.seed = Some(u64::MAX);
+    let params = SamplingParams {
+        repetition_penalty: 1.5,
+        frequency_penalty: -2.0,
+        presence_penalty: 0.75,
+        stop_token_ids: vec![1, 2, u32::MAX],
+        seed: Some(u64::MAX),
+        ..Default::default()
+    };
 
     let back = roundtrip(&params);
     assert_eq!(back.repetition_penalty, 1.5);
@@ -45,8 +49,10 @@ fn penalties_and_stop_tokens_survive_the_relay_wire_format() {
 /// must deserialize from pre-capture peers (serde default).
 #[test]
 fn top_logprobs_survives_the_relay_wire_format() {
-    let mut params = SamplingParams::default();
-    params.top_logprobs = Some(2);
+    let params = SamplingParams {
+        top_logprobs: Some(2),
+        ..Default::default()
+    };
     let back = roundtrip(&params);
     assert_eq!(back.top_logprobs, Some(2));
     assert!(
