@@ -589,19 +589,6 @@ pub fn compute_scaled_inv_freq(
     }
 }
 
-/// YARN attention-score scaling factor (Peng et al. 2023 §3.4).
-pub fn compute_attention_factor(scaling: Option<&RopeScalingConfig>) -> f32 {
-    match scaling {
-        Some(RopeScalingConfig::Yarn {
-            factor,
-            attention_factor,
-            mscale,
-            ..
-        }) => attention_factor.unwrap_or_else(|| 1.0 + 0.1 * mscale * factor.ln()),
-        _ => 1.0,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35Config {
     pub hidden_size: usize,
@@ -675,27 +662,6 @@ impl Qwen35Config {
         if self.rope_cache_len_hint.is_none() {
             return Err(Qwen35ConfigError::InvalidConfig(
                 "train-side qwen3.5 requires rope_cache_len_hint",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Shared train-side dense/full-attn contract for places that still
-    /// intentionally pin the older scratch acceptance surface.
-    pub fn validate_train_dense_full_attention_contract(&self) -> Result<()> {
-        self.validate_train_scratch_contract()?;
-        if self
-            .layer_types
-            .iter()
-            .any(|layer_type| *layer_type != LayerType::FullAttention)
-        {
-            return Err(Qwen35ConfigError::InvalidConfig(
-                "train-side qwen3.5 currently supports full-attention layers only",
-            ));
-        }
-        if self.rotary_dim != self.head_dim {
-            return Err(Qwen35ConfigError::InvalidConfig(
-                "train-side qwen3.5 requires rotary_dim == head_dim",
             ));
         }
         Ok(())

@@ -9,14 +9,6 @@ pub type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync
 pub const TEST_LR: f32 = 5.0e-3;
 
 #[allow(dead_code)]
-pub fn dense_qwen35_config() -> Qwen35Config {
-    let cfg = base_qwen35_config();
-    cfg.validate_train_dense_full_attention_contract()
-        .expect("dense helper config should satisfy scratch contract");
-    cfg
-}
-
-#[allow(dead_code)]
 pub fn hybrid_qwen35_config() -> Qwen35Config {
     let mut cfg = base_qwen35_config();
     cfg.rotary_dim = cfg.head_dim / 2;
