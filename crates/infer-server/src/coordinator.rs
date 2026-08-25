@@ -9,7 +9,7 @@
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -261,9 +261,19 @@ pub struct CoordinatorHandle {
     multimodal_tx: Option<crate::LocalMultimodalTx>,
     /// Multimodal kind for the current backend (VLM backends only).
     multimodal_kind: Option<MultimodalKind>,
+    /// Set when this group's lockstep loop tears down (dead worker or ack
+    /// stall). `DpCoordinator::select` skips dead groups so a crashed replica
+    /// only fails its own in-flight requests, never the whole deployment.
+    dead: Arc<AtomicBool>,
 }
 
 impl CoordinatorHandle {
+    /// Whether this group's lockstep loop has torn down. Requests routed to a
+    /// dead group fail fast instead of hanging on a closed channel.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
     fn alloc_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -375,6 +385,7 @@ impl DpCoordinator {
     fn select(&self) -> &Arc<CoordinatorHandle> {
         self.groups
             .iter()
+            .filter(|g| !g.is_dead())
             .min_by_key(|g| g.in_flight.load(Ordering::Acquire))
             .unwrap_or(&self.groups[0])
     }
@@ -506,6 +517,11 @@ pub fn dp_coordinator_router(
     shutdown: Option<crate::ServeShutdown>,
 ) -> Router {
     let model = model.into();
+    // Multi-group: no serve-wide shutdown on group teardown — a dead group is
+    // isolated (dead flag + select skips it), the others keep serving. A
+    // single-group router keeps the shutdown so the worker guard reaps the
+    // broken group (#210).
+    let group_shutdown = (relays.len() <= 1).then_some(shutdown).flatten();
     let handles: Vec<Arc<CoordinatorHandle>> = relays
         .into_iter()
         .map(|relay| {
@@ -515,7 +531,7 @@ pub fn dp_coordinator_router(
                 model.clone(),
                 max_thinking_tokens,
                 None,
-                shutdown.clone(),
+                group_shutdown.clone(),
             )
         })
         .collect();
@@ -553,15 +569,17 @@ fn coordinator_handle(
     let sinks = relay.completion_sinks();
     let relay = Arc::new(Mutex::new(relay));
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let dead = Arc::new(AtomicBool::new(false));
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<CoordSubmission>();
 
     {
         let relay = Arc::clone(&relay);
         let in_flight = Arc::clone(&in_flight);
         let sinks = sinks.clone();
+        let dead = Arc::clone(&dead);
         std::thread::Builder::new()
             .name("arle-coordinator-lockstep".to_string())
-            .spawn(move || lockstep_loop(relay, in_flight, sinks, submit_rx, shutdown))
+            .spawn(move || lockstep_loop(relay, in_flight, sinks, submit_rx, shutdown, dead))
             .expect("spawn coordinator lockstep thread");
     }
 
@@ -583,6 +601,7 @@ fn coordinator_handle(
         stats_request_id: AtomicU64::new(0),
         multimodal_tx,
         multimodal_kind,
+        dead,
     })
 }
 
@@ -629,18 +648,29 @@ fn lockstep_loop(
     sinks: CompletionSinks,
     submit_rx: SyncReceiver<CoordSubmission>,
     shutdown: Option<crate::ServeShutdown>,
+    dead: Arc<AtomicBool>,
 ) {
     // Group teardown on a fatal lockstep error (#135): failing the sinks stops
     // the hang, but surviving workers spin inside the broken NCCL collective
-    // until killed. Requesting serve shutdown unwinds the coordinator HTTP
-    // loop, whose exit drops the worker guard — pipe EOF, 5s grace, SIGKILL.
+    // until killed. In a single-group deployment the serve-wide shutdown
+    // unwinds the coordinator HTTP loop, whose exit drops the worker guard —
+    // pipe EOF, 5s grace, SIGKILL. In a DP deployment `shutdown` is None: the
+    // dead flag isolates this group (DpCoordinator::select skips it) while
+    // other groups keep serving; per-group worker reaping is the CLI guard's
+    // job (serve_multiproc, pending-remote).
     let teardown = |sinks: &CompletionSinks, reason: &str| {
         sinks.fail_all(reason);
+        dead.store(true, Ordering::Release);
         if let Some(shutdown) = &shutdown {
             log::error!(
                 "[coordinator] tearing down the serve (worker group unwound by the child guard)"
             );
             shutdown.request();
+        } else {
+            log::error!(
+                "[coordinator] worker group torn down ({reason}); DP deployment, other groups \
+                 continue"
+            );
         }
     };
     let mut seq: u64 = 0;
@@ -844,6 +874,11 @@ fn streaming_submit(
     ApiError,
 > {
     let request_id = state.alloc_request_id();
+    if state.is_dead() {
+        return Err(ApiError::internal(
+            "worker group is unavailable (torn down after a worker failure)",
+        ));
+    }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RelayCompletionDelta>();
     state
         .sinks
@@ -2151,4 +2186,36 @@ async fn dashboard_page() -> ([(header::HeaderName, &'static str); 1], &'static 
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("dashboard.html"),
     )
+}
+
+#[cfg(test)]
+mod dp_failure_domain_tests {
+    use super::*;
+
+    fn test_handle() -> Option<Arc<CoordinatorHandle>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/Qwen3.5-0.8B-runtime");
+        let tokenizer = OpenAiTokenizer::from_model_dir(&path).ok()?;
+        let (relay, _engine_recv, _engine_tx) = RelayCoordinator::new_local();
+        Some(coordinator_handle(relay, tokenizer, "test", 0, None, None))
+    }
+
+    #[test]
+    fn select_skips_dead_group() {
+        let Some(g0) = test_handle() else { return }; // no tokenizer fixture in CI
+        let Some(g1) = test_handle() else { return };
+        g0.dead.store(true, Ordering::Release);
+        let dp = DpCoordinator::new(vec![Arc::clone(&g0), Arc::clone(&g1)]);
+        assert!(Arc::ptr_eq(dp.select(), &g1));
+    }
+
+    #[test]
+    fn streaming_submit_fails_fast_on_dead_group() {
+        let Some(g0) = test_handle() else { return };
+        g0.dead.store(true, Ordering::Release);
+        let err = streaming_submit(&g0, vec![1, 2, 3], 16, SamplingParams::default(), None)
+            .err()
+            .expect("dead group must reject submits");
+        assert!(err.message().contains("torn down"), "{}", err.message());
+    }
 }
