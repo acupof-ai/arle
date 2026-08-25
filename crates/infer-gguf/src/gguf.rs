@@ -386,10 +386,6 @@ impl GgufFile {
         })
     }
 
-    pub fn metadata(&self) -> &HashMap<String, GgufValue> {
-        &self.metadata
-    }
-
     pub fn get(&self, key: &str) -> Option<&GgufValue> {
         self.metadata.get(key)
     }

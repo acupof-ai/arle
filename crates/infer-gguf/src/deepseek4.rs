@@ -234,31 +234,6 @@ pub enum Dsv4TensorKind {
     SharedExpertDown,
 }
 
-impl Dsv4TensorKind {
-    pub fn is_routed_expert(self) -> bool {
-        matches!(
-            self,
-            Self::RoutedExpertGate
-                | Self::RoutedExpertUp
-                | Self::RoutedExpertGateUp
-                | Self::RoutedExpertDown
-        )
-    }
-
-    pub fn is_norm(self) -> bool {
-        matches!(
-            self,
-            Self::OutputNorm
-                | Self::AttnNorm
-                | Self::FfnNorm
-                | Self::AttnQNorm
-                | Self::AttnKvNorm
-                | Self::CompressorNorm
-                | Self::IndexerCompressNorm
-        )
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dsv4TensorRole {
     pub layer: Option<usize>,

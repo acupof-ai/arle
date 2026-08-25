@@ -54,37 +54,3 @@ pub fn load(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
     };
     Ok((read(MARKOV_W1)?, read(MARKOV_W2)?))
 }
-
-pub fn save(path: &Path, w1: &[f32], w2: &[f32], rank: usize) -> Result<()> {
-    ensure!(rank > 0, "markov head rank must be positive");
-    ensure!(
-        w1.len() == w2.len() && w1.len().is_multiple_of(rank),
-        "markov head shapes: w1={} w2={} rank={rank}",
-        w1.len(),
-        w2.len()
-    );
-    let rows = w1.len() / rank;
-    let to_bf16 = |v: &[f32]| -> Vec<u8> {
-        v.iter()
-            .flat_map(|&x| half::bf16::from_f32(x).to_le_bytes())
-            .collect()
-    };
-    let (w1_b, w2_b) = (to_bf16(w1), to_bf16(w2));
-    let tensors = [(MARKOV_W1, &w1_b), (MARKOV_W2, &w2_b)].map(|(name, bytes)| {
-        (
-            name.to_string(),
-            safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![rows, rank], bytes)
-                .expect("bf16 view over own buffer"),
-        )
-    });
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Write-then-rename: `serialize_to_file` truncates first, so a failed save
-    // would otherwise destroy the last good checkpoint.
-    let tmp = path.with_extension("safetensors.tmp");
-    safetensors::serialize_to_file(tensors, None, &tmp)
-        .map_err(|e| anyhow::anyhow!("markov head save to {} failed: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}

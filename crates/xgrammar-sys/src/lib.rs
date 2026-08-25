@@ -92,7 +92,6 @@ mod ffi {
     pub enum ArleXGrammarMatcher {}
 
     unsafe extern "C" {
-        pub fn arle_xgrammar_version() -> *const c_char;
         pub fn arle_xgrammar_free_error(message: *mut c_char);
         pub fn arle_xgrammar_bitmask_size(vocab_size: i32) -> i32;
         pub fn arle_xgrammar_compiler_new(
@@ -114,13 +113,6 @@ mod ffi {
             compiler: *mut ArleXGrammarCompiler,
             schema: *const c_char,
             strict_mode: u8,
-            out: *mut *mut ArleXGrammarCompiledGrammar,
-            error: *mut *mut c_char,
-        ) -> c_int;
-        pub fn arle_xgrammar_compile_ebnf(
-            compiler: *mut ArleXGrammarCompiler,
-            grammar: *const c_char,
-            root_rule_name: *const c_char,
             out: *mut *mut ArleXGrammarCompiledGrammar,
             error: *mut *mut c_char,
         ) -> c_int;
@@ -149,7 +141,6 @@ mod ffi {
             error: *mut *mut c_char,
         ) -> c_int;
         pub fn arle_xgrammar_matcher_is_terminated(matcher: *const ArleXGrammarMatcher) -> u8;
-        pub fn arle_xgrammar_matcher_is_completed(matcher: *const ArleXGrammarMatcher) -> u8;
     }
 }
 
@@ -315,7 +306,6 @@ impl Drop for CompiledGrammar {
 pub struct GrammarMatcher {
     #[cfg(feature = "real")]
     inner: NonNull<ffi::ArleXGrammarMatcher>,
-    grammar: Arc<CompiledGrammar>,
     vocab_size: usize,
     _not_sync: PhantomData<*mut ()>,
 }
@@ -353,7 +343,6 @@ impl GrammarMatcher {
             let vocab_size = grammar.vocab_size();
             Ok(Self {
                 inner: NonNull::new(out).ok_or(XGrammarError::NullHandle("GrammarMatcher"))?,
-                grammar,
                 vocab_size,
                 _not_sync: PhantomData,
             })
@@ -426,22 +415,6 @@ impl GrammarMatcher {
             // SAFETY: `inner` is live for `self`.
             unsafe { ffi::arle_xgrammar_matcher_is_terminated(self.inner.as_ptr()) != 0 }
         }
-    }
-
-    pub fn is_completed(&self) -> bool {
-        #[cfg(not(feature = "real"))]
-        {
-            false
-        }
-        #[cfg(feature = "real")]
-        {
-            // SAFETY: `inner` is live for `self`.
-            unsafe { ffi::arle_xgrammar_matcher_is_completed(self.inner.as_ptr()) != 0 }
-        }
-    }
-
-    pub fn grammar(&self) -> &Arc<CompiledGrammar> {
-        &self.grammar
     }
 }
 
