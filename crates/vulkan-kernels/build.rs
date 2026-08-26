@@ -69,6 +69,33 @@ const MM_CM_DEFINES_Q5_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q5_K", "
 const MM_CM_DEFINES_Q6_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q6_K", "2");
 const MM_CM_DEFINES_Q8_0: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q8_0", "4");
 
+/// Shared `mul_mat_vec.comp` define set for the two NVFP4 GEMVs. `MUL_MAT_ID`
+/// is the ONLY difference between the plain and the fused-expert variant, so it
+/// is passed as an extra rather than duplicated into a second literal list.
+///
+/// Note `B_TYPE = float`, not `block_q8_1_x4`: unlike every other GEMV this
+/// crate registers, the NVFP4 pair runs `mul_mat_vec.comp` (dequantize-to-float
+/// then `dot`), not `mul_mat_vecq.comp` (integer dot). See the `ShaderSpec`
+/// comment below for why.
+macro_rules! nvfp4_gemv_defines {
+    ($($extra:expr,)*) => {
+        &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_NVFP4", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+            $($extra,)*
+        ]
+    };
+}
+
+const NVFP4_GEMV_DEFINES: &[(&str, &str)] = nvfp4_gemv_defines!();
+const NVFP4_GEMV_ID_DEFINES: &[(&str, &str)] = nvfp4_gemv_defines!(("MUL_MAT_ID", "1"),);
+
 const VENDORED: &[ShaderSpec] = &[
     ShaderSpec {
         name: "mul_mat_vec_iq2_xxs",
@@ -243,6 +270,35 @@ const VENDORED: &[ShaderSpec] = &[
             ("MUL_MAT_ID", "1"),
             ("USE_SUBGROUP_ADD", "1"),
         ],
+    },
+    // NVFP4 (four UE4M3 sub-block scales, one per 16 values, then 32 packed
+    // E2M1 nibble bytes — 36 B per 64-value block; ggml-common.h:211). The
+    // routed experts of Qwen3.8-Flash-Next are NVFP4 and nothing else is, so
+    // without these two variants that checkpoint's MoE has no GEMV.
+    //
+    // These are the ONLY GEMVs here built from `mul_mat_vec.comp` rather than
+    // `mul_mat_vecq.comp`, and that is forced, not a preference:
+    // `mul_mat_vecq_funcs.glsl` has no `DATA_A_NVFP4` arm and cannot get one by
+    // a define. Its `mmvq_dot_product` contract is ONE `get_dm(ib)` scale per
+    // dot-product group, and it walks A in `QUANT_K_Q8_1`-sized (32-value)
+    // steps; NVFP4 carries FOUR scales per 64-value block, so an integer-dot
+    // arm would need a different accumulator decomposition, i.e. new vendored
+    // shader code on the hot path. Upstream llama.cpp made the same call —
+    // NVFP4 appears in `dequant_funcs.glsl` and `mul_mm_funcs.glsl`, never in
+    // `mul_mat_vecq_funcs.glsl`.
+    //
+    // Consequence for callers: B is a plain f32 activation vector, NOT
+    // `block_q8_1_x4`. The MoE path skips the `q8_1_quantize` dispatch for
+    // NVFP4 experts, and feeding these pipelines q8_1 bytes is silent garbage.
+    ShaderSpec {
+        name: "mul_mat_vec_nvfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: NVFP4_GEMV_DEFINES,
+    },
+    ShaderSpec {
+        name: "mul_mat_vec_id_nvfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: NVFP4_GEMV_ID_DEFINES,
     },
     // Batched prefill GEMM (`mul_mmq`) — the integer-dot-product tiled matmul
     // that consumes the SAME `block_q8_1_x4` activations the decode GEMVs

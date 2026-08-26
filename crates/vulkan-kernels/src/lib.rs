@@ -75,6 +75,148 @@ pub const fn q8_1_row_bytes(ncols: usize) -> Option<usize> {
     Some(ncols / QK8_1 * BLOCK_Q8_1_BYTES)
 }
 
+/// `block_nvfp4` values per block (ggml-common.h:211 `QK_NVFP4`).
+pub const QK_NVFP4: usize = 64;
+/// Values per UE4M3 sub-block scale (ggml-common.h:212 `QK_NVFP4_SUB`). Matches
+/// the checkpoint's `group_size: 16` (hf_quant_config.json).
+pub const QK_NVFP4_SUB: usize = 16;
+/// `sizeof(block_nvfp4)`: `uint8 d[4]` UE4M3 sub-block scales + `uint8 qs[32]`
+/// packed E2M1 nibbles (ggml-common.h:213-217).
+pub const BLOCK_NVFP4_BYTES: usize = 36;
+
+/// Device bytes one NVFP4 row of `ncols` values occupies once it is in
+/// `block_nvfp4` form (see [`repack_nvfp4_planes`]).
+///
+/// `None` unless `ncols` is a whole number of 64-value blocks: `mul_mat_vec.comp`
+/// indexes A as `ib = (row*ncols + col) / QUANT_K`, so a row width that is not a
+/// block multiple silently makes row `r > 0` read the previous row's tail.
+pub const fn nvfp4_row_bytes(ncols: usize) -> Option<usize> {
+    if ncols == 0 || !ncols.is_multiple_of(QK_NVFP4) {
+        return None;
+    }
+    Some(ncols / QK_NVFP4 * BLOCK_NVFP4_BYTES)
+}
+
+/// Rewrite one NVFP4 weight matrix `[nrows, ncols]` from the checkpoint's
+/// separate planes into the contiguous ggml `block_nvfp4` stream the vendored
+/// `DATA_A_NVFP4` shaders read.
+///
+/// Inputs are two of the four tensors ModelOpt writes per quantized matrix:
+/// `...weight` (`qs_plane`, U8, `ncols/2` bytes per row) and `...weight_scale`
+/// (`scale_plane`, FP8 E4M3, `ncols/16` bytes per row). The other two are F32
+/// scalars and do NOT belong in the blocks: `weight_scale_2` is per-tensor and
+/// rides out-of-band (see [`gemv_id_params_fused`]); `input_scale` describes the
+/// W4A4 *activation* quantizer, which this f32-activation lane does not use.
+///
+/// ## Why the bytes are BUILT and not copied
+///
+/// Two independent layout gaps, both measured against the on-box checkpoint
+/// (`layer-00000-experts-0000-0127.safetensors`, layer 0):
+///
+/// 1. **The scales are interleaved with the data.** `block_nvfp4` is
+///    `d[4] || qs[32]` per 64 values, so each row's scale bytes have to be
+///    sliced into the qs stream 4 at a time. Total bytes are unchanged
+///    (`1280 + 160 == 40 * 36` for a 2560-wide row), so this costs no VRAM.
+///
+/// 2. **The nibble order differs.** ModelOpt packs consecutive pairs — value
+///    `2i` in the low nibble of byte `i`, value `2i+1` in the high nibble.
+///    ggml packs split halves *within each 16-value sub-block* — the low
+///    nibbles of the 8 bytes are elements 0..7 and the high nibbles are
+///    elements 8..15 (`ggml-quants.c:531`, and the consumer at
+///    `vulkan-shaders/dequant_funcs.glsl:493`). A straight `d || qs` copy
+///    therefore permutes every group of 16 weights against its activations and
+///    still produces plausible-looking finite output.
+///
+///    This is not taken on faith from the producer's docs; it is measured, and
+///    `tests/device_nvfp4_gemv.rs` re-measures it. Under each hypothesis the
+///    routed experts' within-group normalized-magnitude profile (mean
+///    `|w| / group_amax` per input channel, 4 experts x 640 rows) is correlated
+///    against the same profile of the layer's own BF16
+///    `shared_expert.gate_proj`, which reads the same residual stream and is
+///    NOT quantized: consecutive-pairs scores +0.54 (up_proj +0.50),
+///    split-halves +0.039 — noise. Unchanged at 32 experts (+0.51 / +0.035),
+///    and the layer-0-vs-MTP-layer control is -0.03, so the signal is
+///    layer-specific structure and not an artifact of the statistic.
+///
+/// ## Why host-side, and not a shader that reads the planes directly
+///
+/// A plane-reading variant would avoid this transform, but:
+/// - the transform is not an extra pass. The weights must be copied host->device
+///   once regardless; this rewrites the bytes *in* that copy, so the marginal
+///   cost is CPU byte-shuffling overlapped with an I/O-bound upload, not a
+///   second traversal of the checkpoint.
+/// - device footprint is identical either way (36 B per 64 values both ways).
+/// - `mul_mat_vec_base.glsl` computes ONE A-side offset,
+///   `expert_id * (batch_stride_a / QUANT_K)`, in block units. A second plane
+///   needs a second, differently-scaled offset and a 7th binding, i.e. forking
+///   the shared binding/offset contract that every registered GEMV uses —
+///   new untested shader code on the MoE hot path, versus a host loop whose
+///   output is checked against an independent CPU dequantizer.
+///
+/// # Errors
+/// `ncols` not a positive multiple of [`QK_NVFP4`], or any of the three slices
+/// not exactly the length that `nrows`/`ncols` implies.
+pub fn repack_nvfp4_planes(
+    qs_plane: &[u8],
+    scale_plane: &[u8],
+    nrows: usize,
+    ncols: usize,
+    out: &mut [u8],
+) -> Result<()> {
+    let Some(row_bytes) = nvfp4_row_bytes(ncols) else {
+        return Err(KernelError::Runtime(format!(
+            "nvfp4 repack: ncols {ncols} is not a positive multiple of {QK_NVFP4}"
+        )));
+    };
+    let qs_row = ncols / 2;
+    let scale_row = ncols / QK_NVFP4_SUB;
+    for (label, got, want) in [
+        ("weight plane", qs_plane.len(), nrows * qs_row),
+        ("weight_scale plane", scale_plane.len(), nrows * scale_row),
+        ("destination", out.len(), nrows * row_bytes),
+    ] {
+        if got != want {
+            return Err(KernelError::Runtime(format!(
+                "nvfp4 repack: {label} is {got} B, expected {want} B for [{nrows}, {ncols}]"
+            )));
+        }
+    }
+
+    const SUBS: usize = QK_NVFP4 / QK_NVFP4_SUB; // 4 scales per block
+    const SUB_BYTES: usize = QK_NVFP4_SUB / 2; // 8 qs bytes per sub-block
+    const SUB_HALF: usize = QK_NVFP4_SUB / 4; // src byte holding element 8
+
+    for r in 0..nrows {
+        let src_qs = &qs_plane[r * qs_row..][..qs_row];
+        let src_sc = &scale_plane[r * scale_row..][..scale_row];
+        let dst_row = &mut out[r * row_bytes..][..row_bytes];
+
+        for (b, block) in dst_row.chunks_exact_mut(BLOCK_NVFP4_BYTES).enumerate() {
+            let (d, qs) = block.split_at_mut(SUBS);
+            // Verbatim: every scale byte in this checkpoint is already a legal
+            // ggml UE4M3 code. Measured over all 39,321,600 layer-0 scale bytes
+            // the range is 0x48..=0x7E — no sign bit (which ggml's 128-entry LUT
+            // has no room for) and no 0x7F (which ggml decodes as 0, not NaN).
+            d.copy_from_slice(&src_sc[b * SUBS..][..SUBS]);
+
+            let src_block = &src_qs[b * (QK_NVFP4 / 2)..][..QK_NVFP4 / 2];
+            for s in 0..SUBS {
+                let src_sub = &src_block[s * SUB_BYTES..][..SUB_BYTES];
+                let dst_sub = &mut qs[s * SUB_BYTES..][..SUB_BYTES];
+                for (j, dst_byte) in dst_sub.iter_mut().enumerate() {
+                    // dst byte j holds elements (j, j+8); in the source those
+                    // live at bytes (j/2, 4 + j/2), both in nibble j&1.
+                    let shift = 4 * (j & 1) as u32;
+                    let lo = (src_sub[j / 2] >> shift) & 0xF;
+                    let hi = (src_sub[SUB_HALF + j / 2] >> shift) & 0xF;
+                    *dst_byte = lo | (hi << 4);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kernel {
     MmvqIq2Xxs,
@@ -98,6 +240,27 @@ pub enum Kernel {
     /// The variant the 122B-A10B MoE hot path actually dispatches: every
     /// `ffn_gate_exps`/`ffn_up_exps` and most `ffn_down_exps` are MXFP4.
     GemvIdMxfp4,
+    /// NVFP4 (four UE4M3 sub-block scales + 32 packed E2M1 nibble bytes per 64
+    /// values, 36 B/block). Carries every routed expert of
+    /// Qwen3.8-Flash-Next — and nothing else in that checkpoint.
+    ///
+    /// UNLIKE every other `Gemv*` here this is `mul_mat_vec.comp`, not
+    /// `mul_mat_vecq.comp`: **B is a plain f32 activation vector, not
+    /// `block_q8_1_x4`** (see `build.rs`'s `mul_mat_vec_nvfp4` comment).
+    /// Push constants are [`gemv_params_f32_b`], not [`gemv_params`].
+    ///
+    /// The weight bytes must be in ggml `block_nvfp4` form, which the
+    /// checkpoint's four separate planes are NOT — see [`repack_nvfp4_planes`].
+    GemvNvfp4,
+    /// The fused MoE expert GEMV for NVFP4 routed experts: `mul_mat_vec.comp`
+    /// built with `MUL_MAT_ID`, so one dispatch runs a token through all top-k
+    /// experts. Same f32-B caveat as [`Kernel::GemvNvfp4`]; push constants are
+    /// [`gemv_id_params`] (whose `stride_b` is already in elements).
+    ///
+    /// The per-tensor `weight_scale_2` has no slot in `block_nvfp4` and rides
+    /// out-of-band through the shader's SCALE0/SCALE1 output fusion — see
+    /// [`gemv_id_params_fused`].
+    GemvIdNvfp4,
     /// Batched prefill GEMM (`mul_mmq`): `D[n, m] = A[m, k] · Bᵀ[n, k]` with a
     /// quantized `A` and `block_q8_1_x4` `B` — the SAME activation format the
     /// decode GEMVs consume, so one `QuantizeQ8_1` dispatch feeds both. Tile
@@ -194,6 +357,19 @@ const SPEC_MMVQ_Q2_K: &[(u32, u32)] = &[(0, 32), (1, 2), (2, 1)];
 // requiredSubgroupSize=64 (see `Kernel::required_subgroup_size`) so the wave is
 // exactly one full subgroup.
 const SPEC_GEMV_K_Q8_1: &[(u32, u32)] = &[(0, 64), (1, 1), (2, 1)];
+/// `mul_mat_vec.comp`'s `BLOCK_SIZE, NUM_ROWS, NUM_COLS`. Numerically equal to
+/// [`SPEC_GEMV_K_Q8_1`] but deliberately a separate constant: the two shaders
+/// only share the spec-constant *ids*, and tying the NVFP4 lane to a name that
+/// says `Q8_1` would hide the fact that a future retune of the q8_1 decode
+/// geometry has nothing to do with this one.
+///
+/// `BLOCK_SIZE = 64` is the 8060S wave width. `mul_mat_vec.comp` gives thread
+/// `tid` the columns `{512*i + 8*tid}` (`K_PER_ITER = 8`), so with a 64-wide
+/// workgroup the coverage is exactly every 8-aligned column once — which is why
+/// `ncols` must be a multiple of 8, and (for the A-side block index to stay
+/// row-aligned) of `QK_NVFP4`. Both hold for this model: hidden 2560 = 40x64,
+/// `moe_intermediate_size` 640 = 10x64.
+const SPEC_GEMV_NVFP4: &[(u32, u32)] = &[(0, 64), (1, 1), (2, 1)];
 const SPEC_RMS_NORM_MUL: &[(u32, u32)] = &[(1, 1)];
 
 impl Kernel {
@@ -210,6 +386,8 @@ impl Kernel {
         Self::GemvIdQ6K,
         Self::GemvIdQ8_0,
         Self::GemvIdMxfp4,
+        Self::GemvNvfp4,
+        Self::GemvIdNvfp4,
         Self::MmqQ4K,
         Self::MmqQ5K,
         Self::MmqQ6K,
@@ -262,6 +440,8 @@ impl Kernel {
             Kernel::GemvIdQ6K => "mul_mat_vec_id_q6_k",
             Kernel::GemvIdQ8_0 => "mul_mat_vec_id_q8_0",
             Kernel::GemvIdMxfp4 => "mul_mat_vec_id_mxfp4",
+            Kernel::GemvNvfp4 => "mul_mat_vec_nvfp4",
+            Kernel::GemvIdNvfp4 => "mul_mat_vec_id_nvfp4",
             Kernel::MmqQ4K => "mul_mmq_q4_k",
             Kernel::MmqQ5K => "mul_mmq_q5_k",
             Kernel::MmqQ6K => "mul_mmq_q6_k",
@@ -315,6 +495,7 @@ impl Kernel {
             | Kernel::GemvIdQ8_0
             | Kernel::GemvMxfp4
             | Kernel::GemvIdMxfp4 => SPEC_GEMV_K_Q8_1,
+            Kernel::GemvNvfp4 | Kernel::GemvIdNvfp4 => SPEC_GEMV_NVFP4,
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
@@ -1065,6 +1246,57 @@ pub fn gemv_dispatch(nrows: u32) -> Dispatch {
     Dispatch::x(nrows.max(1))
 }
 
+/// [`gemv_params`] for the `mul_mat_vec.comp` GEMVs, whose B operand is a plain
+/// f32 vector rather than `block_q8_1_x4` ([`Kernel::GemvNvfp4`]).
+///
+/// The push block is byte-identical in shape; the one field that changes meaning
+/// is `stride_b`, which is a row stride in ELEMENTS here (`mul_mat_vecq.comp`
+/// divides `b_offset` by `QUANT_K_Q8_1` in `compute_outputs`, `mul_mat_vec.comp`
+/// does not). At `batch_idx == 0` the non-`MUL_MAT_ID` branch never reads
+/// `stride_b`, so passing [`gemv_params`] here happens to work today — which is
+/// exactly why the wrong value should not be left sitting in the block.
+pub fn gemv_params_f32_b(ncols: u32, nrows: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        ncols, // ncols: per-row width in elements
+        ncols, // stride_a: weight row stride (elements)
+        ncols, // stride_b: activation row stride in ELEMENTS (f32 B)
+        nrows, // stride_d: ROW COUNT guard the shader checks first_row against
+        ncols, // batch_stride_a (elements); only used via /QUANT_K when batched
+        0,     // batch_stride_b: single batch
+        0,     // batch_stride_d: single batch
+        0,     // fusion_flags: no bias/scale fusion (bindings 3/4 unread)
+        0,     // base_work_group_y: batch offset
+        1,     // ne02
+        1,     // ne12
+        1,     // broadcast2
+        1,     // broadcast3
+    ])
+}
+
+/// `MAT_VEC_FUSION_FLAGS_*` from `mul_mat_vec_iface.glsl`, for the
+/// `fusion_flags` word of [`gemv_id_params_fused`].
+///
+/// Under `MUL_MAT_ID` the two SCALE flags multiply each output row by
+/// `data_fuse{0,1}[gl_GlobalInvocationID.y]` — indexed by the expert SLOT, not
+/// the expert id — so binding 3 / binding 4 are per-selected-expert f32 vectors
+/// of length `n_experts`. That is the slot the NVFP4 per-tensor
+/// `weight_scale_2` folds into: `y_true = weight_scale_2 * y_shader`, because
+/// `block_nvfp4` has nowhere to keep it and it cannot be folded into the block
+/// scale (measured on layer-0 expert-0 `gate_proj`: re-encoding
+/// `weight_scale * weight_scale_2` into E4M3 puts 99.98% of groups below E4M3's
+/// smallest normal, 2^-6). With two flags the routing weight can ride in the
+/// other one and the MoE weighted-accumulate loses a multiply.
+///
+/// The BIAS flags are the non-`MUL_MAT_ID` half of the same enum and are listed
+/// for completeness; note BIAS0 under `MUL_MAT_ID` indexes by expert *id*.
+pub const MAT_VEC_FUSION_BIAS0: u32 = 0x1;
+/// See [`MAT_VEC_FUSION_BIAS0`].
+pub const MAT_VEC_FUSION_BIAS1: u32 = 0x2;
+/// See [`MAT_VEC_FUSION_BIAS0`].
+pub const MAT_VEC_FUSION_SCALE0: u32 = 0x4;
+/// See [`MAT_VEC_FUSION_BIAS0`].
+pub const MAT_VEC_FUSION_SCALE1: u32 = 0x8;
+
 /// Push-constant layout for the FUSED MoE expert GEMV (`mul_mat_vecq.comp` built
 /// with `MUL_MAT_ID`). The `MUL_MAT_ID` branch of `mul_mat_vec_base.glsl` replaces
 /// the trailing 5 batch fields of [`gemv_params`] with 4 expert-id fields, so the
@@ -1101,6 +1333,24 @@ pub fn gemv_dispatch(nrows: u32) -> Dispatch {
 /// experts), B q8_1_x4 activation, D f32 dst (n_experts*nrows rows), Fuse0, Fuse1,
 /// IDS (i32 expert-id list)]`.
 pub fn gemv_id_params(ncols: u32, nrows: u32, n_experts: u32) -> KernelParams {
+    gemv_id_params_fused(ncols, nrows, n_experts, 0)
+}
+
+/// [`gemv_id_params`] with the shader's output fusion turned on. `fusion_flags`
+/// is an OR of [`MAT_VEC_FUSION_SCALE0`] / [`MAT_VEC_FUSION_SCALE1`] /
+/// [`MAT_VEC_FUSION_BIAS0`]; each enabled SCALE flag makes binding 3 (resp. 4)
+/// a live `f32[n_experts]` read at the expert SLOT, so a dummy 4-byte buffer is
+/// no longer sufficient there.
+///
+/// This is how the NVFP4 per-tensor `weight_scale_2` reaches the product
+/// without a slot in `block_nvfp4` and without an extra dispatch — see
+/// [`MAT_VEC_FUSION_BIAS0`] for the arithmetic.
+pub fn gemv_id_params_fused(
+    ncols: u32,
+    nrows: u32,
+    n_experts: u32,
+    fusion_flags: u32,
+) -> KernelParams {
     KernelParams::from_words(vec![
         ncols,             // ncols: per-row width in elements
         ncols,             // stride_a: weight row stride (elements)
@@ -1109,7 +1359,7 @@ pub fn gemv_id_params(ncols: u32, nrows: u32, n_experts: u32) -> KernelParams {
         ncols * nrows,     // batch_stride_a: full expert matrix (elements) -> /QUANT_K
         ncols,             // batch_stride_b: one token's activation
         nrows * n_experts, // batch_stride_d: full dst
-        0,                 // fusion_flags: no bias/scale fusion
+        fusion_flags,      // fusion_flags: bindings 3/4 are read only when set
         n_experts,         // nei0: experts selected for this token
         1,                 // ne11: single token
         0,                 // expert_i1: single-token batch row
@@ -2299,3 +2549,122 @@ pub use real::{
 pub use stub::{
     flash_attn_with_params_and_spec, mm_with_params_and_spec, mmq_with_params_and_spec,
 };
+
+#[cfg(test)]
+mod nvfp4_repack_tests {
+    use super::{BLOCK_NVFP4_BYTES, QK_NVFP4, QK_NVFP4_SUB, nvfp4_row_bytes, repack_nvfp4_planes};
+
+    /// UE4M3 codes with exact power-of-two values, one per sub-block, so the
+    /// expected weights below are written down rather than recomputed:
+    /// `0x30 -> 2^-1`, `0x38 -> 2^0`, `0x40 -> 2^1`, `0x48 -> 2^2`
+    /// (bits `x eeee mmm`, bias 7; `ue4m3_to_f32` in `infer_gguf::dequant`).
+    const SCALES: [u8; 4] = [0x38, 0x40, 0x30, 0x48];
+    const SCALE_VALUES: [f32; 4] = [1.0, 2.0, 0.5, 4.0];
+
+    /// E2M1 nibble -> value, `s eem`: the OCP FP4 table ggml spells as a
+    /// doubled int8 `kvalues_mxfp4` (types.glsl:1767).
+    const E2M1: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+
+    #[test]
+    fn row_bytes_is_36_per_64_values() {
+        assert_eq!(nvfp4_row_bytes(QK_NVFP4), Some(BLOCK_NVFP4_BYTES));
+        // The two widths this model actually uses: hidden and moe_intermediate.
+        assert_eq!(nvfp4_row_bytes(2560), Some(1440));
+        assert_eq!(nvfp4_row_bytes(640), Some(360));
+        // A row that is not a whole number of blocks would make row r>0 read
+        // the previous row's tail, so it must be refused, not rounded.
+        assert_eq!(nvfp4_row_bytes(32), None);
+        assert_eq!(nvfp4_row_bytes(2560 + 16), None);
+        assert_eq!(nvfp4_row_bytes(0), None);
+    }
+
+    /// Element `k` of the source row gets nibble `k % 16`, so every one of the
+    /// 16 E2M1 codes appears in every sub-block and NO two positions inside a
+    /// sub-block share a value. An identity `d || qs` copy — the "just
+    /// interleave the scales" repack — permutes each group to
+    /// `0,2,4,..,14,1,3,..,15` and fails here.
+    fn source_planes(nrows: usize, ncols: usize) -> (Vec<u8>, Vec<u8>) {
+        let qs = (0..nrows * ncols / 2)
+            .map(|i| {
+                let k = 2 * i;
+                let lo = (k % QK_NVFP4_SUB) as u8;
+                let hi = ((k + 1) % QK_NVFP4_SUB) as u8;
+                lo | (hi << 4)
+            })
+            .collect();
+        let sc = (0..nrows * ncols / QK_NVFP4_SUB)
+            .map(|g| SCALES[g % SCALES.len()])
+            .collect();
+        (qs, sc)
+    }
+
+    fn expected_row(ncols: usize) -> Vec<f32> {
+        (0..ncols)
+            .map(|k| E2M1[k % QK_NVFP4_SUB] * SCALE_VALUES[(k / QK_NVFP4_SUB) % SCALE_VALUES.len()])
+            .collect()
+    }
+
+    /// Repack, then dequantize the result with `infer_gguf`'s independent
+    /// `block_nvfp4` reader, and require the hand-written value sequence back.
+    /// Two rows so a row-stride slip shows up as a value mismatch.
+    #[test]
+    fn repacked_blocks_dequantize_to_the_source_elements() {
+        const NROWS: usize = 2;
+        const NCOLS: usize = 3 * QK_NVFP4;
+        let (qs, sc) = source_planes(NROWS, NCOLS);
+        let row_bytes = nvfp4_row_bytes(NCOLS).expect("row bytes");
+        let mut packed = vec![0u8; NROWS * row_bytes];
+        repack_nvfp4_planes(&qs, &sc, NROWS, NCOLS, &mut packed).expect("repack");
+
+        let want = expected_row(NCOLS);
+        for r in 0..NROWS {
+            let got = infer_gguf::dequant::dequantize_row_nvfp4(
+                &packed[r * row_bytes..(r + 1) * row_bytes],
+                NCOLS,
+            )
+            .expect("dequantize repacked row");
+            assert_eq!(got, want, "row {r}");
+        }
+    }
+
+    /// Pin the permutation at the byte level too, so the contract survives even
+    /// if `infer_gguf`'s dequantizer is ever changed in the same direction as a
+    /// repack bug. One sub-block: source bytes hold elements (2i, 2i+1); the
+    /// destination byte `j` must hold elements (j, j+8).
+    #[test]
+    fn one_sub_block_permutes_pairs_into_halves() {
+        // Elements 0..15 carry nibbles 0..15, i.e. element e has nibble e.
+        let qs: Vec<u8> = (0..QK_NVFP4 / 2)
+            .map(|i| {
+                let lo = (2 * i % QK_NVFP4_SUB) as u8;
+                let hi = ((2 * i + 1) % QK_NVFP4_SUB) as u8;
+                lo | (hi << 4)
+            })
+            .collect();
+        let sc = vec![SCALES[0]; QK_NVFP4 / QK_NVFP4_SUB];
+        let mut packed = vec![0u8; BLOCK_NVFP4_BYTES];
+        repack_nvfp4_planes(&qs, &sc, 1, QK_NVFP4, &mut packed).expect("repack");
+
+        assert_eq!(&packed[..4], &[SCALES[0]; 4], "scales copied verbatim");
+        // dst byte j = element j | element (j+8) << 4  =>  j | (j+8) << 4.
+        let want: Vec<u8> = (0..8u8).map(|j| j | ((j + 8) << 4)).collect();
+        assert_eq!(&packed[4..12], want.as_slice(), "sub-block 0 nibbles");
+    }
+
+    #[test]
+    fn mis_sized_planes_are_refused_not_truncated() {
+        const NCOLS: usize = QK_NVFP4;
+        let (qs, sc) = source_planes(1, NCOLS);
+        let mut packed = vec![0u8; BLOCK_NVFP4_BYTES];
+
+        assert!(repack_nvfp4_planes(&qs[..qs.len() - 1], &sc, 1, NCOLS, &mut packed).is_err());
+        assert!(repack_nvfp4_planes(&qs, &sc[..sc.len() - 1], 1, NCOLS, &mut packed).is_err());
+        assert!(
+            repack_nvfp4_planes(&qs, &sc, 1, NCOLS, &mut packed[..BLOCK_NVFP4_BYTES - 1]).is_err()
+        );
+        // ncols must be a whole number of blocks.
+        assert!(repack_nvfp4_planes(&qs, &sc, 1, NCOLS + 16, &mut packed).is_err());
+    }
+}
