@@ -54,6 +54,10 @@ pub enum GgmlType {
     Mxfp4,
     Nvfp4,
     Q1_0,
+    /// OCP FP8 E4M3 (`float8_e4m3fn`), one unblocked byte per element. The
+    /// `qwen4_exp` PLE/n-gram embedding table ships in this, and at
+    /// 320,001,536 x 160 it is far too large to widen at load time.
+    F8E4M3,
 }
 
 impl GgmlType {
@@ -93,6 +97,12 @@ impl GgmlType {
             39 => Self::Mxfp4,
             40 => Self::Nvfp4,
             41 => Self::Q1_0,
+            // Upstream ggml's enum stops at MXFP4 = 39 (GGML_TYPE_COUNT = 40);
+            // 40/41 above are already this tree's own allocations and 42
+            // continues that local sequence. Re-check this id whenever
+            // vendor/llama.cpp is refreshed — upstream may claim 42 for
+            // something else.
+            42 => Self::F8E4M3,
             other => bail!("unknown ggml type id {other}"),
         })
     }
@@ -107,7 +117,8 @@ impl GgmlType {
             | Self::I16
             | Self::I32
             | Self::I64
-            | Self::F64 => 1,
+            | Self::F64
+            | Self::F8E4M3 => 1,
             Self::Q4_0
             | Self::Q4_1
             | Self::Q5_0
@@ -129,7 +140,8 @@ impl GgmlType {
         Some(match self {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 | Self::I16 => 2,
-            Self::I8 => 1,
+            // E4M3 is a plain 1-byte element type: no block, no shared scale.
+            Self::I8 | Self::F8E4M3 => 1,
             Self::I64 | Self::F64 => 8,
             Self::Q4_0 => 18,
             Self::Q4_1 => 20,
@@ -150,6 +162,10 @@ impl GgmlType {
             // MXFP4, so this is 90% of a 122B-A10B checkpoint's elements, not a
             // corner case.
             Self::Mxfp4 => 17,
+            // block_nvfp4 { uint8_t d[QK_NVFP4/QK_NVFP4_SUB] /* UE4M3 */;
+            // uint8_t qs[QK_NVFP4/2] } with QK_NVFP4 = 64 and QK_NVFP4_SUB = 16
+            // (ggml-common.h l.211-217 static_assert) => 4 + 32.
+            Self::Nvfp4 => 36,
             _ => return None,
         })
     }
@@ -641,5 +657,26 @@ mod split_tests {
                 "{name} should not parse as a split part"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod type_layout_tests {
+    use super::GgmlType;
+
+    /// Qwen3.8-Flash-Next keeps its routed experts in NVFP4, so an unpinned
+    /// `type_size` (the pre-fix `None`) made every expert tensor unsliceable.
+    /// The numbers come from ggml-common.h:211-217:
+    ///   QK_NVFP4 = 64, QK_NVFP4_SUB = 16
+    ///   block_nvfp4 { uint8_t d[64/16]; uint8_t qs[64/2]; } = 4 + 32 = 36
+    #[test]
+    fn nvfp4_block_is_64_elements_in_36_bytes() {
+        assert_eq!(GgmlType::Nvfp4.block_size(), 64);
+        assert_eq!(GgmlType::Nvfp4.type_size(), Some(36));
+        assert_eq!(GgmlType::Nvfp4.row_bytes(64), Some(36));
+        // 2560 = the 180B's expert intermediate width; 40 blocks x 36 B.
+        assert_eq!(GgmlType::Nvfp4.row_bytes(2560), Some(1440));
+        // Rows that do not fill whole blocks stay unrepresentable.
+        assert_eq!(GgmlType::Nvfp4.row_bytes(32), None);
     }
 }

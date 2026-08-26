@@ -1620,9 +1620,9 @@ pub fn qwen36_router_topk_params(n_expert: u32, top_k: u32, norm_topk: bool) -> 
     KernelParams::from_words(vec![n_expert, top_k, u32::from(norm_topk)])
 }
 
-/// Dispatch grid for `qwen36_router_topk.comp`: ONE workgroup of 256 threads
-/// (one expert per lane); parallel max/Σexp reductions + `top_k` parallel
-/// argmax-and-mask rounds. (The earlier single-thread `local_size_x=1` version
+/// Dispatch grid for `qwen36_router_topk.comp`: ONE workgroup of 256 threads,
+/// each lane walking a STRIDE of experts (so 512-expert tables work); parallel
+/// max/Σexp reductions + `top_k` parallel argmax-and-mask rounds. (The earlier single-thread `local_size_x=1` version
 /// was ~428µs/call — ~46% of MoE decode — wasting the whole wave.)
 pub fn qwen36_router_topk_dispatch() -> Dispatch {
     Dispatch { x: 1, y: 1, z: 1 }

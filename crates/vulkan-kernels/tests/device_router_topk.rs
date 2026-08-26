@@ -103,12 +103,24 @@ fn qwen36_router_topk_matches_host_oracle() {
 
     // The real qwen36 config (256 experts, top-8, renorm) plus smaller shapes and
     // the k==n edge. Logits scaled x4 so the top-k is well separated (no ties).
+    //
+    // The n>256 shapes are APPENDED rather than interleaved: `rng` is shared
+    // across the whole loop, so this keeps the logits of the pre-existing cases
+    // bit-for-bit what they were — the 256-expert path is live for the on-box
+    // 122B and a change there has to show up as a failure, not as new inputs.
+    // 512/top-10 is the qwen4_exp (Qwen3.8-Flash-Next) router: two strides per
+    // lane. 300 is deliberately not a multiple of the 256-lane BLOCK, so the
+    // second stride is ragged and most lanes own exactly one expert.
     let configs = [
         (256usize, 8usize, true),
         (256, 8, false),
         (8, 2, true),
         (4, 4, true),
         (64, 8, true),
+        (512, 10, true),
+        (512, 10, false),
+        (300, 10, true),
+        (300, 8, false),
     ];
     for &(n_expert, top_k, norm) in &configs {
         for trial in 0..4 {
@@ -155,6 +167,100 @@ fn qwen36_router_topk_matches_host_oracle() {
             eprintln!("[{label}] PASS ids+weights");
         }
     }
+}
+
+/// Dispatch `qwen36_router_topk` and oracle-check it, sharing the assertions
+/// with the random sweep above.
+fn assert_router_topk<'a>(
+    ctx: &'a VulkanContext,
+    cache: &mut KernelCache<'a>,
+    label: &str,
+    logits: &[f32],
+    top_k: usize,
+    norm: bool,
+) {
+    let (want_ids, want_weights) = host_routes(logits, top_k, norm);
+    let buf_logits = upload_f32(ctx, logits);
+    let mut buf_ids = zeroed(ctx, top_k * 4);
+    let mut buf_weights = zeroed(ctx, top_k * 4);
+    let push = qwen36_router_topk_params(logits.len() as u32, top_k as u32, norm).to_le_bytes();
+    launch_cached(
+        cache,
+        ctx,
+        Kernel::Qwen36RouterTopk,
+        &[&buf_logits, &mut buf_ids, &mut buf_weights],
+        qwen36_router_topk_dispatch(),
+        &push,
+        Kernel::Qwen36RouterTopk.specialization_u32(),
+    )
+    .expect("router_topk dispatch");
+
+    let got_ids = read_i32(&buf_ids, top_k);
+    let got_weights = read_f32(&buf_weights, top_k);
+    assert_eq!(
+        got_ids, want_ids,
+        "{label}: expert ids mismatch (got {got_ids:?} vs want {want_ids:?})"
+    );
+    for (j, (&g, &w)) in got_weights.iter().zip(&want_weights).enumerate() {
+        assert!(
+            (g - w).abs() < 1e-5 || (g - w).abs() / w.abs().max(1e-4) < 1e-4,
+            "{label}: weight[{j}] got {g} vs want {w}"
+        );
+    }
+    eprintln!("[{label}] PASS ids+weights");
+}
+
+/// Pins the two ways a one-expert-per-lane router breaks past the 256-lane
+/// BLOCK, with logits PLANTED so the failure is deterministic rather than
+/// probable (the random sweep above would also catch these, but only because a
+/// uniform top-10 of 512 lands entirely in the first 256 about one time in
+/// a thousand). Both cases here fail 100% of the time on an unstrided kernel:
+///   A. winners live above the BLOCK, so a truncated scan cannot name them;
+///   B. winners live below the BLOCK — ids come out RIGHT — but half the
+///      softmax mass sits above it, so a truncated Σexp scales every weight.
+/// C covers a ragged final stride (n not a multiple of BLOCK) with winners
+/// straddling the boundary.
+#[test]
+fn qwen36_router_topk_spans_experts_past_the_block() {
+    let ctx = match VulkanContext::create() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no Vulkan device available ({e}); skipping router_topk stride test");
+            return;
+        }
+    };
+    eprintln!(
+        "ARLE Vulkan router_topk stride proof on: {}",
+        ctx.device_name()
+    );
+    let mut cache = KernelCache::new();
+
+    // A. Monotone ramp over 512: the top-10 are experts 511..502, all in the
+    //    second stride. Spacing 0.05 in logit keeps every prob distinct.
+    let ramp: Vec<f32> = (0..512).map(|e| e as f32 * 0.05).collect();
+    assert_router_topk(&ctx, &mut cache, "ramp512 k=10 norm", &ramp, 10, true);
+    assert_router_topk(&ctx, &mut cache, "ramp512 k=10 raw", &ramp, 10, false);
+
+    // B. Winners are experts 0..9 (descending), but experts 256..511 sit at 0.4
+    //    — below the 0.45 floor of the first stride, so they change no id while
+    //    contributing ~17% of Σexp. Only `norm=false` exposes that: the top-k
+    //    renormalization divides the denominator back out.
+    let masked: Vec<f32> = (0..512)
+        .map(|e| if e < 256 { 3.0 - e as f32 * 0.01 } else { 0.4 })
+        .collect();
+    assert_router_topk(&ctx, &mut cache, "masked512 k=10 raw", &masked, 10, false);
+
+    // C. n=300: one full stride plus a 44-wide ragged one. Winners straddle the
+    //    boundary; the unplanted experts share a value they can never win with.
+    let mut ragged = vec![-1.0f32; 300];
+    for (rank, &e) in [3usize, 255, 256, 257, 299, 100, 200, 12, 280, 44]
+        .iter()
+        .enumerate()
+    {
+        ragged[e] = 9.0 - rank as f32 * 0.5;
+    }
+    assert_router_topk(&ctx, &mut cache, "ragged300 k=10 norm", &ragged, 10, true);
+    assert_router_topk(&ctx, &mut cache, "ragged300 k=10 raw", &ragged, 10, false);
 }
 
 /// Host reference for `qwen36_router_gemv`: `y[e] = Σ_c W[e,c]·x[c]`, transcribed

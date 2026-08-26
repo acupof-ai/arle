@@ -4,11 +4,13 @@
 // Replaces the host `qwen36_topk_routes`: softmax-over-ALL experts, top-k by
 // softmax prob, weights = the selected probs (optionally renormalized to sum 1).
 //
-// ONE workgroup of `BLOCK` threads (one expert per lane for n_expert<=BLOCK):
-// parallel max-reduction, parallel Σexp, then `top_k` rounds of parallel
-// argmax-and-mask, finally the renorm. The earlier version ran this single-
-// threaded (local_size_x=1) — pathologically slow on the GPU (~428µs/call,
-// ~46% of MoE decode); the work is trivially parallel.
+// ONE workgroup of `BLOCK` threads. Each lane owns the experts
+// `tid, tid+BLOCK, tid+2*BLOCK, …` (exactly one for n_expert<=BLOCK), folds them
+// into a private partial, and the workgroup then does a parallel max-reduction,
+// a parallel Σexp, `top_k` rounds of argmax-and-mask, finally the renorm. The
+// earlier version ran this single-threaded (local_size_x=1) — pathologically
+// slow on the GPU (~428µs/call, ~46% of MoE decode); the work is trivially
+// parallel.
 //
 // KEY FACT: softmax is monotonic, so top-k by prob == top-k by raw logit. Select
 // by logit (argmax with strict `>`, ties → LOWER expert id, matching the host's
@@ -17,7 +19,10 @@
 layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
-    uint n_expert;   // total experts (<= BLOCK)
+    // Total experts. Strided over BLOCK lanes, so the only cap is the 32-bit
+    // `taken` mask below: n_expert <= 32*BLOCK = 8192. qwen3.6 uses 256,
+    // qwen4_exp (Qwen3.8-Flash-Next) 512.
+    uint n_expert;
     uint top_k;      // experts to keep per token
     uint norm_topk;  // 1 = renormalize kept weights to sum 1 (clamp F16_MIN)
 } p;
@@ -45,10 +50,13 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint n = p.n_expert;
     const uint k = min(p.top_k, n);
-    const float my_logit = (tid < n) ? logits[tid] : NEG_INF;
 
     // 1. max over all logits.
-    red_f[tid] = my_logit;
+    float lmax = NEG_INF;
+    for (uint e = tid; e < n; e += BLOCK) {
+        lmax = max(lmax, logits[e]);
+    }
+    red_f[tid] = lmax;
     barrier();
     for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
         if (tid < s) {
@@ -62,8 +70,15 @@ void main() {
     barrier();
     const float maxv = g_max;
 
-    // 2. Σ exp(logit - max) over all experts.
-    red_f[tid] = (tid < n) ? exp(my_logit - maxv) : 0.0;
+    // 2. Σ exp(logit - max) over all experts. Summing a lane's strides first is
+    //    a different association than a pure tree for n>BLOCK, but every term is
+    //    in (0,1] so the drift is at the ULP level; for n<=BLOCK the lane has a
+    //    single term and the arithmetic is bit-identical to the flat version.
+    float lsum = 0.0;
+    for (uint e = tid; e < n; e += BLOCK) {
+        lsum += exp(logits[e] - maxv);
+    }
+    red_f[tid] = lsum;
     barrier();
     for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
         if (tid < s) {
@@ -77,12 +92,26 @@ void main() {
     barrier();
     const float sumv = g_sum;
 
-    // 3. top-k by logit (== by prob). Each round: parallel argmax over the
-    //    not-yet-selected experts; strict `>` keeps the lower id on ties.
-    bool taken = false;
+    // 3. top-k by logit (== by prob). Each round: every lane argmaxes over its
+    //    own not-yet-selected strides, then the workgroup argmaxes those; strict
+    //    `>` keeps the lower id on ties in BOTH steps (a lane walks its strides
+    //    in ascending expert order, so the earlier stride wins its own ties).
+    //    `taken` is a bitmask over strides, not a bool, because a lane can own
+    //    several experts and only the selected one must drop out.
+    uint taken = 0u;
     for (uint j = 0u; j < k; ++j) {
-        red_f[tid] = (tid < n && !taken) ? my_logit : NEG_INF;
-        red_i[tid] = int(tid);
+        float mine_v = NEG_INF;
+        int mine_i = int(tid); // a lane with no expert still needs a losing id
+        uint e = tid;
+        for (uint stride = 0u; e < n; ++stride) {
+            if ((taken & (1u << stride)) == 0u && logits[e] > mine_v) {
+                mine_v = logits[e];
+                mine_i = int(e);
+            }
+            e += BLOCK;
+        }
+        red_f[tid] = mine_v;
+        red_i[tid] = mine_i;
         barrier();
         for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
             if (tid < s) {
@@ -99,8 +128,8 @@ void main() {
             barrier();
         }
         int best = red_i[0];
-        if (tid == uint(best)) {
-            taken = true;
+        if (uint(best) % uint(BLOCK) == tid) {
+            taken |= 1u << (uint(best) / uint(BLOCK));
         }
         if (tid == 0u) {
             sel[j] = best;

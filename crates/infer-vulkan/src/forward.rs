@@ -2867,10 +2867,21 @@ fn record_router_gemv<'a>(
 /// `weights_off`. Single-thread kernel; all three buffers are arena. 3-binding →
 /// `ring3`.
 #[allow(clippy::too_many_arguments)]
-/// Lanes in `qwen36_router_topk.comp` (`#define BLOCK 256`), i.e. the largest
-/// expert count that shader can score. Mirrored here because the push-constant
-/// block carries `n_expert` with no way for the shader to reject an overflow.
+/// Lanes in `qwen36_router_topk.comp` (`#define BLOCK 256`). Each lane now walks
+/// a STRIDE of experts, so this is no longer the expert ceiling — but the
+/// ceiling is still finite: the shader tracks which of a lane's strides are
+/// already selected in a 32-bit `taken` bitmask, so it holds at most 32 strides.
+/// `1u << stride` with `stride >= 32` is undefined in GLSL and would corrupt
+/// selection silently, which is exactly the failure this constant exists to
+/// prevent.
 const QWEN36_ROUTER_TOPK_BLOCK: usize = 256;
+
+/// Largest `n_expert` the strided shader can score: 32 strides of `BLOCK`.
+const QWEN36_ROUTER_TOPK_MAX_EXPERTS: usize = 32 * QWEN36_ROUTER_TOPK_BLOCK;
+
+/// `shared int sel[64]` in the shader. Nothing checks `top_k` against it, and
+/// overrunning it is an out-of-bounds shared-memory write, not an error.
+const QWEN36_ROUTER_TOPK_MAX_K: usize = 64;
 
 fn record_router_topk<'a>(
     ctx: &'a VulkanContext,
@@ -2883,15 +2894,17 @@ fn record_router_topk<'a>(
     ids_off: u64,
     weights_off: u64,
 ) -> Result<()> {
-    // `qwen36_router_topk.comp` is ONE workgroup of `BLOCK = 256` lanes, one
-    // expert per lane, and it reads `logits[tid] for tid < n`. Handing it
-    // `n_expert > 256` does not fail — it routes every token through only the
-    // first 256 experts, and the top-k renormalisation divides by the wrong
-    // softmax denominator, so the output stays coherent and is silently wrong.
-    // Qwen3.8-Flash-Next has 512. Refuse rather than mis-route.
+    // Both caps are silent when exceeded, which is why they are checked here
+    // rather than trusted: past `MAX_EXPERTS` the shader's `taken` bitmask
+    // overflows and selection is corrupted; past `MAX_K` it writes off the end
+    // of `shared int sel[64]`.
     anyhow::ensure!(
-        n_expert <= QWEN36_ROUTER_TOPK_BLOCK,
-        "{name}: router top-k shader handles at most {QWEN36_ROUTER_TOPK_BLOCK} experts,          got {n_expert}; a larger table needs the strided variant (silently drops          experts {QWEN36_ROUTER_TOPK_BLOCK}..{n_expert} otherwise)"
+        n_expert <= QWEN36_ROUTER_TOPK_MAX_EXPERTS,
+        "{name}: router top-k shader scores at most {QWEN36_ROUTER_TOPK_MAX_EXPERTS}          experts (32 strides of {QWEN36_ROUTER_TOPK_BLOCK}), got {n_expert}"
+    );
+    anyhow::ensure!(
+        top_k <= QWEN36_ROUTER_TOPK_MAX_K,
+        "{name}: router top-k shader holds at most {QWEN36_ROUTER_TOPK_MAX_K} selected          experts (`shared int sel[64]`), got top_k {top_k}"
     );
     let spec = Kernel::Qwen36RouterTopk.specialization_u32();
     let push = qwen36_router_topk_params(n_expert as u32, top_k as u32, norm_topk).to_le_bytes();
