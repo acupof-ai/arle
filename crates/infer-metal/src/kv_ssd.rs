@@ -299,21 +299,23 @@ impl MetalPageStore {
             }
             written += 1;
         }
-        let snapshot = self
-            .logical_key_for_pages(&prefix_pages[..written])
-            .and_then(|logical_key| self.prefixes.get(&logical_key).cloned());
+        // Persist every restore image we hold, not just the one at the end:
+        // `publish_slot` leaves one per prefill chunk, and a later prompt that
+        // shares only a leading run can restore at any of those boundaries.
+        let boundaries: Vec<(u64, MetalPrefixSnapshot)> = (1..=written)
+            .filter_map(|n| {
+                let logical_key = self.logical_key_for_pages(&prefix_pages[..n])?;
+                Some((keys[n - 1], self.prefixes.get(&logical_key)?.clone()))
+            })
+            .collect();
         log::debug!(
-            "Metal KV T2 sidecar: tokens={} pages={} keys={} written={} snapshot={}",
+            "Metal KV T2 sidecar: tokens={} pages={} written={written} snapshots={}",
             tokens.len(),
             prefix_pages.len(),
-            keys.len(),
-            written,
-            snapshot.is_some()
+            boundaries.len()
         );
-        if written > 0
-            && let Some(snapshot) = snapshot
-        {
-            self.write_disk_prefix(keys[written - 1], &snapshot);
+        for (content_key, snapshot) in boundaries {
+            self.write_disk_prefix(content_key, &snapshot);
         }
         // Publish is rare (once per prompt) and a kill skips Drop, so make the
         // just-written pages recoverable now rather than at shutdown.

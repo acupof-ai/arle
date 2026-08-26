@@ -50,8 +50,17 @@ Fixed-space behavior checked at a 96 MiB cap: the file stays exactly 96 MiB and
 the store evicts; a prefix that cannot fit the store is skipped rather than
 evicting its own head while writing its tail.
 
-Cost: publishing a 12.6k prompt writes ~160 MB, which the blocking queue makes
-synchronous — first-request TTFT 14.3 s (no disk) vs 15.4 s.
+Partial matches (shared prefix, different tail) need a restore image at the
+boundary they stop at. `publish_slot` already leaves one per prefill chunk, so
+the sidecar persists **every** boundary snapshot it holds, not just the last.
+Shared 7.8k-token system prefix, `--chunked-prefill-size 1024`, unseen question
+after a restart: TTFT 4.9 s (last-snapshot-only) -> **0.55 s**, restoring 7168 of
+7815 tokens. Without chunking there is one boundary, so a partial match still
+recomputes; that is the knob to set for shared-prefix workloads.
+
+Cost: publishing a 12.6k prompt writes ~194 MB, which the blocking queue makes
+synchronous — first-request TTFT 14.3 s (no disk) vs 16.0 s. Boundary snapshots
+add ~1 MB per prompt (147 KB each, one per chunk).
 
 ## Rule
 
@@ -63,3 +72,7 @@ synchronous — first-request TTFT 14.3 s (no disk) vs 15.4 s.
   low-frequency checkpoint instead (here: prefix publish).
 - `try_send` on a bounded writer queue silently truncates a bulk write. When the
   whole batch must land for the feature to work, block.
+- A recurrent model's prefix cache can only resume where a recurrent-state
+  snapshot exists. Reuse length is set by snapshot granularity, not by how many
+  KV pages matched — 487 matched blocks licensed 0 of them until the
+  intermediate snapshots were persisted.
