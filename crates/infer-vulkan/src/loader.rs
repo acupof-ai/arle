@@ -693,7 +693,9 @@ pub mod upload {
             assert_eq!(nan & 0x7C00, 0x7C00);
             assert_ne!(nan & 0x03FF, 0);
             // Smallest normal/subnormal halves round-trip sanity.
-            assert_eq!(f32_to_f16(6.103515625e-5), 0x0400); // 2^-14 smallest normal
+            // 2^-14, written as a ratio of powers of two so it stays exact
+            // without a 10-digit decimal (clippy::excessive_precision).
+            assert_eq!(f32_to_f16(1.0 / 16384.0), 0x0400); // smallest normal
             assert_eq!(f32_to_f16(5.9604645e-8), 0x0001); // smallest subnormal
         }
 

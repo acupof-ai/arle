@@ -22,6 +22,7 @@ pub mod model_qwen35;
 pub mod model_qwen36;
 #[cfg(feature = "vulkan")]
 pub mod prefill;
+pub mod qwen4_names;
 
 pub use executor::{VulkanExecutor, VulkanInflight, load_qwen3_gguf};
 pub use kv_pool::VulkanKvPool;
