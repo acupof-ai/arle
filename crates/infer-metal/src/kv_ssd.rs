@@ -481,7 +481,9 @@ impl MetalPageStore {
                 }
             }
             Err(err) => {
-                log::warn!("Metal KV T2 prefix encode failed for content key {content_key}: {err:#}");
+                log::warn!(
+                    "Metal KV T2 prefix encode failed for content key {content_key}: {err:#}"
+                );
             }
         }
     }
@@ -606,7 +608,10 @@ fn decode_page_payload(bytes: &[u8]) -> anyhow::Result<Vec<mlx::MlxArray>> {
     Ok(arrays)
 }
 
-fn encode_prefix_payload(content_key: u64, snapshot: &MetalPrefixSnapshot) -> anyhow::Result<Vec<u8>> {
+fn encode_prefix_payload(
+    content_key: u64,
+    snapshot: &MetalPrefixSnapshot,
+) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&content_key.to_le_bytes());
     out.extend_from_slice(&(snapshot.cache_len as u64).to_le_bytes());

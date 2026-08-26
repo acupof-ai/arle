@@ -1,6 +1,10 @@
 # Metal KV disk tier: content-keyed, survives restart — metal, 2026-08-26
 
 > Status: Confirmed (local M4 Pro 48 GB)
+>
+> Baseline: `67dd8e1b4`, `arle serve --backend metal --model-path
+> LiquidAI/LFM2.5-8B-A1B-MLX-4bit --kv-cache-dtype bf16 --kv-disk=<dir>`,
+> M4 Pro 48 GB.
 
 ## Context
 

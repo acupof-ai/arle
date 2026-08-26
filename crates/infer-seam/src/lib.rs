@@ -74,7 +74,11 @@ pub fn prefix_block_content_key(parent: u64, block: &[u32]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
-    for byte in parent.to_le_bytes().into_iter().chain(block.iter().flat_map(|t| t.to_le_bytes())) {
+    for byte in parent
+        .to_le_bytes()
+        .into_iter()
+        .chain(block.iter().flat_map(|t| t.to_le_bytes()))
+    {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
