@@ -9,6 +9,44 @@
 
 use vulkan_sys::VulkanContext;
 
+/// Budget vs size per heap. The two differ by 3.7 GiB on this box's
+/// device-local heap (70.71 vs 74.43 GiB), and residency planned against the
+/// size over-commits — the driver then demotes pages silently instead of
+/// failing, a ~5x bandwidth cliff with no error to catch.
+#[test]
+fn report_memory_budgets() {
+    let Ok(ctx) = VulkanContext::create() else {
+        eprintln!("no Vulkan device; skipping");
+        return;
+    };
+    let heaps = ctx.memory_heaps();
+    let Some(budgets) = ctx.memory_budgets() else {
+        eprintln!("no VK_EXT_memory_budget; residency must fall back to heap size");
+        return;
+    };
+    assert_eq!(
+        budgets.len(),
+        heaps.len(),
+        "budget array must be index-aligned with memory_heaps()"
+    );
+    const GIB: f64 = (1u64 << 30) as f64;
+    for (i, ((size, device_local), (budget, usage))) in heaps.iter().zip(&budgets).enumerate() {
+        eprintln!(
+            "  heap {i}: size {:7.2} GiB  budget {:7.2} GiB  usage {:6.2} GiB{}",
+            *size as f64 / GIB,
+            *budget as f64 / GIB,
+            *usage as f64 / GIB,
+            if *device_local { "  DEVICE_LOCAL" } else { "" }
+        );
+        // A budget above the heap size would mean the index alignment (or the
+        // struct offsets) are wrong — that is the failure this test exists for.
+        assert!(
+            budget <= size,
+            "heap {i}: budget {budget} exceeds size {size} — misaligned budget query"
+        );
+    }
+}
+
 #[test]
 fn report_shader_core_topology() {
     let Ok(ctx) = VulkanContext::create() else {

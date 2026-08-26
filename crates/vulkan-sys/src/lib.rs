@@ -772,6 +772,35 @@ mod real {
                 .collect()
         }
 
+        /// Per-heap `(budget, usage)` bytes from `VK_EXT_memory_budget`,
+        /// index-aligned with [`Self::memory_heaps`]. `None` when the driver
+        /// does not fill the struct (extension unsupported) — fall back to
+        /// heap size, never treat it as budget 0.
+        ///
+        /// The distinction matters on this box: heap 1 reports 74.43 GiB of
+        /// *size* but only 70.71 GiB of *budget*, and planning residency
+        /// against the size over-commits by more than a gigabyte before the
+        /// first token.
+        pub fn memory_budgets(&self) -> Option<Vec<(u64, u64)>> {
+            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            // SAFETY: physical_device outlives the instance borrow; the
+            // chained struct is stack-owned for the duration of the call. As
+            // with `amd_shader_core` above, an unsupported extension leaves
+            // the chained struct zeroed rather than failing.
+            unsafe {
+                self.instance
+                    .get_physical_device_memory_properties2(self.physical_device, &mut props2);
+            }
+            let n = props2.memory_properties.memory_heap_count as usize;
+            let filled = (0..n).any(|i| budget.heap_budget[i] != 0);
+            filled.then(|| {
+                (0..n)
+                    .map(|i| (budget.heap_budget[i], budget.heap_usage[i]))
+                    .collect()
+            })
+        }
+
         pub fn memory_types(&self) -> Vec<(u32, bool, bool)> {
             let props = unsafe {
                 self.instance
