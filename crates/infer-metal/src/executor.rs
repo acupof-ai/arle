@@ -204,13 +204,13 @@ impl std::fmt::Debug for MetalInflight {
     }
 }
 
-/// The raw-argmax fast path keeps the device `argmax` + async path. Non-greedy
-/// Metal sampling used to materialize host f32 logits and sample on CPU every
-/// token, which creates synchronous D2H stalls on the local desktop path;
-/// the temperature path is therefore downgraded to device greedy unless
-/// `--metal-host-sampling` opts into the blocking sampler. A greedy request
-/// whose logits are rewritten first (penalties, grammar, logit_bias) has no
-/// device equivalent, so it always pays the D2H and reaches the host sampler.
+/// The raw-argmax fast path keeps the device `argmax` + async path. Everything
+/// else — temperature/top-p/min-p, penalties, grammar, logit_bias — has no
+/// device equivalent, so it materializes host f32 logits and samples on CPU.
+/// That costs a synchronous D2H per token (157 -> 125 tok/s on LFM2.5-8B-A1B),
+/// paid only by requests that ask for it. It used to be silently downgraded to
+/// greedy behind `--metal-host-sampling`, which made `temperature` a no-op:
+/// temperature 0.7 returned byte-identical output to temperature 0.
 #[cfg(feature = "metal")]
 fn sample_inflight(
     slot: usize,
@@ -219,11 +219,7 @@ fn sample_inflight(
     history: Option<infer_plan::PenaltyHistory<'_>>,
     position: u64,
 ) -> MetalInflight {
-    let downgrade = !params.is_greedy() && !crate::runtime_flags::host_sampling();
-    if params.is_raw_argmax() || downgrade {
-        if downgrade {
-            warn_host_sampling_downgrade();
-        }
+    if params.is_raw_argmax() {
         let sampled = mlx::argmax(logits);
         mlx::async_eval(&[&sampled]);
         return MetalInflight::Sampled { slot, sampled };
@@ -269,20 +265,6 @@ fn materialize_inflight_now(inflight: MetalInflight) -> anyhow::Result<StepOutpu
                 }],
             })
         }
-    }
-}
-
-#[cfg(feature = "metal")]
-#[cfg(feature = "metal")]
-fn warn_host_sampling_downgrade() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        log::warn!(
-            "Metal non-greedy sampling requested, but host logits sampling is disabled; \
-             using device greedy argmax. Set --metal-host-sampling to opt into \
-             the blocking D2H sampler."
-        );
     }
 }
 

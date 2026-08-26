@@ -93,6 +93,14 @@ pub struct EngineLoadConfig {
     /// half of free disk at the root; `Some` without a root fails closed.
     #[serde(default)]
     pub kv_disk_limit: Option<KvTierBudget>,
+    /// Serve-wide sampling defaults for fields the request omits, applied over
+    /// the checkpoint's `generation_config.json`. A checkpoint that ships no
+    /// sampling config (LFM2.5-MLX) otherwise serves greedy with no penalty,
+    /// and a client that sends no sampling fields (eli) cannot change that.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
     /// Opt-in running-cap oversubscription: rotate waiters in by parking the
     /// longest-running decode's whole-slot image (requires a whole-slot tier
     /// backend). Default false → byte-identical.
@@ -219,6 +227,8 @@ impl Default for EngineLoadConfig {
             kv_dram: KvTierBudget::default(),
             kv_ssd_root: None,
             kv_disk_limit: None,
+            temperature: None,
+            repetition_penalty: None,
             slot_oversubscription: false,
             oversubscription_min_slice: default_oversubscription_min_slice(),
             student_lora_adapters: None,
@@ -534,7 +544,8 @@ mod backend {
             // Model-driven serve defaults for omitted sampling fields (nucleus +
             // temperature). The cc rollout lane overrides `.temperature` after this.
             infer_server::set_sampling_defaults(
-                infer_server::SamplingDefaults::from_generation_config(model_path),
+                infer_server::SamplingDefaults::from_generation_config(model_path)
+                    .with_overrides(config.temperature, config.repetition_penalty),
             );
 
             #[cfg(feature = "metal")]
@@ -1133,9 +1144,11 @@ mod backend {
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(axum::Router, Option<Arc<LoadedInferenceEngine>>)> {
         // Model-driven serve defaults for omitted sampling fields (nucleus +
-        // temperature) — the `arle serve` router lane.
+        // temperature) — the `arle serve` router lane. CLI flags win over the
+        // checkpoint.
         infer_server::set_sampling_defaults(
-            infer_server::SamplingDefaults::from_generation_config(model_path),
+            infer_server::SamplingDefaults::from_generation_config(model_path)
+                .with_overrides(config.temperature, config.repetition_penalty),
         );
 
         // The L3 disk tier is consumed by CUDA and Metal; every other

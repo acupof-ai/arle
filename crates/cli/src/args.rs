@@ -612,6 +612,18 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_kv_budget)]
     pub(crate) kv_disk_limit: Option<infer_api::KvTierBudget>,
 
+    /// Serve-wide sampling defaults for fields the request omits; both override
+    /// the checkpoint's `generation_config.json`. A checkpoint that ships no
+    /// sampling config serves greedy, which loops on long generations:
+    /// LFM2.5-8B-A1B repeated a 10-gram 10x over 2500 tokens and never finished
+    /// a count-to-200, and `--repetition-penalty 1.05` alone finished it in 807.
+    #[arg(long, value_name = "F")]
+    pub(crate) temperature: Option<f32>,
+
+    /// See `--temperature`. `1.0` disables; 1.05-1.1 is the useful band.
+    #[arg(long, value_name = "F")]
+    pub(crate) repetition_penalty: Option<f32>,
+
     /// KV cache storage dtype. `auto` lets the backend choose its default.
     #[arg(long, value_enum, default_value_t = ServeKvCacheDtypeArg::Auto)]
     pub(crate) kv_cache_dtype: ServeKvCacheDtypeArg,
@@ -847,10 +859,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) metal_warmup: bool,
 
-    /// Host (blocking D2H) non-greedy sampler; false = device greedy argmax.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) metal_host_sampling: bool,
-
     /// Cap block-diffusion denoising steps per row (unset = checkpoint default).
     #[arg(long, value_name = "N")]
     pub(crate) diffusion_max_denoising_steps: Option<usize>,
@@ -888,7 +896,6 @@ impl ServeArgs {
     pub(crate) fn metal_runtime_flags(&self) -> infer_api::MetalRuntimeFlags {
         infer_api::MetalRuntimeFlags {
             warmup: self.metal_warmup,
-            host_sampling: self.metal_host_sampling,
             speculative: !self.no_speculative,
             draft_model: self.draft_model.clone(),
             speculative_tokens: self.speculative_tokens,

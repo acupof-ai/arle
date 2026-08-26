@@ -32,6 +32,8 @@ pub struct SamplingDefaults {
     pub top_k: i32,
     pub top_p: f32,
     pub min_p: f32,
+    /// `1.0` disables. No `generation_config.json` key — CLI-set only.
+    pub repetition_penalty: f32,
 }
 
 impl Default for SamplingDefaults {
@@ -41,6 +43,7 @@ impl Default for SamplingDefaults {
             top_k: -1,
             top_p: 1.0,
             min_p: 0.0,
+            repetition_penalty: 1.0,
         }
     }
 }
@@ -49,7 +52,10 @@ impl SamplingDefaults {
     /// Read `temperature`/`top_k`/`top_p` from the model's
     /// `generation_config.json`; a missing file, unreadable file, or missing key
     /// keeps the greedy/no-filter default for that field (tolerant parse, mirrors
-    /// `Qwen35Config::load_stop_token_ids`). `min_p` has no wire key — stays default.
+    /// `Qwen35Config::load_stop_token_ids`). `min_p` and
+    /// `repetition_penalty` have no wire key — they stay default, so the CLI
+    /// overrides are the only lever on a checkpoint that ships no sampling
+    /// config (LFM2.5-MLX ships none).
     #[must_use]
     pub fn from_generation_config(model_dir: impl AsRef<Path>) -> Self {
         let mut defaults = Self::default();
@@ -71,6 +77,22 @@ impl SamplingDefaults {
         }
         defaults
     }
+
+    /// CLI overrides win over the checkpoint's config; `None` keeps it.
+    #[must_use]
+    pub fn with_overrides(
+        mut self,
+        temperature: Option<f32>,
+        repetition_penalty: Option<f32>,
+    ) -> Self {
+        if let Some(t) = temperature {
+            self.temperature = t;
+        }
+        if let Some(p) = repetition_penalty {
+            self.repetition_penalty = p;
+        }
+        self
+    }
 }
 
 // Set-once-at-serve-init, read-per-request. Const initializer = the shipped
@@ -80,6 +102,7 @@ static SAMPLING_DEFAULTS: RwLock<SamplingDefaults> = RwLock::new(SamplingDefault
     top_k: -1,
     top_p: 1.0,
     min_p: 0.0,
+    repetition_penalty: 1.0,
 });
 
 pub fn set_sampling_defaults(defaults: SamplingDefaults) {
@@ -566,7 +589,7 @@ fn sampling_params(
         top_k: top_k.unwrap_or(serve.top_k),
         top_p: top_p.unwrap_or(serve.top_p),
         min_p: min_p.unwrap_or(serve.min_p),
-        repetition_penalty: repetition_penalty.unwrap_or(default.repetition_penalty),
+        repetition_penalty: repetition_penalty.unwrap_or(serve.repetition_penalty),
         frequency_penalty: frequency_penalty.unwrap_or(default.frequency_penalty),
         presence_penalty: presence_penalty.unwrap_or(default.presence_penalty),
         ignore_eos: ignore_eos.unwrap_or(default.ignore_eos),

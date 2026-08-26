@@ -102,9 +102,6 @@ impl Default for CudaRuntimeFlags {
 pub struct MetalRuntimeFlags {
     #[serde(default)]
     pub warmup: bool,
-    /// Host (blocking D2H) non-greedy sampler; off = device greedy argmax.
-    #[serde(default)]
-    pub host_sampling: bool,
     /// Speculative decode master switch (`--no-speculative` clears it).
     #[serde(default = "d_true")]
     pub speculative: bool,
@@ -127,7 +124,6 @@ impl Default for MetalRuntimeFlags {
     fn default() -> Self {
         Self {
             warmup: false,
-            host_sampling: false,
             speculative: d_true(),
             draft_model: None,
             speculative_tokens: None,
