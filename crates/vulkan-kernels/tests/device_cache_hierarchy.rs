@@ -98,6 +98,70 @@ fn sweep_one<'a>(
     (read_bytes as f64 * 2.0 * PASSES as f64) / secs / 1e9
 }
 
+/// GPU streaming-read bandwidth by the SOURCE buffer's memory flavor.
+///
+/// The qwen4_exp residency replan wants to move ~4 GiB of read-only weights
+/// off the device heap (72.00 GiB of slabs vs a 70.71 GiB driver budget), and
+/// on a UMA part the candidate destination is the host heap — same LPDDR5X,
+/// different memory type. Whether that move is nearly free or a 5x cliff is a
+/// property of the GPU's read path through each type (snooping, caching
+/// attributes), not of the DRAM, so it has to be measured, not argued from
+/// "it's the same silicon". Working set far past the MALL so the number is the
+/// sustained link, not a cache artifact; dst stays `alloc_uma` in every row so
+/// the src flavor is the only variable.
+#[test]
+fn report_gpu_read_bandwidth_by_memory_flavor() {
+    if std::env::var("ARLE_CACHE_SWEEP").is_err() {
+        eprintln!("set ARLE_CACHE_SWEEP=1 to run the memory-flavor sweep; skipping");
+        return;
+    }
+    let ctx = match VulkanContext::create() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no Vulkan device ({e}); skipping");
+            return;
+        }
+    };
+    let mut cache = KernelCache::new();
+    const BYTES: usize = 512 << 20;
+    let dst = DeviceBuffer::alloc_uma(&ctx, BYTES).expect("alloc dst");
+    let weight = {
+        let ones: Vec<u8> = (0..4096).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        let mut b = DeviceBuffer::alloc_uma(&ctx, ones.len()).expect("alloc weight");
+        b.copy_from_host(&ones).expect("upload weight");
+        b
+    };
+    eprintln!("device: {}", ctx.device_name());
+    eprintln!("GPU streaming read+write of 512 MiB, dst always alloc_uma:\n");
+    for (name, src) in [
+        (
+            "alloc_uma        (DEVICE_LOCAL, heap 1)",
+            DeviceBuffer::alloc_uma(&ctx, BYTES),
+        ),
+        (
+            "alloc            (host WC, heap 0)",
+            DeviceBuffer::alloc(&ctx, BYTES),
+        ),
+        (
+            "alloc_host_cached (host cached, heap 0)",
+            DeviceBuffer::alloc_host_cached(&ctx, BYTES),
+        ),
+    ] {
+        match src {
+            Ok(src) => {
+                let gbps = sweep_one(&ctx, &mut cache, &src, &weight, &dst, BYTES);
+                eprintln!("  src {name}: {gbps:8.1} GB/s");
+            }
+            Err(e) => eprintln!("  src {name}: alloc failed ({e})"),
+        }
+    }
+    eprintln!(
+        "\nIf the heap-0 rows hold near the heap-1 row, weights can spill to the\n\
+         host heap and the replan is a residency-tag change; if they collapse,\n\
+         the replan must shrink the plan instead (requant, not relocate)."
+    );
+}
+
 #[test]
 fn report_cache_cliffs() {
     if std::env::var("ARLE_CACHE_SWEEP").is_err() {
