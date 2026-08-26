@@ -330,6 +330,11 @@ struct DiskTier {
     store: DiskStore,
     /// Key -> slot index plus valid payload length in the mmap store.
     keys: BTreeMap<u64, DiskRecord>,
+    /// Durable tier only: `(last_use, key)` so a full fixed-size store evicts
+    /// its coldest record instead of refusing the write.
+    lru: BTreeSet<(u64, u64)>,
+    lru_stamp: BTreeMap<u64, u64>,
+    lru_clock: u64,
     /// Durable tier: suppress drop-time wipe, persist manifest on mutation.
     durable: bool,
     /// Model/weights-version tag written into the manifest.
@@ -545,6 +550,9 @@ impl DiskTier {
         let mut items: Vec<WriteItem> = Vec::with_capacity(entries.len());
         let mut entries = entries.into_iter();
         while let Some((key, payload, useful)) = entries.next() {
+            if self.store.available_slots() == 0 && self.durable {
+                self.evict_coldest();
+            }
             let Some(slot) = self.store.alloc_slot() else {
                 let mut rejected = Vec::with_capacity(items.len() + entries.len() + 1);
                 rejected.extend(self.reject(items));
@@ -593,10 +601,30 @@ impl DiskTier {
                 }
                 Ok(())
             }
-            Err(TrySendError::Full(DiskWork::Write(items))) => {
-                drop(pending);
-                Err(self.reject(items))
-            }
+            // Queue full: block instead of dropping the write. The completion
+            // channel is unbounded, so the worker never waits on us.
+            Err(TrySendError::Full(work)) => match tx.send(work) {
+                Ok(()) => {
+                    self.stats.write_ops = self.stats.write_ops.saturating_add(pending.len() as u64);
+                    self.stats.useful_write_bytes = self.stats.useful_write_bytes.saturating_add(
+                        pending
+                            .iter()
+                            .filter(|(_, record)| record.useful)
+                            .map(|(_, record)| record.payload.len() as u64)
+                            .sum::<u64>(),
+                    );
+                    for (key, record) in pending {
+                        self.pending.insert(key, record);
+                    }
+                    Ok(())
+                }
+                Err(std::sync::mpsc::SendError(DiskWork::Write(items))) => {
+                    drop(pending);
+                    self.accepting_writes = false;
+                    Err(self.reject(items))
+                }
+                Err(_) => unreachable!("enqueue only submits disk writes"),
+            },
             Err(TrySendError::Disconnected(DiskWork::Write(items))) => {
                 drop(pending);
                 self.accepting_writes = false;
@@ -621,6 +649,42 @@ impl DiskTier {
             .collect()
     }
 
+    fn lru_track(&mut self, key: u64) {
+        if !self.durable {
+            return;
+        }
+        if let Some(old) = self.lru_stamp.remove(&key) {
+            self.lru.remove(&(old, key));
+        }
+        self.lru_clock = self.lru_clock.saturating_add(1);
+        self.lru.insert((self.lru_clock, key));
+        self.lru_stamp.insert(key, self.lru_clock);
+    }
+
+    fn lru_untrack(&mut self, key: u64) {
+        if let Some(old) = self.lru_stamp.remove(&key) {
+            self.lru.remove(&(old, key));
+        }
+    }
+
+    /// Free the coldest committed record of a full durable store.
+    fn evict_coldest(&mut self) -> bool {
+        let victim = self
+            .lru
+            .iter()
+            .map(|&(_, key)| key)
+            .find(|key| !self.pending.contains_key(key));
+        let Some(key) = victim else {
+            return false;
+        };
+        self.lru_untrack(key);
+        if let Some(record) = self.keys.remove(&key) {
+            self.store.free_slot(record.slot);
+        }
+        self.manifest_dirty = true;
+        true
+    }
+
     fn drain_completions(&mut self) {
         while let Ok(completion) = self.completion_rx.try_recv() {
             match completion {
@@ -641,6 +705,7 @@ impl DiskTier {
                                 ) {
                                     self.store.free_slot(old.slot);
                                 }
+                                self.lru_track(item.key);
                                 self.manifest_dirty |= self.durable;
                             } else {
                                 self.store.free_slot(item.slot);
@@ -1048,6 +1113,9 @@ impl KvTierStore {
                     root_dir: namespace,
                     store,
                     keys: BTreeMap::new(),
+                    lru: BTreeSet::new(),
+                    lru_stamp: BTreeMap::new(),
+                    lru_clock: 0,
                     durable,
                     epoch,
                     stats,
@@ -1188,6 +1256,17 @@ impl KvTierStore {
         self.disk = Some(DiskTier {
             root_dir: namespace,
             store,
+            lru: keys
+                .keys()
+                .enumerate()
+                .map(|(stamp, key)| (stamp as u64, *key))
+                .collect(),
+            lru_stamp: keys
+                .keys()
+                .enumerate()
+                .map(|(stamp, key)| (*key, stamp as u64))
+                .collect(),
+            lru_clock: keys.len() as u64,
             keys,
             durable: true,
             epoch,
@@ -1203,6 +1282,24 @@ impl KvTierStore {
             _lock: Some(namespace_lock),
         });
         true
+    }
+
+    /// Flush committed disk records into the manifest without stopping the
+    /// writer. A durable store is only recoverable up to its last manifest, and
+    /// the process may be killed without running `Drop`.
+    pub fn sync_manifest(&mut self) {
+        let Some(disk) = self.disk.as_mut() else {
+            return;
+        };
+        disk.drain_completions();
+        if disk.durable
+            && disk.manifest_dirty
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV manifest sync failed: {err}");
+            return;
+        }
+        disk.manifest_dirty = false;
     }
 
     pub fn persist(&mut self) {
@@ -1553,6 +1650,7 @@ impl KvTierStore {
                 let Some(record) = disk.keys.get(&key).copied() else {
                     return Err(anyhow!("KV tier store has no entry for key {key}"));
                 };
+                disk.lru_track(key);
                 let len = if record.len == 0 {
                     self.bytes_per_page
                 } else {
@@ -1566,7 +1664,11 @@ impl KvTierStore {
             return Err(anyhow!("KV tier store has no entry for key {key}"));
         };
         // Promote to host L2 (best-effort: evict-if-full via insert_inner).
-        self.insert_inner(key, disk_payload.clone());
+        // Disk-only stores (host budget 0) keep the record where it is; a
+        // re-insert would rewrite the same payload into a fresh slot per read.
+        if self.host_capacity_pages > 0 {
+            self.insert_inner(key, disk_payload.clone());
+        }
         Ok(Cow::Owned(disk_payload))
     }
 
@@ -1610,6 +1712,9 @@ impl KvTierStore {
                 .copied()
                 .ok_or_else(|| anyhow!("KV tier store has no entry for key {key}"))?;
             self.disk_read_hits += 1;
+            if let Some(disk) = self.disk.as_mut() {
+                disk.lru_track(key);
+            }
             let len = if record.len == 0 {
                 self.bytes_per_page
             } else {
@@ -1642,6 +1747,44 @@ impl KvTierStore {
     /// `tier_key(ns_chunk, chunk_sub(key, i))`. On any failed insert removes
     /// everything already added and returns false. No collectives — callers
     /// own any TP consensus.
+    /// Whether a chunked blob is fully present (manifest plus every chunk) —
+    /// LRU eviction can drop a chunk out from under a still-listed manifest.
+    pub fn contains_chunked(&self, ns: u64, ns_chunk: u64, key: u64) -> bool {
+        let manifest_key = tier_key(ns, key);
+        let manifest: Vec<u8> = if let Some(entry) = self.host.get(&manifest_key) {
+            entry.payload.clone()
+        } else if let Some(disk) = self.disk.as_ref() {
+            if let Some(pending) = disk.pending.get(&manifest_key) {
+                pending.payload.as_ref().clone()
+            } else if let Some(record) = disk.keys.get(&manifest_key) {
+                let len = if record.len == 0 {
+                    self.bytes_per_page
+                } else {
+                    record.len.min(self.bytes_per_page)
+                };
+                match &disk.store {
+                    DiskStore::Mmap(store) => store.read_slot(record.slot)[..len].to_vec(),
+                    // Direct I/O needs `&mut`; presence of the manifest is the
+                    // best a shared borrow can answer.
+                    #[cfg(target_os = "linux")]
+                    DiskStore::Direct(_) => return true,
+                }
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        };
+        parse_chunk_manifest(&manifest).is_ok_and(|(chunks, _)| {
+            (0..chunks).all(|idx| self.contains(tier_key(ns_chunk, chunk_sub(key, idx))))
+        })
+    }
+
+    /// Committed-or-pending disk records.
+    pub fn disk_page_count(&self) -> usize {
+        self.disk.as_ref().map_or(0, DiskTier::logical_pages)
+    }
+
     pub fn insert_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64, bytes: &[u8]) -> bool {
         debug_assert!(!bytes.is_empty(), "chunked blob must be non-empty");
         let chunks = bytes.len().div_ceil(self.bytes_per_page);
@@ -1738,6 +1881,7 @@ impl KvTierStore {
         };
         disk.drain_completions();
         disk.pending.remove(&key);
+        disk.lru_untrack(key);
         if let Some(record) = disk.keys.remove(&key) {
             disk.store.free_slot(record.slot);
             disk.manifest_dirty |= disk.durable;
@@ -1759,6 +1903,7 @@ impl KvTierStore {
             }
             if let Some(disk) = &mut self.disk {
                 disk.pending.remove(key);
+                disk.lru_untrack(*key);
                 if let Some(record) = disk.keys.remove(key) {
                     disk.store.free_slot(record.slot);
                     disk_index_changed = true;

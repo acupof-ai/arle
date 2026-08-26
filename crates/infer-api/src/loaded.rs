@@ -1269,8 +1269,17 @@ mod backend {
                         resource_plan,
                     )?;
                 if let Some((root, budget)) = kv_ssd {
+                    // Namespace tag: a different model or KV dtype must not
+                    // serve this store's pages.
+                    let epoch = format!("{:016x}", infer_seam::prefix_block_content_key(
+                        0,
+                        &format!("{model_source}|{metal_kv_dtype:?}")
+                            .bytes()
+                            .map(u32::from)
+                            .collect::<Vec<_>>(),
+                    ));
                     anyhow::ensure!(
-                        executor.set_kv_tier_disk(root, budget, page_size),
+                        executor.set_kv_tier_disk(root, budget, page_size, &epoch),
                         "--kv-disk: the loaded Metal model has no usable \
                          page-addressable KV tier store (a budget below one \
                          page also lands here; raise --kv-disk-limit)"

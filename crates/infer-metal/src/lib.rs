@@ -44,7 +44,7 @@ pub use config::model_dir_is_deepseek_ocr;
 pub use deepseek_ocr::{LoadedMetalDeepseekOcr, MetalDeepseekOcrModel};
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
 #[cfg(feature = "metal")]
-pub use kv_native_sys::default_t2_budget_bytes;
+pub use executor::metal_default_t2_budget_bytes as default_t2_budget_bytes;
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
 pub use mlx::{

@@ -2,20 +2,32 @@
 //!
 //! The disk level is the backend-neutral [`kv_native_sys::KvTierStore`] run
 //! disk-only (host budget 0 — on unified memory demoting device→host frees
-//! nothing; OS pressure already spills via SSD). This module owns only the
-//! MLX payload codec and the live-slot↔tier bridge; budgeting, slot
-//! allocation, and mmap I/O live in the store.
+//! nothing; OS pressure already spills via SSD) in its durable, fixed-size
+//! namespace. Everything on disk is addressed by the engine's prefix content
+//! key, so a restarted server attaches a prompt's pages and restore snapshot
+//! without re-prefilling. This module owns only the MLX payload codec and the
+//! live-slot↔tier bridge; budgeting, eviction, and mmap I/O live in the store.
 
-use kv_native_sys::{CHUNK_IDX_BITS, KvTierStore, TIER_NS_SHIFT, tier_key};
+use kv_native_sys::{KvTierStore, tier_key};
 
 use super::*;
 
-/// Store key namespaces (top byte). One store instance per Metal executor, so
-/// only intra-instance collisions matter; pages are plain fixed-slot inserts,
-/// prefix snapshots are variable-size chunked blobs.
+/// Store key namespaces (top byte); the sub-key is the content key. Pages are
+/// plain fixed-slot inserts, prefix snapshots are variable-size chunked blobs.
 const NS_PAGE: u64 = 1;
 const NS_PREFIX: u64 = 2;
 const NS_PREFIX_CHUNK: u64 = 3;
+
+/// Default `--kv-disk` size on Metal: a fixed, self-evicting 1 GiB file. The
+/// tier is a restart cache, so a bounded footprint beats a disk-fraction one.
+const DEFAULT_DISK_BUDGET_BYTES: usize = 1 << 30;
+
+/// Default L3 budget for a Metal `--kv-disk` root, clamped to what the disk can
+/// actually give (the signature matches the CUDA disk-fraction default).
+#[must_use]
+pub fn default_t2_budget_bytes(root: &std::path::Path, ssd_fraction: f64) -> usize {
+    DEFAULT_DISK_BUDGET_BYTES.min(kv_native_sys::default_t2_budget_bytes(root, ssd_fraction))
+}
 
 /// Slot headroom over the raw KV page bytes for the codec's per-array headers
 /// (dtype/ndim/dims/len ≈ 56 B × O(100) arrays); generous so a page payload
@@ -26,13 +38,11 @@ pub struct MetalPageStore {
     pub(super) pages: HashMap<u32, MetalPageBlock>,
     pub(super) prefixes: HashMap<Vec<u64>, MetalPrefixSnapshot>,
     pub(super) next_logical_id: u64,
-    /// Disk-only shared tier store (`--kv-disk`).
+    /// Disk-only durable tier store (`--kv-disk`).
     tier: Option<KvTierStore>,
-    /// Seam tier key → logical page id (several demote keys may bind one
-    /// logical page; its payload is written once).
-    tier_to_logical: HashMap<u64, u64>,
-    /// Prefix keys with an on-disk snapshot → hashed store key.
-    disk_prefixes: HashMap<Vec<u64>, u64>,
+    /// Engine page size (content keys are chained per page); 0 until the tier
+    /// is attached.
+    page_size: usize,
 }
 
 impl Default for MetalPageStore {
@@ -42,8 +52,7 @@ impl Default for MetalPageStore {
             prefixes: HashMap::new(),
             next_logical_id: 1,
             tier: None,
-            tier_to_logical: HashMap::new(),
-            disk_prefixes: HashMap::new(),
+            page_size: 0,
         }
     }
 }
@@ -52,6 +61,9 @@ impl Default for MetalPageStore {
 pub struct MetalPageBlock {
     pub(super) logical_id: u64,
     pub(super) owner: Option<MetalPageOwner>,
+    /// Engine prefix content key, known once the page's tokens are published
+    /// (sidecar save) or when it was promoted from the tier.
+    pub(super) content_key: Option<u64>,
     pub(super) kv_flat: Vec<mlx::MlxArray>,
 }
 
@@ -68,58 +80,45 @@ pub struct MetalPrefixSnapshot {
     pub(super) gdr_flat: Vec<mlx::MlxArray>,
 }
 
-/// FNV-1a over the logical-id key, masked so prefix chunk keys
-/// (`hash << CHUNK_IDX_BITS | idx`) stay below the namespace byte. A collision
-/// is caught at decode by the ids echo in the payload.
-fn prefix_store_key(ids: &[u64]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for id in ids {
-        for byte in id.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    }
-    hash & ((1 << (TIER_NS_SHIFT - CHUNK_IDX_BITS)) - 1)
-}
-
-/// Write-through one logical page into the tier (idempotent: page content is
-/// immutable per logical id, so an existing record is kept as-is).
-fn write_page(tier: &mut KvTierStore, block: &MetalPageBlock) -> bool {
-    let key = tier_key(NS_PAGE, block.logical_id);
+/// Write-through one page under its content key (idempotent: content keys
+/// name immutable content, so an existing record is kept as-is).
+fn write_page(tier: &mut KvTierStore, content_key: u64, block: &MetalPageBlock) -> bool {
+    let key = tier_key(NS_PAGE, content_key);
     if tier.contains(key) {
         return true;
     }
     match encode_page_payload(&block.kv_flat) {
         Ok(bytes) => tier.insert(key, bytes),
         Err(err) => {
-            log::warn!(
-                "Metal KV T2 page encode failed for logical page {}: {err:#}",
-                block.logical_id
-            );
+            log::warn!("Metal KV T2 page encode failed for content key {content_key}: {err:#}");
             false
         }
     }
 }
 
 impl MetalPageStore {
+    /// Attach the durable disk namespace for `epoch` (model + KV layout tag):
+    /// a restart replays its manifest and serves prior prompts by content key.
     pub(super) fn set_ssd(
         &mut self,
         root: PathBuf,
         budget_bytes: usize,
         bytes_per_page: usize,
+        page_size: usize,
+        epoch: &str,
     ) -> bool {
+        self.page_size = page_size.max(1);
         let slot_bytes = bytes_per_page.max(1).saturating_add(PAGE_CODEC_HEADROOM);
         // Host budget pinned to 0: unified memory makes a DRAM L2 a no-op.
         let mut store = KvTierStore::with_budget(0, slot_bytes);
-        if !store.set_disk(root, budget_bytes, slot_bytes) {
+        if !store.load(root, budget_bytes, slot_bytes, epoch.to_string(), 0, 1, 0) {
             return false;
         }
         eprintln!(
-            "[infer-metal] KV T2 disk tier: budget_bytes={}, capacity_pages={}",
+            "[infer-metal] KV T2 disk tier: budget_bytes={}, capacity_pages={}, restored_pages={}",
             budget_bytes,
-            store.capacity_pages()
+            store.capacity_pages(),
+            store.disk_page_count()
         );
         self.tier = Some(store);
         true
@@ -134,7 +133,7 @@ impl MetalPageStore {
     }
 
     pub(super) fn kv_tier_disk_pages(&self) -> usize {
-        self.tier_to_logical.len()
+        self.tier.as_ref().map_or(0, KvTierStore::disk_page_count)
     }
 
     pub(super) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
@@ -165,24 +164,42 @@ impl MetalPageStore {
     }
 
     pub(super) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
-        let logical_id = self.tier_to_logical.get(&key)?;
-        self.tier.as_ref()?.location(tier_key(NS_PAGE, *logical_id))
+        self.tier.as_ref()?.location(tier_key(NS_PAGE, key))
     }
 
     #[cfg(test)]
-    pub(super) fn has_disk_prefix(&self, key: &[u64]) -> bool {
-        self.disk_prefixes.contains_key(key)
+    pub(super) fn has_disk_prefix(&self, content_key: u64) -> bool {
+        self.tier
+            .as_ref()
+            .is_some_and(|tier| tier.contains_chunked(NS_PREFIX, NS_PREFIX_CHUNK, content_key))
     }
 
     /// Largest leading block count for which Metal has a complete restore
-    /// image. Demoted keys are checked before promotion, so an unusable prefix
-    /// tail is never read back from T2.
+    /// image: a resident snapshot for the block's logical key, or a durable
+    /// one under the block's content key. Demoted keys are checked before
+    /// promotion, so an unusable prefix tail is never read back from T2.
     pub(super) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         (1..=blocks.len())
             .rev()
             .find(|&k| {
-                self.logical_key_for_prefix_blocks(&blocks[..k])
-                    .is_some_and(|key| self.prefix_available(&key))
+                if self
+                    .logical_key_for_prefix_blocks(&blocks[..k])
+                    .is_some_and(|key| self.prefixes.contains_key(&key))
+                {
+                    return true;
+                }
+                let content_key = match blocks[k - 1] {
+                    PrefixBlock::ResidentPage(page) => {
+                        self.pages.get(&page).and_then(|b| b.content_key)
+                    }
+                    PrefixBlock::DemotedKey(key) => Some(key),
+                };
+                match (content_key, self.tier.as_ref()) {
+                    (Some(key), Some(tier)) => {
+                        tier.contains_chunked(NS_PREFIX, NS_PREFIX_CHUNK, key)
+                    }
+                    _ => false,
+                }
             })
             .unwrap_or(0)
     }
@@ -203,7 +220,6 @@ impl MetalPageStore {
                 .iter()
                 .any(|logical_id| key.contains(logical_id))
         });
-        self.reclaim_unreferenced(&released_logical_ids);
     }
 
     pub(super) fn next_logical_id(&mut self) -> u64 {
@@ -219,36 +235,91 @@ impl MetalPageStore {
             .collect()
     }
 
-    pub(super) fn logical_key_for_prefix_blocks(&self, blocks: &[PrefixBlock]) -> Option<Vec<u64>> {
+    fn logical_key_for_prefix_blocks(&self, blocks: &[PrefixBlock]) -> Option<Vec<u64>> {
         blocks
             .iter()
             .map(|block| match *block {
                 PrefixBlock::ResidentPage(page) => Some(self.pages.get(&page)?.logical_id),
-                PrefixBlock::DemotedKey(tier_key) => self.tier_to_logical.get(&tier_key).copied(),
+                PrefixBlock::DemotedKey(_) => None,
             })
             .collect()
     }
 
-    pub(super) fn prefix_available(&self, key: &[u64]) -> bool {
-        self.prefixes.contains_key(key) || self.disk_prefixes.contains_key(key)
-    }
-
-    pub(super) fn ensure_prefix_snapshot_resident(&mut self, key: &[u64]) -> anyhow::Result<()> {
+    /// Make the restore snapshot for the resident page run `key` available in
+    /// memory, reading it from the durable tier under `content_key` if needed.
+    fn ensure_prefix_snapshot_resident(
+        &mut self,
+        key: &[u64],
+        content_key: Option<u64>,
+    ) -> anyhow::Result<()> {
         if self.prefixes.contains_key(key) {
             return Ok(());
         }
-        let hash = *self
-            .disk_prefixes
-            .get(key)
+        let content_key = content_key
             .ok_or_else(|| anyhow::anyhow!("Metal prefix snapshot {key:?} is not resident"))?;
         let tier = self
             .tier
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Metal KV T2 store is not configured"))?;
-        let bytes = tier.read_chunked(NS_PREFIX, NS_PREFIX_CHUNK, hash)?;
-        let snapshot = decode_prefix_payload(&bytes, key)?;
+        let bytes = tier.read_chunked(NS_PREFIX, NS_PREFIX_CHUNK, content_key)?;
+        let snapshot = decode_prefix_payload(&bytes, content_key)?;
         self.prefixes.insert(key.to_vec(), snapshot);
         Ok(())
+    }
+
+    /// Bind published pages to their engine content keys and write them (plus
+    /// the prefix restore snapshot ending at the last page) through to the
+    /// durable tier.
+    pub(super) fn save_prefix_sidecar(&mut self, tokens: &[u32], prefix_pages: &[u32]) {
+        if self.page_size == 0 {
+            return;
+        }
+        // A prefix larger than the store would evict its own head while
+        // writing its tail, leaving nothing reusable and paying the writes for
+        // it. Chunked snapshot rides along, hence the margin.
+        let capacity = self.kv_tier_capacity_pages();
+        if capacity > 0 && prefix_pages.len().saturating_add(16) > capacity {
+            log::debug!(
+                "Metal KV T2 sidecar skipped: {} pages exceed the {capacity}-page store",
+                prefix_pages.len()
+            );
+            return;
+        }
+        let keys = infer_seam::prefix_content_keys(tokens, self.page_size);
+        let mut written = 0usize;
+        for (page, key) in prefix_pages.iter().zip(keys.iter().copied()) {
+            let Some(block) = self.pages.get_mut(page) else {
+                break;
+            };
+            block.content_key = Some(key);
+            if let Some(tier) = self.tier.as_mut()
+                && !write_page(tier, key, block)
+            {
+                break;
+            }
+            written += 1;
+        }
+        let snapshot = self
+            .logical_key_for_pages(&prefix_pages[..written])
+            .and_then(|logical_key| self.prefixes.get(&logical_key).cloned());
+        log::debug!(
+            "Metal KV T2 sidecar: tokens={} pages={} keys={} written={} snapshot={}",
+            tokens.len(),
+            prefix_pages.len(),
+            keys.len(),
+            written,
+            snapshot.is_some()
+        );
+        if written > 0
+            && let Some(snapshot) = snapshot
+        {
+            self.write_disk_prefix(keys[written - 1], &snapshot);
+        }
+        // Publish is rare (once per prompt) and a kill skips Drop, so make the
+        // just-written pages recoverable now rather than at shutdown.
+        if let Some(tier) = self.tier.as_mut() {
+            tier.sync_manifest();
+        }
     }
 
     pub(super) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
@@ -257,13 +328,13 @@ impl MetalPageStore {
         };
         let mut accepted = 0usize;
         for &(page, key) in entries {
-            let Some(block) = self.pages.get(&page) else {
+            let Some(block) = self.pages.get_mut(&page) else {
                 break;
             };
-            if !write_page(tier, block) {
+            if !write_page(tier, key, block) {
                 break;
             }
-            self.tier_to_logical.insert(key, block.logical_id);
+            block.content_key = Some(key);
             accepted = accepted.saturating_add(1);
         }
         Ok(accepted)
@@ -281,55 +352,18 @@ impl MetalPageStore {
     }
 
     fn read_tier_page(&mut self, key: u64) -> anyhow::Result<MetalPageBlock> {
-        let logical_id = *self
-            .tier_to_logical
-            .get(&key)
-            .ok_or_else(|| anyhow::anyhow!("Metal KV T2 missing tier key {key}"))?;
         let tier = self
             .tier
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Metal KV T2 store is not configured"))?;
-        let bytes = tier.read(tier_key(NS_PAGE, logical_id))?;
+        let bytes = tier.read(tier_key(NS_PAGE, key))?;
         let kv_flat = decode_page_payload(&bytes)?;
         Ok(MetalPageBlock {
-            logical_id,
+            logical_id: self.next_logical_id(),
             owner: None,
+            content_key: Some(key),
             kv_flat,
         })
-    }
-
-    pub(super) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
-        let unbound: Vec<u64> = keys
-            .iter()
-            .filter_map(|key| self.tier_to_logical.remove(key))
-            .collect();
-        self.reclaim_unreferenced(&unbound);
-    }
-
-    /// Reclaim disk payloads for logical pages with no demote binding and no
-    /// resident mirror — the shared store has no eviction of its own, so an
-    /// unreachable payload would pin budget forever. A dead page also takes
-    /// every disk prefix built on it (unreachable without the page).
-    fn reclaim_unreferenced(&mut self, logical_ids: &[u64]) {
-        let Some(tier) = self.tier.as_mut() else {
-            return;
-        };
-        for &logical_id in logical_ids {
-            if self.tier_to_logical.values().any(|&l| l == logical_id)
-                || self.pages.values().any(|b| b.logical_id == logical_id)
-            {
-                continue;
-            }
-            tier.remove(&[tier_key(NS_PAGE, logical_id)]);
-            self.disk_prefixes.retain(|key, hash| {
-                if key.contains(&logical_id) {
-                    tier.remove_chunked(NS_PREFIX, NS_PREFIX_CHUNK, *hash);
-                    false
-                } else {
-                    true
-                }
-            });
-        }
     }
 
     pub(super) fn publish_slot(
@@ -378,9 +412,15 @@ impl MetalPageStore {
             // Host page ids may be reused after the seam frees a slot. Overwrite
             // with the current slot's contents; retained/shared pages cannot be
             // reallocated by the host pool, so this does not corrupt live reuse.
+            let content_key = self
+                .pages
+                .get(page_id)
+                .filter(|block| block.logical_id == logical_id)
+                .and_then(|block| block.content_key);
             let block = MetalPageBlock {
                 logical_id,
                 owner: Some(owner),
+                content_key,
                 kv_flat,
             };
             if let Some(old) = self.pages.insert(*page_id, block)
@@ -388,24 +428,20 @@ impl MetalPageStore {
             {
                 overwritten_logical_ids.push(old.logical_id);
             }
-            if let (Some(tier), Some(block)) = (self.tier.as_mut(), self.pages.get(page_id)) {
-                write_page(tier, block);
-            }
         }
-        if !overwritten_logical_ids.is_empty() {
-            if let Some(live_key) = self.logical_key_for_pages(&page_ids[..publish_pages]) {
-                // Alias hazard: overwriting a logical page means this page id was
-                // recycled to a new occupant. Any surviving prefix containing the old
-                // logical id would pair NEW K/V with a STALE restore snapshot. Keep
-                // only exact prefixes of the live occupant's logical page list.
-                self.prefixes.retain(|key, _| {
-                    !overwritten_logical_ids
-                        .iter()
-                        .any(|logical_id| key.contains(logical_id))
-                        || (key.len() <= live_key.len() && live_key[..key.len()] == key[..])
-                });
-            }
-            self.reclaim_unreferenced(&overwritten_logical_ids);
+        // Alias hazard: overwriting a logical page means this page id was
+        // recycled to a new occupant. Any surviving prefix containing the old
+        // logical id would pair NEW K/V with a STALE restore snapshot. Keep
+        // only exact prefixes of the live occupant's logical page list.
+        if !overwritten_logical_ids.is_empty()
+            && let Some(live_key) = self.logical_key_for_pages(&page_ids[..publish_pages])
+        {
+            self.prefixes.retain(|key, _| {
+                !overwritten_logical_ids
+                    .iter()
+                    .any(|logical_id| key.contains(logical_id))
+                    || (key.len() <= live_key.len() && live_key[..key.len()] == key[..])
+            });
         }
 
         // A reusable prefix boundary is valid only when the page-id prefix and
@@ -415,36 +451,36 @@ impl MetalPageStore {
             && publish_pages == full_pages
             && let Some(key) = self.logical_key_for_pages(&page_ids[..full_pages])
         {
-            let snapshot = MetalPrefixSnapshot {
-                cache_len: slot.cache_len,
-                gdr_flat: slot.gdr_flat.clone(),
-            };
-            self.write_disk_prefix(&key, &snapshot);
-            self.prefixes.insert(key, snapshot);
+            self.prefixes.insert(
+                key,
+                MetalPrefixSnapshot {
+                    cache_len: slot.cache_len,
+                    gdr_flat: slot.gdr_flat.clone(),
+                },
+            );
         }
 
         Ok(())
     }
 
-    /// Write-through one prefix restore image (idempotent: a logical-id key
-    /// names immutable content, so an existing blob is kept as-is).
-    fn write_disk_prefix(&mut self, key: &[u64], snapshot: &MetalPrefixSnapshot) {
+    /// Write-through one prefix restore image under the content key of its
+    /// last block (idempotent: an existing blob is kept as-is).
+    fn write_disk_prefix(&mut self, content_key: u64, snapshot: &MetalPrefixSnapshot) {
         let Some(tier) = self.tier.as_mut() else {
             return;
         };
-        if self.disk_prefixes.contains_key(key) {
+        if tier.contains(tier_key(NS_PREFIX, content_key)) {
             return;
         }
-        match encode_prefix_payload(key, snapshot) {
+        match encode_prefix_payload(content_key, snapshot) {
             Ok(bytes) => {
-                let hash = prefix_store_key(key);
-                if tier.insert_chunked(NS_PREFIX, NS_PREFIX_CHUNK, hash, &bytes) {
-                    self.disk_prefixes.insert(key.to_vec(), hash);
-                } else {
-                    log::debug!("Metal KV T2 prefix write refused (store full) for key {key:?}");
+                if !tier.insert_chunked(NS_PREFIX, NS_PREFIX_CHUNK, content_key, &bytes) {
+                    log::debug!("Metal KV T2 prefix write refused for content key {content_key}");
                 }
             }
-            Err(err) => log::warn!("Metal KV T2 prefix encode failed for key {key:?}: {err:#}"),
+            Err(err) => {
+                log::warn!("Metal KV T2 prefix encode failed for content key {content_key}: {err:#}");
+            }
         }
     }
 
@@ -477,7 +513,11 @@ impl MetalPageStore {
                     "Metal prefix attach missing resident logical pages for slot {slot}, prefix_tokens={prefix_tokens}"
                 )
             })?;
-        self.ensure_prefix_snapshot_resident(&key)?;
+        let content_key = slot_pages
+            .get(prefix_pages - 1)
+            .and_then(|page| self.pages.get(page))
+            .and_then(|block| block.content_key);
+        self.ensure_prefix_snapshot_resident(&key, content_key)?;
         let snapshot = self.prefixes.get(&key).ok_or_else(|| {
             anyhow::anyhow!(
                 "Metal prefix attach missing GDR snapshot for slot {slot}, prefix_tokens={prefix_tokens}, key={key:?}"
@@ -548,8 +588,8 @@ impl MetalPageStore {
 }
 
 // All-u64 LE framing. Page payload: `[n_arrays][arrays…]`. Prefix payload:
-// `[n_ids][ids…][cache_len][n_arrays][arrays…]` — the ids echo catches a
-// hashed-key collision at decode. Array: `[dtype][ndim][dims…][len][bytes]`.
+// `[content_key][cache_len][n_arrays][arrays…]` — the key echo catches a
+// namespace collision at decode. Array: `[dtype][ndim][dims…][len][bytes]`.
 
 fn encode_page_payload(arrays: &[mlx::MlxArray]) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -564,26 +604,20 @@ fn decode_page_payload(bytes: &[u8]) -> anyhow::Result<Vec<mlx::MlxArray>> {
     Ok(arrays)
 }
 
-fn encode_prefix_payload(key: &[u64], snapshot: &MetalPrefixSnapshot) -> anyhow::Result<Vec<u8>> {
+fn encode_prefix_payload(content_key: u64, snapshot: &MetalPrefixSnapshot) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(key.len() as u64).to_le_bytes());
-    for id in key {
-        out.extend_from_slice(&id.to_le_bytes());
-    }
+    out.extend_from_slice(&content_key.to_le_bytes());
     out.extend_from_slice(&(snapshot.cache_len as u64).to_le_bytes());
     encode_arrays(&mut out, &snapshot.gdr_flat)?;
     Ok(out)
 }
 
-fn decode_prefix_payload(bytes: &[u8], key: &[u64]) -> anyhow::Result<MetalPrefixSnapshot> {
+fn decode_prefix_payload(bytes: &[u8], content_key: u64) -> anyhow::Result<MetalPrefixSnapshot> {
     let mut reader = PayloadReader { bytes, offset: 0 };
-    let id_count = reader.usize()?;
-    let ids: Vec<u64> = (0..id_count)
-        .map(|_| reader.u64())
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let recorded = reader.u64()?;
     anyhow::ensure!(
-        ids == key,
-        "Metal KV T2 prefix key mismatch: requested={key:?}, record={ids:?}"
+        recorded == content_key,
+        "Metal KV T2 prefix key mismatch: requested={content_key}, record={recorded}"
     );
     let cache_len = reader.usize()?;
     let gdr_flat = decode_arrays(&mut reader)?;
