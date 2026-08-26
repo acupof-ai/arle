@@ -2867,6 +2867,11 @@ fn record_router_gemv<'a>(
 /// `weights_off`. Single-thread kernel; all three buffers are arena. 3-binding →
 /// `ring3`.
 #[allow(clippy::too_many_arguments)]
+/// Lanes in `qwen36_router_topk.comp` (`#define BLOCK 256`), i.e. the largest
+/// expert count that shader can score. Mirrored here because the push-constant
+/// block carries `n_expert` with no way for the shader to reject an overflow.
+const QWEN36_ROUTER_TOPK_BLOCK: usize = 256;
+
 fn record_router_topk<'a>(
     ctx: &'a VulkanContext,
     res: &mut DecodeResources<'a>,
@@ -2878,6 +2883,16 @@ fn record_router_topk<'a>(
     ids_off: u64,
     weights_off: u64,
 ) -> Result<()> {
+    // `qwen36_router_topk.comp` is ONE workgroup of `BLOCK = 256` lanes, one
+    // expert per lane, and it reads `logits[tid] for tid < n`. Handing it
+    // `n_expert > 256` does not fail — it routes every token through only the
+    // first 256 experts, and the top-k renormalisation divides by the wrong
+    // softmax denominator, so the output stays coherent and is silently wrong.
+    // Qwen3.8-Flash-Next has 512. Refuse rather than mis-route.
+    anyhow::ensure!(
+        n_expert <= QWEN36_ROUTER_TOPK_BLOCK,
+        "{name}: router top-k shader handles at most {QWEN36_ROUTER_TOPK_BLOCK} experts,          got {n_expert}; a larger table needs the strided variant (silently drops          experts {QWEN36_ROUTER_TOPK_BLOCK}..{n_expert} otherwise)"
+    );
     let spec = Kernel::Qwen36RouterTopk.specialization_u32();
     let push = qwen36_router_topk_params(n_expert as u32, top_k as u32, norm_topk).to_le_bytes();
     let groups = {

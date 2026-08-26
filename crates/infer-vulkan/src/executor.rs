@@ -32,6 +32,19 @@ pub enum VulkanModelKind {
     Dsv4,
     Qwen35Hybrid,
     Qwen36Moe,
+    /// Qwen3.8-Flash-Next (`qwen4_exp`). Recognised so it fails by NAME rather
+    /// than being mistaken for a plain MoE — it has 512 experts (top-10), a
+    /// hyper-connection residual stream 4x the hidden width, a PLE/n-gram
+    /// lookup table, and a sparse-attention indexer, none of which the
+    /// `Qwen36Moe` path implements.
+    ///
+    /// The misroute this prevents is silent, not loud: `expert_count > 0` used
+    /// to catch it, and the resulting forward would have run
+    /// `qwen36_router_topk.comp` with `n_expert = 512` against its `BLOCK 256`
+    /// — routing every token through only the first half of the expert table,
+    /// with the top-k renormalisation hiding the wrong softmax denominator.
+    /// Coherent output, no crash, silently wrong model.
+    Qwen4Exp,
 }
 
 pub fn classify_vulkan_architecture(
@@ -43,6 +56,11 @@ pub fn classify_vulkan_architecture(
     let name = model_name.unwrap_or_default().to_ascii_lowercase();
     if arch.contains("deepseek4") || arch.contains("deepseek_v4") {
         return VulkanModelKind::Dsv4;
+    }
+    // `qwen4_exp` BEFORE the expert-count clause below: it reports 512 experts
+    // and would otherwise be classified as an ordinary MoE.
+    if arch.contains("qwen4_exp") || arch.contains("qwen4exp") {
+        return VulkanModelKind::Qwen4Exp;
     }
     // MoE first: `qwen35moe` / `qwen3moe` archs and anything with experts. Note
     // `qwen35moe.contains("qwen35")` is true, so this MUST precede the dense
@@ -565,6 +583,17 @@ mod tests {
         assert_eq!(
             classify_vulkan_architecture("qwen3", None, 0),
             VulkanModelKind::Qwen3Dense
+        );
+        // The regression this guards: `qwen4_exp` reports 512 experts, so the
+        // `expert_count > 0` clause claimed it as `Qwen36Moe` and the model ran
+        // on a path whose router shader tops out at 256 experts.
+        assert_eq!(
+            classify_vulkan_architecture("qwen4_exp", Some("Qwen3.8-Flash-Next"), 512),
+            VulkanModelKind::Qwen4Exp
+        );
+        assert_eq!(
+            classify_vulkan_architecture("qwen4_exp", None, 0),
+            VulkanModelKind::Qwen4Exp
         );
     }
 

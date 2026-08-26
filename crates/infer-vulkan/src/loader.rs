@@ -237,6 +237,38 @@ pub struct ResidencyPlan {
     pub device_bytes: u64,
 }
 
+impl ResidencyPlan {
+    /// Refuse a plan that will not fit the device-local heap, BEFORE any upload
+    /// starts.
+    ///
+    /// Without this the failure arrives thousands of tensors deep as an opaque
+    /// `ERROR_OUT_OF_DEVICE_MEMORY` from whichever allocation happened to be
+    /// unlucky, after minutes of staging. The plan already knows the answer; ask
+    /// it. `headroom` is what must survive for the KV cache, activation arena
+    /// and descriptor pools — a plan that fits with zero bytes to spare does not
+    /// fit.
+    ///
+    /// Sized against the DEVICE_LOCAL heap rather than total system memory on
+    /// purpose: on this APU the two differ by the BIOS carve-out (measured: a
+    /// 60 GiB device-local allocation moved OS-visible free RAM by only 4.2 GiB,
+    /// so the heaps are largely disjoint and the host figure says nothing about
+    /// what the device can hold).
+    pub fn ensure_fits(&self, device_local_bytes: u64, headroom: u64) -> Result<()> {
+        let budget = device_local_bytes.saturating_sub(headroom);
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        ensure!(
+            self.device_bytes <= budget,
+            "residency plan needs {:.2} GiB but the device-local heap is {:.2} GiB              ({:.2} GiB reserved for KV + activations, leaving {:.2} GiB usable);              over by {:.2} GiB",
+            gib(self.device_bytes),
+            gib(device_local_bytes),
+            gib(headroom),
+            gib(budget),
+            gib(self.device_bytes.saturating_sub(budget)),
+        );
+        Ok(())
+    }
+}
+
 pub fn plan_model(gguf: &GgufFile, num_layers: usize) -> Result<ResidencyPlan> {
     let mut plan = ResidencyPlan {
         layer_bytes: vec![0; num_layers],
@@ -448,6 +480,20 @@ pub mod upload {
         gguf: &GgufFile,
         plan: &ResidencyPlan,
     ) -> Result<ResidentWeights<'a>> {
+        // Refuse an over-budget plan before staging a single byte. Reserve for
+        // the KV cache, the activation arena and descriptor pools — all of which
+        // are allocated after this returns, so a plan that exactly fills the
+        // heap fails later and less legibly.
+        const RESERVE_BYTES: u64 = 3 << 30;
+        let device_local: u64 = ctx
+            .memory_heaps()
+            .into_iter()
+            .filter(|&(_, device_local)| device_local)
+            .map(|(size, _)| size)
+            .max()
+            .unwrap_or(u64::MAX);
+        plan.ensure_fits(device_local, RESERVE_BYTES)?;
+
         let mut tensors = std::collections::HashMap::new();
         let mut embedding: Option<HostEmbeddingTable> = None;
 
