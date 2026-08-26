@@ -65,8 +65,9 @@ use vulkan_kernels::{
     qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
     qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
-    qwen36_router_topk_params, rms_norm_dispatch, rms_norm_params, rope_neox_dispatch,
-    rope_neox_params, sigmoid_mul_dispatch, sigmoid_mul_params, swiglu_dispatch, swiglu_params,
+    qwen36_router_topk_params, rms_norm_dispatch, rms_norm_dispatch_rows, rms_norm_params,
+    rms_norm_params_rows, rope_neox_dispatch, rope_neox_params, sigmoid_mul_dispatch,
+    sigmoid_mul_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -272,6 +273,15 @@ pub(crate) struct Slot {
 /// killing the per-GEMV host round-trip that dominated decode.
 pub struct DeviceArena<'a> {
     buffer: DeviceBuffer<'a>,
+    /// HOST_CACHED staging for the ONE thing the host reads every token: the
+    /// `[vocab]` logits. `buffer` is write-combined — great for GPU access and
+    /// host writes, ~0.10 GB/s for host reads — so reading 970 KB of logits
+    /// straight out of it cost 10.04 ms per token, a third of the decode step,
+    /// and no GPU profile could see it because no dispatch is involved. A
+    /// device-to-device copy into cached memory (recorded into the command
+    /// buffer that was going to be submitted anyway) makes the same read
+    /// 0.023 ms. Sized to the widest GEMV output row, which IS the vocab row.
+    readback: DeviceBuffer<'a>,
     /// q8_1_x4 quantized activation.
     quant: Slot,
     /// f32 destination rows (widest GEMV output rows).
@@ -470,8 +480,11 @@ impl<'a> DeviceArena<'a> {
 
         let buffer = DeviceBuffer::alloc_uma(ctx, total)
             .map_err(|e| anyhow!("alloc GEMV device arena ({total} B): {e}"))?;
+        let readback = DeviceBuffer::alloc_host_cached(ctx, dst_len.max(4))
+            .map_err(|e| anyhow!("alloc host-cached readback ({dst_len} B): {e}"))?;
         Ok(Self {
             buffer,
+            readback,
             quant,
             dst,
             fuse0,
@@ -512,6 +525,22 @@ impl<'a> DeviceArena<'a> {
         self.buffer
             .copy_from_host_at(off, &bytes)
             .map_err(|e| anyhow!("write arena @{off}: {e}"))
+    }
+
+    /// Read `len` f32 out of the HOST_CACHED [`Self::readback`] buffer, which
+    /// a prior [`Self::record_readback`] filled. Pair the two; reading without
+    /// the recorded copy returns whatever the last copy left behind.
+    fn read_staged(&self, len: usize) -> Result<Vec<f32>> {
+        let mut bytes = vec![0u8; len * std::mem::size_of::<f32>()];
+        self.readback
+            .copy_to_host(&mut bytes[..])
+            .map_err(|e| anyhow!("read staged logits: {e}"))?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
     }
 
     /// Read `len` f32 from the arena at byte `off` (UMA, no staging).
@@ -1134,13 +1163,28 @@ pub(crate) fn final_norm_lm_head<'a>(
         normed_off,
         dst_off,
     )?;
+    // Stage the logits into HOST_CACHED memory on the way out: this rides the
+    // submit that was already going to happen, and turns the host read below
+    // from 10.04 ms into 0.023 ms.
+    {
+        let DecodeResources {
+            recorder, arena, ..
+        } = &mut *res;
+        recorder.copy_buffer(
+            &arena.buffer,
+            dst_off,
+            &arena.readback,
+            0,
+            (vocab * std::mem::size_of::<f32>()) as u64,
+        );
+    }
     let t_submit = std::time::Instant::now();
     res.recorder
         .submit_and_wait()
         .map_err(|e| anyhow!("final_norm: submit: {e}"))?;
     let submit_ns = t_submit.elapsed().as_nanos();
 
-    let logits = res.arena.read_at(dst_off, vocab)?;
+    let logits = res.arena.read_staged(vocab)?;
     let total_ns = t_start.elapsed().as_nanos();
     res.gemv_submit_ns += submit_ns;
     res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
@@ -1289,12 +1333,23 @@ fn record_full_attention<'a>(
     )?;
     res.recorder.barrier();
     res.gemv_count += 3;
-    for hh in 0..nq {
-        // query half of head hh in q_full (stride 2*hd): bytes [hh*2*hd .. +hd].
-        let qsrc = qkv_off + (hh * 2 * hd) as u64 * f32_b;
-        let qdst = q_off + (hh * hd) as u64 * f32_b;
-        record_rms_norm(ctx, res, &q_norm.buffer, "attn_q_norm", hd, eps, qsrc, qdst)?;
-    }
+    // One dispatch for ALL query heads: head `hh`'s query half sits at
+    // `hh * 2*hd` in the interleaved `[query|gate]` block, so a `2*hd` source
+    // row stride extracts it and the result lands packed at `hh * hd`. This was
+    // a per-head loop; see `record_rms_norm_rows` for why the dispatch COUNT
+    // was the thing that mattered.
+    record_rms_norm_rows(
+        ctx,
+        res,
+        &q_norm.buffer,
+        "attn_q_norm",
+        hd,
+        nq,
+        2 * hd,
+        eps,
+        qkv_off,
+        q_off,
+    )?;
     res.recorder.barrier();
     for hh in 0..nq {
         let qdst = q_off + (hh * hd) as u64 * f32_b;
@@ -1310,10 +1365,20 @@ fn record_full_attention<'a>(
             qdst,
         )?;
     }
-    for hh in 0..nkv {
-        let ksrc = k_off + (hh * hd) as u64 * f32_b;
-        record_rms_norm(ctx, res, &k_norm.buffer, "attn_k_norm", hd, eps, ksrc, ksrc)?;
-    }
+    // In-place is safe here: the K heads are already packed, so
+    // `src_row_stride == ncols` and no row reads another row's output.
+    record_rms_norm_rows(
+        ctx,
+        res,
+        &k_norm.buffer,
+        "attn_k_norm",
+        hd,
+        nkv,
+        hd,
+        eps,
+        k_off,
+        k_off,
+    )?;
     res.recorder.barrier();
     for hh in 0..nkv {
         let kdst = k_off + (hh * hd) as u64 * f32_b;
@@ -1696,11 +1761,21 @@ fn record_linear_attention<'a>(
     // conv→gdr chain consumed it; qkv_dim ≥ v_dim_total so it fits).
     let gated_normed_off = res.arena.lin_qkv_conv.offset;
     res.recorder.barrier(); // gated-norm reads the gdr Output written above.
-    for vh in 0..nv {
-        let src = out_off + (vh * vd) as u64 * std::mem::size_of::<f32>() as u64;
-        let dst = gated_normed_off + (vh * vd) as u64 * std::mem::size_of::<f32>() as u64;
-        record_rms_norm(ctx, res, ssm_norm_buf, "ssm_norm", vd, eps, src, dst)?;
-    }
+    // `nv` value heads in one dispatch — 64 of them per linear layer on the
+    // 122B, and there are 36 linear layers, so this loop alone was 2304 of the
+    // 2809 `norm` dispatches per token.
+    record_rms_norm_rows(
+        ctx,
+        res,
+        ssm_norm_buf,
+        "ssm_norm",
+        vd,
+        nv,
+        vd,
+        eps,
+        out_off,
+        gated_normed_off,
+    )?;
     res.recorder.barrier(); // the swiglu reads every head's normed output + z.
     // out = silu(z) * normed over [v_dim_total]; reuse lin_out for the result.
     record_swiglu(
@@ -2131,6 +2206,76 @@ fn record_gemv_id<'a>(
 /// `[ncols]` row: input from arena byte `in_off`, weight from the device tensor
 /// `w_buf` sub-range, output to arena byte `out_off`. Bindings 0=A(in), 1=B(w),
 /// 2=D(out); spec `do_multiply=1`; push = [`rms_norm_params`]; one workgroup.
+/// Multi-row RMSNorm on the DECODE arena: `nrows` independent rows of `ncols`,
+/// row `r` read at `r * src_row_stride` and written PACKED at `r * ncols`.
+/// In-place is safe only when `src_row_stride == ncols`.
+///
+/// This is the per-head loop collapsed into ONE dispatch, and it is the single
+/// biggest lever on decode wall-clock. The loops it replaces issued one
+/// dispatch per head — 2809 `norm` dispatches per token on the 122B — each
+/// occupying a single workgroup on a 20-WGP part and costing ~3.37 us of HOST
+/// command recording. That host time is pure idle for the memory link: the
+/// GEMVs already stream at ~81% of DRAM peak, so the loss was never bandwidth,
+/// it was duty cycle (the link sat idle 47% of a decode step).
+///
+/// `src_row_stride > ncols` extracts a strided sub-block for free, which is what
+/// the `[query|gate]`-interleaved q projection needs. Mirrors
+/// [`crate::prefill`]'s `pf_rms_norm_rows`; the two differ only in which buffer
+/// they bind (decode uses the arena, prefill its own chunk scratch).
+#[allow(clippy::too_many_arguments)]
+fn record_rms_norm_rows<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    w_buf: &DeviceBuffer<'_>,
+    name: &str,
+    ncols: usize,
+    nrows: usize,
+    src_row_stride: usize,
+    eps: f32,
+    in_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    debug_assert!(
+        src_row_stride >= ncols,
+        "{name}: src_row_stride {src_row_stride} < ncols {ncols}"
+    );
+    let push =
+        rms_norm_params_rows(ncols as u32, nrows as u32, src_row_stride as u32, eps).to_le_bytes();
+    let groups = {
+        let d = rms_norm_dispatch_rows(nrows as u32);
+        [d.x, d.y, d.z]
+    };
+    let src_bytes = (nrows * src_row_stride * 4) as u64;
+    let dst_bytes = (nrows * ncols * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(
+            ctx,
+            Kernel::RmsNorm,
+            Kernel::RmsNorm.specialization_u32(),
+            push.len() as u32,
+            3,
+        )
+        .map_err(|e| anyhow!("{name}: build rms_norm pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, in_off, src_bytes),
+            (w_buf, 0, w_buf.len() as u64),
+            (arena_buf, out_off, dst_bytes),
+        ])
+        .map_err(|e| anyhow!("{name}: bind rms_norm ring set: {e}"))?;
+    recorder.label_next("norm");
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
 fn record_rms_norm<'a>(
     ctx: &'a VulkanContext,
     res: &mut DecodeResources<'a>,

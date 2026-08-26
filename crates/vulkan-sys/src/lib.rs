@@ -634,6 +634,47 @@ mod real {
             })
         }
 
+        /// Allocate a READ-BACK buffer: `HOST_VISIBLE | HOST_COHERENT |
+        /// HOST_CACHED`, falling back to plain host-visible if the device has
+        /// no cached type.
+        ///
+        /// The distinction is not cosmetic. `alloc`/`alloc_uma` memory on this
+        /// APU is write-combined: the host can WRITE it at full speed but reads
+        /// are uncached, and every read is a partial-line fetch. Measured on the
+        /// 8060S reading one token's logits (248320 f32 = 970 KB):
+        ///
+        /// ```text
+        ///   alloc_uma  9.80 ms   0.10 GB/s     <- 811x slower than memcpy
+        ///   alloc     10.03 ms   0.10 GB/s
+        ///   memcpy     0.01 ms  82.19 GB/s
+        /// ```
+        ///
+        /// A per-token readback out of write-combined memory is therefore ~10 ms
+        /// of pure host stall that no GPU profile can see, because no dispatch
+        /// is involved. Anything the host READS every step belongs here; use
+        /// [`Self::alloc_uma`] for buffers the host only writes.
+        pub fn alloc_host_cached(ctx: &'a VulkanContext, len: usize) -> Result<Self> {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST;
+            Self::alloc_with_usage(
+                ctx,
+                len,
+                usage,
+                vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+                    | vk::MemoryPropertyFlags::HOST_CACHED,
+            )
+            .or_else(|_| {
+                Self::alloc_with_usage(
+                    ctx,
+                    len,
+                    usage,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+            })
+        }
+
         pub fn alloc_with_usage(
             ctx: &'a VulkanContext,
             len: usize,
@@ -1232,6 +1273,75 @@ mod real {
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
                     &[memory_barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
+
+        /// Record a device-to-device buffer copy into THIS command buffer, so
+        /// it rides the submit that is already happening.
+        ///
+        /// The point is read-back staging: the arena is write-combined (fast for
+        /// the GPU and for host writes, ~0.10 GB/s for host READS), so anything
+        /// the host reads per token should be copied into a
+        /// [`DeviceBuffer::alloc_host_cached`] buffer first. On the 8060S that
+        /// turns a 970 KB logits read from 10.04 ms into 0.023 ms. Recording the
+        /// copy here rather than in a `one_shot_submit` keeps it free: no extra
+        /// submit, no extra fence.
+        ///
+        /// Both buffers need the matching `TRANSFER_SRC`/`TRANSFER_DST` usage,
+        /// which every `alloc*` constructor here sets.
+        pub fn copy_buffer(
+            &mut self,
+            src: &DeviceBuffer<'_>,
+            src_offset: u64,
+            dst: &DeviceBuffer<'_>,
+            dst_offset: u64,
+            size: u64,
+        ) {
+            if size == 0 {
+                return;
+            }
+            let region = vk::BufferCopy::default()
+                .src_offset(src_offset)
+                .dst_offset(dst_offset)
+                .size(size);
+            // The copy must see the compute writes that produced the data, and
+            // the host must see the copy — hence TRANSFER on both sides of the
+            // surrounding barriers rather than the COMPUTE-only `barrier()`.
+            let to_transfer = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            let to_host = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            // SAFETY: `command_buffer` is live and recording (between `begin`
+            // and `submit_and_wait`). Both buffers outlive this call via the
+            // borrows, and both carry TRANSFER_SRC|TRANSFER_DST usage. `region`
+            // is bounds-checked by the caller against both buffer lengths.
+            unsafe {
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[to_transfer],
+                    &[],
+                    &[],
+                );
+                self.ctx.device.cmd_copy_buffer(
+                    self.command_buffer,
+                    src.buffer,
+                    dst.buffer,
+                    &[region],
+                );
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[to_host],
                     &[],
                     &[],
                 );
@@ -1944,6 +2054,10 @@ mod stub {
             Err(VULKAN_NOT_COMPILED)
         }
 
+        pub fn alloc_host_cached(_ctx: &'a VulkanContext, _len: usize) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
         pub fn len(&self) -> usize {
             0
         }
@@ -2006,6 +2120,16 @@ mod stub {
         }
 
         pub fn barrier(&mut self) {}
+
+        pub fn copy_buffer(
+            &mut self,
+            _src: &DeviceBuffer<'_>,
+            _src_offset: u64,
+            _dst: &DeviceBuffer<'_>,
+            _dst_offset: u64,
+            _size: u64,
+        ) {
+        }
 
         pub fn label_next(&mut self, _label: &'static str) {}
 
