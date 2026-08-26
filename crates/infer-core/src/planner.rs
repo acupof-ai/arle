@@ -227,8 +227,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if demoted_seq_len == 0 {
             return false;
         }
-        let key = self.next_tier_key;
-        self.next_tier_key = self.next_tier_key.wrapping_add(1);
+        let key = self.next_slot_tier_key;
+        self.next_slot_tier_key = self.next_slot_tier_key.wrapping_add(1);
         // The park stalls the whole engine (whole-slot D2H + sync), so its cost
         // is a scheduling input, not a detail: surface it per event.
         let started = std::time::Instant::now();
@@ -300,8 +300,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             && demoted_seq_len > 0
             && let Some(tier) = self.executor.kv_slot_tier()
         {
-            let key = self.next_tier_key;
-            self.next_tier_key = self.next_tier_key.wrapping_add(1);
+            let key = self.next_slot_tier_key;
+            self.next_slot_tier_key = self.next_slot_tier_key.wrapping_add(1);
             match tier.demote_slot(slot, key) {
                 Ok(true) => {
                     slot_swap_key = Some(key);

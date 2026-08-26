@@ -673,8 +673,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             {
                 break;
             }
-            let key = self.next_tier_key;
-            self.next_tier_key = self.next_tier_key.wrapping_add(1);
+            let Some(key) = self.radix.content_key_of_page(page) else {
+                break;
+            };
             entries.push((page, key));
         }
         if entries.is_empty() {
@@ -765,7 +766,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             );
             return Ok(clamped);
         }
-        let blocks_all = self.radix.tiered_longest_prefix_match(tokens).blocks;
+        let mut blocks_all = self.radix.tiered_longest_prefix_match(tokens).blocks;
+        self.adopt_cold_tier_blocks(tokens, &mut blocks_all);
         let resident = blocks_all
             .iter()
             .take_while(|b| matches!(b, PrefixBlock::ResidentPage(_)))
@@ -809,6 +811,38 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Resident blocks pass through. Demoted blocks are restored by one mget
     /// batch before any attach; if the batch fails, only the leading resident
     /// run before the first demoted block is returned.
+    /// Extend a radix match with blocks a previous process left in the durable
+    /// tier: probe the store by content key past the in-memory match and adopt
+    /// every hit as a demoted node, so the normal promote path restores it.
+    fn adopt_cold_tier_blocks(&mut self, tokens: &[u32], blocks: &mut Vec<PrefixBlock>) {
+        let block_size = self.radix.block_size().max(1);
+        let total = tokens.len() / block_size;
+        if blocks.len() >= total {
+            return;
+        }
+        let keys = infer_seam::prefix_content_keys(tokens, block_size);
+        let mut adopted = 0usize;
+        for idx in blocks.len()..total {
+            let key = keys[idx];
+            let on_tier = self
+                .executor
+                .kv_page_tier_view()
+                .is_some_and(|tier| tier.kv_tier_location(key).is_some());
+            if !on_tier
+                || !self
+                    .radix
+                    .adopt_demoted_block(&tokens[..(idx + 1) * block_size], key)
+            {
+                break;
+            }
+            blocks.push(PrefixBlock::DemotedKey(key));
+            adopted += 1;
+        }
+        if adopted > 0 {
+            log::info!("prefix-lookup(tier): adopted {adopted} cold blocks by content key");
+        }
+    }
+
     fn materialize_prefix_blocks(&mut self, blocks: &[PrefixBlock]) -> Vec<BlockId> {
         let demoted = blocks
             .iter()

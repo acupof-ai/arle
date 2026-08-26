@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use infer_seam::{PrefixBlock, ShardSpec};
+use infer_seam::{PrefixBlock, ShardSpec, prefix_block_content_key};
 
 /// Host page id used as the prefix-cache block id.
 pub type BlockId = u32;
@@ -103,6 +103,8 @@ pub struct RadixCache {
 #[derive(Debug, Clone)]
 struct Node {
     block: Vec<u32>,
+    /// Chained content hash of the token path; the tier key when demoted.
+    content_key: u64,
     page_id: Option<BlockId>,
     /// Backend tier-store key while this block's contents live in the host
     /// tier instead of a device page. Mutually exclusive with `page_id`.
@@ -124,6 +126,7 @@ impl Node {
     fn root() -> Self {
         Self {
             block: Vec::new(),
+            content_key: 0,
             page_id: None,
             tier_key: None,
             ref_count: 0,
@@ -135,9 +138,16 @@ impl Node {
         }
     }
 
-    fn child(block: Vec<u32>, page_id: Option<BlockId>, parent: usize, last_access: u64) -> Self {
+    fn child(
+        block: Vec<u32>,
+        content_key: u64,
+        page_id: Option<BlockId>,
+        parent: usize,
+        last_access: u64,
+    ) -> Self {
         Self {
             block,
+            content_key,
             page_id,
             tier_key: None,
             ref_count: 0,
@@ -451,18 +461,7 @@ impl RadixCache {
             let child_idx = if let Some(&child_idx) = self.nodes[node_idx].children.get(&block) {
                 child_idx
             } else {
-                let last_access = self.tick();
-                let node = Node::child(block.clone(), page, node_idx, last_access);
-                let child_idx = if let Some(free_idx) = self.free.pop() {
-                    self.nodes[free_idx] = node;
-                    free_idx
-                } else {
-                    self.nodes.push(node);
-                    self.nodes.len() - 1
-                };
-                self.nodes[node_idx]
-                    .children
-                    .insert(block.clone(), child_idx);
+                let child_idx = self.new_child(node_idx, block, page);
                 if let Some(page_id) = page
                     && self.page_to_node.insert(page_id, child_idx).is_none()
                 {
@@ -494,6 +493,61 @@ impl RadixCache {
         }
 
         newly_cached
+    }
+
+    fn new_child(&mut self, parent_idx: usize, block: Vec<u32>, page: Option<BlockId>) -> usize {
+        let last_access = self.tick();
+        let content_key = prefix_block_content_key(self.nodes[parent_idx].content_key, &block);
+        let node = Node::child(block.clone(), content_key, page, parent_idx, last_access);
+        let child_idx = if let Some(free_idx) = self.free.pop() {
+            self.nodes[free_idx] = node;
+            free_idx
+        } else {
+            self.nodes.push(node);
+            self.nodes.len() - 1
+        };
+        self.nodes[parent_idx].children.insert(block, child_idx);
+        child_idx
+    }
+
+    #[must_use]
+    pub fn content_key_of_page(&self, page: BlockId) -> Option<u64> {
+        self.page_to_node
+            .get(&page)
+            .map(|&idx| self.nodes[idx].content_key)
+    }
+
+    /// Register a block found in the backend tier by content key (a prior
+    /// process demoted it). Every earlier block of `tokens` must already be a
+    /// node; the last block becomes a demoted node under `tier_key`, or is left
+    /// alone when it is already resident or demoted.
+    pub fn adopt_demoted_block(&mut self, tokens: &[u32], tier_key: u64) -> bool {
+        let blocks: Vec<&[u32]> = tokens.chunks_exact(self.block_size).collect();
+        let Some((last, path)) = blocks.split_last() else {
+            return false;
+        };
+        let mut node_idx = 0usize;
+        for block in path {
+            let Some(&child_idx) = self.nodes[node_idx].children.get(*block) else {
+                return false;
+            };
+            node_idx = child_idx;
+        }
+        let child_idx = match self.nodes[node_idx].children.get(*last) {
+            Some(&idx) => idx,
+            None => self.new_child(node_idx, last.to_vec(), None),
+        };
+        let node = &mut self.nodes[child_idx];
+        if node.page_id.is_some() || node.tier_key.is_some() {
+            return false;
+        }
+        if node.content_key != tier_key {
+            return false;
+        }
+        node.tier_key = Some(tier_key);
+        node.evicted = false;
+        self.tier_to_node.insert(tier_key, child_idx);
+        true
     }
 
     fn adjust_resident_ancestors(&mut self, mut idx: usize, delta: i64) {

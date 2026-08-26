@@ -351,18 +351,22 @@ impl MetalExecutor {
     }
 
     #[cfg(feature = "metal")]
+    /// `epoch` tags the durable namespace (model identity + KV dtype); a
+    /// different tag discards the prior store instead of serving foreign KV.
     pub fn set_kv_tier_disk(
         &mut self,
         root: PathBuf,
         budget_bytes: usize,
         page_size: usize,
+        epoch: &str,
     ) -> bool {
         let Some(real) = self.real.as_mut() else {
             return false;
         };
         let bytes_per_page =
             estimated_metal_kv_page_bytes(&real.config, real.kv_cache_dtype, page_size.max(1));
-        real.page_store.set_ssd(root, budget_bytes, bytes_per_page)
+        real.page_store
+            .set_ssd(root, budget_bytes, bytes_per_page, page_size, epoch)
     }
 
     /// Feature-free placeholder forward: one deterministic token per scheduled
@@ -533,6 +537,11 @@ impl infer_seam::PrefixReuse for MetalExecutor {
         _slot_pages: &[u32],
         _newly_cached: &[u32],
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_mut() {
+            real.page_store
+                .save_prefix_sidecar(&_tokens[.._matched_len.min(_tokens.len())], _prefix_pages);
+        }
         Ok(())
     }
 }
@@ -616,14 +625,9 @@ impl infer_seam::KvPageTier for MetalExecutor {
         anyhow::bail!("Metal placeholder backend has no KV tier store")
     }
 
-    fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
-        #[cfg(feature = "metal")]
-        if let Some(real) = self.real.as_mut() {
-            real.page_store.drop_kv_tier_entries(keys);
-        }
-        #[cfg(not(feature = "metal"))]
-        let _ = keys;
-    }
+    // The durable tier keeps every page until its own LRU evicts it, so a
+    // radix drop (promotion or severed subtree) frees nothing on disk.
+    fn drop_kv_tier_entries(&mut self, _keys: &[u64]) {}
 }
 
 /// A greedy decode step whose `step_session` was already issued (async) for the
@@ -1629,6 +1633,8 @@ impl RealMetalExecutor {
 mod kv_ssd;
 #[cfg(feature = "metal")]
 use kv_ssd::*;
+#[cfg(feature = "metal")]
+pub use kv_ssd::default_t2_budget_bytes as metal_default_t2_budget_bytes;
 
 #[cfg(feature = "metal")]
 #[path = "slot.rs"]
@@ -2267,7 +2273,7 @@ mod tests {
         let _guard = mlx_sys::mlx_guard();
         let root = temp_ssd_root("promote");
         let mut store = MetalPageStore::default();
-        assert!(store.set_ssd(root.clone(), 8 * 1024 * 1024, 1024));
+        assert!(store.set_ssd(root.clone(), 8 * 1024 * 1024, 1024, 4, "test-epoch"));
         let mut pool = MetalKvPool::new(1, 8, 4);
 
         pool.alloc(0, 8).unwrap();
@@ -2280,16 +2286,18 @@ mod tests {
             vec![gdr_array(7)],
         );
         store.publish_slot(&state, &pool).unwrap();
-        let logical_key = store
-            .logical_key_for_pages(&pages)
-            .expect("published logical key");
+        // Two 4-token pages; the sidecar binds their content keys and persists
+        // the restore snapshot under the key of the last one.
+        let tokens: Vec<u32> = (0..8u32).collect();
+        store.save_prefix_sidecar(&tokens, &pages);
+        let content_keys = infer_seam::prefix_content_keys(&tokens, 4);
         assert!(
-            store.has_disk_prefix(&logical_key),
+            store.has_disk_prefix(content_keys[1]),
             "write-through must persist the prefix snapshot"
         );
         assert_eq!(
             store
-                .demote_prefix_pages(&[(pages[0], 10), (pages[1], 11)])
+                .demote_prefix_pages(&[(pages[0], content_keys[0]), (pages[1], content_keys[1])])
                 .unwrap(),
             2
         );
@@ -2305,14 +2313,17 @@ mod tests {
             0
         );
 
-        let demoted = [PrefixBlock::DemotedKey(10), PrefixBlock::DemotedKey(11)];
+        let demoted = [
+            PrefixBlock::DemotedKey(content_keys[0]),
+            PrefixBlock::DemotedKey(content_keys[1]),
+        ];
         assert_eq!(
             store.reusable_prefix_blocks(&demoted),
             2,
             "T2 mcheck must prove the prefix before mget/promote"
         );
         store
-            .promote_prefix_pages(&[(10, pages[0]), (11, pages[1])])
+            .promote_prefix_pages(&[(content_keys[0], pages[0]), (content_keys[1], pages[1])])
             .unwrap();
         assert_eq!(
             store.reusable_prefix_blocks(&resident_prefix_blocks(&pages)),

@@ -539,8 +539,9 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     throughput_stats: ThroughputStats,
     kv_tier_stats: KvTierStats,
     kv_system_metrics: KvSystemMetrics,
-    /// Next backend tier-store key; monotonically burned (failures included).
-    next_tier_key: u64,
+    /// Next whole-slot tier-store key (slot images are process-local; prefix
+    /// pages use content keys instead).
+    next_slot_tier_key: u64,
     /// Monotonic admit stamp source for oversubscription victim selection;
     /// each admit/resume into a slot burns one (see `RequestState::admit_seq`).
     next_admit_seq: u64,
@@ -627,7 +628,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             throughput_stats: ThroughputStats::default(),
             kv_tier_stats: KvTierStats::default(),
             kv_system_metrics: KvSystemMetrics::default(),
-            next_tier_key: 0,
+            next_slot_tier_key: 0,
             next_admit_seq: 0,
             on_token: None,
             mode: EngineMode::Serving,

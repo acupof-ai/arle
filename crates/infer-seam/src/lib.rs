@@ -62,6 +62,38 @@ pub enum PollResult<I> {
     NotReady(I),
 }
 
+/// Bits of a tier key below the backend store's namespace byte; content keys
+/// are masked to this width so they double as tier keys.
+pub const TIER_KEY_BITS: u32 = 56;
+
+/// Content key of one prefix block: FNV-1a over the parent block's key and the
+/// block's tokens. Stable across processes, so a durable tier store can be
+/// probed for a prompt's blocks without any in-memory index.
+#[must_use]
+pub fn prefix_block_content_key(parent: u64, block: &[u32]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in parent.to_le_bytes().into_iter().chain(block.iter().flat_map(|t| t.to_le_bytes())) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash & ((1u64 << TIER_KEY_BITS) - 1)
+}
+
+/// Chained content keys for every full block of `tokens`.
+#[must_use]
+pub fn prefix_content_keys(tokens: &[u32], block_size: usize) -> Vec<u64> {
+    let mut parent = 0u64;
+    tokens
+        .chunks_exact(block_size.max(1))
+        .map(|block| {
+            parent = prefix_block_content_key(parent, block);
+            parent
+        })
+        .collect()
+}
+
 /// One prefix-cache block offered to a backend for restore-boundary selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefixBlock {
