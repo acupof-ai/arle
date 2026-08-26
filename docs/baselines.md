@@ -757,11 +757,39 @@ This is what decides whether a 63.65 GiB checkpoint fits.
 
 ### llama.cpp reference rows on this box (not ARLE — competitor anchors)
 
-| model | size | pp512 | tg128 |
-| --- | ---: | ---: | ---: |
-| qwen35 27B Q8_0 (dense) | 26.62 GiB | 140.96 ± 4.32 | 7.24 ± 0.02 |
-| qwen35moe 35B.A3B Q4_K_M | 20.60 GiB | 822.71 ± 41.05 | 47.29 ± 0.41 |
-| qwen35moe 122B.A10B Q4_K_M | 63.65 GiB | 200.28 ± 9.04 | 23.41 ± 0.19 |
+| model | size | pp512 | tg128 | pp4096+tg128 |
+| --- | ---: | ---: | ---: | ---: |
+| qwen35 27B Q8_0 (dense) | 26.62 GiB | 140.96 ± 4.32 | 7.24 ± 0.02 | — |
+| qwen35 27B Q8_0, KV q8_0 | 26.62 GiB | 132.87 ± 3.96 | 6.96 ± 0.04 | 80.88 ± 2.20 |
+| qwen35 27B Q8_0, **CPU** | 26.62 GiB | 13.38 ± 0.22 | — | — |
+| qwen35moe 35B.A3B Q4_K_M | 20.60 GiB | 822.71 ± 41.05 | 47.29 ± 0.41 | — |
+| qwen35moe 35B.A3B Q8_0 | 34.36 GiB | 735.74 ± 39.65 | 42.86 ± 0.51 | 325.95 ± 19.56 |
+| qwen35moe 122B.A10B Q4_K_M | 63.65 GiB | 200.28 ± 9.04 | 23.41 ± 0.19 | 162.72 ± 1.46 |
+
+Three things these rows say that a single pp512 number does not:
+
+- **The GPU is worth 10.5x over the CPU** on the same file (27B Q8_0, 140.96 vs
+  13.38 pp512) — worth remembering before blaming the Vulkan lane for anything.
+- **Long context costs 20-55%**: `pp4096+tg128` vs `pp512` is 445 -> 80.9 on the
+  dense 27B (KV q8_0) but only 200 -> 163 on the 122B MoE. The MoE degrades far
+  less, because its per-token cost is dominated by the active experts rather
+  than by attention over a longer prefix.
+- **KV `q8_0` is roughly free** (27B: 140.96 -> 132.87 pp512, -5.7%).
+
+### Quantization quality — 35B-A3B, wiki.test.raw, ctx 8192
+
+| quant | PPL | vs Q8_0 |
+| --- | ---: | ---: |
+| Q8_0 | 5.3646 +/- 0.04342 | — |
+| Q4_K_M | 5.3825 +/- 0.04361 | **+0.0179 (+0.33%)** |
+
+Q4_K_M costs a third of a percent of perplexity for 40% of the bytes. On a
+bandwidth-bound box that is not a trade-off, it is free money — which is why
+every ARLE row here is Q4_K_M.
+
+Raw logs preserved at `models/llamacpp-baselines/` (21.6 KB); the GGUFs they
+were measured on have since been deleted to reclaim disk, so these rows cannot
+be re-run without re-downloading.
 
 ### Qwen3.5-122B-A10B · same box · Vulkan — MoE BRING-UP (2026-08-26)
 
