@@ -2868,35 +2868,49 @@ mod nvfp4_repack_tests {
         assert_eq!(nvfp4_row_bytes(0), None);
     }
 
-    /// Element `k` of the source row gets nibble `k % 16`, so every one of the
-    /// 16 E2M1 codes appears in every sub-block and NO two positions inside a
-    /// sub-block share a value. An identity `d || qs` copy — the "just
-    /// interleave the scales" repack — permutes each group to
-    /// `0,2,4,..,14,1,3,..,15` and fails here.
+    /// Nibble for GLOBAL element index `g = r * ncols + k`:
+    /// `(5*g + g/16) % 16`. Within one sub-block this is a full permutation of
+    /// the 16 E2M1 codes (x5 is a bijection mod 16), and the `g/16` term
+    /// shifts the permutation by one per sub-block — so no two sub-blocks,
+    /// blocks, or rows carry the same byte pattern. The first version of this
+    /// fixture used `k % 16`, which is periodic with the sub-block: dropping
+    /// the sub-block index, dropping the block index, and pinning the source
+    /// row to 0 were three mutations that all passed. Aperiodicity is the
+    /// property the tests below actually rely on; keep it.
+    fn nibble_at(g: usize) -> u8 {
+        ((5 * g + g / QK_NVFP4_SUB) % 16) as u8
+    }
+
+    /// Scale code for global sub-block index `g_sub`, rotating the 4-code
+    /// cycle by one per block so block 0's scales fit no other block.
+    fn scale_index_at(g_sub: usize) -> usize {
+        (g_sub + g_sub / 4) % SCALES.len()
+    }
+
     fn source_planes(nrows: usize, ncols: usize) -> (Vec<u8>, Vec<u8>) {
         let qs = (0..nrows * ncols / 2)
-            .map(|i| {
-                let k = 2 * i;
-                let lo = (k % QK_NVFP4_SUB) as u8;
-                let hi = ((k + 1) % QK_NVFP4_SUB) as u8;
-                lo | (hi << 4)
-            })
+            .map(|i| nibble_at(2 * i) | (nibble_at(2 * i + 1) << 4))
             .collect();
         let sc = (0..nrows * ncols / QK_NVFP4_SUB)
-            .map(|g| SCALES[g % SCALES.len()])
+            .map(|g| SCALES[scale_index_at(g)])
             .collect();
         (qs, sc)
     }
 
-    fn expected_row(ncols: usize) -> Vec<f32> {
+    fn expected_row(r: usize, ncols: usize) -> Vec<f32> {
         (0..ncols)
-            .map(|k| E2M1[k % QK_NVFP4_SUB] * SCALE_VALUES[(k / QK_NVFP4_SUB) % SCALE_VALUES.len()])
+            .map(|k| {
+                let g = r * ncols + k;
+                E2M1[nibble_at(g) as usize] * SCALE_VALUES[scale_index_at(g / QK_NVFP4_SUB)]
+            })
             .collect()
     }
 
     /// Repack, then dequantize the result with `infer_gguf`'s independent
     /// `block_nvfp4` reader, and require the hand-written value sequence back.
-    /// Two rows so a row-stride slip shows up as a value mismatch.
+    /// The fixture is aperiodic (see [`nibble_at`]), so a wrong sub-block
+    /// index, a wrong block index, and a wrong source row each produce a
+    /// value mismatch here rather than a coincidental pass.
     #[test]
     fn repacked_blocks_dequantize_to_the_source_elements() {
         const NROWS: usize = 2;
@@ -2906,14 +2920,13 @@ mod nvfp4_repack_tests {
         let mut packed = vec![0u8; NROWS * row_bytes];
         repack_nvfp4_planes(&qs, &sc, NROWS, NCOLS, &mut packed).expect("repack");
 
-        let want = expected_row(NCOLS);
         for r in 0..NROWS {
             let got = infer_gguf::dequant::dequantize_row_nvfp4(
                 &packed[r * row_bytes..(r + 1) * row_bytes],
                 NCOLS,
             )
             .expect("dequantize repacked row");
-            assert_eq!(got, want, "row {r}");
+            assert_eq!(got, expected_row(r, NCOLS), "row {r}");
         }
     }
 

@@ -258,6 +258,60 @@ fn max_relative_error(got: &[f32], want: &[f32]) -> (f32, usize) {
     (worst, worst_row)
 }
 
+/// Dequantize every row two ways — the repacked `block_nvfp4` stream vs the
+/// plane-direct reader — assert bit-identity, and return the dequantized
+/// weights for the caller's oracle.
+fn dequant_and_check_repack(
+    label: &str,
+    experts: &[Projection<'_>],
+    packed: &[Vec<u8>],
+) -> Vec<Vec<Vec<f32>>> {
+    let (nrows, ncols) = (experts[0].nrows, experts[0].ncols);
+    let row_bytes = nvfp4_row_bytes(ncols).expect("row bytes");
+    let mut weights: Vec<Vec<Vec<f32>>> = Vec::with_capacity(experts.len());
+    for (e, proj) in experts.iter().enumerate() {
+        let mut rows = Vec::with_capacity(nrows);
+        for r in 0..nrows {
+            let from_blocks =
+                dequantize_row_nvfp4(&packed[e][r * row_bytes..(r + 1) * row_bytes], ncols)
+                    .expect("dequantize repacked row");
+            let from_planes = dequantize_row_from_planes(
+                &proj.qs_plane[r * (ncols / 2)..(r + 1) * (ncols / 2)],
+                &proj.scale_plane[r * (ncols / QK_NVFP4_SUB)..(r + 1) * (ncols / QK_NVFP4_SUB)],
+                ncols,
+            );
+            assert_eq!(
+                from_blocks, from_planes,
+                "{label} expert {e} row {r}: repacked block_nvfp4 disagrees with the                  plane-direct dequantizer"
+            );
+            rows.push(from_blocks);
+        }
+        weights.push(rows);
+    }
+    eprintln!(
+        "[{label}] repack verified: {} weights, 2 independent decoders agree bit for bit",
+        experts.len() * nrows * ncols
+    );
+    weights
+}
+
+/// Claim 1 standalone, on real checkpoint bytes, with NO `VulkanContext`: a
+/// box without a Vulkan device verifies the repack instead of skipping it
+/// together with the GPU claims.
+#[test]
+fn repack_matches_plane_dequant_on_real_expert_bytes() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(st) = open_shards(vec![dir.join(EXPERT_SHARD)]) else {
+        return;
+    };
+    for label in ["gate_proj", "down_proj"] {
+        let experts: Vec<Projection<'_>> =
+            (0..2).map(|e| Projection::load(&st, label, e)).collect();
+        let packed: Vec<Vec<u8>> = experts.iter().map(Projection::repack).collect();
+        dequant_and_check_repack(label, &experts, &packed);
+    }
+}
+
 /// Both NVFP4 pipelines against an f64 CPU dot product over real expert bytes.
 #[test]
 fn nvfp4_gemv_matches_cpu_oracle_on_real_expert_bytes() {
@@ -289,34 +343,10 @@ fn nvfp4_gemv_matches_cpu_oracle_on_real_expert_bytes() {
             "{label}: ncols {ncols} must be a multiple of {QK_NVFP4}"
         );
 
-        // --- Claim 1: the repack is a faithful relabelling of the planes. ---
+        // --- Claim 1: the repack is a faithful relabelling of the planes.
+        // (Also runs GPU-free as `repack_matches_plane_dequant_on_real_expert_bytes`.)
         let packed: Vec<Vec<u8>> = experts.iter().map(Projection::repack).collect();
-        let row_bytes = nvfp4_row_bytes(ncols).expect("row bytes");
-        let mut weights: Vec<Vec<Vec<f32>>> = Vec::with_capacity(experts.len());
-        for (e, proj) in experts.iter().enumerate() {
-            let mut rows = Vec::with_capacity(nrows);
-            for r in 0..nrows {
-                let from_blocks =
-                    dequantize_row_nvfp4(&packed[e][r * row_bytes..(r + 1) * row_bytes], ncols)
-                        .expect("dequantize repacked row");
-                let from_planes = dequantize_row_from_planes(
-                    &proj.qs_plane[r * (ncols / 2)..(r + 1) * (ncols / 2)],
-                    &proj.scale_plane[r * (ncols / QK_NVFP4_SUB)..(r + 1) * (ncols / QK_NVFP4_SUB)],
-                    ncols,
-                );
-                assert_eq!(
-                    from_blocks, from_planes,
-                    "{label} expert {e} row {r}: repacked block_nvfp4 disagrees with the \
-                     plane-direct dequantizer"
-                );
-                rows.push(from_blocks);
-            }
-            weights.push(rows);
-        }
-        eprintln!(
-            "[{label}] repack verified: {} weights, 2 independent decoders agree bit for bit",
-            experts.len() * nrows * ncols
-        );
+        let weights = dequant_and_check_repack(label, &experts, &packed);
 
         // Shared activation for the token.
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
