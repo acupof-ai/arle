@@ -543,6 +543,38 @@ const LOCAL: &[ShaderSpec] = &[
         source: "crates/vulkan-kernels/shaders/qwen36_moe_weighted_accum.comp",
         defines: &[],
     },
+    // Qwen3.8-Flash-Next (`qwen4_exp`) PLE. Neither half exists in the vendored
+    // corpus: the grouped RMSNorm scales by `1.0 + weight` and the conv is
+    // dilated, so no `-D` of an upstream shader reaches either. Both are fused
+    // to this model's sequence rather than written as primitives because decode
+    // here is dispatch-bound — see the shader headers.
+    ShaderSpec {
+        name: "qwen4_ple_gate",
+        source: "crates/vulkan-kernels/shaders/qwen4_ple_gate.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_ple_conv",
+        source: "crates/vulkan-kernels/shaders/qwen4_ple_conv.comp",
+        defines: &[],
+    },
+    // Qwen3.8-Flash-Next hyper-connections: two of the four dispatches ONE
+    // `Qwen4ExpTextGatedResidual` costs. The other two need no new shader — the
+    // vendored `rms_norm` does the grouped norm through push constants alone
+    // (`rms_norm_params_grouped`) and the f32 `qwen36_router_gemv` does the
+    // down-projection. These two are fused rather than generic because the site
+    // occurs 97 times per token on a dispatch-bound decode: the naive
+    // composition is 10 dispatches per site, this is 4.
+    ShaderSpec {
+        name: "qwen4_hc_mix",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_mix.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_hc_combine",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_combine.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {

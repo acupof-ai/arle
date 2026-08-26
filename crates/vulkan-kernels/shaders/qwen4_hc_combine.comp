@@ -1,0 +1,132 @@
+#version 450
+// ARLE Vulkan shader: Qwen3.8-Flash-Next (`qwen4_exp`) hyper-connection COMBINE
+// — the injection gate and the scatter back onto the residual, fused.
+//
+// Host oracle: `infer_vulkan::qwen4_hc`'s `injection_weights` +
+// `inject_block_output`. Two phases in ONE dispatch:
+//
+//   1. inj[s] = 2 * sigmoid((W_inject[s] . hn) / hc_count)   # [hc_count]
+//   2. h[s*hidden + i] += inj[s] * y[i]                      # in place
+//
+// `hn` is the grouped-RMSNorm output; `h` is the RAW inter-layer residual the
+// norm was taken of. They are DIFFERENT buffers, which is what makes phase 2
+// safe to run in place while other workgroups are still in phase 1 — the norm
+// is consumed by the gates and thrown away, never written back.
+//
+// ## Why both phases live in one dispatch, and what that costs
+//
+// Splitting them would be a fifth and sixth dispatch at this site, and the site
+// occurs 97 times per token on a decode path that is dispatch-bound. The price
+// is that `inj` has to be known to every workgroup that writes a slice of `h`,
+// and there is no cross-workgroup sync inside a dispatch: so EVERY workgroup
+// recomputes the whole phase-1 reduction over all `hc_count * hc_hidden`
+// weights. Every workgroup runs the identical reduction over identical data in
+// the identical order, so they agree bit-for-bit — the gate applied to stream
+// `s` is one value, not one per workgroup.
+//
+// That replication is why the grid is deliberately SMALL: one workgroup per
+// BLOCK hidden channels (10 for hidden=2560), not one per output element.
+// Phase 1 is ~160KB of `W_inject` per workgroup, phase 2 only ~4 elements per
+// lane, so a 40-workgroup grid would quadruple L2 traffic to shave nothing off
+// the per-CU byte count (160 + hidden/G KB per workgroup, flat past G ~ 8).
+// The tile is the one number here worth a sweep on a real trace.
+//
+// Bindings: `0 = hn` [hc_count*hidden] f32 (read), `1 = W_inject`
+// [hc_count, hc_count*hidden] f32 row-major (read), `2 = h`
+// [hc_count*hidden] f32 (READ+WRITTEN in place), `3 = y` [hidden] f32 (the
+// sublayer's block output).
+#extension GL_EXT_control_flow_attributes : enable
+
+// 4 wave64 waves. Wider than the mix kernel's single wave because phase 1 is a
+// 4 x hc_hidden contraction (40960 elements at hidden=2560), not 4 x 320.
+#define BLOCK 256
+// See `qwen4_hc_mix.comp` — a literal bound keeps the per-stream accumulators
+// in registers instead of scratch.
+#define HC_MAX 8
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint hidden;    // hidden_size (2560)
+    uint hc_count;  // residual streams (4); must be <= HC_MAX
+} p;
+
+layout(binding = 0) readonly buffer Normed {
+    float hn[]; // [hc_count * hidden], stream-major
+};
+layout(binding = 1) readonly buffer WeightInject {
+    float w_inject[]; // [hc_count, hc_count * hidden], row-major [out, in]
+};
+layout(binding = 2) buffer Hyper {
+    float h[]; // [hc_count * hidden] — the residual, updated in place
+};
+layout(binding = 3) readonly buffer BlockOutput {
+    float y[]; // [hidden]
+};
+
+shared float partial[HC_MAX][BLOCK];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint hc = p.hc_count;
+    const uint hc_hidden = hc * p.hidden;
+
+    float acc[HC_MAX];
+    [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+        acc[s] = 0.0;
+    }
+
+    // Phase 1. BLOCK-strided so the 256 lanes read contiguous `W_inject`; `hn`
+    // is loaded once per column and shared by all `hc_count` rows.
+    for (uint c = tid; c < hc_hidden; c += BLOCK) {
+        const float hv = hn[c];
+        [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+            if (s < hc) {
+                acc[s] += w_inject[s * hc_hidden + c] * hv;
+            }
+        }
+    }
+
+    [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+        if (s < hc) {
+            partial[s][tid] = acc[s];
+        }
+    }
+    barrier();
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+                if (s < hc) {
+                    partial[s][tid] += partial[s][tid + stride];
+                }
+            }
+        }
+        barrier();
+    }
+
+    // `2 * sigmoid(...)` puts every gate strictly in (0, 2) — a stream can be
+    // damped or amplified, never sign-flipped. The `/ hc_count` is inside the
+    // sigmoid; outside it the gate saturates (the reference's layer-0 logit is
+    // -16.6, i.e. 2*sigmoid(-4.16) = 0.031 versus 2*sigmoid(-16.6) = 1.2e-7).
+    float inj[HC_MAX];
+    [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+        if (s < hc) {
+            const float z = partial[s][0] / float(hc);
+            inj[s] = 2.0 / (1.0 + exp(-z));
+        }
+    }
+
+    // Phase 2. This workgroup owns one BLOCK-wide slice of the hidden range and
+    // writes that slice in ALL streams, so `y[j]` is fetched once per lane and
+    // reused `hc_count` times, and no integer division by `hidden` is needed to
+    // recover the stream index.
+    const uint j = gl_WorkGroupID.x * BLOCK + tid;
+    if (j < p.hidden) {
+        const float yv = y[j];
+        [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+            if (s < hc) {
+                h[s * p.hidden + j] += inj[s] * yv;
+            }
+        }
+    }
+}

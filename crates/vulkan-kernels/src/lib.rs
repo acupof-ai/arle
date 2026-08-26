@@ -325,6 +325,28 @@ pub enum Kernel {
     /// using DEVICE weights (from `Qwen36RouterTopk`), replacing the host-constant
     /// per-expert scaled-add loop so routing stays on-device.
     Qwen36MoeWeightedAccum,
+    /// Qwen3.8-Flash-Next PLE gate, fused: the two grouped RMSNorms, the
+    /// per-stream dot, the signed-sqrt gate + sigmoid, the broadcast multiply
+    /// and `norm_conv` — eight generic dispatches in one. Emits BOTH the
+    /// un-normed gated value (residual branch) and its `norm_conv` output (conv
+    /// branch); see [`qwen4_ple_gate_params`].
+    Qwen4PleGate,
+    /// Qwen3.8-Flash-Next PLE short conv, fused: dilated depthwise conv
+    /// (kernel 4, dilation 3) over a 9-step ring, SiLU, the ring roll and the
+    /// residual add. See [`qwen4_ple_conv_params`].
+    Qwen4PleConv,
+    /// Qwen3.8-Flash-Next hyper-connection MIX, fused: the `W_up` GEMV, its
+    /// sigmoid, the `* hn` and the cross-stream mean, with the bottleneck's
+    /// `silu(u / hc_count)` folded into the read of binding 2. One workgroup per
+    /// HIDDEN channel, so the `[hc_count*hidden]` mixing gate is never
+    /// materialized and no second pass is needed for the mean. See
+    /// [`qwen4_hc_mix_params`].
+    Qwen4HcMix,
+    /// Qwen3.8-Flash-Next hyper-connection COMBINE, fused: the `W_inject` dots
+    /// and `2*sigmoid(dot/hc_count)`, then the in-place
+    /// `h[s] += inj[s] * y` scatter across all streams. See
+    /// [`qwen4_hc_combine_params`].
+    Qwen4HcCombine,
 }
 
 const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
@@ -424,6 +446,10 @@ impl Kernel {
         Self::Qwen36MoeWeightedAccum,
         Self::Qwen35SsmConv,
         Self::Qwen35GatedDeltaNet,
+        Self::Qwen4PleGate,
+        Self::Qwen4PleConv,
+        Self::Qwen4HcMix,
+        Self::Qwen4HcCombine,
     ];
 
     pub const fn shader_name(self) -> &'static str {
@@ -478,6 +504,10 @@ impl Kernel {
             Kernel::Qwen36RouterTopk => "qwen36_router_topk",
             Kernel::Qwen36RouterGemv => "qwen36_router_gemv",
             Kernel::Qwen36MoeWeightedAccum => "qwen36_moe_weighted_accum",
+            Kernel::Qwen4PleGate => "qwen4_ple_gate",
+            Kernel::Qwen4PleConv => "qwen4_ple_conv",
+            Kernel::Qwen4HcMix => "qwen4_hc_mix",
+            Kernel::Qwen4HcCombine => "qwen4_hc_combine",
         }
     }
 
@@ -522,7 +552,11 @@ impl Kernel {
             | Kernel::Qwen35GatedDeltaNet
             | Kernel::Qwen36RouterTopk
             | Kernel::Qwen36RouterGemv
-            | Kernel::Qwen36MoeWeightedAccum => &[],
+            | Kernel::Qwen36MoeWeightedAccum
+            | Kernel::Qwen4PleGate
+            | Kernel::Qwen4PleConv
+            | Kernel::Qwen4HcMix
+            | Kernel::Qwen4HcCombine => &[],
             // `mul_mmq`'s tile geometry is chosen per call from the matmul shape
             // (see [`MmqSpec::choose`]); there is no single default, and running
             // it with the shader's built-in defaults would silently pick a tile
@@ -1647,6 +1681,66 @@ pub fn rms_norm_dispatch_rows(nrows: u32) -> Dispatch {
     Dispatch::x(nrows.max(1))
 }
 
+/// GROUPED RMSNorm: `ngroups` independent norms of `group_size` elements over
+/// one contiguous `[ngroups * group_size]` vector, each group scaled by its OWN
+/// slice of an equally-wide weight vector. Grid is
+/// [`rms_norm_dispatch_rows`]`(ngroups)`; source and destination are both packed.
+///
+/// This is the shape `Qwen4ExpTextRMSNorm(group_size=hidden_size)` needs —
+/// `hc_norm` over a `hc_count * hidden` hyper-connection residual, and the PLE's
+/// key/query norms. It is NOT what [`rms_norm_params_rows`] does: that one sets
+/// `ne11 = 1`, whose `fastmod(row, ne11)` is always 0, i.e. it BROADCASTS one
+/// weight row over every row. The only difference here is `ne11 = ngroups` with
+/// `nb11 = group_size`, so `src1_idx(0, row, 0, 0) = row * group_size` picks
+/// group `row`'s own gains. Getting this wrong is silent: with a freshly seeded
+/// hyper state all `hc_count` streams are byte-identical copies, so a broadcast
+/// weight and a grouped weight agree exactly until the streams diverge.
+///
+/// ## Caller contract: the weight must arrive PRE-BIASED
+///
+/// `Qwen4ExpTextRMSNorm` applies `x * inv_rms * (1.0 + weight)`, but
+/// `rms_norm.comp` applies the plain `x * inv_rms * weight` and it is vendored
+/// (`vendor/llama.cpp/vulkan-shaders/`) — this crate's build script never edits
+/// that directory. So the `+ 1` is folded ONCE at load: store `1.0 + w` in the
+/// device buffer, exactly as the GGUF converters pre-fold norm scales. The
+/// parameter is zero-initialised in this model, so the fold's own rounding is
+/// bounded by 2^-24 on a gain of ~1.
+pub fn rms_norm_params_grouped(group_size: u32, ngroups: u32, eps: f32) -> KernelParams {
+    let n = group_size;
+    let total = ngroups * n;
+    KernelParams::from_words(vec![
+        total, // ne (total elements)
+        n,
+        ngroups,
+        1,
+        1, // ne00..ne03
+        1,
+        n,
+        total,
+        total, // nb00..nb03 (nb00 = 1 element stride)
+        n,
+        ngroups,
+        1,
+        1, // ne10..ne13 — ne11 = ngroups is THE grouped-vs-broadcast bit
+        1,
+        n,
+        total,
+        total, // nb10..nb13 (nb11 = n: group `row`'s gains start at row*n)
+        n,
+        ngroups,
+        1,
+        1, // ne20..ne23
+        1,
+        n,
+        total,
+        total,         // nb20..nb23
+        0,             // misalign_offsets
+        eps.to_bits(), // param1 (f32 eps)
+        0,             // param2 (f32, unused)
+        0,             // param3 (i32, unused by rms_norm)
+    ])
+}
+
 /// `swiglu.comp` (+ `glu_head.glsl` / `glu_main.glsl`) in SPLIT mode (`mode=2`):
 /// `out[i] = silu(a[i]) * b[i]` over `n` elements with `a` = gate (binding 0),
 /// `b` = up (binding 1), `d` = out (binding 2). The 16-uint push block is
@@ -1903,6 +1997,200 @@ pub fn qwen36_moe_weighted_accum_params(hidden: u32, count: u32, init: bool) -> 
 }
 
 pub fn qwen36_moe_weighted_accum_dispatch(hidden: u32) -> Dispatch {
+    Dispatch::x(hidden.div_ceil(256).max(1))
+}
+
+// Qwen3.8-Flash-Next (`qwen4_exp`) PLE push-constant contracts. The host oracle
+// both kernels are diffed against is `infer_vulkan::qwen4_ple` (`PleLayer`),
+// itself transcribed from `Qwen4ExpTextPLELayer`. Neither half could be a
+// define of a vendored shader: `Qwen4ExpTextRMSNorm` scales by `1.0 + weight`
+// (the parameter is zero-initialised) and normalises in `hidden`-wide GROUPS of
+// a `hc_count * hidden`-wide row, and the conv is dilated. They are fused to
+// this model's sequence rather than written as primitives because decode on
+// this box is dispatch-bound: the naive composition is ~12 dispatches per PLE
+// layer, this pair is 2.
+//
+// The two tensors the pair passes between them are NOT interchangeable. The
+// gate writes `gated` (un-normed, for the residual) and `gated_normed`
+// (`norm_conv`'s output, for the conv); the conv reads both, taps only the
+// normed one and adds only the un-normed one.
+
+/// Push-constant block for `qwen4_ple_gate.comp` = `{hidden, hc_count, seq_len,
+/// eps(f32 bits)}` (4 words). Runs `key_normed = grouped_rmsnorm(key_proj_out)`,
+/// `query_normed = grouped_rmsnorm(hidden_states)`, the per-stream
+/// `dot / sqrt(hidden)`, `sign(g) * sqrt(max(|g|, 1e-6))`, `sigmoid`, the
+/// broadcast multiply against `value_proj_out`, and `norm_conv` — one dispatch.
+///
+/// Bindings (in order): `0 = KeyProj [seq*hc_count*hidden] f32`,
+/// `1 = HiddenIn [seq*hc_count*hidden] f32` (the hyper residual),
+/// `2 = ValueProj [seq*hidden] f32` (no stream axis — one value row gates into
+/// every stream), `3 = NormKeyW [hc_count*hidden] f32`,
+/// `4 = NormQueryW [hc_count*hidden] f32`, `5 = NormConvW [hc_count*hidden]
+/// f32`, `6 = Gated [seq*hc_count*hidden] f32` (write, UN-normed — the residual
+/// branch's tensor), `7 = GatedNormed [seq*hc_count*hidden] f32` (write,
+/// `norm_conv`'s output — the conv branch's tensor).
+///
+/// `hidden` is the RMSNorm group width, so a group is one stream's slice of the
+/// wide row and the norm weights are indexed `stream * hidden + i`.
+pub fn qwen4_ple_gate_params(hidden: u32, hc_count: u32, seq_len: u32, eps: f32) -> KernelParams {
+    KernelParams::from_words(vec![hidden, hc_count, seq_len, eps.to_bits()])
+}
+
+/// Dispatch grid for `qwen4_ple_gate.comp`: ONE workgroup of 256 threads per
+/// (stream, token) — `x = hc_count`, `y = seq_len`. A stream owns exactly one
+/// `hidden`-wide RMSNorm group of every tensor involved, so all four reductions
+/// (two sums of squares, the dot, and the gated sum of squares `norm_conv`
+/// needs) are workgroup-local; lanes stride the group, so `hidden` need not be
+/// a multiple of 256.
+pub fn qwen4_ple_gate_dispatch(hc_count: u32, seq_len: u32) -> Dispatch {
+    Dispatch {
+        x: hc_count.max(1),
+        y: seq_len.max(1),
+        z: 1,
+    }
+}
+
+/// Push-constant block for `qwen4_ple_conv.comp` = `{channels, seq_len,
+/// kernel_size, dilation, ring_pos}` (5 `uint`s). Depthwise dilated conv +
+/// SiLU + ring roll + residual add, one dispatch. With `kernel_size = 4` and
+/// `dilation = 3` the taps are `t-9, t-6, t-3, t`, weighted by
+/// `conv1d[c][0..4]` in that order.
+///
+/// Bindings (in order): `0 = XNormed [seq*channels] f32` (`gated_normed` — the
+/// ONLY tensor the taps and the ring see), `1 = ConvW [channels*kernel_size]
+/// f32` (row-major, channel `c` at `c*kernel_size`), `2 = Ring
+/// [state_len*channels] f32` (read+written; slot-major, `slot*channels + c`),
+/// `3 = Residual [seq*channels] f32` (`gated`, UN-normed), `4 = OutBuf
+/// [seq*channels] f32` = `residual + silu(conv)`.
+///
+/// `ring_pos` names the slot the next row is written into, which is also the
+/// oldest row held, so lag `L` reads `(ring_pos + state_len - L) % state_len`.
+/// A zero-filled ring at `ring_pos = 0` is the reference's zero left-pad at
+/// sequence start. Advance it with [`qwen4_ple_conv_ring_advance`].
+pub fn qwen4_ple_conv_params(
+    channels: u32,
+    seq_len: u32,
+    kernel_size: u32,
+    dilation: u32,
+    ring_pos: u32,
+) -> KernelParams {
+    KernelParams::from_words(vec![channels, seq_len, kernel_size, dilation, ring_pos])
+}
+
+/// `state_len` for `qwen4_ple_conv.comp` = `(kernel_size - 1) * dilation`, i.e.
+/// how many rows the ring holds (9 for this checkpoint). Exposed so a caller
+/// sizes the ring buffer from the same expression the shader indexes it with.
+pub const fn qwen4_ple_conv_state_len(kernel_size: u32, dilation: u32) -> u32 {
+    kernel_size.saturating_sub(1) * dilation
+}
+
+/// The `ring_pos` to pass NEXT, after a dispatch that consumed `seq_len` rows.
+/// The shader writes one row per step and advances by one, so this is a plain
+/// `+ seq_len` modulo the state length — kept here rather than at each call
+/// site because an off-by-one silently reads the wrong lag rather than failing.
+pub const fn qwen4_ple_conv_ring_advance(
+    ring_pos: u32,
+    seq_len: u32,
+    kernel_size: u32,
+    dilation: u32,
+) -> u32 {
+    let state_len = qwen4_ple_conv_state_len(kernel_size, dilation);
+    if state_len == 0 {
+        return 0;
+    }
+    (ring_pos + seq_len % state_len) % state_len
+}
+
+/// Dispatch grid for `qwen4_ple_conv.comp`: `local_size_x = 256`, one
+/// invocation per channel (`gl_GlobalInvocationID.x = c`), so
+/// `ceil(channels/256)` workgroups — 40 for the 10240-wide PLE row. The conv is
+/// fully per-channel, and each lane walks the sequence itself, so the ring
+/// update needs no shared memory or barriers. Tail lanes self-mask on
+/// `c >= channels`.
+pub fn qwen4_ple_conv_dispatch(channels: u32) -> Dispatch {
+    Dispatch::x(channels.div_ceil(256).max(1))
+}
+
+// Qwen3.8-Flash-Next HYPER-CONNECTIONS. One `Qwen4ExpTextGatedResidual` is FOUR
+// dispatches, and the count is the design:
+//
+//   1. `Kernel::RmsNorm`          + [`rms_norm_params_grouped`]        -> hn
+//   2. `Kernel::Qwen36RouterGemv` + [`qwen36_router_gemv_params`]      -> u_raw
+//   3. `Kernel::Qwen4HcMix`       + [`qwen4_hc_mix_params`]            -> x
+//   4. `Kernel::Qwen4HcCombine`   + [`qwen4_hc_combine_params`]        -> h
+//
+// with a `CommandRecorder::barrier()` between each (every step reads the
+// previous step's writes) and ONE submit for the whole site. The naive
+// composition of the same math is ten dispatches; at 97 sites per token and
+// ~3.4us of host recording each, that difference is ~2ms/token of host time on
+// a decode path that is already dispatch-bound. Steps 1 and 2 need no new
+// shader — the grouped norm is the vendored `rms_norm` reached through push
+// constants alone, and the down-projection is the generic f32
+// `qwen36_router_gemv`.
+//
+// The oracle all four are diffed against is `infer_vulkan::qwen4_hc`
+// (`gated_residual` + `inject_block_output`); `tests/device_qwen4_hc.rs` runs
+// the whole sequence against it.
+
+/// Push-constant block for `qwen4_hc_mix.comp` = `{hidden, hc_count,
+/// hc_lowrank}` (3 `uint`s). Bindings (in order): `0 = hn`
+/// [hc_count*hidden] f32 (read), `1 = W_up` [hc_count*hidden, hc_lowrank] f32
+/// row-major (read), `2 = u_raw` [hc_lowrank] f32 (read), `3 = x` [hidden] f32
+/// (write).
+///
+/// **Binding 2 is the RAW `W_down @ hn` dot, not `silu(dot / hc_count)`.** The
+/// activation is applied inside this kernel. Step 2 of the sequence is the
+/// generic `qwen36_router_gemv`, whose only epilogue is a plain sigmoid, and
+/// that shader belongs to the Qwen3.6 MoE lane; rather than spend a fifth
+/// dispatch on a `silu` pass, the scale-then-silu rides along on the read of
+/// `u_raw`, which every workgroup makes anyway. Feeding this kernel an already
+/// activated bottleneck applies silu twice and is not an error the driver can
+/// catch.
+///
+/// `hc_count` must be <= 8 (`HC_MAX` in the shader, which sizes the register
+/// accumulators).
+pub fn qwen4_hc_mix_params(hidden: u32, hc_count: u32, hc_lowrank: u32) -> KernelParams {
+    KernelParams::from_words(vec![hidden, hc_count, hc_lowrank])
+}
+
+/// Dispatch grid for `qwen4_hc_mix.comp`: ONE workgroup (64 lanes = one wave64)
+/// per HIDDEN channel, NOT per output row of `W_up`. A row-per-workgroup grid
+/// would be `hc_count * hidden` workgroups each producing one element of the
+/// mixing gate, which then needs a second dispatch and a [hc_count*hidden]
+/// scratch buffer for the cross-stream mean; this grid lets workgroup `i`
+/// compute all `hc_count` gates for channel `i` and reduce them on the spot.
+pub fn qwen4_hc_mix_dispatch(hidden: u32) -> Dispatch {
+    Dispatch::x(hidden.max(1))
+}
+
+/// Push-constant block for `qwen4_hc_combine.comp` = `{hidden, hc_count}`
+/// (2 `uint`s). Bindings (in order): `0 = hn` [hc_count*hidden] f32 (read),
+/// `1 = W_inject` [hc_count, hc_count*hidden] f32 row-major (read), `2 = h`
+/// [hc_count*hidden] f32 (**read and written, in place**), `3 = y` [hidden] f32
+/// (read — the sublayer's block output).
+///
+/// `hn` and `h` must be DIFFERENT buffers: `hn` is the grouped-RMSNorm output
+/// the injection gate is computed from, `h` is the raw residual the gated block
+/// output accumulates onto (the reference adds onto `hyper_input`, not onto the
+/// norm). Aliasing them lets one workgroup's phase-2 write corrupt another
+/// workgroup's phase-1 read.
+///
+/// `hc_count` must be <= 8 (`HC_MAX` in the shader).
+pub fn qwen4_hc_combine_params(hidden: u32, hc_count: u32) -> KernelParams {
+    KernelParams::from_words(vec![hidden, hc_count])
+}
+
+/// Dispatch grid for `qwen4_hc_combine.comp`: `local_size_x = 256`, one
+/// workgroup per 256 HIDDEN channels (each covering that slice in all
+/// `hc_count` streams) — 10 workgroups at hidden = 2560.
+///
+/// Deliberately small. There is no cross-workgroup sync inside a dispatch, so
+/// every workgroup recomputes the whole phase-1 reduction over `W_inject`
+/// (~160 KB at these shapes) before it may write its slice; the per-CU byte
+/// count is `160 KB + hidden/G` and is flat past a handful of workgroups, while
+/// L2 traffic grows linearly in `G`. A one-element-per-thread grid (40
+/// workgroups) would quadruple that traffic to shave nothing.
+pub fn qwen4_hc_combine_dispatch(hidden: u32) -> Dispatch {
     Dispatch::x(hidden.div_ceil(256).max(1))
 }
 
