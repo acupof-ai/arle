@@ -337,6 +337,8 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         }
     });
     engine_config.kv_disk_limit = serve_args.kv_disk_limit;
+    engine_config.temperature = serve_args.temperature;
+    engine_config.repetition_penalty = serve_args.repetition_penalty;
     infer_api::validate_kv_ssd_config(&engine_config).map_err(|err| format!("{err:#}"))?;
     // Lower MTP spec into the engine config at the CLI level so BOTH paths carry the
     // draft depth: the multiproc coordinator serializes `config.options.engine_config`
