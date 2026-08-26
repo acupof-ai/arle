@@ -118,17 +118,20 @@ impl MetalSlotState {
         }
     }
 
-    /// Append captured rows to the rolling target-hidden history (last 64).
+    /// Append captured rows to the rolling target-hidden history, keeping the
+    /// last [`DFLASH_TARGET_HIDDEN_ROWS`]. An empty history takes the new rows
+    /// as-is — the old `unwrap_or_else(clone)` concatenated them with
+    /// themselves, doubling the first seed.
     pub(super) fn roll_target_hidden(&mut self, new_rows: mlx::MlxArray) {
-        let old = self
-            .dflash_target_hidden
-            .take()
-            .unwrap_or_else(|| new_rows.clone());
-        let combined = mlx::concatenate_axis(&[old, new_rows], 0);
+        let combined = match self.dflash_target_hidden.take() {
+            Some(old) => mlx::concatenate_axis(&[old, new_rows], 0),
+            None => new_rows,
+        };
         let len = combined.shape().first().copied().unwrap_or(0);
-        self.dflash_target_hidden = Some(if len > 64 {
+        let window = DFLASH_TARGET_HIDDEN_ROWS;
+        self.dflash_target_hidden = Some(if len > window {
             let dim = combined.shape().get(1).copied().unwrap_or(0);
-            mlx::slice(&combined, &[len - 64, 0], &[len, dim], &[1, 1])
+            mlx::slice(&combined, &[len - window, 0], &[len, dim], &[1, 1])
         } else {
             combined
         });

@@ -25,6 +25,13 @@ const KV_CACHE_CHUNK: i32 = 256;
 #[cfg(feature = "metal")]
 const DFLASH_DISABLED: u32 = u32::MAX;
 
+/// Rows of target hidden the draft attends over. The draft prepends every row
+/// into its own KV, so this is a per-block cost knob, not just a memory one:
+/// seeding the whole prompt made the first block after prefill cost O(prompt)
+/// (274 ms at 15 k tokens) against ~10 ms for every block after it.
+#[cfg(feature = "metal")]
+const DFLASH_TARGET_HIDDEN_ROWS: i32 = 64;
+
 /// Metal KV-cache storage dtype. The host `MetalKvPool` remains a logical page
 /// allocator; this controls the MLX arrays inside each Metal slot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -935,10 +942,11 @@ impl RealMetalExecutor {
                 slot.dflash_target_hidden = None;
                 slot.dflash_draft_state = None;
             }
-            slot.dflash_target_hidden = Some(match slot.dflash_target_hidden.take() {
-                Some(prev) => mlx::concatenate_axis(&[prev, hidden], 0),
-                None => hidden,
-            });
+            // Same rolling window decode keeps. Prefill used to seed the whole
+            // prompt, so the first draft block prepended 15 k context rows into
+            // the draft KV and cost 274 ms; every later block, already windowed,
+            // costs ~10 ms.
+            slot.roll_target_hidden(hidden);
             if slot.dflash_draft_state.is_none()
                 && let Some(runtime) = self.dflash.as_ref()
             {
