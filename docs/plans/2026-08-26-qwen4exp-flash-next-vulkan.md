@@ -1,7 +1,14 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on the Vulkan lane
 
-Status: active. S0 shipped (`a971fbcb1`). Target box: Radeon 8060S (gfx1151),
-74.43 GiB device-local heap, 63.6 GB OS-visible RAM, 256 GB/s LPDDR5X.
+Status: active. S0-S2 shipped. Target box: Radeon 8060S (gfx1151), 74.43 GiB
+device-local heap, 63.6 GB OS-visible RAM, 256 GB/s LPDDR5X.
+
+| step | commit | what it bought |
+| --- | --- | --- |
+| S0 | `a971fbcb1` | `qwen4_exp` fails by name instead of loading as a 256-expert MoE; router and device-budget guards |
+| S1 | `246e53c7d` | router to 8192 experts (strided), NVFP4 + FP8-E4M3 dtypes |
+| — | `784570820` | the cache cliff, measured rather than quoted |
+| S2 | `650c9b91f` | safetensors reader, name classifier, slab suballocator — **71.314 GiB residency plan over the real checkpoint, 296,475 tensors, zero unclassified** |
 
 Reference implementations, both read rather than inferred from:
 - `transformers` 5.16 `models/qwen4_exp/modeling_qwen4_exp.py` (2707 lines) —
