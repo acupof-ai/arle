@@ -1,14 +1,34 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on the Vulkan lane
 
-Status: active. S0-S2 shipped. Target box: Radeon 8060S (gfx1151), 74.43 GiB
-device-local heap, 63.6 GB OS-visible RAM, 256 GB/s LPDDR5X.
+Status: active. S0-S4 shipped; S5 in flight. Target box: Radeon 8060S
+(gfx1151), 74.43 GiB device-local heap (**70.71 GiB driver budget** -- plan
+against the budget, not the size), 63.6 GB OS-visible RAM, 256 GB/s LPDDR5X.
 
 | step | commit | what it bought |
 | --- | --- | --- |
-| S0 | `a971fbcb1` | `qwen4_exp` fails by name instead of loading as a 256-expert MoE; router and device-budget guards |
-| S1 | `246e53c7d` | router to 8192 experts (strided), NVFP4 + FP8-E4M3 dtypes |
-| — | `784570820` | the cache cliff, measured rather than quoted |
-| S2 | `650c9b91f` | safetensors reader, name classifier, slab suballocator — **71.314 GiB residency plan over the real checkpoint, 296,475 tensors, zero unclassified** |
+| S0 | `5c7cec117` | `qwen4_exp` fails by name instead of loading as a 256-expert MoE; router and device-budget guards |
+| S1 | `c059efe35` | router to 8192 experts (strided), NVFP4 + FP8-E4M3 dtypes |
+| — | `73b71ba0e` | the cache cliff, measured rather than quoted |
+| S2 | `21424b1ab` | safetensors reader, name classifier, slab suballocator — **71.314 GiB residency plan over the real checkpoint, 296,475 tensors, zero unclassified** |
+| S3 | `885e221e5` | NVFP4 expert GEMV (repacked planes, plain-f32 B operand) + host oracles for hyper-connections and PLE |
+| S4 | `e574b5823` | fused HC/PLE kernels: GatedResidual in 4 dispatches, PLE in 2; device tests 2.1e-6 / 3.6e-7 vs the oracles |
+
+(Hashes are post-rebase onto main and will drift again at the next rebase; the
+stage names are the stable key.)
+
+**Adversarial audit, 2026-08-27** (5 auditors + triage over S0-S4): every
+numeric claim checked against a primary source held, including the NVFP4 nibble
+order and the FP8 decoder over all 256 codes. Three landmines sit where S5
+steps, none in shipped output: (1) the 72.00 GiB slab commit exceeds the
+**70.71 GiB driver budget** -- `ensure_fits` checks heap *size*, and the default
+build compiles the dry-run out; (2) the `1 + w` RMSNorm fold is per-family, not
+global -- GatedResidual `hc_norm` folds at load, but `qwen4_ple_gate` applies
+`(1.0 + w)` in-shader so its three norms upload RAW; (3) `norm_topk_prob` is
+absent from config.json and the HF default is `true` -- defaulting it false
+attenuates every MoE output ~2.5x, finite and coherent-looking. Plus five
+tests-that-cannot-fail, worst first: the NVFP4 repack fixture is periodic with
+period 8 so index mutations pass; no test pins any tensor family to a
+shape/dtype.
 
 Reference implementations, both read rather than inferred from:
 - `transformers` 5.16 `models/qwen4_exp/modeling_qwen4_exp.py` (2707 lines) —
@@ -253,10 +273,10 @@ into "measured". Build it before chasing the first token, not after.
 | step | content | size |
 | --- | --- | ---: |
 | S0 ✅ | fail-loud guards: arch variant, router bail, device budget cap | done |
-| S1 | strided router (512), NVFP4 dtype, FP8 E4M3 dequant | 8 h |
-| S2 | safetensors source, slab uploader, mmap'd N-table host embedding | 30 h |
-| S3 | NVFP4 fused-expert GEMV + CPU oracle | 14 h |
-| S4 | hyper-connection scaffold + **per-layer parity harness** | 40 h |
+| S1 ✅ | strided router (512), NVFP4 dtype, FP8 E4M3 dequant | done |
+| S2 ✅ | safetensors source, slab uploader, mmap'd N-table host embedding | done |
+| S3 ✅ | NVFP4 fused-expert GEMV + CPU oracle | done |
+| S4 ✅ | fused hyper-connection + PLE kernels vs host oracles | done |
 | S5 | PLE + n-gram → **first token** (indexer stubbed, ≤2048 ctx) | 24 h |
 | S6 | QSA indexer → contexts >2051 | 40 h |
 | S7 | requantize the non-expert 87%; batched MoE prefill; fuse hyper-connections | 40 h |
