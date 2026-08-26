@@ -482,13 +482,13 @@ impl infer_seam::PrefixReuse for MetalExecutor {
     fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {
-            if real.dflash.is_some() {
-                // Prefix reuse is a restore-boundary promise. DFlash needs
-                // target-hidden features and draft KV in addition to target
-                // K/V plus recurrent state; the current snapshot publishes only
-                // the target restore image, so no DFlash boundary is complete.
-                return 0;
-            }
+            // DFlash rides the same boundary: the snapshot's target K/V plus
+            // recurrent state IS the whole restore image. Its two extra pieces
+            // are rebuilt, not restored — the draft KV is reset at every block
+            // anyway, and the target-hidden store is re-seeded by the tail
+            // prefill that a match always leaves behind (`attach_cap =
+            // prompt_len - 1`). A shorter first-block context only costs
+            // acceptance; the target verify still decides every token.
             return real.page_store.reusable_prefix_blocks(blocks);
         }
         blocks.len()
@@ -927,18 +927,23 @@ impl RealMetalExecutor {
         slot.committed_len = slot.cache_len;
         slot.last_sampled = None;
         if let Some(hidden) = dflash_hidden {
+            // `start_pos == 0` restarts the slot's token stream: drop the prior
+            // turn's rolling hidden and draft KV. A prefix-restored prompt
+            // never sees chunk 0, so seed on first sight instead of only at 0 —
+            // otherwise decode preflights with no draft state and hard-errors.
             if row.start_pos == 0 {
-                slot.dflash_target_hidden = Some(hidden);
-                if let Some(runtime) = self.dflash.as_ref() {
-                    slot.dflash_draft_state = Some(
-                        runtime.new_draft_state(row.total_tokens + runtime.block_size() + 512),
-                    );
-                }
-            } else {
-                slot.dflash_target_hidden = Some(match slot.dflash_target_hidden.take() {
-                    Some(prev) => mlx::concatenate_axis(&[prev, hidden], 0),
-                    None => hidden,
-                });
+                slot.dflash_target_hidden = None;
+                slot.dflash_draft_state = None;
+            }
+            slot.dflash_target_hidden = Some(match slot.dflash_target_hidden.take() {
+                Some(prev) => mlx::concatenate_axis(&[prev, hidden], 0),
+                None => hidden,
+            });
+            if slot.dflash_draft_state.is_none()
+                && let Some(runtime) = self.dflash.as_ref()
+            {
+                slot.dflash_draft_state =
+                    Some(runtime.new_draft_state(row.total_tokens + runtime.block_size() + 512));
             }
         }
         let position = slot.cache_len as u64;
