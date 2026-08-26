@@ -1187,7 +1187,7 @@ impl RealMetalExecutor {
             slot.ensure_session_active(model)?;
             self.weights.set_capture_layers(layer_ids)?;
             let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
-            let logits = model.eager_step_session(&token_arr, slot.cache_len as i32)?;
+            let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
             let captured = self.weights.drain_captured_hidden()?;
             self.weights.clear_capture_layers();
             slot.drain_session(model)?;
