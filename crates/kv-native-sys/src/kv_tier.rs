@@ -605,7 +605,8 @@ impl DiskTier {
             // channel is unbounded, so the worker never waits on us.
             Err(TrySendError::Full(work)) => match tx.send(work) {
                 Ok(()) => {
-                    self.stats.write_ops = self.stats.write_ops.saturating_add(pending.len() as u64);
+                    self.stats.write_ops =
+                        self.stats.write_ops.saturating_add(pending.len() as u64);
                     self.stats.useful_write_bytes = self.stats.useful_write_bytes.saturating_add(
                         pending
                             .iter()

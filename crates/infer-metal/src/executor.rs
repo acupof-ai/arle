@@ -1632,9 +1632,9 @@ impl RealMetalExecutor {
 #[path = "kv_ssd.rs"]
 mod kv_ssd;
 #[cfg(feature = "metal")]
-use kv_ssd::*;
-#[cfg(feature = "metal")]
 pub use kv_ssd::default_t2_budget_bytes as metal_default_t2_budget_bytes;
+#[cfg(feature = "metal")]
+use kv_ssd::*;
 
 #[cfg(feature = "metal")]
 #[path = "slot.rs"]

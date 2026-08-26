@@ -1,6 +1,10 @@
 # LFM2 Metal decode: in-place KV write + eager forward — metal, 2026-08-26
 
 > Status: Confirmed (local M4 Pro 48 GB)
+>
+> Baseline: `c858c0485`, `arle serve --backend metal --model-path
+> LiquidAI/LFM2.5-8B-A1B-MLX-4bit --kv-cache-dtype bf16`, both arms built from
+> the same tree (`git apply -R` for the baseline binary), M4 Pro 48 GB.
 
 ## Context
 
