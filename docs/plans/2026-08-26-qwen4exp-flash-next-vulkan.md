@@ -108,6 +108,52 @@ offload target to an auxiliary GPU. On this box neither host RAM (37.22 GiB
 Vulkan-visible) nor device memory can hold 47.68 GiB, so file-backed is not an
 optimization here, it is the only option.
 
+## On-chip reuse is the reason to prefer Config C
+
+Measured, not quoted (`device_cache_hierarchy`, streaming read+write):
+
+```
+   12 MiB   285.1 GB/s  111% of DRAM peak
+   16 MiB   300.8 GB/s  117%   <- last size served on-chip
+   24 MiB   164.0 GB/s   64%   <- cliff
+ 1024 MiB   207.9 GB/s   81%   <- DRAM asymptote
+```
+
+The kernel reads and writes, so a 16 MiB working set puts ~32 MiB through the
+cache — consistent with a 32 MB MALL, and the first time that number has been
+measured on this box rather than taken from a spec sheet. The 81% asymptote
+independently reproduces the GEMV efficiency measured on the 122B.
+
+This model is unusually well-shaped for that tier, because `hidden = 2560` and
+`moe_intermediate_size = 640` make everything small:
+
+| per layer | BF16 | Q8_0 | Q4_K |
+| --- | ---: | ---: | ---: |
+| hyper-connections | 25.2 MiB | 13.4 | **7.1** |
+| linear_attn | 110.5 MiB | 58.7 | **31.1** |
+| 10 active experts (NVFP4, fixed) | — | — | **26.4** |
+
+At Q4_K every piece is at or under the tier; at BF16 none of them are. That is a
+second, independent argument for Config C beyond the bytes-per-token one — a
+dense 27B layer is 235 MiB and has no such regime at any precision.
+
+**Batching is the multiplier, and it applies to the dense 87%.** Weights read
+once and used B times:
+
+| batch | weight bytes/token | roofline |
+| ---: | ---: | ---: |
+| 1 | 9.95 GB | 25.7 tok/s |
+| 4 | ~3.4 GB | ~76 tok/s |
+| 8 | ~2.2 GB | ~117 tok/s |
+
+The expert half does NOT amortize the same way: at top-10-of-512, a batch of 8
+touches up to 80 distinct experts, so each serves ~1 token and its bytes are
+re-read per token. The reuse comes almost entirely from the non-expert weights,
+which is the same 87% that dominates B=1. This is why MTP earns its 1.41 GiB
+twice over — batched verify turns one weight sweep into N tokens — and why it
+must wait for a batched MoE forward rather than shipping against a sequential
+one.
+
 ## The four novel components
 
 **Hyper-connections** — the structural one. The inter-layer residual is
