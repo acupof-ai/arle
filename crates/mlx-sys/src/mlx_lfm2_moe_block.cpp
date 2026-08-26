@@ -157,9 +157,9 @@ array lfm2_moe_block_forward_dense_cpp(
     // Flatten to 2D [N, H] — take() with multi-dim indices would otherwise
     // produce rank-4 expert weights that break transpose.
     auto x_2d = mlx::core::flatten(x, 0, -2);
-    auto logits = mlx::core::matmul(astype(x_2d, float32), astype(router_w, float32));
+    auto logits = astype(mlx::core::matmul(x_2d, router_w), float32);
     auto s = mlx::core::softmax(logits, /*axis=*/-1);
-    s = s + astype(expert_bias, float32);
+    s = s + expert_bias;
 
     const int kth = num_experts - top_k;
     auto part = mlx::core::argpartition(s, kth, /*axis=*/-1);
@@ -206,9 +206,9 @@ array lfm2_moe_block_forward_cpp(
     }
 
     // Softmax routing in f32 (matches the mlx-lm reference upcast).
-    auto logits = mlx::core::matmul(astype(x, float32), astype(router_w, float32));
+    auto logits = astype(mlx::core::matmul(x, router_w), float32);
     auto s = mlx::core::softmax(logits, /*axis=*/-1);
-    s = s + astype(expert_bias, float32);
+    s = s + expert_bias;
 
     // Top-k via argpartition (the vendored MLX topk returns values only):
     // the last-k slice of the partitioned indices holds the top-k expert ids.
