@@ -295,6 +295,34 @@ pub enum Kernel {
     /// (`lm_head`: 229.5 vs 234.1, inside run-to-run noise). The two differ in
     /// staging cost and in which values survive, not in decode speed.
     GemvBf16,
+    /// The **W4A16** quantized-dense GEMV: `block_q4_K` weights x a **plain
+    /// f32 activation vector** — the specialized float-B `mul_mat_vec_q4_k`
+    /// shader, NOT the int-dot `mul_mat_vecq` family. The distinction is the
+    /// whole point: [`Kernel::GemvQ4K`] is W4A8 (it requantizes the B side to
+    /// 8 bits via [`Kernel::QuantizeQ8_1`]), a different quality contract
+    /// from the plain-f32 activations this checkpoint's dense tier computes.
+    /// **Feeding this kernel a `block_q8_1_x4` buffer as B is silent
+    /// garbage** — the reversed trap from the `mul_mat_vecq` kernels, and
+    /// `device_gemv_q4k_dense.rs` measures the loud number behind that
+    /// sentence.
+    ///
+    /// Same contract as [`Kernel::GemvNvfp4`]/[`Kernel::GemvBf16`]: push
+    /// constants [`gemv_params_f32_b`] (B stride in ELEMENTS), 5 bindings
+    /// `[A, B, D, Fuse0, Fuse1]`, dispatch [`gemv_dispatch`]. A is
+    /// [`quantize_q4_k_from_bf16`] output; `ncols` must be a multiple of
+    /// [`QK_K`] (the shader walks whole super-blocks AND its B reads are
+    /// `data_b_v4` with no tail guard).
+    GemvQ4KDense,
+    /// The **W8A16** rung: `block_q8_0` weights x a plain f32 activation —
+    /// the generic float-B `mul_mat_vec.comp` compiled with `DATA_A_Q8_0`
+    /// (its `dequantize4` exists; the K-quants' does not, which is why Q4_K
+    /// needed the specialized file above). The per-family fallback where
+    /// Q4_K's quality cost is refused or its 256-wide gate fails (the
+    /// 640-wide shared-expert `down_proj`). Same W-A16 contract as
+    /// [`Kernel::GemvQ4KDense`]: [`gemv_params_f32_b`], plain f32 B — NOT
+    /// [`Kernel::GemvQ8_0`], which is the W8A8 int-dot kernel over
+    /// `block_q8_1_x4` activations.
+    GemvQ8_0Dense,
     /// Batched prefill GEMM (`mul_mmq`): `D[n, m] = A[m, k] · Bᵀ[n, k]` with a
     /// quantized `A` and `block_q8_1_x4` `B` — the SAME activation format the
     /// decode GEMVs consume, so one `QuantizeQ8_1` dispatch feeds both. Tile
@@ -483,6 +511,25 @@ const GEMV_DENSE_NUM_ROWS: u32 = 1;
 /// reading past the row. Verified on real 640-wide bytes.
 const SPEC_GEMV_DENSE: &[(u32, u32)] =
     &[(0, GEMV_DENSE_BLOCK_SIZE), (1, GEMV_DENSE_NUM_ROWS), (2, 1)];
+/// `mul_mat_vec_q4_k.comp`'s `BLOCK_SIZE, NUM_ROWS, NUM_COLS` — the W4A16
+/// Q4_K GEMV. Same ids and numbers as [`SPEC_GEMV_NVFP4`], same reason for a
+/// separate constant: only the ids are shared between shaders, and this one's
+/// geometry has its own constraints. `BLOCK_SIZE = 64` is one full 8060S
+/// wave; the shader pins 16 threads to each 256-value super-block
+/// (`it_size = BLOCK_SIZE/16` super-blocks in flight), so `BLOCK_SIZE` must
+/// be a multiple of 16 and `ncols` a multiple of [`QK_K`] — which the
+/// quantizer's own 256 gate already enforces for every A this kernel can be
+/// handed. `NUM_ROWS = 1` makes the grid one workgroup per output row,
+/// consistent with [`gemv_dispatch`]; the shader itself guards a partial last
+/// row group against `p.stride_d`, but at 1 the two never disagree.
+const SPEC_GEMV_Q4K_DENSE: &[(u32, u32)] = &[(0, 64), (1, 1), (2, 1)];
+/// `mul_mat_vec.comp`'s geometry for the W8A16 Q8_0 GEMV. The quantized arm
+/// runs `K_PER_ITER = 8` (one 32-value q8_0 block per two threads per
+/// iteration, B through `data_b_v4`), so `ncols % 8 == 0` — subsumed by the
+/// format's own 32-value blocks. 64 = one full wave, NUM_ROWS = 1 as above;
+/// deliberately not [`SPEC_GEMV_DENSE`], whose 128 was tuned on the
+/// `K_PER_ITER = 4` non-quantized arm and does not transfer untested.
+const SPEC_GEMV_Q8_0_DENSE: &[(u32, u32)] = &[(0, 64), (1, 1), (2, 1)];
 const SPEC_RMS_NORM_MUL: &[(u32, u32)] = &[(1, 1)];
 
 impl Kernel {
@@ -503,6 +550,8 @@ impl Kernel {
         Self::GemvIdNvfp4,
         Self::GemvF16,
         Self::GemvBf16,
+        Self::GemvQ4KDense,
+        Self::GemvQ8_0Dense,
         Self::MmqQ4K,
         Self::MmqQ5K,
         Self::MmqQ6K,
@@ -567,6 +616,8 @@ impl Kernel {
             Kernel::GemvIdNvfp4 => "mul_mat_vec_id_nvfp4",
             Kernel::GemvF16 => "mul_mat_vec_f16",
             Kernel::GemvBf16 => "mul_mat_vec_bf16",
+            Kernel::GemvQ4KDense => "mul_mat_vec_q4_k",
+            Kernel::GemvQ8_0Dense => "mul_mat_vec_q8_0",
             Kernel::MmqQ4K => "mul_mmq_q4_k",
             Kernel::MmqQ5K => "mul_mmq_q5_k",
             Kernel::MmqQ6K => "mul_mmq_q6_k",
@@ -630,6 +681,8 @@ impl Kernel {
             | Kernel::GemvIdMxfp4 => SPEC_GEMV_K_Q8_1,
             Kernel::GemvNvfp4 | Kernel::GemvIdNvfp4 => SPEC_GEMV_NVFP4,
             Kernel::GemvF16 | Kernel::GemvBf16 => SPEC_GEMV_DENSE,
+            Kernel::GemvQ4KDense => SPEC_GEMV_Q4K_DENSE,
+            Kernel::GemvQ8_0Dense => SPEC_GEMV_Q8_0_DENSE,
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
@@ -2767,6 +2820,30 @@ macro_rules! launcher_fns {
             $call_params(Kernel::GemvQ8_0, ctx, buffers, dispatch, params)
         }
 
+        // The W4A16 / W8A16 quantized-dense GEMVs. Same 5-binding order as
+        // above, but B is a PLAIN f32 activation vector and the push block is
+        // [`gemv_params_f32_b`] (stride in ELEMENTS) — the float-B
+        // `mul_mat_vec` family, not `mul_mat_vecq`. Handing these a
+        // `block_q8_1_x4` buffer as B is the reversed trap: silent garbage,
+        // measured loudly in `device_gemv_q4k_dense.rs`.
+        pub fn q4_k_dense_gemv_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvQ4KDense, ctx, buffers, dispatch, params)
+        }
+
+        pub fn q8_0_dense_gemv_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvQ8_0Dense, ctx, buffers, dispatch, params)
+        }
+
         // Fused MoE expert GEMV (`mul_mat_vec_id`). Buffer order is the plain
         // GEMV's 5 + a 6th IDS binding: [A stacked-expert weights, B q8_1_x4
         // activation, D f32 dst (n_experts*nrows rows), Fuse0, Fuse1, IDS (i32
@@ -3740,6 +3817,631 @@ mod q8_0_quantize_tests {
         assert_eq!(
             dst, [0u8; BLOCK_Q8_0_BYTES],
             "sub-1e-37 block must be all zero"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K load-time quantization (the dense-tier Q4 flip)
+// ---------------------------------------------------------------------------
+
+/// ggml's `nearest_int` (`vendor/llama.cpp/ggml-quants.c:563-568`): add
+/// `1.5 * 2^23` and read the low mantissa bits back out. The f32 ADDITION does
+/// the rounding, so ties go to EVEN — `nearest_int(2.5) == 2` — the opposite
+/// tie policy from the `roundf` (half away from zero) that
+/// [`quantize_q8_0_from_bf16`] matches. Every rounding in the Q4_K quantizer
+/// goes through this function because every rounding in the C reference does;
+/// swapping in `f32::round` is the corresponding silent mutation here and
+/// `q4_k_rounding_is_nearest_even_not_half_away` exists to catch it.
+#[inline]
+fn nearest_int(fval: f32) -> i32 {
+    // Same domain contract as the C assert; every caller in this file feeds
+    // magnitudes bounded by 63-ish (scale packing) or 16-ish (value grids).
+    debug_assert!(fval.abs() <= 4_194_303.0, "nearest_int domain: {fval}");
+    let val = fval + 12_582_912.0;
+    ((val.to_bits() & 0x007f_ffff) as i32) - 0x0040_0000
+}
+
+/// Exact IEEE binary16 -> f32 (`GGML_FP16_TO_FP32`). Every finite f16 value is
+/// exactly representable in f32, so this is a re-encoding, not a rounding —
+/// which is why the reference can afford to re-quantize values against the
+/// ROUND-TRIPPED scale (`quantize_row_q4_K_ref` does exactly that) and this
+/// port computes the identical grid.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exp = (bits >> 10) & 0x1F;
+    let man = u32::from(bits & 0x3FF);
+    let magnitude: f32 = match exp {
+        // Subnormal or zero: man * 2^-24, exact in f32 (man <= 1023).
+        0 => man as f32 * 2.0f32.powi(-24),
+        0x1F => f32::from_bits(0x7F80_0000 | (man << 13)), // Inf / NaN
+        e => f32::from_bits((u32::from(e) + 112) << 23 | man << 13),
+    };
+    f32::from_bits(sign | magnitude.to_bits())
+}
+
+/// `make_qkx2_quants` (`vendor/llama.cpp/ggml-quants.c:741-820`): the weighted
+/// scale/min search behind every k-quant with a min term. Seed `l_out` from
+/// the naive `[min, max]` grid, then walk `nstep + 1` candidate inverse scales
+/// (`(rmin + rdelta*is + nmax) / (max - min)`), solve the 2x2 weighted
+/// least-squares system for `(scale, min)` at each, and keep the candidate
+/// with the lowest weighted squared reconstruction error. Ported at the fixed
+/// `use_mad = false` the Q4_K call site passes (ggml-quants.c:1418, squared
+/// error); the `use_mad = true` branch belongs to Q2_K, which has no CPU
+/// quantizer here.
+///
+/// Arithmetic is f32 in the C statement order (Rust never contracts to FMA),
+/// so the search visits the same candidates and accepts them on the same
+/// comparisons. The one divergence: where `nmax/(max - min)` overflows f32
+/// (a sub-block whose whole range is below ~4.4e-38) the C reference runs Inf
+/// through `nearest_int` — formally UB — and this port takes a defined path
+/// to the byte-identical result (see the guards inline).
+///
+/// Returns `(scale, the_min)`; `the_min` is `-min`, i.e. >= 0.
+fn make_qkx2_quants(
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l_out: &mut [u8],
+    laux: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+) -> (f32, f32) {
+    let n = x.len();
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        l_out[..n].fill(0);
+        return (0.0, -min);
+    }
+    let mut iscale = nmax as f32 / (max - min);
+    if !iscale.is_finite() {
+        // `max - min` below ~4.4e-38 (an all-subnormal sub-block): the C
+        // reference feeds Inf through `nearest_int` here — UB via the
+        // magic-number trick, though in practice L clamps to 0 and
+        // `scale = 1/Inf = 0`. Take the defined path to those same values;
+        // the super-block's f16 scale rounds to 0 for this whole band anyway,
+        // so the packed bytes decode identically.
+        l_out[..n].fill(0);
+        return (0.0, -min);
+    }
+    let mut scale = 1.0 / iscale;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let l = nearest_int(iscale * (x[i] - min));
+        l_out[i] = l.clamp(0, nmax) as u8;
+        let diff = scale * f32::from(l_out[i]) + min - x[i];
+        best_error += weights[i] * (diff * diff);
+    }
+    if nstep < 1 {
+        return (scale, -min);
+    }
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        if !iscale.is_finite() {
+            // The sliver where the seed's 15/(max-min) fits in f32 but a
+            // candidate's up-to-16/(max-min) does not; C hits the same UB as
+            // above and in practice zeroes Laux, making det = 0 — a skip.
+            continue;
+        }
+        let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let l = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+            laux[i] = l as u8;
+            let (w, lf) = (weights[i], l as f32);
+            sum_l += w * lf;
+            sum_l2 += w * lf * lf;
+            sum_xl += w * lf * x[i];
+        }
+        let det = sum_w * sum_l2 - sum_l * sum_l;
+        if det > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / det;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = this_scale * f32::from(laux[i]) + this_min - x[i];
+                cur_error += weights[i] * (diff * diff);
+            }
+            if cur_error < best_error {
+                l_out[..n].copy_from_slice(&laux[..n]);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    (scale, -min)
+}
+
+/// `get_scale_min_k4` (`vendor/llama.cpp/ggml-quants.c:822-829`): unpack the
+/// `j`-th 6-bit (sub-scale, sub-min) pair from the 12 packed scale bytes.
+/// Blocks 0-3 store their low 6 bits whole in bytes `j`/`j+4`; blocks 4-7
+/// split across a low nibble in bytes 8-11 and the high 2 bits of bytes 0-7.
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Load-time CPU quantizer for the dense-tier Q4_K flip: one `[nrows, ncols]`
+/// BF16 weight matrix (checkpoint bytes, straight off the mmap) -> ggml
+/// `block_q4_K` (144 B per 256-value super-block: 2 f16 super-scales + 12 B of
+/// packed 6-bit sub-scales/mins + 128 nibble bytes), the format
+/// [`Kernel::GemvQ4KDense`] reads as its A operand. 2 B/elem becomes 0.5625
+/// B/elem — 3.56x fewer bytes than BF16 and 1.89x fewer than Q8_0 for every
+/// tensor flipped.
+///
+/// ## The reference matched — `vendor/llama.cpp/ggml-quants.c`
+///
+/// `quantize_row_q4_K_ref` (:1399-1470), statement for statement:
+///
+/// - per 32-value sub-block, importance weights `w[l] = av_x + |x[l]|` with
+///   `av_x = sqrt(sum(x^2)/32)` (:1414-1418), then [`make_qkx2_quants`]
+///   (:1418, `nmax 15, rmin -1.0, rdelta 0.1, nstep 20, use_mad false`) —
+///   the iterative weighted least-squares search for (sub-scale, sub-min);
+/// - 6-bit quantization of the eight sub-scales/mins against
+///   `inv_scale = 63/max_scale`, `inv_min = 63/max_min`, packed by the
+///   split-byte scheme of :1436-1444 ([`get_scale_min_k4`] is its inverse);
+/// - super-scales `d = f16(max_scale/63)`, `dmin = f16(max_min/63)` via
+///   round-to-nearest-even ([`f32_to_f16_rne`], :1445-1446);
+/// - every value RE-quantized against the round-tripped grid
+///   `l = nearest_int((x + dmin*m) / (d*sc))`, clamped to `0..=15`
+///   (:1448-1459) — a sub-block whose effective `d*sc` is 0 keeps the L
+///   values from the search, exactly as the C `continue` does;
+/// - nibble packing: within each 64-value group, element `k` is the LOW
+///   nibble of byte `k` and element `k+32` the HIGH nibble (:1462-1466).
+///
+/// Every rounding goes through [`nearest_int`] (ties to EVEN — NOT the
+/// half-away `roundf` of the Q8_0 path). The bf16 -> f32 widening is exact,
+/// so quantizing from the mmap bytes and from a hypothetical f32 staging copy
+/// are the same computation.
+///
+/// ## Divergences from the C reference — refusing garbage, not re-rounding it
+///
+/// - A non-finite input value is an ERROR naming its row/col, same policy as
+///   [`quantize_q8_0_from_bf16`].
+/// - A super-block scale so large that `f16(max_scale/63)` would round to
+///   infinity is an error; ggml stores the Inf and every dot product through
+///   the block is poisoned.
+/// - Where `63/max_scale` (or `63/max_min`) overflows f32 — `max_scale` below
+///   ~1.9e-37, i.e. an all-subnormal super-block — the C reference feeds Inf
+///   into `nearest_int`, which is UB through the magic-number trick. This
+///   port uses `inv = 0` there (sub-scales quantize to 0), and the block
+///   decodes IDENTICALLY because `f16(max_scale/63)` is already 0 for the
+///   whole band: `d = 0` zeroes every dequantized value either way.
+///
+/// ## The width constraint, against this model's dense tier
+///
+/// `ncols` must be a positive multiple of [`QK_K`] (256). Of
+/// Qwen3.8-Flash-Next's dense activation widths: 2560 (linattn in_proj_qkv,
+/// full-attn q/k/v_proj, shared-expert gate/up, lm_head) and 6144 (linattn
+/// out_proj, full-attn o_proj) both qualify; 640 (shared-expert down_proj)
+/// does NOT — a 640-wide row is 2.5 super-blocks — so that family stays on
+/// Q8_0 (640 = 20 q8_0 blocks) or BF16. This function refuses it rather than
+/// padding, because a padded row stride is a layout the GEMV was never told
+/// about.
+///
+/// ## The B-operand contract — W4A16, and loudly so
+///
+/// The dense-tier consumer of these bytes is [`Kernel::GemvQ4KDense`]: the
+/// float-B `mul_mat_vec` family, so B is the PLAIN f32 activation vector the
+/// forward already has, push constants are [`gemv_params_f32_b`] (stride in
+/// ELEMENTS), and no [`Kernel::QuantizeQ8_1`] dispatch exists anywhere on
+/// the path — only the weights are quantized (W4A16). The same bytes are
+/// also readable by [`Kernel::GemvQ4K`] (`mul_mat_vecq`, W4A8), but that
+/// kernel additionally requantizes the ACTIVATIONS to 8 bits, a quality
+/// contract this model's dense tier deliberately does not take. The two B
+/// formats are mutually silent garbage in both directions —
+/// `device_gemv_q4k_dense.rs::q4_k_dense_gemv_mutations_fail_loudly`
+/// measures the `block_q8_1_x4`-as-f32-B direction for these kernels.
+///
+/// Rows are self-contained, so a caller may slice by row range exactly as the
+/// Q8_0 doc describes (the parallel load in the device harness does).
+///
+/// # Errors
+/// `ncols` not a positive multiple of [`QK_K`]; `src`/`dst` not exactly the
+/// sizes `[nrows, ncols]` implies; a non-finite input value (reported with
+/// its row and column); a super-block whose f16 super-scale would be Inf.
+pub fn quantize_q4_k_from_bf16(
+    src: &[u8],
+    nrows: usize,
+    ncols: usize,
+    dst: &mut [u8],
+) -> Result<()> {
+    let Some(row_bytes) = q4_k_row_bytes(ncols) else {
+        return Err(KernelError::Runtime(format!(
+            "q4_k quantize: ncols {ncols} is not a positive multiple of {QK_K} \
+             (a {ncols}-wide row is {} super-blocks) — keep this tensor Q8_0 or BF16",
+            ncols as f64 / QK_K as f64
+        )));
+    };
+    for (label, got, want) in [
+        ("source", src.len(), nrows * ncols * 2),
+        ("destination", dst.len(), nrows * row_bytes),
+    ] {
+        if got != want {
+            return Err(KernelError::Runtime(format!(
+                "q4_k quantize: {label} is {got} B, expected {want} B for [{nrows}, {ncols}] bf16"
+            )));
+        }
+    }
+
+    let mut vals = [0f32; QK_K];
+    let mut l_full = [0u8; QK_K];
+    let mut laux = [0u8; 32];
+    let mut weights = [0f32; 32];
+    let mut scales = [0f32; QK_K / 32];
+    let mut mins = [0f32; QK_K / 32];
+
+    for (block_idx, (src_block, dst_block)) in src
+        .chunks_exact(QK_K * 2)
+        .zip(dst.chunks_exact_mut(BLOCK_Q4_K_BYTES))
+        .enumerate()
+    {
+        // bf16 -> f32 is exact: bf16 is the top half of the f32 bit pattern.
+        for (j, (v, c)) in vals.iter_mut().zip(src_block.chunks_exact(2)).enumerate() {
+            *v = f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16);
+            if !v.is_finite() {
+                let flat = block_idx * QK_K + j;
+                return Err(KernelError::Runtime(format!(
+                    "q4_k quantize: non-finite weight {v} at row {} col {} — this \
+                     tensor must not be quantized",
+                    flat / ncols,
+                    flat % ncols
+                )));
+            }
+        }
+
+        // :1410-1427 — per-sub-block weighted scale/min search.
+        let mut max_scale = 0f32;
+        let mut max_min = 0f32;
+        for j in 0..QK_K / 32 {
+            let xb = &vals[32 * j..32 * (j + 1)];
+            let mut sum_x2 = 0f32;
+            for v in xb {
+                sum_x2 += v * v;
+            }
+            let av_x = (sum_x2 / 32.0).sqrt();
+            for (w, v) in weights.iter_mut().zip(xb) {
+                *w = av_x + v.abs();
+            }
+            let (sc, mn) = make_qkx2_quants(
+                15,
+                xb,
+                &weights,
+                &mut l_full[32 * j..32 * (j + 1)],
+                &mut laux,
+                -1.0,
+                0.1,
+                20,
+            );
+            scales[j] = sc;
+            mins[j] = mn;
+            if sc > max_scale {
+                max_scale = sc;
+            }
+            if mn > max_min {
+                max_min = mn;
+            }
+        }
+
+        // :1429-1444 — 6-bit sub-scales/mins against the two super-scales.
+        // The `is_finite` guards are the all-subnormal divergence documented
+        // above; `nearest_int(..) as u8` reproduces C's `(uint8_t)` wrap
+        // before the MIN(63, ..) clamp.
+        let inv_scale = if max_scale > 0.0 {
+            let inv = 63.0 / max_scale;
+            if inv.is_finite() { inv } else { 0.0 }
+        } else {
+            0.0
+        };
+        let inv_min = if max_min > 0.0 {
+            let inv = 63.0 / max_min;
+            if inv.is_finite() { inv } else { 0.0 }
+        } else {
+            0.0
+        };
+        let (dm_bytes, rest) = dst_block.split_at_mut(4);
+        let (packed_scales, qs) = rest.split_at_mut(12);
+        packed_scales.fill(0);
+        for j in 0..QK_K / 32 {
+            let ls = (nearest_int(inv_scale * scales[j]) as u8).min(63);
+            let lm = (nearest_int(inv_min * mins[j]) as u8).min(63);
+            if j < 4 {
+                packed_scales[j] = ls;
+                packed_scales[j + 4] = lm;
+            } else {
+                packed_scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                packed_scales[j - 4] |= (ls >> 4) << 6;
+                packed_scales[j] |= (lm >> 4) << 6;
+            }
+        }
+        let d_bits = f32_to_f16_rne(max_scale / 63.0);
+        let dmin_bits = f32_to_f16_rne(max_min / 63.0);
+        for (what, val, bits) in [("scale", max_scale, d_bits), ("min", max_min, dmin_bits)] {
+            if bits & 0x7C00 == 0x7C00 {
+                return Err(KernelError::Runtime(format!(
+                    "q4_k quantize: super-block {block_idx} max {what} {val} makes \
+                     the f16 super-scale infinite — this tensor must not be quantized"
+                )));
+            }
+        }
+        dm_bytes[..2].copy_from_slice(&d_bits.to_le_bytes());
+        dm_bytes[2..].copy_from_slice(&dmin_bits.to_le_bytes());
+
+        // :1448-1459 — re-quantize every value against the ROUND-TRIPPED
+        // grid (f16 super-scale x 6-bit sub-scale), because that grid is the
+        // one the dequantizer will use.
+        let d_f = f16_bits_to_f32(d_bits);
+        let dmin_f = f16_bits_to_f32(dmin_bits);
+        for j in 0..QK_K / 32 {
+            let (sc, m) = get_scale_min_k4(j, packed_scales);
+            let d = d_f * f32::from(sc);
+            if d == 0.0 {
+                continue;
+            }
+            let dm = dmin_f * f32::from(m);
+            for (lv, v) in l_full[32 * j..32 * (j + 1)]
+                .iter_mut()
+                .zip(&vals[32 * j..32 * (j + 1)])
+            {
+                *lv = nearest_int((v + dm) / d).clamp(0, 15) as u8;
+            }
+        }
+
+        // :1462-1466 — nibble packing, low nibble = first half of each
+        // 64-value group, high nibble = second half.
+        for (grp, dst32) in l_full.chunks_exact(64).zip(qs.chunks_exact_mut(32)) {
+            for (b, (lo, hi)) in dst32.iter_mut().zip(grp[..32].iter().zip(&grp[32..])) {
+                *b = lo | (hi << 4);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod q4_k_quantize_tests {
+    use super::{
+        BLOCK_Q4_K_BYTES, QK_K, f16_bits_to_f32, get_scale_min_k4, nearest_int,
+        quantize_q4_k_from_bf16,
+    };
+    use infer_gguf::dequant::dequantize_row_q4_k;
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        // Truncate f32 -> bf16. Every fixture value below is exactly
+        // representable in bf16, so truncation is exact for them.
+        values
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    /// The tie policy is ggml's `nearest_int` — round to nearest, ties to
+    /// EVEN — not the half-away `roundf` the Q8_0 quantizer matches. The .5
+    /// cases are where the three plausible roundings part:
+    ///   nearest even (ggml k-quants):  2.5 ->  2, -2.5 -> -2, 0.5 -> 0
+    ///   half away (ggml q8_0):         2.5 ->  3, -2.5 -> -3, 0.5 -> 1
+    ///   truncation:                    2.5 ->  2, -2.5 -> -2, 1.7 -> 1
+    /// Mutating [`nearest_int`] to `f32::round` fails the .5 rows; mutating
+    /// it to `trunc` fails the 1.7 row.
+    #[test]
+    fn q4_k_rounding_is_nearest_even_not_half_away() {
+        for (v, want) in [
+            (2.5f32, 2),
+            (-2.5, -2),
+            (0.5, 0),
+            (-0.5, 0),
+            (1.5, 2),
+            (-1.5, -2),
+            (3.5, 4),
+            (1.7, 2),
+            (-1.7, -2),
+            (14.49, 14),
+            (62.5, 62),
+            (63.5, 64),
+        ] {
+            assert_eq!(
+                nearest_int(v),
+                want,
+                "nearest_int({v}) must follow the magic-number RNE trick"
+            );
+        }
+    }
+
+    /// A super-block built so the reference computation is EXACT end to end,
+    /// making all 144 output bytes hand-computable — the layout pin.
+    ///
+    /// Values are `64 * pat(i)` with `pat(i) = (7*i + i/32 + 3) % 16`. Every
+    /// value is bf16-exact (4-bit pattern times a power of two), each
+    /// 32-value sub-block covers all of 0..=15 (7 is coprime to 16), and the
+    /// seed grid `iscale = 15/960 = 1/64` is a power of two, so the seed
+    /// reconstructs every value exactly: `best_error == 0.0`, no search
+    /// candidate can be accepted (`cur_error < 0` is impossible), and the
+    /// sub-block scale is exactly 64.0 with min exactly 0. From there every
+    /// stored field is forced: `ls = nearest_int(63/64 * 64) = 63` and
+    /// `lm = 0` for all 8 sub-blocks, `d = f16_rne(64/63) = 1.015625`
+    /// (0x3C10), `dmin = 0`, and the re-quantize pass reproduces
+    /// `L[i] = pat(i)` exactly (`nearest_int(1.000244 * p)` = p for p <= 15).
+    /// The `i/32` term makes `pat` differ between an element and its partner
+    /// 32 positions later, so a swapped low/high nibble, a wrong qs offset, a
+    /// swapped d/dmin, or any scale mis-pack changes bytes this test compares
+    /// literally. (63 instead of 64 is the tempting multiplier — d would be
+    /// exactly 1.0 — but 63*15 = 945 needs 10 mantissa bits and is NOT
+    /// bf16-representable, which silently breaks the exact fit.)
+    #[test]
+    fn q4_k_exact_fit_block_is_bit_predictable() {
+        let pat = |i: usize| -> u8 { ((7 * i + i / 32 + 3) % 16) as u8 };
+        let values: Vec<f32> = (0..QK_K).map(|i| 64.0 * f32::from(pat(i))).collect();
+        let src = bf16_bytes(&values);
+        let mut block = [0u8; BLOCK_Q4_K_BYTES];
+        quantize_q4_k_from_bf16(&src, 1, QK_K, &mut block).expect("quantize fixture");
+
+        assert_eq!(
+            u16::from_le_bytes([block[0], block[1]]),
+            0x3C10,
+            "super-scale d must be f16_rne(64/63) = 1.015625"
+        );
+        assert_eq!(
+            u16::from_le_bytes([block[2], block[3]]),
+            0,
+            "super-min dmin must be exactly 0"
+        );
+        // ls = 63 everywhere, lm = 0 everywhere: bytes 0-3 carry a full
+        // 6-bit 63 plus the (63 >> 4) = 3 high bits of blocks 4-7 -> 0xFF;
+        // bytes 4-7 carry lm = 0 (their high bits stay 0 likewise); bytes
+        // 8-11 carry (63 & 0xF) | (0 << 4) = 0x0F.
+        assert_eq!(
+            &block[4..16],
+            &[255, 255, 255, 255, 0, 0, 0, 0, 0x0F, 0x0F, 0x0F, 0x0F],
+            "packed 6-bit scales/mins"
+        );
+        // Nibble packing: within each 64-value group, element k is the low
+        // nibble of byte k and element k+32 the high nibble.
+        for g in 0..4 {
+            for k in 0..32 {
+                let want = pat(64 * g + k) | (pat(64 * g + k + 32) << 4);
+                assert_eq!(block[16 + 32 * g + k], want, "qs byte {k} of 64-group {g}");
+            }
+        }
+        // And the independent dequantizer reads back exactly the predicted
+        // grid: d1 = 1.015625 * 63 = 63.984375 (exact in f32), value =
+        // 63.984375 * pat(i) - 0 — every step exact, so `==`, not "close".
+        let dq = dequantize_row_q4_k(&block, QK_K).expect("dequant");
+        for (i, got) in dq.iter().enumerate() {
+            let want = 63.984375f32 * f32::from(pat(i));
+            assert_eq!(*got, want, "value {i} must land on the predicted grid");
+        }
+    }
+
+    /// Reconstruction on random bf16 data, read back through `infer_gguf`'s
+    /// independent `block_q4_K` dequantizer: every value within one effective
+    /// sub-block lsb (`d * sc`) of its input, plus room for the 6-bit min.
+    /// The re-quantize-against-the-round-tripped-grid step is what keeps this
+    /// bound tight; packing bugs blow it up by orders of magnitude. Worst
+    /// measured over these 500 super-blocks (magnitudes across 4 decades) is
+    /// 0.923 lsb — slightly past the naive 0.5 + rounding because a 6-bit
+    /// sub-scale that rounds DOWN leaves the grid maximum below the block
+    /// maximum, and the clamp to 15 eats the difference. 1.25 keeps ~35%
+    /// headroom while any layout bug (multiple lsb) still fails loudly.
+    #[test]
+    fn q4_k_roundtrip_reconstruction_stays_within_measured_lsb_bound() {
+        const BOUND: f64 = 1.25;
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut rng = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 32) as u32
+        };
+        let mut worst = 0f64;
+        for case in 0..500 {
+            let scale = 10f32.powi((case % 4) - 2);
+            let values: Vec<f32> = (0..QK_K)
+                .map(|_| {
+                    let unit = (f64::from(rng()) / f64::from(u32::MAX)) as f32 * 2.0 - 1.0;
+                    // bf16-representable by construction (truncate).
+                    f32::from_bits((unit * scale).to_bits() & 0xFFFF_0000)
+                })
+                .collect();
+            let src = bf16_bytes(&values);
+            let mut block = [0u8; BLOCK_Q4_K_BYTES];
+            quantize_q4_k_from_bf16(&src, 1, QK_K, &mut block).expect("quantize");
+            let dq = dequantize_row_q4_k(&block, QK_K).expect("dequant");
+
+            let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            for j in 0..QK_K / 32 {
+                let (sc, _m) = get_scale_min_k4(j, &block[4..16]);
+                let lsb = f64::from(d) * f64::from(sc);
+                if lsb == 0.0 {
+                    continue;
+                }
+                for i in 32 * j..32 * (j + 1) {
+                    let err = (f64::from(values[i]) - f64::from(dq[i])).abs() / lsb;
+                    worst = worst.max(err);
+                    assert!(
+                        err <= BOUND,
+                        "case {case} value {i}: {} dequantizes to {}, {err:.3} lsb away \
+                         (lsb {lsb:.3e})",
+                        values[i],
+                        dq[i]
+                    );
+                }
+            }
+        }
+        eprintln!("q4_k roundtrip worst error: {worst:.3} effective lsb");
+    }
+
+    #[test]
+    fn q4_k_quantize_refuses_bad_shapes_and_non_finite_input() {
+        let src = bf16_bytes(&[1.0f32; QK_K]);
+        let mut dst = [0u8; BLOCK_Q4_K_BYTES];
+        // 640 is the model's shared-expert down_proj width: 2.5 super-blocks.
+        // The quantizer must refuse it, which is what keeps that family Q8_0.
+        let mut dst640 = vec![0u8; 640 / QK_K * BLOCK_Q4_K_BYTES + 1];
+        let src640 = bf16_bytes(&[1.0f32; 640]);
+        let err = quantize_q4_k_from_bf16(&src640, 1, 640, &mut dst640)
+            .expect_err("640 cols must be refused");
+        assert!(
+            err.to_string().contains("2.5 super-blocks"),
+            "error must say why 640 fails: {err}"
+        );
+        // Mis-sized buffers: refused, not truncated.
+        assert!(quantize_q4_k_from_bf16(&src[..src.len() - 2], 1, QK_K, &mut dst).is_err());
+        assert!(quantize_q4_k_from_bf16(&src, 1, QK_K, &mut dst[..BLOCK_Q4_K_BYTES - 1]).is_err());
+
+        // A NaN weight names its position instead of poisoning the scale.
+        let mut values = [1.0f32; QK_K];
+        values[300 % QK_K] = f32::NAN;
+        let err = quantize_q4_k_from_bf16(&bf16_bytes(&values), 1, QK_K, &mut dst)
+            .expect_err("NaN input must be refused");
+        assert!(
+            err.to_string().contains("col 44"),
+            "error must name the column: {err}"
+        );
+
+        // The all-subnormal band (63/max_scale overflows f32) decodes to
+        // zero through the inv = 0 divergence instead of C's UB.
+        let mut tiny = [0f32; QK_K];
+        for (i, v) in tiny.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 1.0e-40 } else { -1.0e-40 };
+        }
+        quantize_q4_k_from_bf16(&bf16_bytes(&tiny), 1, QK_K, &mut dst).expect("tiny block");
+        assert_eq!(
+            u16::from_le_bytes([dst[0], dst[1]]),
+            0,
+            "sub-1e-37 super-scale must store d = 0"
+        );
+        let dq = dequantize_row_q4_k(&dst, QK_K).expect("dequant tiny");
+        assert!(
+            dq.iter().all(|v| *v == 0.0),
+            "sub-1e-37 block must decode to exactly zero"
         );
     }
 }

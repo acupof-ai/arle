@@ -132,6 +132,13 @@ macro_rules! dense_gemv_defines {
 
 const DENSE_GEMV_DEFINES_F16: &[(&str, &str)] = dense_gemv_defines!("DATA_A_F16");
 const DENSE_GEMV_DEFINES_BF16: &[(&str, &str)] = dense_gemv_defines!("DATA_A_BF16");
+/// The W8A16 rung of the dense tier: Q8_0 weights x a PLAIN f32 activation
+/// through the same float-B `mul_mat_vec.comp` — `dequant_funcs.glsl:122`
+/// already carries Q8_0's `dequantize4`, so unlike Q4_K (below) this needs no
+/// new vendored file, only a define. NOT `mul_mat_vecq_q8_0`, which is W4A8/
+/// W8A8: it quantizes the activations to 8 bits (`block_q8_1_x4` B), a
+/// different quality contract from the checkpoint's plain-f32 activations.
+const DENSE_GEMV_DEFINES_Q8_0: &[(&str, &str)] = dense_gemv_defines!("DATA_A_Q8_0");
 
 const VENDORED: &[ShaderSpec] = &[
     ShaderSpec {
@@ -362,6 +369,45 @@ const VENDORED: &[ShaderSpec] = &[
         name: "mul_mat_vec_bf16",
         source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
         defines: DENSE_GEMV_DEFINES_BF16,
+    },
+    // The W4A16 arm of the dense-tier flip: Q4_K weights x a PLAIN f32
+    // activation vector. This is deliberately NOT `mul_mat_vecq_q4_k` (that
+    // one is W4A8 — it takes `block_q8_1_x4` activations, i.e. the B side is
+    // requantized to 8 bits, a quality contract this checkpoint's dense tier
+    // was never signed up for). And it CANNOT ride the generic
+    // `mul_mat_vec.comp` either: the quantized arm there is `K_PER_ITER 8`,
+    // which demands a `dequantize4`, and the K-quants only carry the vec2
+    // `dequantize` (`dequant_funcs.glsl:600`) — a compile error, not a
+    // performance choice. Upstream's answer is this specialized per-superblock
+    // shader; `mul_mat_vec_q4_k.comp` is vendored VERBATIM from
+    // ggml-org/llama.cpp (tree `llama.cpp-claude-vulkan-ryzen-ai-optimization-
+    // Sl23N`, `ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp`),
+    // joining the same-family `mul_mat_vec_q2_k.comp` already here. It reads
+    // `p.stride_d` as its row bound and B through `data_b_v4`, 16 threads per
+    // 256-value super-block — see `SPEC_GEMV_Q4K_DENSE` in lib.rs for the
+    // geometry consequences.
+    ShaderSpec {
+        name: "mul_mat_vec_q4_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPE_VEC2", "vec2"),
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
+    // Q8_0's W8A16 rung — the per-family fallback where Q4_K's quality cost
+    // is refused (or its 256-wide constraint fails, e.g. the 640-wide shared-
+    // expert down_proj). Same float-B family and 5-buffer ABI as the dense
+    // F16/BF16 pair above; see DENSE_GEMV_DEFINES_Q8_0.
+    ShaderSpec {
+        name: "mul_mat_vec_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: DENSE_GEMV_DEFINES_Q8_0,
     },
     // Batched prefill GEMM (`mul_mmq`) — the integer-dot-product tiled matmul
     // that consumes the SAME `block_q8_1_x4` activations the decode GEMVs
