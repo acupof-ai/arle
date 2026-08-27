@@ -1181,6 +1181,8 @@ pub struct DevSlots {
     ids: u64,
     wts: u64,
     scale0: u64,
+    /// One f32 `1.0` — the weight for `h += 1.0 * ple_out` accumulates.
+    one: u64,
     gate: u64,
     up: u64,
     down: u64,
@@ -1258,6 +1260,7 @@ impl DevSlots {
             // ALL written before any expert GEMV is recorded — which is what
             // lets the whole MoE tail share one submit.
             scale0: take(48),
+            one: take(1),
             gate: take(6400),
             up: take(6400),
             down: take(25600),
@@ -1640,12 +1643,33 @@ impl<'ctx> Qwen4Dev<'ctx> {
             HcSite::Mlp => "dev.hc.mlp.pre",
             HcSite::Mixer => "dev.hc.mixer",
         });
+        self.write_f32(self.slots.h, h)?;
+        self.hc_pre_record(weights, hc, layer, site)?;
+        self.flush()?;
+        self.read_f32(self.slots.x, hc.hidden_size)
+    }
+
+    /// [`Self::hc_pre`] minus the host round trip: `h` is already in the `h`
+    /// slot, the block input lands in the `x` slot, nothing is flushed. The
+    /// staged token loop chains these; the wrapper above serves the fallback
+    /// path and the harness.
+    pub fn hc_pre_record(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        hc: &HyperConnectionConfig,
+        layer: Option<usize>,
+        site: HcSite,
+    ) -> Result<()> {
+        let _s = prof::stage(match site {
+            HcSite::Attn => "dev.hc.attn.pre",
+            HcSite::Mlp => "dev.hc.mlp.pre",
+            HcSite::Mixer => "dev.hc.mixer",
+        });
         let b = weights.hyper_connection(layer, site)?;
         let hh = hc.hc_hidden() as u64;
         let (norm_buf, norm_off, norm_len) = weights.binding(b.hc_norm)?;
         let (down_buf, down_off, down_len) = weights.binding(b.mix_down)?;
         let (up_buf, up_off, up_len) = weights.binding(b.mix_up)?;
-        self.write_f32(self.slots.h, h)?;
         let s = self.slots;
         let push =
             rms_norm_params_grouped(hc.hidden_size as u32, hc.hc_count as u32, hc.rms_norm_eps)
@@ -1695,9 +1719,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
                 Bind::A(s.x, hc.hidden_size as u64 * 4),
             ],
             [d.x, d.y, d.z],
-        )?;
-        self.flush()?;
-        self.read_f32(self.slots.x, hc.hidden_size)
+        )
     }
 
     /// The combine half: inject `y` into the residual left by [`Self::hc_pre`]
@@ -1715,13 +1737,34 @@ impl<'ctx> Qwen4Dev<'ctx> {
             HcSite::Attn => "dev.hc.attn.comb",
             _ => "dev.hc.mlp.comb",
         });
+        self.write_f32(self.slots.y, y)?;
+        let y_off = self.slots.y;
+        self.hc_combine_record(weights, hc, layer, site, y_off)?;
+        self.flush()?;
+        self.read_f32(self.slots.h, hc.hc_hidden())
+    }
+
+    /// [`Self::hc_combine`] minus the host round trip: the block output is
+    /// read from `y_off` (the `y` slot for attention, the MoE accumulator for
+    /// the MLP site) and the updated residual stays in the `h` slot.
+    pub fn hc_combine_record(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        hc: &HyperConnectionConfig,
+        layer: Option<usize>,
+        site: HcSite,
+        y_off: u64,
+    ) -> Result<()> {
+        let _s = prof::stage(match site {
+            HcSite::Attn => "dev.hc.attn.comb",
+            _ => "dev.hc.mlp.comb",
+        });
         let b = weights.hyper_connection(layer, site)?;
         let inject = b
             .block_inject
             .ok_or_else(|| anyhow!("hc_combine on the mixer site (no block_inject)"))?;
         let (inj_buf, inj_off, inj_len) = weights.binding(inject)?;
         let hh = hc.hc_hidden() as u64;
-        self.write_f32(self.slots.y, y)?;
         let s = self.slots;
         let push = qwen4_hc_combine_params(hc.hidden_size as u32, hc.hc_count as u32).to_le_bytes();
         let d = qwen4_hc_combine_dispatch(hc.hidden_size as u32);
@@ -1733,12 +1776,10 @@ impl<'ctx> Qwen4Dev<'ctx> {
                 Bind::A(s.hn, hh * 4),
                 Bind::Ext(inj_buf, inj_off, inj_len),
                 Bind::A(s.h, hh * 4),
-                Bind::A(s.y, hc.hidden_size as u64 * 4),
+                Bind::A(y_off, hc.hidden_size as u64 * 4),
             ],
             [d.x, d.y, d.z],
-        )?;
-        self.flush()?;
-        self.read_f32(self.slots.h, hc.hc_hidden())
+        )
     }
 
     // ── MoE ──────────────────────────────────────────────────────────────
@@ -1760,13 +1801,31 @@ impl<'ctx> Qwen4Dev<'ctx> {
         x: &[f32],
         collect_taps: bool,
     ) -> Result<(Vec<f32>, DevMoeTaps)> {
+        self.write_f32(self.slots.x, x)?;
+        let taps = self.moe_record(weights, cfg, layer, collect_taps)?;
+        self.flush()?;
+        let y = self.read_f32(self.slots.acc, cfg.hidden_size)?;
+        Ok((y, taps))
+    }
+
+    /// [`Self::moe`] minus the trailing flush/read: `x` is already staged and
+    /// the result stays in the `acc` slot. The ONE unavoidable fence remains —
+    /// the ids read-back that feeds the slot-ordered `weight_scale_2` gather —
+    /// and it flushes everything recorded so far, which in the staged loop is
+    /// the whole layer up to this point.
+    pub fn moe_record(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        collect_taps: bool,
+    ) -> Result<DevMoeTaps> {
         let h = cfg.hidden_size;
         let top_k = cfg.num_experts_per_tok;
         let inter = cfg.moe_intermediate_size;
         let _s = prof::stage("dev.moe");
         prof::phase("dev.moe.router");
         let s = self.slots;
-        self.write_f32(s.x, x)?;
 
         // Router logits + top-k, one submit.
         let router = *weights.tensor(&layer_tensor_name(layer, "mlp.gate.weight"))?;
@@ -1892,18 +1951,13 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let shared_on_device = self
             .record_shared_expert(weights, cfg, layer)
             .context("device shared expert")?;
-        self.flush()?;
-        let y = self.read_f32(s.acc, h)?;
-        Ok((
-            y,
-            DevMoeTaps {
-                logits,
-                ids,
-                weights: route_weights,
-                routed,
-                shared_on_device,
-            },
-        ))
+        Ok(DevMoeTaps {
+            logits,
+            ids,
+            weights: route_weights,
+            routed,
+            shared_on_device,
+        })
     }
 
     /// One fused NVFP4 expert GEMV over the selected `ids`, with the stack's
@@ -2112,11 +2166,33 @@ impl<'ctx> Qwen4Dev<'ctx> {
         h: &[f32],
         ring_rows: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>)> {
+        {
+            let pc = ple_config(cfg);
+            ensure!(h.len() == pc.hc_hidden(), "ple hidden width");
+        }
+        self.write_f32(self.slots.h, h)?;
+        self.ple_record(weights, cfg, layer, embeddings, ring_rows, false)?;
+        self.finish_ple(cfg)
+    }
+
+    /// The recorded half of [`Self::ple`]: `h` is already in the `h` slot.
+    /// With `add_into_h` the PLE output is accumulated into the residual ON
+    /// DEVICE (`h += 1.0 * out`), which is what lets the staged loop keep the
+    /// baton on the GPU. [`Self::finish_ple`] flushes and returns
+    /// `(out, advanced ring)` for the host-canonical state.
+    pub fn ple_record(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        embeddings: &[f32],
+        ring_rows: &[f32],
+        add_into_h: bool,
+    ) -> Result<()> {
         let _s = prof::stage("dev.ple");
         let pc = ple_config(cfg);
         let hh = pc.hc_hidden();
         ensure!(embeddings.len() == pc.ple_embed_dim, "ple embeddings width");
-        ensure!(h.len() == hh, "ple hidden width");
         ensure!(
             ring_rows.len() == pc.short_conv_state_len() * hh,
             "ple ring rows"
@@ -2126,7 +2202,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let vp = *weights.tensor(&name("ple.value_proj.weight"))?;
         let s = self.slots;
         self.write_f32(s.ple_emb, embeddings)?;
-        self.write_f32(s.h, h)?;
         self.write_f32(s.ple_ring, ring_rows)?;
         // key/value projections from whichever format the tier holds — the
         // F32-only assert this replaced was the audit-noted blocker that kept
@@ -2188,6 +2263,32 @@ impl<'ctx> Qwen4Dev<'ctx> {
             ],
             [d.x, d.y, d.z],
         )?;
+        if add_into_h {
+            self.barrier();
+            self.write_f32(s.one, &[1.0])?;
+            let push = qwen36_moe_weighted_accum_params(hh as u32, 1, false).to_le_bytes();
+            let d = qwen36_moe_weighted_accum_dispatch(hh as u32);
+            self.rec(
+                Kernel::Qwen36MoeWeightedAccum,
+                Kernel::Qwen36MoeWeightedAccum.specialization_u32(),
+                &push,
+                &[
+                    Bind::A(s.ple_o, (hh * 4) as u64),
+                    Bind::A(s.one, 4),
+                    Bind::A(s.h, (hh * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Flush and hand back `(out, advanced ring)` — the ring rotated to the
+    /// host's oldest-first layout (see the RING note inside).
+    pub fn finish_ple(&mut self, cfg: &Qwen4ExpConfig) -> Result<(Vec<f32>, Vec<f32>)> {
+        let pc = ple_config(cfg);
+        let hh = pc.hc_hidden();
+        let s = self.slots;
         self.flush()?;
         // Production reads: the residual add and the advanced ring (the conv
         // kernel wrote it in place; the host `PleConvState` stays canonical
@@ -2258,12 +2359,50 @@ impl<'ctx> Qwen4Dev<'ctx> {
         x: &[f32],
         pos: usize,
     ) -> Result<(Vec<f32>, DevFullTaps)> {
+        self.write_f32(self.slots.x, x)?;
+        self.write_rope_pos(pos)?;
+        self.full_attention_record(weights, cfg, layer, pos)?;
+        self.flush()?;
+        let (hd, nq, q_dim) = (
+            cfg.head_dim,
+            cfg.num_attention_heads,
+            cfg.num_attention_heads * cfg.head_dim,
+        );
+        let s = self.slots;
+        Ok((
+            self.read_f32(s.y, cfg.hidden_size)?,
+            DevFullTaps {
+                q_full: self.read_f32(s.qkv, nq * 2 * hd)?,
+                q_roped: self.read_f32(s.q, q_dim)?,
+                gated: self.read_f32(s.attn, q_dim)?,
+            },
+        ))
+    }
+
+    /// This token's RoPE position, staged once per token — every
+    /// full-attention layer reads the same slot, so in the staged loop the
+    /// write happens BEFORE any recording, never between recorded readers.
+    pub fn write_rope_pos(&mut self, pos: usize) -> Result<()> {
+        let pos_bytes = i64::try_from(pos).map(|_| (pos as i32).to_le_bytes())?;
+        self.arena
+            .copy_from_host_at(self.slots.pos, &pos_bytes)
+            .map_err(|e| anyhow!("write rope pos: {e}"))
+    }
+
+    /// [`Self::full_attention`] minus the host round trip: `x` and the RoPE
+    /// position are already staged, `y` stays in the `y` slot.
+    pub fn full_attention_record(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        pos: usize,
+    ) -> Result<()> {
         let _s = prof::stage("dev.full_attn");
         let hd = cfg.head_dim;
         let nq = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
         let group = nq / nkv;
-        let h = cfg.hidden_size;
         let q_dim = nq * hd;
         let kv_dim = nkv * hd;
         let full_idx = *self
@@ -2286,11 +2425,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let v_w = *weights.tensor(&name("self_attn.v_proj.weight"))?;
         let o_w = *weights.tensor(&name("self_attn.o_proj.weight"))?;
         let s = self.slots;
-        self.write_f32(s.x, x)?;
-        let pos_bytes = i64::try_from(pos).map(|_| (pos as i32).to_le_bytes())?;
-        self.arena
-            .copy_from_host_at(s.pos, &pos_bytes)
-            .map_err(|e| anyhow!("write rope pos: {e}"))?;
 
         // q/k/v projections off the one staged activation, whatever format
         // the tier holds — the F32-only gate this replaced kept all twelve
@@ -2450,16 +2584,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         }
         self.barrier();
         // o-proj → the y slot, tier format.
-        self.record_dense_at(weights, &o_w, s.attn, s.y)?;
-        self.flush()?;
-        Ok((
-            self.read_f32(s.y, h)?,
-            DevFullTaps {
-                q_full: self.read_f32(s.qkv, nq * 2 * hd)?,
-                q_roped: self.read_f32(s.q, q_dim)?,
-                gated: self.read_f32(s.attn, q_dim)?,
-            },
-        ))
+        self.record_dense_at(weights, &o_w, s.attn, s.y)
     }
 }
 
@@ -2685,8 +2810,22 @@ impl<'ctx> DevResidentLinAttn<'ctx> {
         layer: usize,
         x: &[f32],
     ) -> Result<Vec<f32>> {
+        dev.write_f32(dev.slots.x, x)?;
+        self.forward_record(dev, weights, cfg, layer)?;
+        dev.flush()?;
+        dev.read_f32(dev.slots.y, cfg.hidden_size)
+    }
+
+    /// [`Self::forward`] minus the host round trip: the block input is
+    /// already in the `x` slot, `y` stays in the `y` slot, nothing flushes.
+    pub fn forward_record(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+    ) -> Result<()> {
         let _s = prof::stage("dev.linear_attn");
-        let h = cfg.hidden_size;
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
         let nk = cfg.linear_num_key_heads;
@@ -2723,7 +2862,6 @@ impl<'ctx> DevResidentLinAttn<'ctx> {
             t_norm.nrows * t_norm.ncols
         );
         let norm_bind = weights.binding(&t_norm)?;
-        dev.write_f32(s.x, x)?;
         let at_qkv = s.dense_y;
         let at_z = at_qkv + (conv_dim.next_multiple_of(64) * 4) as u64;
         let at_a = at_z + ((nv * vd).next_multiple_of(64) * 4) as u64;
@@ -2819,9 +2957,7 @@ impl<'ctx> DevResidentLinAttn<'ctx> {
         // GGUF -> HF, then out-proj from the resident tier.
         self.record_perm(dev, s.attn, Self::MAP_V_INV, s.dense_x, vblk, nv as u32)?;
         dev.barrier();
-        dev.record_dense_at(weights, &t_out, s.dense_x, s.y)?;
-        dev.flush()?;
-        dev.read_f32(s.y, h)
+        dev.record_dense_at(weights, &t_out, s.dense_x, s.y)
     }
 
     /// Harness taps: read + unpermute the slot outputs of the LAST
@@ -3210,8 +3346,88 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             dev,
             resident_linear,
             state,
+            lm_head,
             ..
         } = self;
+
+        // ── the staged loop: the baton (h/x/y) never leaves the device ────
+        // Eligible when EVERY stage of EVERY layer runs on device; then the
+        // only fences per token are the per-layer MoE ids read-back, the PLE
+        // ring hand-back, and the final logits. Everything else — 48 layers of
+        // hyper-connections, attention and expert tails — is recorded
+        // back-to-back into as few submits as the ids fence allows.
+        let staged = match (dev.as_ref(), weights.as_ref(), resident_linear.as_ref()) {
+            (Some(d), Some(w), Some(rl)) => {
+                (0..cfg.num_hidden_layers).all(|l| {
+                    w.hyper_connection(Some(l), HcSite::Attn).is_ok()
+                        && w.hyper_connection(Some(l), HcSite::Mlp).is_ok()
+                        && w.expert_stack(l, ExpertProj::Gate).is_ok()
+                        && match cfg.layer_types[l] {
+                            Qwen4LayerType::LinearAttention => rl.covers(l),
+                            Qwen4LayerType::FullAttention => d.full_attention_ready(w, l),
+                        }
+                }) && w.hyper_connection(None, HcSite::Mixer).is_ok()
+                    && cfg.ple_layer_ids.iter().all(|&l| {
+                        w.tensor(&layer_tensor_name(l, "ple.key_proj.weight"))
+                            .is_ok()
+                    })
+                    && w.tensor(&lm_head.name).is_ok()
+            }
+            _ => false,
+        };
+        if staged {
+            let d = dev.as_mut().expect("staged");
+            let w = weights.as_ref().expect("staged");
+            let rl = resident_linear.as_ref().expect("staged");
+            d.write_f32(d.slots.h, &h)?;
+            d.write_rope_pos(start_pos)?;
+            for layer in 0..cfg.num_hidden_layers {
+                let hl = layers
+                    .get(&layer)
+                    .ok_or_else(|| anyhow!("host layer {layer} not loaded"))?;
+                if hl.ple.is_some() {
+                    let ring = state
+                        .ple_conv
+                        .get_mut(&layer)
+                        .ok_or_else(|| anyhow!("no PLE conv state for layer {layer}"))?;
+                    d.ple_record(w, cfg, layer, &ple_emb, ring.rows(), true)?;
+                    let (_out, ring_rows) = d.finish_ple(cfg)?;
+                    ring.rows_mut().copy_from_slice(&ring_rows);
+                }
+                d.hc_pre_record(w, hc, Some(layer), HcSite::Attn)?;
+                d.barrier();
+                match hl.kind {
+                    Qwen4LayerType::LinearAttention => {
+                        rl.forward_record(d, w, cfg, layer)?;
+                    }
+                    Qwen4LayerType::FullAttention => {
+                        d.full_attention_record(w, cfg, layer, start_pos)?;
+                    }
+                }
+                d.barrier();
+                let y_off = d.slots.y;
+                d.hc_combine_record(w, hc, Some(layer), HcSite::Attn, y_off)?;
+                d.barrier();
+                d.hc_pre_record(w, hc, Some(layer), HcSite::Mlp)?;
+                d.barrier();
+                d.moe_record(w, cfg, layer, false)?;
+                d.barrier();
+                let acc_off = d.slots.acc;
+                d.hc_combine_record(w, hc, Some(layer), HcSite::Mlp, acc_off)?;
+                d.barrier();
+            }
+            d.hc_pre_record(w, hc, None, HcSite::Mixer)?;
+            d.barrier();
+            let lm_span = prof::stage("host.lm_head");
+            let lm = *w.tensor(&lm_head.name)?;
+            let (x_off, y_off) = (d.slots.x, d.slots.dense_y);
+            d.record_dense_at(w, &lm, x_off, y_off)?;
+            d.flush()?;
+            let logits = d.read_f32(d.slots.dense_y, cfg.vocab_size)?;
+            drop(lm_span);
+            state.seq_len += 1;
+            return Ok(logits);
+        }
 
         for layer in 0..cfg.num_hidden_layers {
             let hl = layers
