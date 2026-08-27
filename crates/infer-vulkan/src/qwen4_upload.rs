@@ -51,7 +51,7 @@
 //! Measured against the on-box checkpoint (header arithmetic, `plan_qwen4_upload`
 //! over all 206 shards): 63.28 GiB packed experts + 6.70 GiB F16 + 2.66 GiB F32
 //! = **72.64 GiB**, against a 74.43 GiB device-local heap. That is why
-//! [`Qwen4UploadConfig::reserve_bytes`] defaults to 1 GiB and not to the 3 GiB
+//! [`Qwen4UploadConfig::reserve_bytes`] defaults to 1.5 GiB and not to the 3 GiB
 //! the qwen35 loader reserves: this model does not fit with a 3 GiB reserve, and
 //! it does not need one.
 //!
@@ -138,7 +138,7 @@ pub const SLAB_SWEEP_STEP_BYTES: u64 = 4 << 20;
 /// Device-local bytes held back for the KV cache, the linear-attention
 /// recurrent state, the activation arena and the descriptor pools.
 ///
-/// 1 GiB, not the 3 GiB `crate::loader` reserves. The model does not fit with 3
+/// 1.5 GiB, not the 3 GiB `crate::loader` reserves. The model does not fit with 3
 /// GiB, and it does not need it: measured from the config, this model's
 /// device-side state is 48 MiB of KV cache (12 full-attention layers x 2048
 /// context x 2 KV heads x 256 head_dim x K+V x f16), 108 MiB of recurrent state
@@ -147,7 +147,12 @@ pub const SLAB_SWEEP_STEP_BYTES: u64 = 4 << 20;
 /// f32 logits. 1 GiB is roughly 4x that, and — with the slab sweep in
 /// [`Qwen4Plan::choose_packing`] — it is available: the full residency commits
 /// 72.66 GiB of the 74.43 GiB heap.
-pub const DEFAULT_RESERVE_BYTES: u64 = 1 << 30;
+/// 1.5 GiB: the KV planes (12 x ~4 MB), the resident linear-attention state
+/// (36 x 3.1 MB), the arena, descriptor pools, and slack for the driver's own
+/// allocations. The 1 GiB first guess tripped its own fail-loud check the
+/// moment the BF16 hyper-connection tier shrank the plan enough for
+/// spill_to_fit to keep an extra expert stack on device.
+pub const DEFAULT_RESERVE_BYTES: u64 = 3 << 29;
 
 // ---------------------------------------------------------------- name builders
 
@@ -288,6 +293,19 @@ pub fn device_format(kind: Qwen4TensorKind, dense: Qwen4DeviceFormat) -> Option<
             ..
         } => Some(Nvfp4),
         Expert { .. } => None,
+
+        // The three big hyper-connection tensors follow the dense tier when
+        // it is VERBATIM BF16 (the qwen4_hc_*_bf16 kernel variants decode
+        // it); any converting dense format falls back to F32 — there is no
+        // F16 arm of those shaders, and silently feeding one F16 bytes is
+        // exactly the class of bug the format enum exists to prevent.
+        HyperConnection {
+            part: HcPart::MixDown | HcPart::MixUp | HcPart::BlockInject,
+            ..
+        } => Some(match dense {
+            Qwen4DeviceFormat::Bf16 => Qwen4DeviceFormat::Bf16,
+            _ => F32,
+        }),
 
         // F32 because the consuming shader declares `readonly buffer { float
         // w[]; }`. Changing any of these to F16 is silent garbage.
@@ -2958,12 +2976,15 @@ mod tests {
             plan.items.iter().all(|i| i.name != EMBED_TOKENS_NAME),
             "embed_tokens never gets a device buffer"
         );
-        // The mixer is `use_combine=false`, so three F32 tensors and no
-        // `block_inject_weight`: 10240 + 2 x (320 x 10240) elements.
+        // The mixer is `use_combine=false`, so three tensors and no
+        // `block_inject_weight`: the folded hc_norm stays F32 (10240 x 4 B),
+        // the two mix tensors follow the BF16 dense default (320 x 10240 x
+        // 2 B each) — the split this pins is exactly the one the format
+        // table draws between "folds at load" and "verbatim bytes".
         assert_eq!(
             plan.global_bytes,
-            (10240 + 2 * 320 * 10240) * 4,
-            "mixer = hc_norm + mix_down + mix_up, all F32"
+            10240 * 4 + 2 * 320 * 10240 * 2,
+            "mixer = F32 hc_norm + two BF16 mix tensors"
         );
         assert!(plan.host_bytes >= 1 << 30, "embed_tokens is 1.18 GiB");
         // `model-bf16-00001` carries the whole 27-block vision tower alongside

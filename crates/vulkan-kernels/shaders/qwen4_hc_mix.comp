@@ -60,9 +60,20 @@ layout(push_constant) uniform Params {
 layout(binding = 0) readonly buffer Normed {
     float hn[]; // [hc_count * hidden], stream-major
 };
+#ifdef WEIGHTS_BF16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(binding = 1) readonly buffer WeightUp {
+    uint16_t w_up_raw[]; // [hc_count * hidden, hc_lowrank] bf16, row-major
+};
+// bf16 is the top half of an f32.
+float w_up_at(uint i) { return uintBitsToFloat(uint(w_up_raw[i]) << 16); }
+#else
 layout(binding = 1) readonly buffer WeightUp {
     float w_up[]; // [hc_count * hidden, hc_lowrank], row-major [out, in]
 };
+float w_up_at(uint i) { return w_up[i]; }
+#endif
 layout(binding = 2) readonly buffer LowrankRaw {
     float u_raw[]; // [hc_lowrank] — RAW W_down @ hn, NOT silu'd
 };
@@ -95,7 +106,7 @@ void main() {
         const float uc = z / (1.0 + exp(-z));
         [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
             if (s < hc) {
-                acc[s] += w_up[(s * p.hidden + ch) * p.hc_lowrank + c] * uc;
+                acc[s] += w_up_at((s * p.hidden + ch) * p.hc_lowrank + c) * uc;
             }
         }
     }

@@ -386,6 +386,11 @@ pub enum Kernel {
     /// `h[s] += inj[s] * y` scatter across all streams. See
     /// [`qwen4_hc_combine_params`].
     Qwen4HcCombine,
+    /// [`Kernel::Qwen4HcMix`] over VERBATIM BF16 mixer weights (binding 1) —
+    /// same push block, same grid; only the weight decode differs.
+    Qwen4HcMixBf16,
+    /// [`Kernel::Qwen4HcCombine`] over VERBATIM BF16 `W_inject`.
+    Qwen4HcCombineBf16,
     /// Static block permutation (`dst[b] = src[map[b]]`, blocks of `block`
     /// f32): the HF<->GGUF head-map bridge for qwen4_exp's linear attention.
     /// See [`qwen4_block_perm_params`].
@@ -538,6 +543,8 @@ impl Kernel {
         Self::Qwen4PleGate,
         Self::Qwen4PleConv,
         Self::Qwen4HcMix,
+        Self::Qwen4HcMixBf16,
+        Self::Qwen4HcCombineBf16,
         Self::Qwen4BlockPerm,
         Self::Qwen4HcCombine,
     ];
@@ -600,6 +607,8 @@ impl Kernel {
             Kernel::Qwen4PleGate => "qwen4_ple_gate",
             Kernel::Qwen4PleConv => "qwen4_ple_conv",
             Kernel::Qwen4HcMix => "qwen4_hc_mix",
+            Kernel::Qwen4HcMixBf16 => "qwen4_hc_mix_bf16",
+            Kernel::Qwen4HcCombineBf16 => "qwen4_hc_combine_bf16",
             Kernel::Qwen4BlockPerm => "qwen4_block_perm",
             Kernel::Qwen4HcCombine => "qwen4_hc_combine",
         }
@@ -652,6 +661,8 @@ impl Kernel {
             | Kernel::Qwen4PleConv
             | Kernel::Qwen4HcMix
             | Kernel::Qwen4HcCombine
+            | Kernel::Qwen4HcMixBf16
+            | Kernel::Qwen4HcCombineBf16
             | Kernel::Qwen4BlockPerm => &[],
             // `mul_mmq`'s tile geometry is chosen per call from the matmul shape
             // (see [`MmqSpec::choose`]); there is no single default, and running

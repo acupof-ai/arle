@@ -76,7 +76,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use infer_gguf::dequant::dequantize_row_nvfp4;
 use infer_gguf::safetensors::SafeTensorsDir;
@@ -1673,8 +1673,16 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let b = weights.hyper_connection(layer, site)?;
         let hh = hc.hc_hidden() as u64;
         let (norm_buf, norm_off, norm_len) = weights.binding(b.hc_norm)?;
-        let (down_buf, down_off, down_len) = weights.binding(b.mix_down)?;
         let (up_buf, up_off, up_len) = weights.binding(b.mix_up)?;
+        ensure!(
+            b.mix_up.format == b.mix_down.format,
+            "hyper-connection mix_down/mix_up formats diverge"
+        );
+        let mix_kernel = match b.mix_up.format {
+            Qwen4DeviceFormat::F32 => Kernel::Qwen4HcMix,
+            Qwen4DeviceFormat::Bf16 => Kernel::Qwen4HcMixBf16,
+            f => bail!("hyper-connection mix weights in unsupported format {f:?}"),
+        };
         let s = self.slots;
         let push =
             rms_norm_params_grouped(hc.hidden_size as u32, hc.hc_count as u32, hc.rms_norm_eps)
@@ -1692,19 +1700,9 @@ impl<'ctx> Qwen4Dev<'ctx> {
             [d.x, d.y, d.z],
         )?;
         self.barrier();
-        let push = qwen36_router_gemv_params(hc.hc_lowrank as u32, hh as u32, false).to_le_bytes();
-        let d = qwen36_router_gemv_dispatch(hc.hc_lowrank as u32);
-        self.rec(
-            Kernel::Qwen36RouterGemv,
-            Kernel::Qwen36RouterGemv.specialization_u32(),
-            &push,
-            &[
-                Bind::A(s.hn, hh * 4),
-                Bind::Ext(down_buf, down_off, down_len),
-                Bind::A(s.u_raw, hc.hc_lowrank as u64 * 4),
-            ],
-            [d.x, d.y, d.z],
-        )?;
+        // mix_down GEMV rides the format-dispatching dense path (F32 router
+        // gemv or verbatim-BF16), same as every other projection.
+        self.record_dense_at(weights, b.mix_down, s.hn, s.u_raw)?;
         self.barrier();
         let push = qwen4_hc_mix_params(
             hc.hidden_size as u32,
@@ -1714,8 +1712,8 @@ impl<'ctx> Qwen4Dev<'ctx> {
         .to_le_bytes();
         let d = qwen4_hc_mix_dispatch(hc.hidden_size as u32);
         self.rec(
-            Kernel::Qwen4HcMix,
-            Kernel::Qwen4HcMix.specialization_u32(),
+            mix_kernel,
+            mix_kernel.specialization_u32(),
             &push,
             &[
                 Bind::A(s.hn, hh * 4),
@@ -1769,13 +1767,18 @@ impl<'ctx> Qwen4Dev<'ctx> {
             .block_inject
             .ok_or_else(|| anyhow!("hc_combine on the mixer site (no block_inject)"))?;
         let (inj_buf, inj_off, inj_len) = weights.binding(inject)?;
+        let comb_kernel = match inject.format {
+            Qwen4DeviceFormat::F32 => Kernel::Qwen4HcCombine,
+            Qwen4DeviceFormat::Bf16 => Kernel::Qwen4HcCombineBf16,
+            f => bail!("hyper-connection inject weights in unsupported format {f:?}"),
+        };
         let hh = hc.hc_hidden() as u64;
         let s = self.slots;
         let push = qwen4_hc_combine_params(hc.hidden_size as u32, hc.hc_count as u32).to_le_bytes();
         let d = qwen4_hc_combine_dispatch(hc.hidden_size as u32);
         self.rec(
-            Kernel::Qwen4HcCombine,
-            Kernel::Qwen4HcCombine.specialization_u32(),
+            comb_kernel,
+            comb_kernel.specialization_u32(),
             &push,
             &[
                 Bind::A(s.hn, hh * 4),

@@ -54,9 +54,20 @@ layout(push_constant) uniform Params {
 layout(binding = 0) readonly buffer Normed {
     float hn[]; // [hc_count * hidden], stream-major
 };
+#ifdef WEIGHTS_BF16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(binding = 1) readonly buffer WeightInject {
+    uint16_t w_inject_raw[]; // [hc_count, hc_count * hidden] bf16
+};
+// bf16 is the top half of an f32.
+float w_inject_at(uint i) { return uintBitsToFloat(uint(w_inject_raw[i]) << 16); }
+#else
 layout(binding = 1) readonly buffer WeightInject {
     float w_inject[]; // [hc_count, hc_count * hidden], row-major [out, in]
 };
+float w_inject_at(uint i) { return w_inject[i]; }
+#endif
 layout(binding = 2) buffer Hyper {
     float h[]; // [hc_count * hidden] — the residual, updated in place
 };
@@ -82,7 +93,7 @@ void main() {
         const float hv = hn[c];
         [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
             if (s < hc) {
-                acc[s] += w_inject[s * hc_hidden + c] * hv;
+                acc[s] += w_inject_at(s * hc_hidden + c) * hv;
             }
         }
     }

@@ -644,9 +644,19 @@ const LOCAL: &[ShaderSpec] = &[
         defines: &[],
     },
     ShaderSpec {
+        name: "qwen4_hc_mix_bf16",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_mix.comp",
+        defines: &[("WEIGHTS_BF16", "1")],
+    },
+    ShaderSpec {
         name: "qwen4_hc_combine",
         source: "crates/vulkan-kernels/shaders/qwen4_hc_combine.comp",
         defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_hc_combine_bf16",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_combine.comp",
+        defines: &[("WEIGHTS_BF16", "1")],
     },
 ];
 
