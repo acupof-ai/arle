@@ -279,8 +279,9 @@ into "measured". Build it before chasing the first token, not after.
 | S3 ✅ | NVFP4 fused-expert GEMV + CPU oracle | done |
 | S4 ✅ | fused hyper-connection + PLE kernels vs host oracles | done |
 | S5 ✅ | PLE + n-gram → **first token** (indexer stubbed, ≤2048 ctx) | done |
+| perf ✅ | decode 899 → 84.9 ms/token: resident linattn/PLE/full-attn, staged loop (50 fences), BF16 tiers | done |
 | S6 | QSA indexer → contexts >2051 | 40 h |
-| S7 | requantize the non-expert 87%; batched MoE prefill; fuse hyper-connections | 40 h |
+| S7 | requantize experts (Q8_0 returns MTP+vision); batched MoE prefill + verify (cols k≤8 / WMMA k≥16, measured) | 40 h |
 | S8 | MTP speculative decode (needs S7's batched verify) | 20 h |
 
 Hours are CC-execution, not calendar.
