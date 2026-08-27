@@ -34,5 +34,9 @@ xgrammar-sys = { path = "../xgrammar-sys" }
 minijinja = { version = "2.20.0", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "2.20.0", features = ["pycompat"] }
 
+[dev-dependencies]
+# `ServiceExt::oneshot` for GPU-free router tests (chat UI + route table).
+tower = { version = "0.5", features = ["util"] }
+
 [lints]
 workspace = true

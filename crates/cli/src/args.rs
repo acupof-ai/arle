@@ -588,6 +588,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub(crate) bind: String,
 
+    /// Open the default browser at the served address (the built-in chat UI
+    /// at `/`) once the port is bound — i.e. after the model finishes
+    /// loading. In-process serve path only.
+    #[arg(long, default_value_t = false)]
+    pub(crate) open: bool,
+
     /// Use conservative local-machine engine budgets for smoother foreground UX.
     #[arg(long, default_value_t = false)]
     pub(crate) low_impact: bool,

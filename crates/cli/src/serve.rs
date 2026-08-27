@@ -391,6 +391,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         port: serve_args.port,
         engine_config,
         spec,
+        open_browser: serve_args.open,
     };
 
     Ok(ServeConfig { backend, options })

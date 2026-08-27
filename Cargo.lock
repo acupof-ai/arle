@@ -1685,6 +1685,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tower",
  "uuid",
  "xgrammar-sys",
 ]

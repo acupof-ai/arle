@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARLE Chat</title>
+<!-- Single-file chat UI compiled into the server binary (include_str!).
+     Everything is inline and relative so the page works with no network
+     beyond the serving host itself; the offline guarantee is pinned by
+     chat_ui_tests in coordinator.rs. -->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: #14161a; color: #e6e6e6;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+    padding: 0.6rem 1rem; border-bottom: 1px solid #2a2e35;
+    font-size: 13px; color: #9aa3ad;
+  }
+  #model { font-weight: 600; color: #c7d0da; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #stats { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  main { flex: 1; overflow-y: auto; padding: 1rem; }
+  .msg { max-width: 52rem; margin: 0 auto 0.9rem; }
+  .who {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: #7b8794; margin-bottom: 0.15rem;
+  }
+  .msg.user .body { background: #1f2937; border-radius: 8px; padding: 0.5rem 0.75rem; }
+  .body, .answer, .think-text { white-space: pre-wrap; word-break: break-word; }
+  details.think {
+    color: #8b95a1; font-size: 13px; border-left: 2px solid #333a44;
+    padding-left: 0.6rem; margin-bottom: 0.4rem;
+  }
+  details.think summary { cursor: pointer; user-select: none; }
+  .error { color: #f87171; }
+  footer {
+    display: flex; gap: 0.6rem; align-items: flex-end;
+    width: 100%; max-width: 54rem; margin: 0 auto;
+    padding: 0.7rem 1rem 0.9rem; border-top: 1px solid #2a2e35;
+  }
+  textarea {
+    flex: 1; resize: none; font: inherit; color: inherit;
+    background: #1b1f26; border: 1px solid #2f3540; border-radius: 8px;
+    padding: 0.5rem 0.7rem;
+  }
+  textarea:focus { outline: 1px solid #4b5563; }
+  button {
+    font: inherit; color: #fff; background: #2563eb; border: 0;
+    border-radius: 8px; padding: 0.45rem 0.9rem; cursor: pointer;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.15); }
+  button:disabled { background: #2a2f38; color: #69707b; cursor: default; }
+  #stop:not(:disabled) { background: #991b1b; }
+  #clear { background: #374151; }
+</style>
+</head>
+<body>
+<header>
+  <div id="model">ARLE</div>
+  <div id="stats"></div>
+</header>
+<main id="log"></main>
+<footer>
+  <textarea id="prompt" rows="3" autofocus
+    placeholder="Type a message. Enter sends, Shift+Enter is a new line."></textarea>
+  <button id="send">Send</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="clear">New chat</button>
+</footer>
+<script>
+"use strict";
+// These two paths must exist in the server's route table; chat_ui_tests in
+// coordinator.rs extracts every quoted /v1 path here and asserts each one
+// resolves against the real router.
+var CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
+var MODELS_PATH = "/v1/models";
+
+var logEl = document.getElementById("log");
+var promptEl = document.getElementById("prompt");
+var sendBtn = document.getElementById("send");
+var stopBtn = document.getElementById("stop");
+var clearBtn = document.getElementById("clear");
+var statsEl = document.getElementById("stats");
+var modelEl = document.getElementById("model");
+
+var turns = [];        // {role, content} turns re-sent with every request
+var controller = null; // AbortController of the in-flight stream, else null
+
+// Model name is cosmetic: any failure just leaves the plain header.
+fetch(MODELS_PATH).then(function (r) { return r.json(); }).then(function (j) {
+  var id = j && j.data && j.data[0] && j.data[0].id;
+  if (id) { modelEl.textContent = id; document.title = id + " - ARLE"; }
+}).catch(function () {});
+
+function bubble(role) {
+  var wrap = document.createElement("div");
+  wrap.className = "msg " + role;
+  var who = document.createElement("div");
+  who.className = "who";
+  who.textContent = role;
+  var body = document.createElement("div");
+  body.className = "body";
+  wrap.appendChild(who);
+  wrap.appendChild(body);
+  logEl.appendChild(wrap);
+  return body;
+}
+
+function setBusy(busy) {
+  sendBtn.disabled = busy;
+  stopBtn.disabled = !busy;
+}
+
+function fmtStats(started, firstTok, lastTok, tokens) {
+  if (!firstTok) { return "waiting for first token"; }
+  var ttft = ((firstTok - started) / 1000).toFixed(2);
+  var span = (lastTok - firstTok) / 1000;
+  // Rate over the inter-token window only, so a long prefill does not
+  // deflate the decode number; first token has no preceding gap.
+  var tps = tokens > 1 && span > 0 ? ((tokens - 1) / span).toFixed(1) : "-";
+  return tokens + " tok | " + tps + " tok/s | first token " + ttft + "s";
+}
+
+async function send() {
+  var text = promptEl.value.trim();
+  if (!text || controller) { return; }
+  promptEl.value = "";
+  turns.push({ role: "user", content: text });
+  bubble("user").textContent = text;
+
+  var body = bubble("assistant");
+  var think = document.createElement("details");
+  think.className = "think";
+  think.style.display = "none";
+  var thinkSummary = document.createElement("summary");
+  thinkSummary.textContent = "thinking";
+  var thinkText = document.createElement("div");
+  thinkText.className = "think-text";
+  think.appendChild(thinkSummary);
+  think.appendChild(thinkText);
+  var answer = document.createElement("div");
+  answer.className = "answer";
+  body.appendChild(think);
+  body.appendChild(answer);
+
+  controller = new AbortController();
+  setBusy(true);
+  var started = performance.now();
+  var firstTok = 0, lastTok = 0, chunkTokens = 0, usageTokens = 0;
+  var assistantText = "";
+  statsEl.textContent = fmtStats(started, 0, 0, 0);
+
+  function fail(message) {
+    var err = document.createElement("div");
+    err.className = "error";
+    err.textContent = "[error] " + message;
+    answer.appendChild(err);
+  }
+
+  try {
+    var res = await fetch(CHAT_COMPLETIONS_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: turns,
+        stream: true,
+        stream_options: { include_usage: true }
+      }),
+      signal: controller.signal
+    });
+    if (!res.ok || !res.body) {
+      var errBody = await res.text();
+      throw new Error("HTTP " + res.status + " " + errBody.slice(0, 500));
+    }
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var buf = "";
+    for (;;) {
+      var step = await reader.read();
+      if (step.done) { break; }
+      buf += decoder.decode(step.value, { stream: true });
+      // Keep the view pinned to the bottom only if the reader was already there.
+      var stick = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 48;
+      var cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        var frame = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        var lines = frame.split("\n");
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          // Non-"data:" lines include the server's ": keep-alive" comments.
+          if (line.lastIndexOf("data: ", 0) !== 0) { continue; }
+          var payload = line.slice(6);
+          if (payload === "[DONE]") { continue; }
+          var obj;
+          try { obj = JSON.parse(payload); } catch (e) { continue; }
+          if (obj.error && obj.error.message) { fail(obj.error.message); continue; }
+          if (obj.usage && obj.usage.completion_tokens) {
+            usageTokens = obj.usage.completion_tokens;
+          }
+          var delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
+          if (!delta) { continue; }
+          if (delta.reasoning_content) {
+            think.style.display = "";
+            thinkText.textContent += delta.reasoning_content;
+          }
+          if (delta.content) {
+            assistantText += delta.content;
+            answer.textContent = assistantText;
+          }
+          if (delta.content || delta.reasoning_content) {
+            // Each delta carries one detokenized piece (about one token);
+            // the exact count arrives in the final usage trailer.
+            chunkTokens += 1;
+            var now = performance.now();
+            if (!firstTok) { firstTok = now; }
+            lastTok = now;
+            statsEl.textContent =
+              fmtStats(started, firstTok, lastTok, usageTokens || chunkTokens);
+          }
+        }
+      }
+      if (stick) { logEl.scrollTop = logEl.scrollHeight; }
+    }
+  } catch (err) {
+    if (!err || err.name !== "AbortError") {
+      fail(err && err.message ? err.message : String(err));
+    }
+  }
+  statsEl.textContent = fmtStats(started, firstTok, lastTok, usageTokens || chunkTokens);
+  if (assistantText) {
+    // A stopped stream keeps its partial text: it is what the user saw.
+    turns.push({ role: "assistant", content: assistantText });
+  }
+  controller = null;
+  setBusy(false);
+  promptEl.focus();
+}
+
+sendBtn.addEventListener("click", send);
+stopBtn.addEventListener("click", function () {
+  if (controller) { controller.abort(); }
+});
+clearBtn.addEventListener("click", function () {
+  if (controller) { controller.abort(); }
+  turns = [];
+  logEl.textContent = "";
+  statsEl.textContent = "";
+  promptEl.focus();
+});
+promptEl.addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+</script>
+</body>
+</html>
