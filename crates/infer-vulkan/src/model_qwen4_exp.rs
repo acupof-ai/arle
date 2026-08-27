@@ -24,6 +24,17 @@
 //! `tests/qwen4_forward.rs` is the parity harness: it runs both on real
 //! weights and reports max relative error per stage.
 //!
+//! ## Where the host stages get their arithmetic
+//!
+//! A host stage owns its SEMANTICS but not necessarily its GEMVs. Every
+//! `W · x` in the host lane goes through [`DenseGemv`], which runs it on the
+//! device when the projection's twin is resident and falls back to
+//! [`HostDense::matvec`] when it is not — so `host.linear_attn` still spells
+//! the conv ring, the gated-delta recurrence and the gated norm exactly as
+//! before, while its 2896.9 MiB/token of `in_proj` bytes stream on the GPU.
+//! The measured reason: those matvecs were 6779.61 MiB and 679.22 ms of a
+//! 898.80 ms token (75.6%) at 10.47 GB/s, against ~205 GB/s on device.
+//!
 //! ## Deliberate deviations from a bit-exact bf16 reference
 //!
 //! The checkpoint is bf16 (+ NVFP4 experts); the reference implementation runs
@@ -75,19 +86,19 @@ use crate::qwen4_hc::{self, GatedResidualWeights, HyperConnectionConfig};
 use crate::qwen4_names::{ExpertProj, HcSite, Nvfp4Part};
 use crate::qwen4_ple::{NGramContext, NGramHash, PleConfig, PleConvState, PleLayer, PleWeights};
 use crate::qwen4_upload::{
-    Qwen4DeviceFormat, Qwen4HostTables, Qwen4UploadConfig, Qwen4UploadScope, Qwen4Weights,
-    bf16_to_f32, expert_tensor_name, f32_to_f16, layer_tensor_name, plan_qwen4_upload,
-    upload_qwen4,
+    Qwen4DeviceFormat, Qwen4DeviceTensor, Qwen4HostTables, Qwen4UploadConfig, Qwen4UploadScope,
+    Qwen4Weights, bf16_to_f32, expert_tensor_name, f32_to_f16, layer_tensor_name,
+    plan_qwen4_upload, upload_qwen4,
 };
 
 use vulkan_kernels::{
-    FlashAttentionSpec, Kernel, KernelCache, KernelParams, MAT_VEC_FUSION_SCALE0,
+    FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams, MAT_VEC_FUSION_SCALE0,
     f16_kv_pack_dispatch, f16_kv_pack_params, flash_attn_dispatch, flash_attn_params,
-    gemv_id_dispatch, gemv_id_params_fused, qwen4_hc_combine_dispatch, qwen4_hc_combine_params,
-    qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch, qwen4_ple_conv_params,
-    qwen4_ple_gate_dispatch, qwen4_ple_gate_params, qwen35_gated_delta_net_dispatch,
-    qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
-    qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
+    gemv_dense_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_params_f32_b,
+    qwen4_hc_combine_dispatch, qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params,
+    qwen4_ple_conv_dispatch, qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
+    qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
+    qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
     qwen36_router_topk_params, record_dispatch, repack_nvfp4_planes, rms_norm_dispatch_rows,
     rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch, rope_neox_params,
@@ -199,6 +210,10 @@ pub const fn v_slot_perm(nk: usize, nv: usize, slot: usize) -> usize {
 /// One dense projection: row-major `[out_dim, in_dim]` bf16 bytes borrowed
 /// from the checkpoint mmap.
 pub struct HostDense<'st> {
+    /// The checkpoint tensor name. Carried so a call site can ask for this
+    /// projection's DEVICE twin ([`DenseGemv`]) without threading a second
+    /// string alongside every weight — the residency is keyed by name.
+    pub name: String,
     bytes: &'st [u8],
     /// Contraction width.
     pub in_dim: usize,
@@ -223,6 +238,7 @@ impl<'st> HostDense<'st> {
             info.dims
         );
         Ok(Self {
+            name: name.to_string(),
             bytes: st.tensor_data(name)?,
             in_dim,
             out_dim,
@@ -232,6 +248,7 @@ impl<'st> HostDense<'st> {
     /// `W @ x`, f64 accumulation.
     #[must_use]
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
+        let _p = prof::span_bytes("matvec", self.bytes.len() as u64);
         matvec_bf16(self.bytes, self.in_dim, self.out_dim, x)
     }
 
@@ -239,6 +256,71 @@ impl<'st> HostDense<'st> {
     #[must_use]
     pub fn to_f32(&self) -> Vec<f32> {
         bf16_vec(self.bytes)
+    }
+}
+
+/// Routes [`HostDense`] projections to [`Qwen4Dev::dense_gemv`] when their
+/// device twin is resident, and to the host transcription when it is not.
+///
+/// The host stages own the SEMANTICS of this model — the conv ring, the
+/// gated-delta recurrence, RoPE, the softmax, the head permutations — and they
+/// keep owning them. All this moves is the arithmetic of `W · x`, which is
+/// 75.6% of a measured token and the only part of those stages that is pure
+/// bandwidth. A stage with no resident twin is byte-identical to before.
+///
+/// Resolution is ALL-OR-NOTHING per batch: if any matrix of a shared-`x` group
+/// is missing, the whole group runs on the host. Half a batch on each side
+/// would still be correct, but it would make a stage's cost — and its error
+/// profile — depend on which weights happened to fit, which is not something
+/// a measurement should have to guess at.
+pub struct DenseGemv<'a, 'ctx, 'st> {
+    dev: &'a mut Qwen4Dev<'ctx>,
+    weights: &'a Qwen4Weights<'ctx, 'st>,
+}
+
+impl<'a, 'ctx, 'st> DenseGemv<'a, 'ctx, 'st> {
+    pub fn new(dev: &'a mut Qwen4Dev<'ctx>, weights: &'a Qwen4Weights<'ctx, 'st>) -> Self {
+        Self { dev, weights }
+    }
+
+    /// This projection's device twin, if it is resident AND its logical shape
+    /// matches. The shape check is not paranoia: `mul_mat_vec.comp` derives the
+    /// row stride from `ncols`, so a twin that disagreed with the host tensor
+    /// about the shape would read rows at the wrong stride and still run.
+    fn twin(&self, d: &HostDense<'_>) -> Option<Qwen4DeviceTensor> {
+        let t = *self.weights.tensor(&d.name).ok()?;
+        (t.ncols == d.in_dim && t.nrows == d.out_dim && t.format != Qwen4DeviceFormat::Nvfp4)
+            .then_some(t)
+    }
+
+    /// `y_j = W_j · x` for projections sharing `x` — one submit on device, or
+    /// the host transcription for all of them.
+    pub fn matvec_many(&mut self, mats: &[&HostDense<'_>], x: &[f32]) -> Result<Vec<Vec<f32>>> {
+        let twins: Option<Vec<Qwen4DeviceTensor>> = mats.iter().map(|m| self.twin(m)).collect();
+        match twins {
+            Some(t) if !t.is_empty() => self.dev.dense_gemv(self.weights, x, &t),
+            _ => Ok(mats.iter().map(|m| m.matvec(x)).collect()),
+        }
+    }
+
+    /// [`Self::matvec_many`] for a single projection.
+    pub fn matvec(&mut self, m: &HostDense<'_>, x: &[f32]) -> Result<Vec<f32>> {
+        let mut out = self.matvec_many(&[m], x)?;
+        out.pop()
+            .ok_or_else(|| anyhow!("dense gemv returned nothing"))
+    }
+}
+
+/// [`DenseGemv::matvec_many`] with an optional router — `None` is the pure
+/// host transcription, which is what the parity oracle passes.
+fn dense_many(
+    gemv: Option<&mut DenseGemv<'_, '_, '_>>,
+    mats: &[&HostDense<'_>],
+    x: &[f32],
+) -> Result<Vec<Vec<f32>>> {
+    match gemv {
+        Some(g) => g.matvec_many(mats, x),
+        None => Ok(mats.iter().map(|m| m.matvec(x)).collect()),
     }
 }
 
@@ -644,13 +726,18 @@ pub struct LinearTaps {
 
 /// One token of `Qwen4ExpTextGatedDeltaNet` (the `seq_len == 1` recurrent
 /// rule), advancing `gdr_state` and `conv_ring` in place.
+///
+/// `gemv = None` is the pure host oracle. With `Some`, only the four
+/// in-projections and `out_proj` move to the device (see [`DenseGemv`]); the
+/// conv, the recurrence and the gated norm stay here, bit for bit.
 pub fn host_linear_attention(
     cfg: &Qwen4ExpConfig,
     w: &HostLinearAttn<'_>,
     x: &[f32],
     gdr_state: &mut [f32],
     conv_ring: &mut [f32],
-) -> (Vec<f32>, LinearTaps) {
+    mut gemv: Option<&mut DenseGemv<'_, '_, '_>>,
+) -> Result<(Vec<f32>, LinearTaps)> {
     let kd = cfg.linear_key_head_dim;
     let vd = cfg.linear_value_head_dim;
     let nk = cfg.linear_num_key_heads;
@@ -661,10 +748,13 @@ pub fn host_linear_attention(
     assert_eq!(gdr_state.len(), nv * kd * vd, "gdr state length");
     assert_eq!(conv_ring.len(), conv_dim * (kernel - 1), "conv ring length");
 
-    let qkv_raw = w.qkv.matvec(x);
-    let z = w.z.matvec(x);
-    let a = w.a.matvec(x);
-    let b = w.b.matvec(x);
+    // All four share `x`, so they are one batch — and one submit. `a`/`b` are
+    // F32-resident where `qkv`/`z` are F16; `dense_gemv` mixes the two.
+    let mut proj = dense_many(gemv.as_deref_mut(), &[&w.qkv, &w.z, &w.a, &w.b], x)?.into_iter();
+    let qkv_raw = proj.next().expect("qkv");
+    let z = proj.next().expect("z");
+    let a = proj.next().expect("a");
+    let b = proj.next().expect("b");
 
     // Depthwise causal conv over `[ring | qkv_raw]`, bf16-rounded sum, SiLU.
     let state_w = kernel - 1;
@@ -685,6 +775,7 @@ pub fn host_linear_attention(
     conv_ring.copy_within(conv_dim.., 0);
     conv_ring[(state_w - 1) * conv_dim..].copy_from_slice(&qkv_raw);
 
+    prof::phase("host.linattn.recurrence");
     // Recurrent gated-delta rule, f32 in the kernel's serial order.
     let q_all = &qkv_conv[..nk * kd];
     let k_all = &qkv_conv[nk * kd..2 * nk * kd];
@@ -723,6 +814,7 @@ pub fn host_linear_attention(
         }
     }
 
+    prof::phase("host.linattn.post");
     // Gated RMSNorm per value head: `rms(core) * norm_w * act(z)`, PLAIN gain,
     // gate activation from `output_gate_type` (sigmoid on this checkpoint).
     let mut gated = vec![0.0f32; nv * vd];
@@ -744,8 +836,11 @@ pub fn host_linear_attention(
         }
     }
 
-    let y = w.out.matvec(&gated);
-    (
+    let y = match gemv {
+        Some(g) => g.matvec(&w.out, &gated)?,
+        None => w.out.matvec(&gated),
+    };
+    Ok((
         y,
         LinearTaps {
             qkv_raw,
@@ -754,7 +849,7 @@ pub fn host_linear_attention(
             core,
             gated,
         },
-    )
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -812,7 +907,8 @@ pub fn host_full_attention(
     x: &[f32],
     pos: usize,
     kv: &mut HostKv,
-) -> (Vec<f32>, FullTaps) {
+    mut gemv: Option<&mut DenseGemv<'_, '_, '_>>,
+) -> Result<(Vec<f32>, FullTaps)> {
     let hd = cfg.head_dim;
     let nq = cfg.num_attention_heads;
     let nkv = cfg.num_key_value_heads;
@@ -820,9 +916,10 @@ pub fn host_full_attention(
     let kv_dim = nkv * hd;
     assert_eq!(kv.k.len(), pos * kv_dim, "KV cache length vs position");
 
-    let q_full = w.q.matvec(x);
-    let mut k_new = w.k.matvec(x);
-    let v_new = w.v.matvec(x);
+    let mut proj = dense_many(gemv.as_deref_mut(), &[&w.q, &w.k, &w.v], x)?.into_iter();
+    let q_full = proj.next().expect("q");
+    let mut k_new = proj.next().expect("k");
+    let v_new = proj.next().expect("v");
 
     // Per-head q/k RMSNorm (1 + w), then partial RoPE.
     let mut q_roped = vec![0.0f32; nq * hd];
@@ -843,6 +940,7 @@ pub fn host_full_attention(
     kv.k.extend(k_new.iter().map(|&v| round_to_f16(v)));
     kv.v.extend(v_new.iter().map(|&v| round_to_f16(v)));
 
+    prof::phase("host.fullattn.sdpa");
     // Causal SDPA over the cache, scale 1/sqrt(head_dim), f64 softmax.
     let scale = 1.0 / (hd as f64).sqrt();
     let kv_len = pos + 1;
@@ -881,6 +979,7 @@ pub fn host_full_attention(
         }
     }
 
+    prof::phase("host.fullattn.post");
     // Per-element sigmoid gate from the interleaved q projection.
     let mut gated = vec![0.0f32; nq * hd];
     for h in 0..nq {
@@ -890,8 +989,11 @@ pub fn host_full_attention(
         }
     }
 
-    let y = w.o.matvec(&gated);
-    (
+    let y = match gemv {
+        Some(g) => g.matvec(&w.o, &gated)?,
+        None => w.o.matvec(&gated),
+    };
+    Ok((
         y,
         FullTaps {
             q_full,
@@ -900,7 +1002,7 @@ pub fn host_full_attention(
             v_raw: v_new,
             gated,
         },
-    )
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1093,8 +1195,37 @@ pub struct DevSlots {
     ple_o: u64,
     ple_ring: u64,
     pos: u64,
+    dense_x: u64,
+    dense_y: u64,
     dummy: u64,
     total: u64,
+}
+
+/// Activation capacity of [`DevSlots::dense_x`], in f32 elements. The widest
+/// dense contraction in this checkpoint is 6144 (`out_proj`/`o_proj`).
+const DENSE_X_ELEMS: usize = 8192;
+
+/// Output capacity of [`DevSlots::dense_y`], in f32 elements — one batch's
+/// worth. `lm_head`'s 248320 rows set the floor; the widest multi-matrix batch
+/// is the linear-attention in-projections at 16512 (256-B padded).
+const DENSE_Y_ELEMS: usize = 262_144;
+
+/// Where each matrix of a [`Qwen4Dev::dense_gemv`] batch writes inside
+/// `dense_y`, in f32 elements, plus the total the batch needs.
+///
+/// Every offset is a DESCRIPTOR offset, so it must satisfy the device's
+/// `minStorageBufferOffsetAlignment` (16 or 64 bytes on this part). 64
+/// elements = 256 B clears both and matches the arena's own slot granularity.
+/// A 1-row matrix — the shared-expert scalar gate — therefore still costs a
+/// full stride, which is why this is padding and not a running sum.
+fn dense_batch_offsets(rows: &[usize]) -> (Vec<usize>, usize) {
+    let mut offs = Vec::with_capacity(rows.len());
+    let mut cursor = 0usize;
+    for &n in rows {
+        offs.push(cursor);
+        cursor += n.next_multiple_of(64);
+    }
+    (offs, cursor)
 }
 
 impl DevSlots {
@@ -1140,6 +1271,8 @@ impl DevSlots {
             ple_o: take(10240),
             ple_ring: take(9 * 10240),
             pos: take(4),
+            dense_x: take(DENSE_X_ELEMS as u64),
+            dense_y: take(DENSE_Y_ELEMS as u64),
             dummy: take(8),
             total: off,
         }
@@ -1261,6 +1394,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
     }
 
     fn write_f32(&mut self, off: u64, data: &[f32]) -> Result<()> {
+        let _p = prof::span_bytes("h2d", (data.len() * 4) as u64);
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.arena
             .copy_from_host_at(off, &bytes)
@@ -1268,6 +1402,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
     }
 
     fn read_f32(&self, off: u64, n: usize) -> Result<Vec<f32>> {
+        let _p = prof::span_bytes("d2h", (n * 4) as u64);
         let mut bytes = vec![0u8; n * 4];
         self.arena
             .copy_to_host_at(off, &mut bytes)
@@ -1279,6 +1414,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
     }
 
     fn read_i32(&self, off: u64, n: usize) -> Result<Vec<i32>> {
+        let _p = prof::span_bytes("d2h", (n * 4) as u64);
         let mut bytes = vec![0u8; n * 4];
         self.arena
             .copy_to_host_at(off, &mut bytes)
@@ -1298,6 +1434,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         binds: &[Bind<'_>],
         groups: [u32; 3],
     ) -> Result<()> {
+        let _p = prof::span("record");
         if !self.open {
             self.recorder
                 .begin()
@@ -1321,6 +1458,10 @@ impl<'ctx> Qwen4Dev<'ctx> {
             .map_err(|e| anyhow!("build {kernel:?} pipeline: {e}"))?;
         let set = DescriptorSet::storage_buffers_ranged(self.ctx, layout, &resolved)
             .map_err(|e| anyhow!("bind {kernel:?} set: {e}"))?;
+        // Label the dispatch with the stage that recorded it, so
+        // ARLE_GPU_TIMESTAMPS reports GPU-busy time in the SAME buckets as the
+        // host table and the two can be subtracted.
+        self.recorder.label_next(prof::current());
         record_dispatch(&mut self.recorder, pipeline, &set, push, groups);
         self.live.push(set);
         Ok(())
@@ -1332,9 +1473,24 @@ impl<'ctx> Qwen4Dev<'ctx> {
         }
     }
 
+    /// Drain the recorder's per-dispatch GPU timestamp totals — `(label,
+    /// dispatches, milliseconds)`, empty unless `ARLE_GPU_TIMESTAMPS` is set.
+    /// The labels are [`prof`] stage names (see `rec`), so this table and the
+    /// host table share buckets and their difference is submit + fence cost.
+    pub fn take_gpu_profile(&mut self) -> Vec<(&'static str, u64, f64)> {
+        self.recorder.take_gpu_profile()
+    }
+
+    /// Total `vkQueueSubmit`s over this runner's life.
+    #[must_use]
+    pub fn submit_count(&self) -> u64 {
+        self.recorder.submit_count()
+    }
+
     /// Submit everything recorded since the last flush and wait.
     fn flush(&mut self) -> Result<()> {
         if self.open {
+            let _p = prof::span("submit");
             self.recorder
                 .submit_and_wait()
                 .map_err(|e| anyhow!("submit: {e}"))?;
@@ -1342,6 +1498,109 @@ impl<'ctx> Qwen4Dev<'ctx> {
         }
         self.live.clear();
         Ok(())
+    }
+
+    // ── dense GEMV: the device twin of `HostDense::matvec` ───────────────
+
+    /// `y_j = W_j · x` for projections that SHARE the activation `x`, in ONE
+    /// submit.
+    ///
+    /// This is where the dense tier's bytes stop crossing the CPU. The same
+    /// 7.11 GB/token that streams at ~9.8 GB/s through [`matvec_bf16`] streams
+    /// at ~205 GB/s here — but a submit costs ~0.14 ms of fence wall on this
+    /// box, more than the GEMVs of an entire layer, so the batching is not a
+    /// convenience: one submit per shared activation is what makes the move
+    /// pay.
+    ///
+    /// Two shader families behind one call. F16 weights go to
+    /// `mul_mat_vec_f16`, whose B operand is a PLAIN f32 vector rather than
+    /// `block_q8_1_x4` (there is no non-quantized arm in `mul_mat_vecq`);
+    /// F32 weights go to the generic `qwen36_router_gemv` the rest of this
+    /// file already uses. Both write f32, so a batch may mix them — which the
+    /// linear-attention in-projections need, their `a`/`b` rows being F32 and
+    /// their `qkv`/`z` rows F16.
+    pub fn dense_gemv(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        x: &[f32],
+        mats: &[Qwen4DeviceTensor],
+    ) -> Result<Vec<Vec<f32>>> {
+        ensure!(!mats.is_empty(), "dense_gemv with no matrices");
+        ensure!(
+            x.len() <= DENSE_X_ELEMS,
+            "dense_gemv activation of {} elements exceeds the {DENSE_X_ELEMS}-element scratch",
+            x.len()
+        );
+        let s = self.slots;
+        for t in mats {
+            ensure!(
+                t.ncols == x.len(),
+                "dense_gemv: weight ncols {} != activation width {}",
+                t.ncols,
+                x.len()
+            );
+        }
+        let rows: Vec<usize> = mats.iter().map(|t| t.nrows).collect();
+        let (offs, cursor) = dense_batch_offsets(&rows);
+        ensure!(
+            cursor <= DENSE_Y_ELEMS,
+            "dense_gemv batch wants {cursor} output elements, scratch holds {DENSE_Y_ELEMS}"
+        );
+        self.write_f32(s.dense_x, x)?;
+        for (t, &off) in mats.iter().zip(&offs) {
+            let (wb, wo, wl) = weights.binding(t)?;
+            let src = Bind::A(s.dense_x, (t.ncols * 4) as u64);
+            let dst = Bind::A(s.dense_y + (off * 4) as u64, (t.nrows * 4) as u64);
+            let ncols = u32::try_from(t.ncols)?;
+            let nrows = u32::try_from(t.nrows)?;
+            match t.format {
+                Qwen4DeviceFormat::F16 => {
+                    // `mul_mat_vec.comp` never reads `p.stride_a` — the row
+                    // stride IS `p.ncols` — so only an exactly-packed
+                    // row-major weight can be expressed through this push
+                    // block. `ncols % 4` is the shader's one shape rule.
+                    ensure!(
+                        ncols.is_multiple_of(4),
+                        "dense_gemv: F16 ncols {ncols} is not a multiple of 4"
+                    );
+                    let spec = GemvDenseSpec::DEFAULT;
+                    let d = gemv_dense_dispatch(nrows, &spec);
+                    self.rec(
+                        Kernel::GemvF16,
+                        spec.specialization_u32(),
+                        &gemv_params_f32_b(ncols, nrows).to_le_bytes(),
+                        &[
+                            Bind::Ext(wb, wo, wl),
+                            src,
+                            dst,
+                            Bind::A(s.dummy, 8),
+                            Bind::A(s.dummy, 8),
+                        ],
+                        [d.x, d.y, d.z],
+                    )?;
+                }
+                Qwen4DeviceFormat::F32 => {
+                    let d = qwen36_router_gemv_dispatch(nrows);
+                    self.rec(
+                        Kernel::Qwen36RouterGemv,
+                        Kernel::Qwen36RouterGemv.specialization_u32(),
+                        &qwen36_router_gemv_params(nrows, ncols, false).to_le_bytes(),
+                        &[src, Bind::Ext(wb, wo, wl), dst],
+                        [d.x, d.y, d.z],
+                    )?;
+                }
+                Qwen4DeviceFormat::Nvfp4 => {
+                    return Err(anyhow!(
+                        "dense_gemv on an NVFP4 tensor — the routed-expert path owns those"
+                    ));
+                }
+            }
+        }
+        self.flush()?;
+        mats.iter()
+            .zip(&offs)
+            .map(|(t, &off)| self.read_f32(s.dense_y + (off * 4) as u64, t.nrows))
+            .collect()
     }
 
     // ── hyper-connection site ────────────────────────────────────────────
@@ -1360,6 +1619,11 @@ impl<'ctx> Qwen4Dev<'ctx> {
         site: HcSite,
         h: &[f32],
     ) -> Result<Vec<f32>> {
+        let _s = prof::stage(match site {
+            HcSite::Attn => "dev.hc.attn.pre",
+            HcSite::Mlp => "dev.hc.mlp.pre",
+            HcSite::Mixer => "dev.hc.mixer",
+        });
         let b = weights.hyper_connection(layer, site)?;
         let hh = hc.hc_hidden() as u64;
         let (norm_buf, norm_off, norm_len) = weights.binding(b.hc_norm)?;
@@ -1431,6 +1695,10 @@ impl<'ctx> Qwen4Dev<'ctx> {
         site: HcSite,
         y: &[f32],
     ) -> Result<Vec<f32>> {
+        let _s = prof::stage(match site {
+            HcSite::Attn => "dev.hc.attn.comb",
+            _ => "dev.hc.mlp.comb",
+        });
         let b = weights.hyper_connection(layer, site)?;
         let inject = b
             .block_inject
@@ -1474,6 +1742,8 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let h = cfg.hidden_size;
         let top_k = cfg.num_experts_per_tok;
         let inter = cfg.moe_intermediate_size;
+        let _s = prof::stage("dev.moe");
+        prof::phase("dev.moe.router");
         let s = self.slots;
         self.write_f32(s.x, x)?;
 
@@ -1516,6 +1786,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
 
         // Fused expert GEMVs. `weight_scale_2` rides SCALE0, indexed by SLOT.
         // ne11 = 1 shares the one `x` row across slots for gate/up.
+        prof::phase("dev.moe.gate_up");
         let mut scale0 = Vec::new();
         for (proj, dst_off) in [(ExpertProj::Gate, s.gate), (ExpertProj::Up, s.up)] {
             self.gemv_id_nvfp4(
@@ -1534,6 +1805,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             // below must not race the recorded read, so flush per projection.
             self.flush()?;
         }
+        prof::phase("dev.moe.swiglu");
         // act = silu(gate) * up over [top_k * inter].
         let n_act = (top_k * inter) as u32;
         let push = swiglu_params(n_act).to_le_bytes();
@@ -1550,6 +1822,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             [d.x, d.y, d.z],
         )?;
         self.flush()?;
+        prof::phase("dev.moe.down_accum");
         // down: each expert slot reads ITS OWN activation row (ne11 = top_k).
         self.gemv_id_nvfp4(
             weights,
@@ -1581,6 +1854,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         self.flush()?;
         let routed = self.read_f32(s.acc, h)?;
 
+        prof::phase("dev.moe.shared");
         // Shared expert on device iff its dense tier is F32-resident.
         let shared_on_device = self
             .try_shared_expert(weights, cfg, layer)
@@ -1836,6 +2110,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         h: &[f32],
         ring_rows: &[f32],
     ) -> Result<DevPleTaps> {
+        let _s = prof::stage("dev.ple");
         let pc = ple_config(cfg);
         let hh = pc.hc_hidden();
         ensure!(embeddings.len() == pc.ple_embed_dim, "ple embeddings width");
@@ -1989,6 +2264,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         x: &[f32],
         pos: usize,
     ) -> Result<(Vec<f32>, DevFullTaps)> {
+        let _s = prof::stage("dev.full_attn");
         let hd = cfg.head_dim;
         let nq = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
@@ -2398,6 +2674,7 @@ impl<'ctx> DevLinearAttn<'ctx> {
         let conv_dim = 2 * nk * kd + nv * vd;
         let state_w = kernel - 1;
         ensure!(gdr_state.len() == nv * kd * vd, "gdr state length");
+        let _s = prof::stage("dev.linear_attn");
         ensure!(conv_ring.len() == conv_dim * state_w, "conv ring length");
         let s = dev.slots;
 
@@ -2575,16 +2852,31 @@ impl<'ctx> DevLinearAttn<'ctx> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `sigmoid(shared_expert_gate · x) · down(silu(gate·x) ⊙ up·x)` on host.
-fn host_shared_expert(moe: &HostMoe<'_>, x: &[f32]) -> Vec<f32> {
-    let s = sigmoid32(moe.shexp_gate.matvec(x)[0]);
-    let g = moe.sh_gate.matvec(x);
-    let u = moe.sh_up.matvec(x);
+fn host_shared_expert(
+    moe: &HostMoe<'_>,
+    x: &[f32],
+    mut gemv: Option<&mut DenseGemv<'_, '_, '_>>,
+) -> Result<Vec<f32>> {
+    // The scalar gate rides in the same batch as gate/up: it is a 1-row F32
+    // GEMV, and a submit of its own would cost more than the row does.
+    let mut proj = dense_many(
+        gemv.as_deref_mut(),
+        &[&moe.shexp_gate, &moe.sh_gate, &moe.sh_up],
+        x,
+    )?
+    .into_iter();
+    let s = sigmoid32(proj.next().expect("shared gate")[0]);
+    let g = proj.next().expect("gate_proj");
+    let u = proj.next().expect("up_proj");
     let act: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| silu32(g) * u).collect();
-    let mut y = moe.sh_down.matvec(&act);
+    let mut y = match gemv {
+        Some(gv) => gv.matvec(&moe.sh_down, &act)?,
+        None => moe.sh_down.matvec(&act),
+    };
     for v in &mut y {
         *v *= s;
     }
-    y
+    Ok(y)
 }
 
 /// How much of the model rides the device.
@@ -2592,12 +2884,16 @@ fn host_shared_expert(moe: &HostMoe<'_>, x: &[f32]) -> Vec<f32> {
 pub enum Qwen4ExpDeviceMode {
     /// No device at all — the pure host transcription (slow; the oracle lane).
     HostOnly,
-    /// Full model: the NVFP4 expert stacks + the F32 small tier resident; the
-    /// dense bf16 tier and `lm_head` stay host-side. This is the residency
-    /// that FITS the driver's heapBudget — the full plan's F16 dense tier has
-    /// no registered GEMV to consume it anyway, and dropping it (6.70 GiB) +
-    /// `lm_head` (1.18 GiB) brings the commit under the ~70.7 GiB budget the
-    /// 74.4 GiB heap actually grants.
+    /// Full model, everything resident: the NVFP4 expert stacks, the F32 small
+    /// tier, AND the F16 dense tier including `lm_head`.
+    ///
+    /// The dense tier used to be dropped here for two reasons, both now gone:
+    /// no registered GEMV consumed it ([`Kernel::GemvF16`] does), and the plan
+    /// did not fit the driver's ~70.7 GiB `heapBudget` (`spill_to_fit` moves
+    /// the coldest expert stacks to the host heap, which a same-sitting sweep
+    /// priced at 0.5% of read bandwidth). Keeping it resident is what takes the
+    /// 6779.61 MiB/token of host bf16 matvec — 75.6% of a measured token — off
+    /// the CPU.
     HybridExperts,
     /// A layer subset with the dense tier F32-resident too (bring-up /
     /// parity): all stages of the named layers run on device, including
@@ -2673,18 +2969,12 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
         let (weights, dev, dev_linear) = match (ctx, mode) {
             (None, _) | (_, Qwen4ExpDeviceMode::HostOnly) => (None, None, BTreeMap::new()),
             (Some(ctx), Qwen4ExpDeviceMode::HybridExperts) => {
-                let scope = Qwen4UploadScope {
-                    lm_head: false,
-                    ..Qwen4UploadScope::full()
-                };
+                // Everything, dense tier included. `upload_qwen4` owns the
+                // budget guard AND the host-heap spill that makes the full
+                // plan fit; a second copy of that arithmetic here could only
+                // disagree with it.
                 let ucfg = Qwen4UploadConfig::default();
-                let mut plan = plan_qwen4_upload(st, &ucfg, &scope)?;
-                // Drop the F16 dense tier: no F16 GEMV exists to read it, and
-                // WITH it the commit exceeds the driver's heapBudget (the
-                // audit's landmine #1). Keep NVFP4 stacks + the F32 tier.
-                plan.items.retain(|it| it.format != Qwen4DeviceFormat::F16);
-                plan.device_bytes = plan.items.iter().map(|it| it.bytes).sum();
-                ensure_within_driver_budget(ctx, plan.device_bytes, ucfg.reserve_bytes)?;
+                let plan = plan_qwen4_upload(st, &ucfg, &Qwen4UploadScope::full())?;
                 let weights = upload_qwen4(ctx, st, &plan, &ucfg)?;
                 let dev = Qwen4Dev::new(ctx, &cfg, &[], cfg.max_context)?;
                 (Some(weights), Some(dev), BTreeMap::new())
@@ -2699,7 +2989,6 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                     ..Qwen4UploadConfig::default()
                 };
                 let plan = plan_qwen4_upload(st, &ucfg, &scope)?;
-                ensure_within_driver_budget(ctx, plan.device_bytes, ucfg.reserve_bytes)?;
                 let weights = upload_qwen4(ctx, st, &plan, &ucfg)?;
                 let full_dev: Vec<usize> = subset
                     .iter()
@@ -2741,6 +3030,12 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
     #[must_use]
     pub fn state(&self) -> &Qwen4ExpState {
         &self.state
+    }
+
+    /// The device runner, for the profile harness. `None` in
+    /// [`Qwen4ExpDeviceMode::HostOnly`].
+    pub fn dev_mut(&mut self) -> Option<&mut Qwen4Dev<'ctx>> {
+        self.dev.as_mut()
     }
 
     /// Gather one token's concatenated n-gram embedding `[ple_embed_dim]`
@@ -2788,6 +3083,8 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             self.state.seq_len
         );
 
+        let _token = prof::stage("token");
+        let ngram_span = prof::stage("host.ngram_gather");
         // n-gram rows for THIS token, from the context BEFORE it.
         let ple_emb = if self.cfg.ple_layer_ids.is_empty() {
             Vec::new()
@@ -2796,10 +3093,13 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             self.gather_ple_embedding(&ids)?
         };
         self.state.ngram.push(&[i64::from(token)]);
+        drop(ngram_span);
 
         // Seed the hyper residual: the embedding tiled hc_count times.
+        let embed_span = prof::stage("host.embed_seed");
         let embed = self.tables.embed_row(token as usize)?;
         let mut h = qwen4_hc::seed_hyper_state(&self.hc, &embed)?;
+        drop(embed_span);
 
         let Self {
             cfg,
@@ -2822,6 +3122,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             // the gather + ring already live host-side). UNCONDITIONAL on the
             // PLE layer — omitting it is a wrong forward, not a degraded one.
             if let Some(ple) = &hl.ple {
+                let _s = prof::stage("host.ple");
                 let ring = state
                     .ple_conv
                     .get_mut(&layer)
@@ -2844,6 +3145,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let w = weights.as_ref().expect("hc_dev checked");
                 (d.hc_pre(w, hc, Some(layer), HcSite::Attn, &h)?, None)
             } else {
+                let _s = prof::stage("host.hc_pre");
                 let gr = qwen4_hc::gated_residual(hc, &hl.attn_hc, &h)?;
                 (gr.block_input.clone(), Some(gr))
             };
@@ -2858,12 +3160,18 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                         .conv
                         .get_mut(&layer)
                         .ok_or_else(|| anyhow!("no conv ring"))?;
-                    match (dev.as_mut(), dev_linear.get(&layer)) {
-                        (Some(d), Some(la)) => la.forward(d, cfg, &x, gdr, ring)?.0,
-                        _ => {
-                            let w = hl.linear.as_ref().expect("linear weights");
-                            host_linear_attention(cfg, w, &x, gdr, ring).0
-                        }
+                    if dev.is_some() && dev_linear.contains_key(&layer) {
+                        let d = dev.as_mut().expect("dev present");
+                        let la = &dev_linear[&layer];
+                        la.forward(d, cfg, &x, gdr, ring)?.0
+                    } else {
+                        let _s = prof::stage("host.linear_attn");
+                        let w = hl.linear.as_ref().expect("linear weights");
+                        let mut gemv = dev
+                            .as_mut()
+                            .zip(weights.as_ref())
+                            .map(|(d, wt)| DenseGemv::new(d, wt));
+                        host_linear_attention(cfg, w, &x, gdr, ring, gemv.as_mut())?.0
                     }
                 }
                 Qwen4LayerType::FullAttention => {
@@ -2876,9 +3184,14 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                         let w = weights.as_ref().expect("dev_ready");
                         d.full_attention(w, cfg, layer, &x, start_pos)?.0
                     } else {
+                        let _s = prof::stage("host.full_attn");
                         let w = hl.full.as_ref().expect("full weights");
                         let kv = state.kv.get_mut(&layer).ok_or_else(|| anyhow!("no KV"))?;
-                        host_full_attention(cfg, w, &x, start_pos, kv).0
+                        let mut gemv = dev
+                            .as_mut()
+                            .zip(weights.as_ref())
+                            .map(|(d, wt)| DenseGemv::new(d, wt));
+                        host_full_attention(cfg, w, &x, start_pos, kv, gemv.as_mut())?.0
                     }
                 }
             };
@@ -2888,6 +3201,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let w = weights.as_ref().expect("hc_dev checked");
                 h = d.hc_combine(w, hc, Some(layer), HcSite::Attn, &y)?;
             } else {
+                let _s = prof::stage("host.hc_comb");
                 let gr = host_gr.expect("host gated residual");
                 let inj = gr
                     .injection_weights
@@ -2902,6 +3216,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let w = weights.as_ref().expect("hc_dev checked");
                 (d.hc_pre(w, hc, Some(layer), HcSite::Mlp, &h)?, None)
             } else {
+                let _s = prof::stage("host.hc_pre");
                 let gr = qwen4_hc::gated_residual(hc, &hl.mlp_hc, &h)?;
                 (gr.block_input.clone(), Some(gr))
             };
@@ -2910,17 +3225,25 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 .as_ref()
                 .is_some_and(|w| dev.is_some() && w.expert_stack(layer, ExpertProj::Gate).is_ok());
             let y = if moe_dev {
-                let d = dev.as_mut().expect("moe_dev checked");
-                let w = weights.as_ref().expect("moe_dev checked");
-                let (mut y, taps) = d.moe(w, cfg, layer, &x)?;
+                let (mut y, taps) = {
+                    let d = dev.as_mut().expect("moe_dev checked");
+                    let w = weights.as_ref().expect("moe_dev checked");
+                    d.moe(w, cfg, layer, &x)?
+                };
                 if !taps.shared_on_device {
-                    let sh = host_shared_expert(&hl.moe, &x);
+                    let _s = prof::stage("host.shared_expert");
+                    let mut gemv = dev
+                        .as_mut()
+                        .zip(weights.as_ref())
+                        .map(|(d, wt)| DenseGemv::new(d, wt));
+                    let sh = host_shared_expert(&hl.moe, &x, gemv.as_mut())?;
                     for (yv, &sv) in y.iter_mut().zip(&sh) {
                         *yv += sv;
                     }
                 }
                 y
             } else {
+                let _s = prof::stage("host.moe");
                 host_moe(cfg, st, layer, &hl.moe, &x)?.0
             };
 
@@ -2929,6 +3252,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let w = weights.as_ref().expect("hc_dev checked");
                 h = d.hc_combine(w, hc, Some(layer), HcSite::Mlp, &y)?;
             } else {
+                let _s = prof::stage("host.hc_comb");
                 let gr = host_gr.expect("host gated residual");
                 let inj = gr
                     .injection_weights
@@ -2939,7 +3263,9 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
         }
 
         // Stream mixer (use_combine = false) collapses 10240 → 2560; there is
-        // NO other final norm. Then lm_head (host bf16).
+        // NO other final norm. Then lm_head — on device when it is resident,
+        // which is worth 52 ms of the 899 ms token measured before this lane
+        // existed: 1212.5 MiB in ONE projection.
         let mixer_dev = self
             .weights
             .as_ref()
@@ -2949,52 +3275,241 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             let w = self.weights.as_ref().expect("mixer_dev checked");
             d.hc_pre(w, &self.hc, None, HcSite::Mixer, &h)?
         } else {
+            let _s = prof::stage("host.hc_pre");
             qwen4_hc::gated_residual(&self.hc, &self.mixer, &h)?.block_input
         };
-        let logits = self.lm_head.matvec(&x);
+        let lm_span = prof::stage("host.lm_head");
+        let logits = match self.dev.as_mut().zip(self.weights.as_ref()) {
+            Some((d, w)) => DenseGemv::new(d, w).matvec(&self.lm_head, &x)?,
+            None => self.lm_head.matvec(&x),
+        };
+        drop(lm_span);
 
         self.state.seq_len += 1;
         Ok(logits)
     }
 }
 
-/// Refuse a device plan that exceeds the DRIVER'S heap budget, not just the
-/// heap size. `vulkaninfo` on the target box: heap 1 is 74.43 GiB but
-/// `heapBudget` is ~70.71 GiB — `ensure_fits` against the size passes and the
-/// load then either dies with OUT_OF_DEVICE_MEMORY or gets silently demoted
-/// to a ~5x-slower fallback tier. Checking the budget up front turns that
-/// into a loud, immediate error.
-fn ensure_within_driver_budget(ctx: &VulkanContext, plan_bytes: u64, reserve: u64) -> Result<()> {
-    let heaps = ctx.memory_heaps();
-    let budgets = ctx.memory_budgets();
-    let mut limit = heaps
-        .iter()
-        .filter(|&&(_, local)| local)
-        .map(|&(size, _)| size)
-        .max()
-        .unwrap_or(u64::MAX);
-    if let Some(budgets) = budgets {
-        // Budgets align with heap indices; take the device-local one.
-        for (i, &(size, local)) in heaps.iter().enumerate() {
-            if local && size == limit {
-                if let Some(&(budget, usage)) = budgets.get(i) {
-                    limit = limit.min(budget.saturating_sub(usage));
-                }
-                break;
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-stage wall-clock profile (additive instrumentation; see `prof`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Where a token's wall clock goes, charged so the buckets PARTITION it.
+///
+/// The forward is a chain of synchronous stages, so a table of independently
+/// measured stage timings would double-count (a stage's wall contains its
+/// copies and its fence wait) and leave the reader unable to tell a real
+/// residual from an overlap. Instead every timed scope adds its wall to a
+/// thread-local "already charged" counter, and a [`Stage`] books only
+/// `wall - (what its children charged)` under its own `cpu` part. The rows
+/// therefore sum to the outermost stage's measured wall exactly, and the
+/// unattributed remainder shows up as one honest line rather than as slack
+/// smeared over the table.
+///
+/// Off — and untimed, no `Instant::now` — unless [`set_enabled`] turns it on.
+/// The consumer is `tests/qwen4_forward.rs`'s `profile_forward_token`.
+pub mod prof {
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// One `(stage, part)` accumulator. `part` is `cpu` for a stage's own host
+    /// work and `h2d`/`record`/`submit`/`d2h` for the device leaves.
+    #[derive(Clone, Debug)]
+    pub struct Row {
+        /// The innermost open [`Stage`] (or [`phase`]) when this was charged.
+        pub stage: &'static str,
+        /// Which leaf of that stage.
+        pub part: &'static str,
+        /// Total wall charged here.
+        pub nanos: u64,
+        /// How many times this bucket was charged (dispatches for `record`,
+        /// `vkQueueSubmit`s for `submit`, copies for `h2d`/`d2h`).
+        pub calls: u64,
+        /// Bytes moved, for the copy parts.
+        pub bytes: u64,
+    }
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static ROWS: Mutex<Vec<Row>> = Mutex::new(Vec::new());
+
+    /// An open [`phase`] inside the current stage.
+    #[derive(Clone, Copy)]
+    struct Open {
+        name: &'static str,
+        t0: Instant,
+        charged0: u64,
+        parent: &'static str,
+    }
+
+    thread_local! {
+        /// The innermost open stage — what [`Span`]s charge to, and the label
+        /// `rec` hands the GPU timestamp profiler.
+        static STAGE: Cell<&'static str> = const { Cell::new("(outside)") };
+        /// Nanoseconds charged to any bucket so far. A stage's own `cpu` is
+        /// its wall minus this counter's delta across its lifetime.
+        static CHARGED: Cell<u64> = const { Cell::new(0) };
+        /// The open phase, if any. One level; phases never straddle a stage.
+        static PHASE: Cell<Option<Open>> = const { Cell::new(None) };
+    }
+
+    fn nanos(d: Duration) -> u64 {
+        u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Turn timing on or off for every thread.
+    pub fn set_enabled(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether scopes are currently timed.
+    #[must_use]
+    pub fn enabled() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    /// The innermost open stage's name.
+    #[must_use]
+    pub fn current() -> &'static str {
+        STAGE.with(Cell::get)
+    }
+
+    fn accum(stage: &'static str, part: &'static str, nanos: u64, bytes: u64) {
+        let Ok(mut rows) = ROWS.lock() else { return };
+        match rows.iter_mut().find(|r| r.stage == stage && r.part == part) {
+            Some(r) => {
+                r.nanos += nanos;
+                r.calls += 1;
+                r.bytes += bytes;
             }
+            None => rows.push(Row {
+                stage,
+                part,
+                nanos,
+                calls: 1,
+                bytes,
+            }),
         }
     }
-    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    ensure!(
-        plan_bytes.saturating_add(reserve) <= limit,
-        "qwen4 device plan needs {:.2} GiB (+{:.2} GiB reserve) but the driver grants only \
-         {:.2} GiB of the device-local heap (heapBudget, not heap size). KNOWN ISSUE: the \
-         full-residency replan is scheduled work; run the hybrid residency or a subset.",
-        gib(plan_bytes),
-        gib(reserve),
-        gib(limit),
-    );
-    Ok(())
+
+    fn charge(n: u64) {
+        CHARGED.with(|c| c.set(c.get().saturating_add(n)));
+    }
+
+    /// Drain and reset the table.
+    #[must_use]
+    pub fn take() -> Vec<Row> {
+        ROWS.lock()
+            .map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default()
+    }
+
+    /// A timed leaf of the current stage.
+    pub struct Span {
+        part: &'static str,
+        bytes: u64,
+        t0: Option<Instant>,
+    }
+
+    /// Time this scope as `part` of the current stage.
+    #[must_use]
+    pub fn span(part: &'static str) -> Span {
+        span_bytes(part, 0)
+    }
+
+    /// Time this scope as `part`, also booking `bytes` moved.
+    #[must_use]
+    pub fn span_bytes(part: &'static str, bytes: u64) -> Span {
+        Span {
+            part,
+            bytes,
+            t0: enabled().then(Instant::now),
+        }
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            let Some(t0) = self.t0 else { return };
+            let dt = nanos(t0.elapsed());
+            accum(current(), self.part, dt, self.bytes);
+            charge(dt);
+        }
+    }
+
+    /// A stage. Nests: an inner stage's whole wall is a child charge of the
+    /// outer one, so the outermost stage's `cpu` row IS the residual.
+    pub struct Stage {
+        prev: &'static str,
+        name: &'static str,
+        t0: Option<Instant>,
+        charged0: u64,
+    }
+
+    /// Open a stage for this scope.
+    #[must_use]
+    pub fn stage(name: &'static str) -> Stage {
+        if !enabled() {
+            return Stage {
+                prev: current(),
+                name,
+                t0: None,
+                charged0: 0,
+            };
+        }
+        let prev = current();
+        let charged0 = CHARGED.with(Cell::get);
+        STAGE.with(|s| s.set(name));
+        Stage {
+            prev,
+            name,
+            t0: Some(Instant::now()),
+            charged0,
+        }
+    }
+
+    fn close(name: &'static str, t0: Instant, charged0: u64, parent: &'static str) {
+        let wall = nanos(t0.elapsed());
+        let children = CHARGED.with(Cell::get).saturating_sub(charged0);
+        accum(name, "cpu", wall.saturating_sub(children), 0);
+        CHARGED.with(|c| c.set(charged0.saturating_add(wall)));
+        STAGE.with(|s| s.set(parent));
+    }
+
+    impl Drop for Stage {
+        fn drop(&mut self) {
+            let Some(t0) = self.t0 else { return };
+            end_phase();
+            close(self.name, t0, self.charged0, self.prev);
+        }
+    }
+
+    /// Split a stage into sequential phases WITHOUT restructuring its body:
+    /// each call closes the open phase and opens `name`; the enclosing
+    /// [`Stage`] closes the last one. Keeps the instrumentation diff on a long
+    /// straight-line device stage down to one line per phase boundary.
+    pub fn phase(name: &'static str) {
+        if !enabled() {
+            return;
+        }
+        end_phase();
+        let open = Open {
+            name,
+            t0: Instant::now(),
+            charged0: CHARGED.with(Cell::get),
+            parent: current(),
+        };
+        PHASE.with(|p| p.set(Some(open)));
+        STAGE.with(|s| s.set(name));
+    }
+
+    /// Close the open phase, if any.
+    pub fn end_phase() {
+        let Some(o) = PHASE.with(Cell::take) else {
+            return;
+        };
+        close(o.name, o.t0, o.charged0, o.parent);
+    }
 }
 
 #[cfg(test)]
@@ -3015,6 +3530,19 @@ mod tests {
     }
 
     /// Encode f32s as bf16 bytes (RNE), for synthetic `HostDense` tensors.
+    /// A `HostDense` over raw bf16 bytes for the offline fixtures. The empty
+    /// name is deliberate: these tensors have no device twin, and a name that
+    /// accidentally matched a resident one would silently route the oracle
+    /// through the GPU.
+    fn dense(bytes: &[u8], in_dim: usize, out_dim: usize) -> HostDense<'_> {
+        HostDense {
+            name: String::new(),
+            bytes,
+            in_dim,
+            out_dim,
+        }
+    }
+
     fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
         vals.iter()
             .flat_map(|&v| {
@@ -3282,35 +3810,15 @@ mod tests {
             bf16_bytes(&out_w),
         );
         let w = HostLinearAttn {
-            qkv: HostDense {
-                bytes: &qkv_b,
-                in_dim: h,
-                out_dim: conv_dim,
-            },
-            z: HostDense {
-                bytes: &z_b,
-                in_dim: h,
-                out_dim: nv * vd,
-            },
-            a: HostDense {
-                bytes: &a_b,
-                in_dim: h,
-                out_dim: nv,
-            },
-            b: HostDense {
-                bytes: &b_b,
-                in_dim: h,
-                out_dim: nv,
-            },
+            qkv: dense(&qkv_b, h, conv_dim),
+            z: dense(&z_b, h, nv * vd),
+            a: dense(&a_b, h, nv),
+            b: dense(&b_b, h, nv),
             a_log: a_log.clone(),
             dt_bias: dt_bias.clone(),
             conv: conv_w.clone(),
             norm: norm.clone(),
-            out: HostDense {
-                bytes: &out_b,
-                in_dim: nv * vd,
-                out_dim: h,
-            },
+            out: dense(&out_b, nv * vd, h),
         };
 
         let tokens: Vec<Vec<f32>> = (0..3).map(|_| int_vec(h)).collect();
@@ -3397,7 +3905,8 @@ mod tests {
         let mut gdr = vec![0.0f32; nv * kd * vd];
         let mut ring = vec![0.0f32; conv_dim * (kernel - 1)];
         for (t, x) in tokens.iter().enumerate() {
-            let (y, _taps) = host_linear_attention(&cfg, &w, x, &mut gdr, &mut ring);
+            let (y, _taps) =
+                host_linear_attention(&cfg, &w, x, &mut gdr, &mut ring, None).expect("host linear");
             let want: Vec<f32> = want_y[t].iter().map(|&v| v as f32).collect();
             let rel = max_rel(&y, &want);
             assert!(
@@ -3437,32 +3946,16 @@ mod tests {
             bf16_bytes(&o_w),
         );
         let w = HostFullAttn {
-            q: HostDense {
-                bytes: &q_b,
-                in_dim: h,
-                out_dim: nq * hd * 2,
-            },
-            k: HostDense {
-                bytes: &k_b,
-                in_dim: h,
-                out_dim: nkv * hd,
-            },
-            v: HostDense {
-                bytes: &v_b,
-                in_dim: h,
-                out_dim: nkv * hd,
-            },
-            o: HostDense {
-                bytes: &o_b,
-                in_dim: q_dim,
-                out_dim: h,
-            },
+            q: dense(&q_b, h, nq * hd * 2),
+            k: dense(&k_b, h, nkv * hd),
+            v: dense(&v_b, h, nkv * hd),
+            o: dense(&o_b, q_dim, h),
             q_norm: vec![0.0; hd],
             k_norm: vec![0.0; hd],
         };
         let x = int_vec(h);
         let mut kv = HostKv::default();
-        let (y, taps) = host_full_attention(&cfg, &w, &x, 0, &mut kv);
+        let (y, taps) = host_full_attention(&cfg, &w, &x, 0, &mut kv, None).expect("host full");
         let group = nq / nkv;
         for head in 0..nq {
             let kvh = head / group;
@@ -3478,5 +3971,135 @@ mod tests {
             }
         }
         assert_eq!(kv.k.len(), nkv * hd, "one position cached");
+    }
+
+    /// The profile buckets must PARTITION the wall, not overlap it: a leaf's
+    /// time is subtracted from its parent's `cpu`, and a nested stage's whole
+    /// wall from its parent's. Without that subtraction every row containing a
+    /// child double-counts, and the table's "where did the token go" answer is
+    /// inflated by exactly the amount that matters most.
+    ///
+    /// Sleeps are coarse (Windows' timer granularity is ~15.6 ms and rounds
+    /// up), so the bands are wide; the defect this catches is a 1.5x sum, not
+    /// a 5% one.
+    #[test]
+    fn prof_buckets_partition_the_wall() {
+        use std::time::{Duration, Instant};
+        let _ = prof::take();
+        prof::set_enabled(true);
+        let t0 = Instant::now();
+        {
+            let _outer = prof::stage("outer");
+            {
+                let _leaf = prof::span("d2h");
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            {
+                let _inner = prof::stage("inner");
+                {
+                    let _leaf = prof::span("submit");
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let wall = t0.elapsed().as_nanos() as u64;
+        prof::set_enabled(false);
+        let rows = prof::take();
+
+        // `prof`'s ROWS table is process-global while its stage stack is
+        // thread-local, so a test running in PARALLEL with this one lands its
+        // own rows here — `HostDense::matvec` opens a `matvec` span, and the
+        // host attention oracles open `host.*` phases. That is not a defect in
+        // the partition: the claim under test is that ONE thread's stage tree
+        // partitions ITS wall, and a foreign thread's rows are noise from a
+        // different tree. Scoping the sum to this test's own stage names is
+        // what makes it a statement about nesting rather than about the
+        // scheduler. (Without it the suite is red only under `--test-threads`
+        // > 1, and only sometimes — the worst kind of red.)
+        let mine = |r: &prof::Row| r.stage == "outer" || r.stage == "inner";
+        let foreign = rows.iter().filter(|r| !mine(r)).count();
+        let sum: u64 = rows.iter().filter(|r| mine(r)).map(|r| r.nanos).sum();
+        let ratio = sum as f64 / wall as f64;
+        assert!(
+            (0.97..=1.03).contains(&ratio),
+            "own rows sum to {ratio:.3}x the {:.1} ms wall ({foreign} foreign rows ignored): \
+             {rows:?}",
+            wall as f64 / 1e6
+        );
+
+        let at = |stage: &str, part: &str| {
+            rows.iter()
+                .find(|r| r.stage == stage && r.part == part)
+                .map_or(0.0, |r| r.nanos as f64 / 1e6)
+        };
+        // `outer` slept 40 ms of its own and CONTAINED ~100 ms more.
+        let outer_cpu = at("outer", "cpu");
+        assert!(
+            (25.0..75.0).contains(&outer_cpu),
+            "outer cpu {outer_cpu:.1} ms should be its own ~40 ms sleep, not the ~140 ms it spans"
+        );
+        let inner_cpu = at("inner", "cpu");
+        assert!(
+            (20.0..60.0).contains(&inner_cpu),
+            "inner cpu {inner_cpu:.1} ms should exclude its own ~30 ms leaf"
+        );
+        assert!(
+            (30.0..75.0).contains(&at("outer", "d2h")),
+            "leaf charged to its stage"
+        );
+        assert!(
+            (20.0..60.0).contains(&at("inner", "submit")),
+            "leaf charged to its stage"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.stage != "outer" || r.part != "submit"),
+            "the inner stage's leaf must not land on the outer stage"
+        );
+    }
+
+    /// A batch's output offsets are DESCRIPTOR offsets, so the layout has to
+    /// pad rather than pack: a running sum would bind the shared expert's
+    /// 1-row scalar gate at byte 4, which no device accepts and which
+    /// `storage_buffers_ranged` cannot fix for us.
+    ///
+    /// The two shapes here are the real ones — the shared expert's
+    /// `{gate, gate_proj, up_proj}` and the linear-attention
+    /// `{qkv, z, a, b}` — so a regression shows up as the wrong bytes, not as
+    /// an abstract off-by-one.
+    #[test]
+    fn dense_batch_offsets_pad_every_output_to_a_bindable_stride() {
+        let (offs, total) = dense_batch_offsets(&[1, 640, 640]);
+        assert_eq!(offs, vec![0, 64, 704], "shared-expert batch");
+        assert_eq!(total, 1344);
+
+        let rows = [10240usize, 6144, 48, 48];
+        let (offs, total) = dense_batch_offsets(&rows);
+        assert_eq!(offs, vec![0, 10240, 16384, 16448], "linear in-projections");
+        assert_eq!(total, 16512);
+
+        for (i, (&o, &n)) in offs.iter().zip(&rows).enumerate() {
+            assert_eq!(
+                (o * 4) % 256,
+                0,
+                "output {i} at element {o} is not 256-B aligned"
+            );
+            let end = offs.get(i + 1).copied().unwrap_or(total);
+            assert!(
+                o + n <= end,
+                "output {i} ({n} rows at {o}) runs into its neighbour"
+            );
+        }
+
+        // `lm_head` is the widest projection this checkpoint asks for and it
+        // goes alone; if it stops fitting, `dense_gemv` refuses the token.
+        assert!(
+            dense_batch_offsets(&[248_320]).1 <= DENSE_Y_ELEMS,
+            "lm_head rows"
+        );
+        // `out_proj` / `o_proj` are the widest contraction (6144).
+        const { assert!(DENSE_X_ELEMS >= 6_144, "widest dense activation") };
     }
 }

@@ -470,11 +470,12 @@ impl infer_seam::PrefixReuse for VulkanExecutor {
 /// (or a GGUF whose metadata classifies as `Qwen4Exp` and whose parent
 /// directory holds the safetensors checkpoint).
 ///
-/// Device residency defaults to the hybrid split (NVFP4 experts + the F32
-/// small tier resident; dense bf16 + `lm_head` host-side — the residency that
-/// fits the driver's heapBudget). `ARLE_QWEN4_DEVICE_MODE=host` forces the
-/// pure host transcription; `=subset:0,1,3` uploads only those layers with
-/// the dense tier F32-resident (bring-up).
+/// Device residency defaults to the hybrid split: everything resident — NVFP4
+/// experts, the F32 small tier, and the F16 dense tier including `lm_head` —
+/// with `upload_qwen4`'s spill placing whatever exceeds the driver's
+/// heapBudget on the host heap. `ARLE_QWEN4_DEVICE_MODE=host` forces the pure
+/// host transcription; `=subset:0,1,3` uploads only those layers with the
+/// dense tier F32-resident (bring-up).
 pub fn load_qwen4_dir(
     dir: impl AsRef<std::path::Path>,
     num_slots: usize,
