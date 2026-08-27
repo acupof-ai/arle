@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on the Vulkan lane
 
-Status: active. S0-S4 shipped; S5 in flight. Target box: Radeon 8060S
+Status: active. S0-S5 shipped — first token out (` Paris`), see the
+[win entry](../experience/wins/2026-08-27-qwen4exp-first-token.md). Target box: Radeon 8060S
 (gfx1151), 74.43 GiB device-local heap (**70.71 GiB driver budget** -- plan
 against the budget, not the size), 63.6 GB OS-visible RAM, 256 GB/s LPDDR5X.
 
@@ -277,7 +278,7 @@ into "measured". Build it before chasing the first token, not after.
 | S2 ✅ | safetensors source, slab uploader, mmap'd N-table host embedding | done |
 | S3 ✅ | NVFP4 fused-expert GEMV + CPU oracle | done |
 | S4 ✅ | fused hyper-connection + PLE kernels vs host oracles | done |
-| S5 | PLE + n-gram → **first token** (indexer stubbed, ≤2048 ctx) | 24 h |
+| S5 ✅ | PLE + n-gram → **first token** (indexer stubbed, ≤2048 ctx) | done |
 | S6 | QSA indexer → contexts >2051 | 40 h |
 | S7 | requantize the non-expert 87%; batched MoE prefill; fuse hyper-connections | 40 h |
 | S8 | MTP speculative decode (needs S7's batched verify) | 20 h |
