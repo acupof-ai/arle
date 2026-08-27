@@ -15,9 +15,25 @@
 //! - `DeviceDequant` is BF16 in the file and F16 on the device: 2 bytes either
 //!   way, so this tier is byte-neutral too.
 //!
-//! So the device total below needs no conversion factor. What it does NOT
-//! include is allocator padding; the `vulkan` build adds a `SlabPlan` dry-run at
-//! the end, which is what answers "does it fit" for real.
+//! So the family table below needs no conversion factor. What it does NOT
+//! include is the F32 tier or allocator padding, and that gap is not small:
+//! `qwen4_upload` uploads the hyper-connection weights, norms and routers at F32
+//! because their shaders declare `float[]`, which is 1.33 GiB more than the BF16
+//! the file holds. **The classifier tally is therefore a FLOOR, not the number
+//! the load is gated on** — 71.314 GiB against the planner's 72.640. The fit
+//! assertions run `plan_qwen4_upload` for exactly that reason; the table stays
+//! because it answers a different question (where are the bytes).
+//!
+//! ## The heap size is not the budget
+//!
+//! Heap 1 reports 74.43 GiB of `VkMemoryHeap::size` and 70.71 GiB of
+//! `heapBudget`. Planning against the size is what let a 72.64 GiB residency
+//! look like it fit; over-committing this UMA part is not
+//! `ERROR_OUT_OF_DEVICE_MEMORY` but silent page demotion, so the load appears to
+//! work and is quietly several times slow.
+//! `device_budget_is_the_planning_number` pins the live numbers against the
+//! constants here, so a driver or BIOS change surfaces as a failing test rather
+//! than as a mystery.
 //!
 //! Runs in ~1s and needs no GPU, so it is not gated behind an opt-in flag; it
 //! skips cleanly when the checkpoint is absent. Point `ARLE_QWEN4_CKPT` at the
@@ -28,9 +44,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use infer_gguf::safetensors::SafeTensorsDir;
+use infer_vulkan::loader::{DeviceBudget, DeviceBudgetSource};
 use infer_vulkan::qwen4_names::{
     HcSite, Nvfp4Part, Qwen4Residency, Qwen4Stream, Qwen4TensorKind, Qwen4TensorRole,
     classify_qwen4_tensor,
+};
+use infer_vulkan::qwen4_upload::{
+    DEFAULT_RESERVE_BYTES, Qwen4UploadConfig, Qwen4UploadScope, plan_qwen4_upload,
 };
 
 const CKPT_ENV: &str = "ARLE_QWEN4_CKPT";
@@ -38,13 +58,29 @@ const CKPT_DEFAULT: &str = r"C:\Users\Asus\models\qwen3.8-flash-next-nvfp4";
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-/// Device-local heap on the Radeon 8060S (Strix Halo, 128 GB LPDDR5X UMA), as
-/// reported by `VkPhysicalDeviceMemoryProperties` for the DEVICE_LOCAL heap.
-const HEAP_GIB: f64 = 74.43;
+/// Device-local heap SIZE on the Radeon 8060S (Strix Halo, 128 GB LPDDR5X UMA),
+/// as reported by `VkPhysicalDeviceMemoryProperties`: 74.4322 GiB. Informative
+/// only — nothing is planned against it.
+const HEAP_BYTES: u64 = 79_920_955_392;
+
+/// What the DRIVER grants on that heap: `VK_EXT_memory_budget`'s `heapBudget`,
+/// 70.7107 GiB, 3.72 GiB under the size. THIS is the number a residency plan
+/// lives or dies by.
+const BUDGET_BYTES: u64 = 75_924_905_984;
 
 /// `maxMemoryAllocationSize` on this device, queried via maintenance3. Every
 /// binding must fit inside one slab of this size.
 const SLAB_BYTES: u64 = 2048 << 20;
+
+/// The pinned budget, shaped for `Qwen4Plan::ensure_fits`.
+fn pinned_budget() -> DeviceBudget {
+    DeviceBudget {
+        bytes: BUDGET_BYTES,
+        source: DeviceBudgetSource::DriverBudget,
+        heap_index: 1,
+        heap_size: HEAP_BYTES,
+    }
+}
 
 fn checkpoint_dir() -> PathBuf {
     std::env::var_os(CKPT_ENV)
@@ -196,8 +232,14 @@ fn print_section(title: &str, rows: &BTreeMap<String, Row>, denom: u64) {
     println!();
 }
 
+/// The family table, and the CLASSIFIER FLOOR it adds up to.
+///
+/// Deliberately not a fit check any more: this tally is 1.33 GiB under the
+/// planner's because it does not model the F32 tier, so asserting a fit here
+/// would assert the wrong number. `full_plan_fits_the_driver_budget_only_after_spilling`
+/// owns that question.
 #[test]
-fn real_checkpoint_residency_plan_fits_the_device_heap() {
+fn real_checkpoint_residency_table_and_classifier_floor() {
     let dir = checkpoint_dir();
     if !dir.is_dir() {
         eprintln!(
@@ -334,12 +376,19 @@ fn real_checkpoint_residency_plan_fits_the_device_heap() {
         device,
         device as f64 / GIB,
     );
-    let heap = HEAP_GIB * GIB;
+    let heap = HEAP_BYTES as f64;
+    let budget = BUDGET_BYTES as f64;
     println!(
         "    vs device-local heap {:.2} GiB: {:.2}% used, {:.2} GiB headroom",
-        HEAP_GIB,
+        heap / GIB,
         100.0 * device as f64 / heap,
         (heap - device as f64) / GIB,
+    );
+    println!(
+        "    vs DRIVER BUDGET     {:.2} GiB: {:.2}% used, {:.2} GiB headroom  <- the real limit",
+        budget / GIB,
+        100.0 * device as f64 / budget,
+        (budget - device as f64) / GIB,
     );
     println!(
         "    largest single device binding: {:.3} GiB  {}  (maxMemoryAllocationSize = {:.0} GiB)",
@@ -383,14 +432,20 @@ fn real_checkpoint_residency_plan_fits_the_device_heap() {
             plan.wasted_bytes() as f64 / GIB,
         );
         println!(
-            "    committed vs heap: {:.2}% used, {:.2} GiB headroom",
-            100.0 * plan.committed_bytes() as f64 / heap,
-            (heap - plan.committed_bytes() as f64) / GIB,
+            "    committed vs budget: {:.2}% used, {:.2} GiB headroom",
+            100.0 * plan.committed_bytes() as f64 / budget,
+            (budget - plan.committed_bytes() as f64) / GIB,
         );
+        // The classifier floor already over-commits the budget before the F32
+        // tier is even counted. Assert the direction rather than a fit: the
+        // number that has to fit is `full_plan_fits_the_driver_budget`'s.
         assert!(
-            (plan.committed_bytes() as f64) < heap,
-            "committed slabs {:.3} GiB exceed the {HEAP_GIB} GiB device-local heap",
+            plan.committed_bytes() > BUDGET_BYTES - DEFAULT_RESERVE_BYTES,
+            "the classifier FLOOR ({:.3} GiB of slabs) is under budget minus reserve \
+             ({:.3} GiB) — the spill tier and this whole guard may no longer be needed, \
+             which is worth failing over",
             plan.committed_bytes() as f64 / GIB,
+            (BUDGET_BYTES - DEFAULT_RESERVE_BYTES) as f64 / GIB,
         );
     }
     println!();
@@ -427,15 +482,180 @@ fn real_checkpoint_residency_plan_fits_the_device_heap() {
         all_bytes as f64 / GIB,
     );
     assert!(
-        (device as f64) < heap,
-        "device plan {:.3} GiB does not fit the {HEAP_GIB} GiB heap",
-        device as f64 / GIB
-    );
-    assert!(
         largest_device.0 <= SLAB_BYTES,
         "device tensor {} is {} B, above maxMemoryAllocationSize {} B — it needs splitting",
         largest_device.1,
         largest_device.0,
         SLAB_BYTES,
     );
+}
+
+/// The number every residency plan is gated on, read off the live driver.
+///
+/// The constants in this file are pinned so the other tests are not tautologies
+/// (`assert!(x <= x)` passes on any box). This is the one test that compares
+/// them to reality, so a driver update, a BIOS UMA carve-out change or a
+/// different part surfaces here instead of as an over-committed load.
+#[cfg(feature = "vulkan")]
+#[test]
+fn device_budget_is_the_planning_number() {
+    use infer_vulkan::loader::device_local_budget_from;
+
+    let ctx = match vulkan_sys::VulkanContext::create() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let heaps = ctx.memory_heaps();
+    let budgets = ctx.memory_budgets();
+    println!("device: {}", ctx.device_name());
+    for (i, (size, device_local)) in heaps.iter().enumerate() {
+        let b = budgets.as_ref().and_then(|b| b.get(i));
+        println!(
+            "  heap {i}: size {:.2} GiB device_local={device_local} budget {} usage {}",
+            *size as f64 / GIB,
+            b.map_or("-".into(), |&(x, _)| format!("{:.2} GiB", x as f64 / GIB)),
+            b.map_or("-".into(), |&(_, u)| format!("{:.2} GiB", u as f64 / GIB)),
+        );
+    }
+
+    let live = device_local_budget_from(&heaps, budgets.as_deref()).expect("a device-local heap");
+    println!(
+        "  planning budget: {:.4} GiB from heap {} ({}), heap size {:.4} GiB",
+        live.bytes as f64 / GIB,
+        live.heap_index,
+        live.source.label(),
+        live.heap_size as f64 / GIB,
+    );
+
+    assert_eq!(
+        live.source,
+        DeviceBudgetSource::DriverBudget,
+        "VK_EXT_memory_budget is supported here; falling back to heap size would silently \
+         hand the plan 3.72 GiB it does not have"
+    );
+    assert_eq!(live.heap_size, HEAP_BYTES, "heap size moved");
+    // Usage is not zero on a busy box, so the budget is an upper bound on what
+    // is grantable right now; the pinned constant is the idle figure.
+    assert!(
+        live.bytes <= BUDGET_BYTES,
+        "live budget {} exceeds the pinned {BUDGET_BYTES}",
+        live.bytes
+    );
+    assert!(
+        live.bytes + (2 << 30) > BUDGET_BYTES,
+        "live budget {:.2} GiB is more than 2 GiB under the pinned {:.2} GiB — either this \
+         box is loaded or the constant is stale",
+        live.bytes as f64 / GIB,
+        BUDGET_BYTES as f64 / GIB,
+    );
+    assert!(
+        live.bytes < live.heap_size,
+        "budget must be under the heap size on this part; that gap is the whole point"
+    );
+}
+
+/// The number the load is really gated on: `plan_qwen4_upload`'s, against the
+/// DRIVER'S budget.
+///
+/// Distinct from the classifier tally above, which is 1.33 GiB lighter because
+/// it does not model the F32 tier. Both are over budget; only this one is over
+/// by the right amount.
+#[test]
+fn full_plan_fits_the_driver_budget_only_after_spilling() {
+    let dir = checkpoint_dir();
+    if !dir.is_dir() {
+        eprintln!("SKIP: no checkpoint at {} (set {CKPT_ENV})", dir.display());
+        return;
+    }
+    let Ok(st) = SafeTensorsDir::open_dir(&dir) else {
+        eprintln!("SKIP: cannot open {} as a safetensors dir", dir.display());
+        return;
+    };
+    let cfg = Qwen4UploadConfig::default();
+    let plan =
+        plan_qwen4_upload(&st, &cfg, &Qwen4UploadScope::full()).expect("plan the full model");
+    let budget = pinned_budget();
+    let usable = BUDGET_BYTES - DEFAULT_RESERVE_BYTES;
+    println!(
+        "planner: device {:.3} GiB vs budget {:.3} GiB - reserve {:.3} GiB = {:.3} GiB usable",
+        plan.device_bytes as f64 / GIB,
+        BUDGET_BYTES as f64 / GIB,
+        DEFAULT_RESERVE_BYTES as f64 / GIB,
+        usable as f64 / GIB,
+    );
+
+    // 1. It does NOT fit. This is the assertion that fails at HEAD's behaviour
+    //    (sized against the 74.43 GiB heap) and passes now.
+    let err = plan
+        .ensure_fits(&budget, DEFAULT_RESERVE_BYTES)
+        .expect_err("the full residency must not fit the driver's budget");
+    println!("refused: {err}");
+    assert!(
+        plan.device_bytes > usable,
+        "plan {:.3} GiB is within the {:.3} GiB the driver grants — the spill tier would be \
+         dead code, which is worth failing over",
+        plan.device_bytes as f64 / GIB,
+        usable as f64 / GIB,
+    );
+
+    // 2. It fits once the coldest suballocations move to the host heap.
+    let mut spilled = plan.clone();
+    let moved = spilled
+        .spill_to_fit(&budget, DEFAULT_RESERVE_BYTES, 35 << 30)
+        .expect("the plan fits after spilling");
+    println!(
+        "spilled {} suballocation(s) / {:.3} GiB -> device {:.3} GiB, host {:.3} GiB",
+        moved.items,
+        moved.bytes as f64 / GIB,
+        spilled.device_bytes as f64 / GIB,
+        spilled.spill_bytes as f64 / GIB,
+    );
+    spilled
+        .ensure_fits(&budget, DEFAULT_RESERVE_BYTES)
+        .expect("the spilled plan fits");
+    assert!(
+        spilled.spill_bytes > 0 && spilled.spill_bytes < 8 * (1 << 30),
+        "the spill should be single-digit GiB, not the whole model: {:.3} GiB",
+        spilled.spill_bytes as f64 / GIB,
+    );
+    assert_eq!(
+        spilled.device_bytes + spilled.spill_bytes,
+        plan.device_bytes,
+        "a spill relocates bytes, it does not create or destroy them"
+    );
+
+    // 3. And the SLABS fit too, which the plan's own bytes cannot answer.
+    #[cfg(feature = "vulkan")]
+    {
+        let alignment = 16;
+        use infer_vulkan::qwen4_upload::Qwen4Tier;
+        let device_pack = spilled
+            .choose_packing(Qwen4Tier::Device, SLAB_BYTES, alignment)
+            .expect("pack the device tier");
+        let spill_pack = spilled
+            .choose_packing(Qwen4Tier::HostSpill, SLAB_BYTES, alignment)
+            .expect("pack the spill tier");
+        println!(
+            "slabs: device {:.3} GiB / {} slabs of {:.0} MiB, spill {:.3} GiB / {} slabs",
+            device_pack.committed_bytes as f64 / GIB,
+            device_pack.slab_count,
+            device_pack.slab_bytes as f64 / (1u64 << 20) as f64,
+            spill_pack.committed_bytes as f64 / GIB,
+            spill_pack.slab_count,
+        );
+        device_pack
+            .ensure_fits(BUDGET_BYTES, DEFAULT_RESERVE_BYTES)
+            .expect("the device tier's committed slabs fit the budget");
+        // The unspilled plan's slabs do NOT, which is what the spill bought.
+        assert!(
+            plan.choose_packing(Qwen4Tier::Device, SLAB_BYTES, alignment)
+                .expect("pack the unspilled plan")
+                .ensure_fits(BUDGET_BYTES, DEFAULT_RESERVE_BYTES)
+                .is_err(),
+            "the unspilled residency's slabs must not fit the budget"
+        );
+    }
 }

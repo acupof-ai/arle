@@ -112,6 +112,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use infer_gguf::dequant::{BLOCK_NVFP4_BYTES, QK_NVFP4, QK_NVFP4_SUB};
 use infer_gguf::safetensors::{SafeTensorInfo, SafeTensorsDir};
 
+use crate::loader::DeviceBudget;
 use crate::qwen4_names::{
     ExpertProj, HcPart, HcSite, Nvfp4Part, Qwen4Residency, Qwen4Stream, Qwen4TensorKind,
     Qwen4TensorRole, classify_qwen4_tensor,
@@ -368,6 +369,23 @@ pub struct Qwen4UploadConfig {
     pub slab_bytes: Option<u64>,
     /// Device-local bytes held back from the plan. See [`DEFAULT_RESERVE_BYTES`].
     pub reserve_bytes: u64,
+    /// Move the coldest read-only weights to the host heap when the device
+    /// budget cannot hold them, rather than refusing the load. See
+    /// [`Qwen4Tier`] for the measured 2.05% this costs, and
+    /// [`Qwen4Plan::spill_to_fit`] for what moves first.
+    ///
+    /// On by default because the full residency is 2.95 GiB over the driver's
+    /// budget; set it false to make an over-budget plan a hard error instead.
+    pub spill_to_host: bool,
+    /// Override the device-local limit the plan is sized against. `None` — the
+    /// default — asks the driver (`crate::loader::device_local_budget`).
+    ///
+    /// Only for tests: a small artificial budget is what lets the spill path be
+    /// exercised on a subset scope in seconds instead of on the 71 GiB full
+    /// residency. Nothing in production should set it, and a value ABOVE what
+    /// the driver grants is not honoured — the smaller of the two wins, so this
+    /// can only ever tighten the guard.
+    pub device_budget_bytes: Option<u64>,
 }
 
 impl Default for Qwen4UploadConfig {
@@ -376,6 +394,8 @@ impl Default for Qwen4UploadConfig {
             dense_format: Qwen4DeviceFormat::F16,
             slab_bytes: None,
             reserve_bytes: DEFAULT_RESERVE_BYTES,
+            spill_to_host: true,
+            device_budget_bytes: None,
         }
     }
 }
@@ -489,6 +509,64 @@ pub enum Qwen4Source {
     },
 }
 
+/// Which heap one suballocation's slab lives on.
+///
+/// # Why a spill tier exists at all
+///
+/// The full text residency is 72.64 GiB of suballocations that pack into 72.656
+/// GiB of slabs, against a DRIVER BUDGET of 70.71 GiB (heap 1 reports 74.43 GiB
+/// of *size*; see `crate::loader::DeviceBudget`). With
+/// [`DEFAULT_RESERVE_BYTES`] held back that is **2.95 GiB over**, and
+/// over-committing this UMA part is not `OUT_OF_DEVICE_MEMORY` — it is silent
+/// page demotion, i.e. a load that appears to work and then runs several times
+/// slow with nothing in any log.
+///
+/// The alternative to relocating those bytes is shrinking them (requantizing
+/// the BF16 dense tier, or an F16 build of the three `float[]` shaders). Both
+/// are real work in someone else's file. Relocating is measured to be nearly
+/// free: on this part the host heap is the *same* LPDDR5X, and a 512 MiB GPU
+/// streaming read costs
+///
+/// ```text
+///   heap 1, alloc_uma          204.4 GB/s
+///   heap 0, alloc_host_cached  200.2 GB/s   -2.05%
+/// ```
+///
+/// (same sitting, `vulkan-kernels::device_cache_hierarchy::
+/// report_gpu_read_bandwidth_by_memory_flavor`; ratio, not absolute — this box
+/// throttles). A spilled weight stays an ordinary storage-buffer binding, so
+/// every GEMV consumes it unchanged.
+///
+/// **A measured trap, since the number above invites the wrong reading.** The
+/// `alloc (host WC, heap 0)` row of that same sweep is NOT on heap 0.
+/// `memory_type_index` prefers the largest heap among the compatible types, and
+/// heap 1 exposes a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` type, so plain
+/// `DeviceBuffer::alloc` lands on heap 1. Confirmed by watching `heapUsage` move
+/// under a 512 MiB allocation: `alloc` charges heap 1, `alloc_host_cached`
+/// charges heap 0, `alloc_uma` charges heap 1. `alloc_host_cached` is therefore
+/// the only public flavour that reaches heap 0 on this part, which is what the
+/// spill slabs use — and HOST_CACHED also makes the loader's own verification
+/// read-backs fast instead of write-combined-slow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Qwen4Tier {
+    /// DEVICE_LOCAL slabs on the big heap. Everything lives here while it fits.
+    #[default]
+    Device,
+    /// `HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` slabs on the host heap, for
+    /// read-only weights the device budget cannot hold.
+    HostSpill,
+}
+
+impl Qwen4Tier {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Device => "device-local heap",
+            Self::HostSpill => "host heap (spill)",
+        }
+    }
+}
+
 /// One suballocation the upload will make.
 #[derive(Debug, Clone)]
 pub struct Qwen4PlanItem {
@@ -497,6 +575,10 @@ pub struct Qwen4PlanItem {
     pub role: Qwen4TensorRole,
     pub format: Qwen4DeviceFormat,
     pub bytes: u64,
+    /// Which heap this entry's slab comes from. Every item plans as
+    /// [`Qwen4Tier::Device`]; [`Qwen4Plan::spill_to_fit`] is the only thing that
+    /// moves one.
+    pub tier: Qwen4Tier,
     /// Contraction width in LOGICAL elements (GGUF `ne0`), i.e. `ncols` for the
     /// GEMV push constants. For an expert stack this is the per-expert in-dim.
     pub ncols: usize,
@@ -511,8 +593,12 @@ pub struct Qwen4PlanItem {
 #[derive(Debug, Clone, Default)]
 pub struct Qwen4Plan {
     pub items: Vec<Qwen4PlanItem>,
-    /// Sum of `items[..].bytes`, before slab alignment padding.
+    /// Sum of the [`Qwen4Tier::Device`] items' bytes, before slab alignment
+    /// padding. Unchanged from "every item" until something spills.
     pub device_bytes: u64,
+    /// Sum of the [`Qwen4Tier::HostSpill`] items' bytes. Zero unless
+    /// [`Qwen4Plan::spill_to_fit`] moved something.
+    pub spill_bytes: u64,
     /// Device bytes per decoder layer, for a layer-at-a-time bring-up.
     pub layer_bytes: BTreeMap<usize, u64>,
     /// Device bytes of the stream-level tensors (the mixer, `lm_head`).
@@ -535,70 +621,221 @@ impl Qwen4Plan {
     /// allocation happened to be unlucky. `headroom` is what must survive for
     /// the KV cache, the linear-attention state, the activation arena and the
     /// descriptor pools; a plan that fits with zero bytes to spare does not fit.
-    pub fn ensure_fits(&self, device_local_bytes: u64, headroom: u64) -> Result<()> {
-        let budget = device_local_bytes.saturating_sub(headroom);
+    ///
+    /// `budget` carries which limit it is — the driver's `heapBudget - heapUsage`
+    /// or the heap size it falls back to — because on this part those differ by
+    /// 3.72 GiB and the plan sits between them.
+    pub fn ensure_fits(&self, budget: &DeviceBudget, headroom: u64) -> Result<()> {
+        let usable = budget.bytes.saturating_sub(headroom);
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         ensure!(
-            self.device_bytes <= budget,
-            "qwen4 residency plan needs {:.2} GiB but the device-local heap is {:.2} GiB \
-             ({:.2} GiB reserved for KV + state + activations, leaving {:.2} GiB usable); \
-             over by {:.2} GiB",
+            self.device_bytes <= usable,
+            "qwen4 residency plan needs {:.2} GiB on the device but heap {} grants {:.2} GiB \
+             — {} (heap size {:.2} GiB); {:.2} GiB reserved for KV + state + activations \
+             leaves {:.2} GiB usable, so the plan is over by {:.2} GiB. Spill the coldest \
+             weights to the host heap (`Qwen4Plan::spill_to_fit`) or narrow the scope.",
             gib(self.device_bytes),
-            gib(device_local_bytes),
+            budget.heap_index,
+            gib(budget.bytes),
+            budget.source.label(),
+            gib(budget.heap_size),
             gib(headroom),
-            gib(budget),
-            gib(self.device_bytes.saturating_sub(budget)),
+            gib(usable),
+            gib(self.device_bytes.saturating_sub(usable)),
         );
         Ok(())
     }
 
+    /// Move the coldest read-only suballocations to [`Qwen4Tier::HostSpill`]
+    /// until the device tier fits `budget.bytes - headroom`.
+    ///
+    /// Idempotent and monotone: it only ever moves Device → HostSpill, and it
+    /// stops the moment the device tier fits, so calling it on a plan that
+    /// already fits is a no-op that reports zero moves.
+    ///
+    /// # Spill order, and why it is not "biggest first"
+    ///
+    /// The router picks 10 of 512 experts per token, so ~98% of an NVFP4 stack's
+    /// bytes are not read at all on a given step, while every other item in the
+    /// plan — attention, linear-attn, the hyper-connection weights, `lm_head` —
+    /// is read in FULL every token. Moving a stack therefore pays the 2.05%
+    /// host-heap read penalty on ~2% of its bytes; moving the same volume of
+    /// dense weight pays it on all of them. Stacks first, dense last. Within a
+    /// class, largest first: fewest suballocations moved per gibibyte recovered,
+    /// and it keeps the spill slabs few and full.
+    ///
+    /// `host_available` is the host heap's own budget (see
+    /// `crate::loader::device_local_budget_from` for the device side; heap 0's
+    /// figure comes from the same `memory_budgets()` array). A spill that would
+    /// not fit THERE is refused rather than moved.
+    pub fn spill_to_fit(
+        &mut self,
+        budget: &DeviceBudget,
+        headroom: u64,
+        host_available: u64,
+    ) -> Result<Qwen4Spill> {
+        let usable = budget.bytes.saturating_sub(headroom);
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        if self.device_bytes <= usable {
+            return Ok(Qwen4Spill {
+                items: 0,
+                bytes: 0,
+                device_bytes: self.device_bytes,
+            });
+        }
+
+        // Every item is spillable — they are all read-only storage buffers — so
+        // the only residency that cannot be rescued is one with no device memory
+        // left AT ALL: the KV cache, the recurrent state and the arena are
+        // device-side and come out of the reserve, so a reserve at or past the
+        // budget is unrunnable however the weights are arranged.
+        ensure!(
+            usable > 0,
+            "qwen4 spill: heap {} grants {:.2} GiB and {:.2} GiB is reserved for KV + state \
+             + activations, leaving nothing on the device — no arrangement of the weights \
+             makes this residency runnable",
+            budget.heap_index,
+            gib(budget.bytes),
+            gib(headroom),
+        );
+
+        let mut order: Vec<usize> = (0..self.items.len())
+            .filter(|&i| self.items[i].tier == Qwen4Tier::Device)
+            .collect();
+        order.sort_by_key(|&i| Self::spill_rank(&self.items[i]));
+
+        // Choose the moves first and apply them only once they are all legal.
+        // A refusal that left a half-spilled plan behind would be worse than no
+        // spill at all: the caller still holds the `&mut`, and the plan would no
+        // longer say what it says on the tin.
+        let mut to_move = Vec::new();
+        let mut device_after = self.device_bytes;
+        let mut moved_bytes = 0u64;
+        for i in order {
+            if device_after <= usable {
+                break;
+            }
+            device_after -= self.items[i].bytes;
+            moved_bytes += self.items[i].bytes;
+            to_move.push(i);
+        }
+
+        // Postcondition, not a user-facing case: the loop only stops when the
+        // device tier fits or the spillable set is exhausted, and every item is
+        // spillable, so a `spill_rank` or accounting bug is what would trip it.
+        ensure!(
+            device_after <= usable,
+            "qwen4 spill: even with all {} spillable suballocations ({:.2} GiB) on the \
+             host heap the device tier is {:.2} GiB against {:.2} GiB usable",
+            to_move.len(),
+            gib(moved_bytes),
+            gib(device_after),
+            gib(usable),
+        );
+        ensure!(
+            self.spill_bytes + moved_bytes <= host_available,
+            "qwen4 spill: {:.2} GiB of weights would go to the host heap, which grants only \
+             {:.2} GiB",
+            gib(self.spill_bytes + moved_bytes),
+            gib(host_available),
+        );
+
+        for &i in &to_move {
+            self.items[i].tier = Qwen4Tier::HostSpill;
+        }
+        self.device_bytes = device_after;
+        self.spill_bytes += moved_bytes;
+        Ok(Qwen4Spill {
+            items: to_move.len(),
+            bytes: moved_bytes,
+            device_bytes: self.device_bytes,
+        })
+    }
+
+    /// Sort key for [`Self::spill_to_fit`]: coldest bytes first, then largest.
+    fn spill_rank(item: &Qwen4PlanItem) -> (u8, std::cmp::Reverse<u64>) {
+        let class = match item.source {
+            // Sparsely read: 10 of `n_experts` slices per token.
+            Qwen4Source::Nvfp4Stack { .. } => 0,
+            // Read in full every token.
+            Qwen4Source::Bf16 { .. } => 1,
+        };
+        (class, std::cmp::Reverse(item.bytes))
+    }
+
+    /// Items in `tier`, in plan order.
+    pub fn tier_items(&self, tier: Qwen4Tier) -> impl Iterator<Item = &Qwen4PlanItem> {
+        self.items.iter().filter(move |i| i.tier == tier)
+    }
+
+    /// Bytes in `tier`, recomputed from the items rather than read off the
+    /// running totals — the two agreeing is a thing worth being able to assert.
+    #[must_use]
+    pub fn tier_bytes(&self, tier: Qwen4Tier) -> u64 {
+        self.tier_items(tier).map(|i| i.bytes).sum()
+    }
+
     /// Largest suballocation in the plan, i.e. the host scratch buffer the
-    /// upload needs (1.18 GiB when `lm_head` is in scope), and the floor on any
-    /// slab size — `SlabPlan` refuses a request no slab could ever hold.
+    /// upload needs (1.18 GiB when `lm_head` is in scope). Across BOTH tiers:
+    /// the scratch is shared.
     #[must_use]
     pub fn max_item_bytes(&self) -> u64 {
         self.items.iter().map(|i| i.bytes).max().unwrap_or(0)
     }
 
-    /// Dry-run this plan into slabs of `slab_bytes` and report what the heap
+    /// Largest suballocation in `tier` — the floor on that tier's slab size,
+    /// since `SlabPlan` refuses a request no slab could ever hold.
+    #[must_use]
+    pub fn max_item_bytes_in(&self, tier: Qwen4Tier) -> u64 {
+        self.tier_items(tier).map(|i| i.bytes).max().unwrap_or(0)
+    }
+
+    /// Dry-run one tier into slabs of `slab_bytes` and report what that heap
     /// would actually give up.
     ///
     /// Runs through `vulkan_sys::SlabPlan`, the same type `SlabAllocator` drives
     /// its real allocations through, so the estimate and the residency cannot
     /// drift. Largest-first, matching [`upload_qwen4`].
     #[cfg(feature = "vulkan")]
-    pub fn pack(&self, slab_bytes: u64, alignment: u64) -> Result<Qwen4Packing> {
+    pub fn pack(&self, tier: Qwen4Tier, slab_bytes: u64, alignment: u64) -> Result<Qwen4Packing> {
         let mut sp = vulkan_sys::SlabPlan::new(slab_bytes, alignment)
             .map_err(|e| anyhow!("qwen4 packing at {slab_bytes} B slabs: {e}"))?;
-        let mut order: Vec<usize> = (0..self.items.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(self.items[i].bytes));
-        for &i in &order {
-            sp.place(self.items[i].bytes).map_err(|e| {
+        let mut items: Vec<&Qwen4PlanItem> = self.tier_items(tier).collect();
+        items.sort_by_key(|i| std::cmp::Reverse(i.bytes));
+        for item in items {
+            sp.place(item.bytes).map_err(|e| {
                 anyhow!(
                     "qwen4 packing: {} ({} B) into {slab_bytes} B slabs: {e}",
-                    self.items[i].name,
-                    self.items[i].bytes
+                    item.name,
+                    item.bytes
                 )
             })?;
         }
         Ok(Qwen4Packing {
+            tier,
             slab_bytes,
             committed_bytes: sp.committed_bytes(),
+            used_bytes: sp.used_bytes(),
             slab_count: sp.slab_count(),
         })
     }
 
-    /// The slab size that commits the fewest bytes for THIS plan.
+    /// The slab size that commits the fewest bytes for THIS tier of THIS plan.
     ///
     /// Not a tuning nicety — 1.34 GiB of a 74.43 GiB heap, measured on the full
     /// model (see [`Qwen4Packing`]). And not a constant either: the optimum is a
     /// property of the item multiset, so it moves with
-    /// [`Qwen4UploadConfig::dense_format`] and with the scope. Sweeping at load
-    /// costs well under a second and re-derives it from whatever is actually
-    /// being uploaded.
+    /// [`Qwen4UploadConfig::dense_format`], with the scope, and with what has
+    /// spilled. Sweeping at load costs well under a second and re-derives it
+    /// from whatever is actually being uploaded.
     #[cfg(feature = "vulkan")]
-    pub fn choose_packing(&self, max_slab_bytes: u64, alignment: u64) -> Result<Qwen4Packing> {
-        let floor = self.max_item_bytes().max(vulkan_sys::MIN_SLAB_BYTES);
+    pub fn choose_packing(
+        &self,
+        tier: Qwen4Tier,
+        max_slab_bytes: u64,
+        alignment: u64,
+    ) -> Result<Qwen4Packing> {
+        let floor = self.max_item_bytes_in(tier).max(vulkan_sys::MIN_SLAB_BYTES);
         ensure!(
             floor <= max_slab_bytes,
             "qwen4 packing: the largest suballocation is {floor} B but a slab may not              exceed {max_slab_bytes} B (maxMemoryAllocationSize)"
@@ -614,7 +851,7 @@ impl Qwen4Plan {
         candidates.push(floor);
         candidates.push(max_slab_bytes);
         for sz in candidates {
-            let Ok(packing) = self.pack(sz, alignment) else {
+            let Ok(packing) = self.pack(tier, sz, alignment) else {
                 continue;
             };
             if best.is_none_or(|b| packing.committed_bytes < b.committed_bytes) {
@@ -623,6 +860,15 @@ impl Qwen4Plan {
         }
         best.ok_or_else(|| anyhow!("qwen4 packing: no slab size in range fits this plan"))
     }
+}
+
+/// What [`Qwen4Plan::spill_to_fit`] moved off the device heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Qwen4Spill {
+    pub items: usize,
+    pub bytes: u64,
+    /// The device tier after the move.
+    pub device_bytes: u64,
 }
 
 /// What a plan costs the heap once it is cut into slabs.
@@ -649,9 +895,13 @@ impl Qwen4Plan {
 #[cfg(feature = "vulkan")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qwen4Packing {
+    /// Which heap these slabs come from.
+    pub tier: Qwen4Tier,
     pub slab_bytes: u64,
     /// Bytes `vkAllocateMemory` will be asked for, summed over slabs.
     pub committed_bytes: u64,
+    /// Bytes handed to suballocations, excluding padding and slab tails.
+    pub used_bytes: u64,
     pub slab_count: usize,
 }
 
@@ -661,28 +911,38 @@ impl Qwen4Packing {
     ///
     /// The check [`Qwen4Plan::ensure_fits`] cannot make: that one sees the
     /// plan's bytes, this one sees the bytes the slabs will really cost.
-    pub fn ensure_fits(&self, device_local_bytes: u64, headroom: u64) -> Result<()> {
+    /// `available` is the heap's grantable bytes — the driver's budget on the
+    /// device tier (`crate::loader::DeviceBudget::bytes`), heap 0's on the
+    /// spill tier — never a raw `VkMemoryHeap::size`.
+    pub fn ensure_fits(&self, available: u64, headroom: u64) -> Result<()> {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         ensure!(
-            self.committed_bytes + headroom <= device_local_bytes,
-            "qwen4 residency commits {:.2} GiB over {} slabs of {:.0} MiB, which leaves              {:.2} GiB of the {:.2} GiB device-local heap — less than the {:.2} GiB the KV              cache, recurrent state and arena need",
+            self.committed_bytes.saturating_add(headroom) <= available,
+            "qwen4 residency commits {:.2} GiB over {} slabs of {:.0} MiB on the {}, which \
+             leaves {:.2} GiB of the {:.2} GiB granted — less than the {:.2} GiB the KV \
+             cache, recurrent state and arena need; over by {:.2} GiB",
             gib(self.committed_bytes),
             self.slab_count,
             self.slab_bytes as f64 / (1u64 << 20) as f64,
-            gib(device_local_bytes.saturating_sub(self.committed_bytes)),
-            gib(device_local_bytes),
+            self.tier.label(),
+            gib(available.saturating_sub(self.committed_bytes)),
+            gib(available),
             gib(headroom),
+            gib(self
+                .committed_bytes
+                .saturating_add(headroom)
+                .saturating_sub(available)),
         );
         Ok(())
     }
 
     /// `committed - used`, as a fraction of what was committed.
     #[must_use]
-    pub fn waste_fraction(&self, plan: &Qwen4Plan) -> f64 {
+    pub fn waste_fraction(&self) -> f64 {
         if self.committed_bytes == 0 {
             return 0.0;
         }
-        self.committed_bytes.saturating_sub(plan.device_bytes) as f64 / self.committed_bytes as f64
+        self.committed_bytes.saturating_sub(self.used_bytes) as f64 / self.committed_bytes as f64
     }
 }
 
@@ -808,6 +1068,7 @@ pub fn plan_qwen4_upload(
                 role,
                 format,
                 bytes,
+                tier: Qwen4Tier::Device,
                 ncols,
                 nrows,
                 source: Qwen4Source::Bf16 {
@@ -886,6 +1147,7 @@ pub fn plan_qwen4_upload(
                 role,
                 format: Qwen4DeviceFormat::Nvfp4,
                 bytes: (n_experts * group.nrows * row_bytes) as u64,
+                tier: Qwen4Tier::Device,
                 ncols: group.ncols,
                 nrows: group.nrows,
                 source: Qwen4Source::Nvfp4Stack {
@@ -1444,6 +1706,11 @@ pub struct Qwen4DeviceTensor {
     /// PER-EXPERT row count.
     pub nrows: usize,
     pub format: Qwen4DeviceFormat,
+    /// Which allocator owns `alloc`. A [`vulkan_sys::SlabAlloc`] is only a
+    /// `(slab index, offset, len)` triple, so the same handle names a different
+    /// buffer in each tier; resolving one against the wrong allocator would
+    /// bind whatever happens to sit at that offset and still run.
+    pub tier: Qwen4Tier,
 }
 
 /// One layer's 512 experts of one projection, stacked expert-major.
@@ -1535,10 +1802,140 @@ pub struct Qwen4HcBinding<'a> {
     pub block_inject: Option<&'a Qwen4DeviceTensor>,
 }
 
+/// Host-heap slabs for the [`Qwen4Tier::HostSpill`] weights.
+///
+/// A parallel to `vulkan_sys::SlabAllocator` because that type has no host-heap
+/// flavour: its `SlabMemory::Uma` asks for `DEVICE_LOCAL | HOST_VISIBLE`, and on
+/// this part that is heap 1 — the heap the spill exists to get off. Measured by
+/// watching `heapUsage` move under a 512 MiB allocation: `DeviceBuffer::alloc`
+/// and `alloc_uma` both charge heap 1; only `alloc_host_cached` charges heap 0.
+/// So the spill tier drives a bare `SlabPlan` over buffers of its own.
+///
+/// Simpler than `SlabAllocator` in the way that matters here: these slabs are
+/// host-mappable, so a write is a `copy_from_host_at` straight into the mapping
+/// — no staging window, no command submit, no per-chunk copy.
+#[cfg(feature = "vulkan")]
+struct Qwen4SpillSlabs<'ctx> {
+    ctx: &'ctx vulkan_sys::VulkanContext,
+    slabs: Vec<vulkan_sys::DeviceBuffer<'ctx>>,
+    plan: vulkan_sys::SlabPlan,
+    /// Index of the device-local heap, so [`Self::grow_to_plan`] can catch a
+    /// slab that landed on it.
+    device_heap: usize,
+}
+
+#[cfg(feature = "vulkan")]
+impl<'ctx> Qwen4SpillSlabs<'ctx> {
+    fn new(
+        ctx: &'ctx vulkan_sys::VulkanContext,
+        slab_bytes: u64,
+        alignment: u64,
+        device_heap: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            ctx,
+            slabs: Vec::new(),
+            plan: vulkan_sys::SlabPlan::new(slab_bytes, alignment)
+                .map_err(|e| anyhow!("qwen4 spill slabs at {slab_bytes} B: {e}"))?,
+            device_heap,
+        })
+    }
+
+    fn alloc(&mut self, len: u64) -> Result<vulkan_sys::SlabAlloc> {
+        let alloc = self
+            .plan
+            .place(len)
+            .map_err(|e| anyhow!("qwen4 spill: placing {len} B: {e}"))?;
+        self.grow_to_plan()?;
+        Ok(alloc)
+    }
+
+    /// Back every slab `SlabPlan::place` opened with a real host-heap buffer.
+    ///
+    /// `place` only ever opens NOMINAL-size slabs, so the plan's capacities and
+    /// these buffers' lengths cannot drift.
+    fn grow_to_plan(&mut self) -> Result<()> {
+        while self.slabs.len() < self.plan.slab_count() {
+            let bytes = usize::try_from(self.plan.slab_size())
+                .map_err(|_| anyhow!("qwen4 spill: slab size does not fit in usize"))?;
+            // `alloc_host_cached` FALLS BACK to plain HOST_VISIBLE|HOST_COHERENT
+            // when the device exposes no HOST_CACHED type, and
+            // `memory_type_index` then prefers the largest compatible heap —
+            // which here is the device-local one. That fallback would spill onto
+            // the heap we are fleeing, silently, and the load would die a few
+            // GiB later with an opaque allocation error. Trust the accounting,
+            // not the flavour: watch whether the device heap absorbed it.
+            let before = self.device_heap_usage();
+            let buffer = vulkan_sys::DeviceBuffer::alloc_host_cached(self.ctx, bytes)
+                .map_err(|e| anyhow!("qwen4 spill: allocating a {bytes} B host slab: {e}"))?;
+            if let (Some(before), Some(after)) = (before, self.device_heap_usage()) {
+                ensure!(
+                    after.saturating_sub(before) < self.plan.slab_size() / 2,
+                    "qwen4 spill: a {bytes} B host slab charged {} B to device-local heap {} \
+                     — this device has no HOST_CACHED memory type and `alloc_host_cached` fell \
+                     back onto the heap the spill is meant to relieve",
+                    after - before,
+                    self.device_heap,
+                );
+            }
+            self.slabs.push(buffer);
+        }
+        Ok(())
+    }
+
+    fn device_heap_usage(&self) -> Option<u64> {
+        self.ctx
+            .memory_budgets()
+            .and_then(|b| b.get(self.device_heap).map(|&(_, usage)| usage))
+    }
+
+    fn write(&mut self, alloc: &vulkan_sys::SlabAlloc, src: &[u8]) -> Result<()> {
+        let slab = self
+            .slabs
+            .get_mut(alloc.slab())
+            .ok_or_else(|| anyhow!("qwen4 spill: slab index {} out of range", alloc.slab()))?;
+        slab.copy_from_host_at(alloc.offset(), src)
+            .map_err(|e| anyhow!("qwen4 spill: writing {} B: {e}", src.len()))
+    }
+
+    fn binding(
+        &self,
+        alloc: &vulkan_sys::SlabAlloc,
+    ) -> Result<(&vulkan_sys::DeviceBuffer<'ctx>, u64, u64)> {
+        let slab = self
+            .slabs
+            .get(alloc.slab())
+            .ok_or_else(|| anyhow!("qwen4 spill: slab index {} out of range", alloc.slab()))?;
+        Ok((slab, alloc.offset(), alloc.len()))
+    }
+
+    /// Read a suballocation back. HOST_CACHED, so this is a cached memcpy — not
+    /// the write-combined 0.10 GB/s trap the device tier's staged read-back
+    /// exists to avoid.
+    fn read_back(&self, alloc: &vulkan_sys::SlabAlloc, dst: &mut [u8]) -> Result<()> {
+        let slab = self
+            .slabs
+            .get(alloc.slab())
+            .ok_or_else(|| anyhow!("qwen4 spill: slab index {} out of range", alloc.slab()))?;
+        slab.copy_to_host_at(alloc.offset(), dst)
+            .map_err(|e| anyhow!("qwen4 spill: reading {} B back: {e}", dst.len()))
+    }
+
+    fn committed_bytes(&self) -> u64 {
+        self.plan.committed_bytes()
+    }
+
+    fn slab_count(&self) -> usize {
+        self.slabs.len()
+    }
+}
+
 /// Everything `qwen4_exp` needs to run, resident.
 #[cfg(feature = "vulkan")]
 pub struct Qwen4Weights<'ctx, 'st> {
     slabs: vulkan_sys::SlabAllocator<'ctx>,
+    /// `None` unless something spilled; see [`Qwen4Tier`].
+    spill: Option<Qwen4SpillSlabs<'ctx>>,
     tensors: BTreeMap<String, Qwen4DeviceTensor>,
     experts: HashMap<(usize, ExpertProj), Qwen4ExpertStack>,
     layer_kinds: BTreeMap<usize, Qwen4LayerKind>,
@@ -1557,13 +1954,24 @@ impl<'ctx, 'st> Qwen4Weights<'ctx, 'st> {
 
     /// `(slab buffer, offset, len)` — straight into
     /// `DescriptorSet::storage_buffers_ranged`.
+    ///
+    /// A spilled weight binds exactly like a device-resident one; the tier is a
+    /// property of the memory the slab came from, not of the descriptor.
     pub fn binding(
         &self,
         tensor: &Qwen4DeviceTensor,
     ) -> Result<(&vulkan_sys::DeviceBuffer<'ctx>, u64, u64)> {
-        self.slabs
-            .binding(&tensor.alloc)
-            .map_err(|e| anyhow!("qwen4 weights: binding a suballocation: {e}"))
+        match tensor.tier {
+            Qwen4Tier::Device => self
+                .slabs
+                .binding(&tensor.alloc)
+                .map_err(|e| anyhow!("qwen4 weights: binding a suballocation: {e}")),
+            Qwen4Tier::HostSpill => self
+                .spill
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4 weights: a spilled tensor with no spill tier"))?
+                .binding(&tensor.alloc),
+        }
     }
 
     /// [`Self::tensor`] then [`Self::binding`], for the common case.
@@ -1630,22 +2038,93 @@ impl<'ctx, 'st> Qwen4Weights<'ctx, 'st> {
 
     /// Read a suballocation back through a staging buffer. Verification only —
     /// it allocates, submits and blocks; never put it on a per-token path.
+    /// (The spill tier is host-mapped, so its read-back is a plain cached
+    /// memcpy — but the contract is the same: verification, not decode.)
     pub fn read_back(&self, tensor: &Qwen4DeviceTensor, dst: &mut [u8]) -> Result<()> {
-        self.slabs
-            .read_back(&tensor.alloc, dst)
-            .map_err(|e| anyhow!("qwen4 weights: read-back: {e}"))
+        match tensor.tier {
+            Qwen4Tier::Device => self
+                .slabs
+                .read_back(&tensor.alloc, dst)
+                .map_err(|e| anyhow!("qwen4 weights: read-back: {e}")),
+            Qwen4Tier::HostSpill => self
+                .spill
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4 weights: a spilled tensor with no spill tier"))?
+                .read_back(&tensor.alloc, dst),
+        }
     }
+
+    /// Committed bytes per tier, for a caller that wants to report residency.
+    #[must_use]
+    pub fn committed_bytes(&self, tier: Qwen4Tier) -> u64 {
+        match tier {
+            Qwen4Tier::Device => self.slabs.committed_bytes(),
+            Qwen4Tier::HostSpill => self
+                .spill
+                .as_ref()
+                .map_or(0, Qwen4SpillSlabs::committed_bytes),
+        }
+    }
+
+    /// Slab count per tier.
+    #[must_use]
+    pub fn slab_count(&self, tier: Qwen4Tier) -> usize {
+        match tier {
+            Qwen4Tier::Device => self.slabs.slab_count(),
+            Qwen4Tier::HostSpill => self.spill.as_ref().map_or(0, Qwen4SpillSlabs::slab_count),
+        }
+    }
+}
+
+/// The device-local budget this upload will plan against.
+///
+/// `cfg.device_budget_bytes` can only ever TIGHTEN what the driver grants — a
+/// test that wants to exercise the spill path on a subset asks for a small
+/// budget, and a caller that fat-fingers a large one still gets the driver's.
+#[cfg(feature = "vulkan")]
+fn upload_budget(ctx: &vulkan_sys::VulkanContext, cfg: &Qwen4UploadConfig) -> Result<DeviceBudget> {
+    let mut budget = crate::loader::device_local_budget(ctx)?;
+    if let Some(cap) = cfg.device_budget_bytes {
+        budget.bytes = budget.bytes.min(cap);
+    }
+    Ok(budget)
+}
+
+/// Grantable bytes on the largest NON-device-local heap — where the spill tier
+/// lands. `0` when the device reports no host heap, which makes a spill refuse
+/// rather than allocate somewhere unintended.
+#[cfg(feature = "vulkan")]
+fn host_heap_available(ctx: &vulkan_sys::VulkanContext) -> u64 {
+    let heaps = ctx.memory_heaps();
+    let budgets = ctx.memory_budgets();
+    heaps
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(_, device_local))| !device_local)
+        .map(
+            |(i, &(size, _))| match budgets.as_ref().and_then(|b| b.get(i)) {
+                Some(&(budget, usage)) => budget.saturating_sub(usage).min(size),
+                None => size,
+            },
+        )
+        .max()
+        .unwrap_or(0)
 }
 
 /// Execute `plan` against `ctx`, borrowing every source byte from `st`'s mmaps.
 ///
 /// Order of operations matters and is not incidental:
-/// 1. [`Qwen4Plan::ensure_fits`] BEFORE a byte is staged.
-/// 2. Suballocate LARGEST-FIRST. `vulkan_sys::SlabPlan` documents the measured
-///    difference on this exact checkpoint: 62 slabs and 1.01% waste largest-first
-///    against 64 slabs and 4.10% in arrival order.
+/// 1. Size against the DRIVER'S budget (`crate::loader::device_local_budget`),
+///    then spill what will not fit, then [`Qwen4Plan::ensure_fits`] — all BEFORE
+///    a byte is staged.
+/// 2. Suballocate LARGEST-FIRST, per tier. `vulkan_sys::SlabPlan` documents the
+///    measured difference on this exact checkpoint: 62 slabs and 1.01% waste
+///    largest-first against 64 slabs and 4.10% in arrival order.
 /// 3. Write in plan order, which is checkpoint order, so a shard's mmap pages
 ///    are touched once and in sequence rather than revisited per slab.
+///
+/// The plan arrives by reference and is cloned only if something has to spill:
+/// a residency that fits pays nothing for the tier existing.
 ///
 /// `st` must include the shard holding `embed_tokens` even for a subset run:
 /// [`Qwen4HostTables::build`] treats it as required, because a residency without
@@ -1658,17 +2137,37 @@ pub fn upload_qwen4<'ctx, 'st>(
     cfg: &Qwen4UploadConfig,
 ) -> Result<Qwen4Weights<'ctx, 'st>> {
     cfg.validate()?;
-    // Size against the DEVICE_LOCAL heap, not system RAM: on this APU a 60 GiB
-    // device-local allocation moved OS-visible free RAM by only 4.2 GiB, so the
-    // host figure says nothing about what the device can hold.
-    let device_local: u64 = ctx
-        .memory_heaps()
-        .into_iter()
-        .filter(|&(_, device_local)| device_local)
-        .map(|(size, _)| size)
-        .max()
-        .unwrap_or(u64::MAX);
-    plan.ensure_fits(device_local, cfg.reserve_bytes)?;
+    // Size against the DEVICE_LOCAL heap's BUDGET, not system RAM and not the
+    // heap size: on this APU a 60 GiB device-local allocation moved OS-visible
+    // free RAM by only 4.2 GiB (so the host figure says nothing about what the
+    // device can hold), and the driver's budget is 3.72 GiB under the heap size
+    // (so the size says nothing about what it will GRANT).
+    let budget = upload_budget(ctx, cfg)?;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+
+    // Spill before the guard, not after it: `spill_to_fit` is a no-op on a plan
+    // that already fits, so a subset residency never touches the host heap.
+    let spilled;
+    let plan = if cfg.spill_to_host && plan.ensure_fits(&budget, cfg.reserve_bytes).is_err() {
+        let mut owned = plan.clone();
+        let moved = owned.spill_to_fit(&budget, cfg.reserve_bytes, host_heap_available(ctx))?;
+        log::warn!(
+            "qwen4 residency: {:.2} GiB over heap {}'s {:.2} GiB budget ({}); spilled {} \
+             suballocation(s) / {:.2} GiB to the host heap, device tier now {:.2} GiB",
+            gib(plan.device_bytes),
+            budget.heap_index,
+            gib(budget.bytes),
+            budget.source.label(),
+            moved.items,
+            gib(moved.bytes),
+            gib(moved.device_bytes),
+        );
+        spilled = owned;
+        &spilled
+    } else {
+        plan
+    };
+    plan.ensure_fits(&budget, cfg.reserve_bytes)?;
 
     // The plan's own bytes are a FLOOR: slabs have tails. Cut them the cheapest
     // way for this particular plan and check what that really costs, before any
@@ -1678,44 +2177,73 @@ pub fn upload_qwen4<'ctx, 'st>(
     // `SlabAllocator` applies exactly this floor; mirroring it keeps the dry run
     // and the real placement on the same alignment.
     let alignment = ctx.min_storage_buffer_offset_alignment().max(16);
-    let packing = match cfg.slab_bytes {
-        Some(bytes) => plan.pack(bytes.min(max_slab), alignment)?,
-        None => plan.choose_packing(max_slab, alignment)?,
+    let pack_tier = |tier| match cfg.slab_bytes {
+        Some(bytes) => plan.pack(tier, bytes.min(max_slab), alignment),
+        None => plan.choose_packing(tier, max_slab, alignment),
     };
-    packing.ensure_fits(device_local, cfg.reserve_bytes)?;
+    let packing = pack_tier(Qwen4Tier::Device)?;
+    packing.ensure_fits(budget.bytes, cfg.reserve_bytes)?;
     log::info!(
-        "qwen4 residency: {:.2} GiB over {} slabs of {:.0} MiB ({:.2}% packing waste),          {:.2} GiB of heap left",
-        packing.committed_bytes as f64 / (1u64 << 30) as f64,
+        "qwen4 residency: {:.2} GiB over {} slabs of {:.0} MiB ({:.2}% packing waste),          {:.2} GiB of the {:.2} GiB budget left",
+        gib(packing.committed_bytes),
         packing.slab_count,
         packing.slab_bytes as f64 / (1u64 << 20) as f64,
-        100.0 * packing.waste_fraction(plan),
-        device_local.saturating_sub(packing.committed_bytes) as f64 / (1u64 << 30) as f64,
+        100.0 * packing.waste_fraction(),
+        gib(budget.bytes.saturating_sub(packing.committed_bytes)),
+        gib(budget.bytes),
     );
 
     let mut slabs = vulkan_sys::SlabAllocator::with_slab_size(ctx, packing.slab_bytes)
         .map_err(|e| anyhow!("qwen4 upload: creating the slab allocator: {e}"))?;
+    let mut spill = if plan.spill_bytes == 0 {
+        None
+    } else {
+        let spill_packing = pack_tier(Qwen4Tier::HostSpill)?;
+        // No reserve on the host heap: nothing else this loader allocates lives
+        // there, and the KV cache / arena the reserve protects are device-side.
+        spill_packing.ensure_fits(host_heap_available(ctx), 0)?;
+        log::info!(
+            "qwen4 spill tier: {:.2} GiB over {} host slabs of {:.0} MiB",
+            gib(spill_packing.committed_bytes),
+            spill_packing.slab_count,
+            spill_packing.slab_bytes as f64 / (1u64 << 20) as f64,
+        );
+        Some(Qwen4SpillSlabs::new(
+            ctx,
+            spill_packing.slab_bytes,
+            alignment,
+            budget.heap_index,
+        )?)
+    };
 
-    // Largest-first placement; `order` indexes back into `plan.items`. Same
-    // order the dry run used, so the real slab count matches what was checked.
+    // Largest-first placement WITHIN each tier; `order` indexes back into
+    // `plan.items`. Same order each tier's dry run used, so the real slab counts
+    // match what was checked.
     let mut order: Vec<usize> = (0..plan.items.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(plan.items[i].bytes));
+    order.sort_by_key(|&i| (plan.items[i].tier, std::cmp::Reverse(plan.items[i].bytes)));
     let mut allocs: Vec<Option<vulkan_sys::SlabAlloc>> = vec![None; plan.items.len()];
     for &i in &order {
         let item = &plan.items[i];
-        let alloc = slabs.alloc(item.bytes).map_err(|e| {
-            anyhow!(
-                "qwen4 upload: reserving {} B for {}: {e}",
-                item.bytes,
-                item.name
-            )
-        })?;
+        let alloc = match item.tier {
+            Qwen4Tier::Device => slabs.alloc(item.bytes).map_err(|e| {
+                anyhow!(
+                    "qwen4 upload: reserving {} B for {}: {e}",
+                    item.bytes,
+                    item.name
+                )
+            })?,
+            Qwen4Tier::HostSpill => spill
+                .as_mut()
+                .ok_or_else(|| anyhow!("{}: spilled with no spill tier", item.name))?
+                .alloc(item.bytes)?,
+        };
         allocs[i] = Some(alloc);
     }
 
-    // One host buffer, sized to the biggest suballocation and reused. Two
-    // reasons it is not per-tensor: `SlabAllocator::write` needs one contiguous
-    // slice (there is no write-at-offset), and `lm_head` alone would otherwise
-    // churn 1.18 GiB of allocate/zero/free.
+    // One host buffer, sized to the biggest suballocation in EITHER tier and
+    // reused. Two reasons it is not per-tensor: `SlabAllocator::write` needs one
+    // contiguous slice (there is no write-at-offset), and `lm_head` alone would
+    // otherwise churn 1.18 GiB of allocate/zero/free.
     let scratch_len = usize::try_from(plan.max_item_bytes())
         .map_err(|_| anyhow!("qwen4 upload: largest suballocation does not fit in usize"))?;
     let mut scratch = vec![0u8; scratch_len];
@@ -1754,6 +2282,7 @@ pub fn upload_qwen4<'ctx, 'st>(
                             ncols: item.ncols,
                             nrows: item.nrows,
                             format: item.format,
+                            tier: item.tier,
                         },
                         n_experts: *n_experts,
                         weight_scale_2,
@@ -1762,9 +2291,16 @@ pub fn upload_qwen4<'ctx, 'st>(
                 );
             }
         }
-        slabs
-            .write(&alloc, dst)
-            .map_err(|e| anyhow!("qwen4 upload: writing {}: {e}", item.name))?;
+        match item.tier {
+            Qwen4Tier::Device => slabs
+                .write(&alloc, dst)
+                .map_err(|e| anyhow!("qwen4 upload: writing {}: {e}", item.name))?,
+            Qwen4Tier::HostSpill => spill
+                .as_mut()
+                .ok_or_else(|| anyhow!("{}: spilled with no spill tier", item.name))?
+                .write(&alloc, dst)
+                .with_context(|| format!("writing {}", item.name))?,
+        }
 
         tensors.insert(
             item.name.clone(),
@@ -1773,12 +2309,14 @@ pub fn upload_qwen4<'ctx, 'st>(
                 ncols: item.ncols,
                 nrows: item.nrows,
                 format: item.format,
+                tier: item.tier,
             },
         );
     }
 
     Ok(Qwen4Weights {
         slabs,
+        spill,
         tensors,
         experts,
         layer_kinds: plan.layer_kinds.clone(),
@@ -1852,12 +2390,29 @@ mod tests {
 
     const CKPT_ENV: &str = "ARLE_QWEN4_CKPT";
     const CKPT_DEFAULT: &str = r"C:\Users\Asus\models\qwen3.8-flash-next-nvfp4";
-    /// The 8060S's device-local heap, read off the device
-    /// (`VulkanContext::memory_heaps`): 74.4322 GiB. The plan is checked against
-    /// this rather than against whatever the running box reports so the budget
-    /// is a fact under test, not a tautology.
+    /// The 8060S's device-local heap SIZE, read off the device
+    /// (`VulkanContext::memory_heaps`): 74.4322 GiB. Pinned rather than read
+    /// from the running box so the budget is a fact under test, not a
+    /// tautology. NOT what a plan is sized against — see [`BUDGET`].
     const HEAP: u64 = 79_920_955_392;
+    /// What the DRIVER grants on that heap (`VK_EXT_memory_budget`'s
+    /// `heapBudget`, usage 0 at idle): 70.7107 GiB — 3.72 GiB under the size.
+    /// This is the number a residency plan lives or dies by; over-committing a
+    /// UMA part is silent page demotion, not `OUT_OF_DEVICE_MEMORY`.
+    const BUDGET: u64 = 75_924_905_984;
     /// Set to run the whole 71 GiB residency (minutes, and the plan must fit).
+    ///
+    /// MEASURED STATE, so the next reader is not surprised: with the spill tier
+    /// this gets the plan past every guard — 69.58 GiB of device slabs + 3.08
+    /// GiB of host slabs, all within the driver's 70.71 GiB budget — and then
+    /// dies ~450 s in, at a `SlabAllocator::write` command SUBMIT, with
+    /// `ERROR_OUT_OF_DEVICE_MEMORY` on a 40 KB norm. That is not the budget
+    /// guard: a separate probe allocated 74 x 1 GiB DEVICE_LOCAL slabs on this
+    /// box before failing, i.e. the budget is advisory and there was room. The
+    /// remaining suspect is total system pressure — 72.7 GiB of committed
+    /// buffers against 128 GB of LPDDR5X while ~122 GiB of checkpoint is being
+    /// streamed through the page cache. Sizing THAT is the next phase's job;
+    /// this test is left able to fail rather than weakened to pass.
     #[cfg(feature = "vulkan")]
     const FULL_ENV: &str = "ARLE_QWEN4_UPLOAD_FULL";
 
@@ -2066,22 +2621,215 @@ mod tests {
     }
 
     #[test]
-    fn ensure_fits_refuses_an_over_budget_plan() {
+    fn ensure_fits_refuses_a_plan_the_driver_will_not_grant() {
         let plan = Qwen4Plan {
             device_bytes: 72 << 30,
             ..Default::default()
         };
-        // 74.43 GiB heap, 1 GiB reserve -> fits.
-        assert!(plan.ensure_fits(79_918_820_000, 1 << 30).is_ok());
-        // The qwen35 loader's 3 GiB reserve does NOT fit this model.
+        // 72 GiB fits the 74.43 GiB HEAP with a 1 GiB reserve...
+        plan.ensure_fits(&heap_size_budget(), 1 << 30)
+            .expect("72 GiB fits the heap size");
+        // ...and does NOT fit the 70.71 GiB the driver actually grants. Same
+        // plan, same reserve, opposite verdicts: this pair is the whole defect.
         let err = plan
-            .ensure_fits(79_918_820_000, 3 << 30)
-            .expect_err("3 GiB reserve must not fit");
+            .ensure_fits(&driver_budget(), 1 << 30)
+            .expect_err("must not fit the driver budget");
         assert!(
             err.to_string().contains("over by"),
             "message should quantify the overage: {err}"
         );
-        assert!(plan.ensure_fits(60 << 30, 0).is_err());
+        // The qwen35 loader's 3 GiB reserve does not fit this model either way.
+        assert!(plan.ensure_fits(&heap_size_budget(), 3 << 30).is_err());
+    }
+
+    #[test]
+    fn ensure_fits_is_exact_at_budget_minus_reserve() {
+        let budget = driver_budget();
+        let usable = budget.bytes - DEFAULT_RESERVE_BYTES;
+        let at = Qwen4Plan {
+            device_bytes: usable,
+            ..Default::default()
+        };
+        at.ensure_fits(&budget, DEFAULT_RESERVE_BYTES)
+            .expect("exactly budget - reserve fits");
+        let over = Qwen4Plan {
+            device_bytes: usable + 1,
+            ..Default::default()
+        };
+        assert!(
+            over.ensure_fits(&budget, DEFAULT_RESERVE_BYTES).is_err(),
+            "one byte past budget - reserve must not fit"
+        );
+    }
+
+    // ------------------------------------------------------------- spill tier
+
+    /// A plan of `bytes`-sized items, `stacks` of them NVFP4 stacks (spilled
+    /// first) and the rest BF16 dense.
+    fn synthetic_plan(stacks: &[u64], dense: &[u64]) -> Qwen4Plan {
+        let mut plan = Qwen4Plan::default();
+        let role = Qwen4TensorRole {
+            kind: Qwen4TensorKind::MoeRouter,
+            layer: Some(0),
+            sub_index: None,
+            stream: Qwen4Stream::Text,
+            residency: Qwen4Residency::DevicePacked,
+        };
+        for (n, &bytes) in stacks.iter().enumerate() {
+            plan.items.push(Qwen4PlanItem {
+                name: format!("stack{n}"),
+                role,
+                format: Qwen4DeviceFormat::Nvfp4,
+                bytes,
+                tier: Qwen4Tier::Device,
+                ncols: 2560,
+                nrows: 640,
+                source: Qwen4Source::Nvfp4Stack {
+                    layer: 0,
+                    proj: ExpertProj::Gate,
+                    n_experts: 512,
+                },
+            });
+            plan.device_bytes += bytes;
+        }
+        for (n, &bytes) in dense.iter().enumerate() {
+            plan.items.push(Qwen4PlanItem {
+                name: format!("dense{n}"),
+                role,
+                format: Qwen4DeviceFormat::F16,
+                bytes,
+                tier: Qwen4Tier::Device,
+                ncols: 2560,
+                nrows: 2560,
+                source: Qwen4Source::Bf16 { fold_bias: false },
+            });
+            plan.device_bytes += bytes;
+        }
+        plan
+    }
+
+    fn budget_of(bytes: u64) -> DeviceBudget {
+        DeviceBudget {
+            bytes,
+            source: crate::loader::DeviceBudgetSource::DriverBudget,
+            heap_index: 1,
+            heap_size: HEAP,
+        }
+    }
+
+    /// heap 1 sized by what the DRIVER grants: 70.71 GiB.
+    fn driver_budget() -> DeviceBudget {
+        budget_of(BUDGET)
+    }
+
+    /// The same heap sized by `VkMemoryHeap::size` instead: 74.43 GiB. What the
+    /// guard used before this change, and 3.72 GiB more than it may have.
+    fn heap_size_budget() -> DeviceBudget {
+        DeviceBudget {
+            bytes: HEAP,
+            source: crate::loader::DeviceBudgetSource::HeapSize,
+            heap_index: 1,
+            heap_size: HEAP,
+        }
+    }
+
+    #[test]
+    fn spill_moves_expert_stacks_before_dense_weights() {
+        // 4 GiB of plan, 3 GiB of budget, no reserve: exactly 1 GiB must move,
+        // and it must come out of the sparsely-read stacks.
+        let mut plan = synthetic_plan(&[1 << 30, 1 << 30], &[1 << 30, 1 << 30]);
+        let moved = plan
+            .spill_to_fit(&budget_of(3 << 30), 0, 64 << 30)
+            .expect("1 GiB of 4 fits after one move");
+        assert_eq!(moved.items, 1, "one 1 GiB suballocation is enough");
+        assert_eq!(moved.bytes, 1 << 30);
+        assert_eq!(plan.device_bytes, 3 << 30);
+        assert_eq!(plan.spill_bytes, 1 << 30);
+        // A stack, not a dense weight: 10 of 512 experts are read per token, so
+        // a spilled stack pays the host-heap penalty on ~2% of its bytes.
+        let spilled: Vec<&str> = plan
+            .tier_items(Qwen4Tier::HostSpill)
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(spilled, ["stack0"], "the dense items must stay on device");
+        // Running totals and the item tags agree.
+        assert_eq!(plan.device_bytes, plan.tier_bytes(Qwen4Tier::Device));
+        assert_eq!(plan.spill_bytes, plan.tier_bytes(Qwen4Tier::HostSpill));
+    }
+
+    #[test]
+    fn spill_takes_dense_weights_only_after_every_stack() {
+        // 4 GiB of plan against 1 GiB of budget: both stacks plus one dense.
+        let mut plan = synthetic_plan(&[1 << 30, 1 << 30], &[1 << 30, 1 << 30]);
+        let moved = plan
+            .spill_to_fit(&budget_of(1 << 30), 0, 64 << 30)
+            .expect("3 of 4 GiB can move");
+        assert_eq!(moved.items, 3);
+        let spilled: Vec<&str> = plan
+            .tier_items(Qwen4Tier::HostSpill)
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(
+            spilled,
+            ["stack0", "stack1", "dense0"],
+            "stacks exhaust before any dense weight moves"
+        );
+    }
+
+    #[test]
+    fn spill_stops_the_moment_the_device_tier_fits() {
+        // Budget already covers the plan: nothing moves, and the call is a
+        // no-op rather than a "spill everything eligible".
+        let mut plan = synthetic_plan(&[1 << 30], &[1 << 30]);
+        let moved = plan
+            .spill_to_fit(&budget_of(8 << 30), 0, 64 << 30)
+            .expect("a plan that fits needs no spill");
+        assert_eq!((moved.items, moved.bytes), (0, 0));
+        assert_eq!(plan.spill_bytes, 0);
+        assert!(plan.tier_items(Qwen4Tier::HostSpill).next().is_none());
+        // And it is idempotent: a second call on the spilled plan moves nothing.
+        let mut plan = synthetic_plan(&[1 << 30, 1 << 30], &[]);
+        plan.spill_to_fit(&budget_of(1 << 30), 0, 64 << 30).unwrap();
+        let again = plan.spill_to_fit(&budget_of(1 << 30), 0, 64 << 30).unwrap();
+        assert_eq!(again.items, 0);
+        assert_eq!(plan.spill_bytes, 1 << 30);
+    }
+
+    #[test]
+    fn spill_refuses_when_the_host_heap_cannot_hold_it() {
+        let mut plan = synthetic_plan(&[4 << 30], &[1 << 30]);
+        let err = plan
+            .spill_to_fit(&budget_of(1 << 30), 0, 1 << 30)
+            .expect_err("4 GiB must not spill into a 1 GiB host heap");
+        assert!(
+            err.to_string().contains("host heap"),
+            "message should name the host heap: {err}"
+        );
+        // Untouched: a refusal must not leave a half-spilled plan behind for a
+        // caller that still holds the `&mut`.
+        assert_eq!(plan.spill_bytes, 0);
+        assert_eq!(plan.device_bytes, 5 << 30);
+        assert!(plan.tier_items(Qwen4Tier::HostSpill).next().is_none());
+    }
+
+    #[test]
+    fn spill_refuses_a_budget_the_reserve_swallows_whole() {
+        // The reserve alone exceeds the budget, so nothing device-side is left
+        // for the KV cache and arena. Spilling every weight would "fit" by
+        // arithmetic and then die at the first `vkAllocateMemory`; refuse here
+        // instead, with the numbers.
+        let mut plan = synthetic_plan(&[1 << 30], &[1 << 30]);
+        let err = plan
+            .spill_to_fit(&budget_of(1 << 30), 4 << 30, 64 << 30)
+            .expect_err("a reserve past the budget cannot be satisfied");
+        assert!(
+            err.to_string().contains("nothing on the device"),
+            "message should say the box has no device memory left: {err}"
+        );
+        // And the plan is untouched: a refusal must not leave a half-spilled
+        // plan behind for a caller that logs the Err and carries on.
+        assert_eq!(plan.spill_bytes, 0);
+        assert_eq!(plan.device_bytes, 2 << 30);
     }
 
     #[test]
@@ -2273,6 +3021,174 @@ mod tests {
     }
 
     // -------------------------------------------------------- device upload
+
+    /// The spill tier, end to end on the real device: a weight that could not
+    /// fit the budget lands on the HOST heap and reads back byte-identical to
+    /// the same weight uploaded device-resident.
+    ///
+    /// Driven by an artificial `device_budget_bytes` one byte under the subset
+    /// plan, which is what lets this run in seconds instead of on the 71 GiB
+    /// full residency. The two things it can catch are the two that would be
+    /// invisible otherwise: bytes written to the wrong offset in a slab this
+    /// module allocates itself, and `alloc_host_cached` quietly falling back
+    /// onto the device heap.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn spilled_weights_land_on_the_host_heap_byte_identical() {
+        let Some(dir) = checkpoint_dir() else {
+            eprintln!("SKIP: no qwen3.8-flash-next checkpoint (set {CKPT_ENV})");
+            return;
+        };
+        let ctx = match vulkan_sys::VulkanContext::create() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let st = open_subset(&dir);
+        let cfg = Qwen4UploadConfig::default();
+        let plan = plan_qwen4_upload(&st, &cfg, &subset_scope()).expect("plan");
+
+        // Device-resident reference.
+        let base = upload_qwen4(&ctx, &st, &plan, &cfg).expect("reference upload");
+        assert_eq!(base.slab_count(Qwen4Tier::HostSpill), 0, "nothing spills");
+
+        // Pick a slab size and a budget that make the spill tier INTERESTING:
+        // every expert stack has to move, and the slab holds two of them, so at
+        // least one spilled tensor sits at a NONZERO offset. Both halves matter
+        // — with a single spilled item, or one item per slab, every offset is
+        // zero and a `copy_from_host_at(0, ..)` bug reads clean.
+        let stack_bytes = plan
+            .items
+            .iter()
+            .filter(|i| matches!(i.source, Qwen4Source::Nvfp4Stack { .. }))
+            .map(|i| i.bytes)
+            .max()
+            .expect("the subset has expert stacks");
+        let stacks_total: u64 = plan
+            .items
+            .iter()
+            .filter(|i| matches!(i.source, Qwen4Source::Nvfp4Stack { .. }))
+            .map(|i| i.bytes)
+            .sum();
+        let dense_bytes = plan.device_bytes - stacks_total;
+        let slab = 2 * stack_bytes + (16 << 20);
+        // Low bound: the device tier's own slabs must still fit the budget.
+        // High bound: one stack under "everything but the stacks", so no stack
+        // can stay. Midpoint, so neither rounding nor a checkpoint reshuffle
+        // silently lands outside.
+        let lo = dense_bytes.div_ceil(slab) * slab;
+        let hi = dense_bytes + stack_bytes;
+        assert!(
+            lo < hi,
+            "no budget forces every stack out while leaving room for {lo} B of device slabs"
+        );
+        let host_before = host_heap_available(&ctx);
+        let tight = Qwen4UploadConfig {
+            reserve_bytes: 0,
+            device_budget_bytes: Some(lo + (hi - lo) / 2),
+            slab_bytes: Some(slab),
+            ..cfg
+        };
+        let spilled = upload_qwen4(&ctx, &st, &plan, &tight).expect("spilled upload");
+        let host_after = host_heap_available(&ctx);
+
+        let mut moved: Vec<(&String, &Qwen4DeviceTensor)> = spilled
+            .tensors
+            .iter()
+            .filter(|(_, t)| t.tier == Qwen4Tier::HostSpill)
+            .collect();
+        moved.sort_by_key(|(_, t)| (t.alloc.slab(), t.alloc.offset()));
+        eprintln!(
+            "qwen4 spill device test: {} suballocation(s) moved",
+            moved.len()
+        );
+        for (name, t) in &moved {
+            eprintln!(
+                "  {name}: slab {} offset {} len {}",
+                t.alloc.slab(),
+                t.alloc.offset(),
+                t.alloc.len()
+            );
+        }
+        assert!(
+            moved.len() >= 2,
+            "the offset comparison below needs more than one spilled suballocation"
+        );
+        assert!(
+            moved.iter().any(|(_, t)| t.alloc.offset() > 0),
+            "every spilled tensor is at offset 0, so a write-at-0 bug would read clean"
+        );
+        assert!(
+            moved
+                .iter()
+                .all(|(_, t)| t.format == Qwen4DeviceFormat::Nvfp4),
+            "the coldest tier is the NVFP4 expert stacks; dense weights should not move"
+        );
+        let spill_bytes: u64 = moved.iter().map(|(_, t)| t.alloc.len()).sum();
+        assert!(spilled.slab_count(Qwen4Tier::HostSpill) >= 1);
+        assert!(spilled.committed_bytes(Qwen4Tier::HostSpill) >= spill_bytes);
+
+        // The host heap really gave up the bytes. Without this the whole tier
+        // could be sitting on heap 1 and every other assertion would still pass.
+        assert!(
+            host_before.saturating_sub(host_after) >= spill_bytes / 2,
+            "host heap available moved by only {} B for a {spill_bytes} B spill — the slabs \
+             did not land on heap 0",
+            host_before.saturating_sub(host_after),
+        );
+
+        // Byte-identical to the device-resident upload of the same tensors,
+        // whole-stack: a wrong slab offset shows up as a shifted tail, not as a
+        // wrong first block.
+        for (name, t) in &moved {
+            let reference = *base.tensor(name).expect("resident in the reference upload");
+            assert_eq!(reference.tier, Qwen4Tier::Device);
+            assert_eq!(reference.alloc.len(), t.alloc.len());
+            let len = usize::try_from(t.alloc.len()).unwrap();
+            let mut want = vec![0u8; len];
+            let mut got = vec![0u8; len];
+            base.read_back(&reference, &mut want)
+                .expect("device read-back");
+            spilled.read_back(t, &mut got).expect("spill read-back");
+            assert!(
+                want.iter().any(|&b| b != 0),
+                "{name}: the reference read-back is all zeros; the comparison would be vacuous"
+            );
+            // Not `assert_eq!` on the vectors: a mismatch would print 117 MB of
+            // bytes. Report the first differing index instead, which is also
+            // the number that says WHAT went wrong — 0 for a wrong tensor, the
+            // suballocation's own offset for a wrong slab offset.
+            let first_diff = got.iter().zip(&want).position(|(a, b)| a != b);
+            assert_eq!(
+                first_diff,
+                None,
+                "{name}: spilled bytes differ from device bytes at index {:?} of {len}                  (slab {} offset {})",
+                first_diff,
+                t.alloc.slab(),
+                t.alloc.offset(),
+            );
+        }
+
+        // The binding resolves against the spill allocator, not the device one:
+        // a `SlabAlloc` is only (slab index, offset, len), so the same handle
+        // names a different buffer in each tier.
+        let (name, t) = moved[moved.len() - 1];
+        let (spill_buf, off, blen) = spilled.binding(t).expect("spilled binding");
+        let (dev_buf, _, _) = spilled
+            .binding(
+                spilled
+                    .tensor(&layer_tensor_name(0, "mlp.gate.weight"))
+                    .unwrap(),
+            )
+            .expect("a device binding");
+        assert_eq!((off, blen), (t.alloc.offset(), t.alloc.len()), "{name}");
+        assert!(
+            !std::ptr::eq(spill_buf, dev_buf),
+            "the spilled tensor must not bind the device slab"
+        );
+    }
 
     /// A real, small residency: layer 0 with 128 experts plus the stream mixer,
     /// ~0.5 GiB. Asserts what the forward depends on and nothing else:
@@ -2586,13 +3502,53 @@ mod tests {
             gib(plan.host_bytes)
         );
 
-        // The measured budget, and the reason `DEFAULT_RESERVE_BYTES` is 1 GiB.
-        plan.ensure_fits(HEAP, DEFAULT_RESERVE_BYTES)
-            .expect("the shipping plan must fit with the default reserve");
+        // The plan fits the heap SIZE with the default reserve...
+        plan.ensure_fits(&heap_size_budget(), DEFAULT_RESERVE_BYTES)
+            .expect("the plan fits the 74.43 GiB heap size");
+        // ...and does NOT fit what the driver GRANTS. This is the defect the
+        // budget change exists for: at HEAD the guard above was the only one
+        // running, so 72.64 GiB of plan sailed past a 70.71 GiB budget.
+        let over = plan
+            .ensure_fits(&driver_budget(), DEFAULT_RESERVE_BYTES)
+            .expect_err("72.64 GiB must not fit a 70.71 GiB budget");
+        eprintln!("qwen4 full plan vs driver budget: {over}");
         assert!(
-            plan.ensure_fits(HEAP, 3 << 30).is_err(),
-            "it does NOT fit with the qwen35 loader's 3 GiB reserve — that is why              DEFAULT_RESERVE_BYTES is smaller, and the margin is worth knowing about"
+            plan.device_bytes > BUDGET - DEFAULT_RESERVE_BYTES,
+            "the plan is {:.3} GiB against {:.3} GiB usable — if this ever stops \
+             being true the spill tier has become unnecessary, which is worth noticing",
+            gib(plan.device_bytes),
+            gib(BUDGET - DEFAULT_RESERVE_BYTES),
         );
+
+        // Spilling the coldest suballocations is what makes it fit, and it takes
+        // only expert stacks: 10 of 512 experts are read per token, so a spilled
+        // stack pays the 2.05% host-heap read penalty on ~2% of its bytes.
+        let mut spilled = plan.clone();
+        let moved = spilled
+            .spill_to_fit(&driver_budget(), DEFAULT_RESERVE_BYTES, 35 << 30)
+            .expect("the full plan fits once the coldest stacks move to the host heap");
+        eprintln!(
+            "qwen4 spill: {} suballocation(s) / {:.3} GiB -> device {:.3} GiB, host {:.3} GiB",
+            moved.items,
+            gib(moved.bytes),
+            gib(spilled.device_bytes),
+            gib(spilled.spill_bytes),
+        );
+        spilled
+            .ensure_fits(&driver_budget(), DEFAULT_RESERVE_BYTES)
+            .expect("the spilled plan fits");
+        assert!(
+            spilled
+                .tier_items(Qwen4Tier::HostSpill)
+                .all(|i| matches!(i.source, Qwen4Source::Nvfp4Stack { .. })),
+            "only expert stacks should have had to move"
+        );
+        assert_eq!(
+            spilled.device_bytes + spilled.spill_bytes,
+            plan.device_bytes,
+            "a spill relocates bytes, it does not create or destroy them"
+        );
+
         // F32 everywhere would blow the heap outright; this is what makes the
         // F16 dense tier load-bearing rather than a preference.
         let f32_plan = plan_qwen4_upload(
@@ -2605,7 +3561,9 @@ mod tests {
         )
         .expect("plan at F32");
         assert!(
-            f32_plan.ensure_fits(HEAP, DEFAULT_RESERVE_BYTES).is_err(),
+            f32_plan
+                .ensure_fits(&heap_size_budget(), DEFAULT_RESERVE_BYTES)
+                .is_err(),
             "an all-F32 dense tier is {:.2} GiB and must not fit",
             gib(f32_plan.device_bytes)
         );
@@ -2632,8 +3590,12 @@ mod tests {
 
         // 2 GiB is `maxMemoryAllocationSize` on this part — the size a loader
         // that did not sweep would naturally pick.
-        let naive = plan.pack(2 << 30, 16).expect("pack at the device maximum");
-        let chosen = plan.choose_packing(2 << 30, 16).expect("sweep");
+        let naive = plan
+            .pack(Qwen4Tier::Device, 2 << 30, 16)
+            .expect("pack at the device maximum");
+        let chosen = plan
+            .choose_packing(Qwen4Tier::Device, 2 << 30, 16)
+            .expect("sweep");
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         eprintln!(
             "qwen4 packing: naive {:.3} GiB / {} slabs -> chosen {:.3} GiB / {} slabs              of {:.0} MiB ({:.2}% waste), {:.3} GiB of heap left",
@@ -2642,8 +3604,8 @@ mod tests {
             gib(chosen.committed_bytes),
             chosen.slab_count,
             chosen.slab_bytes as f64 / (1u64 << 20) as f64,
-            100.0 * chosen.waste_fraction(&plan),
-            gib(HEAP - chosen.committed_bytes),
+            100.0 * chosen.waste_fraction(),
+            gib(BUDGET.saturating_sub(chosen.committed_bytes)),
         );
 
         assert!(
@@ -2660,9 +3622,9 @@ mod tests {
             gib(naive.committed_bytes - chosen.committed_bytes)
         );
         assert!(
-            chosen.waste_fraction(&plan) < 0.005,
+            chosen.waste_fraction() < 0.005,
             "chosen packing wastes {:.2}%",
-            100.0 * chosen.waste_fraction(&plan)
+            100.0 * chosen.waste_fraction()
         );
         // The whole point: the default reserve is actually available.
         chosen
@@ -2731,12 +3693,36 @@ mod tests {
             320_001_536,
             "the derived padded n-gram vocab"
         );
+        // The residency does not fit the driver's budget on the device alone —
+        // `full_plan_fits_the_device_local_heap` pins that it is 2.93 GiB over —
+        // so a full load that succeeds MUST have spilled. If this ever reads 0,
+        // either the plan shrank or the budget grew, and both are worth knowing.
+        let spilled: Vec<&String> = w
+            .tensors
+            .iter()
+            .filter(|(_, t)| t.tier == Qwen4Tier::HostSpill)
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            !spilled.is_empty(),
+            "the full residency fit the device budget without spilling — check whether the \
+             budget or the plan moved"
+        );
+        assert!(
+            spilled.iter().all(|n| n.ends_with("_stack")),
+            "only NVFP4 expert stacks should be cold enough to spill, got {spilled:?}"
+        );
         eprintln!(
-            "PASS: qwen4 full residency in {:.1} s, {:.2} GiB committed over {} slabs              ({:.2}% waste)",
+            "PASS: qwen4 full residency in {:.1} s — device {:.2} GiB over {} slabs \
+             ({:.2}% waste), host spill {:.2} GiB over {} slabs ({} stacks: {:?})",
             started.elapsed().as_secs_f64(),
             gib(w.slabs().committed_bytes()),
             w.slabs().slab_count(),
             100.0 * w.slabs().wasted_bytes() as f64 / w.slabs().committed_bytes() as f64,
+            gib(w.committed_bytes(Qwen4Tier::HostSpill)),
+            w.slab_count(Qwen4Tier::HostSpill),
+            spilled.len(),
+            spilled,
         );
     }
 }
