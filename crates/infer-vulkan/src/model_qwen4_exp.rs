@@ -94,7 +94,7 @@ use crate::qwen4_upload::{
 use vulkan_kernels::{
     FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams, MAT_VEC_FUSION_SCALE0,
     f16_kv_pack_dispatch, f16_kv_pack_params, flash_attn_dispatch, flash_attn_params,
-    gemv_dense_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_params_f32_b,
+    gemv_dense_dispatch, gemv_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_params_f32_b,
     qwen4_block_perm_dispatch, qwen4_block_perm_params, qwen4_hc_combine_dispatch,
     qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch,
     qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
@@ -1570,14 +1570,32 @@ impl<'ctx> Qwen4Dev<'ctx> {
                     [d.x, d.y, d.z],
                 )?;
             }
-            Qwen4DeviceFormat::Q8_0 => {
-                // The W8A16 arm (generic mul_mat_vec + DATA_A_Q8_0, plain
-                // f32 B) lands with the Q4_K kernel work; the W4A8
-                // (q8_1-activation) path that briefly lived here was removed
-                // deliberately — this model's precision contract is A16.
-                return Err(anyhow!(
-                    "Q8_0 dense GEMV pends the W8A16 kernel (GemvQ8_0Dense)"
-                ));
+            Qwen4DeviceFormat::Q4K | Qwen4DeviceFormat::Q8_0 => {
+                // W4A16 / W8A16: the same plain-f32 B contract as the float
+                // arms — no activation quantization anywhere on this model.
+                let (kernel, gate) = if t.format == Qwen4DeviceFormat::Q4K {
+                    (Kernel::GemvQ4KDense, 256)
+                } else {
+                    (Kernel::GemvQ8_0Dense, 8)
+                };
+                ensure!(
+                    ncols % gate == 0,
+                    "{kernel:?}: ncols {ncols} is not a multiple of {gate}"
+                );
+                let d = gemv_dispatch(nrows);
+                self.rec(
+                    kernel,
+                    kernel.specialization_u32(),
+                    &gemv_params_f32_b(ncols, nrows).to_le_bytes(),
+                    &[
+                        Bind::Ext(wb, wo, wl),
+                        src,
+                        dst,
+                        Bind::A(s.dummy, 8),
+                        Bind::A(s.dummy, 8),
+                    ],
+                    [d.x, d.y, d.z],
+                )?;
             }
             Qwen4DeviceFormat::F32 => {
                 let d = qwen36_router_gemv_dispatch(nrows);
@@ -3211,11 +3229,21 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 // = bf16 (default, verbatim bytes) | q8 (load-time Q8_0 —
                 // half the bytes at a measured 6.6-7.4e-3 vector-rel per
                 // tensor). The harness's SubsetF32 arm below is unaffected.
+                // Dense-tier format without a recompile. q4k = W4A16 Q4_K
+                // on every width-qualified family (the 640-wide shared-expert
+                // down rides Q8_0); q8 = W8A16 Q8_0 everywhere; default is
+                // the verbatim BF16 tier until the quality probe flips it.
                 let ucfg = match std::env::var("ARLE_QWEN4_DENSE").as_deref() {
+                    Ok("q4k" | "q4") => Qwen4UploadConfig {
+                        dense_format: Qwen4DeviceFormat::Q4K,
+                        ..Qwen4UploadConfig::default()
+                    },
+                    Ok("q8" | "q8_0") => Qwen4UploadConfig {
+                        dense_format: Qwen4DeviceFormat::Q8_0,
+                        ..Qwen4UploadConfig::default()
+                    },
                     Ok("bf16") | Err(_) => Qwen4UploadConfig::default(),
-                    Ok(other) => bail!(
-                        "ARLE_QWEN4_DENSE={other}: only bf16 today — the W4A16                          q4k/q8 arms land with the GemvQ4KDense kernel work"
-                    ),
+                    Ok(other) => bail!("ARLE_QWEN4_DENSE={other}: bf16 | q4k | q8"),
                 };
                 let plan = plan_qwen4_upload(st, &ucfg, &Qwen4UploadScope::full())?;
                 let weights = upload_qwen4(ctx, st, &plan, &ucfg)?;

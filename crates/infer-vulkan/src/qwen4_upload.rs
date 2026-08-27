@@ -231,6 +231,14 @@ pub enum Qwen4DeviceFormat {
     F16,
     /// IEEE binary32.
     F32,
+    /// ggml `block_q4_K`: 256-value superblocks, 144 B (two f16 super-scales,
+    /// twelve bytes of packed 6-bit sub-scales/mins, 128 nibble bytes) —
+    /// quantized AT LOAD from BF16 by the ggml-exact `quantize_q4_k_from_bf16`.
+    /// 0.5625 B/elem; consumed by `GemvQ4KDense`, whose B operand is the
+    /// PLAIN f32 activation (W4A16 — no activation quantization anywhere).
+    /// Refuses widths that are not whole superblocks (the 640-wide
+    /// shared-expert down stays Q8_0/BF16).
+    Q4K,
     /// ggml `block_q8_0`: f16 scale + 32 int8 per 32 values, 34 B/block —
     /// quantized AT LOAD from the checkpoint's BF16 by the ggml-exact
     /// `quantize_q8_0_from_bf16`. Halves the dense bytes at a measured
@@ -253,6 +261,12 @@ impl Qwen4DeviceFormat {
     pub const fn bytes_for(self, ncols: usize, nrows: usize) -> Option<u64> {
         match self {
             Self::Bf16 | Self::F16 => Some((ncols * nrows * 2) as u64),
+            Self::Q4K => {
+                if ncols == 0 || !ncols.is_multiple_of(256) {
+                    return None;
+                }
+                Some((ncols / 256 * 144 * nrows) as u64)
+            }
             Self::Q8_0 => {
                 if ncols == 0 || !ncols.is_multiple_of(32) {
                     return None;
@@ -321,7 +335,9 @@ pub fn device_format(kind: Qwen4TensorKind, dense: Qwen4DeviceFormat) -> Option<
             // Q8 arm of those shaders, and 1.27 GB/token of BF16 beats
             // 2.5 GB of F32). Only the float-converting configs (the
             // harness's F32 subset) keep F32.
-            Qwen4DeviceFormat::Bf16 | Qwen4DeviceFormat::Q8_0 => Qwen4DeviceFormat::Bf16,
+            Qwen4DeviceFormat::Bf16 | Qwen4DeviceFormat::Q8_0 | Qwen4DeviceFormat::Q4K => {
+                Qwen4DeviceFormat::Bf16
+            }
             _ => F32,
         }),
 
@@ -345,10 +361,18 @@ pub fn device_format(kind: Qwen4TensorKind, dense: Qwen4DeviceFormat) -> Option<
         | PleNormConv
         | PleConv1d => Some(F32),
 
+        // The 640-wide shared-expert down is not a whole number of Q4_K
+        // superblocks; under a Q4_K dense tier it rides Q8_0 (whose GEMV
+        // takes ncols % 8) instead of silently failing the plan.
+        SharedExpertDownProj => Some(match dense {
+            Qwen4DeviceFormat::Q4K => Qwen4DeviceFormat::Q8_0,
+            other => other,
+        }),
+
         // The dense GEMV weights — 6.70 GiB at F16, 13.4 GiB at F32.
         LinearAttnInProjQkv | LinearAttnInProjZ | LinearAttnOutProj | AttnQProj | AttnKProj
         | AttnVProj | AttnOProj | IndexerQkProj | SharedExpertGateProj | SharedExpertUpProj
-        | SharedExpertDownProj | PleKeyProj | PleValueProj | LmHead => Some(dense),
+        | PleKeyProj | PleValueProj | LmHead => Some(dense),
 
         // Host-resident tables (see `Qwen4HostTables`).
         EmbedTokens
@@ -1690,6 +1714,49 @@ pub fn f32_to_f16(x: f32) -> u16 {
     sign | (result as u16)
 }
 
+/// Slice a BF16 -> quantized conversion across threads by row ranges. Both
+/// quantizers are row-self-contained (their docs guarantee it), so each
+/// thread owns a disjoint `[row_lo, row_hi)` of src and dst. Single-threaded
+/// the whole 13.3 GiB dense tier costs ~30 s of load at the measured
+/// ~0.45 GB/s; sixteen ways it is under 3.
+#[cfg(feature = "vulkan")]
+#[expect(clippy::too_many_arguments, reason = "a conversion plan is this wide")]
+fn quantize_rows_threaded(
+    name: &str,
+    src: &[u8],
+    nrows: usize,
+    ncols: usize,
+    dst: &mut [u8],
+    block_vals: usize,
+    block_bytes: usize,
+    quantize: fn(&[u8], usize, usize, &mut [u8]) -> vulkan_kernels::Result<()>,
+) -> Result<()> {
+    let src_row = ncols * 2;
+    let dst_row = ncols / block_vals * block_bytes;
+    ensure!(
+        src.len() == nrows * src_row && dst.len() == nrows * dst_row,
+        "{name}: quantize buffer geometry"
+    );
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .min(16)
+        .min(nrows.max(1));
+    let chunk = nrows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (i, dst_chunk) in dst.chunks_mut(chunk * dst_row).enumerate() {
+            let rows = dst_chunk.len() / dst_row;
+            let src_chunk = &src[i * chunk * src_row..][..rows * src_row];
+            handles.push(scope.spawn(move || quantize(src_chunk, rows, ncols, dst_chunk)));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| anyhow!("{name}: quantize worker panicked"))??;
+        }
+        Ok(())
+    })
+}
+
 /// Fill `dst` with the F16 form of a BF16 tensor.
 ///
 /// Streamed element by element rather than through an intermediate
@@ -2316,14 +2383,39 @@ pub fn upload_qwen4<'ctx, 'st>(
                         );
                         dst.copy_from_slice(src);
                     }
+                    Qwen4DeviceFormat::Q4K => {
+                        ensure!(
+                            !*fold_bias,
+                            "{}: the 1+w fold needs a converting format, not Q4_K",
+                            item.name
+                        );
+                        quantize_rows_threaded(
+                            &item.name,
+                            src,
+                            item.nrows,
+                            item.ncols,
+                            dst,
+                            256,
+                            144,
+                            vulkan_kernels::quantize_q4_k_from_bf16,
+                        )?;
+                    }
                     Qwen4DeviceFormat::Q8_0 => {
                         ensure!(
                             !*fold_bias,
                             "{}: the 1+w fold needs a float format, not Q8_0",
                             item.name
                         );
-                        vulkan_kernels::quantize_q8_0_from_bf16(src, item.nrows, item.ncols, dst)
-                            .with_context(|| format!("{}: q8_0 quantize", item.name))?;
+                        quantize_rows_threaded(
+                            &item.name,
+                            src,
+                            item.nrows,
+                            item.ncols,
+                            dst,
+                            32,
+                            34,
+                            vulkan_kernels::quantize_q8_0_from_bf16,
+                        )?;
                     }
                     Qwen4DeviceFormat::F16 => write_bf16_as_f16(&item.name, src, dst)?,
                     Qwen4DeviceFormat::F32 => write_bf16_as_f32(&item.name, src, dst, *fold_bias)?,

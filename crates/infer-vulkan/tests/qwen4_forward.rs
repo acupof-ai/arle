@@ -1354,7 +1354,14 @@ fn dense_format_quality_probe() {
         let mut logits_all = Vec::new();
         let mut tok_s = 0.0f64;
         let mut tok_n = 0usize;
-        for prompt in &prompts {
+        for (pi, prompt) in prompts.iter().enumerate() {
+            // The baseline generates freely; candidates REPLAY the baseline's
+            // token sequence (teacher forcing), so every compared position
+            // has an IDENTICAL prefix — free-running comparison compounds the
+            // first divergence into every later token and poisons both the
+            // agreement rate and the logit columns.
+            let forced: Option<&Vec<u32>> =
+                runs.first().map(|(_, r): &(String, Run)| &r.greedy[pi]);
             let mut seq = prompt.clone();
             let mut generated: Vec<u32> = Vec::new();
             let mut step_logits = Vec::new();
@@ -1377,7 +1384,12 @@ fn dense_format_quality_probe() {
                     step_logits.push(logits);
                     generated.push(arg);
                     if seq.len() < prompt.len() + GEN {
-                        seq.push(arg);
+                        // Candidates advance on the BASELINE's token, not
+                        // their own argmax.
+                        let next = forced
+                            .and_then(|f| f.get(generated.len() - 1).copied())
+                            .unwrap_or(arg);
+                        seq.push(next);
                     }
                 }
             }
@@ -1421,7 +1433,7 @@ fn dense_format_quality_probe() {
     eprintln!("\n── quality vs {base_name} ──");
     eprintln!(
         "  {:<6} {:>9} {:>12} {:>12} {:>9} {:>10}",
-        "format", "agree", "top1 MAE", "vector MAE", "load s", "ms/token"
+        "format", "step-agree", "top1 MAE", "vector MAE", "load s", "ms/token"
     );
     for (name, run) in &runs[1..] {
         let mut agree = 0usize;
