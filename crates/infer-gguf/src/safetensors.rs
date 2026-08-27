@@ -84,6 +84,36 @@ fn ggml_type_for(dtype: &str) -> Option<GgmlType> {
     })
 }
 
+/// Bytes per declared element, for the dtypes safetensors stores a whole number
+/// of bytes at a time. `None` means there is no shape-to-length invariant to
+/// check: a sub-byte dtype (`F4`, `F6_E2M3`, `E8M0`, ...), where `shape` and
+/// byte length are not proportional, or a spelling this reader has never seen.
+///
+/// Mapped dtypes take their width from `GgmlType` so the two tables cannot
+/// drift; the literals below are only the dtypes with no `GgmlType` twin.
+///
+/// `U8` is the entry that matters. It carries the whole NVFP4 expert tier of the
+/// `qwen4_exp` checkpoint — 56.25 GiB of its 126, measured over all 206 shard
+/// headers — and it has the strictest invariant of any dtype in the file:
+/// exactly one byte per declared element. The 2-values-per-byte packing lives in
+/// the SHAPE (`[640, 1280]` for a `[640, 2560]` matrix), not in a shape-to-bytes
+/// ratio, so the cross-check below applies to it unchanged.
+fn bytes_per_element(dtype: &str, ggml_type: Option<GgmlType>) -> Option<u64> {
+    if let Some(ty) = ggml_type
+        && ty.block_size() == 1
+        && let Some(elem) = ty.type_size()
+    {
+        return Some(elem as u64);
+    }
+    Some(match dtype {
+        "U8" | "BOOL" | "F8_E5M2" => 1,
+        "U16" => 2,
+        "U32" => 4,
+        "U64" => 8,
+        _ => return None,
+    })
+}
+
 /// Cap on `{`/`[` nesting while skipping an unknown value. A conforming header
 /// nests three deep (`{tensor: {shape: [..]}}`); the cap only exists so a
 /// malformed file cannot recurse the parser off the stack.
@@ -440,16 +470,16 @@ fn parse_tensor(j: &mut Json<'_>, name: String, blob_len: u64) -> Result<SafeTen
     let len = end - start;
 
     let ggml_type = ggml_type_for(&dtype);
-    // Cross-check the declared length against shape x element size. This is
-    // the cheap guard that catches a mis-parsed shape at open time instead of
-    // letting a transposed or short weight reach a shader. Only unblocked
-    // dtypes can be checked; the U8 NVFP4 planes carry no such invariant.
-    if let Some(ty) = ggml_type
-        && ty.block_size() == 1
-        && let Some(elem) = ty.type_size()
-    {
+    // Cross-check the declared length against shape x element size: the cheap
+    // guard that catches a mis-declared header at open time instead of letting a
+    // short slice reach a shader. It pins the ELEMENT COUNT, so it catches a
+    // plane declared at its logical width instead of its packed one, a dropped
+    // or invented axis, and a truncated span — but not a pure transpose, whose
+    // product is unchanged. Axis ORDER is pinned by the callers' geometry
+    // asserts, not here.
+    if let Some(elem) = bytes_per_element(&dtype, ggml_type) {
         let elems = shape.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d));
-        let want = elems.and_then(|n| n.checked_mul(elem as u64));
+        let want = elems.and_then(|n| n.checked_mul(elem));
         ensure!(
             want == Some(len),
             "tensor {name}: dtype {dtype} shape {shape:?} implies {want:?} bytes but \
@@ -728,6 +758,67 @@ mod header_tests {
         );
     }
 
+    /// The tier the cross-check used to skip. A `[640, 2560]` NVFP4 plane is
+    /// stored `[640, 1280]` — two FP4 values per byte — so a header that
+    /// declares the LOGICAL width over the PACKED byte span is off by exactly
+    /// 2x. That is the mistake a repacker or a hand-edited header makes, it is
+    /// 56.25 GiB of this checkpoint, and while `U8` was exempt it was accepted
+    /// in silence and handed to a GEMV as a half-length row.
+    #[test]
+    fn rejects_u8_plane_whose_shape_contradicts_its_byte_span() {
+        let bad =
+            r#"{"e.gate_proj.weight":{"dtype":"U8","shape":[640,2560],"data_offsets":[0,819200]}}"#;
+        let err = parse_header(bad.as_bytes(), 819_200).expect_err("must reject");
+        assert!(
+            err.to_string().contains(
+                "dtype U8 shape [640, 2560] implies Some(1638400) bytes but \
+                 data_offsets declare 819200"
+            ),
+            "unexpected error: {err}"
+        );
+
+        // The same plane declared at its packed width is what the real shards
+        // carry, and still opens.
+        let good =
+            r#"{"e.gate_proj.weight":{"dtype":"U8","shape":[640,1280],"data_offsets":[0,819200]}}"#;
+        let (tensors, _) = parse_header(good.as_bytes(), 819_200).expect("packed shape parses");
+        assert_eq!(tensors[0].dims, vec![1280, 640]);
+        assert_eq!(tensors[0].ggml_type, None, "still not guessed into a block");
+    }
+
+    /// The rest of the whole-byte tier, none of which has a `GgmlType` twin.
+    /// Each row is the correct element count against a deliberately wrong span.
+    #[test]
+    fn cross_check_covers_the_unsigned_and_bool_tiers() {
+        for (dtype, elems, wrong_len) in [
+            ("U16", 4u64, 4u64),
+            ("U32", 4, 8),
+            ("U64", 4, 16),
+            ("BOOL", 4, 2),
+            ("F8_E5M2", 4, 8),
+        ] {
+            let json = format!(
+                r#"{{"w":{{"dtype":"{dtype}","shape":[{elems}],"data_offsets":[0,{wrong_len}]}}}}"#
+            );
+            assert!(
+                parse_header(json.as_bytes(), wrong_len).is_err(),
+                "{dtype}: a {wrong_len}-byte span for {elems} elements must be rejected"
+            );
+        }
+    }
+
+    /// The exemption that must survive: a sub-byte dtype packs several elements
+    /// into a byte, so `shape x 1` is not its length and asserting it would
+    /// refuse a valid file. `bytes_per_element` returns `None` for these.
+    #[test]
+    fn sub_byte_dtypes_stay_exempt_from_the_cross_check() {
+        let json = r#"{"q":{"dtype":"F4","shape":[64],"data_offsets":[0,32]}}"#;
+        let (tensors, _) = parse_header(json.as_bytes(), 32).expect("F4 must not be rejected");
+        assert_eq!(tensors[0].ggml_type, None);
+        assert_eq!(tensors[0].len, 32);
+        assert_eq!(tensors[0].element_count(), 64);
+    }
+
     /// Names come out of a JSON string, so escapes are the writer's choice.
     #[test]
     fn decodes_string_escapes_in_names() {
@@ -908,5 +999,33 @@ mod on_box_tests {
             .tensor("model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale")
             .expect("expert gate_proj weight_scale");
         assert_eq!(scale.ggml_type, Some(GgmlType::F8E4M3));
+    }
+
+    /// Sizes the tier the cross-check now guards. `open()` succeeding is itself
+    /// the evidence that every U8 plane satisfies `shape x 1 == byte span`, so
+    /// what is worth asserting here is HOW MUCH that covers — a future reader
+    /// that quietly re-exempts `U8` would leave this many bytes unchecked.
+    #[test]
+    fn real_checkpoint_u8_tier_is_the_bulk_of_the_file() {
+        let Some(st) = open() else { return };
+        let mut planes = 0usize;
+        let mut bytes = 0u64;
+        for t in st.tensors() {
+            if t.dtype != "U8" {
+                continue;
+            }
+            planes += 1;
+            bytes += t.len;
+            assert_eq!(
+                t.element_count(),
+                t.len,
+                "{}: U8 is exactly one byte per element",
+                t.name
+            );
+        }
+        // Measured 2026-08 over all 206 shard headers: 48 layers x 512 experts
+        // x 3 projections, and 56.25 GiB — 45% of the checkpoint's 126 GiB.
+        assert_eq!(planes, 73_728, "U8 NVFP4 planes");
+        assert_eq!(bytes, 60_397_977_600, "U8 bytes");
     }
 }

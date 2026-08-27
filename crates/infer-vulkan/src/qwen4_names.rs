@@ -656,53 +656,133 @@ mod tests {
     /// Collect the keys of the JSON object that starts at the first `{` in `src`.
     ///
     /// `infer-vulkan` carries no JSON dependency, and the only thing these tests
-    /// want out of either file is the set of object keys — the values are a
-    /// shard filename (the index) or a dtype/shape record (a safetensors
-    /// header), neither of which is under test here.
-    fn json_object_keys(src: &str) -> Vec<&str> {
+    /// want out of either file is its depth-1 members — the values are a shard
+    /// filename (the index) or a `{dtype, shape, data_offsets}` record (a
+    /// safetensors header), so each is handed back as the raw source slice and
+    /// the caller reads what it needs out of it.
+    fn json_object_members(src: &str) -> Vec<(&str, &str)> {
         let bytes = src.as_bytes();
-        let mut keys = Vec::new();
+        let mut out = Vec::new();
         let Some(open) = src.find('{') else {
-            return keys;
+            return out;
         };
         let mut i = open + 1;
-        let mut depth = 1usize;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'{' | b'[' => {
-                    depth += 1;
+        loop {
+            i = skip_ws(bytes, i);
+            if bytes.get(i) != Some(&b'"') {
+                return out; // the closing `}`, or a malformed tail
+            }
+            let key_start = i + 1;
+            i = skip_json_string(bytes, i);
+            let key_end = i - 1;
+            i = skip_ws(bytes, i);
+            if bytes.get(i) != Some(&b':') {
+                return out;
+            }
+            let value_start = skip_ws(bytes, i + 1);
+            i = skip_json_value(bytes, value_start);
+            out.push((&src[key_start..key_end], &src[value_start..i]));
+            i = skip_ws(bytes, i);
+            if bytes.get(i) != Some(&b',') {
+                return out;
+            }
+            i += 1;
+        }
+    }
+
+    fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    }
+
+    /// Past the closing quote of the string starting at `i`.
+    fn skip_json_string(bytes: &[u8], mut i: usize) -> usize {
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += if bytes[i] == b'\\' { 2 } else { 1 };
+        }
+        i + 1
+    }
+
+    /// Past one value of any kind. Objects and arrays are skipped by brace
+    /// depth, with strings consumed whole so a `}` inside a name cannot end them
+    /// early.
+    fn skip_json_value(bytes: &[u8], mut i: usize) -> usize {
+        match bytes.get(i) {
+            Some(b'"') => skip_json_string(bytes, i),
+            Some(b'{' | b'[') => {
+                let mut depth = 0usize;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'"' => {
+                            i = skip_json_string(bytes, i);
+                            continue;
+                        }
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return i + 1;
+                            }
+                        }
+                        _ => {}
+                    }
                     i += 1;
                 }
-                b'}' | b']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
+                i
+            }
+            // A number, `true`, `false` or `null`: run to the next structural
+            // byte.
+            _ => {
+                while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b']') {
                     i += 1;
                 }
-                b'"' => {
-                    let start = i + 1;
-                    let mut end = start;
-                    while end < bytes.len() && bytes[end] != b'"' {
-                        end += if bytes[end] == b'\\' { 2 } else { 1 };
-                    }
-                    i = end + 1;
-                    // A key is a depth-1 string followed by `:`; the same string
-                    // in value position (the shard filename) is not.
-                    if depth == 1 {
-                        let mut colon = i;
-                        while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
-                            colon += 1;
-                        }
-                        if bytes.get(colon) == Some(&b':') {
-                            keys.push(&src[start..end]);
-                        }
-                    }
-                }
-                _ => i += 1,
+                i
             }
         }
-        keys
+    }
+
+    /// One tensor's dtype and shape exactly as a shard header declares them.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Declared {
+        dtype: String,
+        /// safetensors order: row-major, so the LAST axis is contiguous. NOT
+        /// reversed into GGUF `ne` order — these pins record what the checkpoint
+        /// says, not what a reader chooses to call `dims`.
+        shape: Vec<u64>,
+    }
+
+    /// `None` when `name` is not in this header.
+    fn declared_in(header: &str, name: &str) -> Option<Declared> {
+        let entry = json_object_members(header)
+            .into_iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, entry)| entry)?;
+        let mut dtype = None;
+        let mut shape = None;
+        for (key, value) in json_object_members(entry) {
+            match key {
+                "dtype" => dtype = Some(value.trim_matches('"').to_string()),
+                "shape" => {
+                    shape = Some(
+                        value
+                            .trim_matches(['[', ']'].as_slice())
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|part| !part.is_empty())
+                            .map(|part| part.parse::<u64>().expect("shape entry is an integer"))
+                            .collect(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        Some(Declared {
+            dtype: dtype.expect("header entry has a dtype"),
+            shape: shape.expect("header entry has a shape"),
+        })
     }
 
     /// safetensors framing: 8-byte little-endian header length, then that many
@@ -721,7 +801,10 @@ mod tests {
         let at = index
             .find("\"weight_map\"")
             .expect("index.json has a weight_map");
-        json_object_keys(&index[at..])
+        json_object_members(&index[at..])
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     }
 
     /// The whole point of this module: walk every name the real checkpoint
@@ -1007,8 +1090,9 @@ mod tests {
             return;
         }
         let header = read_safetensors_header(&shard).expect("read shard header");
-        let names: Vec<&str> = json_object_keys(&header)
+        let names: Vec<&str> = json_object_members(&header)
             .into_iter()
+            .map(|(name, _)| name)
             .filter(|name| *name != "__metadata__")
             .collect();
         assert_eq!(names.len(), EXPERTS_PER_SHARD as usize * 3 * 4);
@@ -1034,6 +1118,823 @@ mod tests {
         for name in &names {
             assert!(indexed.contains(name), "`{name}` missing from the index");
         }
+    }
+
+    // ---- geometry the reference derives from config.json -------------------
+    //
+    // Named rather than spelled as literals so each pinned shape below reads as
+    // the arithmetic `modeling_qwen4_exp.py` does in the module's `__init__`.
+    // A pin that disagrees means the checkpoint and the reference disagree.
+    const HIDDEN: u64 = 2560; // text_config.hidden_size
+    const VOCAB: u64 = 248_320;
+    const HC_COUNT: u64 = 4;
+    const HC_HIDDEN: u64 = HIDDEN * HC_COUNT; // Qwen4ExpTextGatedResidual hc_hidden_size
+    const HC_LOWRANK: u64 = 320;
+    const KEY_DIM: u64 = 16 * 128; // linear_num_key_heads x linear_key_head_dim
+    const VALUE_DIM: u64 = 48 * 128; // linear_num_value_heads x linear_value_head_dim
+    const NUM_V_HEADS: u64 = 48;
+    const HEAD_V_DIM: u64 = 128; // linear_value_head_dim; RMSNormGated's width
+    const CONV_K: u64 = 4; // linear_conv_kernel_dim, and ple_conv_kernel_size
+    const HEAD_DIM: u64 = 256; // full-attention head_dim
+    const N_HEADS: u64 = 24;
+    const N_KV_HEADS: u64 = 2;
+    const INDEXER_DIM: u64 = 128; // indexer_head_dim
+    const MOE_INTER: u64 = 640; // moe_intermediate_size == shared_expert_intermediate_size
+    const NVFP4_GROUP: u64 = 16; // hf_quant_config.json group_size
+    const NGRAM_HEADS: u64 = 16; // (ngram_size - 1) x heads_per_ngram = 2 x 8
+    const NGRAM_HEAD_DIM: u64 = 160; // ple_embed_dim 2560 / NGRAM_HEADS
+    const NGRAM_SHARD_ROWS: u64 = 2_500_012; // padded n-gram vocab / split_ngram_parts
+    const VIS_HIDDEN: u64 = 1152;
+    const VIS_INTER: u64 = 4304;
+    const VIS_MERGE: u64 = VIS_HIDDEN * 4; // spatial_merge_size^2 patches concatenated
+    const VIS_POS: u64 = 2304; // num_position_embeddings
+
+    /// One pinned family: a tensor's name suffix under its group's prefix, the
+    /// role `classify_qwen4_tensor` must return for it, and the dtype and shape
+    /// its shard header declares.
+    struct Pin {
+        suffix: &'static str,
+        kind: Qwen4TensorKind,
+        /// Expert id / n-gram shard / vision block, when the name carries one.
+        sub: Option<u32>,
+        dtype: &'static str,
+        /// safetensors order: row-major, LAST axis contiguous. NOT reversed into
+        /// GGUF `ne` order — a pin records what the checkpoint says.
+        shape: &'static [u64],
+    }
+
+    /// Pins sharing a name prefix, and therefore the stream and layer it implies.
+    struct PinGroup {
+        prefix: &'static str,
+        stream: Qwen4Stream,
+        layer: Option<usize>,
+        pins: &'static [Pin],
+    }
+
+    const PIN_GROUPS: &[PinGroup] = &[
+        PinGroup {
+            // Stream-level: no `layers.<n>.`, so `layer` is None.
+            prefix: "",
+            stream: Qwen4Stream::Text,
+            layer: None,
+            pins: &[
+                Pin {
+                    suffix: "lm_head.weight",
+                    kind: LmHead,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[VOCAB, HIDDEN],
+                },
+                Pin {
+                    suffix: "model.language_model.embed_tokens.weight",
+                    kind: EmbedTokens,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[VOCAB, HIDDEN],
+                },
+                // The mixer is the terminal op before lm_head, and the reason
+                // there is no `model.language_model.norm.weight`.
+                Pin {
+                    suffix: "model.language_model.hyper_connection_mixer.hc_norm.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Mixer,
+                        part: HcPart::Norm,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Mixer,
+                        part: HcPart::MixDown,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_LOWRANK, HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Mixer,
+                        part: HcPart::MixUp,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN, HC_LOWRANK],
+                },
+            ],
+        },
+        PinGroup {
+            // Layer 0 is linear-attention (`(0 + 1) % 4 != 0`) and carries a
+            // full MoE, so one layer covers three families at once.
+            prefix: "model.language_model.layers.0.",
+            stream: Qwen4Stream::Text,
+            layer: Some(0),
+            pins: &[
+                Pin {
+                    suffix: "attn_hyper_connection.hc_norm.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Attn,
+                        part: HcPart::Norm,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "attn_hyper_connection.input_mix_weight_down.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Attn,
+                        part: HcPart::MixDown,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_LOWRANK, HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "attn_hyper_connection.input_mix_weight_up.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Attn,
+                        part: HcPart::MixUp,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN, HC_LOWRANK],
+                },
+                Pin {
+                    suffix: "attn_hyper_connection.block_inject_weight.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Attn,
+                        part: HcPart::BlockInject,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_COUNT, HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp_hyper_connection.hc_norm.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Mlp,
+                        part: HcPart::Norm,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp_hyper_connection.input_mix_weight_down.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Mlp,
+                        part: HcPart::MixDown,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_LOWRANK, HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp_hyper_connection.input_mix_weight_up.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Mlp,
+                        part: HcPart::MixUp,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN, HC_LOWRANK],
+                },
+                Pin {
+                    suffix: "mlp_hyper_connection.block_inject_weight.weight",
+                    kind: HyperConnection {
+                        site: HcSite::Mlp,
+                        part: HcPart::BlockInject,
+                    },
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_COUNT, HC_HIDDEN],
+                },
+                // q, k and v share one projection; z is value-width alone. The
+                // 10240 vs 6144 split is what separates these two arms.
+                Pin {
+                    suffix: "linear_attn.in_proj_qkv.weight",
+                    kind: LinearAttnInProjQkv,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[KEY_DIM * 2 + VALUE_DIM, HIDDEN],
+                },
+                Pin {
+                    suffix: "linear_attn.in_proj_z.weight",
+                    kind: LinearAttnInProjZ,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[VALUE_DIM, HIDDEN],
+                },
+                Pin {
+                    suffix: "linear_attn.in_proj_b.weight",
+                    kind: LinearAttnInProjB,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[NUM_V_HEADS, HIDDEN],
+                },
+                Pin {
+                    suffix: "linear_attn.in_proj_a.weight",
+                    kind: LinearAttnInProjA,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[NUM_V_HEADS, HIDDEN],
+                },
+                // Depthwise: groups == in_channels, so the middle axis is 1.
+                Pin {
+                    suffix: "linear_attn.conv1d.weight",
+                    kind: LinearAttnConv1d,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[KEY_DIM * 2 + VALUE_DIM, 1, CONV_K],
+                },
+                Pin {
+                    suffix: "linear_attn.A_log",
+                    kind: LinearAttnALog,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[NUM_V_HEADS],
+                },
+                Pin {
+                    suffix: "linear_attn.dt_bias",
+                    kind: LinearAttnDtBias,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[NUM_V_HEADS],
+                },
+                Pin {
+                    suffix: "linear_attn.norm.weight",
+                    kind: LinearAttnNorm,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HEAD_V_DIM],
+                },
+                Pin {
+                    suffix: "linear_attn.out_proj.weight",
+                    kind: LinearAttnOutProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN, VALUE_DIM],
+                },
+                // 512 router logits vs the shared expert's single sigmoid gate:
+                // the one number that tells these two `mlp.*gate*` arms apart.
+                Pin {
+                    suffix: "mlp.gate.weight",
+                    kind: MoeRouter,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[NUM_EXPERTS as u64, HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp.shared_expert_gate.weight",
+                    kind: SharedExpertGate,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[1, HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp.shared_expert.gate_proj.weight",
+                    kind: SharedExpertGateProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[MOE_INTER, HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp.shared_expert.up_proj.weight",
+                    kind: SharedExpertUpProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[MOE_INTER, HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp.shared_expert.down_proj.weight",
+                    kind: SharedExpertDownProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN, MOE_INTER],
+                },
+            ],
+        },
+        PinGroup {
+            // Layer 3 is the first full-attention layer, and the only place the
+            // self_attn and QSA-indexer families exist.
+            prefix: "model.language_model.layers.3.",
+            stream: Qwen4Stream::Text,
+            layer: Some(3),
+            pins: &[
+                // x2 because the second half is the sigmoid output gate, not
+                // extra query heads — that factor is why q is 24x k, not 12x.
+                Pin {
+                    suffix: "self_attn.q_proj.weight",
+                    kind: AttnQProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[N_HEADS * HEAD_DIM * 2, HIDDEN],
+                },
+                Pin {
+                    suffix: "self_attn.k_proj.weight",
+                    kind: AttnKProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[N_KV_HEADS * HEAD_DIM, HIDDEN],
+                },
+                Pin {
+                    suffix: "self_attn.v_proj.weight",
+                    kind: AttnVProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[N_KV_HEADS * HEAD_DIM, HIDDEN],
+                },
+                Pin {
+                    suffix: "self_attn.o_proj.weight",
+                    kind: AttnOProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN, N_HEADS * HEAD_DIM],
+                },
+                Pin {
+                    suffix: "self_attn.q_norm.weight",
+                    kind: AttnQNorm,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HEAD_DIM],
+                },
+                Pin {
+                    suffix: "self_attn.k_norm.weight",
+                    kind: AttnKNorm,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HEAD_DIM],
+                },
+                Pin {
+                    suffix: "self_attn.indexer.index_qk_proj.weight",
+                    kind: IndexerQkProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[(4 + 1) * INDEXER_DIM, HIDDEN], // n_heads + kv_heads
+                },
+                Pin {
+                    suffix: "self_attn.indexer.q_layernorm.weight",
+                    kind: IndexerQNorm,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[INDEXER_DIM],
+                },
+                Pin {
+                    suffix: "self_attn.indexer.k_layernorm.weight",
+                    kind: IndexerKNorm,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[INDEXER_DIM],
+                },
+            ],
+        },
+        PinGroup {
+            // The PLE hangs off exactly one layer (`ple_layer_ids: [2]`,
+            // one-indexed).
+            prefix: "model.language_model.layers.1.",
+            stream: Qwen4Stream::Text,
+            layer: Some(PLE_LAYER),
+            pins: &[
+                // key_proj emits one key per residual stream (10240), value_proj
+                // one shared value (2560). That is what separates these arms.
+                Pin {
+                    suffix: "ple.key_proj.weight",
+                    kind: PleKeyProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN, HIDDEN],
+                },
+                Pin {
+                    suffix: "ple.value_proj.weight",
+                    kind: PleValueProj,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN, HIDDEN],
+                },
+                Pin {
+                    suffix: "ple.norm_key.weight",
+                    kind: PleNormKey,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "ple.norm_query.weight",
+                    kind: PleNormQuery,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "ple.norm_conv.weight",
+                    kind: PleNormConv,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN],
+                },
+                Pin {
+                    suffix: "ple.conv1d.weight",
+                    kind: PleConv1d,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN, 1, CONV_K],
+                },
+                Pin {
+                    suffix: "ple.ple_embedding.ngram_embedding.shard_0.weight",
+                    kind: PleNgramShard,
+                    sub: Some(0),
+                    dtype: "F8_E4M3",
+                    shape: &[NGRAM_SHARD_ROWS, NGRAM_HEAD_DIM],
+                },
+                // One BF16 scalar dequantizing all 47.68 GiB of FP8 above it.
+                Pin {
+                    suffix: "ple.ple_embedding.ngram_embedding.weight_scale",
+                    kind: PleNgramWeightScale,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[1],
+                },
+                Pin {
+                    suffix: "ple.ple_embedding.layer_multipliers",
+                    kind: PleNgramLayerMultipliers,
+                    sub: None,
+                    dtype: "I64",
+                    shape: &[3], // ngram_size
+                },
+                Pin {
+                    suffix: "ple.ple_embedding.ngram_heads_offsets",
+                    kind: PleNgramHeadsOffsets,
+                    sub: None,
+                    dtype: "I64",
+                    shape: &[NGRAM_HEADS],
+                },
+                Pin {
+                    suffix: "ple.ple_embedding.ngram_heads_vocab_sizes",
+                    kind: PleNgramHeadsVocabSizes,
+                    sub: None,
+                    dtype: "I64",
+                    shape: &[NGRAM_HEADS],
+                },
+            ],
+        },
+        PinGroup {
+            // The NVFP4 record, and the reason this table exists: the four
+            // components are same-count siblings whose match arms the counting
+            // test cannot tell apart. The geometry can — see the test's docs.
+            prefix: "model.language_model.layers.0.mlp.experts.7.",
+            stream: Qwen4Stream::Text,
+            layer: Some(0),
+            pins: &[
+                Pin {
+                    suffix: "gate_proj.weight",
+                    kind: Expert {
+                        proj: ExpertProj::Gate,
+                        part: Nvfp4Part::Packed,
+                    },
+                    sub: Some(7),
+                    dtype: "U8",
+                    shape: &[MOE_INTER, HIDDEN / 2], // two FP4 values per byte
+                },
+                Pin {
+                    suffix: "gate_proj.weight_scale",
+                    kind: Expert {
+                        proj: ExpertProj::Gate,
+                        part: Nvfp4Part::BlockScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F8_E4M3",
+                    shape: &[MOE_INTER, HIDDEN / NVFP4_GROUP],
+                },
+                Pin {
+                    suffix: "gate_proj.weight_scale_2",
+                    kind: Expert {
+                        proj: ExpertProj::Gate,
+                        part: Nvfp4Part::GlobalScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F32",
+                    shape: &[],
+                },
+                Pin {
+                    suffix: "gate_proj.input_scale",
+                    kind: Expert {
+                        proj: ExpertProj::Gate,
+                        part: Nvfp4Part::InputScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F32",
+                    shape: &[],
+                },
+                Pin {
+                    suffix: "up_proj.weight",
+                    kind: Expert {
+                        proj: ExpertProj::Up,
+                        part: Nvfp4Part::Packed,
+                    },
+                    sub: Some(7),
+                    dtype: "U8",
+                    shape: &[MOE_INTER, HIDDEN / 2],
+                },
+                Pin {
+                    suffix: "up_proj.weight_scale",
+                    kind: Expert {
+                        proj: ExpertProj::Up,
+                        part: Nvfp4Part::BlockScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F8_E4M3",
+                    shape: &[MOE_INTER, HIDDEN / NVFP4_GROUP],
+                },
+                Pin {
+                    suffix: "up_proj.weight_scale_2",
+                    kind: Expert {
+                        proj: ExpertProj::Up,
+                        part: Nvfp4Part::GlobalScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F32",
+                    shape: &[],
+                },
+                Pin {
+                    suffix: "up_proj.input_scale",
+                    kind: Expert {
+                        proj: ExpertProj::Up,
+                        part: Nvfp4Part::InputScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F32",
+                    shape: &[],
+                },
+                // down_proj runs the other way: 2560 rows of 640, so its packed
+                // and scale widths are the MoE intermediate, not hidden.
+                Pin {
+                    suffix: "down_proj.weight",
+                    kind: Expert {
+                        proj: ExpertProj::Down,
+                        part: Nvfp4Part::Packed,
+                    },
+                    sub: Some(7),
+                    dtype: "U8",
+                    shape: &[HIDDEN, MOE_INTER / 2],
+                },
+                Pin {
+                    suffix: "down_proj.weight_scale",
+                    kind: Expert {
+                        proj: ExpertProj::Down,
+                        part: Nvfp4Part::BlockScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F8_E4M3",
+                    shape: &[HIDDEN, MOE_INTER / NVFP4_GROUP],
+                },
+                Pin {
+                    suffix: "down_proj.weight_scale_2",
+                    kind: Expert {
+                        proj: ExpertProj::Down,
+                        part: Nvfp4Part::GlobalScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F32",
+                    shape: &[],
+                },
+                Pin {
+                    suffix: "down_proj.input_scale",
+                    kind: Expert {
+                        proj: ExpertProj::Down,
+                        part: Nvfp4Part::InputScale,
+                    },
+                    sub: Some(7),
+                    dtype: "F32",
+                    shape: &[],
+                },
+            ],
+        },
+        PinGroup {
+            // `mtp.*` is quant-excluded and `_keys_to_ignore_on_load_unexpected`
+            // in the reference, so these four have no reference module behind
+            // them: the shapes are the file's word, and the widths are the only
+            // thing distinguishing the two pre_fc norms.
+            prefix: "mtp.",
+            stream: Qwen4Stream::Mtp,
+            layer: None,
+            pins: &[
+                Pin {
+                    suffix: "fc_embedding.weight",
+                    kind: MtpFcEmbedding,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN, HIDDEN],
+                },
+                Pin {
+                    suffix: "fc_hidden.weight",
+                    kind: MtpFcHidden,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN, HIDDEN],
+                },
+                Pin {
+                    suffix: "pre_fc_norm_embedding.weight",
+                    kind: MtpPreFcNormEmbedding,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN],
+                },
+                Pin {
+                    suffix: "pre_fc_norm_hidden.weight",
+                    kind: MtpPreFcNormHidden,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HC_HIDDEN],
+                },
+            ],
+        },
+        PinGroup {
+            // The stacked HF expert layout, which survives only where modelopt
+            // did not quantize. gate_up is fused, hence 2 x MOE_INTER.
+            prefix: "mtp.layers.0.",
+            stream: Qwen4Stream::Mtp,
+            layer: Some(0),
+            pins: &[
+                Pin {
+                    suffix: "mlp.experts.gate_up_proj",
+                    kind: ExpertsStackedGateUp,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[NUM_EXPERTS as u64, 2 * MOE_INTER, HIDDEN],
+                },
+                Pin {
+                    suffix: "mlp.experts.down_proj",
+                    kind: ExpertsStackedDown,
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[NUM_EXPERTS as u64, HIDDEN, MOE_INTER],
+                },
+            ],
+        },
+        PinGroup {
+            prefix: "model.visual.",
+            stream: Qwen4Stream::Vision,
+            layer: None,
+            pins: &[
+                // Conv3d: (out, in_channels, temporal_patch_size, patch, patch).
+                Pin {
+                    suffix: "patch_embed.proj.weight",
+                    kind: Vision(VisionSlot::PatchEmbed),
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[VIS_HIDDEN, 3, 2, 16, 16],
+                },
+                Pin {
+                    suffix: "pos_embed.weight",
+                    kind: Vision(VisionSlot::PosEmbed),
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[VIS_POS, VIS_HIDDEN],
+                },
+                Pin {
+                    suffix: "blocks.5.norm1.weight",
+                    kind: Vision(VisionSlot::BlockNorm),
+                    sub: Some(5),
+                    dtype: "BF16",
+                    shape: &[VIS_HIDDEN],
+                },
+                Pin {
+                    suffix: "blocks.5.attn.qkv.weight",
+                    kind: Vision(VisionSlot::BlockAttn),
+                    sub: Some(5),
+                    dtype: "BF16",
+                    shape: &[3 * VIS_HIDDEN, VIS_HIDDEN],
+                },
+                Pin {
+                    suffix: "blocks.5.mlp.linear_fc1.weight",
+                    kind: Vision(VisionSlot::BlockMlp),
+                    sub: Some(5),
+                    dtype: "BF16",
+                    shape: &[VIS_INTER, VIS_HIDDEN],
+                },
+                // The merger is the only vision tensor whose output is the TEXT
+                // hidden size — out_hidden_size 2560, not 1152.
+                Pin {
+                    suffix: "merger.linear_fc2.weight",
+                    kind: Vision(VisionSlot::Merger),
+                    sub: None,
+                    dtype: "BF16",
+                    shape: &[HIDDEN, VIS_MERGE],
+                },
+            ],
+        },
+    ];
+
+    /// PIN: every tensor family, to the shape and the dtype the real checkpoint
+    /// declares for it.
+    ///
+    /// `real_checkpoint_name_list_classifies_completely` proves each family has
+    /// the right NUMBER of members — which is exactly the property that survives
+    /// swapping two match arms of equal cardinality, and the checkpoint has
+    /// several such sibling pairs. Each row here names one real tensor and
+    /// asserts the exact role it must classify to, so any such swap fails.
+    ///
+    /// The dtype and shape are what make a pinned answer *verifiable* rather
+    /// than merely *frozen*. `weight_scale` at F8_E4M3 `[640, 160]` is 2560/16
+    /// group scales and can be nothing but the per-block scale; `weight_scale_2`
+    /// at F32 `[]` can be nothing but the global scalar. Likewise
+    /// `input_mix_weight_down` `[320, 10240]` vs `_up` `[10240, 320]`,
+    /// `in_proj_qkv` 10240 vs `in_proj_z` 6144, PLE `key_proj` 10240 vs
+    /// `value_proj` 2560, router 512 vs shared-expert gate 1, and
+    /// `pre_fc_norm_embedding` 2560 vs `pre_fc_norm_hidden` 10240.
+    ///
+    /// Where the file offers no such proof, say so rather than imply it: these
+    /// siblings declare IDENTICAL geometry, so their pins rest on the name and
+    /// on `modeling_qwen4_exp.py`, not on anything measurable here —
+    /// `in_proj_a`/`in_proj_b`, `A_log`/`dt_bias`, `q_norm`/`k_norm`,
+    /// `norm_key`/`norm_query`, the indexer's `q_layernorm`/`k_layernorm`,
+    /// `k_proj`/`v_proj`, a routed or shared expert's `gate_proj`/`up_proj`,
+    /// `ngram_heads_offsets`/`ngram_heads_vocab_sizes`,
+    /// `input_scale`/`weight_scale_2`, `lm_head`/`embed_tokens`, and
+    /// `mtp.fc_embedding`/`fc_hidden`. A value signature does not rescue
+    /// `A_log`/`dt_bias` either: measured on layer 0, `A_log` spans
+    /// -3.58..5.06 and `dt_bias` -8.00..2.53, so neither sign nor range
+    /// separates them. Only a numeric forward parity check can, which is
+    /// `tests/qwen4_forward.rs`'s job.
+    #[test]
+    fn real_checkpoint_pins_every_family_to_a_shape_and_a_dtype() {
+        let Some(dir) = checkpoint_dir() else {
+            eprintln!("SKIP: no qwen3.8-flash-next checkpoint (set {CKPT_ENV})");
+            return;
+        };
+        let index = std::fs::read_to_string(dir.join("model.safetensors.index.json"))
+            .expect("read model.safetensors.index.json");
+        let at = index
+            .find("\"weight_map\"")
+            .expect("index.json has a weight_map");
+        let weight_map: HashMap<&str, &str> = json_object_members(&index[at..])
+            .into_iter()
+            .map(|(name, shard)| (name, shard.trim_matches('"')))
+            .collect();
+        assert_eq!(weight_map.len(), TOTAL_NAMES, "weight_map entry count");
+
+        // Shard headers are read once each and reused: the pins touch seven
+        // files, one of which is a 200 KiB expert header.
+        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut checked = 0usize;
+
+        for group in PIN_GROUPS {
+            for pin in group.pins {
+                let name = format!("{}{}", group.prefix, pin.suffix);
+                let want = Qwen4TensorRole::new(group.stream, pin.kind, group.layer, pin.sub);
+                let role = classify_qwen4_tensor(&name)
+                    .unwrap_or_else(|e| panic!("classify `{name}`: {e}"));
+                assert_eq!(role, want, "role for `{name}`");
+
+                let shard = *weight_map
+                    .get(name.as_str())
+                    .unwrap_or_else(|| panic!("`{name}` is not in the weight_map"));
+                let header = headers.entry(shard.to_string()).or_insert_with(|| {
+                    read_safetensors_header(&dir.join(shard)).expect("read shard header")
+                });
+                let decl = declared_in(header, &name)
+                    .unwrap_or_else(|| panic!("`{name}` not in its own shard {shard}"));
+                assert_eq!(decl.dtype, pin.dtype, "dtype of `{name}`");
+                assert_eq!(decl.shape, pin.shape, "header shape of `{name}`");
+                checked += 1;
+            }
+        }
+
+        // Every family the checkpoint actually contains must be pinned. Without
+        // this, a family added later would classify, count, and still reach a
+        // GEMV with nothing asserting its geometry.
+        let pinned: BTreeSet<String> = PIN_GROUPS
+            .iter()
+            .flat_map(|g| g.pins)
+            .map(|p| format!("{:?}", p.kind))
+            .collect();
+        let present: BTreeSet<String> = weight_map
+            .keys()
+            .map(|name| {
+                let role = classify_qwen4_tensor(name)
+                    .unwrap_or_else(|e| panic!("classify `{name}`: {e}"));
+                format!("{:?}", role.kind)
+            })
+            .collect();
+        // Named rather than compared whole: a 71-element set diff printed twice
+        // buries the one family that moved.
+        let unpinned: Vec<&String> = present.difference(&pinned).collect();
+        let stale: Vec<&String> = pinned.difference(&present).collect();
+        assert!(
+            unpinned.is_empty(),
+            "families in the checkpoint with no pin: {unpinned:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "pinned families the checkpoint no longer has: {stale:?}"
+        );
+        assert_eq!(checked, pinned.len(), "one pin per family, no duplicates");
+
+        eprintln!("PASS: {checked} qwen4_exp families pinned to a shape and a dtype");
     }
 
     #[test]
