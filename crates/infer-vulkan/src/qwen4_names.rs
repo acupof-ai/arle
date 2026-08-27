@@ -35,50 +35,109 @@
 //! # Residency intent
 //!
 //! [`Qwen4Residency`] is the *plan*, not the upload; nothing here touches a
-//! device. The intent is what makes the model fit the 74.43 GiB device-local
-//! heap, and the arithmetic is tight enough that the assignment is forced:
+//! device. Since the S7 prep there is no `Drop` tier: the MTP block and the
+//! vision tower are wanted (MTP is the speculative-decode head — an explicit
+//! product decision, not a tuning choice), so every family carries a real
+//! destination:
 //!
-//! | tier | what | device bytes |
+//! | tier | what | file bytes |
 //! |---|---|---|
 //! | [`DevicePacked`](Qwen4Residency::DevicePacked) | 48 x 512 x 3 NVFP4 projections + their FP8 block scales | 63.28 GiB |
-//! | [`DeviceDequant`](Qwen4Residency::DeviceDequant) | the rest of the text stream, BF16 -> F16 (incl. `lm_head`) | ~8.0 GiB |
-//! | [`HostGather`](Qwen4Residency::HostGather) | `embed_tokens` (1.27 GiB) + the FP8 n-gram table (47.68 GiB) | 0 |
-//! | [`Drop`](Qwen4Residency::Drop) | MTP block (~4.8 GiB) + vision tower (~0.83 GiB) | 0 |
+//! | [`DeviceDequant`](Qwen4Residency::DeviceDequant) | the rest of the text stream (incl. `lm_head`), the MTP block (4.86 GiB), the vision tower (0.84 GiB) | 13.72 GiB |
+//! | [`HostGather`](Qwen4Residency::HostGather) | `embed_tokens` (1.27 GiB) + the FP8 n-gram table (47.68 GiB) | 0 on device |
 //!
-//! which lands at ~71.3 GiB. Uploading either host-gather family, or keeping the
-//! MTP experts, blows the heap outright — so `HostGather`/`Drop` here are
-//! load-bearing decisions, not tidiness.
+//! The device tiers add to ~77.0 GiB against a 70.71 GiB driver budget, so the
+//! full intent CANNOT be all-device: `Qwen4Plan::spill_to_fit` demotes the
+//! coldest suballocations to the host-visible heap (measured ~2% streaming
+//! cost), and the natural victims are precisely the newly admitted cold mass —
+//! the MTP expert stacks (4.69 GiB, read 10 of 512 slices per speculated
+//! token) and the vision tower (read only when an image is prefetched). The
+//! scenario arithmetic — dense BF16 vs dense Q8_0, spill volume named — lives
+//! in `tests/qwen4_residency_plan.rs`, measured off the real checkpoint.
+//!
+//! Uploading either [`HostGather`](Qwen4Residency::HostGather) family is still
+//! ruled out outright: the n-gram table alone is 64% of the budget.
 
 use anyhow::{Result, anyhow, bail};
 
 /// Which of the three top-level parameter trees a tensor lives in.
 ///
-/// The split matters because it decides droppability: a text-only decode runs
-/// `model.language_model.*` and nothing else.
+/// The split matters for scoping (a text-only decode runs
+/// `model.language_model.*` and nothing else) and for spill priority: the MTP
+/// and vision trees are the coldest device bytes, read only during speculation
+/// or image prefill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Qwen4Stream {
     /// `model.language_model.*`, plus the global `lm_head.weight`.
     Text,
-    /// `mtp.*` — the 1-layer multi-token-prediction block.
+    /// `mtp.*` — the 1-layer multi-token-prediction head, 31 tensors, 4.86 GiB.
+    ///
+    /// NO reference module exists for it: `modeling_qwen4_exp.py` matches
+    /// `_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]` on BOTH model classes
+    /// (lines 1256 and 1535), and no class in the transformers tree implements
+    /// an MTP head (qwen3_next ignores the same prefix, modeling_qwen3_next.py
+    /// line 877). What IS reference-verified is every submodule the `mtp.*`
+    /// names resolve to, because the MTP layer reuses the text decoder's exact
+    /// suffix vocabulary:
+    ///
+    /// - `mtp.layers.0.self_attn.*` -> `Qwen4ExpTextAttention` (line 757) plus
+    ///   the QSA indexer (line 611) — the MTP layer is full-attention (it has
+    ///   no `linear_attn.*` tensors, asserted by the counting test).
+    /// - `mtp.layers.0.mlp.*` -> `Qwen4ExpTextSparseMoeBlock` (line 919):
+    ///   router (line 898, top-10 of 512), shared expert, and
+    ///   `Qwen4ExpTextExperts` (line 859) — whose STACKED 3-D
+    ///   `gate_up_proj`/`down_proj` parameters survive here verbatim because
+    ///   `mtp.*` is quant-excluded.
+    /// - `mtp.layers.0.{attn,mlp}_hyper_connection.*` and
+    ///   `mtp.hyper_connection_mixer.*` -> `Qwen4ExpTextGatedResidual`
+    ///   (line 941); the mixer is `use_combine=False` like the text one, so
+    ///   the MTP block consumes and produces the hc_count x hidden = 10240
+    ///   stream and its own mixer collapses it back to 2560.
+    ///
+    /// The four `mtp.*`-only tensors are the DeepSeek-V3-style fusion, adapted
+    /// to hyper-connections; their semantics are pinned by shape, not by a
+    /// reference forward (there is none): `pre_fc_norm_hidden` is `[10240]` —
+    /// it norms the PRE-mixer 4-stream hidden state of the main model, which
+    /// is therefore what the MTP consumes (a `[2560]` norm would mean the
+    /// post-mixer state) — while `pre_fc_norm_embedding` is `[2560]` over the
+    /// next token's embedding row, and `fc_hidden`/`fc_embedding` (both
+    /// `[2560, 2560]`, applied per-stream resp. broadcast) fuse the two into
+    /// the 10240-wide input of `mtp.layers.0`. Logits come from the shared
+    /// `lm_head` after the MTP's own mixer.
     Mtp,
-    /// `model.visual.*` — the 27-block vision tower.
+    /// `model.visual.*` — the 27-block vision tower, 333 tensors, 0.84 GiB.
+    ///
+    /// Fully reference-verified: `Qwen4ExpVisionModel` (modeling_qwen4_exp.py
+    /// line 1849) runs patch_embed (line 1685) + interpolated pos_embed,
+    /// 27 x `Qwen4ExpVisionBlock` (line 1818), then the merger (line 1705)
+    /// whose `linear_fc2` lands in the TEXT hidden size; `Qwen4ExpModel`
+    /// scatters those rows into `inputs_embeds` (`masked_scatter`, line 2286)
+    /// BEFORE the text stream's hc_count repeat — so the tower runs only when
+    /// an image is present, never in the decode loop.
     Vision,
 }
 
 /// Where a tensor is meant to end up. Data only; the module docs carry the byte
 /// budget that forces each assignment.
+///
+/// There is deliberately no `Drop` variant: since the S7 prep every family in
+/// the checkpoint has a real destination (the MTP head and the vision tower
+/// included). "Not loaded" is a [`crate::qwen4_upload::Qwen4UploadScope`]
+/// decision about one run, not a fact about a tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Qwen4Residency {
     /// Uploaded as raw NVFP4 bytes (2 values/byte) plus the FP8 per-16-element
     /// block scales, decoded inside the GEMV. Dequantizing instead would take
     /// the 63.28 GiB of experts to roughly 253 GiB.
     DevicePacked,
-    /// BF16 in the file, F16 on the device.
+    /// BF16 in the file; uploaded in whatever format the plan's dense tier
+    /// selects (verbatim BF16 today, Q8_0 for the GEMV weights under S7).
+    /// Device-wanted, which is an INTENT: `Qwen4Plan::spill_to_fit` may still
+    /// demote the coldest of these to the host-visible heap when the driver
+    /// budget cannot hold them all.
     DeviceDequant,
     /// Stays on the host; the forward gathers the few rows a token needs.
     HostGather,
-    /// Not uploaded at all for a text-only load.
-    Drop,
 }
 
 /// Which `Qwen4ExpTextGatedResidual` a hyper-connection weight belongs to.
@@ -137,9 +196,10 @@ pub enum Nvfp4Part {
 }
 
 /// Vision-tower module slot. Deliberately coarser than the other families: the
-/// whole tower is [`Qwen4Residency::Drop`] for a text load, so resolving
-/// weight-vs-bias would add 15 variants nothing dispatches against. The
-/// *matcher* is still exhaustive, so a renamed vision tensor still errors.
+/// whole tower shares one residency intent and one (prefill-only) dispatch
+/// site, so resolving weight-vs-bias would add 15 variants nothing dispatches
+/// against. The *matcher* is still exhaustive, so a renamed vision tensor
+/// still errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VisionSlot {
     PatchEmbed,
@@ -258,13 +318,14 @@ impl Qwen4TensorKind {
     /// True for the host-resident tables: `embed_tokens`, the n-gram table, and
     /// the small buffers the n-gram hash consumes in the same host-side step.
     pub const fn is_host_table(self) -> bool {
-        matches!(self.text_residency(), Qwen4Residency::HostGather)
+        matches!(self.residency(), Qwen4Residency::HostGather)
     }
 
-    /// Residency intent for this family **on the text stream**. MTP and vision
-    /// copies of a shared family are overridden to [`Qwen4Residency::Drop`] by
-    /// [`Qwen4TensorRole::new`]; see [`Qwen4Stream`].
-    pub const fn text_residency(self) -> Qwen4Residency {
+    /// Residency intent for this family. Stream-independent: the families that
+    /// exist on more than one stream (the shared decoder-layer vocabulary)
+    /// want the same destination wherever they occur, and the MTP- and
+    /// vision-only families carry their own intent below.
+    pub const fn residency(self) -> Qwen4Residency {
         use Qwen4Residency::*;
         match self {
             // 1.27 GiB that only ever contributes one row per token.
@@ -284,16 +345,23 @@ impl Qwen4TensorKind {
             | Self::PleNgramHeadsOffsets
             | Self::PleNgramHeadsVocabSizes => HostGather,
 
-            // Speculative decode is not wired on the Vulkan lane, and the MTP
-            // block carries a full 512-expert BF16 MoE (~4.7 GiB).
+            // The MTP expert stacks (4.69 GiB of BF16) and the four fusion
+            // weights: device-WANTED since the S7 prep — the MTP head is the
+            // speculative-decode lever and an explicit keep. The stacks are
+            // the single coldest device family (10 of 512 slices read, and
+            // only per speculated token), so when the budget forces a spill
+            // they must be the first bytes demoted; that ordering is the
+            // plan's job, not this classifier's.
             Self::MtpFcEmbedding
             | Self::MtpFcHidden
             | Self::MtpPreFcNormEmbedding
             | Self::MtpPreFcNormHidden
             | Self::ExpertsStackedGateUp
-            | Self::ExpertsStackedDown => Drop,
+            | Self::ExpertsStackedDown => DeviceDequant,
 
-            Self::Vision(_) => Drop,
+            // 0.84 GiB read only while an image is prefetched: device-wanted,
+            // and after the MTP stacks the next spill candidate.
+            Self::Vision(_) => DeviceDequant,
 
             _ => DeviceDequant,
         }
@@ -314,8 +382,9 @@ pub struct Qwen4TensorRole {
     /// [`Qwen4TensorKind::PleNgramShard`], block id (0..27) for
     /// [`Qwen4TensorKind::Vision`]. `None` otherwise.
     pub sub_index: Option<u32>,
-    /// Resolved intent: [`Qwen4TensorKind::text_residency`], forced to
-    /// [`Qwen4Residency::Drop`] off the text stream.
+    /// Resolved intent: [`Qwen4TensorKind::residency`], on every stream. The
+    /// MTP and vision trees stopped being special-cased in the S7 prep — what
+    /// to actually load is `Qwen4UploadScope`'s question.
     pub residency: Qwen4Residency,
 }
 
@@ -326,22 +395,13 @@ impl Qwen4TensorRole {
         layer: Option<usize>,
         sub_index: Option<u32>,
     ) -> Self {
-        let residency = match stream {
-            Qwen4Stream::Text => kind.text_residency(),
-            Qwen4Stream::Mtp | Qwen4Stream::Vision => Qwen4Residency::Drop,
-        };
         Self {
             stream,
             kind,
             layer,
             sub_index,
-            residency,
+            residency: kind.residency(),
         }
-    }
-
-    /// Not uploaded for a text-only decode.
-    pub const fn is_droppable(self) -> bool {
-        matches!(self.residency, Qwen4Residency::Drop)
     }
 }
 
@@ -1062,13 +1122,13 @@ mod tests {
             1 + NGRAM_SHARDS as usize + 4,
             "embed_tokens + 128 n-gram shards + scale + 3 index buffers"
         );
-        assert_eq!(tier(Qwen4Residency::Drop), 31 + 333, "MTP + vision tower");
-        assert_eq!(tier(Qwen4Residency::DeviceDequant), 1066);
+        // 1066 text + 31 MTP + 333 vision: the S7 prep moved the two cold
+        // trees out of the retired Drop tier and into device intent.
+        assert_eq!(tier(Qwen4Residency::DeviceDequant), 1066 + 31 + 333);
         assert_eq!(
             tier(Qwen4Residency::DevicePacked)
                 + tier(Qwen4Residency::DeviceDequant)
-                + tier(Qwen4Residency::HostGather)
-                + tier(Qwen4Residency::Drop),
+                + tier(Qwen4Residency::HostGather),
             TOTAL_NAMES
         );
 
@@ -1963,14 +2023,19 @@ mod tests {
     #[test]
     fn residency_intent_is_data() {
         use Qwen4Residency::*;
-        assert_eq!(EmbedTokens.text_residency(), HostGather);
-        assert_eq!(PleNgramShard.text_residency(), HostGather);
+        assert_eq!(EmbedTokens.residency(), HostGather);
+        assert_eq!(PleNgramShard.residency(), HostGather);
         assert!(PleNgramShard.is_host_table());
         assert!(EmbedTokens.is_host_table());
         assert!(!LmHead.is_host_table());
-        assert_eq!(LmHead.text_residency(), DeviceDequant);
-        assert_eq!(Vision(VisionSlot::Merger).text_residency(), Drop);
-        assert_eq!(ExpertsStackedGateUp.text_residency(), Drop);
+        assert_eq!(LmHead.residency(), DeviceDequant);
+        // The S7 reclassification: MTP and vision are device-WANTED, not
+        // dropped. The user's call, and the whole point of that prep round.
+        assert_eq!(Vision(VisionSlot::Merger).residency(), DeviceDequant);
+        assert_eq!(ExpertsStackedGateUp.residency(), DeviceDequant);
+        assert_eq!(ExpertsStackedDown.residency(), DeviceDequant);
+        assert_eq!(MtpFcEmbedding.residency(), DeviceDequant);
+        assert_eq!(MtpPreFcNormHidden.residency(), DeviceDequant);
         for proj in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down] {
             for part in [
                 Nvfp4Part::Packed,
@@ -1978,20 +2043,19 @@ mod tests {
                 Nvfp4Part::GlobalScale,
                 Nvfp4Part::InputScale,
             ] {
-                assert_eq!(Expert { proj, part }.text_residency(), DevicePacked);
+                assert_eq!(Expert { proj, part }.residency(), DevicePacked);
                 assert!(Expert { proj, part }.is_routed_expert());
             }
         }
 
-        // The same family is device-resident on the text stream and dropped on
-        // the MTP one; the stream, not the kind, is what decides.
+        // A shared family carries ONE intent wherever it occurs; what a given
+        // run loads is `Qwen4UploadScope`'s question, not the classifier's.
         let text = classify_qwen4_tensor("model.language_model.layers.0.mlp.gate.weight")
             .expect("text router");
         let mtp = classify_qwen4_tensor("mtp.layers.0.mlp.gate.weight").expect("mtp router");
         assert_eq!(text.kind, mtp.kind);
         assert_eq!(text.residency, DeviceDequant);
-        assert_eq!(mtp.residency, Drop);
-        assert!(mtp.is_droppable());
-        assert!(!text.is_droppable());
+        assert_eq!(mtp.residency, DeviceDequant);
+        assert_ne!(text.stream, mtp.stream, "the stream still tells them apart");
     }
 }

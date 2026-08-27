@@ -8,6 +8,18 @@
 //! the number the Vulkan lane is actually gated on: how much of the 74.43 GiB
 //! device-local heap a text-only load of this model wants.
 //!
+//! ## S7 prep: MTP + vision are back in the plan
+//!
+//! The classifier no longer has a `Drop` tier: the MTP head (4.86 GiB — the
+//! speculative-decode lever, an explicit product keep) and the vision tower
+//! (0.84 GiB) are `DeviceDequant` INTENT now. `plan_qwen4_upload` still skips
+//! them — it gates on `stream != Text`, not on residency — so nothing about
+//! the shipping 84.9 ms/token load changes until the integration flips that
+//! gate. The two S7 tests at the bottom are the paper plan that integration
+//! consumes: per-name (shape, dtype, tier) pins over the real checkpoint, and
+//! the scenario table (dense BF16 vs dense Q8_0, each with MTP + vision,
+//! against budget minus reserve, spill volume named).
+//!
 //! Why declared file bytes are the right unit for the device tiers:
 //! - `DevicePacked` (the NVFP4 experts) is uploaded byte-exact — the packed U8
 //!   plane, the FP8 block scales and the F32 scalars all go up unchanged, and
@@ -20,9 +32,11 @@
 //! `qwen4_upload` uploads the hyper-connection weights, norms and routers at F32
 //! because their shaders declare `float[]`, which is 1.33 GiB more than the BF16
 //! the file holds. **The classifier tally is therefore a FLOOR, not the number
-//! the load is gated on** — 71.314 GiB against the planner's 72.640. The fit
-//! assertions run `plan_qwen4_upload` for exactly that reason; the table stays
-//! because it answers a different question (where are the bytes).
+//! the load is gated on** — 77.006 GiB of device INTENT since the S7
+//! reclassification (71.314 of it the text stream, which the planner prices
+//! at 71.452). The fit assertions run `plan_qwen4_upload` for exactly that
+//! reason; the table stays because it answers a different question (where are
+//! the bytes).
 //!
 //! ## The heap size is not the budget
 //!
@@ -46,11 +60,12 @@ use std::time::Instant;
 use infer_gguf::safetensors::SafeTensorsDir;
 use infer_vulkan::loader::{DeviceBudget, DeviceBudgetSource};
 use infer_vulkan::qwen4_names::{
-    HcSite, Nvfp4Part, Qwen4Residency, Qwen4Stream, Qwen4TensorKind, Qwen4TensorRole,
+    HcPart, HcSite, Nvfp4Part, Qwen4Residency, Qwen4Stream, Qwen4TensorKind, Qwen4TensorRole,
     classify_qwen4_tensor,
 };
 use infer_vulkan::qwen4_upload::{
-    DEFAULT_RESERVE_BYTES, Qwen4UploadConfig, Qwen4UploadScope, plan_qwen4_upload,
+    DEFAULT_RESERVE_BYTES, Qwen4DeviceFormat, Qwen4UploadConfig, Qwen4UploadScope,
+    plan_qwen4_upload,
 };
 
 const CKPT_ENV: &str = "ARLE_QWEN4_CKPT";
@@ -181,7 +196,6 @@ fn tier_name(r: Qwen4Residency) -> &'static str {
         Qwen4Residency::DevicePacked => "DevicePacked",
         Qwen4Residency::DeviceDequant => "DeviceDequant",
         Qwen4Residency::HostGather => "HostGather",
-        Qwen4Residency::Drop => "Drop",
     }
 }
 
@@ -234,10 +248,12 @@ fn print_section(title: &str, rows: &BTreeMap<String, Row>, denom: u64) {
 
 /// The family table, and the CLASSIFIER FLOOR it adds up to.
 ///
-/// Deliberately not a fit check any more: this tally is 1.33 GiB under the
-/// planner's because it does not model the F32 tier, so asserting a fit here
-/// would assert the wrong number. `full_plan_fits_the_driver_budget_only_after_spilling`
-/// owns that question.
+/// Deliberately not a fit check: this tally does not model the F32 tier
+/// (1.33 GiB on the text stream) or slab tails, and since the S7
+/// reclassification it counts the MTP + vision intent the shipping planner
+/// does not price yet, so asserting a fit here would assert the wrong number.
+/// `full_plan_fits_the_driver_budget_only_after_spilling` owns the shipping
+/// plan's fit; `s7_scenario_table_dense_bf16_vs_q8_0` owns the S7 one.
 #[test]
 fn real_checkpoint_residency_table_and_classifier_floor() {
     let dir = checkpoint_dir();
@@ -273,6 +289,9 @@ fn real_checkpoint_residency_table_and_classifier_floor() {
     // The single biggest binding on each device tier, because
     // maxMemoryAllocationSize (2 GiB) is a per-binding limit, not a total.
     let mut largest_device: (u64, String) = (0, String::new());
+    // Every device tensor over that limit; each one is a split the upload
+    // MUST perform, so they are pinned by name below.
+    let mut oversized_device: Vec<String> = Vec::new();
 
     for info in st.tensors() {
         all_bytes += info.len;
@@ -304,16 +323,19 @@ fn real_checkpoint_residency_table_and_classifier_floor() {
         if matches!(
             role.residency,
             Qwen4Residency::DevicePacked | Qwen4Residency::DeviceDequant
-        ) && info.len > largest_device.0
-        {
-            largest_device = (info.len, info.name.clone());
+        ) {
+            if info.len > largest_device.0 {
+                largest_device = (info.len, info.name.clone());
+            }
+            if info.len > SLAB_BYTES {
+                oversized_device.push(info.name.clone());
+            }
         }
     }
 
     let packed = *tier_bytes.get("DevicePacked").unwrap_or(&0);
     let dequant = *tier_bytes.get("DeviceDequant").unwrap_or(&0);
     let host = *tier_bytes.get("HostGather").unwrap_or(&0);
-    let dropped = *tier_bytes.get("Drop").unwrap_or(&0);
     let device = packed + dequant;
 
     // ---- report -----------------------------------------------------------
@@ -333,7 +355,7 @@ fn real_checkpoint_residency_table_and_classifier_floor() {
     );
     println!();
 
-    for tier in ["DevicePacked", "DeviceDequant", "HostGather", "Drop"] {
+    for tier in ["DevicePacked", "DeviceDequant", "HostGather"] {
         if let Some(rows) = per_tier.get(tier) {
             print_section(&format!("[{tier}]"), rows, all_bytes);
         }
@@ -358,7 +380,6 @@ fn real_checkpoint_residency_table_and_classifier_floor() {
         ("DevicePacked ", packed),
         ("DeviceDequant", dequant),
         ("HostGather   ", host),
-        ("Drop         ", dropped),
     ] {
         println!(
             "    {} {:>9} tensors {:>18} B  {:>10.3} GiB  {:>6.2}% of file",
@@ -412,7 +433,17 @@ fn real_checkpoint_residency_table_and_classifier_floor() {
                     )
                 })
             })
-            .map(|i| i.len)
+            // The MTP stacked gate_up (3.125 GiB) is over maxMemoryAllocationSize;
+            // it is a 512-expert stack, so it splits legally at any expert
+            // boundary. Halving models the coarsest such split — the batch_stride
+            // contract survives as two 256-expert sub-stacks.
+            .flat_map(|i| {
+                if i.len > SLAB_BYTES {
+                    vec![i.len / 2, i.len - i.len / 2]
+                } else {
+                    vec![i.len]
+                }
+            })
             .collect();
         // Largest-first: measured to be the difference between the ceil() floor
         // and ~4 GiB of stranded slab tails.
@@ -458,7 +489,7 @@ fn real_checkpoint_residency_table_and_classifier_floor() {
         &unclassified[..unclassified.len().min(5)],
     );
     assert_eq!(
-        packed + dequant + host + dropped,
+        packed + dequant + host,
         all_bytes,
         "tiers must partition the checkpoint's declared bytes"
     );
@@ -468,25 +499,31 @@ fn real_checkpoint_residency_table_and_classifier_floor() {
         "every tensor lands in exactly one tier"
     );
 
-    let low = 65.0 * GIB;
-    let high = 75.0 * GIB;
+    // With MTP + vision reclassified into device intent the floor moved from
+    // ~71.3 to ~77.0 GiB — deliberately OVER the 70.71 GiB budget; the S7
+    // scenario test below owns the fit-vs-spill arithmetic.
+    let low = 74.0 * GIB;
+    let high = 80.0 * GIB;
     assert!(
         (device as f64) >= low && (device as f64) <= high,
-        "device-resident plan is {:.3} GiB, outside the 65-75 GiB window \
-         (packed {:.3} + dequant {:.3}); host {:.3}, dropped {:.3}, file total {:.3}",
+        "device-intent floor is {:.3} GiB, outside the 74-80 GiB window \
+         (packed {:.3} + dequant {:.3}); host {:.3}, file total {:.3}",
         device as f64 / GIB,
         packed as f64 / GIB,
         dequant as f64 / GIB,
         host as f64 / GIB,
-        dropped as f64 / GIB,
         all_bytes as f64 / GIB,
     );
-    assert!(
-        largest_device.0 <= SLAB_BYTES,
-        "device tensor {} is {} B, above maxMemoryAllocationSize {} B — it needs splitting",
-        largest_device.1,
-        largest_device.0,
-        SLAB_BYTES,
+    // Exactly one device tensor is over maxMemoryAllocationSize: the MTP
+    // stacked gate_up (3.125 GiB). That is a split the integration MUST
+    // perform — a 512-expert stack splits legally at any expert boundary — so
+    // pin WHICH tensor it is rather than forbidding it, and fail if the set
+    // ever grows (a new member would be a new mandatory split) or shrinks
+    // (the note would be stale).
+    assert_eq!(
+        oversized_device,
+        vec!["mtp.layers.0.mlp.experts.gate_up_proj".to_string()],
+        "the set of device tensors above maxMemoryAllocationSize ({SLAB_BYTES} B) moved"
     );
 }
 
@@ -658,4 +695,541 @@ fn full_plan_fits_the_driver_budget_only_after_spilling() {
             "the unspilled residency's slabs must not fit the budget"
         );
     }
+}
+
+// ------------------------------------------------------------------ S7 prep
+//
+// The MTP head and the vision tower are back in the residency intent
+// (`qwen4_names` has no `Drop` tier any more), and the dense tier is about to
+// halve under Q8_0. The two tests below are the paper plan the integration
+// consumes: per-name (shape, dtype, tier) pins over the real checkpoint, and
+// the scenario table against the driver budget minus the reserve.
+
+/// Q8_0 device bytes for a `[nrows, ncols]` weight: 34 bytes (one f16 scale +
+/// 32 i8 quants) per 32-element block, the GGUF layout `GemvQ8_0` consumes.
+/// `None` when a row is not a whole number of blocks — a ragged Q8_0 row would
+/// make row `r > 0` read its neighbour's tail, the same failure class the
+/// NVFP4 planner guards against.
+fn q8_0_bytes(ncols: u64, nrows: u64) -> Option<u64> {
+    (ncols != 0 && ncols.is_multiple_of(32)).then(|| nrows * (ncols / 32) * 34)
+}
+
+/// The families the planner prices at `dense_format` (the mirror of
+/// `qwen4_upload::device_format`'s dense arm) plus the two MTP fusion fcs the
+/// integration will put on the same tier. These are exactly the weights the
+/// Q8_0 lever applies to: plain-GEMV consumers with whole-block rows.
+///
+/// Deliberately NOT included:
+/// - the hyper-connection mixes — their kernels are the `qwen4_hc_*_bf16`
+///   family, so under a Q8_0 dense tier they must STAY BF16 rather than take
+///   `device_format`'s F32 fallback (which would cost +1.18 GiB);
+/// - the MTP expert stacks — the batched expert GEMV path; quantizing them is
+///   a further, separate lever (the table prints what it would buy).
+fn takes_dense_format(kind: Qwen4TensorKind) -> bool {
+    use Qwen4TensorKind as K;
+    matches!(
+        kind,
+        K::LinearAttnInProjQkv
+            | K::LinearAttnInProjZ
+            | K::LinearAttnOutProj
+            | K::AttnQProj
+            | K::AttnKProj
+            | K::AttnVProj
+            | K::AttnOProj
+            | K::IndexerQkProj
+            | K::SharedExpertGateProj
+            | K::SharedExpertUpProj
+            | K::SharedExpertDownProj
+            | K::PleKeyProj
+            | K::PleValueProj
+            | K::LmHead
+            | K::MtpFcEmbedding
+            | K::MtpFcHidden
+    )
+}
+
+/// The small families `qwen4_upload::device_format` sends to F32 because their
+/// consuming shaders declare `float[]`: on the device they cost 2x their BF16
+/// file bytes. Mirrored here so the MTP additions are priced the way the
+/// planner will price them (it does not price the MTP stream yet). The two
+/// `pre_fc` norms follow by the same rule — they are `Qwen4ExpTextRMSNorm`
+/// weights and will land in the same `rms_norm.comp` consumer.
+fn f32_on_device(kind: Qwen4TensorKind) -> bool {
+    use Qwen4TensorKind as K;
+    matches!(
+        kind,
+        K::HyperConnection {
+            part: HcPart::Norm,
+            ..
+        } | K::AttnQNorm
+            | K::AttnKNorm
+            | K::IndexerQNorm
+            | K::IndexerKNorm
+            | K::MoeRouter
+            | K::SharedExpertGate
+            | K::MtpPreFcNormEmbedding
+            | K::MtpPreFcNormHidden
+    )
+}
+
+/// One S7 residency pin: a real checkpoint tensor, the stream and tier it must
+/// classify to, and the dtype + shape its shard header must declare.
+struct S7Pin {
+    name: &'static str,
+    stream: Qwen4Stream,
+    residency: Qwen4Residency,
+    dtype: &'static str,
+    /// Header (row-major) order, as `model.safetensors.index.json`'s shards
+    /// spell it. `SafeTensorInfo::dims` is this REVERSED (GGUF ne order); the
+    /// test reverses on compare so the pin stays in the checkpoint's words.
+    shape: &'static [u64],
+}
+
+/// The reclassified families, pinned name -> (shape, dtype, tier) over the
+/// real checkpoint, plus contrast rows whose tier did NOT move so a global
+/// flip of the residency logic cannot pass. Roles verified against
+/// `modeling_qwen4_exp.py` — see the `Qwen4Stream::Mtp` / `::Vision` docs in
+/// `qwen4_names` for the class-by-class mapping and line numbers.
+const S7_PINS: &[S7Pin] = &[
+    // ---- MTP head: 31 tensors, every one device-wanted ----
+    S7Pin {
+        name: "mtp.fc_embedding.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[2560, 2560],
+    },
+    S7Pin {
+        name: "mtp.fc_hidden.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[2560, 2560],
+    },
+    // [2560]: norms the NEXT token's embedding row.
+    S7Pin {
+        name: "mtp.pre_fc_norm_embedding.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[2560],
+    },
+    // [10240]: norms the PRE-mixer 4-stream hidden state — the width is the
+    // proof the MTP taps the stream before `hyper_connection_mixer` collapses
+    // it, which is what the integration must keep alive.
+    S7Pin {
+        name: "mtp.pre_fc_norm_hidden.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[10240],
+    },
+    S7Pin {
+        name: "mtp.hyper_connection_mixer.hc_norm.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[10240],
+    },
+    // The 4.69 GiB that forced the old Drop tier: the quant-excluded stacked
+    // expert layout (`Qwen4ExpTextExperts`, modeling_qwen4_exp.py:859).
+    // gate_up is fused, hence 2 x 640; at 3.125 GiB it is the one tensor over
+    // maxMemoryAllocationSize and must split at an expert boundary.
+    S7Pin {
+        name: "mtp.layers.0.mlp.experts.gate_up_proj",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[512, 1280, 2560],
+    },
+    S7Pin {
+        name: "mtp.layers.0.mlp.experts.down_proj",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[512, 2560, 640],
+    },
+    // The MTP decoder layer is full-attention: q carries the sigmoid output
+    // gate (x2), same as the text stream's 12 full layers.
+    S7Pin {
+        name: "mtp.layers.0.self_attn.q_proj.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[12288, 2560],
+    },
+    S7Pin {
+        name: "mtp.layers.0.self_attn.indexer.index_qk_proj.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[640, 2560],
+    },
+    S7Pin {
+        name: "mtp.layers.0.mlp.gate.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[512, 2560],
+    },
+    S7Pin {
+        name: "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[2560, 640],
+    },
+    S7Pin {
+        name: "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight",
+        stream: Qwen4Stream::Mtp,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[4, 10240],
+    },
+    // ---- vision tower: 333 tensors, prefill-only, device-wanted ----
+    S7Pin {
+        name: "model.visual.patch_embed.proj.weight",
+        stream: Qwen4Stream::Vision,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[1152, 3, 2, 16, 16],
+    },
+    S7Pin {
+        name: "model.visual.pos_embed.weight",
+        stream: Qwen4Stream::Vision,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[2304, 1152],
+    },
+    S7Pin {
+        name: "model.visual.blocks.0.attn.qkv.weight",
+        stream: Qwen4Stream::Vision,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[3456, 1152],
+    },
+    // A bias, so the coarse Vision slots are proven to cover both planes.
+    S7Pin {
+        name: "model.visual.blocks.13.norm2.bias",
+        stream: Qwen4Stream::Vision,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[1152],
+    },
+    S7Pin {
+        name: "model.visual.blocks.26.mlp.linear_fc2.weight",
+        stream: Qwen4Stream::Vision,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[1152, 4304],
+    },
+    // merger fc1 works on the 2x2-merged width (1152 x 4 = 4608); fc2 is the
+    // one vision weight whose output is the TEXT hidden size.
+    S7Pin {
+        name: "model.visual.merger.linear_fc1.weight",
+        stream: Qwen4Stream::Vision,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[4608, 4608],
+    },
+    S7Pin {
+        name: "model.visual.merger.linear_fc2.weight",
+        stream: Qwen4Stream::Vision,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[2560, 4608],
+    },
+    // ---- contrast rows: tiers that did NOT move in the S7 prep ----
+    S7Pin {
+        name: "model.language_model.embed_tokens.weight",
+        stream: Qwen4Stream::Text,
+        residency: Qwen4Residency::HostGather,
+        dtype: "BF16",
+        shape: &[248320, 2560],
+    },
+    S7Pin {
+        name: "lm_head.weight",
+        stream: Qwen4Stream::Text,
+        residency: Qwen4Residency::DeviceDequant,
+        dtype: "BF16",
+        shape: &[248320, 2560],
+    },
+    S7Pin {
+        name: "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+        stream: Qwen4Stream::Text,
+        residency: Qwen4Residency::DevicePacked,
+        dtype: "U8",
+        shape: &[640, 1280],
+    },
+    S7Pin {
+        name: "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight",
+        stream: Qwen4Stream::Text,
+        residency: Qwen4Residency::HostGather,
+        dtype: "F8_E4M3",
+        shape: &[2500012, 160],
+    },
+];
+
+/// PIN: the S7 reclassification, name by name, over the real checkpoint.
+///
+/// `qwen4_names`' own tests prove the counts and shapes per FAMILY; what they
+/// cannot prove is the tier, because they compute the expected role with the
+/// same code that assigns it. The rows here spell stream + tier as literals,
+/// so swapping two families' residencies (or quietly re-dropping the MTP) is a
+/// failing diff, not a silent re-plan.
+#[test]
+fn s7_mtp_vision_pins_shape_dtype_and_tier() {
+    let dir = checkpoint_dir();
+    if !dir.is_dir() {
+        eprintln!("SKIP: no checkpoint at {} (set {CKPT_ENV})", dir.display());
+        return;
+    }
+    let Ok(st) = SafeTensorsDir::open_dir(&dir) else {
+        eprintln!("SKIP: cannot open {} as a safetensors dir", dir.display());
+        return;
+    };
+    let by_name: BTreeMap<&str, _> = st.tensors().iter().map(|i| (i.name.as_str(), i)).collect();
+
+    for pin in S7_PINS {
+        let role = classify_qwen4_tensor(pin.name)
+            .unwrap_or_else(|e| panic!("classify `{}`: {e}", pin.name));
+        assert_eq!(role.stream, pin.stream, "stream of `{}`", pin.name);
+        assert_eq!(role.residency, pin.residency, "tier of `{}`", pin.name);
+
+        let info = by_name
+            .get(pin.name)
+            .unwrap_or_else(|| panic!("`{}` is not in the checkpoint", pin.name));
+        assert_eq!(info.dtype, pin.dtype, "dtype of `{}`", pin.name);
+        let header_order: Vec<u64> = info.dims.iter().rev().copied().collect();
+        assert_eq!(header_order, pin.shape, "header shape of `{}`", pin.name);
+    }
+    println!(
+        "PASS: {} S7 pins hold (name -> stream, tier, dtype, shape)",
+        S7_PINS.len()
+    );
+}
+
+/// THE TABLE: the full S7 plan at (a) dense BF16 + MTP/vision and (b) dense
+/// Q8_0 + MTP/vision, against the 70.71 GiB driver budget minus the 1.5 GiB
+/// reserve, spill volume named. All floors — suballocation bytes, before slab
+/// tails (~0.02..1.3 GiB depending on the packing, `choose_packing`'s job).
+///
+/// Pricing rules, mirrored from `qwen4_upload::device_format` because the
+/// planner does not price the MTP/vision streams yet: NVFP4 stays packed;
+/// dense-GEMV weights cost 2 B/elem at BF16 or 34 B per 32 elems at Q8_0; the
+/// `float[]`-shader families cost 4 B/elem; everything else BF16-verbatim.
+/// The vision tower is priced BF16-verbatim whole — its F32 norm/bias delta
+/// is under 4 MiB, inside the table's rounding.
+#[test]
+fn s7_scenario_table_dense_bf16_vs_q8_0() {
+    let dir = checkpoint_dir();
+    if !dir.is_dir() {
+        eprintln!("SKIP: no checkpoint at {} (set {CKPT_ENV})", dir.display());
+        return;
+    }
+    let Ok(st) = SafeTensorsDir::open_dir(&dir) else {
+        eprintln!("SKIP: cannot open {} as a safetensors dir", dir.display());
+        return;
+    };
+
+    // The brief's reserve: 1.5 GiB held back for KV + recurrent state +
+    // activations (the MTP layer's own KV rides in the same reserve).
+    assert_eq!(DEFAULT_RESERVE_BYTES, 3 << 29, "the 1.5 GiB reserve moved");
+    let usable = BUDGET_BYTES - DEFAULT_RESERVE_BYTES;
+
+    // ---- text stream: the planner's own number, then the Q8_0 delta -------
+    let cfg = Qwen4UploadConfig::default();
+    let plan =
+        plan_qwen4_upload(&st, &cfg, &Qwen4UploadScope::full()).expect("plan the text stream");
+    let mut text_dense_bf16 = 0u64;
+    let mut text_dense_q8 = 0u64;
+    for item in &plan.items {
+        if item.format == Qwen4DeviceFormat::Bf16 && takes_dense_format(item.role.kind) {
+            assert_eq!(
+                item.bytes,
+                (item.ncols * item.nrows) as u64 * 2,
+                "`{}` is priced as plain BF16 rows",
+                item.name
+            );
+            let q8 = q8_0_bytes(item.ncols as u64, item.nrows as u64).unwrap_or_else(|| {
+                panic!(
+                    "`{}`: ncols {} is not whole Q8_0 blocks",
+                    item.name, item.ncols
+                )
+            });
+            text_dense_bf16 += item.bytes;
+            text_dense_q8 += q8;
+        }
+    }
+    let text_savings = text_dense_bf16 - text_dense_q8;
+    // The lever the Q8_0 sibling is building, sized exactly: 6.702 GiB of
+    // dense-GEMV BF16 becomes 3.560 GiB of Q8_0 (x 17/32). If the dense tier's
+    // membership or default format moves, this is where it surfaces.
+    assert_eq!(text_dense_bf16, 7_195_852_800, "dense GEMV tier moved");
+    assert_eq!(
+        text_savings, 3_373_056_000,
+        "Q8_0 savings moved (3.141 GiB)"
+    );
+
+    // ---- MTP + vision additions, priced per the rules above ---------------
+    let mut mtp_file = 0u64;
+    let mut vis_file = 0u64;
+    let mut mtp_a = 0u64; // scenario (a): dense BF16
+    let mut mtp_b = 0u64; // scenario (b): dense Q8_0, stacks kept BF16
+    let mut mtp_stacks_bf16 = 0u64;
+    let mut mtp_stacks_q8 = 0u64; // informational further lever
+    for info in st.tensors() {
+        let role = classify_qwen4_tensor(&info.name)
+            .unwrap_or_else(|e| panic!("classify `{}`: {e}", info.name));
+        match role.stream {
+            Qwen4Stream::Text => {}
+            Qwen4Stream::Vision => vis_file += info.len,
+            Qwen4Stream::Mtp => {
+                mtp_file += info.len;
+                // dims are reversed, so dims[0] is the contraction width.
+                let ncols = info.dims.first().copied().unwrap_or(1);
+                let nrows = info.element_count() / ncols;
+                let stacked = matches!(
+                    role.kind,
+                    Qwen4TensorKind::ExpertsStackedGateUp | Qwen4TensorKind::ExpertsStackedDown
+                );
+                let (a, b) = if f32_on_device(role.kind) {
+                    (info.len * 2, info.len * 2)
+                } else if takes_dense_format(role.kind) {
+                    let q8 = q8_0_bytes(ncols, nrows).unwrap_or_else(|| {
+                        panic!("`{}`: ncols {ncols} is not whole Q8_0 blocks", info.name)
+                    });
+                    (info.len, q8)
+                } else {
+                    (info.len, info.len)
+                };
+                mtp_a += a;
+                mtp_b += b;
+                if stacked {
+                    mtp_stacks_bf16 += info.len;
+                    mtp_stacks_q8 += q8_0_bytes(ncols, nrows)
+                        .unwrap_or_else(|| panic!("`{}`: ragged stack rows", info.name));
+                }
+            }
+        }
+    }
+
+    // The shipping planner still books these very bytes as dropped; when the
+    // integration flips its stream gate, this equality is what guarantees no
+    // bytes appear or vanish in the handover.
+    assert_eq!(
+        plan.dropped_bytes,
+        mtp_file + vis_file,
+        "planner dropped_bytes must equal the measured MTP + vision file bytes"
+    );
+    // The Drop tier the user vetoed, measured piece by piece (5.692 GiB
+    // total). These sums are deterministic functions of the checkpoint and
+    // THIS file's pricing rules, so they pin exactly; a change in either is a
+    // failing diff by design.
+    assert_eq!(mtp_file, 5_214_301_696, "MTP file bytes moved (4.856 GiB)");
+    assert_eq!(vis_file, 897_862_112, "vision file bytes moved (0.836 GiB)");
+    assert_eq!(
+        mtp_stacks_bf16, 5_033_164_800,
+        "MTP expert stacks are 4.6875 GiB"
+    );
+    // mtp_a = file + 2.6 MiB of F32 doubling; mtp_b additionally converts the
+    // 132.5 MiB of MTP dense-GEMV weights (q/k/v/o, indexer, shared expert,
+    // the two fusion fcs) to Q8_0.
+    assert_eq!(mtp_a, 5_217_016_832, "scenario (a) MTP pricing moved");
+    assert_eq!(mtp_b, 5_151_890_432, "scenario (b) MTP pricing moved");
+
+    let a_total = plan.device_bytes + mtp_a + vis_file;
+    let b_total = plan.device_bytes - text_savings + mtp_b + vis_file;
+    let b_prime = b_total - mtp_stacks_bf16 + mtp_stacks_q8;
+    let over = |total: u64| total.saturating_sub(usable);
+
+    println!();
+    println!("=== S7 scenario table: qwen4_exp full plan incl. MTP + vision ===");
+    println!(
+        "budget {:.3} GiB - reserve {:.3} GiB = usable {:.3} GiB (suballocation floors, pre-slab-tails)",
+        BUDGET_BYTES as f64 / GIB,
+        DEFAULT_RESERVE_BYTES as f64 / GIB,
+        usable as f64 / GIB,
+    );
+    println!(
+        "  text stream (planner, dense BF16 + F32 tier)  : {:>7.3} GiB",
+        plan.device_bytes as f64 / GIB
+    );
+    println!(
+        "  Q8_0 over the dense GEMV tier ({:.3} GiB BF16) : {:>7.3} GiB saved",
+        text_dense_bf16 as f64 / GIB,
+        text_savings as f64 / GIB
+    );
+    println!(
+        "  MTP additions   (a) {:>6.3} GiB / (b) {:>6.3} GiB  [stacks {:.3} GiB stay BF16 in (b)]",
+        mtp_a as f64 / GIB,
+        mtp_b as f64 / GIB,
+        mtp_stacks_bf16 as f64 / GIB
+    );
+    println!(
+        "  vision additions    {:>6.3} GiB (both)",
+        vis_file as f64 / GIB
+    );
+    for (label, total) in [
+        ("(a) dense BF16 + MTP + vision", a_total),
+        ("(b) dense Q8_0 + MTP + vision", b_total),
+    ] {
+        println!(
+            "  {label}: {:>7.3} GiB -> over usable by {:>6.3} GiB -> SPILL {:>6.3} GiB",
+            total as f64 / GIB,
+            over(total) as f64 / GIB,
+            over(total) as f64 / GIB,
+        );
+    }
+    println!(
+        "  spill victims, coldest first: MTP expert stacks {:.3} GiB (10/512 slices, only when \
+         speculating), vision tower {:.3} GiB (image prefill only), remainder {:.3} GiB from the \
+         coldest NVFP4 stacks",
+        mtp_stacks_bf16 as f64 / GIB,
+        vis_file as f64 / GIB,
+        over(b_total).saturating_sub(mtp_stacks_bf16 + vis_file) as f64 / GIB,
+    );
+    println!(
+        "  further lever, not assumed: MTP stacks at Q8_0 too -> {:.3} GiB total, SPILL {:.3} GiB",
+        b_prime as f64 / GIB,
+        over(b_prime) as f64 / GIB,
+    );
+    println!();
+
+    // ---- the verdicts the integration plans against -----------------------
+    // Everything above `plan.device_bytes` is exact-pinned, so the only slack
+    // these windows absorb is planner churn (its F32 tier, item pricing).
+    // Measured this sitting (2026-08-28, checkpoint 206 shards, no GPU
+    // involved): over_a 7.936 GiB, over_b 4.734 GiB.
+    //
+    // (a) does NOT fit device-resident — over by ~7.9 GiB, most of a full
+    // heap-0 spill budget. This is the answer to "can we have dense BF16 and
+    // the MTP back": only with 7.9 GiB streaming from the host heap.
+    let over_a = over(a_total) as f64 / GIB;
+    assert!(
+        (7.4..8.5).contains(&over_a),
+        "(a) must overshoot usable by ~7.9 GiB, got {over_a:.3} GiB over",
+    );
+    // (b) does not fit either — Q8_0 buys back 3.14 GiB but not the MTP mass —
+    // and must land exactly the Q8_0 deltas under (a).
+    let over_b = over(b_total) as f64 / GIB;
+    assert!(
+        (4.2..5.3).contains(&over_b),
+        "(b) must overshoot usable by ~4.7 GiB, got {over_b:.3} GiB over",
+    );
+    assert_eq!(
+        a_total - b_total,
+        text_savings + (mtp_a - mtp_b),
+        "the two scenarios differ by exactly the Q8_0 deltas"
+    );
+    // The invariant that makes (b) the plan worth shipping: the newly admitted
+    // cold mass ALONE covers its spill — demote the MTP stacks and the vision
+    // tower and every per-token-hot byte stays device-resident.
+    assert!(
+        mtp_stacks_bf16 + vis_file >= over(b_total),
+        "the MTP stacks + vision ({:.3} GiB) no longer cover (b)'s {:.3} GiB spill — \
+         something hot would have to move to the host heap",
+        (mtp_stacks_bf16 + vis_file) as f64 / GIB,
+        over_b,
+    );
 }
