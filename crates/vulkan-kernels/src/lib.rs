@@ -3318,3 +3318,428 @@ mod nvfp4_repack_tests {
         assert!(repack_nvfp4_planes(&qs, &sc, 1, NCOLS + 16, &mut packed).is_err());
     }
 }
+
+/// IEEE-754 f32 -> binary16, round-to-nearest-even — the conversion
+/// `GGML_FP32_TO_FP16` performs (F16C `vcvtps2ph` under RNE in hardware
+/// builds, the correctly-rounded scalar fallback otherwise), and therefore
+/// the conversion the vendored `quantize_row_q8_0_ref` stores its block
+/// scale with (`vendor/llama.cpp/ggml-quants.c:251`).
+///
+/// Deliberately NOT shared with [`bf16_to_f16`]: that function saturates
+/// overflow to ±65504 because an infinite WEIGHT poisons a dot product,
+/// while ggml's scale conversion rounds past-range values to ±Inf like the
+/// hardware does. Everywhere the two policies coincide the outputs are
+/// bit-identical, and `q8_0_scale_conversion_matches_the_bf16_reencoder`
+/// pins that over all 65536 bf16 patterns rather than assuming it.
+fn f32_to_f16_rne(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let abs = bits & 0x7FFF_FFFF;
+    if abs >= 0x7F80_0000 {
+        // Inf stays Inf; any NaN payload collapses to a quiet NaN.
+        return sign | 0x7C00 | if abs > 0x7F80_0000 { 0x0200 } else { 0 };
+    }
+    let exp = (abs >> 23) as i32;
+    let man = abs & 0x7F_FFFF;
+    if exp >= 143 {
+        // >= 2^16: past the largest finite f16 before rounding even starts.
+        return sign | 0x7C00;
+    }
+    if exp >= 113 {
+        // Normal in f16. Drop 13 mantissa bits with round-to-nearest-even; a
+        // carry out of the mantissa walks into the exponent (and onto Inf at
+        // the very top, 65520 and up), which is exactly IEEE round-then-detect.
+        let mut h = (((exp - 112) as u32) << 10) | (man >> 13);
+        let rem = man & 0x1FFF;
+        if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+            h += 1;
+        }
+        return sign | h as u16;
+    }
+    if exp == 0 {
+        // f32 subnormal: more than 100 binades below f16's 2^-24 grid.
+        return sign;
+    }
+    // Subnormal in f16 (|x| < 2^-14): restore the implicit leading 1 and place
+    // the value on the fixed 2^-24 grid with round-to-nearest-even. The carry
+    // out of a rounded-up top subnormal lands on 0x0400 — the smallest normal
+    // — which is the right value, not an overflow.
+    let mant = man | 0x80_0000;
+    let shift = (126 - exp) as u32; // 14..=125
+    if shift >= 32 {
+        // q would be 0 and the halfway point (2^(shift-1) >= 2^31) is beyond
+        // any 24-bit mantissa, so rounding up is impossible: exact zero.
+        return sign;
+    }
+    let mut q = mant >> shift;
+    let rem = mant & ((1u32 << shift) - 1);
+    let halfway = 1u32 << (shift - 1);
+    if rem > halfway || (rem == halfway && q & 1 == 1) {
+        q += 1;
+    }
+    sign | q as u16
+}
+
+/// Load-time CPU quantizer for the dense-tier Q8_0 flip: one `[nrows, ncols]`
+/// BF16 weight matrix (checkpoint bytes, straight off the mmap) -> ggml
+/// `block_q8_0` (34 B per 32 values: f16 scale + 32 int8), the format
+/// [`Kernel::GemvQ8_0`] reads as its A operand. 2 B/elem becomes 1.0625
+/// B/elem — a 1.88x cut of the per-token bytes for every tensor flipped.
+///
+/// ## The reference matched — bit for bit, not "approximately"
+///
+/// `quantize_row_q8_0_ref`, `vendor/llama.cpp/ggml-quants.c:238`:
+///
+/// - `amax = max |x|` over the 32 values of the block;
+/// - `d = amax / 127.0f`, computed and kept in **f32**;
+/// - the stored scale is `GGML_FP32_TO_FP16(d)` — round-to-nearest-even
+///   ([`f32_to_f16_rne`]); but
+/// - `id = 1.0f / d` is taken from the **unrounded f32 `d`**, not the f16
+///   round-trip — quantize against the f16 scale instead and the low bits of
+///   every qs byte walk;
+/// - `qs[j] = roundf(x[j] * id)` — round half AWAY from zero (`roundf`),
+///   which `f32::round` matches exactly. Round-to-nearest-even here is the
+///   classic silent mutation: it changes only exact-.5 quotients, and
+///   `q8_0_rounding_is_half_away_from_zero_not_rne` exists to catch it.
+///
+/// The bf16 -> f32 widening on the input side is exact (bf16 IS the top half
+/// of the f32 pattern), so quantizing from the BF16 bytes and quantizing from
+/// a hypothetical f32 staging copy are the same computation. This function
+/// streams through a 32-element stack buffer — no tensor-wide f32 staging of
+/// the 686M dense elements. Rows are self-contained (`ncols` must be a whole
+/// number of blocks), so a caller may also slice by row range:
+/// `quantize_q8_0_from_bf16(&src[r0*ncols*2..r1*ncols*2], r1-r0, ncols,
+/// &mut dst[r0*row_bytes..r1*row_bytes])`.
+///
+/// ## Divergences from the C reference — refusing garbage, not re-rounding it
+///
+/// - A non-finite input value is an ERROR, not a poisoned scale. ggml would
+///   silently write `d = Inf` (every weight of the block then dequantizes to
+///   0 or NaN); a load-time quantizer must say which tensor is broken.
+/// - A block whose `amax` is so small that `1/d` overflows f32
+///   (`d < ~2.9e-39`, i.e. every |value| below ~3.7e-37) is written as an
+///   all-zero block with `d = 0`. In C this band is undefined behavior
+///   (`(int8_t)roundf(Inf)`); the value ggml's own dequantizer assigns the
+///   block is 0 either way, because f16(d) is 0 for every d below 2^-25 —
+///   so this writes the bytes that decode to the SAME numbers, minus the UB.
+///
+/// ## The B-operand recipe (what the integration copies)
+///
+/// `GemvQ8_0` is `mul_mat_vecq.comp`: its B operand is `block_q8_1_x4`
+/// **activations**, not a plain f32 vector — feeding it f32 bytes is silent
+/// garbage (measured at 2.5e6 max rel error on `in_proj_qkv` in
+/// `device_gemv_q8_dense.rs::q8_0_dense_gemv_mutations_fail_loudly`). Per
+/// token:
+///
+/// 1. quantize each distinct activation WIDTH once with
+///    [`Kernel::QuantizeQ8_1`]: input the f32 vector (`ne` elements), output
+///    `ne.div_ceil(128) * 144` bytes ([`q8_1_quantize_params`] /
+///    [`q8_1_quantize_dispatch`]); then
+/// 2. every Q8_0 GEMV of that width shares the one quantized slot as its B
+///    binding — hidden-width 2560 feeds `in_proj_qkv` AND `lm_head` from the
+///    same dispatch. Push constants are [`gemv_params`] (whose `stride_b` is
+///    in q8_1 BLOCKS, `ncols/32`), dispatch [`gemv_dispatch`], binding order
+///    `[A q8_0 weights, B q8_1_x4, D f32 dst, Fuse0, Fuse1]`.
+///
+/// # Errors
+/// `ncols` not a positive multiple of [`QK8_0`]; `src`/`dst` not exactly the
+/// sizes `[nrows, ncols]` implies; a non-finite input value (reported with its
+/// row and column).
+pub fn quantize_q8_0_from_bf16(
+    src: &[u8],
+    nrows: usize,
+    ncols: usize,
+    dst: &mut [u8],
+) -> Result<()> {
+    let Some(row_bytes) = q8_0_row_bytes(ncols) else {
+        return Err(KernelError::Runtime(format!(
+            "q8_0 quantize: ncols {ncols} is not a positive multiple of {QK8_0}"
+        )));
+    };
+    for (label, got, want) in [
+        ("source", src.len(), nrows * ncols * 2),
+        ("destination", dst.len(), nrows * row_bytes),
+    ] {
+        if got != want {
+            return Err(KernelError::Runtime(format!(
+                "q8_0 quantize: {label} is {got} B, expected {want} B for [{nrows}, {ncols}] bf16"
+            )));
+        }
+    }
+
+    for (block_idx, (src_block, dst_block)) in src
+        .chunks_exact(QK8_0 * 2)
+        .zip(dst.chunks_exact_mut(BLOCK_Q8_0_BYTES))
+        .enumerate()
+    {
+        // bf16 -> f32 is exact: bf16 is the top half of the f32 bit pattern.
+        let mut vals = [0f32; QK8_0];
+        for (j, (v, c)) in vals.iter_mut().zip(src_block.chunks_exact(2)).enumerate() {
+            *v = f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16);
+            if !v.is_finite() {
+                let flat = block_idx * QK8_0 + j;
+                return Err(KernelError::Runtime(format!(
+                    "q8_0 quantize: non-finite weight {v} at row {} col {} — this \
+                     tensor must not be quantized",
+                    flat / ncols,
+                    flat % ncols
+                )));
+            }
+        }
+
+        let mut amax = 0f32;
+        for v in vals {
+            amax = amax.max(v.abs());
+        }
+        let d = amax / 127.0;
+        // ggml computes `id` from the UNROUNDED f32 d. The `is_finite` guard is
+        // the all-subnormal-block divergence documented above: where 1/d would
+        // overflow, f16(d) is 0 anyway, so d = 0 + zero qs decodes identically.
+        let id = if d > 0.0 {
+            let inv = 1.0 / d;
+            if inv.is_finite() { inv } else { 0.0 }
+        } else {
+            0.0
+        };
+        let stored_d = if id == 0.0 { 0 } else { f32_to_f16_rne(d) };
+        if stored_d & 0x7C00 == 0x7C00 {
+            let flat = block_idx * QK8_0;
+            return Err(KernelError::Runtime(format!(
+                "q8_0 quantize: block amax {amax} at row {} makes the f16 scale \
+                 infinite — this tensor must not be quantized",
+                flat / ncols
+            )));
+        }
+
+        let (scale, qs) = dst_block.split_at_mut(2);
+        scale.copy_from_slice(&stored_d.to_le_bytes());
+        for (q, v) in qs.iter_mut().zip(vals) {
+            // roundf: half away from zero. In-range by construction
+            // (|v * id| <= 127 * (1 + 2^-23)), so the i8 cast never saturates.
+            *q = (v * id).round() as i8 as u8;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod q8_0_quantize_tests {
+    use super::{BLOCK_Q8_0_BYTES, QK8_0, bf16_to_f16, f32_to_f16_rne, quantize_q8_0_from_bf16};
+
+    /// Independent f16 decoder (bit-layout, not the encoder's inverse).
+    fn f16_to_f64(bits: u16) -> f64 {
+        let sign = if bits & 0x8000 != 0 { -1.0f64 } else { 1.0 };
+        let exp = (bits >> 10) & 0x1F;
+        let man = f64::from(bits & 0x3FF);
+        match exp {
+            0 => sign * man * 2.0f64.powi(-24),
+            0x1F if man == 0.0 => sign * f64::INFINITY,
+            0x1F => f64::NAN,
+            e => sign * (1.0 + man / 1024.0) * 2.0f64.powi(i32::from(e) - 15),
+        }
+    }
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        // Truncate f32 -> bf16. Every fixture value below is exactly
+        // representable in bf16, so truncation is exact for them.
+        values
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    /// The RNE converter against [`bf16_to_f16`] over ALL 65536 bf16 bit
+    /// patterns. The two were written independently (different algorithms,
+    /// different bands), so agreement is evidence, not tautology. They may
+    /// differ ONLY where their policies differ by design: finite bf16 values
+    /// at or above 2^16, which `bf16_to_f16` saturates to ±65504 and ggml
+    /// rounds to ±Inf.
+    #[test]
+    fn q8_0_scale_conversion_matches_the_bf16_reencoder() {
+        let mut checked = 0usize;
+        for bits in 0..=u16::MAX {
+            let exp = (bits >> 7) & 0xFF;
+            let finite_overflow = exp >= 143 && exp != 0xFF;
+            if finite_overflow {
+                continue;
+            }
+            let via_f32 = f32_to_f16_rne(f32::from_bits(u32::from(bits) << 16));
+            let mut direct = [0u8; 2];
+            bf16_to_f16(&bits.to_le_bytes(), &mut direct).expect("bf16 -> f16");
+            assert_eq!(
+                via_f32,
+                u16::from_le_bytes(direct),
+                "bf16 pattern {bits:#06x}: f32_to_f16_rne disagrees with bf16_to_f16"
+            );
+            checked += 1;
+        }
+        // 65536 minus the deliberate-policy band: finite exponents 143..=254
+        // are 112 * 128 mantissas * 2 signs = 28672 skipped patterns.
+        assert_eq!(
+            checked, 36_864,
+            "the loop must cover exactly the shared band"
+        );
+    }
+
+    /// `f32_to_f16_rne` against a brute-force nearest-even oracle at the exact
+    /// magnitudes a q8_0 scale lives at (`amax / 127` is never a round
+    /// number). The oracle scans all 65536 f16 patterns for the closest value,
+    /// breaking ties toward the even mantissa — an implementation-free
+    /// statement of RNE. A truncating or half-away scale conversion fails
+    /// here with the two candidate bit patterns printed.
+    #[test]
+    fn q8_0_scale_conversion_is_nearest_even_at_scale_magnitudes() {
+        let mut d = 0x1234_5678u64;
+        let mut rng = move || {
+            d ^= d << 13;
+            d ^= d >> 7;
+            d ^= d << 17;
+            (d >> 32) as u32
+        };
+        for case in 0..2000 {
+            // amax spans normal weights (~1e-3..8) and the f16-subnormal scale
+            // band (amax < 127 * 2^-14).
+            let amax = if case % 4 == 0 {
+                (f64::from(rng()) / f64::from(u32::MAX)) as f32 * 1e-3
+            } else {
+                (f64::from(rng()) / f64::from(u32::MAX)) as f32 * 8.0
+            };
+            let scale = amax / 127.0;
+            let got = f32_to_f16_rne(scale);
+            let target = f64::from(scale);
+            let mut best = 0u16;
+            let mut best_err = f64::INFINITY;
+            for cand in 0..0x7C00u16 {
+                // positive finite f16s, ordered by value
+                let err = (f16_to_f64(cand) - target).abs();
+                if err < best_err || (err == best_err && cand & 1 == 0) {
+                    best = cand;
+                    best_err = err;
+                }
+            }
+            assert_eq!(
+                got,
+                best,
+                "scale {scale:e}: stored f16 {got:#06x} ({}) but nearest-even is {best:#06x} ({})",
+                f16_to_f64(got),
+                f16_to_f64(best)
+            );
+        }
+    }
+
+    /// The value-rounding fixture: amax = 127 pins `d = 1.0` and `id = 1.0`
+    /// exactly, so each qs byte is `roundf(value)` with nothing else in the
+    /// way. The .5 cases are where the three plausible roundings part:
+    ///   half away (ggml):  2.5 ->  3, -2.5 -> -3, 0.5 -> 1, 3.5 -> 4
+    ///   nearest even:      2.5 ->  2, -2.5 -> -2, 0.5 -> 0, 3.5 -> 4
+    ///   truncation:        2.5 ->  2, -2.5 -> -2, 0.5 -> 0, 3.5 -> 3
+    /// Mutating the quantizer to either wrong rounding fails this assert with
+    /// the exact byte diff. (Mutation run recorded in the test-file header of
+    /// `device_gemv_q8_dense.rs`.)
+    #[test]
+    fn q8_0_rounding_is_half_away_from_zero_not_rne() {
+        let mut values = [0f32; QK8_0];
+        let fixture: [(usize, f32, i8); 10] = [
+            (0, 127.0, 127),
+            (1, 2.5, 3),
+            (2, -2.5, -3),
+            (3, 0.5, 1),
+            (4, -0.5, -1),
+            (5, 1.5, 2),
+            (6, -1.5, -2),
+            (7, 3.5, 4),
+            (8, -3.5, -4),
+            (9, 126.5, 127),
+        ];
+        for &(i, v, _) in &fixture {
+            values[i] = v;
+        }
+        let src = bf16_bytes(&values);
+        let mut block = [0u8; BLOCK_Q8_0_BYTES];
+        quantize_q8_0_from_bf16(&src, 1, QK8_0, &mut block).expect("quantize fixture");
+
+        let d_bits = u16::from_le_bytes([block[0], block[1]]);
+        assert_eq!(d_bits, 0x3C00, "amax 127 must store d = 1.0 exactly");
+        for &(i, v, want) in &fixture {
+            let got = block[2 + i] as i8;
+            assert_eq!(
+                got, want,
+                "value {v} quantized to {got}, ggml round-half-away says {want}"
+            );
+        }
+        for i in fixture.len()..QK8_0 {
+            assert_eq!(block[2 + i] as i8, 0, "untouched lane {i} must be 0");
+        }
+    }
+
+    /// The dequantized block must sit within the sharp reconstruction bound
+    /// `|w - q * f16(d)| <= (0.5 + 127 * 2^-11) * d ~= 0.562 d`: half an lsb
+    /// from `roundf` plus the f16 rounding of the scale itself. Truncation
+    /// breaks it at ~1.06 d; a swapped-halves layout bug breaks it by orders
+    /// of magnitude. Checked over random blocks here and over the real
+    /// checkpoint tensors in `device_gemv_q8_dense.rs`.
+    #[test]
+    fn q8_0_roundtrip_stays_within_half_an_lsb_of_the_scale() {
+        const BOUND: f64 = 0.57;
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 32) as u32
+        };
+        for _ in 0..500 {
+            let values: Vec<f32> = (0..QK8_0)
+                .map(|_| {
+                    let unit = (f64::from(rng()) / f64::from(u32::MAX)) as f32 * 2.0 - 1.0;
+                    // bf16-representable by construction (truncate).
+                    f32::from_bits(unit.to_bits() & 0xFFFF_0000)
+                })
+                .collect();
+            let src = bf16_bytes(&values);
+            let mut block = [0u8; BLOCK_Q8_0_BYTES];
+            quantize_q8_0_from_bf16(&src, 1, QK8_0, &mut block).expect("quantize");
+
+            let amax = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let d = f64::from(amax) / 127.0;
+            if d == 0.0 {
+                continue;
+            }
+            let d16 = f16_to_f64(u16::from_le_bytes([block[0], block[1]]));
+            for (j, &w) in values.iter().enumerate() {
+                let dq = f64::from(block[2 + j] as i8) * d16;
+                let err = (f64::from(w) - dq).abs() / d;
+                assert!(
+                    err <= BOUND,
+                    "lane {j}: w {w} dequantizes to {dq}, {err:.3} lsb from it (> {BOUND})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_quantize_refuses_bad_shapes_and_non_finite_input() {
+        let src = bf16_bytes(&[1.0f32; QK8_0]);
+        let mut dst = [0u8; BLOCK_Q8_0_BYTES];
+        // ncols not a block multiple / mis-sized buffers: refused, not rounded.
+        assert!(quantize_q8_0_from_bf16(&src, 1, QK8_0 + 1, &mut dst).is_err());
+        assert!(quantize_q8_0_from_bf16(&src[..src.len() - 2], 1, QK8_0, &mut dst).is_err());
+        assert!(quantize_q8_0_from_bf16(&src, 1, QK8_0, &mut dst[..BLOCK_Q8_0_BYTES - 1]).is_err());
+
+        // A NaN weight names its position instead of poisoning the scale.
+        let mut values = [1.0f32; QK8_0];
+        values[7] = f32::NAN;
+        let err = quantize_q8_0_from_bf16(&bf16_bytes(&values), 1, QK8_0, &mut dst)
+            .expect_err("NaN input must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("col 7"), "error must name the column: {msg}");
+
+        // The all-subnormal band decodes to zero instead of C's UB garbage.
+        let tiny = [1.0e-40f32; QK8_0];
+        quantize_q8_0_from_bf16(&bf16_bytes(&tiny), 1, QK8_0, &mut dst).expect("tiny block");
+        assert_eq!(
+            dst, [0u8; BLOCK_Q8_0_BYTES],
+            "sub-1e-37 block must be all zero"
+        );
+    }
+}
