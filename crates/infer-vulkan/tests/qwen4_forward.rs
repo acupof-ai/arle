@@ -1268,3 +1268,206 @@ fn profile_forward_token() {
     );
     assert_eq!(top, "ĠParis", "profiling must not change the answer");
 }
+
+/// End-to-end dense-format quality: greedy-generate a probe set in EACH
+/// requested format, sequentially in one process (each model is dropped
+/// before the next loads, so the device heap frees), and compare against the
+/// first format as baseline.
+///
+/// Three columns per format, because they fail differently: greedy AGREEMENT
+/// (the coarse bit — does the output change), top-1 logit MAE (how hard the
+/// argmax is being pushed), and full-vector MAE (diffuse drift the top-k
+/// never shows). A quantization that keeps agreement at 100% while tripling
+/// vector MAE is spending its error budget; one that flips greedy tokens is
+/// past it.
+///
+/// ```text
+/// ARLE_QWEN4_QUALITY=bf16,q8 cargo test -p infer-vulkan --features vulkan \
+///     --release --test qwen4_forward dense_format_quality_probe \
+///     -- --test-threads=1 --nocapture
+/// ```
+#[test]
+fn dense_format_quality_probe() {
+    let Ok(formats) = std::env::var("ARLE_QWEN4_QUALITY") else {
+        eprintln!("SKIP: set ARLE_QWEN4_QUALITY=bf16,q8[,q4k] (first entry is the baseline)");
+        return;
+    };
+    let formats: Vec<String> = formats.split(',').map(|s| s.trim().to_string()).collect();
+    assert!(
+        formats.len() >= 2,
+        "need a baseline and at least one candidate"
+    );
+    let Some(dir) = checkpoint_dir() else { return };
+    let ctx = match VulkanContext::create() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let (by_tok, by_id) = load_vocab(&dir);
+
+    // Probe prompts as single-BPE pieces so the id sequence is exactly what
+    // the tokenizer would emit. A prompt with any missing piece is dropped
+    // (reported), not fatal — vocab coverage varies.
+    let prompt_specs: [&[&str]; 4] = [
+        &["The", "Ġcapital", "Ġof", "ĠFrance", "Ġis"],
+        &["The", "Ġsun", "Ġrises", "Ġin", "Ġthe"],
+        &["One", "Ġplus", "Ġone", "Ġequals"],
+        &["def", "Ġadd", "(", "a", ",", "Ġb", ")", ":"],
+    ];
+    let mut prompts: Vec<Vec<u32>> = Vec::new();
+    for spec in prompt_specs {
+        let ids: Option<Vec<u32>> = spec.iter().map(|p| by_tok.get(*p).copied()).collect();
+        match ids {
+            Some(ids) => prompts.push(ids),
+            None => eprintln!("  (probe dropped, vocab missing a piece: {spec:?})"),
+        }
+    }
+    assert!(
+        prompts.len() >= 2,
+        "not enough probe prompts survived the vocab"
+    );
+    const GEN: usize = 8;
+
+    // One format's run: greedy sequences + the full logits of every step.
+    struct Run {
+        greedy: Vec<Vec<u32>>,
+        logits: Vec<Vec<Vec<f32>>>,
+        load_s: f64,
+        tok_ms: f64,
+    }
+    let mut runs: Vec<(String, Run)> = Vec::new();
+    for fmt in &formats {
+        // SAFETY: this test binary runs single-threaded (--test-threads=1 is
+        // required for device suites anyway), and the var is read exactly
+        // once per load.
+        unsafe { std::env::set_var("ARLE_QWEN4_DENSE", fmt) };
+        let st = SafeTensorsDir::open_dir(&dir).expect("open checkpoint");
+        let cfg = Qwen4ExpConfig::from_model_dir(&dir).expect("parse config");
+        let t0 = std::time::Instant::now();
+        let mut model =
+            VulkanQwen4ExpModel::load(Some(&ctx), &st, cfg, &Qwen4ExpDeviceMode::HybridExperts)
+                .expect("model load");
+        let load_s = t0.elapsed().as_secs_f64();
+        let mut greedy: Vec<Vec<u32>> = Vec::new();
+        let mut logits_all = Vec::new();
+        let mut tok_s = 0.0f64;
+        let mut tok_n = 0usize;
+        for prompt in &prompts {
+            let mut seq = prompt.clone();
+            let mut generated: Vec<u32> = Vec::new();
+            let mut step_logits = Vec::new();
+            for pos in 0..seq.len() + GEN - 1 {
+                let start = if pos == 0 { 0 } else { pos };
+                let tok = seq[pos.min(seq.len() - 1)];
+                let t1 = std::time::Instant::now();
+                let logits = model.forward_token(0, 0, tok, start).expect("forward");
+                if pos >= 2 {
+                    tok_s += t1.elapsed().as_secs_f64();
+                    tok_n += 1;
+                }
+                if pos + 1 >= seq.len() {
+                    let arg = logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i as u32)
+                        .unwrap();
+                    step_logits.push(logits);
+                    generated.push(arg);
+                    if seq.len() < prompt.len() + GEN {
+                        seq.push(arg);
+                    }
+                }
+            }
+            // Reset the recurrent state between prompts.
+            model.forward_token(0, 0, seq[0], 0).expect("reset probe");
+            greedy.push(generated);
+            logits_all.push(step_logits);
+        }
+        eprintln!(
+            "[{fmt}] load {load_s:.1}s, {:.1} ms/token over {tok_n} fwd",
+            tok_s / tok_n as f64 * 1e3
+        );
+        for (p, g) in prompts.iter().zip(&greedy) {
+            let text: String = g
+                .iter()
+                .map(|id| by_id.get(id).cloned().unwrap_or_else(|| format!("<{id}>")))
+                .collect();
+            let ptext: String = p
+                .iter()
+                .map(|id| by_id.get(id).cloned().unwrap_or_default())
+                .collect();
+            eprintln!(
+                "    {} -> {}",
+                ptext.replace('Ġ', " "),
+                text.replace('Ġ', " ")
+            );
+        }
+        runs.push((
+            fmt.clone(),
+            Run {
+                greedy,
+                logits: logits_all,
+                load_s,
+                tok_ms: tok_s / tok_n as f64 * 1e3,
+            },
+        ));
+    }
+
+    // Compare every candidate against the baseline.
+    let (base_name, base) = &runs[0];
+    eprintln!("\n── quality vs {base_name} ──");
+    eprintln!(
+        "  {:<6} {:>9} {:>12} {:>12} {:>9} {:>10}",
+        "format", "agree", "top1 MAE", "vector MAE", "load s", "ms/token"
+    );
+    for (name, run) in &runs[1..] {
+        let mut agree = 0usize;
+        let mut total = 0usize;
+        let mut top1_mae = 0.0f64;
+        let mut vec_mae = 0.0f64;
+        let mut vec_n = 0usize;
+        for (pb, pr) in base.greedy.iter().zip(&run.greedy) {
+            for (a, b) in pb.iter().zip(pr) {
+                total += 1;
+                if a == b {
+                    agree += 1;
+                }
+            }
+        }
+        for (pb, pr) in base.logits.iter().zip(&run.logits) {
+            for (lb, lr) in pb.iter().zip(pr) {
+                let arg = lb
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+                    .unwrap();
+                top1_mae += f64::from((lb[arg] - lr[arg]).abs());
+                vec_mae += lb
+                    .iter()
+                    .zip(lr)
+                    .map(|(&a, &b)| f64::from((a - b).abs()))
+                    .sum::<f64>()
+                    / lb.len() as f64;
+                vec_n += 1;
+            }
+        }
+        eprintln!(
+            "  {:<6} {:>8.1}% {:>12.4} {:>12.5} {:>9.1} {:>10.1}",
+            name,
+            100.0 * agree as f64 / total as f64,
+            top1_mae / vec_n as f64,
+            vec_mae / vec_n as f64,
+            run.load_s,
+            run.tok_ms,
+        );
+    }
+    eprintln!(
+        "\nGate suggestion: candidate agreement >= 95% and top1 MAE well under the\n\
+         baseline's top1-vs-top2 margin means the flip is safe; below that,\n\
+         flip per family instead of wholesale."
+    );
+}
