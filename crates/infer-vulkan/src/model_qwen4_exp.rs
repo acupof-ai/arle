@@ -1254,7 +1254,10 @@ impl DevSlots {
             logits: take(512),
             ids: take(16),
             wts: take(16),
-            scale0: take(16),
+            // Three projections' slot scales side by side (gate|up|down),
+            // ALL written before any expert GEMV is recorded — which is what
+            // lets the whole MoE tail share one submit.
+            scale0: take(48),
             gate: take(6400),
             up: take(6400),
             down: take(25600),
@@ -1745,12 +1748,17 @@ impl<'ctx> Qwen4Dev<'ctx> {
     /// fused expert GEMVs (PLAIN f32 activations — no q8_1 quantize on this
     /// path) and the weighted accumulate. The shared expert rides on device
     /// when its dense tier is F32-resident; `taps.shared_on_device` says so.
+    /// `collect_taps` inserts the extra flush that captures `routed` (the
+    /// accumulator BEFORE the shared expert) for the parity harness; the
+    /// decode loop passes `false` and the whole expert tail — gate, up,
+    /// swiglu, down, weighted accum, shared expert — is ONE submit.
     pub fn moe(
         &mut self,
         weights: &Qwen4Weights<'_, '_>,
         cfg: &Qwen4ExpConfig,
         layer: usize,
         x: &[f32],
+        collect_taps: bool,
     ) -> Result<(Vec<f32>, DevMoeTaps)> {
         let h = cfg.hidden_size;
         let top_k = cfg.num_experts_per_tok;
@@ -1798,26 +1806,32 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let route_weights = self.read_f32(s.wts, top_k)?;
 
         // Fused expert GEMVs. `weight_scale_2` rides SCALE0, indexed by SLOT.
-        // ne11 = 1 shares the one `x` row across slots for gate/up.
+        // All three projections' slot scales are computed from `ids` and
+        // written BEFORE anything is recorded, so no host write races a
+        // recorded read and no flush is needed until the read at the end —
+        // this was 5 submits per layer (one per projection plus the swiglu
+        // firebreak) and is now part of ONE.
         prof::phase("dev.moe.gate_up");
-        let mut scale0 = Vec::new();
-        for (proj, dst_off) in [(ExpertProj::Gate, s.gate), (ExpertProj::Up, s.up)] {
-            self.gemv_id_nvfp4(
-                weights,
-                layer,
-                proj,
-                &ids,
-                h,
-                inter,
-                s.x,
-                1,
-                dst_off,
-                &mut scale0,
-            )?;
-            // scale0 lives in one slot and differs per stack; the host write
-            // below must not race the recorded read, so flush per projection.
-            self.flush()?;
+        let mut scale0_all = vec![0.0f32; 3 * top_k];
+        for (i, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
+            .into_iter()
+            .enumerate()
+        {
+            let mut part = Vec::new();
+            weights
+                .expert_stack(layer, proj)?
+                .scale0_for_route(&ids, &mut part)?;
+            scale0_all[i * top_k..(i + 1) * top_k].copy_from_slice(&part);
         }
+        self.write_f32(s.scale0, &scale0_all)?;
+        let sc = |i: usize| (i * top_k * 4) as u64;
+        for (i, (proj, dst_off)) in [(ExpertProj::Gate, s.gate), (ExpertProj::Up, s.up)]
+            .into_iter()
+            .enumerate()
+        {
+            self.gemv_id_nvfp4(weights, layer, proj, &ids, h, inter, s.x, 1, dst_off, sc(i))?;
+        }
+        self.barrier();
         prof::phase("dev.moe.swiglu");
         // act = silu(gate) * up over [top_k * inter].
         let n_act = (top_k * inter) as u32;
@@ -1834,7 +1848,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             ],
             [d.x, d.y, d.z],
         )?;
-        self.flush()?;
+        self.barrier();
         prof::phase("dev.moe.down_accum");
         // down: each expert slot reads ITS OWN activation row (ne11 = top_k).
         self.gemv_id_nvfp4(
@@ -1847,7 +1861,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             s.gate,
             top_k,
             s.down,
-            &mut scale0,
+            sc(2),
         )?;
         self.barrier();
         // acc = Σ_e w_e · down[e].
@@ -1864,19 +1878,22 @@ impl<'ctx> Qwen4Dev<'ctx> {
             ],
             [d.x, d.y, d.z],
         )?;
-        self.flush()?;
-        let routed = self.read_f32(s.acc, h)?;
-
-        prof::phase("dev.moe.shared");
-        // Shared expert on device iff its dense tier is F32-resident.
-        let shared_on_device = self
-            .try_shared_expert(weights, cfg, layer)
-            .context("device shared expert")?;
-        let y = if shared_on_device {
+        // `routed` is the accumulator BEFORE the shared expert; capturing it
+        // costs a flush, so only the harness pays for it.
+        let routed = if collect_taps {
+            self.flush()?;
             self.read_f32(s.acc, h)?
         } else {
-            routed.clone()
+            Vec::new()
         };
+
+        prof::phase("dev.moe.shared");
+        self.barrier();
+        let shared_on_device = self
+            .record_shared_expert(weights, cfg, layer)
+            .context("device shared expert")?;
+        self.flush()?;
+        let y = self.read_f32(s.acc, h)?;
         Ok((
             y,
             DevMoeTaps {
@@ -1904,14 +1921,11 @@ impl<'ctx> Qwen4Dev<'ctx> {
         b_off: u64,
         ne11: usize,
         dst_off: u64,
-        scale0: &mut Vec<f32>,
+        scale0_off: u64,
     ) -> Result<()> {
         let top_k = ids.len();
         let s = self.slots;
         let stack = weights.expert_stack(layer, proj)?;
-        stack.scale0_for_route(ids, scale0)?;
-        let scale0_now = scale0.clone();
-        self.write_f32(s.scale0, &scale0_now)?;
         let (sb, so, sl) = weights.binding(&stack.tensor)?;
         let mut words = gemv_id_params_fused(
             ncols as u32,
@@ -1934,7 +1948,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
                 Bind::Ext(sb, so, sl),
                 Bind::A(b_off, (ncols * ne11 * 4) as u64),
                 Bind::A(dst_off, (top_k * nrows * 4) as u64),
-                Bind::A(s.scale0, (top_k * 4) as u64),
+                Bind::A(s.scale0 + scale0_off, (top_k * 4) as u64),
                 Bind::A(s.dummy, 8),
                 Bind::A(s.ids, (top_k * 4) as u64),
             ],
@@ -1942,9 +1956,11 @@ impl<'ctx> Qwen4Dev<'ctx> {
         )
     }
 
-    /// Record + run the shared expert if all four of its dense tensors are
-    /// F32-resident, accumulating into the `acc` slot. Returns whether it ran.
-    fn try_shared_expert(
+    /// RECORD the shared expert into the open batch (no flush), accumulating
+    /// into the `acc` slot. Returns whether it was recorded. The scalar
+    /// `shared_expert_gate` needs the F32 router GEMV (its sigmoid rides the
+    /// kernel); the three projections take whatever format the tier holds.
+    fn record_shared_expert(
         &mut self,
         weights: &Qwen4Weights<'_, '_>,
         cfg: &Qwen4ExpConfig,
@@ -1959,9 +1975,9 @@ impl<'ctx> Qwen4Dev<'ctx> {
             layer_tensor_name(layer, "mlp.shared_expert.down_proj.weight"),
         ];
         let mut tensors = Vec::new();
-        for n in &names {
+        for (i, n) in names.iter().enumerate() {
             match weights.tensor(n) {
-                Ok(t) if t.format == Qwen4DeviceFormat::F32 => tensors.push(*t),
+                Ok(t) if i > 0 || t.format == Qwen4DeviceFormat::F32 => tensors.push(*t),
                 _ => return Ok(false),
             }
         }
@@ -1982,22 +1998,9 @@ impl<'ctx> Qwen4Dev<'ctx> {
             ],
             [d.x, d.y, d.z],
         )?;
-        // gate / up.
+        // gate / up, whatever format the tier holds.
         for (t, dst) in [(&tensors[1], s.gate), (&tensors[2], s.up)] {
-            let (b, o, l) = weights.binding(t)?;
-            let push = qwen36_router_gemv_params(inter as u32, h as u32, false).to_le_bytes();
-            let d = qwen36_router_gemv_dispatch(inter as u32);
-            self.rec(
-                Kernel::Qwen36RouterGemv,
-                Kernel::Qwen36RouterGemv.specialization_u32(),
-                &push,
-                &[
-                    Bind::A(s.x, (h * 4) as u64),
-                    Bind::Ext(b, o, l),
-                    Bind::A(dst, (inter * 4) as u64),
-                ],
-                [d.x, d.y, d.z],
-            )?;
+            self.record_dense_at(weights, t, s.x, dst)?;
         }
         self.barrier();
         let push = swiglu_params(inter as u32).to_le_bytes();
@@ -2015,20 +2018,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         )?;
         self.barrier();
         // down: [inter -> h] into the `down` slot's first row.
-        let (b3, o3, l3) = weights.binding(&tensors[3])?;
-        let push = qwen36_router_gemv_params(h as u32, inter as u32, false).to_le_bytes();
-        let d = qwen36_router_gemv_dispatch(h as u32);
-        self.rec(
-            Kernel::Qwen36RouterGemv,
-            Kernel::Qwen36RouterGemv.specialization_u32(),
-            &push,
-            &[
-                Bind::A(s.gate, (inter * 4) as u64),
-                Bind::Ext(b3, o3, l3),
-                Bind::A(s.down, (h * 4) as u64),
-            ],
-            [d.x, d.y, d.z],
-        )?;
+        self.record_dense_at(weights, &tensors[3], s.gate, s.down)?;
         self.barrier();
         // acc += shgate · down (count = 1, no init).
         let push = qwen36_moe_weighted_accum_params(h as u32, 1, false).to_le_bytes();
@@ -2044,7 +2034,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
             ],
             [d.x, d.y, d.z],
         )?;
-        self.flush()?;
         Ok(true)
     }
 }
@@ -3377,7 +3366,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let (mut y, taps) = {
                     let d = dev.as_mut().expect("moe_dev checked");
                     let w = weights.as_ref().expect("moe_dev checked");
-                    d.moe(w, cfg, layer, &x)?
+                    d.moe(w, cfg, layer, &x, false)?
                 };
                 if !taps.shared_on_device {
                     let _s = prof::stage("host.shared_expert");

@@ -429,7 +429,9 @@ fn parity_layers_0_1_3_device_vs_host() {
             errs.note("hc.mlp.block_input", &x_dev, &gr.block_input);
             let x = gr.block_input.clone();
 
-            let (y_dev, dtaps) = dev.moe(&weights, &cfg, layer, &x).expect("device moe");
+            let (y_dev, dtaps) = dev
+                .moe(&weights, &cfg, layer, &x, true)
+                .expect("device moe");
             assert!(
                 dtaps.shared_on_device,
                 "subset F32 load must run the shared expert on device"
