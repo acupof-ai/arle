@@ -133,17 +133,24 @@ fn report_gpu_read_bandwidth_by_memory_flavor() {
     };
     eprintln!("device: {}", ctx.device_name());
     eprintln!("GPU streaming read+write of 512 MiB, dst always alloc_uma:\n");
+    // Label correction, measured via heapUsage deltas: `alloc` (plain
+    // HOST_VISIBLE|COHERENT) does NOT land on heap 0 here — memory_type_index
+    // prefers the largest compatible heap, and heap 1 is DEVICE_LOCAL|
+    // HOST_VISIBLE|HOST_COHERENT, so that row compares heap 1 to heap 1. The
+    // only flavor that actually exercises heap 0 is alloc_host_cached, and
+    // the real heap-0 cost is ~2%, not the 0.5% the first (mislabeled) run
+    // of this test reported.
     for (name, src) in [
         (
             "alloc_uma        (DEVICE_LOCAL, heap 1)",
             DeviceBuffer::alloc_uma(&ctx, BYTES),
         ),
         (
-            "alloc            (host WC, heap 0)",
+            "alloc            (host-visible; lands on heap 1 here)",
             DeviceBuffer::alloc(&ctx, BYTES),
         ),
         (
-            "alloc_host_cached (host cached, heap 0)",
+            "alloc_host_cached (host cached, the real heap 0)",
             DeviceBuffer::alloc_host_cached(&ctx, BYTES),
         ),
     ] {
