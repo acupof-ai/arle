@@ -68,6 +68,10 @@ const MM_CM_DEFINES_Q4_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q4_K", "
 const MM_CM_DEFINES_Q5_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q5_K", "4");
 const MM_CM_DEFINES_Q6_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q6_K", "2");
 const MM_CM_DEFINES_Q8_0: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q8_0", "4");
+/// F16 A: `types.glsl` supplies `A_TYPE float16_t` at `LOAD_VEC_A 1`, and the
+/// f16 arm of `mul_mm.comp` does its own two-at-a-time load (`LOAD_VEC_BATCH_A
+/// 2`), so 1 is correct here where the quants need their dequant width.
+const MM_CM_DEFINES_F16: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_F16", "1");
 
 /// Shared `mul_mat_vec.comp` define set for the two NVFP4 GEMVs. `MUL_MAT_ID`
 /// is the ONLY difference between the plain and the fused-expert variant, so it
@@ -395,6 +399,11 @@ const VENDORED: &[ShaderSpec] = &[
     // `coopMatMulAdd`, so the activation side is an `f16_kv_pack` away, not a
     // `q8_1_quantize`. Registered unconditionally; `VulkanContext::coopmat()`
     // decides at runtime whether these pipelines are ever built.
+    ShaderSpec {
+        name: "mul_mm_cm_f16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_F16,
+    },
     ShaderSpec {
         name: "mul_mm_cm_q4_k",
         source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",

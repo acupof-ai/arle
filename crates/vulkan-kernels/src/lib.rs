@@ -318,6 +318,11 @@ pub enum Kernel {
     MmCmQ5K,
     MmCmQ6K,
     MmCmQ8_0,
+    /// The dense sibling: F16 weights on the matrix cores. The batched
+    /// (k>1) arm of the dense tier — the k=1 arm is [`Kernel::GemvF16`],
+    /// and the crossover between them is measured, not assumed
+    /// (`device_batched_crossover.rs`).
+    MmCmF16,
     QuantizeQ8_1,
     RmsNorm,
     RopeNeox,
@@ -494,6 +499,7 @@ impl Kernel {
         Self::MmqQ6K,
         Self::MmqQ8_0,
         Self::MmCmQ4K,
+        Self::MmCmF16,
         Self::MmCmQ5K,
         Self::MmCmQ6K,
         Self::MmCmQ8_0,
@@ -554,6 +560,7 @@ impl Kernel {
             Kernel::MmqQ6K => "mul_mmq_q6_k",
             Kernel::MmqQ8_0 => "mul_mmq_q8_0",
             Kernel::MmCmQ4K => "mul_mm_cm_q4_k",
+            Kernel::MmCmF16 => "mul_mm_cm_f16",
             Kernel::MmCmQ5K => "mul_mm_cm_q5_k",
             Kernel::MmCmQ6K => "mul_mm_cm_q6_k",
             Kernel::MmCmQ8_0 => "mul_mm_cm_q8_0",
@@ -646,7 +653,11 @@ impl Kernel {
             Kernel::MmqQ4K | Kernel::MmqQ5K | Kernel::MmqQ6K | Kernel::MmqQ8_0 => &[],
             // Same reasoning for the coopmat GEMM, plus its tile additionally
             // depends on the device's advertised matrix shape ([`MmSpec`]).
-            Kernel::MmCmQ4K | Kernel::MmCmQ5K | Kernel::MmCmQ6K | Kernel::MmCmQ8_0 => &[],
+            Kernel::MmCmQ4K
+            | Kernel::MmCmQ5K
+            | Kernel::MmCmQ6K
+            | Kernel::MmCmQ8_0
+            | Kernel::MmCmF16 => &[],
         }
     }
 
@@ -711,12 +722,14 @@ impl Kernel {
     pub fn required_subgroup_size(self, specialization_u32: &[(u32, u32)]) -> Option<u32> {
         match self {
             Kernel::FlashAttn => Some(32),
-            Kernel::MmCmQ4K | Kernel::MmCmQ5K | Kernel::MmCmQ6K | Kernel::MmCmQ8_0 => {
-                specialization_u32
-                    .iter()
-                    .find(|&&(id, _)| id == MM_CM_WARP_SPEC_ID)
-                    .map(|&(_, warp)| warp)
-            }
+            Kernel::MmCmQ4K
+            | Kernel::MmCmQ5K
+            | Kernel::MmCmQ6K
+            | Kernel::MmCmQ8_0
+            | Kernel::MmCmF16 => specialization_u32
+                .iter()
+                .find(|&&(id, _)| id == MM_CM_WARP_SPEC_ID)
+                .map(|&(_, warp)| warp),
             Kernel::GemvQ4K
             | Kernel::GemvQ5K
             | Kernel::GemvQ6K
@@ -1389,6 +1402,29 @@ pub fn gemv_params_f32_b(ncols: u32, nrows: u32) -> KernelParams {
     ])
 }
 
+/// [`gemv_params_f32_b`] for a [`GemvDenseSpec::with_cols`] pipeline: the
+/// same single-batch push with the two batch strides that place column `j`'s
+/// activations at `j * ncols` f32 elements and its outputs at `j * nrows`.
+/// With `num_cols = 1` the strides are never read and this reduces to the
+/// plain params — pinned by a unit test rather than trusted.
+pub fn gemv_params_f32_b_cols(ncols: u32, nrows: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        ncols, // ncols
+        ncols, // stride_a
+        ncols, // stride_b
+        nrows, // stride_d: row-count guard
+        ncols, // batch_stride_a
+        ncols, // batch_stride_b: column j of B at j*ncols elements
+        nrows, // batch_stride_d: column j of D at j*nrows elements
+        0,     // fusion_flags
+        0,     // base_work_group_y
+        1,     // ne02
+        1,     // ne12
+        1,     // broadcast2
+        1,     // broadcast3
+    ])
+}
+
 /// Spec-constant geometry for the dense (F16/BF16) GEMV, so a caller — or a
 /// tuning sweep — can move `BLOCK_SIZE`/`NUM_ROWS` off [`SPEC_GEMV_DENSE`]
 /// without hand-assembling a `(u32, u32)` list whose ids it has to get right.
@@ -1413,8 +1449,18 @@ impl GemvDenseSpec {
     pub const DEFAULT: Self = Self::new(GEMV_DENSE_BLOCK_SIZE, GEMV_DENSE_NUM_ROWS);
 
     pub const fn new(block_size: u32, num_rows: u32) -> Self {
+        Self::with_cols(block_size, num_rows, 1)
+    }
+
+    /// `NUM_COLS = num_cols`: one pipeline computes `num_cols` activation
+    /// columns per pass, reading column `j` at `j * batch_stride_b` and
+    /// writing it at `j * batch_stride_d` — pair with
+    /// [`gemv_params_f32_b_cols`], whose strides say exactly that. The weight
+    /// row is read ONCE for all columns, which is the whole point: at k>1 the
+    /// per-column weight traffic divides by k without touching `mul_mm`.
+    pub const fn with_cols(block_size: u32, num_rows: u32, num_cols: u32) -> Self {
         Self {
-            specialization_u32: [(0, block_size), (1, num_rows), (2, 1)],
+            specialization_u32: [(0, block_size), (1, num_rows), (2, num_cols)],
             num_rows,
         }
     }
