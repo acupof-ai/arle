@@ -32,8 +32,10 @@ pub enum VulkanModelKind {
     Dsv4,
     Qwen35Hybrid,
     Qwen36Moe,
-    /// Qwen3.8-Flash-Next (`qwen4_exp`). Recognised so it fails by NAME rather
-    /// than being mistaken for a plain MoE — it has 512 experts (top-10), a
+    /// Qwen3.8-Flash-Next (`qwen4_exp`). Recognised by NAME and routed to its
+    /// OWN model ([`crate::model_qwen4_exp`], loaded from the safetensors
+    /// directory) rather than being mistaken for a plain MoE — it has 512
+    /// experts (top-10), a
     /// hyper-connection residual stream 4x the hidden width, a PLE/n-gram
     /// lookup table, and a sparse-attention indexer, none of which the
     /// `Qwen36Moe` path implements.
@@ -103,6 +105,11 @@ pub enum VulkanLoadedModel {
     Qwen3(Box<crate::model_qwen3::VulkanQwen3Model>),
     Qwen35(Box<crate::model_qwen35::VulkanQwen35Model>),
     Qwen36(Box<crate::model_qwen36::VulkanQwen36Model>),
+    /// Qwen3.8-Flash-Next from a safetensors DIRECTORY (there is no GGUF of
+    /// this checkpoint). `'static` because the executor owns the model for the
+    /// process lifetime: the `VulkanContext` and the `SafeTensorsDir` are
+    /// leaked at load, exactly like the leaked context the other arms use.
+    Qwen4Exp(Box<crate::model_qwen4_exp::VulkanQwen4ExpModel<'static, 'static>>),
 }
 
 #[cfg(feature = "vulkan")]
@@ -118,6 +125,7 @@ impl VulkanLoadedModel {
             Self::Qwen3(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen35(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen36(model) => model.forward_token(slot, epoch, token, start_pos),
+            Self::Qwen4Exp(model) => model.forward_token(slot, epoch, token, start_pos),
         }
     }
 
@@ -456,6 +464,85 @@ impl infer_seam::PrefixReuse for VulkanExecutor {
     }
 }
 
+/// Load a `qwen4_exp` (Qwen3.8-Flash-Next) safetensors DIRECTORY into a
+/// single-slot executor. The checkpoint has no GGUF form, so this is its own
+/// entry point; [`load_qwen3_gguf`] also routes here when handed a directory
+/// (or a GGUF whose metadata classifies as `Qwen4Exp` and whose parent
+/// directory holds the safetensors checkpoint).
+///
+/// Device residency defaults to the hybrid split (NVFP4 experts + the F32
+/// small tier resident; dense bf16 + `lm_head` host-side — the residency that
+/// fits the driver's heapBudget). `ARLE_QWEN4_DEVICE_MODE=host` forces the
+/// pure host transcription; `=subset:0,1,3` uploads only those layers with
+/// the dense tier F32-resident (bring-up).
+pub fn load_qwen4_dir(
+    dir: impl AsRef<std::path::Path>,
+    num_slots: usize,
+    max_seq_len: usize,
+) -> Result<(VulkanExecutor, VulkanKvPool)> {
+    ensure!(num_slots > 0, "Vulkan load requires at least one slot");
+    ensure!(max_seq_len > 0, "Vulkan load requires max_seq_len > 0");
+    #[cfg(feature = "vulkan")]
+    {
+        use crate::model_qwen4_exp::{Qwen4ExpDeviceMode, VulkanQwen4ExpModel};
+        let dir = dir.as_ref();
+        let cfg = crate::qwen4_config::Qwen4ExpConfig::from_model_dir(dir)?;
+        let mode = match std::env::var("ARLE_QWEN4_DEVICE_MODE").as_deref() {
+            Ok("host") => Qwen4ExpDeviceMode::HostOnly,
+            Ok(s) if s.starts_with("subset:") => {
+                let layers: Vec<usize> = s["subset:".len()..]
+                    .split(',')
+                    .map(|p| p.trim().parse::<usize>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| anyhow::anyhow!("ARLE_QWEN4_DEVICE_MODE subset list: {e}"))?;
+                Qwen4ExpDeviceMode::SubsetF32(layers)
+            }
+            _ => Qwen4ExpDeviceMode::HybridExperts,
+        };
+        // Process-lifetime residents, same leak pattern as the GGUF arms: the
+        // model borrows both for `'static`.
+        let ctx: Option<&'static vulkan_sys::VulkanContext> =
+            if mode == Qwen4ExpDeviceMode::HostOnly {
+                None
+            } else {
+                Some(Box::leak(Box::new(vulkan_sys::VulkanContext::create()?)))
+            };
+        let st: &'static infer_gguf::safetensors::SafeTensorsDir = Box::leak(Box::new(
+            infer_gguf::safetensors::SafeTensorsDir::open_dir(dir)?,
+        ));
+        let model = VulkanQwen4ExpModel::load(ctx, st, cfg, &mode)?;
+        let stop_tokens = model.stop_token_ids.clone();
+        // The dense QSA stub is exact only inside `max_context`; the model
+        // enforces it per forward, so size the pool to the enforced window.
+        let seq_cap = max_seq_len.min(model.cfg.max_context);
+        if seq_cap < max_seq_len {
+            log::warn!(
+                "qwen4_exp: max_seq_len {max_seq_len} clamped to max_context {seq_cap} \
+                 (the bound that keeps the stubbed QSA indexer exact)"
+            );
+        }
+        let pages_per_slot = seq_cap.div_ceil(DEFAULT_PAGE_SIZE);
+        let pool = VulkanKvPool::new(
+            num_slots,
+            num_slots * pages_per_slot,
+            DEFAULT_PAGE_SIZE,
+            seq_cap,
+        );
+        let exec = VulkanExecutor {
+            model: Some(VulkanLoadedModel::Qwen4Exp(Box::new(model))),
+            stop_tokens,
+        };
+        Ok((exec, pool))
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = dir;
+        Err(anyhow::anyhow!(
+            "Vulkan backend not compiled: rebuild with --features vulkan"
+        ))
+    }
+}
+
 pub fn load_qwen3_gguf(
     path: impl AsRef<std::path::Path>,
     num_slots: usize,
@@ -463,6 +550,11 @@ pub fn load_qwen3_gguf(
 ) -> Result<(VulkanExecutor, VulkanKvPool)> {
     ensure!(num_slots > 0, "Vulkan load requires at least one slot");
     ensure!(max_seq_len > 0, "Vulkan load requires max_seq_len > 0");
+    // A DIRECTORY is the qwen4_exp safetensors checkpoint (no GGUF exists for
+    // it); everything else stays on the GGUF path below.
+    if path.as_ref().is_dir() {
+        return load_qwen4_dir(path, num_slots, max_seq_len);
+    }
     let gguf = infer_gguf::gguf::GgufFile::open(&path)?;
     let kind = classify_vulkan_gguf(&gguf)?;
     #[cfg(feature = "vulkan")]
@@ -485,9 +577,27 @@ pub fn load_qwen3_gguf(
                 let model = crate::model_qwen36::VulkanQwen36Model::load(ctx, &gguf)?;
                 VulkanLoadedModel::Qwen36(Box::new(model))
             }
+            VulkanModelKind::Qwen4Exp => {
+                // The real qwen4_exp checkpoint is safetensors; a GGUF that
+                // classifies as it can only be a metadata stub sitting inside
+                // (or next to) the checkpoint directory. Route to the dir
+                // loader — it owns the safetensors residency and its own
+                // model/forward/arena.
+                let dir = path
+                    .as_ref()
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("qwen4_exp GGUF has no parent directory"))?;
+                ensure!(
+                    dir.join("config.json").is_file(),
+                    "qwen4_exp loads from its safetensors directory, and {} holds no config.json \
+                     — pass the checkpoint DIRECTORY instead of a GGUF",
+                    dir.display()
+                );
+                return load_qwen4_dir(dir, num_slots, max_seq_len);
+            }
             other => bail!(
                 "Vulkan {other:?} GGUF load is not wired yet \
-                 (only Qwen35Hybrid / Qwen36Moe land resident); \
+                 (only Qwen35Hybrid / Qwen36Moe / Qwen4Exp land resident); \
                  host GGUF parse + classification succeeded"
             ),
         };
