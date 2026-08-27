@@ -634,6 +634,11 @@ const LOCAL: &[ShaderSpec] = &[
     // occurs 97 times per token on a dispatch-bound decode: the naive
     // composition is 10 dispatches per site, this is 4.
     ShaderSpec {
+        name: "qwen4_block_perm",
+        source: "crates/vulkan-kernels/shaders/qwen4_block_perm.comp",
+        defines: &[],
+    },
+    ShaderSpec {
         name: "qwen4_hc_mix",
         source: "crates/vulkan-kernels/shaders/qwen4_hc_mix.comp",
         defines: &[],

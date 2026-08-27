@@ -69,9 +69,9 @@ use std::path::PathBuf;
 
 use infer_gguf::safetensors::SafeTensorsDir;
 use infer_vulkan::model_qwen4_exp::{
-    DenseGemv, DevLinearAttn, HostKv, HostLayer, Qwen4Dev, Qwen4ExpDeviceMode, VulkanQwen4ExpModel,
-    hc_config, host_full_attention, host_linear_attention, host_moe, load_host_layer,
-    load_mixer_weights, ple_config, prof,
+    DenseGemv, DevResidentLinAttn, HostKv, HostLayer, Qwen4Dev, Qwen4ExpDeviceMode,
+    VulkanQwen4ExpModel, hc_config, host_full_attention, host_linear_attention, host_moe,
+    load_host_layer, load_mixer_weights, ple_config, prof,
 };
 use infer_vulkan::qwen4_config::Qwen4ExpConfig;
 use infer_vulkan::qwen4_hc;
@@ -270,12 +270,14 @@ fn parity_layers_0_1_3_device_vs_host() {
         dev.full_attention_ready(&weights, 3),
         "layer 3 must be device-runnable"
     );
-    let dev_lin0 = DevLinearAttn::new(&ctx, &cfg, host[&0].linear.as_ref().expect("l0 linear"))
-        .expect("permuted linear uploads");
-    let dev_lin1 = DevLinearAttn::new(&ctx, &cfg, host[&1].linear.as_ref().expect("l1 linear"))
-        .expect("permuted linear uploads");
+    // The SHIPPING linear path: resident device state, tier weights,
+    // activation-side head permutation. Its state starts zeroed, like the
+    // host's, and advances on device across the three tokens — so the
+    // per-token state comparison also proves cross-token continuity.
+    let mut resident = DevResidentLinAttn::new(&ctx, &cfg, [(0, &host[&0]), (1, &host[&1])])
+        .expect("resident linear attention");
     eprintln!(
-        "host layers + permuted uploads ready ({:.1}s)",
+        "host layers + resident linear ready ({:.1}s)",
         t0.elapsed().as_secs_f64()
     );
 
@@ -359,12 +361,20 @@ fn parity_layers_0_1_3_device_vs_host() {
             let y = match layer {
                 0 | 1 => {
                     let w = hl.linear.as_ref().expect("linear");
-                    let mut gdr_dev = gdr[&layer].clone();
-                    let mut ring_dev = ring[&layer].clone();
-                    let la = if layer == 0 { &dev_lin0 } else { &dev_lin1 };
-                    let (y_dev, dt) = la
-                        .forward(&mut dev, &cfg, &x, &mut gdr_dev, &mut ring_dev)
+                    // Seed the device state from the host's so every stage
+                    // comparison isolates ONE token's error — without this the
+                    // two trajectories drift apart legitimately and the table
+                    // stops being comparable to its recorded profile.
+                    resident
+                        .seed_state(&cfg, layer, &gdr[&layer], &ring[&layer])
+                        .expect("seed resident state");
+                    let y_dev = resident
+                        .forward(&mut dev, &weights, &cfg, layer, &x)
                         .expect("device linear attention");
+                    let dt = resident.read_taps(&dev, &cfg).expect("linear taps");
+                    let (gdr_dev, ring_dev) = resident
+                        .read_state(&cfg, layer)
+                        .expect("resident state read");
                     // `None` keeps the oracle a PURE host transcription: the
                     // device-routed dense GEMV is what this harness measures,
                     // not what it measures against.

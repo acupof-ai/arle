@@ -386,6 +386,10 @@ pub enum Kernel {
     /// `h[s] += inj[s] * y` scatter across all streams. See
     /// [`qwen4_hc_combine_params`].
     Qwen4HcCombine,
+    /// Static block permutation (`dst[b] = src[map[b]]`, blocks of `block`
+    /// f32): the HF<->GGUF head-map bridge for qwen4_exp's linear attention.
+    /// See [`qwen4_block_perm_params`].
+    Qwen4BlockPerm,
 }
 
 const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
@@ -534,6 +538,7 @@ impl Kernel {
         Self::Qwen4PleGate,
         Self::Qwen4PleConv,
         Self::Qwen4HcMix,
+        Self::Qwen4BlockPerm,
         Self::Qwen4HcCombine,
     ];
 
@@ -595,6 +600,7 @@ impl Kernel {
             Kernel::Qwen4PleGate => "qwen4_ple_gate",
             Kernel::Qwen4PleConv => "qwen4_ple_conv",
             Kernel::Qwen4HcMix => "qwen4_hc_mix",
+            Kernel::Qwen4BlockPerm => "qwen4_block_perm",
             Kernel::Qwen4HcCombine => "qwen4_hc_combine",
         }
     }
@@ -645,7 +651,8 @@ impl Kernel {
             | Kernel::Qwen4PleGate
             | Kernel::Qwen4PleConv
             | Kernel::Qwen4HcMix
-            | Kernel::Qwen4HcCombine => &[],
+            | Kernel::Qwen4HcCombine
+            | Kernel::Qwen4BlockPerm => &[],
             // `mul_mmq`'s tile geometry is chosen per call from the matmul shape
             // (see [`MmqSpec::choose`]); there is no single default, and running
             // it with the shader's built-in defaults would silently pick a tile
@@ -2478,6 +2485,20 @@ pub fn qwen4_hc_mix_params(hidden: u32, hc_count: u32, hc_lowrank: u32) -> Kerne
 /// compute all `hc_count` gates for channel `i` and reduce them on the spot.
 pub fn qwen4_hc_mix_dispatch(hidden: u32) -> Dispatch {
     Dispatch::x(hidden.max(1))
+}
+
+/// Push-constant block for `qwen4_block_perm.comp` = `{block, nblocks}`.
+/// Bindings: `0 = src` f32 (read), `1 = map` u32 `[nblocks]` (read, dst block
+/// -> SRC block), `2 = dst` f32 (write). `src` and `dst` must not alias — the
+/// permutation is not guaranteed cycle-free and an aliased scatter would read
+/// blocks it already overwrote.
+pub fn qwen4_block_perm_params(block: u32, nblocks: u32) -> KernelParams {
+    KernelParams::from_words(vec![block, nblocks])
+}
+
+/// One workgroup per destination block; threads stride the block.
+pub fn qwen4_block_perm_dispatch(nblocks: u32) -> Dispatch {
+    Dispatch::x(nblocks.max(1))
 }
 
 /// Push-constant block for `qwen4_hc_combine.comp` = `{hidden, hc_count}`

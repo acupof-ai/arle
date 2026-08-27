@@ -95,8 +95,9 @@ use vulkan_kernels::{
     FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams, MAT_VEC_FUSION_SCALE0,
     f16_kv_pack_dispatch, f16_kv_pack_params, flash_attn_dispatch, flash_attn_params,
     gemv_dense_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_params_f32_b,
-    qwen4_hc_combine_dispatch, qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params,
-    qwen4_ple_conv_dispatch, qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
+    qwen4_block_perm_dispatch, qwen4_block_perm_params, qwen4_hc_combine_dispatch,
+    qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch,
+    qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
     qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
     qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
@@ -1176,8 +1177,6 @@ pub struct DevSlots {
     bbuf: u64,
     convo: u64,
     gdro: u64,
-    gdr_state: u64,
-    conv_ring: u64,
     logits: u64,
     ids: u64,
     wts: u64,
@@ -1252,8 +1251,6 @@ impl DevSlots {
             bbuf: take(64),
             convo: take(10240),
             gdro: take(6144),
-            gdr_state: take(48 * 128 * 128),
-            conv_ring: take(3 * 10240),
             logits: take(512),
             ids: take(16),
             wts: take(16),
@@ -1519,6 +1516,68 @@ impl<'ctx> Qwen4Dev<'ctx> {
     /// file already uses. Both write f32, so a batch may mix them — which the
     /// linear-attention in-projections need, their `a`/`b` rows being F32 and
     /// their `qkv`/`z` rows F16.
+    /// Record ONE dense GEMV (`dst = W · src`, both arena offsets) without
+    /// flushing — the format dispatch [`Self::dense_gemv`] and the resident
+    /// linear-attention path share, so F16-vs-F32 routing cannot drift
+    /// between them.
+    fn record_dense_at(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        t: &Qwen4DeviceTensor,
+        src_off: u64,
+        dst_off: u64,
+    ) -> Result<()> {
+        let s = self.slots;
+        let (wb, wo, wl) = weights.binding(t)?;
+        let src = Bind::A(src_off, (t.ncols * 4) as u64);
+        let dst = Bind::A(dst_off, (t.nrows * 4) as u64);
+        let ncols = u32::try_from(t.ncols)?;
+        let nrows = u32::try_from(t.nrows)?;
+        match t.format {
+            Qwen4DeviceFormat::F16 => {
+                // `mul_mat_vec.comp` never reads `p.stride_a` — the row
+                // stride IS `p.ncols` — so only an exactly-packed
+                // row-major weight can be expressed through this push
+                // block. `ncols % 4` is the shader's one shape rule.
+                ensure!(
+                    ncols.is_multiple_of(4),
+                    "dense_gemv: F16 ncols {ncols} is not a multiple of 4"
+                );
+                let spec = GemvDenseSpec::DEFAULT;
+                let d = gemv_dense_dispatch(nrows, &spec);
+                self.rec(
+                    Kernel::GemvF16,
+                    spec.specialization_u32(),
+                    &gemv_params_f32_b(ncols, nrows).to_le_bytes(),
+                    &[
+                        Bind::Ext(wb, wo, wl),
+                        src,
+                        dst,
+                        Bind::A(s.dummy, 8),
+                        Bind::A(s.dummy, 8),
+                    ],
+                    [d.x, d.y, d.z],
+                )?;
+            }
+            Qwen4DeviceFormat::F32 => {
+                let d = qwen36_router_gemv_dispatch(nrows);
+                self.rec(
+                    Kernel::Qwen36RouterGemv,
+                    Kernel::Qwen36RouterGemv.specialization_u32(),
+                    &qwen36_router_gemv_params(nrows, ncols, false).to_le_bytes(),
+                    &[src, Bind::Ext(wb, wo, wl), dst],
+                    [d.x, d.y, d.z],
+                )?;
+            }
+            Qwen4DeviceFormat::Nvfp4 => {
+                return Err(anyhow!(
+                    "dense_gemv on an NVFP4 tensor — the routed-expert path owns those"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn dense_gemv(
         &mut self,
         weights: &Qwen4Weights<'_, '_>,
@@ -1548,53 +1607,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         );
         self.write_f32(s.dense_x, x)?;
         for (t, &off) in mats.iter().zip(&offs) {
-            let (wb, wo, wl) = weights.binding(t)?;
-            let src = Bind::A(s.dense_x, (t.ncols * 4) as u64);
-            let dst = Bind::A(s.dense_y + (off * 4) as u64, (t.nrows * 4) as u64);
-            let ncols = u32::try_from(t.ncols)?;
-            let nrows = u32::try_from(t.nrows)?;
-            match t.format {
-                Qwen4DeviceFormat::F16 => {
-                    // `mul_mat_vec.comp` never reads `p.stride_a` — the row
-                    // stride IS `p.ncols` — so only an exactly-packed
-                    // row-major weight can be expressed through this push
-                    // block. `ncols % 4` is the shader's one shape rule.
-                    ensure!(
-                        ncols.is_multiple_of(4),
-                        "dense_gemv: F16 ncols {ncols} is not a multiple of 4"
-                    );
-                    let spec = GemvDenseSpec::DEFAULT;
-                    let d = gemv_dense_dispatch(nrows, &spec);
-                    self.rec(
-                        Kernel::GemvF16,
-                        spec.specialization_u32(),
-                        &gemv_params_f32_b(ncols, nrows).to_le_bytes(),
-                        &[
-                            Bind::Ext(wb, wo, wl),
-                            src,
-                            dst,
-                            Bind::A(s.dummy, 8),
-                            Bind::A(s.dummy, 8),
-                        ],
-                        [d.x, d.y, d.z],
-                    )?;
-                }
-                Qwen4DeviceFormat::F32 => {
-                    let d = qwen36_router_gemv_dispatch(nrows);
-                    self.rec(
-                        Kernel::Qwen36RouterGemv,
-                        Kernel::Qwen36RouterGemv.specialization_u32(),
-                        &qwen36_router_gemv_params(nrows, ncols, false).to_le_bytes(),
-                        &[src, Bind::Ext(wb, wo, wl), dst],
-                        [d.x, d.y, d.z],
-                    )?;
-                }
-                Qwen4DeviceFormat::Nvfp4 => {
-                    return Err(anyhow!(
-                        "dense_gemv on an NVFP4 tensor — the routed-expert path owns those"
-                    ));
-                }
-            }
+            self.record_dense_at(weights, t, s.dense_x, s.dense_y + (off * 4) as u64)?;
         }
         self.flush()?;
         mats.iter()
@@ -2552,173 +2565,244 @@ fn unpermute_qkv_vec(cfg: &Qwen4ExpConfig, dev: &[f32]) -> Vec<f32> {
     out
 }
 
-/// The permuted F32 device weights of ONE linear-attention layer.
+// ─────────────────────────────────────────────────────────────────────────────
+// Resident linear attention: device-canonical state, tier-resident weights.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The linear-attention token on device WITHOUT [`DevLinearAttn`]'s two costs:
+/// no 7.8 GiB of re-uploaded permuted weights (projections come from the
+/// resident dense tier via the same record path as [`Qwen4Dev::dense_gemv`]),
+/// and no 6.2 MB of per-layer state round-trips (the GDN state and conv ring
+/// live HERE, on device, in the kernel's GGUF layout, and never cross the bus
+/// during decode). The HF<->GGUF head map moves to the ACTIVATIONS —
+/// ~24 KB/layer through [`Kernel::Qwen4BlockPerm`] — which is what makes the
+/// weight-permuting route unnecessary.
 ///
-/// `qwen35_gated_delta_net.comp` tiles key heads over value heads
-/// (`k_head = v_head % nk`); these uploads permute the VALUE-head axis so the
-/// tiled map computes HF's `repeat_interleave` — see the module docs and
-/// [`v_slot_perm`]. Built from the host bf16 weights, so it costs
-/// ~230 MB of F32 per enabled layer; enable it for bring-up subsets, not for
-/// all 36 linear layers at once.
-pub struct DevLinearAttn<'ctx> {
-    qkv_w: DeviceBuffer<'ctx>,
-    z_w: DeviceBuffer<'ctx>,
-    a_w: DeviceBuffer<'ctx>,
-    b_w: DeviceBuffer<'ctx>,
-    conv_w: DeviceBuffer<'ctx>,
-    /// `-exp(A_log)` per SLOT — the kernel expects the GGUF pre-applied form.
-    alog: DeviceBuffer<'ctx>,
-    dt_bias: DeviceBuffer<'ctx>,
-    norm_w: DeviceBuffer<'ctx>,
-    out_w: DeviceBuffer<'ctx>,
+/// While this path is active the `Qwen4ExpState::{gdr, conv}` host maps are
+/// STALE — the device copy is canonical. [`Self::read_state`] exists for the
+/// parity harness, not for the decode loop.
+pub struct DevResidentLinAttn<'ctx> {
+    /// dst-block -> src-block maps, u32: qkv (80 at [`Self::MAP_QKV`]) |
+    /// HF->GGUF value heads (48 at [`Self::MAP_V`]) | its inverse (48 at
+    /// [`Self::MAP_V_INV`]).
+    maps: DeviceBuffer<'ctx>,
+    /// Per linear layer, stride [`Self::aux_stride`]: conv taps in GGUF
+    /// channel order, then `-exp(A_log)` and `dt_bias` slot-permuted (the
+    /// GGUF pre-applied forms the kernels expect).
+    aux: DeviceBuffer<'ctx>,
+    /// Per linear layer, stride [`Self::state_stride`]: GDN S `[nv][kd][vd]`
+    /// then conv ring `[channel][kernel-1]`, both GGUF layout.
+    state: DeviceBuffer<'ctx>,
+    /// Linear layer id -> dense index into `aux` / `state`.
+    index: BTreeMap<usize, usize>,
 }
 
-impl<'ctx> DevLinearAttn<'ctx> {
-    /// Build the permuted uploads from the host weights.
-    pub fn new(
+impl<'ctx> DevResidentLinAttn<'ctx> {
+    const MAP_QKV: u64 = 0;
+    const MAP_V: u64 = 128 * 4;
+    const MAP_V_INV: u64 = 192 * 4;
+
+    fn aux_stride(cfg: &Qwen4ExpConfig) -> usize {
+        // conv | alog | dtb, each region 64-f32 aligned so every binding
+        // offset stays 256-B aligned regardless of the driver's minimum.
+        let conv = cfg.linear_conv_dim() * cfg.linear_conv_kernel_dim;
+        conv.next_multiple_of(64) + 64 + 64
+    }
+
+    fn state_stride(cfg: &Qwen4ExpConfig) -> usize {
+        let nv = cfg.linear_num_value_heads;
+        let (kd, vd) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        nv * kd * vd + cfg.linear_conv_dim() * (cfg.linear_conv_kernel_dim - 1)
+    }
+
+    /// Whether `layer` has resident state and aux here.
+    pub fn covers(&self, layer: usize) -> bool {
+        self.index.contains_key(&layer)
+    }
+
+    pub fn new<'a, 'st: 'a>(
         ctx: &'ctx VulkanContext,
         cfg: &Qwen4ExpConfig,
-        w: &HostLinearAttn<'_>,
+        layers: impl IntoIterator<Item = (usize, &'a HostLayer<'st>)>,
     ) -> Result<Self> {
-        let h = cfg.hidden_size;
-        let kd = cfg.linear_key_head_dim;
-        let vd = cfg.linear_value_head_dim;
         let nk = cfg.linear_num_key_heads;
         let nv = cfg.linear_num_value_heads;
         let kernel = cfg.linear_conv_kernel_dim;
-        let conv_dim = 2 * nk * kd + nv * vd;
-        let qk = 2 * nk * kd;
+        let conv_dim = cfg.linear_conv_dim();
 
-        // in_proj_qkv rows: q/k verbatim, V head blocks permuted.
-        let src = w.qkv.to_f32();
-        let mut qkv = vec![0.0f32; src.len()];
-        qkv[..qk * h].copy_from_slice(&src[..qk * h]);
-        for slot in 0..nv {
-            let orig = v_slot_perm(nk, nv, slot);
-            qkv[(qk + slot * vd) * h..(qk + (slot + 1) * vd) * h]
-                .copy_from_slice(&src[(qk + orig * vd) * h..(qk + (orig + 1) * vd) * h]);
+        // Maps. qkv blocks: q/k identity, v offset by the head permutation.
+        let qk_blocks = 2 * nk * cfg.linear_key_head_dim / cfg.linear_value_head_dim;
+        let mut maps = vec![0u32; 240];
+        for (b, m) in maps.iter_mut().enumerate().take(qk_blocks + nv) {
+            *m = if b < qk_blocks {
+                b as u32
+            } else {
+                (qk_blocks + v_slot_perm(nk, nv, b - qk_blocks)) as u32
+            };
         }
-        // in_proj_z rows: value-head blocks permuted.
-        let src = w.z.to_f32();
-        let mut z = vec![0.0f32; src.len()];
         for slot in 0..nv {
-            let orig = v_slot_perm(nk, nv, slot);
-            z[slot * vd * h..(slot + 1) * vd * h]
-                .copy_from_slice(&src[orig * vd * h..(orig + 1) * vd * h]);
+            maps[128 + slot] = v_slot_perm(nk, nv, slot) as u32;
+            maps[192 + v_slot_perm(nk, nv, slot)] = slot as u32;
         }
-        // a/b rows, A_log (as -exp), dt_bias: one row / element per value head.
-        let permute_rows = |src: &[f32], row: usize| -> Vec<f32> {
-            let mut out = vec![0.0f32; src.len()];
+        let map_bytes: Vec<u8> = maps.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut maps_buf = DeviceBuffer::alloc_uma(ctx, map_bytes.len())
+            .map_err(|e| anyhow!("resident maps alloc: {e}"))?;
+        maps_buf
+            .copy_from_host(&map_bytes)
+            .map_err(|e| anyhow!("resident maps upload: {e}"))?;
+
+        // Per-layer aux: conv taps to GGUF channel order, alog/dtb per slot.
+        let stride = Self::aux_stride(cfg);
+        let mut index = BTreeMap::new();
+        let mut aux = Vec::new();
+        for (layer, hl) in layers {
+            let Some(w) = hl.linear.as_ref() else {
+                continue;
+            };
+            let dense = index.len();
+            index.insert(layer, dense);
+            let base = dense * stride;
+            aux.resize(base + stride, 0.0f32);
+            for c in 0..conv_dim {
+                let hf = qkv_channel_to_hf(cfg, c);
+                aux[base + c * kernel..base + (c + 1) * kernel]
+                    .copy_from_slice(&w.conv[hf * kernel..(hf + 1) * kernel]);
+            }
+            let alog_at = base + (conv_dim * kernel).next_multiple_of(64);
             for slot in 0..nv {
                 let orig = v_slot_perm(nk, nv, slot);
-                out[slot * row..(slot + 1) * row]
-                    .copy_from_slice(&src[orig * row..(orig + 1) * row]);
-            }
-            out
-        };
-        let a = permute_rows(&w.a.to_f32(), h);
-        let b = permute_rows(&w.b.to_f32(), h);
-        let alog: Vec<f32> = (0..nv)
-            .map(|slot| -w.a_log[v_slot_perm(nk, nv, slot)].exp())
-            .collect();
-        let dtb: Vec<f32> = (0..nv)
-            .map(|slot| w.dt_bias[v_slot_perm(nk, nv, slot)])
-            .collect();
-        // conv rows (channel-major taps): V channels permuted.
-        let mut conv = vec![0.0f32; w.conv.len()];
-        for c in 0..conv_dim {
-            let hf = qkv_channel_to_hf(cfg, c);
-            conv[c * kernel..(c + 1) * kernel]
-                .copy_from_slice(&w.conv[hf * kernel..(hf + 1) * kernel]);
-        }
-        // out_proj columns: value-head column blocks permuted.
-        let src = w.out.to_f32();
-        let mut out = vec![0.0f32; src.len()];
-        for row in 0..h {
-            for slot in 0..nv {
-                let orig = v_slot_perm(nk, nv, slot);
-                out[row * nv * vd + slot * vd..row * nv * vd + (slot + 1) * vd].copy_from_slice(
-                    &src[row * nv * vd + orig * vd..row * nv * vd + (orig + 1) * vd],
-                );
+                aux[alog_at + slot] = -w.a_log[orig].exp();
+                aux[alog_at + 64 + slot] = w.dt_bias[orig];
             }
         }
+        ensure!(
+            !index.is_empty(),
+            "resident linear attention with no layers"
+        );
+        let aux_buf = upload_f32(ctx, &aux)?;
+
+        // Device-canonical state, zeroed = sequence start.
+        let state_bytes = index.len() * Self::state_stride(cfg) * 4;
+        let mut state = DeviceBuffer::alloc_uma(ctx, state_bytes)
+            .map_err(|e| anyhow!("resident state alloc ({state_bytes} B): {e}"))?;
+        state
+            .copy_from_host(&vec![0u8; state_bytes])
+            .map_err(|e| anyhow!("resident state zero: {e}"))?;
+
         Ok(Self {
-            qkv_w: upload_f32(ctx, &qkv)?,
-            z_w: upload_f32(ctx, &z)?,
-            a_w: upload_f32(ctx, &a)?,
-            b_w: upload_f32(ctx, &b)?,
-            conv_w: upload_f32(ctx, &conv)?,
-            alog: upload_f32(ctx, &alog)?,
-            dt_bias: upload_f32(ctx, &dtb)?,
-            norm_w: upload_f32(ctx, &w.norm)?,
-            out_w: upload_f32(ctx, &out)?,
+            maps: maps_buf,
+            aux: aux_buf,
+            state,
+            index,
         })
     }
 
-    /// One token on device, advancing the HOST-canonical state in place (it is
-    /// uploaded permuted, advanced by the kernels, read back, un-permuted).
+    /// Sequence start: zero every layer's S and ring.
+    pub fn reset(&mut self) -> Result<()> {
+        let zero = vec![0u8; self.state.len()];
+        self.state
+            .copy_from_host(&zero)
+            .map_err(|e| anyhow!("resident state reset: {e}"))
+    }
+
+    fn record_perm(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        src: u64,
+        map_off: u64,
+        dst: u64,
+        block: u32,
+        nblocks: u32,
+    ) -> Result<()> {
+        let push = qwen4_block_perm_params(block, nblocks).to_le_bytes();
+        let d = qwen4_block_perm_dispatch(nblocks);
+        dev.rec(
+            Kernel::Qwen4BlockPerm,
+            Kernel::Qwen4BlockPerm.specialization_u32(),
+            &push,
+            &[
+                Bind::A(src, u64::from(block) * u64::from(nblocks) * 4),
+                Bind::Ext(&self.maps, map_off, u64::from(nblocks) * 4),
+                Bind::A(dst, u64::from(block) * u64::from(nblocks) * 4),
+            ],
+            [d.x, d.y, d.z],
+        )
+    }
+
+    /// One token: record the whole linear-attention block and flush ONCE.
+    /// Returns `y` `[hidden]`.
     pub fn forward(
         &self,
         dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
         cfg: &Qwen4ExpConfig,
+        layer: usize,
         x: &[f32],
-        gdr_state: &mut [f32],
-        conv_ring: &mut [f32],
-    ) -> Result<(Vec<f32>, DevLinearTaps)> {
+    ) -> Result<Vec<f32>> {
+        let _s = prof::stage("dev.linear_attn");
         let h = cfg.hidden_size;
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
         let nk = cfg.linear_num_key_heads;
         let nv = cfg.linear_num_value_heads;
         let kernel = cfg.linear_conv_kernel_dim;
-        let conv_dim = 2 * nk * kd + nv * vd;
+        let conv_dim = cfg.linear_conv_dim();
         let state_w = kernel - 1;
-        ensure!(gdr_state.len() == nv * kd * vd, "gdr state length");
-        let _s = prof::stage("dev.linear_attn");
-        ensure!(conv_ring.len() == conv_dim * state_w, "conv ring length");
+        let dense = *self
+            .index
+            .get(&layer)
+            .ok_or_else(|| anyhow!("layer {layer} not resident"))?;
+        let aux_base = (dense * Self::aux_stride(cfg) * 4) as u64;
+        let conv_w_len = (conv_dim * kernel * 4) as u64;
+        let alog_at = aux_base + ((conv_dim * kernel).next_multiple_of(64) * 4) as u64;
+        let state_base = (dense * Self::state_stride(cfg) * 4) as u64;
+        let ring_at = state_base + (nv * kd * vd * 4) as u64;
         let s = dev.slots;
 
-        // Host state → device layout: S blocks by slot, ring channel-major.
-        let mut dev_state = vec![0.0f32; gdr_state.len()];
-        for slot in 0..nv {
-            let orig = v_slot_perm(nk, nv, slot);
-            dev_state[slot * kd * vd..(slot + 1) * kd * vd]
-                .copy_from_slice(&gdr_state[orig * kd * vd..(orig + 1) * kd * vd]);
-        }
-        let mut dev_ring = vec![0.0f32; conv_ring.len()];
-        for c in 0..conv_dim {
-            let hf = qkv_channel_to_hf(cfg, c);
-            for t in 0..state_w {
-                dev_ring[c * state_w + t] = conv_ring[t * conv_dim + hf];
-            }
-        }
+        // In-projections from the resident tier, into a scratch region of
+        // `dense_y` laid out qkv | z | a | b at 64-f32 boundaries.
+        let t_qkv = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_qkv.weight"))?;
+        let t_z = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_z.weight"))?;
+        let t_a = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_a.weight"))?;
+        let t_b = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_b.weight"))?;
+        let t_out = *weights.tensor(&layer_tensor_name(layer, "linear_attn.out_proj.weight"))?;
+        let t_norm = *weights.tensor(&layer_tensor_name(layer, "linear_attn.norm.weight"))?;
+        ensure!(
+            t_norm.format == Qwen4DeviceFormat::F32,
+            "linear_attn.norm must be F32-resident (RAW, per folds_norm_bias)"
+        );
+        ensure!(
+            t_norm.nrows * t_norm.ncols == vd,
+            "linear_attn.norm length {} != vd {vd}",
+            t_norm.nrows * t_norm.ncols
+        );
+        let norm_bind = weights.binding(&t_norm)?;
         dev.write_f32(s.x, x)?;
-        dev.write_f32(s.gdr_state, &dev_state)?;
-        dev.write_f32(s.conv_ring, &dev_ring)?;
-
-        // Four F32 GEMVs off the one staged activation.
-        for (buf, n_out, dst) in [
-            (&self.qkv_w, conv_dim, s.qkv),
-            (&self.z_w, nv * vd, s.zbuf),
-            (&self.a_w, nv, s.abuf),
-            (&self.b_w, nv, s.bbuf),
-        ] {
-            let push = qwen36_router_gemv_params(n_out as u32, h as u32, false).to_le_bytes();
-            let d = qwen36_router_gemv_dispatch(n_out as u32);
-            dev.rec(
-                Kernel::Qwen36RouterGemv,
-                Kernel::Qwen36RouterGemv.specialization_u32(),
-                &push,
-                &[
-                    Bind::A(s.x, (h * 4) as u64),
-                    Bind::Ext(buf, 0, buf.len() as u64),
-                    Bind::A(dst, (n_out * 4) as u64),
-                ],
-                [d.x, d.y, d.z],
-            )?;
+        let at_qkv = s.dense_y;
+        let at_z = at_qkv + (conv_dim.next_multiple_of(64) * 4) as u64;
+        let at_a = at_z + ((nv * vd).next_multiple_of(64) * 4) as u64;
+        let at_b = at_a + 64 * 4;
+        for (t, dst) in [(&t_qkv, at_qkv), (&t_z, at_z), (&t_a, at_a), (&t_b, at_b)] {
+            dev.record_dense_at(weights, t, s.x, dst)?;
         }
         dev.barrier();
-        // Depthwise conv + SiLU, advancing the ring.
+
+        // HF -> GGUF: qkv/z as 128-wide head blocks, a/b as single slots.
+        let vblk = vd as u32;
+        self.record_perm(
+            dev,
+            at_qkv,
+            Self::MAP_QKV,
+            s.qkv,
+            vblk,
+            (conv_dim / vd) as u32,
+        )?;
+        self.record_perm(dev, at_z, Self::MAP_V, s.zbuf, vblk, nv as u32)?;
+        self.record_perm(dev, at_a, Self::MAP_V, s.abuf, 1, nv as u32)?;
+        self.record_perm(dev, at_b, Self::MAP_V, s.bbuf, 1, nv as u32)?;
+        dev.barrier();
+
+        // Conv + recurrence + gated norm, state advancing in place on device.
         let push = qwen35_ssm_conv_params(conv_dim as u32, 1, kernel as u32).to_le_bytes();
         let d = qwen35_ssm_conv_dispatch(conv_dim as u32);
         dev.rec(
@@ -2727,14 +2811,13 @@ impl<'ctx> DevLinearAttn<'ctx> {
             &push,
             &[
                 Bind::A(s.qkv, (conv_dim * 4) as u64),
-                Bind::Ext(&self.conv_w, 0, self.conv_w.len() as u64),
-                Bind::A(s.conv_ring, (conv_dim * state_w * 4) as u64),
+                Bind::Ext(&self.aux, aux_base, conv_w_len),
+                Bind::Ext(&self.state, ring_at, (conv_dim * state_w * 4) as u64),
                 Bind::A(s.convo, (conv_dim * 4) as u64),
             ],
             [d.x, d.y, d.z],
         )?;
         dev.barrier();
-        // Recurrent gated-delta update.
         let push = qwen35_gated_delta_net_params(nk as u32, nv as u32, kd as u32, vd as u32, 1)
             .to_le_bytes();
         let d = qwen35_gated_delta_net_dispatch(nv as u32);
@@ -2746,15 +2829,14 @@ impl<'ctx> DevLinearAttn<'ctx> {
                 Bind::A(s.convo, (conv_dim * 4) as u64),
                 Bind::A(s.bbuf, (nv * 4) as u64),
                 Bind::A(s.abuf, (nv * 4) as u64),
-                Bind::Ext(&self.dt_bias, 0, self.dt_bias.len() as u64),
-                Bind::Ext(&self.alog, 0, self.alog.len() as u64),
-                Bind::A(s.gdr_state, (nv * kd * vd * 4) as u64),
+                Bind::Ext(&self.aux, alog_at + 64 * 4, (nv * 4) as u64),
+                Bind::Ext(&self.aux, alog_at, (nv * 4) as u64),
+                Bind::Ext(&self.state, state_base, (nv * kd * vd * 4) as u64),
                 Bind::A(s.gdro, (nv * vd * 4) as u64),
             ],
             [d.x, d.y, d.z],
         )?;
         dev.barrier();
-        // Gated norm: per-head RMSNorm (PLAIN ones-init weight) × gate(z).
         let push =
             rms_norm_params_rows(vd as u32, nv as u32, vd as u32, cfg.rms_norm_eps).to_le_bytes();
         let d = rms_norm_dispatch_rows(nv as u32);
@@ -2764,86 +2846,131 @@ impl<'ctx> DevLinearAttn<'ctx> {
             &push,
             &[
                 Bind::A(s.gdro, (nv * vd * 4) as u64),
-                Bind::Ext(&self.norm_w, 0, self.norm_w.len() as u64),
+                Bind::Ext(norm_bind.0, norm_bind.1, norm_bind.2),
                 Bind::A(s.attn, (nv * vd * 4) as u64),
             ],
             [d.x, d.y, d.z],
         )?;
         dev.barrier();
         let n_gate = (nv * vd) as u32;
-        match cfg.output_gate {
-            GateActivation::Sigmoid => {
-                let push = sigmoid_mul_params(n_gate).to_le_bytes();
-                let d = sigmoid_mul_dispatch(n_gate);
-                dev.rec(
-                    Kernel::SigmoidMul,
-                    Kernel::SigmoidMul.specialization_u32(),
-                    &push,
-                    &[
-                        Bind::A(s.zbuf, u64::from(n_gate) * 4),
-                        Bind::A(s.attn, u64::from(n_gate) * 4),
-                        Bind::A(s.attn, u64::from(n_gate) * 4),
-                    ],
-                    [d.x, d.y, d.z],
-                )?;
-            }
-            GateActivation::Silu => {
-                let push = swiglu_params(n_gate).to_le_bytes();
-                let d = swiglu_dispatch(n_gate);
-                dev.rec(
-                    Kernel::SwiGlu,
-                    Kernel::SwiGlu.specialization_u32(),
-                    &push,
-                    &[
-                        Bind::A(s.zbuf, u64::from(n_gate) * 4),
-                        Bind::A(s.attn, u64::from(n_gate) * 4),
-                        Bind::A(s.attn, u64::from(n_gate) * 4),
-                    ],
-                    [d.x, d.y, d.z],
-                )?;
-            }
-        }
-        dev.barrier();
-        // out-proj.
-        let push = qwen36_router_gemv_params(h as u32, (nv * vd) as u32, false).to_le_bytes();
-        let d = qwen36_router_gemv_dispatch(h as u32);
+        let (kern, push) = match cfg.output_gate {
+            GateActivation::Sigmoid => (Kernel::SigmoidMul, sigmoid_mul_params(n_gate)),
+            GateActivation::Silu => (Kernel::SwiGlu, swiglu_params(n_gate)),
+        };
+        let d = sigmoid_mul_dispatch(n_gate);
         dev.rec(
-            Kernel::Qwen36RouterGemv,
-            Kernel::Qwen36RouterGemv.specialization_u32(),
-            &push,
+            kern,
+            kern.specialization_u32(),
+            &push.to_le_bytes(),
             &[
-                Bind::A(s.attn, (nv * vd * 4) as u64),
-                Bind::Ext(&self.out_w, 0, self.out_w.len() as u64),
-                Bind::A(s.y, (h * 4) as u64),
+                Bind::A(s.zbuf, u64::from(n_gate) * 4),
+                Bind::A(s.attn, u64::from(n_gate) * 4),
+                Bind::A(s.attn, u64::from(n_gate) * 4),
             ],
             [d.x, d.y, d.z],
         )?;
+        dev.barrier();
+        // GGUF -> HF, then out-proj from the resident tier.
+        self.record_perm(dev, s.attn, Self::MAP_V_INV, s.dense_x, vblk, nv as u32)?;
+        dev.barrier();
+        dev.record_dense_at(weights, &t_out, s.dense_x, s.y)?;
         dev.flush()?;
+        dev.read_f32(s.y, h)
+    }
 
-        // State back to HF order.
-        let dev_state = dev.read_f32(s.gdr_state, nv * kd * vd)?;
+    /// Harness taps: read + unpermute the slot outputs of the LAST
+    /// [`Self::forward`]. Only valid immediately after it.
+    pub fn read_taps(&self, dev: &Qwen4Dev<'ctx>, cfg: &Qwen4ExpConfig) -> Result<DevLinearTaps> {
+        let nv = cfg.linear_num_value_heads;
+        let vd = cfg.linear_value_head_dim;
+        let conv_dim = cfg.linear_conv_dim();
+        Ok(DevLinearTaps {
+            qkv_raw: unpermute_qkv_vec(cfg, &dev.read_f32(dev.slots.qkv, conv_dim)?),
+            qkv_conv: unpermute_qkv_vec(cfg, &dev.read_f32(dev.slots.convo, conv_dim)?),
+            z: unpermute_v_vec(cfg, &dev.read_f32(dev.slots.zbuf, nv * vd)?),
+            core: unpermute_v_vec(cfg, &dev.read_f32(dev.slots.gdro, nv * vd)?),
+            gated: unpermute_v_vec(cfg, &dev.read_f32(dev.slots.attn, nv * vd)?),
+        })
+    }
+
+    /// Harness seeding: overwrite a layer's device state from HF-order host
+    /// state. This is what keeps the parity harness a SINGLE-TOKEN error
+    /// isolator: without it the device and host trajectories drift apart
+    /// legitimately (the bf16 conv quantizer flips near-zero boundary
+    /// channels differently on each side, and the state compounds it), and
+    /// the per-element table stops being comparable across runs.
+    pub fn seed_state(
+        &mut self,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        gdr_hf: &[f32],
+        ring_hf: &[f32],
+    ) -> Result<()> {
+        let nk = cfg.linear_num_key_heads;
+        let nv = cfg.linear_num_value_heads;
+        let (kd, vd) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        let conv_dim = cfg.linear_conv_dim();
+        let state_w = cfg.linear_conv_kernel_dim - 1;
+        ensure!(gdr_hf.len() == nv * kd * vd, "seed gdr length");
+        ensure!(ring_hf.len() == conv_dim * state_w, "seed ring length");
+        let dense = *self
+            .index
+            .get(&layer)
+            .ok_or_else(|| anyhow!("layer {layer} not resident"))?;
+        let mut vals = vec![0.0f32; Self::state_stride(cfg)];
+        let (dev_s, dev_ring) = vals.split_at_mut(nv * kd * vd);
         for slot in 0..nv {
             let orig = v_slot_perm(nk, nv, slot);
-            gdr_state[orig * kd * vd..(orig + 1) * kd * vd]
-                .copy_from_slice(&dev_state[slot * kd * vd..(slot + 1) * kd * vd]);
+            dev_s[slot * kd * vd..(slot + 1) * kd * vd]
+                .copy_from_slice(&gdr_hf[orig * kd * vd..(orig + 1) * kd * vd]);
         }
-        let dev_ring = dev.read_f32(s.conv_ring, conv_dim * state_w)?;
         for c in 0..conv_dim {
             let hf = qkv_channel_to_hf(cfg, c);
             for t in 0..state_w {
-                conv_ring[t * conv_dim + hf] = dev_ring[c * state_w + t];
+                dev_ring[c * state_w + t] = ring_hf[t * conv_dim + hf];
             }
         }
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.state
+            .copy_from_host_at((dense * Self::state_stride(cfg) * 4) as u64, &bytes)
+            .map_err(|e| anyhow!("resident state seed: {e}"))
+    }
 
-        let y = dev.read_f32(s.y, h)?;
-        let taps = DevLinearTaps {
-            qkv_raw: unpermute_qkv_vec(cfg, &dev.read_f32(s.qkv, conv_dim)?),
-            qkv_conv: unpermute_qkv_vec(cfg, &dev.read_f32(s.convo, conv_dim)?),
-            z: unpermute_v_vec(cfg, &dev.read_f32(s.zbuf, nv * vd)?),
-            core: unpermute_v_vec(cfg, &dev.read_f32(s.gdro, nv * vd)?),
-            gated: unpermute_v_vec(cfg, &dev.read_f32(s.attn, nv * vd)?),
-        };
-        Ok((y, taps))
+    /// Harness state view: download a layer's S and ring, back to HF order.
+    pub fn read_state(&self, cfg: &Qwen4ExpConfig, layer: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let nk = cfg.linear_num_key_heads;
+        let nv = cfg.linear_num_value_heads;
+        let (kd, vd) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        let conv_dim = cfg.linear_conv_dim();
+        let state_w = cfg.linear_conv_kernel_dim - 1;
+        let dense = *self
+            .index
+            .get(&layer)
+            .ok_or_else(|| anyhow!("layer {layer} not resident"))?;
+        let base = dense * Self::state_stride(cfg) * 4;
+        let mut bytes = vec![0u8; Self::state_stride(cfg) * 4];
+        self.state
+            .copy_to_host_at(base as u64, &mut bytes)
+            .map_err(|e| anyhow!("resident state read: {e}"))?;
+        let vals: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let (dev_s, dev_ring) = vals.split_at(nv * kd * vd);
+        let mut gdr = vec![0.0f32; nv * kd * vd];
+        for slot in 0..nv {
+            let orig = v_slot_perm(nk, nv, slot);
+            gdr[orig * kd * vd..(orig + 1) * kd * vd]
+                .copy_from_slice(&dev_s[slot * kd * vd..(slot + 1) * kd * vd]);
+        }
+        let mut ring = vec![0.0f32; conv_dim * state_w];
+        for c in 0..conv_dim {
+            let hf = qkv_channel_to_hf(cfg, c);
+            for t in 0..state_w {
+                ring[t * conv_dim + hf] = dev_ring[c * state_w + t];
+            }
+        }
+        Ok((gdr, ring))
     }
 }
 
@@ -2919,7 +3046,9 @@ pub struct VulkanQwen4ExpModel<'ctx, 'st> {
     lm_head: HostDense<'st>,
     weights: Option<Qwen4Weights<'ctx, 'st>>,
     dev: Option<Qwen4Dev<'ctx>>,
-    dev_linear: BTreeMap<usize, DevLinearAttn<'ctx>>,
+    /// Device-resident linear attention (state on device, tier weights).
+    /// `None` in host-only mode.
+    resident_linear: Option<DevResidentLinAttn<'ctx>>,
     state: Qwen4ExpState,
     /// EOS + the generation-config extras — what the executor reports.
     pub stop_token_ids: Vec<u32>,
@@ -2966,8 +3095,8 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
         let mixer = load_hc(st, "model.language_model.hyper_connection_mixer", &hc, true)?;
         let lm_head = HostDense::load(st, "lm_head.weight", cfg.hidden_size, cfg.vocab_size)?;
 
-        let (weights, dev, dev_linear) = match (ctx, mode) {
-            (None, _) | (_, Qwen4ExpDeviceMode::HostOnly) => (None, None, BTreeMap::new()),
+        let (weights, dev, resident_linear) = match (ctx, mode) {
+            (None, _) | (_, Qwen4ExpDeviceMode::HostOnly) => (None, None, None),
             (Some(ctx), Qwen4ExpDeviceMode::HybridExperts) => {
                 // Everything, dense tier included. `upload_qwen4` owns the
                 // budget guard AND the host-heap spill that makes the full
@@ -2977,7 +3106,9 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let plan = plan_qwen4_upload(st, &ucfg, &Qwen4UploadScope::full())?;
                 let weights = upload_qwen4(ctx, st, &plan, &ucfg)?;
                 let dev = Qwen4Dev::new(ctx, &cfg, &[], cfg.max_context)?;
-                (Some(weights), Some(dev), BTreeMap::new())
+                let resident =
+                    DevResidentLinAttn::new(ctx, &cfg, layers.iter().map(|(l, hl)| (*l, hl)))?;
+                (Some(weights), Some(dev), Some(resident))
             }
             (Some(ctx), Qwen4ExpDeviceMode::SubsetF32(subset)) => {
                 let scope = Qwen4UploadScope {
@@ -2996,14 +3127,24 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                     .filter(|&l| cfg.layer_types[l] == Qwen4LayerType::FullAttention)
                     .collect();
                 let dev = Qwen4Dev::new(ctx, &cfg, &full_dev, cfg.max_context)?;
-                let mut dev_linear = BTreeMap::new();
-                for &l in subset {
-                    if cfg.layer_types[l] == Qwen4LayerType::LinearAttention {
-                        let host = layers[&l].linear.as_ref().expect("linear layer weights");
-                        dev_linear.insert(l, DevLinearAttn::new(ctx, &cfg, host)?);
-                    }
-                }
-                (Some(weights), Some(dev), dev_linear)
+                // Resident linear attention over whichever subset layers are
+                // linear; none is fine (a full-attention-only subset).
+                let any_linear = subset
+                    .iter()
+                    .any(|&l| cfg.layer_types[l] == Qwen4LayerType::LinearAttention);
+                let resident = if any_linear {
+                    Some(DevResidentLinAttn::new(
+                        ctx,
+                        &cfg,
+                        subset
+                            .iter()
+                            .filter_map(|l| layers.get_key_value(l))
+                            .map(|(l, hl)| (*l, hl)),
+                    )?)
+                } else {
+                    None
+                };
+                (Some(weights), Some(dev), resident)
             }
         };
 
@@ -3020,7 +3161,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             lm_head,
             weights,
             dev,
-            dev_linear,
+            resident_linear,
             state,
             stop_token_ids,
         })
@@ -3076,6 +3217,9 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
         );
         if start_pos == 0 && self.state.seq_len != 0 {
             self.state = Qwen4ExpState::new(&self.cfg, &self.hash);
+            if let Some(rl) = self.resident_linear.as_mut() {
+                rl.reset()?;
+            }
         }
         ensure!(
             start_pos == self.state.seq_len,
@@ -3108,7 +3252,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             layers,
             weights,
             dev,
-            dev_linear,
+            resident_linear,
             state,
             ..
         } = self;
@@ -3160,10 +3304,13 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                         .conv
                         .get_mut(&layer)
                         .ok_or_else(|| anyhow!("no conv ring"))?;
-                    if dev.is_some() && dev_linear.contains_key(&layer) {
-                        let d = dev.as_mut().expect("dev present");
-                        let la = &dev_linear[&layer];
-                        la.forward(d, cfg, &x, gdr, ring)?.0
+                    let resident = resident_linear
+                        .as_ref()
+                        .filter(|rl| rl.covers(layer))
+                        .zip(dev.as_mut())
+                        .zip(weights.as_ref());
+                    if let Some(((rl, d), w)) = resident {
+                        rl.forward(d, w, cfg, layer, &x)?
                     } else {
                         let _s = prof::stage("host.linear_attn");
                         let w = hl.linear.as_ref().expect("linear weights");

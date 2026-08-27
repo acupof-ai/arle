@@ -1,0 +1,33 @@
+#version 450
+// Block permutation: dst block `b` is src block `map[b]`, both `block` floats
+// wide. Exists for the HF<->GGUF head-map mismatch in qwen4_exp's linear
+// attention: the resident dense tier produces activations in HF head order,
+// while `qwen35_gated_delta_net.comp` consumes GGUF order (k = v % nk), and no
+// K-side relabeling reconciles the two — so the ~24 KB of activations get
+// permuted on device instead of 7.8 GiB of weights getting re-uploaded.
+//
+// The map is tiny (<= 80 entries), static for a model, and uploaded once.
+// One workgroup per destination block; threads stride the block.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src { float src[]; };
+layout(binding = 1) readonly buffer Map { uint map[]; };
+layout(binding = 2) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Push {
+    uint block;   // elements per block
+    uint nblocks; // number of destination blocks (= map length)
+} p;
+
+void main() {
+    const uint b = gl_WorkGroupID.x;
+    if (b >= p.nblocks) {
+        return;
+    }
+    const uint s = map[b] * p.block;
+    const uint d = b * p.block;
+    for (uint i = gl_LocalInvocationID.x; i < p.block; i += gl_WorkGroupSize.x) {
+        dst[d + i] = src[s + i];
+    }
+}
