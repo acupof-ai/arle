@@ -3242,7 +3242,16 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                         dense_format: Qwen4DeviceFormat::Q8_0,
                         ..Qwen4UploadConfig::default()
                     },
-                    Ok("bf16") | Err(_) => Qwen4UploadConfig::default(),
+                    Ok("bf16") => Qwen4UploadConfig::default(),
+                    // Default IS q4k: teacher-forced probe put it 2/32
+                    // positions behind near-lossless Q8 (84.4% vs 90.6%
+                    // step-agreement, disagreements concentrated at
+                    // razor-margin positions) at 55.5 vs 72.7 ms/token.
+                    // bf16 stays one env var away.
+                    Err(_) => Qwen4UploadConfig {
+                        dense_format: Qwen4DeviceFormat::Q4K,
+                        ..Qwen4UploadConfig::default()
+                    },
                     Ok(other) => bail!("ARLE_QWEN4_DENSE={other}: bf16 | q4k | q8"),
                 };
                 let plan = plan_qwen4_upload(st, &ucfg, &Qwen4UploadScope::full())?;
