@@ -94,13 +94,12 @@ use crate::qwen4_upload::{
 use vulkan_kernels::{
     FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams, MAT_VEC_FUSION_SCALE0,
     f16_kv_pack_dispatch, f16_kv_pack_params, flash_attn_dispatch, flash_attn_params,
-    gemv_dense_dispatch, gemv_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_params,
-    gemv_params_f32_b, q8_1_quantize_dispatch, q8_1_quantize_params, qwen4_block_perm_dispatch,
-    qwen4_block_perm_params, qwen4_hc_combine_dispatch, qwen4_hc_combine_params,
-    qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch, qwen4_ple_conv_params,
-    qwen4_ple_gate_dispatch, qwen4_ple_gate_params, qwen35_gated_delta_net_dispatch,
-    qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
-    qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
+    gemv_dense_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_params_f32_b,
+    qwen4_block_perm_dispatch, qwen4_block_perm_params, qwen4_hc_combine_dispatch,
+    qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch,
+    qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
+    qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
+    qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
     qwen36_router_topk_params, record_dispatch, repack_nvfp4_planes, rms_norm_dispatch_rows,
     rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch, rope_neox_params,
@@ -1184,9 +1183,6 @@ pub struct DevSlots {
     scale0: u64,
     /// One f32 `1.0` — the weight for `h += 1.0 * ple_out` accumulates.
     one: u64,
-    q8x_2560: u64,
-    q8x_6144: u64,
-    q8x_640: u64,
     gate: u64,
     up: u64,
     down: u64,
@@ -1265,12 +1261,6 @@ impl DevSlots {
             // lets the whole MoE tail share one submit.
             scale0: take(48),
             one: take(1),
-            // block_q8_1_x4 activation slots, one per DISTINCT dense width:
-            // ne.div_ceil(128) * 144 B. One QuantizeQ8_1 per width per
-            // activation instance feeds every Q8_0 GEMV that shares it.
-            q8x_2560: take(720),
-            q8x_6144: take(1728),
-            q8x_640: take(180),
             gate: take(6400),
             up: take(6400),
             down: take(25600),
@@ -1362,9 +1352,6 @@ pub struct Qwen4Dev<'ctx> {
     /// `layer id -> full_idx` for the KV cache, fixed at construction.
     full_idx: BTreeMap<usize, usize>,
     open: bool,
-    /// Which f32 src is quantized into each q8_1 activation slot (widths
-    /// 2560 / 6144 / 640) — see `record_q8_activation`'s contract.
-    q8_staged: [Option<u64>; 3],
 }
 
 impl<'ctx> Qwen4Dev<'ctx> {
@@ -1406,7 +1393,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
             kv,
             full_idx,
             open: false,
-            q8_staged: [None; 3],
         })
     }
 
@@ -1536,50 +1522,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
     /// file already uses. Both write f32, so a batch may mix them — which the
     /// linear-attention in-projections need, their `a`/`b` rows being F32 and
     /// their `qkv`/`z` rows F16.
-    /// The q8_1 activation slot for a dense width, plus its staging index.
-    fn q8_slot(&self, ne: u32) -> Result<(u64, usize)> {
-        match ne {
-            2560 => Ok((self.slots.q8x_2560, 0)),
-            6144 => Ok((self.slots.q8x_6144, 1)),
-            640 => Ok((self.slots.q8x_640, 2)),
-            _ => Err(anyhow!("no q8_1 activation slot for width {ne}")),
-        }
-    }
-
-    /// Record one `QuantizeQ8_1` of the f32 activation at `src` into the
-    /// width's slot, barrier, and mark it staged. Callers do this ONCE per
-    /// activation instance, AFTER the dispatch that produced `src` is
-    /// barriered, and BEFORE the Q8_0 GEMV batch that consumes it — an
-    /// explicit contract because nothing else can know when a device write
-    /// invalidated the slot's contents.
-    fn record_q8_activation(&mut self, src: u64, ne: u32) -> Result<()> {
-        let (slot, idx) = self.q8_slot(ne)?;
-        let push = q8_1_quantize_params(ne).to_le_bytes();
-        let d = q8_1_quantize_dispatch(ne);
-        self.rec(
-            Kernel::QuantizeQ8_1,
-            Kernel::QuantizeQ8_1.specialization_u32(),
-            &push,
-            &[
-                Bind::A(src, u64::from(ne) * 4),
-                Bind::A(slot, (ne.div_ceil(128) * 144) as u64),
-            ],
-            [d.x, d.y, d.z],
-        )?;
-        self.barrier();
-        self.q8_staged[idx] = Some(src);
-        Ok(())
-    }
-
-    /// [`Self::record_q8_activation`] iff any of `mats` is Q8_0-resident —
-    /// the call sites don't have to know the tier's format.
-    fn record_q8_for(&mut self, mats: &[&Qwen4DeviceTensor], src: u64, ne: u32) -> Result<()> {
-        if mats.iter().any(|t| t.format == Qwen4DeviceFormat::Q8_0) {
-            self.record_q8_activation(src, ne)?;
-        }
-        Ok(())
-    }
-
     /// Record ONE dense GEMV (`dst = W · src`, both arena offsets) without
     /// flushing — the format dispatch [`Self::dense_gemv`] and the resident
     /// linear-attention path share, so F16-vs-F32 routing cannot drift
@@ -1629,37 +1571,13 @@ impl<'ctx> Qwen4Dev<'ctx> {
                 )?;
             }
             Qwen4DeviceFormat::Q8_0 => {
-                // B is the width's block_q8_1_x4 slot, NOT the f32 activation
-                // — binding the plain f32 produces finite-looking garbage at
-                // 2.5e6 rel (measured). The caller must have staged it via
-                // record_q8_activation for THIS src; the check makes a
-                // forgotten stage loud instead of stale.
-                let (slot, idx) = self.q8_slot(ncols)?;
-                ensure!(
-                    self.q8_staged[idx] == Some(src_off),
-                    "Q8_0 GEMV of {} needs record_q8_activation(src={src_off:#x}, ne={ncols}) first",
-                    t.nrows
-                );
-                ensure!(
-                    ncols.is_multiple_of(32),
-                    "q8_0 ncols {ncols} not a multiple of 32"
-                );
-                let d = gemv_dispatch(nrows);
-                self.rec(
-                    Kernel::GemvQ8_0,
-                    Kernel::GemvQ8_0.specialization_u32(),
-                    // gemv_params: stride_b in q8_1 BLOCKS — never
-                    // gemv_params_f32_b here.
-                    &gemv_params(ncols, nrows).to_le_bytes(),
-                    &[
-                        Bind::Ext(wb, wo, wl),
-                        Bind::A(slot, (ncols.div_ceil(128) * 144) as u64),
-                        dst,
-                        Bind::A(s.dummy, 8),
-                        Bind::A(s.dummy, 8),
-                    ],
-                    [d.x, d.y, d.z],
-                )?;
+                // The W8A16 arm (generic mul_mat_vec + DATA_A_Q8_0, plain
+                // f32 B) lands with the Q4_K kernel work; the W4A8
+                // (q8_1-activation) path that briefly lived here was removed
+                // deliberately — this model's precision contract is A16.
+                return Err(anyhow!(
+                    "Q8_0 dense GEMV pends the W8A16 kernel (GemvQ8_0Dense)"
+                ));
             }
             Qwen4DeviceFormat::F32 => {
                 let d = qwen36_router_gemv_dispatch(nrows);
@@ -1708,8 +1626,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
             "dense_gemv batch wants {cursor} output elements, scratch holds {DENSE_Y_ELEMS}"
         );
         self.write_f32(s.dense_x, x)?;
-        let refs: Vec<&Qwen4DeviceTensor> = mats.iter().collect();
-        self.record_q8_for(&refs, s.dense_x, x.len() as u32)?;
         for (t, &off) in mats.iter().zip(&offs) {
             self.record_dense_at(weights, t, s.dense_x, s.dense_y + (off * 4) as u64)?;
         }
@@ -2154,7 +2070,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
             [d.x, d.y, d.z],
         )?;
         // gate / up, whatever format the tier holds.
-        self.record_q8_for(&[&tensors[1], &tensors[2]], s.x, h as u32)?;
         for (t, dst) in [(&tensors[1], s.gate), (&tensors[2], s.up)] {
             self.record_dense_at(weights, t, s.x, dst)?;
         }
@@ -2174,7 +2089,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
         )?;
         self.barrier();
         // down: [inter -> h] into the `down` slot's first row.
-        self.record_q8_for(&[&tensors[3]], s.gate, inter as u32)?;
         self.record_dense_at(weights, &tensors[3], s.gate, s.down)?;
         self.barrier();
         // acc += shgate · down (count = 1, no init).
@@ -2309,7 +2223,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
         // key/value projections from whichever format the tier holds — the
         // F32-only assert this replaced was the audit-noted blocker that kept
         // the whole PLE on the host once the dense tier went F16.
-        self.record_q8_for(&[&kp, &vp], s.ple_emb, pc.ple_embed_dim as u32)?;
         self.record_dense_at(weights, &kp, s.ple_emb, s.ple_k)?;
         self.record_dense_at(weights, &vp, s.ple_emb, s.ple_v)?;
         self.barrier();
@@ -2533,7 +2446,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
         // q/k/v projections off the one staged activation, whatever format
         // the tier holds — the F32-only gate this replaced kept all twelve
         // full-attention layers on the HOST in hybrid mode (the tier is F16).
-        self.record_q8_for(&[&q_w, &k_w, &v_w], s.x, cfg.hidden_size as u32)?;
         for (t, dst) in [(&q_w, s.qkv), (&k_w, s.kbuf), (&v_w, s.vbuf)] {
             self.record_dense_at(weights, t, s.x, dst)?;
         }
@@ -2689,7 +2601,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
         }
         self.barrier();
         // o-proj → the y slot, tier format.
-        self.record_q8_for(&[&o_w], s.attn, q_dim as u32)?;
         self.record_dense_at(weights, &o_w, s.attn, s.y)
     }
 }
@@ -2972,7 +2883,6 @@ impl<'ctx> DevResidentLinAttn<'ctx> {
         let at_z = at_qkv + (conv_dim.next_multiple_of(64) * 4) as u64;
         let at_a = at_z + ((nv * vd).next_multiple_of(64) * 4) as u64;
         let at_b = at_a + 64 * 4;
-        dev.record_q8_for(&[&t_qkv, &t_z, &t_a, &t_b], s.x, cfg.hidden_size as u32)?;
         for (t, dst) in [(&t_qkv, at_qkv), (&t_z, at_z), (&t_a, at_a), (&t_b, at_b)] {
             dev.record_dense_at(weights, t, s.x, dst)?;
         }
@@ -3064,7 +2974,6 @@ impl<'ctx> DevResidentLinAttn<'ctx> {
         // GGUF -> HF, then out-proj from the resident tier.
         self.record_perm(dev, s.attn, Self::MAP_V_INV, s.dense_x, vblk, nv as u32)?;
         dev.barrier();
-        dev.record_q8_for(&[&t_out], s.dense_x, (nv * vd) as u32)?;
         dev.record_dense_at(weights, &t_out, s.dense_x, s.y)
     }
 
@@ -3303,12 +3212,10 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 // half the bytes at a measured 6.6-7.4e-3 vector-rel per
                 // tensor). The harness's SubsetF32 arm below is unaffected.
                 let ucfg = match std::env::var("ARLE_QWEN4_DENSE").as_deref() {
-                    Ok("q8") | Ok("q8_0") => Qwen4UploadConfig {
-                        dense_format: Qwen4DeviceFormat::Q8_0,
-                        ..Qwen4UploadConfig::default()
-                    },
                     Ok("bf16") | Err(_) => Qwen4UploadConfig::default(),
-                    Ok(other) => bail!("ARLE_QWEN4_DENSE={other}: expected q8 or bf16"),
+                    Ok(other) => bail!(
+                        "ARLE_QWEN4_DENSE={other}: only bf16 today — the W4A16                          q4k/q8 arms land with the GemvQ4KDense kernel work"
+                    ),
                 };
                 let plan = plan_qwen4_upload(st, &ucfg, &Qwen4UploadScope::full())?;
                 let weights = upload_qwen4(ctx, st, &plan, &ucfg)?;
@@ -3575,7 +3482,6 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             let lm_span = prof::stage("host.lm_head");
             let lm = *w.tensor(&lm_head.name)?;
             let (x_off, y_off) = (d.slots.x, d.slots.dense_y);
-            d.record_q8_for(&[&lm], x_off, cfg.hidden_size as u32)?;
             d.record_dense_at(w, &lm, x_off, y_off)?;
             d.flush()?;
             let logits = d.read_f32(d.slots.dense_y, cfg.vocab_size)?;
