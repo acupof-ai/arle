@@ -92,18 +92,21 @@ use crate::qwen4_upload::{
 };
 
 use vulkan_kernels::{
-    FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams, MAT_VEC_FUSION_SCALE0,
-    f16_kv_pack_dispatch, f16_kv_pack_params, flash_attn_dispatch, flash_attn_params,
-    gemv_dense_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_params_f32_b,
-    qwen4_block_perm_dispatch, qwen4_block_perm_params, qwen4_hc_combine_dispatch,
-    qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch,
-    qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
-    qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
-    qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
+    CoopmatShape, FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams,
+    MAT_VEC_FUSION_SCALE0, MmSpec, f16_kv_pack_dispatch, f16_kv_pack_dispatch_rows,
+    f16_kv_pack_params, f16_kv_pack_params_rows, flash_attn_dispatch, flash_attn_dispatch_batched,
+    flash_attn_params, flash_attn_params_batched, gemv_dense_dispatch, gemv_id_dispatch,
+    gemv_id_params_fused, gemv_params_f32_b, mm_dispatch, mmq_params, qwen4_block_perm_dispatch,
+    qwen4_block_perm_params, qwen4_hc_combine_dispatch, qwen4_hc_combine_params,
+    qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch, qwen4_ple_conv_params,
+    qwen4_ple_gate_dispatch, qwen4_ple_gate_params, qwen35_gated_delta_net_dispatch,
+    qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
+    qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
     qwen36_router_topk_params, record_dispatch, repack_nvfp4_planes, rms_norm_dispatch_rows,
-    rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch, rope_neox_params,
-    sigmoid_mul_dispatch, sigmoid_mul_params, swiglu_dispatch, swiglu_params,
+    rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch, rope_neox_dispatch_batched,
+    rope_neox_params, rope_neox_params_batched, sigmoid_mul_dispatch, sigmoid_mul_params,
+    sigmoid_mul_params_strided, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{CommandRecorder, DescriptorSet, DeviceBuffer, VulkanContext};
 
@@ -1533,10 +1536,23 @@ impl<'ctx> Qwen4Dev<'ctx> {
         src_off: u64,
         dst_off: u64,
     ) -> Result<()> {
-        let s = self.slots;
-        let (wb, wo, wl) = weights.binding(t)?;
         let src = Bind::A(src_off, (t.ncols * 4) as u64);
         let dst = Bind::A(dst_off, (t.nrows * 4) as u64);
+        self.record_dense_binds(weights, t, src, dst)
+    }
+
+    /// [`Self::record_dense_at`] with the activation/output bindings supplied
+    /// by the caller — the chunked prefill's rows live in ITS arena, not this
+    /// one, and the F16-vs-F32 routing must not fork per buffer.
+    fn record_dense_binds(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        t: &Qwen4DeviceTensor,
+        src: Bind<'_>,
+        dst: Bind<'_>,
+    ) -> Result<()> {
+        let s = self.slots;
+        let (wb, wo, wl) = weights.binding(t)?;
         let ncols = u32::try_from(t.ncols)?;
         let nrows = u32::try_from(t.nrows)?;
         match t.format {
@@ -1996,6 +2012,33 @@ impl<'ctx> Qwen4Dev<'ctx> {
     ) -> Result<()> {
         let top_k = ids.len();
         let s = self.slots;
+        let b = Bind::A(b_off, (ncols * ne11 * 4) as u64);
+        let dst = Bind::A(dst_off, (top_k * nrows * 4) as u64);
+        let scale0 = Bind::A(s.scale0 + scale0_off, (top_k * 4) as u64);
+        let ids_b = Bind::A(s.ids, (top_k * 4) as u64);
+        self.gemv_id_nvfp4_binds(
+            weights, layer, proj, top_k, ncols, nrows, b, ne11, dst, scale0, ids_b,
+        )
+    }
+
+    /// [`Self::gemv_id_nvfp4`] with caller-supplied bindings, so the chunked
+    /// prefill can route per-token activations / ids rows out of its own arena.
+    #[expect(clippy::too_many_arguments, reason = "a dispatch is this wide")]
+    fn gemv_id_nvfp4_binds(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        layer: usize,
+        proj: ExpertProj,
+        top_k: usize,
+        ncols: usize,
+        nrows: usize,
+        b: Bind<'_>,
+        ne11: usize,
+        dst: Bind<'_>,
+        scale0: Bind<'_>,
+        ids: Bind<'_>,
+    ) -> Result<()> {
+        let s = self.slots;
         let stack = weights.expert_stack(layer, proj)?;
         let (sb, so, sl) = weights.binding(&stack.tensor)?;
         let mut words = gemv_id_params_fused(
@@ -2017,11 +2060,11 @@ impl<'ctx> Qwen4Dev<'ctx> {
             &push,
             &[
                 Bind::Ext(sb, so, sl),
-                Bind::A(b_off, (ncols * ne11 * 4) as u64),
-                Bind::A(dst_off, (top_k * nrows * 4) as u64),
-                Bind::A(s.scale0 + scale0_off, (top_k * 4) as u64),
+                b,
+                dst,
+                scale0,
                 Bind::A(s.dummy, 8),
-                Bind::A(s.ids, (top_k * 4) as u64),
+                ids,
             ],
             [d.x, d.y, d.z],
         )
@@ -3154,6 +3197,9 @@ pub struct VulkanQwen4ExpModel<'ctx, 'st> {
     /// to build — the serial per-row fallback below still works, just 6-7x
     /// slower.
     ngram_pool: Option<crate::qwen4_ngram_gather::NgramGather>,
+    /// Chunk arena for [`Self::forward_prompt`], built lazily on the first
+    /// prompt (decode-only runs never pay its ~190 MB).
+    prefill: Option<Qwen4Prefill<'ctx>>,
     state: Qwen4ExpState,
     /// EOS + the generation-config extras — what the executor reports.
     pub stop_token_ids: Vec<u32>,
@@ -3239,8 +3285,17 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                     lm_head: false,
                     ..Qwen4UploadScope::layers(subset)
                 };
+                // The dense tier defaults to F32 (the parity harness's
+                // zero-slack residency: decode and prefill then record the
+                // SAME GEMV dispatches). ARLE_QWEN4_SUBSET_DENSE=bf16 stages
+                // it BF16 instead, which is the 20-second repro of the full
+                // model's dense tier — the prefill's coopmat GEMM route only
+                // exists for BF16/F16, so an F32-only gate cannot see it.
                 let ucfg = Qwen4UploadConfig {
-                    dense_format: Qwen4DeviceFormat::F32,
+                    dense_format: match std::env::var("ARLE_QWEN4_SUBSET_DENSE").as_deref() {
+                        Ok("bf16") => Qwen4DeviceFormat::Bf16,
+                        _ => Qwen4DeviceFormat::F32,
+                    },
                     ..Qwen4UploadConfig::default()
                 };
                 let plan = plan_qwen4_upload(st, &ucfg, &scope)?;
@@ -3306,6 +3361,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             dev,
             resident_linear,
             ngram_pool,
+            prefill: None,
             state,
             stop_token_ids,
         })
@@ -3677,6 +3733,1940 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
 
         self.state.seq_len += 1;
         Ok(logits)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chunked prefill: `forward_prompt`.
+//
+// The per-token loop above re-reads every weight once per PROMPT token, so a
+// 2048-token prompt costs 2048 decode steps (~3 minutes at 85 ms/token). This
+// section processes the prompt in chunks of `T` tokens: dense projections
+// become ONE coopmat GEMM per weight (`MmCmBf16` / `MmCmF16` — the same
+// weight read amortized over `T` rows), the linear-attention conv + gated-delta
+// recurrence and the PLE gate/conv run their existing `seq_len = T` kernel
+// modes against the SAME device-resident state decode uses, and full attention
+// is one causal-masked flash dispatch per layer. Stages with no batched kernel
+// — the 97 hyper-connection sites, the MoE router/top-k and the NVFP4 expert
+// tails — record per token WITHIN the chunk (accepted v1: routing differs per
+// token, and a grouped expert GEMM is a later, separate kernel contract).
+//
+// The fence structure is the point: ONE ids read-back per (layer, chunk) — the
+// same count decode pays per token — plus the end-of-chunk flush. Everything
+// else records back-to-back.
+//
+// Equivalence contract: prefill-then-decode must EQUAL the per-token loop —
+// same logits, same recurrent state (GDN S, conv rings, PLE ring, KV rows).
+// `tests/qwen4_prefill.rs` pins that on real weights; every stage here reuses
+// decode's kernels (only the `seq_len`/grid changes), so the two paths cannot
+// drift semantically without that test failing.
+
+/// Tokens per prefill chunk. `ARLE_QWEN4_PREFILL_CHUNK` overrides the default
+/// (256) so the width can be swept against a real load without a rebuild.
+#[must_use]
+pub fn qwen4_prefill_chunk_tokens() -> usize {
+    std::env::var("ARLE_QWEN4_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&t| (1..=1024).contains(&t))
+        .unwrap_or(256)
+}
+
+/// f16 bit patterns for the causal mask (the flash kernel ADDS the mask to the
+/// pre-softmax score, so `0` = attend and `-inf` = blocked).
+const PF_F16_ZERO: u16 = 0x0000;
+const PF_F16_NEG_INF: u16 = 0xFC00;
+
+/// Padded per-token strides (in elements) for rows that are bound PER TOKEN:
+/// a descriptor offset must satisfy `minStorageBufferOffsetAlignment`, and 64
+/// f32 = 256 B clears every device. Rows whose natural width is already a
+/// 64-multiple (`hidden`, `hc_hidden`, ...) stay packed.
+const PF_AB_PAD: usize = 64;
+const PF_IDS_PAD: usize = 64;
+/// One token's `weight_scale_2` row: three projections (gate|up|down) at
+/// [`PF_SC_PROJ`]-element steps so each projection's sub-offset is 256-B
+/// aligned too.
+const PF_SC_STRIDE: usize = 192;
+const PF_SC_PROJ: usize = 64;
+
+/// The causal mask for one chunk: `[t][kv_len]` f16, row `r` (absolute
+/// position `start_pos + r`) attends keys `0..=start_pos + r`.
+fn pf_causal_mask(t: usize, kv_len: usize, start_pos: usize) -> Vec<u8> {
+    let mut mask = Vec::with_capacity(t * kv_len * 2);
+    for r in 0..t {
+        let limit = start_pos + r;
+        for c in 0..kv_len {
+            let bits = if c <= limit {
+                PF_F16_ZERO
+            } else {
+                PF_F16_NEG_INF
+            };
+            mask.extend_from_slice(&bits.to_le_bytes());
+        }
+    }
+    mask
+}
+
+/// Chunk-wide HF<->GGUF permutation maps: one flat u32 buffer holding four
+/// token-major regions, so a chunk's activations permute in ONE
+/// `Qwen4BlockPerm` dispatch instead of `4 * T`.
+///
+/// Returns `(flat, [qkv_at, v_at, ab_at, vinv_at])` — element offsets of:
+/// - `qkv`  `[T * conv_dim/vd]`: raw qkv `[T][conv_dim]` (HF) -> GGUF slots;
+/// - `v`    `[T * nv]`: a packed `[T][nv*vd]` V-head vector (`z`) -> slots;
+/// - `ab`   `[T * nv]`: the [`PF_AB_PAD`]-strided per-token `a`/`b` rows ->
+///   PACKED `[T][nv]` slot order (compaction and permutation in one pass — the
+///   gated-delta kernel wants token stride `nv`, but a GEMV cannot write a
+///   192-byte-aligned row);
+/// - `vinv` `[T * nv]`: slot order back to HF for `out_proj`.
+fn pf_chunk_maps(cfg: &Qwen4ExpConfig, max_tokens: usize) -> (Vec<u32>, [usize; 4]) {
+    let nk = cfg.linear_num_key_heads;
+    let nv = cfg.linear_num_value_heads;
+    let kd = cfg.linear_key_head_dim;
+    let vd = cfg.linear_value_head_dim;
+    let qk_blocks = 2 * nk * kd / vd;
+    let qkv_blocks = qk_blocks + nv;
+
+    let mut flat = Vec::new();
+    let mut offs = [0usize; 4];
+    let region = |flat: &mut Vec<u32>, at: &mut usize| {
+        // 64-element alignment keeps every region's byte offset 256-B aligned.
+        while !flat.len().is_multiple_of(64) {
+            flat.push(0);
+        }
+        *at = flat.len();
+    };
+
+    region(&mut flat, &mut offs[0]);
+    for t in 0..max_tokens {
+        for b in 0..qkv_blocks {
+            let src = if b < qk_blocks {
+                b
+            } else {
+                qk_blocks + v_slot_perm(nk, nv, b - qk_blocks)
+            };
+            flat.push((t * qkv_blocks + src) as u32);
+        }
+    }
+    region(&mut flat, &mut offs[1]);
+    for t in 0..max_tokens {
+        for slot in 0..nv {
+            flat.push((t * nv + v_slot_perm(nk, nv, slot)) as u32);
+        }
+    }
+    region(&mut flat, &mut offs[2]);
+    for t in 0..max_tokens {
+        for slot in 0..nv {
+            flat.push((t * PF_AB_PAD + v_slot_perm(nk, nv, slot)) as u32);
+        }
+    }
+    region(&mut flat, &mut offs[3]);
+    for t in 0..max_tokens {
+        // dst block at HF head `perm(slot)` reads slot-ordered block `slot`.
+        let base = flat.len();
+        flat.resize(base + nv, 0);
+        for slot in 0..nv {
+            flat[base + v_slot_perm(nk, nv, slot)] = (t * nv + slot) as u32;
+        }
+    }
+    (flat, offs)
+}
+
+/// Byte offsets of the chunk arena's regions. Every base is 256-B aligned;
+/// rows inside a region are addressed `base + token * stride * 4` with strides
+/// chosen so per-token binds stay aligned (see [`PF_AB_PAD`] and friends).
+#[derive(Debug, Clone, Copy)]
+struct PfSlots {
+    /// Hyper residual `[T][hc_hidden]`.
+    h: u64,
+    /// Grouped-norm output `[T][hc_hidden]`.
+    hn: u64,
+    /// `mix_down` bottleneck `[T][u_stride]`.
+    u: u64,
+    /// Block input `[T][hidden]`.
+    x: u64,
+    /// Attention block output `[T][hidden]`.
+    y: u64,
+    /// MoE accumulator `[T][hidden]`.
+    acc: u64,
+    /// `in_proj_a` rows, [`PF_AB_PAD`]-strided.
+    a_raw: u64,
+    /// `in_proj_b` rows, [`PF_AB_PAD`]-strided.
+    b_raw: u64,
+    /// Slot-ordered PACKED `a` `[T][nv]`.
+    a2: u64,
+    /// Slot-ordered PACKED `b` `[T][nv]`.
+    b2: u64,
+    /// Router top-k ids, [`PF_IDS_PAD`]-strided i32 rows.
+    ids: u64,
+    /// Router top-k weights, [`PF_IDS_PAD`]-strided.
+    wts: u64,
+    /// Slot-ordered `weight_scale_2` rows, [`PF_SC_STRIDE`]-strided.
+    sc: u64,
+    /// Shared-expert scalar gates, [`PF_IDS_PAD`]-strided.
+    shg: u64,
+    /// Router logits `[T][num_experts]`.
+    lgt: u64,
+    /// Routed gate activations `[T][top_k * inter]`.
+    ge: u64,
+    /// Routed up activations `[T][top_k * inter]`.
+    gu: u64,
+    /// Routed down outputs `[T][top_k * hidden]`.
+    edown: u64,
+    /// Shared-expert gate `[T][sh_inter]`.
+    sg: u64,
+    /// Shared-expert up `[T][sh_inter]`.
+    su: u64,
+    /// Shared-expert down `[T][hidden]`.
+    sd: u64,
+    /// PLE n-gram embeddings `[T][ple_embed_dim]`.
+    emb: u64,
+    /// Generic wide scratch A (projection outputs), `T * wide` f32.
+    wa: u64,
+    /// Generic wide scratch B (permuted / normed), `T * wide` f32.
+    wb: u64,
+    /// Generic wide scratch C (conv / attention outputs), `T * wide` f32.
+    wc: u64,
+    /// `in_proj_z` raw `[T][nv*vd]`.
+    z: u64,
+    /// `z` in slot order `[T][nv*vd]`.
+    z2: u64,
+    /// Gated-delta core output `[T][nv*vd]`.
+    gcore: u64,
+    /// Gated-norm output `[T][nv*vd]`.
+    gnorm: u64,
+    /// Full-attention K rows `[T][kv_dim]`.
+    kbuf: u64,
+    /// Full-attention V rows `[T][kv_dim]`.
+    vbuf: u64,
+    /// PLE `key_proj` output `[T][hc_hidden]`.
+    ple_k: u64,
+    /// PLE `value_proj` output `[T][hidden]`.
+    ple_v: u64,
+    /// PLE gated (un-normed) `[T][hc_hidden]`.
+    ple_g: u64,
+    /// PLE gated-normed `[T][hc_hidden]`.
+    ple_gn: u64,
+    /// PLE conv output `[T][hc_hidden]`.
+    ple_o: u64,
+    /// F16 B-operand staging for the coopmat GEMMs, `T * hc_hidden` halfwords.
+    b16: u64,
+    /// Causal mask `[T][max_context]` f16.
+    mask: u64,
+    /// RoPE positions `[T]` i32.
+    pos: u64,
+    total: u64,
+}
+
+/// The batched-GEMM route for one dense format: `(mm kernel, pack kernel)`.
+/// `None` = record per-token GEMVs instead — the DEFAULT, and not for lack of
+/// speed: the per-token GEMVs are the same dispatches decode records, so the
+/// prefill is bit-exact against the decode loop (measured 0.000e0 at full
+/// scale). The coopmat lane (`ARLE_QWEN4_PREFILL_GEMM=1`) is ~2x faster on
+/// the dense tier but stages activations to f16 (2^-11 — B as PLAIN F16 rows
+/// through [`Kernel::F16KvPack`]; bf16 staging, 2^-8, was measured first and
+/// rejected), and at 48 layers ANY sub-f32 staging compounds until it crosses
+/// expert-selection boundaries in the 512-expert routers — measured 2.6
+/// absolute logit drift and a flipped argmax, essentially unchanged between
+/// bf16 and f16 staging because the drift saturates on expert flips, not on
+/// the seed rounding. A prefill that diverges from decode is a wrong prefill,
+/// so the drifting lane stays opt-in until it can be made exact (candidate:
+/// a two-GEMM f16 residual split, x = hi + r, recovering ~2^-22) or the MoE
+/// batching round changes the numeric layout anyway. The vendored
+/// `TO_FLOAT_TYPE_B` seam is what lets [`Kernel::MmCmBf16`] take f16 B (see
+/// `vulkan-kernels/build.rs`).
+fn pf_gemm_route(
+    ctx: &VulkanContext,
+    format: Qwen4DeviceFormat,
+) -> Option<(Kernel, Kernel, CoopmatShape)> {
+    if std::env::var("ARLE_QWEN4_PREFILL_GEMM").as_deref() != Ok("1") {
+        return None;
+    }
+    if std::env::var_os("ARLE_VK_DISABLE_COOPMAT").is_some() {
+        return None;
+    }
+    let shape = ctx.coopmat()?;
+    let warp = ctx.subgroup_size().0;
+    MmSpec::choose(shape, warp, 32, ctx.max_compute_shared_memory_size())?;
+    match format {
+        Qwen4DeviceFormat::Bf16 => Some((Kernel::MmCmBf16, Kernel::F16KvPack, shape)),
+        Qwen4DeviceFormat::F16 => Some((Kernel::MmCmF16, Kernel::F16KvPack, shape)),
+        _ => None,
+    }
+}
+
+/// The chunk arena + chunk permutation maps for [`VulkanQwen4ExpModel::forward_prompt`].
+///
+/// Deliberately SEPARATE from [`DevSlots`] (the decode arena): scaling the
+/// decode slots by `T` would multiply `dense_y`'s vocab-sized region into
+/// gigabytes, and keeping the two apart leaves the decode path byte-for-byte
+/// untouched. ~190 MB at the default 256-token width — allocated lazily on the
+/// first `forward_prompt`, never for decode-only runs.
+pub struct Qwen4Prefill<'ctx> {
+    buffer: DeviceBuffer<'ctx>,
+    maps: DeviceBuffer<'ctx>,
+    /// Element offsets into `maps`: `[qkv, v, ab, vinv]` (see [`pf_chunk_maps`]).
+    map_at: [usize; 4],
+    slots: PfSlots,
+    /// Per-token element stride of the `u` slot (packed when `hc_lowrank` is
+    /// bind-alignable, padded otherwise — a padded stride also disables the
+    /// GEMM route for `mix_down`, which cannot write strided rows).
+    u_stride: usize,
+    max_tokens: usize,
+}
+
+impl<'ctx> Qwen4Prefill<'ctx> {
+    pub fn new(
+        ctx: &'ctx VulkanContext,
+        cfg: &Qwen4ExpConfig,
+        hc: &HyperConnectionConfig,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        ensure!(max_tokens >= 1, "prefill chunk of zero tokens");
+        let hh = hc.hc_hidden();
+        let h = cfg.hidden_size;
+        let conv_dim = cfg.linear_conv_dim();
+        let nv = cfg.linear_num_value_heads;
+        let vd = cfg.linear_value_head_dim;
+        let nvd = nv * vd;
+        let q2 = cfg.num_attention_heads * cfg.head_dim * 2;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let wide = q2.max(conv_dim);
+        let top_k = cfg.num_experts_per_tok;
+        let inter = cfg.moe_intermediate_size;
+        let sh_inter = cfg.shared_expert_intermediate_size;
+        let lowrank = hc.hc_lowrank;
+        let u_stride = if (lowrank * 4).is_multiple_of(256) {
+            lowrank
+        } else {
+            lowrank.next_multiple_of(64)
+        };
+        ensure!(nv <= PF_AB_PAD, "nv {nv} exceeds the a/b row pad");
+        ensure!(
+            top_k <= PF_SC_PROJ,
+            "top_k {top_k} exceeds the scale0 stride"
+        );
+        ensure!(top_k <= PF_IDS_PAD, "top_k {top_k} exceeds the ids row pad");
+        // Per-token binds rely on these being 256-B strides; they hold for the
+        // real checkpoint and this refuses rather than mis-binds elsewhere.
+        for (name, stride) in [
+            ("hc_hidden", hh),
+            ("hidden", h),
+            ("top_k*inter", top_k * inter),
+            ("top_k*hidden", top_k * h),
+            ("shared inter", sh_inter),
+            ("ple_embed", cfg.ple_embed_dim.max(64)),
+        ] {
+            ensure!(
+                (stride * 4).is_multiple_of(256),
+                "prefill row stride `{name}` ({stride} f32) is not 256-B aligned"
+            );
+        }
+
+        let mut off = 0u64;
+        let mut take = |bytes: u64| {
+            let at = off;
+            off += bytes.div_ceil(256) * 256;
+            at
+        };
+        let t = max_tokens as u64;
+        let f32s = |elems: usize| t * elems as u64 * 4;
+        let slots = PfSlots {
+            h: take(f32s(hh)),
+            hn: take(f32s(hh)),
+            u: take(f32s(u_stride)),
+            x: take(f32s(h)),
+            y: take(f32s(h)),
+            acc: take(f32s(h)),
+            a_raw: take(f32s(PF_AB_PAD)),
+            b_raw: take(f32s(PF_AB_PAD)),
+            a2: take(f32s(nv)),
+            b2: take(f32s(nv)),
+            ids: take(f32s(PF_IDS_PAD)),
+            wts: take(f32s(PF_IDS_PAD)),
+            sc: take(f32s(PF_SC_STRIDE)),
+            shg: take(f32s(PF_IDS_PAD)),
+            lgt: take(f32s(cfg.num_experts)),
+            ge: take(f32s(top_k * inter)),
+            gu: take(f32s(top_k * inter)),
+            edown: take(f32s(top_k * h)),
+            sg: take(f32s(sh_inter)),
+            su: take(f32s(sh_inter)),
+            sd: take(f32s(h)),
+            emb: take(f32s(cfg.ple_embed_dim.max(1))),
+            wa: take(f32s(wide)),
+            wb: take(f32s(wide)),
+            wc: take(f32s(wide)),
+            z: take(f32s(nvd)),
+            z2: take(f32s(nvd)),
+            gcore: take(f32s(nvd)),
+            gnorm: take(f32s(nvd)),
+            kbuf: take(f32s(kv_dim)),
+            vbuf: take(f32s(kv_dim)),
+            ple_k: take(f32s(hh)),
+            ple_v: take(f32s(h)),
+            ple_g: take(f32s(hh)),
+            ple_gn: take(f32s(hh)),
+            ple_o: take(f32s(hh)),
+            b16: take(t * hh as u64 * 2),
+            mask: take(t * cfg.max_context as u64 * 2),
+            pos: take(t * 4),
+            total: off,
+        };
+
+        let buffer = DeviceBuffer::alloc_host_cached(ctx, usize::try_from(slots.total)?)
+            .map_err(|e| anyhow!("alloc qwen4 prefill arena ({} B): {e}", slots.total))?;
+        let (flat, map_at) = pf_chunk_maps(cfg, max_tokens);
+        let map_bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut maps = DeviceBuffer::alloc_uma(ctx, map_bytes.len().max(4))
+            .map_err(|e| anyhow!("alloc qwen4 prefill maps: {e}"))?;
+        maps.copy_from_host(&map_bytes)
+            .map_err(|e| anyhow!("upload qwen4 prefill maps: {e}"))?;
+        Ok(Self {
+            buffer,
+            maps,
+            map_at,
+            slots,
+            u_stride,
+            max_tokens,
+        })
+    }
+
+    /// The chunk width this arena was built for.
+    #[must_use]
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    fn write_f32_at(&mut self, off: u64, data: &[f32]) -> Result<()> {
+        let _p = prof::span_bytes("h2d", (data.len() * 4) as u64);
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.buffer
+            .copy_from_host_at(off, &bytes)
+            .map_err(|e| anyhow!("prefill arena write at {off}: {e}"))
+    }
+
+    fn write_bytes_at(&mut self, off: u64, bytes: &[u8]) -> Result<()> {
+        let _p = prof::span_bytes("h2d", bytes.len() as u64);
+        self.buffer
+            .copy_from_host_at(off, bytes)
+            .map_err(|e| anyhow!("prefill arena write at {off}: {e}"))
+    }
+
+    fn read_f32_at(&self, off: u64, n: usize) -> Result<Vec<f32>> {
+        let _p = prof::span_bytes("d2h", (n * 4) as u64);
+        let mut bytes = vec![0u8; n * 4];
+        self.buffer
+            .copy_to_host_at(off, &mut bytes)
+            .map_err(|e| anyhow!("prefill arena read at {off}: {e}"))?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    fn read_i32_at(&self, off: u64, n: usize) -> Result<Vec<i32>> {
+        let _p = prof::span_bytes("d2h", (n * 4) as u64);
+        let mut bytes = vec![0u8; n * 4];
+        self.buffer
+            .copy_to_host_at(off, &mut bytes)
+            .map_err(|e| anyhow!("prefill arena read at {off}: {e}"))?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    /// Row `tok` of a region whose per-token stride is `stride` f32 elements.
+    fn row(base: u64, tok: usize, stride: usize) -> u64 {
+        base + (tok * stride * 4) as u64
+    }
+
+    /// Stage a packed `[t][k]` f32 block as the GEMM B operand at `b16`,
+    /// through whichever pack kernel `route` names.
+    fn record_pack(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        pack_kernel: Kernel,
+        src_off: u64,
+        ne: usize,
+    ) -> Result<()> {
+        let push = f16_kv_pack_params(ne as u32).to_le_bytes();
+        let d = f16_kv_pack_dispatch_rows(ne as u32, 1);
+        dev.rec(
+            pack_kernel,
+            pack_kernel.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, src_off, (ne * 4) as u64),
+                Bind::Ext(&self.buffer, self.slots.b16, (ne * 2) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )
+    }
+
+    /// One dense projection over the whole chunk: a coopmat GEMM when the
+    /// tier's format has one AND the caller staged `b16` with the matching
+    /// pack kernel; otherwise `t` recorded GEMVs through the same
+    /// format-dispatch decode uses. `packed` is `Some` only when the B operand
+    /// for THIS tensor's format is already staged.
+    #[expect(clippy::too_many_arguments, reason = "a chunk projection is this wide")]
+    fn record_dense_chunk(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        w: &Qwen4DeviceTensor,
+        src32: u64,
+        src_stride: usize,
+        packed: bool,
+        dst: u64,
+        dst_stride: usize,
+        t: usize,
+    ) -> Result<()> {
+        let (k, m) = (w.ncols, w.nrows);
+        ensure!(src_stride >= k, "chunk GEMM: source stride under-spans k");
+        let route = pf_gemm_route(dev.ctx, w.format);
+        if let Some((mm, _, shape)) = route {
+            // A GEMM writes rows packed at stride m; a caller needing padded
+            // rows gets the GEMV loop instead.
+            if packed && src_stride == k && dst_stride == m {
+                let warp = dev.ctx.subgroup_size().0;
+                let spec = MmSpec::choose(
+                    shape,
+                    warp,
+                    t as u32,
+                    dev.ctx.max_compute_shared_memory_size(),
+                )
+                .ok_or_else(|| anyhow!("no coopmat warptile for n = {t}"))?;
+                let (wb, wo, wl) = weights.binding(w)?;
+                let push = mmq_params(m as u32, t as u32, k as u32).to_le_bytes();
+                let d = mm_dispatch(m as u32, t as u32, &spec);
+                return dev.rec(
+                    mm,
+                    spec.specialization_u32(),
+                    &push,
+                    &[
+                        Bind::Ext(wb, wo, wl),
+                        Bind::Ext(&self.buffer, self.slots.b16, (t * k * 2) as u64),
+                        Bind::Ext(&self.buffer, dst, (t * m * 4) as u64),
+                    ],
+                    [d.x, d.y, d.z],
+                );
+            }
+        }
+        for tok in 0..t {
+            dev.record_dense_binds(
+                weights,
+                w,
+                Bind::Ext(
+                    &self.buffer,
+                    Self::row(src32, tok, src_stride),
+                    (k * 4) as u64,
+                ),
+                Bind::Ext(
+                    &self.buffer,
+                    Self::row(dst, tok, dst_stride),
+                    (m * 4) as u64,
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// One chunk-wide block permutation through the token-major maps.
+    #[expect(clippy::too_many_arguments, reason = "src/dst spans differ")]
+    fn record_perm_chunk(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        src: u64,
+        src_span_elems: usize,
+        map_region: usize,
+        block: usize,
+        nblocks: usize,
+        dst: u64,
+        dst_span_elems: usize,
+    ) -> Result<()> {
+        let push = qwen4_block_perm_params(block as u32, nblocks as u32).to_le_bytes();
+        let d = qwen4_block_perm_dispatch(nblocks as u32);
+        dev.rec(
+            Kernel::Qwen4BlockPerm,
+            Kernel::Qwen4BlockPerm.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, src, (src_span_elems * 4) as u64),
+                Bind::Ext(
+                    &self.maps,
+                    (self.map_at[map_region] * 4) as u64,
+                    (nblocks * 4) as u64,
+                ),
+                Bind::Ext(&self.buffer, dst, (dst_span_elems * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )
+    }
+
+    /// The pre half of a hyper-connection site over the chunk: per-token
+    /// grouped norm (the norm's per-group gains cannot batch across tokens),
+    /// chunked `mix_down`, per-token mix. Leaves `h`/`hn` rows for the combine
+    /// half and the block input in the `x` rows.
+    fn record_hc_pre(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        hc: &HyperConnectionConfig,
+        layer: Option<usize>,
+        site: HcSite,
+        t: usize,
+    ) -> Result<()> {
+        let _s = prof::stage("pf.hc.pre");
+        let b = weights.hyper_connection(layer, site)?;
+        let hh = hc.hc_hidden();
+        ensure!(
+            b.mix_up.format == b.mix_down.format,
+            "hyper-connection mix_down/mix_up formats diverge"
+        );
+        let mix_kernel = match b.mix_up.format {
+            Qwen4DeviceFormat::F32 => Kernel::Qwen4HcMix,
+            Qwen4DeviceFormat::Bf16 => Kernel::Qwen4HcMixBf16,
+            f => bail!("hyper-connection mix weights in unsupported format {f:?}"),
+        };
+        let s = self.slots;
+        let (nb, no, nl) = weights.binding(b.hc_norm)?;
+        let push =
+            rms_norm_params_grouped(hc.hidden_size as u32, hc.hc_count as u32, hc.rms_norm_eps)
+                .to_le_bytes();
+        let d = rms_norm_dispatch_rows(hc.hc_count as u32);
+        for tok in 0..t {
+            dev.rec(
+                Kernel::RmsNorm,
+                Kernel::RmsNorm.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, Self::row(s.h, tok, hh), (hh * 4) as u64),
+                    Bind::Ext(nb, no, nl),
+                    Bind::Ext(&self.buffer, Self::row(s.hn, tok, hh), (hh * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        }
+        dev.barrier();
+        let packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, b.mix_down.format) {
+            self.record_pack(dev, pack, s.hn, t * hh)?;
+            dev.barrier();
+            true
+        } else {
+            false
+        };
+        self.record_dense_chunk(
+            dev,
+            weights,
+            b.mix_down,
+            s.hn,
+            hh,
+            packed,
+            s.u,
+            self.u_stride,
+            t,
+        )?;
+        dev.barrier();
+        let (up_buf, up_off, up_len) = weights.binding(b.mix_up)?;
+        let push = qwen4_hc_mix_params(
+            hc.hidden_size as u32,
+            hc.hc_count as u32,
+            hc.hc_lowrank as u32,
+        )
+        .to_le_bytes();
+        let d = qwen4_hc_mix_dispatch(hc.hidden_size as u32);
+        for tok in 0..t {
+            dev.rec(
+                mix_kernel,
+                mix_kernel.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, Self::row(s.hn, tok, hh), (hh * 4) as u64),
+                    Bind::Ext(up_buf, up_off, up_len),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.u, tok, self.u_stride),
+                        (hc.hc_lowrank * 4) as u64,
+                    ),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.x, tok, hc.hidden_size),
+                        (hc.hidden_size * 4) as u64,
+                    ),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The combine half over the chunk: inject each token's block output row
+    /// (`y_base` at `y_stride`) into its residual row. `h`/`hn` rows must be
+    /// the ones [`Self::record_hc_pre`] left for this site.
+    #[expect(clippy::too_many_arguments, reason = "site + output rows")]
+    fn record_hc_combine(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        hc: &HyperConnectionConfig,
+        layer: Option<usize>,
+        site: HcSite,
+        y_base: u64,
+        y_stride: usize,
+        t: usize,
+    ) -> Result<()> {
+        let _s = prof::stage("pf.hc.comb");
+        let b = weights.hyper_connection(layer, site)?;
+        let inject = b
+            .block_inject
+            .ok_or_else(|| anyhow!("hc combine on the mixer site (no block_inject)"))?;
+        let comb_kernel = match inject.format {
+            Qwen4DeviceFormat::F32 => Kernel::Qwen4HcCombine,
+            Qwen4DeviceFormat::Bf16 => Kernel::Qwen4HcCombineBf16,
+            f => bail!("hyper-connection inject weights in unsupported format {f:?}"),
+        };
+        let (ib, io, il) = weights.binding(inject)?;
+        let hh = hc.hc_hidden();
+        let s = self.slots;
+        let push = qwen4_hc_combine_params(hc.hidden_size as u32, hc.hc_count as u32).to_le_bytes();
+        let d = qwen4_hc_combine_dispatch(hc.hidden_size as u32);
+        for tok in 0..t {
+            dev.rec(
+                comb_kernel,
+                comb_kernel.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, Self::row(s.hn, tok, hh), (hh * 4) as u64),
+                    Bind::Ext(ib, io, il),
+                    Bind::Ext(&self.buffer, Self::row(s.h, tok, hh), (hh * 4) as u64),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(y_base, tok, y_stride),
+                        (hc.hidden_size * 4) as u64,
+                    ),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The PLE layer over the chunk: chunked key/value projections, then the
+    /// gate and dilated-conv kernels in their `seq_len = t` modes against the
+    /// ring staged in the DECODE arena's `ple_ring` slot, then `h += out`.
+    /// The caller stages the ring before the chunk and reads it back (rotated)
+    /// after the end-of-chunk flush.
+    fn record_ple(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        t: usize,
+    ) -> Result<()> {
+        let _s = prof::stage("pf.ple");
+        let pc = ple_config(cfg);
+        let hh = pc.hc_hidden();
+        let name = |suffix: &str| layer_tensor_name(layer, suffix);
+        let kp = *weights.tensor(&name("ple.key_proj.weight"))?;
+        let vp = *weights.tensor(&name("ple.value_proj.weight"))?;
+        let s = self.slots;
+        let packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, kp.format) {
+            self.record_pack(dev, pack, s.emb, t * pc.ple_embed_dim)?;
+            dev.barrier();
+            true
+        } else {
+            false
+        };
+        self.record_dense_chunk(
+            dev,
+            weights,
+            &kp,
+            s.emb,
+            pc.ple_embed_dim,
+            packed,
+            s.ple_k,
+            hh,
+            t,
+        )?;
+        self.record_dense_chunk(
+            dev,
+            weights,
+            &vp,
+            s.emb,
+            pc.ple_embed_dim,
+            packed && vp.format == kp.format,
+            s.ple_v,
+            pc.hidden_size,
+            t,
+        )?;
+        dev.barrier();
+        let (nk_b, nk_o, nk_l) = weights.binding_by_name(&name("ple.norm_key.weight"))?;
+        let (nq_b, nq_o, nq_l) = weights.binding_by_name(&name("ple.norm_query.weight"))?;
+        let (nc_b, nc_o, nc_l) = weights.binding_by_name(&name("ple.norm_conv.weight"))?;
+        let push = qwen4_ple_gate_params(
+            pc.hidden_size as u32,
+            pc.hc_count as u32,
+            t as u32,
+            pc.rms_norm_eps,
+        )
+        .to_le_bytes();
+        let d = qwen4_ple_gate_dispatch(pc.hc_count as u32, t as u32);
+        dev.rec(
+            Kernel::Qwen4PleGate,
+            Kernel::Qwen4PleGate.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.ple_k, (t * hh * 4) as u64),
+                Bind::Ext(&self.buffer, s.h, (t * hh * 4) as u64),
+                Bind::Ext(&self.buffer, s.ple_v, (t * pc.hidden_size * 4) as u64),
+                Bind::Ext(nk_b, nk_o, nk_l),
+                Bind::Ext(nq_b, nq_o, nq_l),
+                Bind::Ext(nc_b, nc_o, nc_l),
+                Bind::Ext(&self.buffer, s.ple_g, (t * hh * 4) as u64),
+                Bind::Ext(&self.buffer, s.ple_gn, (t * hh * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        let (cw_b, cw_o, cw_l) = weights.binding_by_name(&name("ple.conv1d.weight"))?;
+        let push = qwen4_ple_conv_params(
+            hh as u32,
+            t as u32,
+            pc.conv_kernel_size as u32,
+            pc.conv_dilation as u32,
+            0,
+        )
+        .to_le_bytes();
+        let d = qwen4_ple_conv_dispatch(hh as u32);
+        let ring_len = (pc.short_conv_state_len() * hh * 4) as u64;
+        dev.rec(
+            Kernel::Qwen4PleConv,
+            Kernel::Qwen4PleConv.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.ple_gn, (t * hh * 4) as u64),
+                Bind::Ext(cw_b, cw_o, cw_l),
+                Bind::A(dev.slots.ple_ring, ring_len),
+                Bind::Ext(&self.buffer, s.ple_g, (t * hh * 4) as u64),
+                Bind::Ext(&self.buffer, s.ple_o, (t * hh * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        // h += 1.0 * out, flat over the whole chunk, through the weighted-
+        // accum kernel exactly as decode's `add_into_h` does. NOT `add.comp`:
+        // its workgroups cover overlapping index ranges (each thread handles
+        // `idx` and `idx + 256`), which is benign into a distinct output but a
+        // read-after-write race when `d` aliases `a` — the in-place residual
+        // add here. The accum kernel touches each element from exactly one
+        // thread. The add is UNCONDITIONAL — omitting the PLE is a wrong
+        // forward, not a degraded one.
+        let n = (t * hh) as u32;
+        let push = qwen36_moe_weighted_accum_params(n, 1, false).to_le_bytes();
+        let d = qwen36_moe_weighted_accum_dispatch(n);
+        dev.rec(
+            Kernel::Qwen36MoeWeightedAccum,
+            Kernel::Qwen36MoeWeightedAccum.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.ple_o, u64::from(n) * 4),
+                Bind::A(dev.slots.one, 4),
+                Bind::Ext(&self.buffer, s.h, u64::from(n) * 4),
+            ],
+            [d.x, d.y, d.z],
+        )
+    }
+
+    /// The linear-attention block over the chunk: chunked in-projections,
+    /// chunk-wide HF->GGUF permutation, then the conv and gated-delta kernels
+    /// in their `seq_len = t` modes — the SAME resident state buffers decode
+    /// advances, stepped `t` tokens in one dispatch each.
+    fn record_linear(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        rl: &DevResidentLinAttn<'ctx>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        t: usize,
+    ) -> Result<()> {
+        let _s = prof::stage("pf.linattn");
+        let kd = cfg.linear_key_head_dim;
+        let vd = cfg.linear_value_head_dim;
+        let nk = cfg.linear_num_key_heads;
+        let nv = cfg.linear_num_value_heads;
+        let kernel = cfg.linear_conv_kernel_dim;
+        let conv_dim = cfg.linear_conv_dim();
+        let h = cfg.hidden_size;
+        let state_w = kernel - 1;
+        let dense = *rl
+            .index
+            .get(&layer)
+            .ok_or_else(|| anyhow!("layer {layer} not resident"))?;
+        let aux_base = (dense * DevResidentLinAttn::aux_stride(cfg) * 4) as u64;
+        let conv_w_len = (conv_dim * kernel * 4) as u64;
+        let alog_at = aux_base + ((conv_dim * kernel).next_multiple_of(64) * 4) as u64;
+        let state_base = (dense * DevResidentLinAttn::state_stride(cfg) * 4) as u64;
+        let ring_at = state_base + (nv * kd * vd * 4) as u64;
+        let s = self.slots;
+
+        let t_qkv = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_qkv.weight"))?;
+        let t_z = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_z.weight"))?;
+        let t_a = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_a.weight"))?;
+        let t_b = *weights.tensor(&layer_tensor_name(layer, "linear_attn.in_proj_b.weight"))?;
+        let t_out = *weights.tensor(&layer_tensor_name(layer, "linear_attn.out_proj.weight"))?;
+        let t_norm = *weights.tensor(&layer_tensor_name(layer, "linear_attn.norm.weight"))?;
+        ensure!(
+            t_norm.format == Qwen4DeviceFormat::F32,
+            "linear_attn.norm must be F32-resident"
+        );
+        let norm_bind = weights.binding(&t_norm)?;
+
+        // In-projections off the shared block input.
+        let packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, t_qkv.format) {
+            self.record_pack(dev, pack, s.x, t * h)?;
+            dev.barrier();
+            true
+        } else {
+            false
+        };
+        self.record_dense_chunk(dev, weights, &t_qkv, s.x, h, packed, s.wa, conv_dim, t)?;
+        self.record_dense_chunk(
+            dev,
+            weights,
+            &t_z,
+            s.x,
+            h,
+            packed && t_z.format == t_qkv.format,
+            s.z,
+            nv * vd,
+            t,
+        )?;
+        // a/b rows land padded so their per-token GEMV outputs stay bindable;
+        // the `ab` chunk map compacts them into the packed slot order the
+        // gated-delta kernel reads.
+        self.record_dense_chunk(dev, weights, &t_a, s.x, h, false, s.a_raw, PF_AB_PAD, t)?;
+        self.record_dense_chunk(dev, weights, &t_b, s.x, h, false, s.b_raw, PF_AB_PAD, t)?;
+        dev.barrier();
+
+        let qkv_blocks = conv_dim / vd;
+        self.record_perm_chunk(
+            dev,
+            s.wa,
+            t * conv_dim,
+            0,
+            vd,
+            t * qkv_blocks,
+            s.wb,
+            t * conv_dim,
+        )?;
+        self.record_perm_chunk(dev, s.z, t * nv * vd, 1, vd, t * nv, s.z2, t * nv * vd)?;
+        self.record_perm_chunk(dev, s.a_raw, t * PF_AB_PAD, 2, 1, t * nv, s.a2, t * nv)?;
+        self.record_perm_chunk(dev, s.b_raw, t * PF_AB_PAD, 2, 1, t * nv, s.b2, t * nv)?;
+        dev.barrier();
+
+        let push = qwen35_ssm_conv_params(conv_dim as u32, t as u32, kernel as u32).to_le_bytes();
+        let d = qwen35_ssm_conv_dispatch(conv_dim as u32);
+        dev.rec(
+            Kernel::Qwen35SsmConv,
+            Kernel::Qwen35SsmConv.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.wb, (t * conv_dim * 4) as u64),
+                Bind::Ext(&rl.aux, aux_base, conv_w_len),
+                Bind::Ext(&rl.state, ring_at, (conv_dim * state_w * 4) as u64),
+                Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        let push =
+            qwen35_gated_delta_net_params(nk as u32, nv as u32, kd as u32, vd as u32, t as u32)
+                .to_le_bytes();
+        let d = qwen35_gated_delta_net_dispatch(nv as u32);
+        dev.rec(
+            Kernel::Qwen35GatedDeltaNet,
+            Kernel::Qwen35GatedDeltaNet.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
+                Bind::Ext(&self.buffer, s.b2, (t * nv * 4) as u64),
+                Bind::Ext(&self.buffer, s.a2, (t * nv * 4) as u64),
+                Bind::Ext(&rl.aux, alog_at + 64 * 4, (nv * 4) as u64),
+                Bind::Ext(&rl.aux, alog_at, (nv * 4) as u64),
+                Bind::Ext(&rl.state, state_base, (nv * kd * vd * 4) as u64),
+                Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        let push = rms_norm_params_rows(vd as u32, (t * nv) as u32, vd as u32, cfg.rms_norm_eps)
+            .to_le_bytes();
+        let d = rms_norm_dispatch_rows((t * nv) as u32);
+        dev.rec(
+            Kernel::RmsNorm,
+            Kernel::RmsNorm.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
+                Bind::Ext(norm_bind.0, norm_bind.1, norm_bind.2),
+                Bind::Ext(&self.buffer, s.gnorm, (t * nv * vd * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        let n_gate = (t * nv * vd) as u32;
+        let (kern, push) = match cfg.output_gate {
+            GateActivation::Sigmoid => (Kernel::SigmoidMul, sigmoid_mul_params(n_gate)),
+            GateActivation::Silu => (Kernel::SwiGlu, swiglu_params(n_gate)),
+        };
+        let d = sigmoid_mul_dispatch(n_gate);
+        dev.rec(
+            kern,
+            kern.specialization_u32(),
+            &push.to_le_bytes(),
+            &[
+                Bind::Ext(&self.buffer, s.z2, u64::from(n_gate) * 4),
+                Bind::Ext(&self.buffer, s.gnorm, u64::from(n_gate) * 4),
+                Bind::Ext(&self.buffer, s.gnorm, u64::from(n_gate) * 4),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        self.record_perm_chunk(dev, s.gnorm, t * nv * vd, 3, vd, t * nv, s.wb, t * nv * vd)?;
+        dev.barrier();
+        let out_packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, t_out.format) {
+            self.record_pack(dev, pack, s.wb, t * nv * vd)?;
+            dev.barrier();
+            true
+        } else {
+            false
+        };
+        self.record_dense_chunk(dev, weights, &t_out, s.wb, nv * vd, out_packed, s.y, h, t)
+    }
+
+    /// The full-attention block over the chunk: chunked q/k/v projections,
+    /// batched q/k norms + RoPE, strided KV pack into the layer's f16 planes
+    /// at `start_pos..start_pos + t`, ONE causal-masked flash dispatch, the
+    /// strided sigmoid gate, and the chunked o-projection.
+    fn record_full(
+        &self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        t: usize,
+        start_pos: usize,
+    ) -> Result<()> {
+        let _s = prof::stage("pf.fullattn");
+        let hd = cfg.head_dim;
+        let nq = cfg.num_attention_heads;
+        let nkv = cfg.num_key_value_heads;
+        let h = cfg.hidden_size;
+        let q_dim = nq * hd;
+        let kv_dim = nkv * hd;
+        let kv_len = start_pos + t;
+        let full_idx = *dev
+            .full_idx
+            .get(&layer)
+            .ok_or_else(|| anyhow!("layer {layer} has no device KV plane"))?;
+        let (plane_bytes, layer_bytes, k_base, v_base, k_rows, v_rows) = {
+            let kv = dev
+                .kv
+                .as_ref()
+                .ok_or_else(|| anyhow!("no device KV cache"))?;
+            ensure!(
+                (kv_len * hd * 2) as u64 <= kv.plane_bytes,
+                "chunk end {kv_len} exceeds the device KV plane"
+            );
+            let k_rows: Vec<u64> = (0..nkv)
+                .map(|kvh| kv.row(kv.k_plane(full_idx, kvh), start_pos))
+                .collect();
+            let v_rows: Vec<u64> = (0..nkv)
+                .map(|kvh| kv.row(kv.v_plane(full_idx, kvh), start_pos))
+                .collect();
+            (
+                kv.plane_bytes,
+                kv.layer_bytes,
+                kv.k_plane(full_idx, 0),
+                kv.v_plane(full_idx, 0),
+                k_rows,
+                v_rows,
+            )
+        };
+        let name = |sfx: &str| layer_tensor_name(layer, sfx);
+        let q_w = *weights.tensor(&name("self_attn.q_proj.weight"))?;
+        let k_w = *weights.tensor(&name("self_attn.k_proj.weight"))?;
+        let v_w = *weights.tensor(&name("self_attn.v_proj.weight"))?;
+        let o_w = *weights.tensor(&name("self_attn.o_proj.weight"))?;
+        let s = self.slots;
+
+        let packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, q_w.format) {
+            self.record_pack(dev, pack, s.x, t * h)?;
+            dev.barrier();
+            true
+        } else {
+            false
+        };
+        self.record_dense_chunk(dev, weights, &q_w, s.x, h, packed, s.wa, nq * 2 * hd, t)?;
+        self.record_dense_chunk(
+            dev,
+            weights,
+            &k_w,
+            s.x,
+            h,
+            packed && k_w.format == q_w.format,
+            s.kbuf,
+            kv_dim,
+            t,
+        )?;
+        self.record_dense_chunk(
+            dev,
+            weights,
+            &v_w,
+            s.x,
+            h,
+            packed && v_w.format == q_w.format,
+            s.vbuf,
+            kv_dim,
+            t,
+        )?;
+        dev.barrier();
+        // Per-head q norm over all (token, head) rows at once: row `r` reads
+        // the QUERY half at `r * 2*hd` and writes packed `[t][nq][hd]`.
+        let (qn_b, qn_o, qn_l) = weights.binding_by_name(&name("self_attn.q_norm.weight"))?;
+        let push = rms_norm_params_rows(
+            hd as u32,
+            (t * nq) as u32,
+            (2 * hd) as u32,
+            cfg.rms_norm_eps,
+        )
+        .to_le_bytes();
+        let d = rms_norm_dispatch_rows((t * nq) as u32);
+        dev.rec(
+            Kernel::RmsNorm,
+            Kernel::RmsNorm.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.wa, (t * nq * 2 * hd * 4) as u64),
+                Bind::Ext(qn_b, qn_o, qn_l),
+                Bind::Ext(&self.buffer, s.wb, (t * q_dim * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        let (kn_b, kn_o, kn_l) = weights.binding_by_name(&name("self_attn.k_norm.weight"))?;
+        let push = rms_norm_params_rows(hd as u32, (t * nkv) as u32, hd as u32, cfg.rms_norm_eps)
+            .to_le_bytes();
+        let d = rms_norm_dispatch_rows((t * nkv) as u32);
+        dev.rec(
+            Kernel::RmsNorm,
+            Kernel::RmsNorm.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.kbuf, (t * kv_dim * 4) as u64),
+                Bind::Ext(kn_b, kn_o, kn_l),
+                Bind::Ext(&self.buffer, s.kbuf, (t * kv_dim * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        // Batched partial NeoX RoPE: every head of token `i` rotates by
+        // `pos[i]` from the staged position row.
+        for (heads, off) in [(nq, s.wb), (nkv, s.kbuf)] {
+            let push = rope_neox_params_batched(
+                hd as u32,
+                cfg.rotary_dim as u32,
+                heads as u32,
+                t as u32,
+                cfg.rope_theta,
+            )
+            .to_le_bytes();
+            let d = rope_neox_dispatch_batched(cfg.rotary_dim as u32, heads as u32, t as u32);
+            let block = (t * heads * hd * 4) as u64;
+            dev.rec(
+                Kernel::RopeNeox,
+                Kernel::RopeNeox.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, off, block),
+                    Bind::Ext(&self.buffer, s.pos, (t * 4) as u64),
+                    Bind::A(dev.slots.dummy, 8),
+                    Bind::Ext(&self.buffer, off, block),
+                    Bind::Ext(&self.buffer, s.pos, (t * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        }
+        dev.barrier();
+        // f16 KV pack: one kv head's `t` strided rows land contiguously at
+        // `[start_pos .. start_pos + t]` in its plane.
+        let pack_push =
+            f16_kv_pack_params_rows(hd as u32, t as u32, kv_dim as u32, hd as u32).to_le_bytes();
+        let pd = f16_kv_pack_dispatch_rows(hd as u32, t as u32);
+        for kvh in 0..nkv {
+            for (src_base, dst_row) in [(s.kbuf, k_rows[kvh]), (s.vbuf, v_rows[kvh])] {
+                dev.rec(
+                    Kernel::F16KvPack,
+                    Kernel::F16KvPack.specialization_u32(),
+                    &pack_push,
+                    &[
+                        Bind::Ext(
+                            &self.buffer,
+                            src_base + (kvh * hd * 4) as u64,
+                            (((t - 1) * kv_dim + hd) * 4) as u64,
+                        ),
+                        Bind::Kv(dst_row, (t * hd * 2) as u64),
+                    ],
+                    [pd.x, pd.y, pd.z],
+                )?;
+            }
+        }
+        dev.barrier();
+        // ONE masked flash dispatch for the whole chunk: grid (t, nq), K/V
+        // bound as the layer's whole plane slabs, GQA via nek2 = nkv.
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let spec = FlashAttentionSpec::f32_f16_masked(hd as u32, hd as u32);
+        let push = flash_attn_params_batched(
+            hd as u32,
+            hd as u32,
+            t as u32,
+            kv_len as u32,
+            nq as u32,
+            nkv as u32,
+            u32::try_from(plane_bytes)?,
+            u32::try_from(plane_bytes)?,
+            scale,
+        )
+        .to_le_bytes();
+        let fd = flash_attn_dispatch_batched(t as u32, nq as u32);
+        dev.rec(
+            Kernel::FlashAttn,
+            spec.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.wb, (t * q_dim * 4) as u64),
+                Bind::Kv(k_base, layer_bytes),
+                Bind::Kv(v_base, layer_bytes),
+                Bind::Ext(&self.buffer, s.mask, (t * kv_len * 2) as u64),
+                Bind::A(dev.slots.dummy, 8),
+                Bind::Ext(&self.buffer, s.wc, (t * q_dim * 4) as u64),
+                Bind::A(dev.slots.dummy, 8),
+            ],
+            [fd.x, fd.y, fd.z],
+        )?;
+        dev.barrier();
+        // Strided sigmoid gate off the interleaved [query|gate] projection.
+        let push =
+            sigmoid_mul_params_strided((t * q_dim) as u32, hd as u32, (2 * hd) as u32, hd as u32)
+                .to_le_bytes();
+        let d = sigmoid_mul_dispatch((t * q_dim) as u32);
+        dev.rec(
+            Kernel::SigmoidMul,
+            Kernel::SigmoidMul.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.wa, (t * nq * 2 * hd * 4) as u64),
+                Bind::Ext(&self.buffer, s.wc, (t * q_dim * 4) as u64),
+                Bind::Ext(&self.buffer, s.wc, (t * q_dim * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        let out_packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, o_w.format) {
+            self.record_pack(dev, pack, s.wc, t * q_dim)?;
+            dev.barrier();
+            true
+        } else {
+            false
+        };
+        self.record_dense_chunk(dev, weights, &o_w, s.wc, q_dim, out_packed, s.y, h, t)
+    }
+
+    /// The MoE block over the chunk, with ONE ids fence for the whole chunk:
+    /// per-token routers + top-k and the (ids-independent) shared expert
+    /// record first, then the fence reads `t * top_k` ids at once, then the
+    /// per-token NVFP4 expert tails and the accumulates record against them.
+    fn record_moe(
+        &mut self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        t: usize,
+    ) -> Result<()> {
+        let _s = prof::stage("pf.moe");
+        let h = cfg.hidden_size;
+        let top_k = cfg.num_experts_per_tok;
+        let inter = cfg.moe_intermediate_size;
+        let sh_inter = cfg.shared_expert_intermediate_size;
+        let s = self.slots;
+        let name = |sfx: &str| layer_tensor_name(layer, sfx);
+        let router = *weights.tensor(&name("mlp.gate.weight"))?;
+        ensure!(
+            router.format == Qwen4DeviceFormat::F32,
+            "mlp.gate must be F32-resident"
+        );
+        let shg_w = *weights.tensor(&name("mlp.shared_expert_gate.weight"))?;
+        ensure!(
+            shg_w.format == Qwen4DeviceFormat::F32,
+            "shared_expert_gate must be F32-resident (its sigmoid rides the kernel)"
+        );
+        let sh_gate = *weights.tensor(&name("mlp.shared_expert.gate_proj.weight"))?;
+        let sh_up = *weights.tensor(&name("mlp.shared_expert.up_proj.weight"))?;
+        let sh_down = *weights.tensor(&name("mlp.shared_expert.down_proj.weight"))?;
+
+        prof::phase("pf.moe.router");
+        // Router + scalar shared gate per token, plus the B staging for the
+        // shared projections — all read only the block input.
+        let (rb, ro, rl_) = weights.binding(&router)?;
+        let r_push =
+            qwen36_router_gemv_params(cfg.num_experts as u32, h as u32, false).to_le_bytes();
+        let rd = qwen36_router_gemv_dispatch(cfg.num_experts as u32);
+        let (gb, go, gl) = weights.binding(&shg_w)?;
+        let g_push = qwen36_router_gemv_params(1, h as u32, true).to_le_bytes();
+        let gd = qwen36_router_gemv_dispatch(1);
+        for tok in 0..t {
+            let x_row = Bind::Ext(&self.buffer, Self::row(s.x, tok, h), (h * 4) as u64);
+            dev.rec(
+                Kernel::Qwen36RouterGemv,
+                Kernel::Qwen36RouterGemv.specialization_u32(),
+                &r_push,
+                &[
+                    Bind::Ext(&self.buffer, Self::row(s.x, tok, h), (h * 4) as u64),
+                    Bind::Ext(rb, ro, rl_),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.lgt, tok, cfg.num_experts),
+                        (cfg.num_experts * 4) as u64,
+                    ),
+                ],
+                [rd.x, rd.y, rd.z],
+            )?;
+            dev.rec(
+                Kernel::Qwen36RouterGemv,
+                Kernel::Qwen36RouterGemv.specialization_u32(),
+                &g_push,
+                &[
+                    x_row,
+                    Bind::Ext(gb, go, gl),
+                    Bind::Ext(&self.buffer, Self::row(s.shg, tok, PF_IDS_PAD), 4),
+                ],
+                [gd.x, gd.y, gd.z],
+            )?;
+        }
+        let sh_packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, sh_gate.format) {
+            self.record_pack(dev, pack, s.x, t * h)?;
+            true
+        } else {
+            false
+        };
+        dev.barrier();
+        prof::phase("pf.moe.topk");
+        let tk_push =
+            qwen36_router_topk_params(cfg.num_experts as u32, top_k as u32, cfg.norm_topk_prob)
+                .to_le_bytes();
+        let td = qwen36_router_topk_dispatch();
+        for tok in 0..t {
+            dev.rec(
+                Kernel::Qwen36RouterTopk,
+                Kernel::Qwen36RouterTopk.specialization_u32(),
+                &tk_push,
+                &[
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.lgt, tok, cfg.num_experts),
+                        (cfg.num_experts * 4) as u64,
+                    ),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.ids, tok, PF_IDS_PAD),
+                        (top_k * 4) as u64,
+                    ),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.wts, tok, PF_IDS_PAD),
+                        (top_k * 4) as u64,
+                    ),
+                ],
+                [td.x, td.y, td.z],
+            )?;
+        }
+        prof::phase("pf.moe.shared");
+        self.record_dense_chunk(dev, weights, &sh_gate, s.x, h, sh_packed, s.sg, sh_inter, t)?;
+        self.record_dense_chunk(
+            dev,
+            weights,
+            &sh_up,
+            s.x,
+            h,
+            sh_packed && sh_up.format == sh_gate.format,
+            s.su,
+            sh_inter,
+            t,
+        )?;
+        dev.barrier();
+        let n_sh = (t * sh_inter) as u32;
+        let push = swiglu_params(n_sh).to_le_bytes();
+        let d = swiglu_dispatch(n_sh);
+        dev.rec(
+            Kernel::SwiGlu,
+            Kernel::SwiGlu.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.sg, u64::from(n_sh) * 4),
+                Bind::Ext(&self.buffer, s.su, u64::from(n_sh) * 4),
+                Bind::Ext(&self.buffer, s.sg, u64::from(n_sh) * 4),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        let down_packed = if let Some((_, pack, _)) = pf_gemm_route(dev.ctx, sh_down.format) {
+            self.record_pack(dev, pack, s.sg, t * sh_inter)?;
+            dev.barrier();
+            true
+        } else {
+            false
+        };
+        self.record_dense_chunk(
+            dev,
+            weights,
+            &sh_down,
+            s.sg,
+            sh_inter,
+            down_packed,
+            s.sd,
+            h,
+            t,
+        )?;
+
+        // ── THE chunk ids fence: one read of t * top_k ids. ──
+        prof::phase("pf.moe.ids_fence");
+        dev.flush()?;
+        let raw_ids = self.read_i32_at(s.ids, t * PF_IDS_PAD)?;
+        let mut sc_flat = vec![0.0f32; t * PF_SC_STRIDE];
+        let mut part = Vec::new();
+        for tok in 0..t {
+            let ids_row = &raw_ids[tok * PF_IDS_PAD..tok * PF_IDS_PAD + top_k];
+            for (pi, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
+                .into_iter()
+                .enumerate()
+            {
+                weights
+                    .expert_stack(layer, proj)?
+                    .scale0_for_route(ids_row, &mut part)?;
+                sc_flat[tok * PF_SC_STRIDE + pi * PF_SC_PROJ
+                    ..tok * PF_SC_STRIDE + pi * PF_SC_PROJ + top_k]
+                    .copy_from_slice(&part);
+            }
+        }
+        self.write_f32_at(s.sc, &sc_flat)?;
+
+        prof::phase("pf.moe.experts");
+        // Routed expert tails, per token (accepted v1 — routing differs per
+        // token). Rows are disjoint across tokens, so gate/up for the whole
+        // chunk record with no intervening barriers.
+        let sc_bind = |tok: usize, pi: usize| {
+            Bind::Ext(
+                &self.buffer,
+                Self::row(s.sc, tok, PF_SC_STRIDE) + (pi * PF_SC_PROJ * 4) as u64,
+                (top_k * 4) as u64,
+            )
+        };
+        let ids_bind = |tok: usize| {
+            Bind::Ext(
+                &self.buffer,
+                Self::row(s.ids, tok, PF_IDS_PAD),
+                (top_k * 4) as u64,
+            )
+        };
+        for tok in 0..t {
+            for (pi, (proj, dst)) in [(ExpertProj::Gate, s.ge), (ExpertProj::Up, s.gu)]
+                .into_iter()
+                .enumerate()
+            {
+                dev.gemv_id_nvfp4_binds(
+                    weights,
+                    layer,
+                    proj,
+                    top_k,
+                    h,
+                    inter,
+                    Bind::Ext(&self.buffer, Self::row(s.x, tok, h), (h * 4) as u64),
+                    1,
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(dst, tok, top_k * inter),
+                        (top_k * inter * 4) as u64,
+                    ),
+                    sc_bind(tok, pi),
+                    ids_bind(tok),
+                )?;
+            }
+        }
+        dev.barrier();
+        let n_act = (t * top_k * inter) as u32;
+        let push = swiglu_params(n_act).to_le_bytes();
+        let d = swiglu_dispatch(n_act);
+        dev.rec(
+            Kernel::SwiGlu,
+            Kernel::SwiGlu.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.ge, u64::from(n_act) * 4),
+                Bind::Ext(&self.buffer, s.gu, u64::from(n_act) * 4),
+                Bind::Ext(&self.buffer, s.ge, u64::from(n_act) * 4),
+            ],
+            [d.x, d.y, d.z],
+        )?;
+        dev.barrier();
+        for tok in 0..t {
+            dev.gemv_id_nvfp4_binds(
+                weights,
+                layer,
+                ExpertProj::Down,
+                top_k,
+                inter,
+                h,
+                Bind::Ext(
+                    &self.buffer,
+                    Self::row(s.ge, tok, top_k * inter),
+                    (top_k * inter * 4) as u64,
+                ),
+                top_k,
+                Bind::Ext(
+                    &self.buffer,
+                    Self::row(s.edown, tok, top_k * h),
+                    (top_k * h * 4) as u64,
+                ),
+                sc_bind(tok, 2),
+                ids_bind(tok),
+            )?;
+        }
+        dev.barrier();
+        prof::phase("pf.moe.accum");
+        let acc_push = qwen36_moe_weighted_accum_params(h as u32, top_k as u32, true).to_le_bytes();
+        let ad = qwen36_moe_weighted_accum_dispatch(h as u32);
+        for tok in 0..t {
+            dev.rec(
+                Kernel::Qwen36MoeWeightedAccum,
+                Kernel::Qwen36MoeWeightedAccum.specialization_u32(),
+                &acc_push,
+                &[
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.edown, tok, top_k * h),
+                        (top_k * h * 4) as u64,
+                    ),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(s.wts, tok, PF_IDS_PAD),
+                        (top_k * 4) as u64,
+                    ),
+                    Bind::Ext(&self.buffer, Self::row(s.acc, tok, h), (h * 4) as u64),
+                ],
+                [ad.x, ad.y, ad.z],
+            )?;
+        }
+        dev.barrier();
+        let sh_push = qwen36_moe_weighted_accum_params(h as u32, 1, false).to_le_bytes();
+        for tok in 0..t {
+            dev.rec(
+                Kernel::Qwen36MoeWeightedAccum,
+                Kernel::Qwen36MoeWeightedAccum.specialization_u32(),
+                &sh_push,
+                &[
+                    Bind::Ext(&self.buffer, Self::row(s.sd, tok, h), (h * 4) as u64),
+                    Bind::Ext(&self.buffer, Self::row(s.shg, tok, PF_IDS_PAD), 4),
+                    Bind::Ext(&self.buffer, Self::row(s.acc, tok, h), (h * 4) as u64),
+                ],
+                [ad.x, ad.y, ad.z],
+            )?;
+        }
+        prof::end_phase();
+        Ok(())
+    }
+
+    /// One chunk end to end: host staging, the layer walk (with one MoE ids
+    /// fence per layer), the end-of-chunk flush, and the PLE ring hand-back.
+    /// Leaves each token's final hyper residual in the `h` rows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the chunk driver owns the split state"
+    )]
+    fn run_chunk(
+        &mut self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        rl: &DevResidentLinAttn<'ctx>,
+        cfg: &Qwen4ExpConfig,
+        hc: &HyperConnectionConfig,
+        state: &mut Qwen4ExpState,
+        seed: &[f32],
+        ple_emb: &[f32],
+        t: usize,
+        start_pos: usize,
+    ) -> Result<()> {
+        ensure!(t >= 1 && t <= self.max_tokens, "chunk of {t} tokens");
+        ensure!(seed.len() == t * hc.hc_hidden(), "seed length");
+        let s = self.slots;
+        let kv_len = start_pos + t;
+
+        {
+            let _st = prof::stage("pf.stage_host");
+            self.write_f32_at(s.h, seed)?;
+            let pos_bytes: Vec<u8> = (0..t)
+                .flat_map(|i| ((start_pos + i) as i32).to_le_bytes())
+                .collect();
+            self.write_bytes_at(s.pos, &pos_bytes)?;
+            self.write_bytes_at(s.mask, &pf_causal_mask(t, kv_len, start_pos))?;
+            if !ple_emb.is_empty() {
+                self.write_f32_at(s.emb, ple_emb)?;
+            }
+            // Host-canonical PLE ring (oldest-first == ring_pos 0) into the
+            // decode arena's slot; the seq-mode conv advances it in place.
+            // `one` feeds the alias-safe `h += 1.0 * ple_out` accumulate.
+            dev.write_f32(dev.slots.one, &[1.0])?;
+            for (_, ring) in state.ple_conv.iter() {
+                dev.write_f32(dev.slots.ple_ring, ring.rows())?;
+            }
+        }
+
+        for layer in 0..cfg.num_hidden_layers {
+            if cfg.is_ple_layer(layer) {
+                ensure!(!ple_emb.is_empty(), "PLE layer {layer} with no embeddings");
+                self.record_ple(dev, weights, cfg, layer, t)?;
+                dev.barrier();
+            }
+            self.record_hc_pre(dev, weights, hc, Some(layer), HcSite::Attn, t)?;
+            dev.barrier();
+            match cfg.layer_types[layer] {
+                Qwen4LayerType::LinearAttention => {
+                    self.record_linear(dev, weights, rl, cfg, layer, t)?;
+                }
+                Qwen4LayerType::FullAttention => {
+                    self.record_full(dev, weights, cfg, layer, t, start_pos)?;
+                }
+            }
+            dev.barrier();
+            self.record_hc_combine(
+                dev,
+                weights,
+                hc,
+                Some(layer),
+                HcSite::Attn,
+                s.y,
+                cfg.hidden_size,
+                t,
+            )?;
+            dev.barrier();
+            self.record_hc_pre(dev, weights, hc, Some(layer), HcSite::Mlp, t)?;
+            dev.barrier();
+            self.record_moe(dev, weights, cfg, layer, t)?;
+            dev.barrier();
+            self.record_hc_combine(
+                dev,
+                weights,
+                hc,
+                Some(layer),
+                HcSite::Mlp,
+                s.acc,
+                cfg.hidden_size,
+                t,
+            )?;
+            dev.barrier();
+        }
+        dev.flush()?;
+
+        // The ring after `t` in-place steps: the next write slot is `t %
+        // state_len`, which is also the oldest row — one rotation restores the
+        // host's oldest-first layout (the `t = 1` case is `finish_ple`'s).
+        for (_, ring) in state.ple_conv.iter_mut() {
+            let pc = ple_config(cfg);
+            let hh = pc.hc_hidden();
+            let state_len = pc.short_conv_state_len();
+            let dev_ring = dev.read_f32(dev.slots.ple_ring, state_len * hh)?;
+            let rows = ring.rows_mut();
+            for i in 0..state_len {
+                let src = (i + t) % state_len;
+                rows[i * hh..(i + 1) * hh].copy_from_slice(&dev_ring[src * hh..(src + 1) * hh]);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
+    /// Why [`Self::forward_prompt`] would refuse, or `None` when it can run.
+    /// The batched path requires every stage of every layer device-resident
+    /// (the same bar as the staged decode loop, minus `lm_head` and the
+    /// mixer, which fall back to their decode routes for the one final token).
+    #[must_use]
+    pub fn prefill_unsupported_reason(&self) -> Option<String> {
+        let (Some(d), Some(w), Some(rl)) = (
+            self.dev.as_ref(),
+            self.weights.as_ref(),
+            self.resident_linear.as_ref(),
+        ) else {
+            return Some("no device residency (host-only mode)".into());
+        };
+        if self.cfg.ple_layer_ids.len() > 1 {
+            return Some("more than one PLE layer (single ring slot)".into());
+        }
+        for l in 0..self.cfg.num_hidden_layers {
+            for site in [HcSite::Attn, HcSite::Mlp] {
+                if let Err(e) = w.hyper_connection(Some(l), site) {
+                    return Some(format!("layer {l}: {e}"));
+                }
+            }
+            if let Err(e) = w.expert_stack(l, ExpertProj::Gate) {
+                return Some(format!("layer {l}: {e}"));
+            }
+            for sfx in [
+                "mlp.gate.weight",
+                "mlp.shared_expert_gate.weight",
+                "mlp.shared_expert.gate_proj.weight",
+                "mlp.shared_expert.up_proj.weight",
+                "mlp.shared_expert.down_proj.weight",
+            ] {
+                match w.tensor(&layer_tensor_name(l, sfx)) {
+                    Err(e) => return Some(format!("layer {l}: {e}")),
+                    Ok(t) if t.format == Qwen4DeviceFormat::Nvfp4 => {
+                        return Some(format!("layer {l}: `{sfx}` is NVFP4"));
+                    }
+                    Ok(_) => {}
+                }
+            }
+            match self.cfg.layer_types[l] {
+                Qwen4LayerType::LinearAttention => {
+                    if !rl.covers(l) {
+                        return Some(format!("layer {l}: linear attention not resident"));
+                    }
+                }
+                Qwen4LayerType::FullAttention => {
+                    if !d.full_attention_ready(w, l) {
+                        return Some(format!("layer {l}: full attention not device-ready"));
+                    }
+                }
+            }
+            if self.cfg.is_ple_layer(l) {
+                for sfx in ["ple.key_proj.weight", "ple.value_proj.weight"] {
+                    if let Err(e) = w.tensor(&layer_tensor_name(l, sfx)) {
+                        return Some(format!("layer {l}: {e}"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Batched prefill of `tokens` at the default chunk width
+    /// ([`qwen4_prefill_chunk_tokens`]). Returns the LAST token's logits —
+    /// the value the per-token loop's final [`Self::forward_token`] would
+    /// return — and advances every piece of recurrent state (device GDN S +
+    /// conv rings, KV planes, PLE ring, n-gram context, `seq_len`) exactly as
+    /// `tokens.len()` decode steps would. `tests/qwen4_prefill.rs` pins that
+    /// equality; a prefill that diverges from decode is a wrong prefill.
+    pub fn forward_prompt(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        self.forward_prompt_chunked(slot, tokens, start_pos, qwen4_prefill_chunk_tokens())
+    }
+
+    /// The executor's batched entry point: `None` when the batched path is
+    /// unavailable (the caller falls back to the per-token loop).
+    pub fn forward_tokens(
+        &mut self,
+        slot: usize,
+        _epoch: u64,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        if tokens.len() < 2 {
+            return Ok(None);
+        }
+        if let Some(reason) = self.prefill_unsupported_reason() {
+            log::info!("qwen4_exp batched prefill unavailable: {reason}");
+            return Ok(None);
+        }
+        self.forward_prompt(slot, tokens, start_pos).map(Some)
+    }
+
+    /// [`Self::forward_prompt`] at an explicit chunk width (the equivalence
+    /// test drives uneven multi-chunk splits through this).
+    pub fn forward_prompt_chunked(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        start_pos: usize,
+        chunk_width: usize,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            slot == 0,
+            "qwen4_exp Vulkan lane is single-slot (got slot {slot})"
+        );
+        ensure!(!tokens.is_empty(), "forward_prompt with no tokens");
+        for &tok in tokens {
+            ensure!(
+                (tok as usize) < self.cfg.vocab_size,
+                "token {tok} outside the vocab"
+            );
+        }
+        ensure!(
+            start_pos + tokens.len() <= self.cfg.max_context,
+            "prompt end {} > max_context {} (the cap that keeps the QSA dense stub exact)",
+            start_pos + tokens.len(),
+            self.cfg.max_context
+        );
+        if let Some(reason) = self.prefill_unsupported_reason() {
+            bail!("qwen4_exp batched prefill unavailable: {reason}");
+        }
+        if start_pos == 0 && self.state.seq_len != 0 {
+            self.state = Qwen4ExpState::new(&self.cfg, &self.hash);
+            if let Some(rl) = self.resident_linear.as_mut() {
+                rl.reset()?;
+            }
+        }
+        ensure!(
+            start_pos == self.state.seq_len,
+            "forward_prompt at {start_pos} but the state holds {} tokens",
+            self.state.seq_len
+        );
+        let width = chunk_width.clamp(1, 1024);
+        if self.prefill.as_ref().is_none_or(|p| p.max_tokens() < width) {
+            let ctx = self.dev.as_ref().expect("checked resident").ctx;
+            self.prefill = Some(Qwen4Prefill::new(ctx, &self.cfg, &self.hc, width)?);
+        }
+
+        let _prompt = prof::stage("prompt");
+        let t0 = std::time::Instant::now();
+        let mut pos = start_pos;
+        for chunk in tokens.chunks(width) {
+            let t = chunk.len();
+            let toks_i64: Vec<i64> = chunk.iter().map(|&v| i64::from(v)).collect();
+            let ple_emb = if self.cfg.ple_layer_ids.is_empty() {
+                Vec::new()
+            } else {
+                let _g = prof::stage("pf.ngram_gather");
+                let ids = self.hash.row_ids(&self.state.ngram, &toks_i64)?;
+                self.gather_ple_embedding(&ids)?
+            };
+            self.state.ngram.push(&toks_i64);
+            let seed = {
+                let _e = prof::stage("pf.embed_seed");
+                let mut seed = Vec::with_capacity(t * self.hc.hc_hidden());
+                for &tok in chunk {
+                    let embed = self.tables.embed_row(tok as usize)?;
+                    seed.extend(qwen4_hc::seed_hyper_state(&self.hc, &embed)?);
+                }
+                seed
+            };
+            let Self {
+                cfg,
+                hc,
+                dev,
+                weights,
+                resident_linear,
+                state,
+                prefill,
+                ..
+            } = self;
+            let d = dev.as_mut().expect("checked resident");
+            let w = weights.as_ref().expect("checked resident");
+            let rl = resident_linear.as_ref().expect("checked resident");
+            prefill
+                .as_mut()
+                .expect("built above")
+                .run_chunk(d, w, rl, cfg, hc, state, &seed, &ple_emb, t, pos)?;
+            state.seq_len += t;
+            pos += t;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        log::info!(
+            "qwen4_exp batched prefill: {} tok @ {start_pos} in {secs:.3}s ({:.1} tok/s, chunk={width})",
+            tokens.len(),
+            tokens.len() as f64 / secs.max(f64::MIN_POSITIVE),
+        );
+
+        // Tail: mixer + lm_head for the LAST token only, through the decode
+        // routes (device when resident, host otherwise — same split as
+        // `forward_token`'s tail).
+        let _tail = prof::stage("pf.tail");
+        let t_last = (tokens.len() - 1) % width; // index within the final chunk
+        let hh = self.hc.hc_hidden();
+        let last_h = {
+            let p = self.prefill.as_ref().expect("built above");
+            p.read_f32_at(Qwen4Prefill::row(p.slots.h, t_last, hh), hh)?
+        };
+        let mixer_dev = self
+            .weights
+            .as_ref()
+            .is_some_and(|w| self.dev.is_some() && w.hyper_connection(None, HcSite::Mixer).is_ok());
+        let x = if mixer_dev {
+            let d = self.dev.as_mut().expect("mixer_dev checked");
+            let w = self.weights.as_ref().expect("mixer_dev checked");
+            d.hc_pre(w, &self.hc, None, HcSite::Mixer, &last_h)?
+        } else {
+            qwen4_hc::gated_residual(&self.hc, &self.mixer, &last_h)?.block_input
+        };
+        match self.dev.as_mut().zip(self.weights.as_ref()) {
+            Some((d, w)) => DenseGemv::new(d, w).matvec(&self.lm_head, &x),
+            None => Ok(self.lm_head.matvec(&x)),
+        }
+    }
+
+    /// The resident linear-attention state, for the equivalence harness.
+    #[must_use]
+    pub fn resident_linear(&self) -> Option<&DevResidentLinAttn<'ctx>> {
+        self.resident_linear.as_ref()
+    }
+
+    /// The device runner (immutable), for the equivalence harness.
+    #[must_use]
+    pub fn dev_ref(&self) -> Option<&Qwen4Dev<'ctx>> {
+        self.dev.as_ref()
+    }
+}
+
+impl<'ctx> Qwen4Dev<'ctx> {
+    /// One cached K or V row (`head_dim` f16 values, decoded to f32) — the
+    /// equivalence harness diffs prefill-written and decode-written KV planes
+    /// with this. UMA/WC host reads are the documented ~0.10 GB/s trap, which
+    /// a few hundred 512-B rows do not feel.
+    pub fn read_kv_row(
+        &self,
+        layer: usize,
+        kv_head: usize,
+        pos: usize,
+        is_v: bool,
+    ) -> Result<Vec<f32>> {
+        let kv = self
+            .kv
+            .as_ref()
+            .ok_or_else(|| anyhow!("no device KV cache"))?;
+        let full_idx = *self
+            .full_idx
+            .get(&layer)
+            .ok_or_else(|| anyhow!("layer {layer} has no device KV plane"))?;
+        let plane = if is_v {
+            kv.v_plane(full_idx, kv_head)
+        } else {
+            kv.k_plane(full_idx, kv_head)
+        };
+        let hd = kv.head_dim;
+        let mut bytes = vec![0u8; hd * 2];
+        kv.buffer
+            .copy_to_host_at(kv.row(plane, pos), &mut bytes)
+            .map_err(|e| anyhow!("read KV row: {e}"))?;
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|c| infer_gguf::dequant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect())
     }
 }
 
@@ -4491,5 +6481,121 @@ mod tests {
         );
         // `out_proj` / `o_proj` are the widest contraction (6144).
         const { assert!(DENSE_X_ELEMS >= 6_144, "widest dense activation") };
+    }
+
+    /// Host simulation of `qwen4_block_perm.comp`: dst block `i` <- src block
+    /// `map[i]`.
+    fn apply_block_perm(src: &[f32], map: &[u32], block: usize, out_len: usize) -> Vec<f32> {
+        let mut dst = vec![f32::NAN; out_len];
+        for (i, &m) in map.iter().enumerate() {
+            for j in 0..block {
+                dst[i * block + j] = src[m as usize * block + j];
+            }
+        }
+        dst
+    }
+
+    /// The chunk-wide permutation maps must agree, token for token, with the
+    /// per-token maps decode uses (`qkv_channel_to_hf` / `v_slot_perm`) —
+    /// including the `ab` region's compact-from-padded-rows contract and the
+    /// inverse map. An off-by-one here produces finite activations from the
+    /// wrong head, which only the device equivalence test would catch (a full
+    /// model load away); this pins it at unit scale.
+    #[test]
+    fn pf_chunk_maps_match_the_per_token_maps() {
+        let cfg = mini_cfg();
+        let nv = cfg.linear_num_value_heads;
+        let nk = cfg.linear_num_key_heads;
+        let vd = cfg.linear_value_head_dim;
+        let conv_dim = cfg.linear_conv_dim();
+        let qkv_blocks = conv_dim / vd;
+        let max_tokens = 3usize;
+        let (flat, offs) = pf_chunk_maps(&cfg, max_tokens);
+        let [qkv_at, v_at, ab_at, vinv_at] = offs;
+
+        // Every region base is 64-element (256-B) aligned.
+        for at in offs {
+            assert_eq!(at % 64, 0, "map region at element {at} is misaligned");
+        }
+
+        // qkv: chunk perm == per-token HF gather.
+        let hf: Vec<f32> = (0..max_tokens * conv_dim).map(|i| i as f32).collect();
+        let map = &flat[qkv_at..qkv_at + max_tokens * qkv_blocks];
+        let dev = apply_block_perm(&hf, map, vd, max_tokens * conv_dim);
+        for t in 0..max_tokens {
+            for c in 0..conv_dim {
+                assert_eq!(
+                    dev[t * conv_dim + c],
+                    hf[t * conv_dim + qkv_channel_to_hf(&cfg, c)],
+                    "qkv map: token {t} channel {c}"
+                );
+            }
+        }
+
+        // v (z): slot s holds HF head perm(s).
+        let hf: Vec<f32> = (0..max_tokens * nv * vd).map(|i| i as f32).collect();
+        let map = &flat[v_at..v_at + max_tokens * nv];
+        let dev = apply_block_perm(&hf, map, vd, max_tokens * nv * vd);
+        for t in 0..max_tokens {
+            for slot in 0..nv {
+                let orig = v_slot_perm(nk, nv, slot);
+                assert_eq!(
+                    dev[(t * nv + slot) * vd],
+                    hf[(t * nv + orig) * vd],
+                    "v map: token {t} slot {slot}"
+                );
+            }
+        }
+
+        // ab: compacts PF_AB_PAD-strided rows into packed slot order.
+        let padded: Vec<f32> = (0..max_tokens * PF_AB_PAD).map(|i| i as f32).collect();
+        let map = &flat[ab_at..ab_at + max_tokens * nv];
+        let dev = apply_block_perm(&padded, map, 1, max_tokens * nv);
+        for t in 0..max_tokens {
+            for slot in 0..nv {
+                let orig = v_slot_perm(nk, nv, slot);
+                assert_eq!(
+                    dev[t * nv + slot],
+                    padded[t * PF_AB_PAD + orig],
+                    "ab map: token {t} slot {slot}"
+                );
+            }
+        }
+
+        // vinv: undoes the v map, per token.
+        let slotted: Vec<f32> = (0..max_tokens * nv * vd).map(|i| i as f32).collect();
+        let map = &flat[vinv_at..vinv_at + max_tokens * nv];
+        let dev = apply_block_perm(&slotted, map, vd, max_tokens * nv * vd);
+        for t in 0..max_tokens {
+            let per_token = unpermute_v_vec(&cfg, &slotted[t * nv * vd..(t + 1) * nv * vd]);
+            assert_eq!(
+                &dev[t * nv * vd..(t + 1) * nv * vd],
+                per_token.as_slice(),
+                "vinv map: token {t}"
+            );
+        }
+    }
+
+    /// Mask row `r` (absolute position `start_pos + r`) must allow keys
+    /// `0..=start_pos + r` and block the rest — the boundary column is where a
+    /// look-ahead leak would live.
+    #[test]
+    fn pf_causal_mask_allows_exactly_the_visible_prefix() {
+        let (t, start_pos) = (3usize, 5usize);
+        let kv_len = start_pos + t;
+        let mask = pf_causal_mask(t, kv_len, start_pos);
+        assert_eq!(mask.len(), t * kv_len * 2);
+        for r in 0..t {
+            for c in 0..kv_len {
+                let at = (r * kv_len + c) * 2;
+                let bits = u16::from_le_bytes([mask[at], mask[at + 1]]);
+                let want = if c <= start_pos + r {
+                    PF_F16_ZERO
+                } else {
+                    PF_F16_NEG_INF
+                };
+                assert_eq!(bits, want, "row {r} col {c}");
+            }
+        }
     }
 }

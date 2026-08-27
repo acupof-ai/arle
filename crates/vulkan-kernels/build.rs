@@ -73,6 +73,35 @@ const MM_CM_DEFINES_Q8_0: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q8_0", "
 /// 2`), so 1 is correct here where the quants need their dequant width.
 const MM_CM_DEFINES_F16: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_F16", "1");
 
+/// BF16 A, F16 B — spelled out rather than routed through
+/// `mm_coopmat_defines!` because its decode is asymmetric. `types.glsl` gives
+/// `DATA_A_BF16` an `A_TYPE uint16_t` at `LOAD_VEC_A 1` (raw bits, bf16 has no
+/// GLSL scalar), so every A load must decode through `TO_FLOAT_TYPE` — the
+/// default (`FLOAT_TYPE`, a numeric cast of the INTEGER bits) is silent
+/// garbage. Upstream routes B through the SAME macro, which would force bf16
+/// activations (2^-8 rounding — measured to compound to an argmax flip over
+/// 48 layers); the vendored `TO_FLOAT_TYPE_B` seam (ARLE patch, defaulting to
+/// `TO_FLOAT_TYPE`) lets B stay plain f16 (2^-11), staged by the same
+/// `f16_kv_pack` every other coopmat GEMM takes. `TO_FLOAT_TYPE` is a
+/// function-like macro so the `uint16_t -> uint32_t` widening is explicit —
+/// `bf16_to_fp32` takes `uint32_t`, and only `GL_EXT_shader_16bit_storage`
+/// (constructor conversions, no implicit ones) is enabled in this shader.
+const MM_CM_DEFINES_BF16: &[(&str, &str)] = &[
+    ("FLOAT16", "1"),
+    ("FLOAT_TYPE", "float16_t"),
+    ("FLOAT_TYPEV2", "f16vec2"),
+    ("FLOAT_TYPEV4", "f16vec4"),
+    ("ACC_TYPE", "float"),
+    ("ACC_TYPEV2", "vec2"),
+    ("COOPMAT", "1"),
+    ("DATA_A_BF16", "1"),
+    ("LOAD_VEC_A", "1"),
+    ("B_TYPE", "float16_t"),
+    ("D_TYPE", "float"),
+    ("TO_FLOAT_TYPE(x)", "bf16_to_fp32(uint(x))"),
+    ("TO_FLOAT_TYPE_B(x)", "(x)"),
+];
+
 /// Shared `mul_mat_vec.comp` define set for the two NVFP4 GEMVs. `MUL_MAT_ID`
 /// is the ONLY difference between the plain and the fused-expert variant, so it
 /// is passed as an extra rather than duplicated into a second literal list.
@@ -423,6 +452,14 @@ const VENDORED: &[ShaderSpec] = &[
         name: "mul_mm_cm_q8_0",
         source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
         defines: MM_CM_DEFINES_Q8_0,
+    },
+    // BF16 A *and* B on the matrix cores — the batched (prefill) arm of the
+    // verbatim-BF16 dense tier, whose k=1 arm is `mul_mat_vec_bf16`. See
+    // `MM_CM_DEFINES_BF16` for why B is bf16 bits here and not f16.
+    ShaderSpec {
+        name: "mul_mm_cm_bf16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_BF16,
     },
     ShaderSpec {
         name: "rms_norm",

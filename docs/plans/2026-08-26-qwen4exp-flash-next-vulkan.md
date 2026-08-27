@@ -280,6 +280,7 @@ into "measured". Build it before chasing the first token, not after.
 | S4 ✅ | fused hyper-connection + PLE kernels vs host oracles | done |
 | S5 ✅ | PLE + n-gram → **first token** (indexer stubbed, ≤2048 ctx) | done |
 | perf ✅ | decode 899 → 84.9 ms/token: resident linattn/PLE/full-attn, staged loop (50 fences), BF16 tiers | done |
+| prefill ✅ | chunked `forward_prompt` 11.8 → 31 tok/s, prefill=decode BIT-EXACT at full scale (0.000e0): seq-mode linattn/PLE, batched flash, chunk perm maps, per-token MoE + one ids fence per layer-chunk (87% of wall — S7's grouped experts are the 100 tok/s lever). Coopmat BF16 GEMM lane (61 tok/s) opt-in `ARLE_QWEN4_PREFILL_GEMM=1`: any sub-f32 staging saturates to an argmax flip at 48 layers (expert-flip boundaries) | done |
 | S6 | QSA indexer → contexts >2051 | 40 h |
 | S7 | requantize experts (Q8_0 returns MTP+vision); batched MoE prefill + verify (cols k≤8 / WMMA k≥16, measured) | 40 h |
 | S8 | MTP speculative decode (needs S7's batched verify) | 20 h |

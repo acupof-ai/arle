@@ -323,6 +323,14 @@ pub enum Kernel {
     /// and the crossover between them is measured, not assumed
     /// (`device_batched_crossover.rs`).
     MmCmF16,
+    /// Verbatim-BF16 weights on the matrix cores — the batched arm of the
+    /// BF16 dense tier (k=1 arm: [`Kernel::GemvBf16`]). A decodes raw bf16
+    /// bits; B is PLAIN F16 rows ([`Kernel::F16KvPack`] staging, same as
+    /// every other coopmat GEMM) through the vendored `TO_FLOAT_TYPE_B` seam
+    /// — upstream's single `TO_FLOAT_TYPE` would force bf16 B, whose 2^-8
+    /// activation rounding measurably compounds to an argmax flip over the
+    /// 48-layer qwen4_exp prefill where f16's 2^-11 does not.
+    MmCmBf16,
     QuantizeQ8_1,
     RmsNorm,
     RopeNeox,
@@ -512,6 +520,7 @@ impl Kernel {
         Self::MmCmQ5K,
         Self::MmCmQ6K,
         Self::MmCmQ8_0,
+        Self::MmCmBf16,
         Self::QuantizeQ8_1,
         Self::RmsNorm,
         Self::RopeNeox,
@@ -576,6 +585,7 @@ impl Kernel {
             Kernel::MmCmQ5K => "mul_mm_cm_q5_k",
             Kernel::MmCmQ6K => "mul_mm_cm_q6_k",
             Kernel::MmCmQ8_0 => "mul_mm_cm_q8_0",
+            Kernel::MmCmBf16 => "mul_mm_cm_bf16",
             Kernel::QuantizeQ8_1 => "q8_1_quantize",
             Kernel::RmsNorm => "rms_norm",
             Kernel::RopeNeox => "rope_neox",
@@ -675,7 +685,8 @@ impl Kernel {
             | Kernel::MmCmQ5K
             | Kernel::MmCmQ6K
             | Kernel::MmCmQ8_0
-            | Kernel::MmCmF16 => &[],
+            | Kernel::MmCmF16
+            | Kernel::MmCmBf16 => &[],
         }
     }
 
@@ -744,7 +755,8 @@ impl Kernel {
             | Kernel::MmCmQ5K
             | Kernel::MmCmQ6K
             | Kernel::MmCmQ8_0
-            | Kernel::MmCmF16 => specialization_u32
+            | Kernel::MmCmF16
+            | Kernel::MmCmBf16 => specialization_u32
                 .iter()
                 .find(|&&(id, _)| id == MM_CM_WARP_SPEC_ID)
                 .map(|&(_, warp)| warp),
