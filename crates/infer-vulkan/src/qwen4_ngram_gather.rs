@@ -20,11 +20,16 @@
 //! *silent* way: the answer is bit-identical, only the token is milliseconds
 //! slower.
 //!
-//! `memmap2` exposes no `PrefetchVirtualMemory` on Windows, so there is no way
-//! to ask the OS to overlap the faults. The parallelism has to be explicit,
-//! hence the persistent worker pool in [`NgramGather`]. It is persistent
-//! because spawning threads costs more than the work: thread creation is tens
-//! of microseconds each on Windows, and the warm gather is 2.5 us in total.
+//! Two ways exist to get the reads outstanding together, and [`NgramGather`]
+//! carries both. On Windows, `PrefetchVirtualMemory` (not surfaced by
+//! `memmap2`, but one FFI declaration away — see `prefetch`) hands the kernel
+//! every row's range in a single syscall and lets it overlap the paging I/O;
+//! the rows are then read serially on the calling thread with no worker in
+//! sight. Everywhere else — and whenever that syscall is refused, or the
+//! batch is bigger than decode-sized — the persistent worker pool fans the
+//! reads out instead. The pool is persistent because spawning threads costs
+//! more than the work: thread creation is tens of microseconds each on
+//! Windows, and the warm gather is microseconds in total.
 //!
 //! # What the fan-out is actually worth, measured
 //!
@@ -64,6 +69,35 @@
 //! one: a device-local Vulkan allocation does not consume OS RAM on this box,
 //! so the page cache stays free to hold whatever of the table it can, and a
 //! read that hits it costs a few hundred nanoseconds with no syscall at all.
+//!
+//! # The 450x that was actually two different bugs (2026-08)
+//!
+//! The decode profile charged `host.ngram_gather` 4.7–5.5 ms/token while a
+//! standalone probe claimed 0.011 ms — a "450x regression". Measured apart,
+//! the gap was two artifacts and no mystery:
+//!
+//! * The forward's PLE stage was a serial `for` loop over single-row reads
+//!   (`gather_ple_embedding`), never this module's gather. That shape
+//!   measures 3.7–4.0 ms/token here, flat, ~245 us per first-touch row —
+//!   the profile's number, aggravated by device pressure.
+//! * The probe's 0.011 ms is the WARM serial number to the microsecond
+//!   (0.0108–0.0119 measured): it re-read page-cache-resident rows. Sixteen
+//!   hard faults cannot complete in 11 us on this NVMe.
+//!
+//! The fix table, decode shape (16 rows/token, fresh rows, Balanced scheme,
+//! back-to-back same sitting, fresh process per lane):
+//!
+//! ```text
+//!   serial (the forward's old loop)          3.7–4.0  ms/token
+//!   16-worker pool                           0.72–0.76 ms/token
+//!   PrefetchVirtualMemory + serial read      0.51–0.60 ms/token  <- gather's fast path
+//! ```
+//!
+//! The prefetch path also skips 16 thread wakes per token on a host thread
+//! that is already the decode bottleneck, and costs ~0.012 ms warm against
+//! the pool's ~0.034. `real_checkpoint_production_pattern_before_and_after`
+//! is this table's regression guard — and its salt comment records the
+//! cache-aliasing bug that briefly made the pool look 15x better than it is.
 //!
 //! # The scale is not optional
 //!
@@ -392,18 +426,13 @@ impl NgramTable {
         Ok(())
     }
 
-    /// Dequantize one row into `out`, which must be [`Self::row_width`] long.
+    /// One row's raw FP8 bytes, borrowed from the shard mmap — the shared
+    /// address arithmetic behind [`Self::read_row`] and the page prefetch.
     ///
     /// # Errors
     /// If `row` is negative or `>= total_rows` — see the module docs: that is a
     /// hash bug, not a table miss, and it is refused rather than zero-filled.
-    pub fn read_row(&self, row: i64, out: &mut [f32]) -> Result<()> {
-        ensure!(
-            out.len() == self.row_width,
-            "n-gram row destination is {} wide, want {}",
-            out.len(),
-            self.row_width
-        );
+    fn row_bytes(&self, row: i64) -> Result<&[u8]> {
         let row = u64::try_from(row).map_err(|_| {
             anyhow!(
                 "negative n-gram row id {row}: the hash cannot produce one, so this is a hash bug"
@@ -424,9 +453,23 @@ impl NgramTable {
             .map_err(|_| anyhow!("n-gram byte offset for row {row} overflows usize"))?;
 
         let data = self.st.tensor_data(&shard.name)?;
-        let src = data
-            .get(start..start + self.row_width)
-            .ok_or_else(|| anyhow!("n-gram row {row} runs past the end of `{}`", shard.name))?;
+        data.get(start..start + self.row_width)
+            .ok_or_else(|| anyhow!("n-gram row {row} runs past the end of `{}`", shard.name))
+    }
+
+    /// Dequantize one row into `out`, which must be [`Self::row_width`] long.
+    ///
+    /// # Errors
+    /// If `row` is negative or `>= total_rows` — see the module docs: that is a
+    /// hash bug, not a table miss, and it is refused rather than zero-filled.
+    pub fn read_row(&self, row: i64, out: &mut [f32]) -> Result<()> {
+        ensure!(
+            out.len() == self.row_width,
+            "n-gram row destination is {} wide, want {}",
+            out.len(),
+            self.row_width
+        );
+        let src = self.row_bytes(row)?;
         for (dst, &byte) in out.iter_mut().zip(src) {
             *dst = fp8_e4m3_to_f32(byte) * self.scale;
         }
@@ -527,6 +570,64 @@ fn read_scalar_scale(st: &SafeTensorsDir, info: &SafeTensorInfo) -> Result<f32> 
         "n-gram weight_scale is {scale}, which cannot be right"
     );
     Ok(scale)
+}
+
+// --------------------------------------------------------------------------
+// Windows page prefetch
+// --------------------------------------------------------------------------
+
+/// One `PrefetchVirtualMemory` call over a whole gather's rows.
+///
+/// `memmap2` exposes no prefetch on Windows, but the syscall is one FFI
+/// declaration away, and it is exactly the missing primitive: the kernel takes
+/// every row's range at once and overlaps the paging I/O itself, so the reads
+/// that follow fault softly — no worker threads, no wakes. Measured against
+/// the 16-worker pool at the decode shape in the module docs' fix table.
+#[cfg(windows)]
+mod prefetch {
+    use super::NgramTable;
+
+    /// `WIN32_MEMORY_RANGE_ENTRY`.
+    #[repr(C)]
+    struct MemoryRangeEntry {
+        // Written for the kernel, never read from Rust — hence the allow.
+        #[allow(dead_code)]
+        virtual_address: *const std::ffi::c_void,
+        #[allow(dead_code)]
+        number_of_bytes: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn PrefetchVirtualMemory(
+            process: *mut std::ffi::c_void,
+            number_of_entries: usize,
+            virtual_addresses: *const MemoryRangeEntry,
+            flags: u32,
+        ) -> i32;
+    }
+
+    /// Ask the OS to page `row_ids`' bytes in, all ranges in one call.
+    ///
+    /// Advisory: `false` means the OS refused (or an id failed to resolve,
+    /// which validated callers never see) and the caller should gather some
+    /// other way — nothing has been read yet either way.
+    pub(super) fn rows(table: &NgramTable, row_ids: &[i64]) -> bool {
+        let mut ranges = Vec::with_capacity(row_ids.len());
+        for &id in row_ids {
+            let Ok(bytes) = table.row_bytes(id) else {
+                return false;
+            };
+            ranges.push(MemoryRangeEntry {
+                virtual_address: bytes.as_ptr().cast(),
+                number_of_bytes: bytes.len(),
+            });
+        }
+        // SAFETY: every range points into a shard mmap that `table` keeps
+        // alive across this call, and the kernel only reads the entries.
+        unsafe { PrefetchVirtualMemory(GetCurrentProcess(), ranges.len(), ranges.as_ptr(), 0) != 0 }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -661,12 +762,21 @@ impl NgramGather {
             .collect()
     }
 
-    /// Dequantize `row_ids` into `out` across the pool.
+    /// Dequantize `row_ids` into `out`, overlapping the page faults.
     ///
     /// Same layout as [`NgramTable::gather_rows`]: `out[r * row_width + j]`.
     /// For decode, `row_ids` is one token's `ngram_heads` ids and `out` is the
     /// `[ple_embed_dim]` vector the PLE layer wants. For prefill, pass every
     /// token's ids at once — the extra rows only deepen the queue.
+    ///
+    /// How the overlap happens is chosen here, per batch. On Windows a
+    /// decode-sized batch (at most one row per worker) goes through one
+    /// `PrefetchVirtualMemory` call and a serial read on the calling thread —
+    /// measured 1.3x faster cold than the pool at the 16-row decode shape
+    /// (0.51-0.60 vs 0.72-0.76 ms/token) and 2.4x cheaper warm (no 16 thread
+    /// wakes; see the module docs' fix table). Larger batches, other OSes, and
+    /// a refused syscall use the worker pool: prefill wants the workers'
+    /// parallel dequant, not just overlapped faults.
     ///
     /// # Errors
     /// If `out` is the wrong length, any id is out of range, the pool was
@@ -676,8 +786,7 @@ impl NgramGather {
             !self.poisoned,
             "n-gram gather pool was poisoned by an unanswered chunk; rebuild it"
         );
-        let width = self.table.row_width;
-        let want = row_ids.len() * width;
+        let want = row_ids.len() * self.table.row_width;
         ensure!(
             out.len() == want,
             "n-gram gather destination is {} long, want {want} for {} rows",
@@ -688,6 +797,21 @@ impl NgramGather {
             return Ok(());
         }
         self.table.validate_ids(row_ids)?;
+
+        #[cfg(windows)]
+        if row_ids.len() <= self.inbox.len() && prefetch::rows(&self.table, row_ids) {
+            return self.table.gather_rows(row_ids, out);
+        }
+
+        self.gather_pooled(row_ids, out)
+    }
+
+    /// The worker fan-out — `gather` minus the fast path, and the body it
+    /// falls back to. Callers guarantee what `gather` validated: `out` is
+    /// `row_ids.len() * row_width` long, every id is in range, and `row_ids`
+    /// is non-empty.
+    fn gather_pooled(&mut self, row_ids: &[i64], out: &mut [f32]) -> Result<()> {
+        let width = self.table.row_width;
 
         // Disjoint field borrows: the dispatch loop reads `inbox` while it pops
         // from `free`.
@@ -954,9 +1078,14 @@ mod synthetic_tests {
 
         for threads in [1usize, 3, 8, 16] {
             let mut pool = NgramGather::new(Arc::clone(&table), threads).expect("pool");
+            // Both doors: the public entry (whatever path it picks on this
+            // OS) and the worker fan-out it falls back to.
             let mut parallel = vec![0.0f32; ids.len() * 4];
             pool.gather(&ids, &mut parallel).expect("parallel");
-            assert_eq!(parallel, serial, "threads = {threads}");
+            assert_eq!(parallel, serial, "gather, threads = {threads}");
+            let mut pooled = vec![0.0f32; ids.len() * 4];
+            pool.gather_pooled(&ids, &mut pooled).expect("pooled");
+            assert_eq!(pooled, serial, "gather_pooled, threads = {threads}");
         }
         drop(table);
         std::fs::remove_dir_all(&dir).ok();
@@ -969,7 +1098,7 @@ mod synthetic_tests {
         let mut out = vec![0.0f32; 4 * 4];
         for round in 0..8u64 {
             let ids: Vec<i64> = (0..4).map(|k| ((round * 4 + k) % 16) as i64).collect();
-            pool.gather(&ids, &mut out).expect("gather");
+            pool.gather_pooled(&ids, &mut out).expect("gather");
             for (k, &row) in ids.iter().enumerate() {
                 assert_eq!(&out[k * 4..(k + 1) * 4], &expect_row(row as u64, 4)[..]);
             }
@@ -989,7 +1118,7 @@ mod synthetic_tests {
         assert_eq!(pool.threads(), 16);
         let ids: Vec<i64> = (0..16).collect();
         let mut out = vec![0.0f32; 16 * 4];
-        pool.gather(&ids, &mut out).expect("gather");
+        pool.gather_pooled(&ids, &mut out).expect("gather");
         let counts = pool.chunks_per_worker();
         assert_eq!(counts.len(), 16);
         assert!(
@@ -1000,13 +1129,41 @@ mod synthetic_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// If the collect loop ever stitched chunks by ARRIVAL order instead of by
+    /// `Chunk::first`, some round here would come back permuted: 16 one-row
+    /// chunks race home across 64 rounds, and arrival matching dispatch order
+    /// 64 times in a row is not a thing 16 OS threads do. Each round asks for
+    /// a different derangement of the same rows, so a permuted stitch cannot
+    /// accidentally reproduce the right answer either.
+    #[test]
+    fn synthetic_chunks_land_by_slot_not_by_arrival() {
+        let (dir, table) = build_table("order", &[16], 4);
+        let mut pool = NgramGather::new(Arc::new(table), 16).expect("pool");
+        let mut out = vec![0.0f32; 16 * 4];
+        for round in 0..64i64 {
+            // (5k + 3r + 7) mod 16: gcd(5, 16) = 1, so each round is a full
+            // permutation of the 16 rows, shifted every round.
+            let ids: Vec<i64> = (0..16).map(|k| (k * 5 + round * 3 + 7) % 16).collect();
+            pool.gather_pooled(&ids, &mut out).expect("gather");
+            for (slot, &row) in ids.iter().enumerate() {
+                assert_eq!(
+                    &out[slot * 4..(slot + 1) * 4],
+                    &expect_row(row as u64, 4)[..],
+                    "slot {slot} of round {round} holds the wrong row"
+                );
+            }
+        }
+        drop(pool);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn synthetic_fewer_rows_than_workers_still_covers_every_row() {
         let (dir, table) = build_table("short", &[64], 4);
         let mut pool = NgramGather::new(Arc::new(table), 16).expect("pool");
         let ids: Vec<i64> = vec![63, 5, 40];
         let mut out = vec![0.0f32; 3 * 4];
-        pool.gather(&ids, &mut out).expect("gather");
+        pool.gather_pooled(&ids, &mut out).expect("gather");
         for (k, &row) in ids.iter().enumerate() {
             assert_eq!(&out[k * 4..(k + 1) * 4], &expect_row(row as u64, 4)[..]);
         }
@@ -1339,6 +1496,193 @@ mod on_box_tests {
         drop(pool);
     }
 
+    /// Byte-for-byte replica of the decode path this module was measured
+    /// against: `model_qwen4_exp.rs::gather_ple_embedding` walks the row ids
+    /// in a serial `for` loop, allocating a fresh row `Vec` and extending —
+    /// 16 page-fault latencies paid one after another. Reproduced here so the
+    /// regression stays measurable from this file after that path is rewired.
+    fn production_replica(table: &NgramTable, ids: &[i64], per_row_us: &mut Vec<f64>) -> Vec<f32> {
+        let width = table.row_width();
+        let mut out = Vec::with_capacity(ids.len() * width);
+        for &id in ids {
+            let t = Instant::now();
+            let mut row = vec![0.0f32; width];
+            table.read_row(id, &mut row).expect("read row");
+            per_row_us.push(t.elapsed().as_secs_f64() * 1e6);
+            out.extend_from_slice(&row);
+        }
+        out
+    }
+
+    fn mean_ms(v: &[f64]) -> f64 {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+
+    fn median_ms(v: &[f64]) -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        s[s.len() / 2]
+    }
+
+    /// Where the decode profile's ~5 ms of `host.ngram_gather` went, and what
+    /// this module does to it — the before/after for the S7 rewire, at the
+    /// real decode pattern (16 rows x 160 B per token) against the real
+    /// `plefp8` shards.
+    ///
+    /// Three lanes, each on its own wall-clock-reseeded fresh rows:
+    /// the serial per-row-alloc loop the forward ran (BEFORE), the public
+    /// [`NgramGather::gather`] the rewire will call (AFTER — the prefetch
+    /// fast path on Windows), and the worker fan-out `gather` falls back to.
+    /// Every lane's warm pass re-reads its own rows out of the page cache —
+    /// the regime the "0.011 ms/token" standalone probe actually measured:
+    /// 16 hard faults cannot complete in 11 us on a DRAM-less NVMe, and the
+    /// warm serial number here lands on ~0.011 ms exactly.
+    #[test]
+    fn real_checkpoint_production_pattern_before_and_after() {
+        let Some(table) = open() else { return };
+        let width = table.row_width();
+        let heads = 16usize;
+        let tokens = 16usize;
+
+        // The lane salts must differ ABOVE bit 4. Seeds are `nonce ^ salt ^ t`
+        // with t < 16, so low-bit salts (0xA, 0xB, ...) alias into the SAME
+        // 16-seed set, every lane after the first re-reads the first lane's
+        // rows out of the page cache, and the bench reports cache-hit numbers
+        // as cold. That exact bug measured this pool at "0.047 ms/token cold"
+        // — 15x better than reality — before it was caught.
+        const SALT_SERIAL: u64 = 0xA0_0000;
+        const SALT_FAST: u64 = 0xB0_0000;
+        const SALT_POOL: u64 = 0xC0_0000;
+
+        let nonce = splitmix64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ u64::from(std::process::id()) << 40,
+        );
+        let batches = |salt: u64| -> Vec<Vec<i64>> {
+            (0..tokens)
+                .map(|t| {
+                    random_rows(
+                        splitmix64(nonce ^ salt ^ t as u64),
+                        heads,
+                        table.total_rows(),
+                    )
+                })
+                .collect()
+        };
+
+        // ── BEFORE: the serial shape `gather_ple_embedding` ran ──────────
+        let ids_serial = batches(SALT_SERIAL);
+        let mut row_us = Vec::with_capacity(tokens * heads);
+        let mut serial_cold = Vec::with_capacity(tokens);
+        for ids in &ids_serial {
+            let t = Instant::now();
+            std::hint::black_box(production_replica(&table, ids, &mut row_us));
+            serial_cold.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        row_us.sort_by(f64::total_cmp);
+        let (row_med, row_p95, row_max) = (
+            row_us[row_us.len() / 2],
+            row_us[row_us.len() * 95 / 100],
+            row_us[row_us.len() - 1],
+        );
+        let mut serial_warm = Vec::with_capacity(tokens);
+        for ids in &ids_serial {
+            let t = Instant::now();
+            std::hint::black_box(production_replica(&table, ids, &mut Vec::new()));
+            serial_warm.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+
+        // ── AFTER: the public gather (prefetch + serial read on Windows) ──
+        let ids_fast = batches(SALT_FAST);
+        let mut pool = NgramGather::new(Arc::clone(&table), DEFAULT_WORKERS).expect("pool");
+        let mut out = vec![0.0f32; heads * width];
+        let mut fast_cold = Vec::with_capacity(tokens);
+        for ids in &ids_fast {
+            let t = Instant::now();
+            pool.gather(ids, &mut out).expect("gather");
+            fast_cold.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut fast_warm = Vec::with_capacity(tokens);
+        for ids in &ids_fast {
+            let t = Instant::now();
+            pool.gather(ids, &mut out).expect("gather");
+            fast_warm.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        // Order-and-data oracle at checkpoint scale: whatever path `gather`
+        // took, its last answer must be the serial one, slot for slot.
+        let oracle = production_replica(&table, ids_fast.last().expect("ids"), &mut Vec::new());
+        assert_eq!(out, oracle, "gather disagrees with the serial oracle");
+
+        // ── the fallback: the worker fan-out, its own fresh rows ─────────
+        let ids_pool = batches(SALT_POOL);
+        let mut pool_cold = Vec::with_capacity(tokens);
+        for ids in &ids_pool {
+            let t = Instant::now();
+            pool.gather_pooled(ids, &mut out).expect("pooled gather");
+            pool_cold.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let oracle = production_replica(&table, ids_pool.last().expect("ids"), &mut Vec::new());
+        assert_eq!(
+            out, oracle,
+            "gather_pooled disagrees with the serial oracle"
+        );
+        let counts = pool.chunks_per_worker();
+        drop(pool);
+
+        eprintln!(
+            "n-gram production pattern ({heads} rows/tok, {tokens} tokens, fresh rows/lane):\n\
+             \x20 BEFORE serial gather_ple_embedding shape: cold first {:.3} / med {:.3} / mean {:.3} ms/tok \
+             (per-row us med {row_med:.0} p95 {row_p95:.0} max {row_max:.0}), warm mean {:.4}\n\
+             \x20 AFTER  public gather:  cold first {:.3} / med {:.3} / mean {:.3} ms/tok, warm mean {:.4}  ({:.1}x cold mean)\n\
+             \x20 fallback worker pool:  cold first {:.3} / med {:.3} / mean {:.3} ms/tok",
+            serial_cold[0],
+            median_ms(&serial_cold),
+            mean_ms(&serial_cold),
+            mean_ms(&serial_warm),
+            fast_cold[0],
+            median_ms(&fast_cold),
+            mean_ms(&fast_cold),
+            mean_ms(&fast_warm),
+            mean_ms(&serial_cold) / mean_ms(&fast_cold).max(f64::MIN_POSITIVE),
+            pool_cold[0],
+            median_ms(&pool_cold),
+            mean_ms(&pool_cold),
+        );
+
+        // Structural. On Windows the fast lanes must NOT have reached the
+        // workers — if they did, `PrefetchVirtualMemory` refused and the
+        // "AFTER" numbers above are secretly pool numbers. Elsewhere all
+        // three pool passes went through the workers.
+        let expect = if cfg!(windows) { tokens } else { 3 * tokens } as u64;
+        assert!(
+            counts.iter().all(|&c| c == expect),
+            "each worker should hold {expect} chunks, got {counts:?}"
+        );
+        // Same cold gate as `real_checkpoint_gather_scales_with_threads`:
+        // ratios are only asserted when the serial baseline proves it faulted.
+        const COLD_MS: f64 = 0.4;
+        if mean_ms(&serial_cold) > COLD_MS {
+            for (name, lane) in [("gather", &fast_cold), ("gather_pooled", &pool_cold)] {
+                assert!(
+                    mean_ms(lane) * 2.0 < mean_ms(&serial_cold),
+                    "{name} gave {:.3} ms/tok against {:.3} ms/tok serial — \
+                     the overlap is not delivering at the production pattern",
+                    mean_ms(lane),
+                    mean_ms(&serial_cold)
+                );
+            }
+        } else {
+            eprintln!(
+                "note: serial replica ran {:.3} ms/tok, under the {COLD_MS} ms cold gate — \
+                 cached rows, ratios not asserted",
+                mean_ms(&serial_cold)
+            );
+        }
+    }
+
     /// The regression the module exists to prevent, and the only honest way to
     /// see it.
     ///
@@ -1392,11 +1736,15 @@ mod on_box_tests {
         }
         let serial_ms = start.elapsed().as_secs_f64() * 1e3 / tokens as f64;
 
+        // `gather_pooled`, not `gather`: this test is the WORKER FAN-OUT's
+        // regression guard, and on Windows the public entry would route these
+        // decode-sized batches through the prefetch fast path instead. The
+        // fast path has its own before/after test below.
         let parallel_batches = batches(0xBE_EF77);
         let mut pool = NgramGather::new(Arc::clone(&table), DEFAULT_WORKERS).expect("pool");
         let start = Instant::now();
         for ids in &parallel_batches {
-            pool.gather(ids, &mut out).expect("parallel gather");
+            pool.gather_pooled(ids, &mut out).expect("parallel gather");
         }
         let parallel_ms = start.elapsed().as_secs_f64() * 1e3 / tokens as f64;
         let counts = pool.chunks_per_worker();
