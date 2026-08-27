@@ -147,6 +147,7 @@ impl VulkanLoadedModel {
     ) -> Result<Option<Vec<f32>>> {
         match self {
             Self::Qwen35(model) => model.forward_tokens(slot, epoch, tokens, start_pos),
+            Self::Qwen4Exp(model) => model.forward_tokens(slot, epoch, tokens, start_pos),
             _ => Ok(None),
         }
     }
