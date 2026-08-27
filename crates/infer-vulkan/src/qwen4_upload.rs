@@ -231,6 +231,13 @@ pub enum Qwen4DeviceFormat {
     F16,
     /// IEEE binary32.
     F32,
+    /// ggml `block_q8_0`: f16 scale + 32 int8 per 32 values, 34 B/block —
+    /// quantized AT LOAD from the checkpoint's BF16 by the ggml-exact
+    /// `quantize_q8_0_from_bf16`. Halves the dense bytes at a measured
+    /// 6.6-7.4e-3 output vector-rel cost per tensor; consumed by GemvQ8_0,
+    /// whose B operand is `block_q8_1_x4` activations (one QuantizeQ8_1
+    /// dispatch per distinct width per token).
+    Q8_0,
     /// ggml `block_nvfp4`: four UE4M3 sub-block scales then 32 packed E2M1
     /// nibble bytes per 64 values, 36 B/block.
     Nvfp4,
@@ -246,6 +253,12 @@ impl Qwen4DeviceFormat {
     pub const fn bytes_for(self, ncols: usize, nrows: usize) -> Option<u64> {
         match self {
             Self::Bf16 | Self::F16 => Some((ncols * nrows * 2) as u64),
+            Self::Q8_0 => {
+                if ncols == 0 || !ncols.is_multiple_of(32) {
+                    return None;
+                }
+                Some((ncols / 32 * 34 * nrows) as u64)
+            }
             Self::F32 => Some((ncols * nrows * 4) as u64),
             Self::Nvfp4 => match nvfp4_row_bytes(ncols) {
                 Some(row) => Some((row * nrows) as u64),
@@ -303,7 +316,12 @@ pub fn device_format(kind: Qwen4TensorKind, dense: Qwen4DeviceFormat) -> Option<
             part: HcPart::MixDown | HcPart::MixUp | HcPart::BlockInject,
             ..
         } => Some(match dense {
-            Qwen4DeviceFormat::Bf16 => Qwen4DeviceFormat::Bf16,
+            // Verbatim BF16 rides the qwen4_hc_*_bf16 kernel variants; a
+            // Q8_0 dense tier keeps the mix tensors at BF16 too (there is no
+            // Q8 arm of those shaders, and 1.27 GB/token of BF16 beats
+            // 2.5 GB of F32). Only the float-converting configs (the
+            // harness's F32 subset) keep F32.
+            Qwen4DeviceFormat::Bf16 | Qwen4DeviceFormat::Q8_0 => Qwen4DeviceFormat::Bf16,
             _ => F32,
         }),
 
@@ -2297,6 +2315,15 @@ pub fn upload_qwen4<'ctx, 'st>(
                             dst.len()
                         );
                         dst.copy_from_slice(src);
+                    }
+                    Qwen4DeviceFormat::Q8_0 => {
+                        ensure!(
+                            !*fold_bias,
+                            "{}: the 1+w fold needs a float format, not Q8_0",
+                            item.name
+                        );
+                        vulkan_kernels::quantize_q8_0_from_bf16(src, item.nrows, item.ncols, dst)
+                            .with_context(|| format!("{}: q8_0 quantize", item.name))?;
                     }
                     Qwen4DeviceFormat::F16 => write_bf16_as_f16(&item.name, src, dst)?,
                     Qwen4DeviceFormat::F32 => write_bf16_as_f32(&item.name, src, dst, *fold_bias)?,

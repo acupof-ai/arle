@@ -525,6 +525,12 @@ pub struct SafeTensorsDir {
     /// layout should not have to know the checkpoint was split.
     tensor_shard: Vec<usize>,
     index: HashMap<String, usize>,
+    /// The checkpoint directory, when opened through [`Self::open_dir`]
+    /// (`None` for an explicit file list). Consumers that need an OWNING
+    /// second view of the same checkpoint — the n-gram gather pool holds an
+    /// `Arc` where the model only borrows — reopen from here; the page cache
+    /// makes the second mmap free.
+    root: Option<PathBuf>,
 }
 
 impl SafeTensorsDir {
@@ -554,7 +560,15 @@ impl SafeTensorsDir {
             "no *.safetensors in {} — is this a checkpoint directory?",
             dir.display()
         );
-        Self::open_files(&paths)
+        let mut opened = Self::open_files(&paths)?;
+        opened.root = Some(dir.to_path_buf());
+        Ok(opened)
+    }
+
+    /// The directory this was opened from, if [`Self::open_dir`] was used.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// Open an explicit, ordered list of shards. Shard indices follow `paths`.
@@ -564,6 +578,7 @@ impl SafeTensorsDir {
             tensors: Vec::new(),
             tensor_shard: Vec::new(),
             index: HashMap::new(),
+            root: None,
         };
         for path in paths {
             out.absorb_shard(path)
