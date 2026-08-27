@@ -574,6 +574,12 @@ impl PleConvState {
     pub fn rows(&self) -> &[f32] {
         &self.rows
     }
+
+    /// The device PLE advances the ring on the GPU and hands it back; this is
+    /// how the host state stays canonical without re-deriving the shift.
+    pub fn rows_mut(&mut self) -> &mut [f32] {
+        &mut self.rows
+    }
 }
 
 /// `Qwen4ExpTextRMSNorm` with a `group_size`, one row at a time.

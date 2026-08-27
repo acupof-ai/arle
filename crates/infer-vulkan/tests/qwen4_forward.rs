@@ -337,13 +337,14 @@ fn parity_layers_0_1_3_device_vs_host() {
             //    norms fails this at ~2x, not at 1e-6.
             if let Some(ple) = &hl.ple {
                 let ring_before = ple_ring.rows().to_vec();
-                let dev_taps = dev
+                let (dev_out, dev_ring) = dev
                     .ple(&weights, &cfg, layer, &ple_emb, &h, &ring_before)
                     .expect("device ple");
                 let host_out = ple
                     .forward(&ple_emb, &h, &mut ple_ring, None)
                     .expect("host ple");
-                errs.note("ple.out", &dev_taps.out, &host_out);
+                errs.note("ple.out", &dev_out, &host_out);
+                errs.note("ple.ring", &dev_ring, ple_ring.rows());
                 for (hv, &ov) in h.iter_mut().zip(&host_out) {
                     *hv += ov;
                 }
@@ -550,6 +551,7 @@ fn parity_layers_0_1_3_device_vs_host() {
         ("linear.qkv_raw", 1e-3, 1e-4),
         ("linear.z", 1e-3, 1e-4),
         ("linear.conv_ring", 1e-3, 1e-4),
+        ("ple.ring", 1e-3, 1e-5),
         ("linear.qkv_conv", 2e-2, 1e-3),
         ("linear.core", 2e-2, 5e-3),
         ("linear.gated", 2e-2, 5e-3),

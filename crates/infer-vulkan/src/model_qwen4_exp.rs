@@ -2122,7 +2122,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         embeddings: &[f32],
         h: &[f32],
         ring_rows: &[f32],
-    ) -> Result<DevPleTaps> {
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let _s = prof::stage("dev.ple");
         let pc = ple_config(cfg);
         let hh = pc.hc_hidden();
@@ -2135,46 +2135,15 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let name = |suffix: &str| layer_tensor_name(layer, suffix);
         let kp = *weights.tensor(&name("ple.key_proj.weight"))?;
         let vp = *weights.tensor(&name("ple.value_proj.weight"))?;
-        ensure!(
-            kp.format == Qwen4DeviceFormat::F32 && vp.format == Qwen4DeviceFormat::F32,
-            "device PLE needs the dense tier F32-resident (found {:?}/{:?})",
-            kp.format,
-            vp.format
-        );
         let s = self.slots;
         self.write_f32(s.ple_emb, embeddings)?;
         self.write_f32(s.h, h)?;
         self.write_f32(s.ple_ring, ring_rows)?;
-        let (kb, ko, kl) = weights.binding(&kp)?;
-        let push =
-            qwen36_router_gemv_params(hh as u32, pc.ple_embed_dim as u32, false).to_le_bytes();
-        let d = qwen36_router_gemv_dispatch(hh as u32);
-        self.rec(
-            Kernel::Qwen36RouterGemv,
-            Kernel::Qwen36RouterGemv.specialization_u32(),
-            &push,
-            &[
-                Bind::A(s.ple_emb, (pc.ple_embed_dim * 4) as u64),
-                Bind::Ext(kb, ko, kl),
-                Bind::A(s.ple_k, (hh * 4) as u64),
-            ],
-            [d.x, d.y, d.z],
-        )?;
-        let (vb, vo, vl) = weights.binding(&vp)?;
-        let push = qwen36_router_gemv_params(pc.hidden_size as u32, pc.ple_embed_dim as u32, false)
-            .to_le_bytes();
-        let d = qwen36_router_gemv_dispatch(pc.hidden_size as u32);
-        self.rec(
-            Kernel::Qwen36RouterGemv,
-            Kernel::Qwen36RouterGemv.specialization_u32(),
-            &push,
-            &[
-                Bind::A(s.ple_emb, (pc.ple_embed_dim * 4) as u64),
-                Bind::Ext(vb, vo, vl),
-                Bind::A(s.ple_v, (pc.hidden_size * 4) as u64),
-            ],
-            [d.x, d.y, d.z],
-        )?;
+        // key/value projections from whichever format the tier holds — the
+        // F32-only assert this replaced was the audit-noted blocker that kept
+        // the whole PLE on the host once the dense tier went F16.
+        self.record_dense_at(weights, &kp, s.ple_emb, s.ple_k)?;
+        self.record_dense_at(weights, &vp, s.ple_emb, s.ple_v)?;
         self.barrier();
         // The gate kernel reads the PLE norms RAW (it spells the `1 + w`
         // itself — the loader must NOT have folded these, which
@@ -2231,6 +2200,29 @@ impl<'ctx> Qwen4Dev<'ctx> {
             [d.x, d.y, d.z],
         )?;
         self.flush()?;
+        // Production reads: the residual add and the advanced ring (the conv
+        // kernel wrote it in place; the host `PleConvState` stays canonical
+        // by taking it back). The full tap set is [`Self::ple_taps`].
+        let out = self.read_f32(s.ple_o, hh)?;
+        // The kernel is a RING: with ring_pos = 0 the read side matches the
+        // host's oldest-first shift layout exactly, but the WRITE lands the
+        // new row in slot 0 (the ex-oldest). One rotation restores
+        // time-major oldest-first, so `PleConvState` can take it verbatim.
+        let dev_ring = self.read_f32(s.ple_ring, pc.short_conv_state_len() * hh)?;
+        let state_len = pc.short_conv_state_len();
+        let mut ring = vec![0.0f32; dev_ring.len()];
+        for t in 0..state_len {
+            let src = (t + 1) % state_len;
+            ring[t * hh..(t + 1) * hh].copy_from_slice(&dev_ring[src * hh..(src + 1) * hh]);
+        }
+        Ok((out, ring))
+    }
+
+    /// Post-[`Self::ple`] tap reads, for the parity harness only.
+    pub fn ple_taps(&self, cfg: &Qwen4ExpConfig) -> Result<DevPleTaps> {
+        let pc = ple_config(cfg);
+        let hh = pc.hc_hidden();
+        let s = self.slots;
         Ok(DevPleTaps {
             key: self.read_f32(s.ple_k, hh)?,
             value: self.read_f32(s.ple_v, pc.hidden_size)?,
@@ -3266,12 +3258,22 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             // the gather + ring already live host-side). UNCONDITIONAL on the
             // PLE layer — omitting it is a wrong forward, not a degraded one.
             if let Some(ple) = &hl.ple {
-                let _s = prof::stage("host.ple");
                 let ring = state
                     .ple_conv
                     .get_mut(&layer)
                     .ok_or_else(|| anyhow!("no PLE conv state for layer {layer}"))?;
-                let out = ple.forward(&ple_emb, &h, ring, None)?;
+                let ple_dev = weights.as_ref().zip(dev.as_mut()).filter(|(w, _)| {
+                    w.tensor(&layer_tensor_name(layer, "ple.key_proj.weight"))
+                        .is_ok()
+                });
+                let out = if let Some((w, d)) = ple_dev {
+                    let (out, ring_rows) = d.ple(w, cfg, layer, &ple_emb, &h, ring.rows())?;
+                    ring.rows_mut().copy_from_slice(&ring_rows);
+                    out
+                } else {
+                    let _s = prof::stage("host.ple");
+                    ple.forward(&ple_emb, &h, ring, None)?
+                };
                 for (hv, &ov) in h.iter_mut().zip(&out) {
                     *hv += ov;
                 }
