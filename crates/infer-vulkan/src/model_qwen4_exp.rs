@@ -1540,7 +1540,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let ncols = u32::try_from(t.ncols)?;
         let nrows = u32::try_from(t.nrows)?;
         match t.format {
-            Qwen4DeviceFormat::F16 => {
+            Qwen4DeviceFormat::Bf16 | Qwen4DeviceFormat::F16 => {
                 // `mul_mat_vec.comp` never reads `p.stride_a` — the row
                 // stride IS `p.ncols` — so only an exactly-packed
                 // row-major weight can be expressed through this push
@@ -1549,10 +1549,15 @@ impl<'ctx> Qwen4Dev<'ctx> {
                     ncols.is_multiple_of(4),
                     "dense_gemv: F16 ncols {ncols} is not a multiple of 4"
                 );
+                let kernel = if t.format == Qwen4DeviceFormat::Bf16 {
+                    Kernel::GemvBf16
+                } else {
+                    Kernel::GemvF16
+                };
                 let spec = GemvDenseSpec::DEFAULT;
                 let d = gemv_dense_dispatch(nrows, &spec);
                 self.rec(
-                    Kernel::GemvF16,
+                    kernel,
                     spec.specialization_u32(),
                     &gemv_params_f32_b(ncols, nrows).to_le_bytes(),
                     &[

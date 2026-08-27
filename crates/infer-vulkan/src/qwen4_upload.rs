@@ -216,6 +216,11 @@ pub fn hyper_connection_prefix(layer: Option<usize>, site: HcSite) -> Result<Str
 /// kernel forces each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Qwen4DeviceFormat {
+    /// The checkpoint's own BF16 bytes, verbatim — no re-encode at load
+    /// (a pure memcpy where F16 walks 686 M elements through a rounding
+    /// step), and no precision loss (the bf16->f16 re-encode changes
+    /// 221,186 dense weights — the subnormal tail F16 cannot represent).
+    Bf16,
     /// IEEE binary16, converted from the checkpoint's BF16 with
     /// round-to-nearest-even.
     F16,
@@ -235,7 +240,7 @@ impl Qwen4DeviceFormat {
     #[must_use]
     pub const fn bytes_for(self, ncols: usize, nrows: usize) -> Option<u64> {
         match self {
-            Self::F16 => Some((ncols * nrows * 2) as u64),
+            Self::Bf16 | Self::F16 => Some((ncols * nrows * 2) as u64),
             Self::F32 => Some((ncols * nrows * 4) as u64),
             Self::Nvfp4 => match nvfp4_row_bytes(ncols) {
                 Some(row) => Some((row * nrows) as u64),
@@ -391,7 +396,7 @@ pub struct Qwen4UploadConfig {
 impl Default for Qwen4UploadConfig {
     fn default() -> Self {
         Self {
-            dense_format: Qwen4DeviceFormat::F16,
+            dense_format: Qwen4DeviceFormat::Bf16,
             slab_bytes: None,
             reserve_bytes: DEFAULT_RESERVE_BYTES,
             spill_to_host: true,
@@ -2260,6 +2265,21 @@ pub fn upload_qwen4<'ctx, 'st>(
             Qwen4Source::Bf16 { fold_bias } => {
                 let src = st.tensor_data(&item.name)?;
                 match item.format {
+                    Qwen4DeviceFormat::Bf16 => {
+                        ensure!(
+                            !*fold_bias,
+                            "{}: the 1+w fold needs a converting format, not verbatim BF16",
+                            item.name
+                        );
+                        ensure!(
+                            src.len() == dst.len(),
+                            "{}: {} B of BF16 into a {} B buffer",
+                            item.name,
+                            src.len(),
+                            dst.len()
+                        );
+                        dst.copy_from_slice(src);
+                    }
                     Qwen4DeviceFormat::F16 => write_bf16_as_f16(&item.name, src, dst)?,
                     Qwen4DeviceFormat::F32 => write_bf16_as_f32(&item.name, src, dst, *fold_bias)?,
                     Qwen4DeviceFormat::Nvfp4 => {
@@ -3239,22 +3259,21 @@ mod tests {
             assert_eq!(got, want, "router element {i}");
         }
 
-        // --- 2. F16 byte-exactness: a dense GEMV weight.
+        // --- 2. Bf16 byte-exactness: a dense GEMV weight is the
+        //     checkpoint's OWN bytes on device — no re-encode to round-trip,
+        //     so the assert is raw byte identity against the mmap.
         let out_proj = layer_tensor_name(0, "linear_attn.out_proj.weight");
         let t = *w.tensor(&out_proj).expect("out_proj resident");
-        assert_eq!(t.format, Qwen4DeviceFormat::F16);
+        assert_eq!(t.format, Qwen4DeviceFormat::Bf16);
         assert_eq!((t.ncols, t.nrows), (6144, 2560));
         let mut back = vec![0u8; 2 * 4096];
         w.read_back(&t, &mut back).expect("out_proj read-back");
         let src = st.tensor_data(&out_proj).expect("out_proj bytes");
-        for (i, chunk) in back.chunks_exact(2).enumerate() {
-            let got = u16::from_le_bytes(chunk.try_into().unwrap());
-            let want = f32_to_f16(bf16_to_f32(u16::from_le_bytes([
-                src[i * 2],
-                src[i * 2 + 1],
-            ])));
-            assert_eq!(got, want, "out_proj element {i}");
-        }
+        assert_eq!(
+            back,
+            src[..back.len()],
+            "out_proj: device bytes differ from the checkpoint's own"
+        );
 
         // --- 3. THE LOADER CONTRACT: `1 + hc_norm` on the device.
         let hc = w
