@@ -2236,7 +2236,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             .all(|sfx| {
                 weights
                     .tensor(&layer_tensor_name(layer, sfx))
-                    .is_ok_and(|t| t.format == Qwen4DeviceFormat::F32)
+                    .is_ok_and(|t| t.format != Qwen4DeviceFormat::Nvfp4)
             })
             && weights
                 .tensor(&layer_tensor_name(layer, "self_attn.q_norm.weight"))
@@ -2285,13 +2285,6 @@ impl<'ctx> Qwen4Dev<'ctx> {
         let k_w = *weights.tensor(&name("self_attn.k_proj.weight"))?;
         let v_w = *weights.tensor(&name("self_attn.v_proj.weight"))?;
         let o_w = *weights.tensor(&name("self_attn.o_proj.weight"))?;
-        for (t, label) in [(&q_w, "q"), (&k_w, "k"), (&v_w, "v"), (&o_w, "o")] {
-            ensure!(
-                t.format == Qwen4DeviceFormat::F32,
-                "device full attention needs {label}_proj F32-resident, found {:?}",
-                t.format
-            );
-        }
         let s = self.slots;
         self.write_f32(s.x, x)?;
         let pos_bytes = i64::try_from(pos).map(|_| (pos as i32).to_le_bytes())?;
@@ -2299,26 +2292,11 @@ impl<'ctx> Qwen4Dev<'ctx> {
             .copy_from_host_at(s.pos, &pos_bytes)
             .map_err(|e| anyhow!("write rope pos: {e}"))?;
 
-        // q/k/v projections off the one staged activation.
-        for (t, n_out, dst) in [
-            (&q_w, 2 * q_dim, s.qkv),
-            (&k_w, kv_dim, s.kbuf),
-            (&v_w, kv_dim, s.vbuf),
-        ] {
-            let (b, o, l) = weights.binding(t)?;
-            let push = qwen36_router_gemv_params(n_out as u32, h as u32, false).to_le_bytes();
-            let d = qwen36_router_gemv_dispatch(n_out as u32);
-            self.rec(
-                Kernel::Qwen36RouterGemv,
-                Kernel::Qwen36RouterGemv.specialization_u32(),
-                &push,
-                &[
-                    Bind::A(s.x, (h * 4) as u64),
-                    Bind::Ext(b, o, l),
-                    Bind::A(dst, (n_out * 4) as u64),
-                ],
-                [d.x, d.y, d.z],
-            )?;
+        // q/k/v projections off the one staged activation, whatever format
+        // the tier holds — the F32-only gate this replaced kept all twelve
+        // full-attention layers on the HOST in hybrid mode (the tier is F16).
+        for (t, dst) in [(&q_w, s.qkv), (&k_w, s.kbuf), (&v_w, s.vbuf)] {
+            self.record_dense_at(weights, t, s.x, dst)?;
         }
         self.barrier();
         // Per-head q RMSNorm out of the interleaved [query|gate] block (source
@@ -2471,21 +2449,8 @@ impl<'ctx> Qwen4Dev<'ctx> {
             )?;
         }
         self.barrier();
-        // o-proj → the y slot.
-        let (ob, oo, ol) = weights.binding(&o_w)?;
-        let push = qwen36_router_gemv_params(h as u32, q_dim as u32, false).to_le_bytes();
-        let d = qwen36_router_gemv_dispatch(h as u32);
-        self.rec(
-            Kernel::Qwen36RouterGemv,
-            Kernel::Qwen36RouterGemv.specialization_u32(),
-            &push,
-            &[
-                Bind::A(s.attn, (q_dim * 4) as u64),
-                Bind::Ext(ob, oo, ol),
-                Bind::A(s.y, (h * 4) as u64),
-            ],
-            [d.x, d.y, d.z],
-        )?;
+        // o-proj → the y slot, tier format.
+        self.record_dense_at(weights, &o_w, s.attn, s.y)?;
         self.flush()?;
         Ok((
             self.read_f32(s.y, h)?,
@@ -3086,7 +3051,17 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let ucfg = Qwen4UploadConfig::default();
                 let plan = plan_qwen4_upload(st, &ucfg, &Qwen4UploadScope::full())?;
                 let weights = upload_qwen4(ctx, st, &plan, &ucfg)?;
-                let dev = Qwen4Dev::new(ctx, &cfg, &[], cfg.max_context)?;
+                // KV planes for every full-attention layer (~4 MB each at
+                // ctx 2048) — without them full_attention_ready is false and
+                // all twelve layers silently fall back to the host.
+                let full_layers: Vec<usize> = cfg
+                    .layer_types
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| **t == Qwen4LayerType::FullAttention)
+                    .map(|(l, _)| l)
+                    .collect();
+                let dev = Qwen4Dev::new(ctx, &cfg, &full_layers, cfg.max_context)?;
                 let resident =
                     DevResidentLinAttn::new(ctx, &cfg, layers.iter().map(|(l, hl)| (*l, hl)))?;
                 (Some(weights), Some(dev), Some(resident))
