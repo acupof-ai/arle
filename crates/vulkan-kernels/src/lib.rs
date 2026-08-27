@@ -261,6 +261,40 @@ pub enum Kernel {
     /// out-of-band through the shader's SCALE0/SCALE1 output fusion — see
     /// [`gemv_id_params_fused`].
     GemvIdNvfp4,
+    /// The DENSE tier's GEMV: a plain `[nrows, ncols]` f16 weight matrix times
+    /// an f32 activation vector. Qwen3.8-Flash-Next keeps its full-attention
+    /// q/k/v/o projections and its 248320-row `lm_head` unquantized, and until
+    /// this variant existed the `Kernel` enum had nothing that could read them.
+    /// Those tensors alone are 2.47 GB/token, stranded on the host at ~55 GB/s
+    /// (~45 ms) instead of the ~230 GB/s (~9.9 ms) measured on device.
+    ///
+    /// Like the NVFP4 pair this is `mul_mat_vec.comp`, so **B is a plain f32
+    /// vector, not `block_q8_1_x4`** — no [`Kernel::QuantizeQ8_1`] dispatch
+    /// feeds it. Push constants are [`gemv_params_f32_b`]; A is row-major with
+    /// rows exactly `ncols` elements apart (the shader's row stride is
+    /// `p.ncols`; `stride_a` is inert here — `mul_mat_vec.comp` never reads it).
+    ///
+    /// The checkpoint is BF16 on disk, so this variant's weight bytes are BUILT
+    /// by [`bf16_to_f16`] rather than copied — and that convert is NOT free.
+    /// F16's 3 extra mantissa bits only pay off against a source more precise
+    /// than bf16; fed from bf16 the widening is exact in the normal band and
+    /// lossy below 2^-17, so for THIS checkpoint [`Kernel::GemvBf16`] is the
+    /// better default and this variant is for a tier built from f32.
+    /// [`bf16_to_f16`] carries the measured band.
+    GemvF16,
+    /// [`Kernel::GemvF16`] over the checkpoint's BF16 bytes verbatim — no
+    /// convert pass, no second host copy, and the residency planner can point
+    /// the binding straight at the mmap. **This is the one to use for
+    /// Qwen3.8-Flash-Next's dense tier**, on all three counts: it is exact, it
+    /// is free to stage, and it is not slower.
+    ///
+    /// Identical contract to [`Kernel::GemvF16`] in every other respect (f32 B,
+    /// [`gemv_params_f32_b`], `p.ncols` row stride). `dequant_funcs.glsl:43`
+    /// widens each `uint16_t` with a `<< 16` — a bit shift, not a conversion
+    /// instruction — and on this part it measures the same GB/s as the f16 path
+    /// (`lm_head`: 229.5 vs 234.1, inside run-to-run noise). The two differ in
+    /// staging cost and in which values survive, not in decode speed.
+    GemvBf16,
     /// Batched prefill GEMM (`mul_mmq`): `D[n, m] = A[m, k] · Bᵀ[n, k]` with a
     /// quantized `A` and `block_q8_1_x4` `B` — the SAME activation format the
     /// decode GEMVs consume, so one `QuantizeQ8_1` dispatch feeds both. Tile
@@ -392,6 +426,49 @@ const SPEC_GEMV_K_Q8_1: &[(u32, u32)] = &[(0, 64), (1, 1), (2, 1)];
 /// row-aligned) of `QK_NVFP4`. Both hold for this model: hidden 2560 = 40x64,
 /// `moe_intermediate_size` 640 = 10x64.
 const SPEC_GEMV_NVFP4: &[(u32, u32)] = &[(0, 64), (1, 1), (2, 1)];
+
+/// `BLOCK_SIZE` for the dense (F16/BF16) GEMV — threads per workgroup, each
+/// taking 4 columns per iteration (`K_PER_ITER = 4` on the non-quantized arm).
+///
+/// Swept 32/64/128 x NUM_ROWS 1/2/4/8 on real `lm_head` bytes (248320x2560
+/// BF16, 1.27 GB — far past the 16 MiB cache cliff, so the number is the
+/// sustained link), six back-to-back sittings. The headline is that THERE IS NO
+/// TUNING LEVER HERE: the whole 12-cell grid spans 205.8-236.6 GB/s against a
+/// 256 GB/s LPDDR5X spec, i.e. the kernel is already bandwidth-saturated at
+/// every geometry and the spread is barely wider than the +-2% run-to-run noise.
+/// Only 32 is clearly off the pace (219.1 GB/s mean at NUM_ROWS=1, -4%); 128
+/// takes the best mean at 231.3 against 64's 227.9, winning 4 of 6 sittings, and
+/// is taken on that evidence while being honestly inside the noise band. A
+/// future retune of this constant is not where the next win is.
+/// See `tests/device_gemv_f16.rs::report_dense_gemv_geometry_sweep`.
+const GEMV_DENSE_BLOCK_SIZE: u32 = 128;
+
+/// `NUM_ROWS` for the dense GEMV: output rows one workgroup computes in a single
+/// pass over the activation.
+///
+/// 1, measured rather than assumed. Raising it is the standard GEMV trick —
+/// several independent weight-row loads in flight against one B fetch — and it
+/// buys nothing on a kernel already at ~90% of DRAM spec: on `lm_head` at
+/// BLOCK_SIZE 128, NUM_ROWS 1/2/4/8 read 231.3 / 222.8 / 218.5 / 218.0 GB/s
+/// (means of six sittings), i.e. monotonically DOWN — the extra rows cost
+/// occupancy and buy reuse of a B vector that was already cache-resident.
+///
+/// 1 also makes [`gemv_dense_dispatch`] and [`gemv_dispatch`] agree, which
+/// removes a grid/pipeline footgun.
+const GEMV_DENSE_NUM_ROWS: u32 = 1;
+
+/// `mul_mat_vec.comp`'s `BLOCK_SIZE, NUM_ROWS, NUM_COLS` for the dense tier.
+/// `NUM_COLS` is the batch width and stays 1: this is the decode GEMV, and a
+/// batched prefill goes through `mul_mm`/`mul_mmq` instead.
+///
+/// The only shape constraint is `ncols % 4 == 0`, which gates
+/// `is_aligned_nonquant` and hence the `data_b_v4` / `A_TYPE_PACKED32` fast
+/// path. `ncols` need NOT divide `K_PER_ITER * BLOCK_SIZE`: the shader bumps
+/// `num_iters` PER THREAD (`mul_mat_vec.comp:161`), so a width like the shared
+/// expert's 640 leaves the upper threads idle on the last iteration instead of
+/// reading past the row. Verified on real 640-wide bytes.
+const SPEC_GEMV_DENSE: &[(u32, u32)] =
+    &[(0, GEMV_DENSE_BLOCK_SIZE), (1, GEMV_DENSE_NUM_ROWS), (2, 1)];
 const SPEC_RMS_NORM_MUL: &[(u32, u32)] = &[(1, 1)];
 
 impl Kernel {
@@ -410,6 +487,8 @@ impl Kernel {
         Self::GemvIdMxfp4,
         Self::GemvNvfp4,
         Self::GemvIdNvfp4,
+        Self::GemvF16,
+        Self::GemvBf16,
         Self::MmqQ4K,
         Self::MmqQ5K,
         Self::MmqQ6K,
@@ -468,6 +547,8 @@ impl Kernel {
             Kernel::GemvIdMxfp4 => "mul_mat_vec_id_mxfp4",
             Kernel::GemvNvfp4 => "mul_mat_vec_nvfp4",
             Kernel::GemvIdNvfp4 => "mul_mat_vec_id_nvfp4",
+            Kernel::GemvF16 => "mul_mat_vec_f16",
+            Kernel::GemvBf16 => "mul_mat_vec_bf16",
             Kernel::MmqQ4K => "mul_mmq_q4_k",
             Kernel::MmqQ5K => "mul_mmq_q5_k",
             Kernel::MmqQ6K => "mul_mmq_q6_k",
@@ -526,6 +607,7 @@ impl Kernel {
             | Kernel::GemvMxfp4
             | Kernel::GemvIdMxfp4 => SPEC_GEMV_K_Q8_1,
             Kernel::GemvNvfp4 | Kernel::GemvIdNvfp4 => SPEC_GEMV_NVFP4,
+            Kernel::GemvF16 | Kernel::GemvBf16 => SPEC_GEMV_DENSE,
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
@@ -1305,6 +1387,195 @@ pub fn gemv_params_f32_b(ncols: u32, nrows: u32) -> KernelParams {
         1,     // broadcast2
         1,     // broadcast3
     ])
+}
+
+/// Spec-constant geometry for the dense (F16/BF16) GEMV, so a caller — or a
+/// tuning sweep — can move `BLOCK_SIZE`/`NUM_ROWS` off [`SPEC_GEMV_DENSE`]
+/// without hand-assembling a `(u32, u32)` list whose ids it has to get right.
+///
+/// It exists mainly to keep the geometry and the grid together. `NUM_ROWS` is
+/// baked into the pipeline but also decides the dispatch
+/// (`first_row = NUM_ROWS * workgroup.x`), and a specialization list that
+/// disagrees with the grid is silently wrong in BOTH directions: too few
+/// workgroups drops the tail rows, too many just idle. [`gemv_dense_dispatch`]
+/// reads the count back out of the same value. (At the tuned
+/// [`GEMV_DENSE_NUM_ROWS`] of 1 the two grids coincide — but a sweep that moves
+/// it must move the dispatch with it, which is exactly what this pairs.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemvDenseSpec {
+    specialization_u32: [(u32, u32); 3],
+    num_rows: u32,
+}
+
+impl GemvDenseSpec {
+    /// The tuned default — the same geometry [`SPEC_GEMV_DENSE`] carries, from
+    /// the same two constants, so the two cannot drift apart.
+    pub const DEFAULT: Self = Self::new(GEMV_DENSE_BLOCK_SIZE, GEMV_DENSE_NUM_ROWS);
+
+    pub const fn new(block_size: u32, num_rows: u32) -> Self {
+        Self {
+            specialization_u32: [(0, block_size), (1, num_rows), (2, 1)],
+            num_rows,
+        }
+    }
+
+    pub const fn specialization_u32(&self) -> &[(u32, u32)] {
+        &self.specialization_u32
+    }
+
+    pub const fn num_rows(&self) -> u32 {
+        self.num_rows
+    }
+}
+
+/// Dispatch grid for a dense GEMV: `ceil(nrows / NUM_ROWS)` workgroups, one per
+/// group of output rows.
+///
+/// `mul_mat_vec.comp`'s `main()` guards a partial last group itself
+/// (`compute_outputs(first_row, min(NUM_ROWS, stride_d - first_row))`), so
+/// `nrows` need not divide `NUM_ROWS` — but `stride_d` in the push block must be
+/// the true row count, which [`gemv_params_f32_b`] already sets.
+///
+/// Single-dimension `x`, which is enough for this model: `lm_head` is the widest
+/// at 248320 groups (NUM_ROWS = 1), and the 8060S allows 4294967295 in x.
+/// (`main()` also linearizes `x + gl_NumWorkGroups.x * z`, so a part with the
+/// 65535 spec minimum in x can be served by splitting into z — no shader change,
+/// but no caller needs it here.)
+pub fn gemv_dense_dispatch(nrows: u32, spec: &GemvDenseSpec) -> Dispatch {
+    Dispatch::x(nrows.max(1).div_ceil(spec.num_rows.max(1)))
+}
+
+/// What a [`bf16_to_f16`] pass cost, in elements. Every field being 0 is the
+/// statement "this blob survived the re-encode unchanged" — which, measured, no
+/// real dense tensor of this checkpoint manages, so the fields are a bound to
+/// check rather than a formality to ignore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Bf16ToF16Report {
+    /// Finite inputs above F16's range, saturated to ±65504 rather than ±Inf.
+    /// Saturating keeps a downstream dot product finite; the count is here so
+    /// the choice is never silent.
+    pub overflowed: usize,
+    /// Nonzero inputs that rounded to zero (|x| below ~2^-25).
+    pub flushed: usize,
+    /// Inputs whose f16 value differs from the bf16 value at all — a superset of
+    /// the two above that also catches the subnormal band (|x| < 2^-14), where
+    /// f16 has fewer than 10 mantissa bits left and bf16's 7 no longer fit.
+    pub inexact: usize,
+}
+
+impl Bf16ToF16Report {
+    /// True when the re-encode changed nothing. Real BF16 weight matrices have a
+    /// subnormal tail and will answer `false`; what matters for those is the
+    /// SIZE of the change, which `tests/device_gemv_f16.rs` bounds at 2^-25 on
+    /// values already under 2^-17.
+    pub fn is_lossless(&self) -> bool {
+        self.inexact == 0
+    }
+}
+
+/// Convert a BF16 weight blob to the F16 bytes [`Kernel::GemvF16`] reads.
+///
+/// Both are 16-bit little-endian, so this is a per-element re-encode of the same
+/// real number: BF16 is `1 + 8 + 7`, F16 `1 + 5 + 10`. In the overlapping
+/// exponent range widening the mantissa is EXACT — F16 has three bits to spare —
+/// which is the whole reason an F16 device tier is more precise than a BF16 one
+/// rather than a lossy step down from it.
+///
+/// The range is the only risk, and it is reported rather than hidden — because
+/// on a real checkpoint it is not zero. F16 spans 2^-14 (smallest normal) to
+/// 65504 against BF16's f32-sized range, so three bands can move: overflow,
+/// flush-to-zero, and the band below 2^-17 where the `(m << 3) | 0x400`
+/// numerator finally starts losing bits to the subnormal shift. Measured over
+/// all 685,834,240 dense weights of Qwen3.8-Flash-Next
+/// (`tests/device_gemv_f16.rs`): 0 overflowed, 1,298 flushed, 221,186 (0.032%)
+/// inexact — every one of them already below 2^-17, and none moved by more than
+/// 2^-25.
+///
+/// So the honest summary is the opposite of the tempting one: for a BF16 source
+/// this is a lossy re-encode, not a precision upgrade. It is worth doing only
+/// when something downstream needs f16 weights; [`Kernel::GemvBf16`] reads the
+/// original bytes at the same speed.
+///
+/// Written as bit surgery on the two encodings rather than through `f32` because
+/// the mapping is exact and finite: bf16 exponent `e` becomes f16 exponent
+/// `e - 112`, and the mantissa is `m << 3` shifted right by `113 - e` in the
+/// subnormal band (round-to-nearest-even, with a carry that lands correctly on
+/// 2^-14). Inf and NaN are preserved as Inf and quiet NaN.
+///
+/// # Errors
+/// `src` not an even number of bytes, or `dst` not the same length as `src`.
+pub fn bf16_to_f16(src: &[u8], dst: &mut [u8]) -> Result<Bf16ToF16Report> {
+    if !src.len().is_multiple_of(2) {
+        return Err(KernelError::Runtime(format!(
+            "bf16->f16: source is {} B, not a whole number of bf16 elements",
+            src.len()
+        )));
+    }
+    if dst.len() != src.len() {
+        return Err(KernelError::Runtime(format!(
+            "bf16->f16: destination is {} B, expected {} B",
+            dst.len(),
+            src.len()
+        )));
+    }
+    let mut report = Bf16ToF16Report::default();
+    for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(2)) {
+        let bits = u16::from_le_bytes([s[0], s[1]]);
+        let sign = bits & 0x8000;
+        let exp = (bits >> 7) & 0xFF;
+        let man = bits & 0x7F;
+
+        let half = if exp == 0xFF {
+            // Inf stays Inf; any NaN payload collapses to a quiet NaN, since
+            // f16 has no room for bf16's 7-bit payload and the value is not one
+            // a weight tier should be carrying anyway.
+            sign | 0x7C00 | if man != 0 { 0x0200 } else { 0 }
+        } else if exp == 0 {
+            // bf16 zero, or a bf16 subnormal at ~1e-41 — 17 decades under f16's
+            // smallest subnormal, so there is nothing to round toward.
+            if man != 0 {
+                report.flushed += 1;
+                report.inexact += 1;
+            }
+            sign
+        } else if exp >= 143 {
+            // 2^16 and up: past 65504 even before rounding.
+            report.overflowed += 1;
+            report.inexact += 1;
+            sign | 0x7BFF
+        } else if exp >= 113 {
+            // Normal both sides. `man << 3` is the exact widening.
+            sign | ((exp - 112) << 10) | (man << 3)
+        } else {
+            // Subnormal in f16: restore bf16's implicit leading 1 at bit 10 and
+            // shift it down into the fixed 2^-24 grid.
+            let shift = 113 - exp;
+            if shift > 12 {
+                report.flushed += 1;
+                report.inexact += 1;
+                sign
+            } else {
+                let num = u32::from(man) << 3 | 0x400;
+                let mut q = num >> shift;
+                let rem = num & ((1u32 << shift) - 1);
+                let halfway = 1u32 << (shift - 1);
+                if rem > halfway || (rem == halfway && q & 1 == 1) {
+                    q += 1;
+                }
+                if rem != 0 {
+                    report.inexact += 1;
+                }
+                if q == 0 {
+                    report.flushed += 1;
+                }
+                // A carry out of bit 9 lands on 0x0400 — exponent 1, the
+                // smallest normal — which is the right answer, not an overflow.
+                sign | q as u16
+            }
+        };
+        d.copy_from_slice(&half.to_le_bytes());
+    }
+    Ok(report)
 }
 
 /// `MAT_VEC_FUSION_FLAGS_*` from `mul_mat_vec_iface.glsl`, for the

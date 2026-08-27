@@ -96,6 +96,39 @@ macro_rules! nvfp4_gemv_defines {
 const NVFP4_GEMV_DEFINES: &[(&str, &str)] = nvfp4_gemv_defines!();
 const NVFP4_GEMV_ID_DEFINES: &[(&str, &str)] = nvfp4_gemv_defines!(("MUL_MAT_ID", "1"),);
 
+/// Shared `mul_mat_vec.comp` define set for the DENSE (non-quantized) tier —
+/// the attention projections and `lm_head` this checkpoint stores as BF16.
+/// `DATA_A_*` is the only difference between the two variants.
+///
+/// These are define-only: NO vendored GLSL was written or edited for them.
+/// `mul_mat_vec.comp:10` already branches on `DATA_A_F16`/`DATA_A_BF16` to
+/// `K_PER_ITER 4` plus an `iter_aligned_nonquant` fast path, and
+/// `dequant_funcs.glsl:25,43` already carries both dequantizers (BF16's is a
+/// `<< 16` bit shift, not a conversion instruction). `types.glsl:23,37` gives
+/// each one `QUANT_K = QUANT_R = 1` and an `A_TYPE_PACKED32`, so the aligned
+/// path loads four weights as two 32-bit words.
+///
+/// B is the same plain f32 activation vector the NVFP4 pair takes, and for the
+/// same structural reason: `mul_mat_vecq_funcs.glsl` has no non-quantized arm
+/// at all. Feeding these pipelines `block_q8_1_x4` bytes is silent garbage.
+macro_rules! dense_gemv_defines {
+    ($data_a:literal) => {
+        &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ($data_a, "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ]
+    };
+}
+
+const DENSE_GEMV_DEFINES_F16: &[(&str, &str)] = dense_gemv_defines!("DATA_A_F16");
+const DENSE_GEMV_DEFINES_BF16: &[(&str, &str)] = dense_gemv_defines!("DATA_A_BF16");
+
 const VENDORED: &[ShaderSpec] = &[
     ShaderSpec {
         name: "mul_mat_vec_iq2_xxs",
@@ -299,6 +332,32 @@ const VENDORED: &[ShaderSpec] = &[
         name: "mul_mat_vec_id_nvfp4",
         source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
         defines: NVFP4_GEMV_ID_DEFINES,
+    },
+    // The DENSE tier of Qwen3.8-Flash-Next: every full-attention q/k/v/o
+    // projection and the 1.27 GB `lm_head`, all BF16 on disk and all of it
+    // ~8 GB/token that had no GEMV at all before these two lines — so it ran on
+    // the host at ~55 GB/s instead of the GPU's ~205.
+    //
+    // Both are registered, but the measurement says which to reach for. F16 has
+    // 3 more mantissa bits than BF16, which makes an f16 tier the more precise
+    // one when it is fed from f32 — fed from a BF16 checkpoint it can only tie
+    // or lose, because the widening is exact in the normal band and f16's
+    // exponent range is the narrower of the two. Measured over all 685,834,240
+    // dense weights of this model (`tests/device_gemv_f16.rs`): 221,186 change
+    // value, all of them already below 2^-17, none by more than 2^-25. So BF16
+    // is the default for reading THESE bytes — same arithmetic, no convert
+    // pass, and the binding can point straight at the mmap. F16 is here for a
+    // tier built from something more precise than bf16, and for callers that
+    // need f16 weights for another reason.
+    ShaderSpec {
+        name: "mul_mat_vec_f16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: DENSE_GEMV_DEFINES_F16,
+    },
+    ShaderSpec {
+        name: "mul_mat_vec_bf16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: DENSE_GEMV_DEFINES_BF16,
     },
     // Batched prefill GEMM (`mul_mmq`) — the integer-dot-product tiled matmul
     // that consumes the SAME `block_q8_1_x4` activations the decode GEMVs
