@@ -370,6 +370,11 @@ pub fn device_format(kind: Qwen4TensorKind, dense: Qwen4DeviceFormat) -> Option<
         }),
 
         // The dense GEMV weights — 6.70 GiB at F16, 13.4 GiB at F32.
+        // (Tried and reverted, with the measurement: lm_head at Q8_0 under a
+        // Q4_K tier bought NOTHING — teacher-forced dNLL 0.0857 vs pure
+        // Q4_K's 0.0820, noise-level and slightly worse — so the logit-direct
+        // family is NOT the dominant quality term and every width-qualified
+        // family stays on the same format.)
         LinearAttnInProjQkv | LinearAttnInProjZ | LinearAttnOutProj | AttnQProj | AttnKProj
         | AttnVProj | AttnOProj | IndexerQkProj | SharedExpertGateProj | SharedExpertUpProj
         | PleKeyProj | PleValueProj | LmHead => Some(dense),
