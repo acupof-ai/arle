@@ -91,8 +91,11 @@ ARLE's 56 tok/s prefill and 21.2 tok/s decode (47.23 ms) the same day. So:
 decode is a TIE on their claimed-weak backend (3.5% apart), prefill is a
 3.3× gap that ranks exactly where the study's lift list pointed (chunked
 delta-net — port in flight the same day). The reported topk assert did not
-reproduce at short context (QSA likely inactive below 2048 visible);
-longer-context behavior probed separately.
+reproduce at any probed length: pp4096 ran at **236.3 tok/s** — no crash
+with QSA active, and faster per token than pp128. Two consequences said
+plainly: their prefill lead grows with context, and they serve ctx > 2048
+today while ARLE's QSA stub caps at 2048 — the S6 port is capability
+parity, not just speed.
 
 ## Rules Reaffirmed
 
