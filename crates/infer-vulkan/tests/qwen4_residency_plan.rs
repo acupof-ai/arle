@@ -1043,6 +1043,12 @@ fn s7_scenario_table_dense_bf16_vs_q8_0() {
         plan_qwen4_upload(&st, &cfg, &Qwen4UploadScope::full()).expect("plan the text stream");
     let mut text_dense_bf16 = 0u64;
     let mut text_dense_q8 = 0u64;
+    // Since S8 the MTP head is PLANNED, not dropped, so its dense-GEMV rows
+    // ride the same item list. Split by stream: the text constant below is
+    // the original guard on the text tier's membership, and the MTP one
+    // pins the head's own dense bytes — the same 132.5 MiB the scenario-(b)
+    // pricing further down converts.
+    let mut mtp_dense_bf16 = 0u64;
     for item in &plan.items {
         if item.format == Qwen4DeviceFormat::Bf16 && takes_dense_format(item.role.kind) {
             assert_eq!(
@@ -1057,10 +1063,19 @@ fn s7_scenario_table_dense_bf16_vs_q8_0() {
                     item.name, item.ncols
                 )
             });
-            text_dense_bf16 += item.bytes;
-            text_dense_q8 += q8;
+            if item.role.stream == Qwen4Stream::Mtp {
+                mtp_dense_bf16 += item.bytes;
+            } else {
+                text_dense_bf16 += item.bytes;
+                text_dense_q8 += q8;
+            }
         }
     }
+    assert_eq!(
+        mtp_dense_bf16, 138_936_320,
+        "MTP dense-GEMV tier moved (132.5 MiB: q/k/v/o, indexer, shared \
+         expert, the two fusion fcs)"
+    );
     let text_savings = text_dense_bf16 - text_dense_q8;
     // The lever the Q8_0 sibling is building, sized exactly: 6.702 GiB of
     // dense-GEMV BF16 becomes 3.560 GiB of Q8_0 (x 17/32). If the dense tier's
@@ -1114,13 +1129,14 @@ fn s7_scenario_table_dense_bf16_vs_q8_0() {
         }
     }
 
-    // The shipping planner still books these very bytes as dropped; when the
-    // integration flips its stream gate, this equality is what guarantees no
-    // bytes appear or vanish in the handover.
+    // The stream gate HAS flipped: S8 plans the MTP head, so only the vision
+    // stream is still dropped. The handover conservation this assert was
+    // written for now reads as a partition — dropped is exactly vision, and
+    // the MTP file bytes reappear in the plan (its dense rows pinned above,
+    // its expert stacks in the scenario pricing below).
     assert_eq!(
-        plan.dropped_bytes,
-        mtp_file + vis_file,
-        "planner dropped_bytes must equal the measured MTP + vision file bytes"
+        plan.dropped_bytes, vis_file,
+        "planner dropped_bytes must equal the measured vision file bytes"
     );
     // The Drop tier the user vetoed, measured piece by piece (5.692 GiB
     // total). These sums are deterministic functions of the checkpoint and
@@ -1138,8 +1154,14 @@ fn s7_scenario_table_dense_bf16_vs_q8_0() {
     assert_eq!(mtp_a, 5_217_016_832, "scenario (a) MTP pricing moved");
     assert_eq!(mtp_b, 5_151_890_432, "scenario (b) MTP pricing moved");
 
-    let a_total = plan.device_bytes + mtp_a + vis_file;
-    let b_total = plan.device_bytes - text_savings + mtp_b + vis_file;
+    // `plan.device_bytes` already CONTAINS the MTP head since S8 (its dense
+    // rows priced BF16, its expert stacks as per-expert slices), so the
+    // scenarios add only what the planner still drops — vision. Adding
+    // `mtp_a` here again would double-count the head's 4.86 GiB, which is
+    // exactly what this assert caught when the stream gate flipped.
+    let a_total = plan.device_bytes + vis_file;
+    // (b) converts every dense-GEMV row to Q8_0, the MTP head's included.
+    let b_total = plan.device_bytes - text_savings - (mtp_a - mtp_b) + vis_file;
     let b_prime = b_total - mtp_stacks_bf16 + mtp_stacks_q8;
     let over = |total: u64| total.saturating_sub(usable);
 
@@ -1152,7 +1174,7 @@ fn s7_scenario_table_dense_bf16_vs_q8_0() {
         usable as f64 / GIB,
     );
     println!(
-        "  text stream (planner, dense BF16 + F32 tier)  : {:>7.3} GiB",
+        "  planner total (text + MTP, dense BF16 + F32)  : {:>7.3} GiB",
         plan.device_bytes as f64 / GIB
     );
     println!(
@@ -1161,7 +1183,7 @@ fn s7_scenario_table_dense_bf16_vs_q8_0() {
         text_savings as f64 / GIB
     );
     println!(
-        "  MTP additions   (a) {:>6.3} GiB / (b) {:>6.3} GiB  [stacks {:.3} GiB stay BF16 in (b)]",
+        "  of which MTP    (a) {:>6.3} GiB / (b) {:>6.3} GiB  [stacks {:.3} GiB stay BF16 in (b)]",
         mtp_a as f64 / GIB,
         mtp_b as f64 / GIB,
         mtp_stacks_bf16 as f64 / GIB
