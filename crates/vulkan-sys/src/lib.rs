@@ -914,12 +914,22 @@ mod real {
             Self::alloc_with_usage(
                 ctx,
                 len,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
+                Self::DEFAULT_USAGE,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
         }
+
+        /// Usage every `alloc*` constructor sets. `INDIRECT_BUFFER` rides along
+        /// so any arena can hold `VkDispatchIndirectCommand` triples for
+        /// [`CommandRecorder::dispatch_indirect`] — usage flags cost nothing at
+        /// allocation time, and one uniform set avoids a second buffer flavor
+        /// whose only difference is a flag.
+        const DEFAULT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+            vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+                | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+                | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+                | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
+        );
 
         /// Allocate a UMA storage buffer: `DEVICE_LOCAL | HOST_VISIBLE |
         /// HOST_COHERENT`. On the Strix Halo APU the big device-local heap is
@@ -929,9 +939,7 @@ mod real {
         /// the device exposes no device-local + host-visible memory type (keeps
         /// non-UMA boxes working, just without the device-local win).
         pub fn alloc_uma(ctx: &'a VulkanContext, len: usize) -> Result<Self> {
-            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST;
+            let usage = Self::DEFAULT_USAGE;
             Self::alloc_with_usage(
                 ctx,
                 len,
@@ -970,9 +978,7 @@ mod real {
         /// is involved. Anything the host READS every step belongs here; use
         /// [`Self::alloc_uma`] for buffers the host only writes.
         pub fn alloc_host_cached(ctx: &'a VulkanContext, len: usize) -> Result<Self> {
-            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST;
+            let usage = Self::DEFAULT_USAGE;
             Self::alloc_with_usage(
                 ctx,
                 len,
@@ -1903,6 +1909,61 @@ mod real {
                 }
                 device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
+            self.after_dispatch();
+        }
+
+        /// [`Self::dispatch`] with the workgroup counts read on the GPU from a
+        /// `VkDispatchIndirectCommand` (three consecutive `u32`s) at
+        /// `args_offset` in `args` — the y (or any) extent can then be a value
+        /// a previous dispatch computed, with no host read-back in between.
+        /// `args` must carry `INDIRECT_BUFFER` usage (every `alloc*`
+        /// constructor here sets it) and `args_offset` must be 4-byte aligned;
+        /// order the args WRITE before this READ with
+        /// [`Self::barrier_indirect`], not the plain [`Self::barrier`] (the
+        /// indirect read happens in the `DRAW_INDIRECT` stage, which a
+        /// compute-only dstStageMask does not cover).
+        pub fn dispatch_indirect(
+            &mut self,
+            pipeline: &ComputePipeline<'_>,
+            set: &DescriptorSet<'_>,
+            push: &[u8],
+            args: &DeviceBuffer<'_>,
+            args_offset: u64,
+        ) {
+            let device = &self.ctx.device;
+            let cmd = self.command_buffer;
+            // SAFETY: `cmd` is the recorder's begun command buffer; `pipeline`,
+            // `set` and `args` are live objects from this context (their
+            // lifetimes tie them to it), the caller keeps `set`/`args` alive
+            // until the submit completes, and `args_offset` addressing a valid
+            // 12-byte triple inside `args` is the documented contract above.
+            unsafe {
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.raw());
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.layout(),
+                    0,
+                    &[set.raw()],
+                    &[],
+                );
+                if !push.is_empty() {
+                    device.cmd_push_constants(
+                        cmd,
+                        pipeline.layout(),
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        push,
+                    );
+                }
+                device.cmd_dispatch_indirect(cmd, args.raw(), args_offset);
+            }
+            self.after_dispatch();
+        }
+
+        /// The per-dispatch bookkeeping both dispatch flavors share: the batch
+        /// counter and (under `ARLE_GPU_TIMESTAMPS`) the trailing timestamp.
+        fn after_dispatch(&mut self) {
             self.dispatches_in_batch += 1;
             let slot = self.prof.as_mut().and_then(|p| {
                 if p.idx < p.capacity {
@@ -1916,9 +1977,12 @@ mod real {
                 }
             });
             if let Some((pool, idx)) = slot {
+                // SAFETY: the command buffer is begun (a dispatch was just
+                // recorded into it) and `pool`/`idx` name a slot the profiler
+                // reserved in its own live query pool.
                 unsafe {
                     self.ctx.device.cmd_write_timestamp(
-                        cmd,
+                        self.command_buffer,
                         vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                         pool,
                         idx,
@@ -1941,6 +2005,41 @@ mod real {
                     self.command_buffer,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[memory_barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
+
+        /// [`Self::barrier`] widened so a compute WRITE of
+        /// `VkDispatchIndirectCommand` args is visible to a later
+        /// [`Self::dispatch_indirect`]'s args READ. That read happens in the
+        /// `DRAW_INDIRECT` stage, which is logically EARLIER than
+        /// `COMPUTE_SHADER` — a dstStageMask of only `COMPUTE_SHADER` does not
+        /// cover it (dst masks implicitly extend to logically LATER stages
+        /// only). The reverse hazard (this dispatch's args read vs a NEXT
+        /// compute write over the same args) is already ordered by any plain
+        /// [`Self::barrier`]: srcStageMask extends to logically EARLIER stages,
+        /// so waiting on prior `COMPUTE_SHADER` work waits on its
+        /// `DRAW_INDIRECT` reads too.
+        pub fn barrier_indirect(&mut self) {
+            let memory_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                );
+            // SAFETY: `command_buffer` is this recorder's begun buffer; a
+            // global memory barrier has no buffer/image references to keep
+            // alive.
+            unsafe {
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
                     vk::DependencyFlags::empty(),
                     &[memory_barrier],
                     &[],
@@ -2905,7 +3004,19 @@ mod stub {
         ) {
         }
 
+        pub fn dispatch_indirect(
+            &mut self,
+            _pipeline: &ComputePipeline<'_>,
+            _set: &DescriptorSet<'_>,
+            _push: &[u8],
+            _args: &DeviceBuffer<'_>,
+            _args_offset: u64,
+        ) {
+        }
+
         pub fn barrier(&mut self) {}
+
+        pub fn barrier_indirect(&mut self) {}
 
         pub fn copy_buffer(
             &mut self,

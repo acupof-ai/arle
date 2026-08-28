@@ -755,6 +755,30 @@ const LOCAL: &[ShaderSpec] = &[
         source: "crates/vulkan-kernels/shaders/qwen4_gdn_chunk_state.comp",
         defines: &[],
     },
+    // Grouped-MoE device planner (count -> scan -> emit) + the write-side
+    // block scatter: together they replace the prefill's per-(layer,chunk)
+    // ids fence — the router ids never come back to the host, the block
+    // counts drive the grouped GEMVs through `vkCmdDispatchIndirect`.
+    ShaderSpec {
+        name: "qwen4_moe_plan_count",
+        source: "crates/vulkan-kernels/shaders/qwen4_moe_plan_count.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_moe_plan_scan",
+        source: "crates/vulkan-kernels/shaders/qwen4_moe_plan_scan.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_moe_plan_emit",
+        source: "crates/vulkan-kernels/shaders/qwen4_moe_plan_emit.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_block_scatter",
+        source: "crates/vulkan-kernels/shaders/qwen4_block_scatter.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {

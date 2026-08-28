@@ -8,7 +8,7 @@
 
 mod cache;
 
-pub use cache::{KernelCache, launch_cached, record_dispatch};
+pub use cache::{KernelCache, launch_cached, record_dispatch, record_dispatch_indirect};
 /// Re-exported so callers can size a [`MmSpec`] without depending on
 /// `vulkan-sys` directly. Resolves to the stub definition when the `vulkan`
 /// feature is off, so the typecheck-only lane builds unchanged.
@@ -445,6 +445,25 @@ pub enum Kernel {
     /// [`Kernel::Qwen35GatedDeltaNet`] scan does. See
     /// [`qwen4_gdn_chunk_params`].
     Qwen4GdnChunkState,
+    /// Grouped-MoE device planner pass 1: per-expert routed-pair counts from
+    /// the chunk's device-resident top-k ids (one workgroup, atomic totals).
+    /// See [`qwen4_moe_plan_count_params`] and the shader header for the
+    /// planner-scratch layout the three passes share.
+    Qwen4MoePlanCount,
+    /// Grouped-MoE device planner pass 2: the serial expert walk that turns
+    /// counts into block-index prefix sums, per-class block totals and the
+    /// `VkDispatchIndirectCommand` triples the grouped GEMVs consume. See
+    /// [`qwen4_moe_plan_scan_params`].
+    Qwen4MoePlanScan,
+    /// Grouped-MoE device planner pass 3: the pair scatter map (pair ->
+    /// gathered row in the fixed class regions) and the class-major expert-id
+    /// lists, closed-form from pass 2's prefixes. See
+    /// [`qwen4_moe_plan_emit_params`].
+    Qwen4MoePlanEmit,
+    /// Write-side block permutation (`dst[map[i]] = src[i / top_k]`, blocks of
+    /// `block` f32): the grouped-MoE gather into sparse fixed-capacity class
+    /// regions, touching only live rows. See [`qwen4_block_scatter_params`].
+    Qwen4BlockScatter,
 }
 
 const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
@@ -621,6 +640,10 @@ impl Kernel {
         Self::Qwen4HcCombine,
         Self::Qwen4GdnChunkIntra,
         Self::Qwen4GdnChunkState,
+        Self::Qwen4MoePlanCount,
+        Self::Qwen4MoePlanScan,
+        Self::Qwen4MoePlanEmit,
+        Self::Qwen4BlockScatter,
     ];
 
     pub const fn shader_name(self) -> &'static str {
@@ -690,6 +713,10 @@ impl Kernel {
             Kernel::Qwen4HcCombine => "qwen4_hc_combine",
             Kernel::Qwen4GdnChunkIntra => "qwen4_gdn_chunk_intra",
             Kernel::Qwen4GdnChunkState => "qwen4_gdn_chunk_state",
+            Kernel::Qwen4MoePlanCount => "qwen4_moe_plan_count",
+            Kernel::Qwen4MoePlanScan => "qwen4_moe_plan_scan",
+            Kernel::Qwen4MoePlanEmit => "qwen4_moe_plan_emit",
+            Kernel::Qwen4BlockScatter => "qwen4_block_scatter",
         }
     }
 
@@ -772,7 +799,11 @@ impl Kernel {
             | Kernel::Qwen4HcCombineBf16
             | Kernel::Qwen4BlockPerm
             | Kernel::Qwen4GdnChunkIntra
-            | Kernel::Qwen4GdnChunkState => &[],
+            | Kernel::Qwen4GdnChunkState
+            | Kernel::Qwen4MoePlanCount
+            | Kernel::Qwen4MoePlanScan
+            | Kernel::Qwen4MoePlanEmit
+            | Kernel::Qwen4BlockScatter => &[],
             // `mul_mmq`'s tile geometry is chosen per call from the matmul shape
             // (see [`MmqSpec::choose`]); there is no single default, and running
             // it with the shader's built-in defaults would silently pick a tile
@@ -2827,6 +2858,106 @@ pub fn qwen4_block_perm_params(block: u32, nblocks: u32) -> KernelParams {
 /// One workgroup per destination block; threads stride the block.
 pub fn qwen4_block_perm_dispatch(nblocks: u32) -> Dispatch {
     Dispatch::x(nblocks.max(1))
+}
+
+/// Push-constant block for `qwen4_block_scatter.comp` = `{block, pairs,
+/// top_k}`. Bindings: `0 = src` f32 (read), `1 = map` u32 `[pairs]` (read,
+/// pair -> DST block), `2 = dst` f32 (write). The write-side twin of
+/// [`qwen4_block_perm_params`]: pair `p` copies src block `p / top_k` to dst
+/// block `map[p]`, so a SPARSE destination region costs only its live rows.
+/// `src`/`dst` must not alias, and `map` must not repeat a destination.
+pub fn qwen4_block_scatter_params(block: u32, pairs: u32, top_k: u32) -> KernelParams {
+    KernelParams::from_words(vec![block, pairs, top_k])
+}
+
+/// One workgroup per PAIR; threads stride the block.
+pub fn qwen4_block_scatter_dispatch(pairs: u32) -> Dispatch {
+    Dispatch::x(pairs.max(1))
+}
+
+/// Grouped-MoE planner scratch size in u32 ELEMENTS for `n_experts` experts:
+/// counts `[E]`, full-block prefix `[E]`, remainder-block prefixes `[8][E]`,
+/// per-class block totals `[8]`, and 2 x 8 `VkDispatchIndirectCommand`
+/// triples (gate/up then down, classes widest-first). The layout is pinned in
+/// `qwen4_moe_plan_count.comp`'s header; these offsets mirror it.
+#[must_use]
+pub const fn qwen4_moe_plan_scratch_elems(n_experts: u32) -> u32 {
+    10 * n_experts + 56
+}
+
+/// Element offset of the per-class block totals inside the planner scratch:
+/// class `w` (block width, `1..=8`) at `qwen4_moe_plan_nblk_at(E) + w - 1`.
+#[must_use]
+pub const fn qwen4_moe_plan_nblk_at(n_experts: u32) -> u32 {
+    10 * n_experts
+}
+
+/// Element offset of class `w`'s gate/up `VkDispatchIndirectCommand` triple
+/// (classes laid widest-first: class 8 at triple 0).
+#[must_use]
+pub const fn qwen4_moe_plan_args_gateup_at(n_experts: u32, w: u32) -> u32 {
+    10 * n_experts + 8 + (8 - w) * 3
+}
+
+/// Element offset of class `w`'s down-projection triple.
+#[must_use]
+pub const fn qwen4_moe_plan_args_down_at(n_experts: u32, w: u32) -> u32 {
+    10 * n_experts + 32 + (8 - w) * 3
+}
+
+/// Push-constant block for `qwen4_moe_plan_count.comp` = `{pairs, top_k,
+/// ids_stride, n_experts}`. Bindings: `0 = ids` i32 `[t][ids_stride]` (read),
+/// `1 = plan` u32 scratch (`qwen4_moe_plan_scratch_elems`, write). Dispatch =
+/// [`qwen4_moe_plan_count_dispatch`] (ONE workgroup: it zeroes the counts and
+/// then accumulates them, so a second workgroup would race the zeroing).
+pub fn qwen4_moe_plan_count_params(
+    pairs: u32,
+    top_k: u32,
+    ids_stride: u32,
+    n_experts: u32,
+) -> KernelParams {
+    KernelParams::from_words(vec![pairs, top_k, ids_stride, n_experts])
+}
+
+pub fn qwen4_moe_plan_count_dispatch() -> Dispatch {
+    Dispatch::x(1)
+}
+
+/// Push-constant block for `qwen4_moe_plan_scan.comp` = `{n_experts,
+/// x_gateup, x_down}` where the `x_*` are the record-time x extents (expert
+/// out-dim rows) baked into the indirect triples. Binding: `0 = plan` u32
+/// scratch (read counts, write everything else). Dispatch = ONE workgroup
+/// (the scan is deliberately serial — that is what pins the block order).
+pub fn qwen4_moe_plan_scan_params(n_experts: u32, x_gateup: u32, x_down: u32) -> KernelParams {
+    KernelParams::from_words(vec![n_experts, x_gateup, x_down])
+}
+
+pub fn qwen4_moe_plan_scan_dispatch() -> Dispatch {
+    Dispatch::x(1)
+}
+
+/// Push-constant block for `qwen4_moe_plan_emit.comp` = `{pairs, top_k,
+/// ids_stride, n_experts, pair_base[8], list_base[8]}` — the per-class fixed
+/// region bases, class `w` at array index `w - 1` (packed as four `uvec4`s in
+/// the shader). Bindings: `0 = ids` (read), `1 = plan` scratch (read), `2 =
+/// scatter` u32 `[pairs]` (write), `3 = list` i32 expert-id lists (write).
+pub fn qwen4_moe_plan_emit_params(
+    pairs: u32,
+    top_k: u32,
+    ids_stride: u32,
+    n_experts: u32,
+    pair_base: [u32; 8],
+    list_base: [u32; 8],
+) -> KernelParams {
+    let mut words = vec![pairs, top_k, ids_stride, n_experts];
+    words.extend_from_slice(&pair_base);
+    words.extend_from_slice(&list_base);
+    KernelParams::from_words(words)
+}
+
+/// One lane per pair AND per expert: `x` covers `max(pairs, n_experts)`.
+pub fn qwen4_moe_plan_emit_dispatch(pairs: u32, n_experts: u32) -> Dispatch {
+    Dispatch::x(pairs.max(n_experts).div_ceil(256).max(1))
 }
 
 /// Push-constant block for `qwen4_hc_combine.comp` = `{hidden, hc_count}`

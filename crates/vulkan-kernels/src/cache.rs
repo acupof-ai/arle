@@ -181,6 +181,22 @@ pub fn record_dispatch(
     recorder.dispatch(pipeline, set, push, groups);
 }
 
+/// [`record_dispatch`] with the workgroup counts read on the GPU from a
+/// `VkDispatchIndirectCommand` at `args_offset` inside `args` — for dispatch
+/// extents a previous dispatch computed (e.g. the grouped-MoE planner's
+/// per-class block counts). Order the args write before this read with
+/// `CommandRecorder::barrier_indirect`, not the plain `barrier`.
+pub fn record_dispatch_indirect(
+    recorder: &mut CommandRecorder<'_>,
+    pipeline: &ComputePipeline<'_>,
+    set: &DescriptorSet<'_>,
+    push: &[u8],
+    args: &vulkan_sys::DeviceBuffer<'_>,
+    args_offset: u64,
+) {
+    recorder.dispatch_indirect(pipeline, set, push, args, args_offset);
+}
+
 /// One-shot cached launch: fetch (or build-once) the pipeline for this call,
 /// bind the buffers, and record + submit a single `record_dispatch` through a
 /// [`CommandRecorder`]. This is the cached replacement for the per-call object

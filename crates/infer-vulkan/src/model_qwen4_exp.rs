@@ -98,17 +98,21 @@ use vulkan_kernels::{
     flash_attn_dispatch_batched, flash_attn_params, flash_attn_params_batched, gemv_dense_dispatch,
     gemv_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_id_params_grouped,
     gemv_nvfp4_spec_cols, gemv_params_f32_b, gemv_params_f32_b_cols, mm_dispatch, mmq_params,
-    qwen4_block_perm_dispatch, qwen4_block_perm_params, qwen4_gdn_chunk_intra_dispatch,
-    qwen4_gdn_chunk_params, qwen4_gdn_chunk_scratch_elems, qwen4_gdn_chunk_state_dispatch,
-    qwen4_hc_combine_dispatch, qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params,
+    qwen4_block_perm_dispatch, qwen4_block_perm_params, qwen4_block_scatter_dispatch,
+    qwen4_block_scatter_params, qwen4_gdn_chunk_intra_dispatch, qwen4_gdn_chunk_params,
+    qwen4_gdn_chunk_scratch_elems, qwen4_gdn_chunk_state_dispatch, qwen4_hc_combine_dispatch,
+    qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params,
+    qwen4_moe_plan_args_down_at, qwen4_moe_plan_args_gateup_at, qwen4_moe_plan_count_dispatch,
+    qwen4_moe_plan_count_params, qwen4_moe_plan_emit_dispatch, qwen4_moe_plan_emit_params,
+    qwen4_moe_plan_scan_dispatch, qwen4_moe_plan_scan_params, qwen4_moe_plan_scratch_elems,
     qwen4_ple_conv_dispatch, qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
     qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
     qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
-    qwen36_router_topk_params, record_dispatch, repack_nvfp4_planes, rms_norm_dispatch_rows,
-    rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch, rope_neox_dispatch_batched,
-    rope_neox_params, rope_neox_params_batched, sigmoid_mul_dispatch, sigmoid_mul_params,
-    sigmoid_mul_params_strided, swiglu_dispatch, swiglu_params,
+    qwen36_router_topk_params, record_dispatch, record_dispatch_indirect, repack_nvfp4_planes,
+    rms_norm_dispatch_rows, rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch,
+    rope_neox_dispatch_batched, rope_neox_params, rope_neox_params_batched, sigmoid_mul_dispatch,
+    sigmoid_mul_params, sigmoid_mul_params_strided, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{CommandRecorder, DescriptorSet, DeviceBuffer, VulkanContext};
 
@@ -1335,6 +1339,15 @@ enum Bind<'b> {
     Ext(&'b DeviceBuffer<'b>, u64, u64),
 }
 
+/// A device-resident `VkDispatchIndirectCommand`: where
+/// [`Qwen4Dev::rec_indirect`] reads its workgroup counts. The offset must be
+/// 4-byte aligned and the 12-byte triple fully inside `buffer` (which carries
+/// `INDIRECT_BUFFER` usage — every `vulkan-sys` `alloc*` constructor sets it).
+struct GroupedIndirect<'b> {
+    buffer: &'b DeviceBuffer<'b>,
+    args_offset: u64,
+}
+
 /// Device f16 KV cache for the RESIDENT full-attention layers, laid out like
 /// `forward.rs`'s `DeviceKvCache`: `[K block | V block]`, each block indexed
 /// `[full_idx, kv_head, pos, head_dim]` f16.
@@ -1526,9 +1539,67 @@ impl<'ctx> Qwen4Dev<'ctx> {
         Ok(())
     }
 
+    /// [`Self::rec`] with the workgroup counts read on the GPU from a
+    /// [`GroupedIndirect`] args triple — same pipeline cache, descriptor
+    /// plumbing and profiler labeling, only the dispatch command differs.
+    fn rec_indirect(
+        &mut self,
+        kernel: Kernel,
+        spec: &[(u32, u32)],
+        push: &[u8],
+        binds: &[Bind<'_>],
+        args: GroupedIndirect<'_>,
+    ) -> Result<()> {
+        let _p = prof::span("record");
+        if !self.open {
+            self.recorder
+                .begin()
+                .map_err(|e| anyhow!("recorder begin: {e}"))?;
+            self.open = true;
+        }
+        let resolved: Vec<(&DeviceBuffer<'_>, u64, u64)> = binds
+            .iter()
+            .map(|b| match *b {
+                Bind::A(off, len) => (&self.arena, off, len),
+                Bind::Kv(off, len) => {
+                    let kv = self.kv.as_ref().expect("KV bind without a KV cache");
+                    (&kv.buffer, off, len)
+                }
+                Bind::Ext(buf, off, len) => (buf, off, len),
+            })
+            .collect();
+        let (pipeline, layout) = self
+            .cache
+            .get(self.ctx, kernel, spec, push.len() as u32, binds.len())
+            .map_err(|e| anyhow!("build {kernel:?} pipeline: {e}"))?;
+        let set = DescriptorSet::storage_buffers_ranged(self.ctx, layout, &resolved)
+            .map_err(|e| anyhow!("bind {kernel:?} set: {e}"))?;
+        self.recorder.label_next(prof::current());
+        record_dispatch_indirect(
+            &mut self.recorder,
+            pipeline,
+            &set,
+            push,
+            args.buffer,
+            args.args_offset,
+        );
+        self.live.push(set);
+        Ok(())
+    }
+
     fn barrier(&mut self) {
         if self.open {
             self.recorder.barrier();
+        }
+    }
+
+    /// [`Self::barrier`] widened to the `DRAW_INDIRECT` stage — required
+    /// between a compute WRITE of indirect args and the
+    /// [`Self::rec_indirect`] that consumes them (see
+    /// `CommandRecorder::barrier_indirect`).
+    fn barrier_indirect(&mut self) {
+        if self.open {
+            self.recorder.barrier_indirect();
         }
     }
 
@@ -2229,13 +2300,21 @@ impl<'ctx> Qwen4Dev<'ctx> {
         )
     }
 
-    /// Record ONE grouped-MoE class ([`MoeClass`]): `n_blocks` expert blocks,
-    /// each `cols` gathered activation rows, through a `NUM_COLS = cols`
-    /// `GemvIdNvfp4` pipeline — the y axis walks BLOCKS (expert-major) where
-    /// the decode dispatch walks one token's slots. `weight_scale_2` rides
-    /// the same `MAT_VEC_FUSION_SCALE0` seam as decode: `scale0` is the
-    /// resident id-indexed `weight_scale_2` table, read through each block's
-    /// expert id.
+    /// Record ONE grouped-MoE class: expert blocks of `cols` gathered
+    /// activation rows each, through a `NUM_COLS = cols` `GemvIdNvfp4`
+    /// pipeline — the y axis walks BLOCKS (expert-major) where the decode
+    /// dispatch walks one token's slots. `weight_scale_2` rides the same
+    /// `MAT_VEC_FUSION_SCALE0` seam as decode: `scale0` is the resident
+    /// id-indexed `weight_scale_2` table, read through each block's expert
+    /// id.
+    ///
+    /// The y extent comes from `indirect` when given (a device-computed
+    /// `VkDispatchIndirectCommand` — the fence-free planner's block count) and
+    /// from `n_blocks` otherwise. `n_blocks` always feeds the push words, and
+    /// an UPPER BOUND is sufficient there: word 9 (`ne11`) only needs
+    /// `expert_i0 % ne11 == expert_i0` for every dispatched block index, and
+    /// words 8/11 are unread by the shader body (`gemv_id_params_grouped`
+    /// documents this).
     #[expect(clippy::too_many_arguments, reason = "a dispatch is this wide")]
     fn gemv_id_nvfp4_grouped(
         &mut self,
@@ -2244,6 +2323,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
         proj: ExpertProj,
         cols: usize,
         n_blocks: usize,
+        indirect: Option<GroupedIndirect<'_>>,
         ncols: usize,
         nrows: usize,
         b: Bind<'_>,
@@ -2268,21 +2348,33 @@ impl<'ctx> Qwen4Dev<'ctx> {
             MAT_VEC_FUSION_SCALE0,
         )
         .to_le_bytes();
-        let d = gemv_id_dispatch(nrows as u32, n_blocks as u32);
-        self.rec(
-            Kernel::GemvIdNvfp4,
-            &gemv_nvfp4_spec_cols(cols as u32),
-            &push,
-            &[
-                Bind::Ext(sb, so, sl),
-                b,
-                dst,
-                scale0,
-                Bind::A(s.dummy, 8),
-                ids,
-            ],
-            [d.x, d.y, d.z],
-        )
+        let binds = [
+            Bind::Ext(sb, so, sl),
+            b,
+            dst,
+            scale0,
+            Bind::A(s.dummy, 8),
+            ids,
+        ];
+        match indirect {
+            Some(args) => self.rec_indirect(
+                Kernel::GemvIdNvfp4,
+                &gemv_nvfp4_spec_cols(cols as u32),
+                &push,
+                &binds,
+                args,
+            ),
+            None => {
+                let d = gemv_id_dispatch(nrows as u32, n_blocks as u32);
+                self.rec(
+                    Kernel::GemvIdNvfp4,
+                    &gemv_nvfp4_spec_cols(cols as u32),
+                    &push,
+                    &binds,
+                    [d.x, d.y, d.z],
+                )
+            }
+        }
     }
 
     /// RECORD the shared expert into the open batch (no flush), accumulating
@@ -4161,14 +4253,17 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
 // recurrence and the PLE gate/conv run their existing `seq_len = T` kernel
 // modes against the SAME device-resident state decode uses, and full attention
 // is one causal-masked flash dispatch per layer. The NVFP4 expert tails are
-// regrouped EXPERT-major behind each layer's ids fence ([`MoeGroupPlan`]), so
-// an active expert's rows stream once per projection instead of once per
-// choosing token. Stages with no batched kernel — the 97 hyper-connection
-// sites and the MoE router/top-k — still record per token WITHIN the chunk.
+// regrouped EXPERT-major ON DEVICE ([`MoeGroupPlan`] is the host oracle; the
+// `Qwen4MoePlan*` kernels build the same plan without the ids ever reaching
+// the host), so an active expert's rows stream once per projection instead of
+// once per choosing token. Stages with no batched kernel — the 97
+// hyper-connection sites and the MoE router/top-k — still record per token
+// WITHIN the chunk.
 //
-// The fence structure is the point: ONE ids read-back per (layer, chunk) — the
-// same count decode pays per token — plus the end-of-chunk flush. Everything
-// else records back-to-back.
+// The fence structure is the point: a whole chunk records into ONE submit
+// with NO intra-chunk read-back — the per-(layer,chunk) ids fence that used
+// to sit in the MoE block held 7.46 s of the 9.27 s chunk-256 wall (80%)
+// before the device planner replaced it. Only the end-of-chunk flush waits.
 //
 // Equivalence contract: prefill-then-decode must EQUAL the per-token loop —
 // same logits, same recurrent state (GDN S, conv rings, PLE ring, KV rows).
@@ -4223,12 +4318,103 @@ const PF_LIST_ALIGN: usize = 64;
 /// expert routed more rows gets `ceil(rows / 8)` blocks.
 const PF_MOE_COLS_CAP: usize = 8;
 
-/// Capacity (elements) of one grouped-MoE class list region for `max_pairs`
-/// routed pairs: every pair could be its own 1-row block, plus worst-case
-/// [`PF_LIST_ALIGN`] padding ahead of each of the [`PF_MOE_COLS_CAP`] classes;
-/// rounded so stacked per-projection copies stay 256-B aligned.
-const fn pf_moe_list_capacity(max_pairs: usize) -> usize {
-    (max_pairs + PF_MOE_COLS_CAP * PF_LIST_ALIGN).next_multiple_of(PF_LIST_ALIGN)
+/// FIXED per-class regions for the grouped-MoE layout, a function of
+/// `(pairs, n_experts)` ALONE — no router ids involved. This is the load-
+/// bearing trick that lets the group planning move onto the GPU without
+/// touching the grouped GEMV: descriptor offsets must be known at RECORD
+/// time, so instead of packing the classes densely (offsets = functions of
+/// the device-only block counts, the old layout), every class `w` (block
+/// width, `1..=`[`PF_MOE_COLS_CAP`]) owns a worst-case region and only its
+/// BLOCK COUNT stays device-side, consumed as a `vkCmdDispatchIndirect` y
+/// extent. Capacity rows no block claims are simply never written or read —
+/// the gather is a write-side scatter over the live pairs
+/// ([`Kernel::Qwen4BlockScatter`]), not a read-side permutation over the
+/// capacity.
+///
+/// Worst cases per class: the full class (`w = CAP`) holds at most
+/// `pairs / CAP` blocks; a remainder class `w < CAP` gets at most ONE block
+/// per expert and each block consumes `w` pairs, so
+/// `min(n_experts, pairs / w)` blocks. Summed at the default chunk (256
+/// tokens x top-10 over 512 experts) the capacity is ~6x the live pairs —
+/// ~330 MB more HOST-CACHED arena (not device-local heap), traded for
+/// deleting the per-(layer,chunk) ids fence that held 80% of the chunk-256
+/// prefill wall.
+///
+/// Classes are laid WIDEST-FIRST (class `CAP` at base 0), matching the old
+/// dense layout's class order; the id-list bases are [`PF_LIST_ALIGN`]-
+/// aligned so per-class binds clear `minStorageBufferOffsetAlignment`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoePlanLayout {
+    /// Block capacity of class `w` at index `w - 1`.
+    cap_blocks: [usize; PF_MOE_COLS_CAP],
+    /// First gathered-pair row of class `w`'s region at index `w - 1`.
+    pair_base: [usize; PF_MOE_COLS_CAP],
+    /// Element offset of class `w`'s expert-id list at index `w - 1`.
+    list_base: [usize; PF_MOE_COLS_CAP],
+    /// Total gathered-pair rows across all class regions.
+    pub pair_capacity: usize,
+    /// Total expert-id list elements across all class regions.
+    pub list_capacity: usize,
+}
+
+impl MoePlanLayout {
+    #[must_use]
+    pub fn new(pairs: usize, n_experts: usize) -> Self {
+        let mut cap_blocks = [0usize; PF_MOE_COLS_CAP];
+        let mut pair_base = [0usize; PF_MOE_COLS_CAP];
+        let mut list_base = [0usize; PF_MOE_COLS_CAP];
+        let mut pair_at = 0usize;
+        let mut list_at = 0usize;
+        for w in (1..=PF_MOE_COLS_CAP).rev() {
+            let cap = if w == PF_MOE_COLS_CAP {
+                pairs / PF_MOE_COLS_CAP
+            } else {
+                n_experts.min(pairs / w)
+            };
+            cap_blocks[w - 1] = cap;
+            pair_base[w - 1] = pair_at;
+            list_base[w - 1] = list_at;
+            pair_at += w * cap;
+            list_at = (list_at + cap).next_multiple_of(PF_LIST_ALIGN);
+        }
+        Self {
+            cap_blocks,
+            pair_base,
+            list_base,
+            pair_capacity: pair_at,
+            list_capacity: list_at,
+        }
+    }
+
+    /// Block capacity of class `w` (`1..=`[`PF_MOE_COLS_CAP`]).
+    #[must_use]
+    pub fn cap_blocks(&self, w: usize) -> usize {
+        self.cap_blocks[w - 1]
+    }
+
+    /// First gathered-pair row of class `w`'s region.
+    #[must_use]
+    pub fn pair_base(&self, w: usize) -> usize {
+        self.pair_base[w - 1]
+    }
+
+    /// Element offset of class `w`'s expert-id list.
+    #[must_use]
+    pub fn list_base(&self, w: usize) -> usize {
+        self.list_base[w - 1]
+    }
+
+    /// The per-class bases as the emit kernel's push words (`u32`, class `w`
+    /// at index `w - 1`).
+    fn push_bases(&self) -> Result<([u32; 8], [u32; 8])> {
+        let mut pair = [0u32; 8];
+        let mut list = [0u32; 8];
+        for w in 1..=PF_MOE_COLS_CAP {
+            pair[w - 1] = u32::try_from(self.pair_base[w - 1])?;
+            list[w - 1] = u32::try_from(self.list_base[w - 1])?;
+        }
+        Ok((pair, list))
+    }
 }
 
 /// The causal mask for one chunk: `[t][kv_len]` f16, row `r` (absolute
@@ -4314,75 +4500,48 @@ fn pf_chunk_maps(cfg: &Qwen4ExpConfig, max_tokens: usize) -> (Vec<u32>, [usize; 
     (flat, offs)
 }
 
-/// One `NUM_COLS` class of a [`MoeGroupPlan`]: `n_blocks` blocks of exactly
-/// `cols` gathered rows, each block one expert — dispatched as ONE
-/// `GemvIdNvfp4` per projection (`gemv_id_params_grouped`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MoeClass {
-    /// Rows per block = the pipeline's `NUM_COLS` (1..=[`PF_MOE_COLS_CAP`]).
-    cols: usize,
-    /// Blocks in this class = the dispatch's y extent.
-    n_blocks: usize,
-    /// First gathered-pair row of this class's B/D slice (rows, not bytes).
-    pair_at: usize,
-    /// Element offset of this class's expert-id (and scale) list inside the
-    /// class-major list buffer; [`PF_LIST_ALIGN`]-aligned so the bind is too.
-    list_at: usize,
-}
-
 /// One chunk's `t x top_k` routed `(token, slot)` pairs regrouped
-/// EXPERT-major, so each active expert's NVFP4 rows stream ONCE per
-/// projection instead of once per token that chose it. At chunk 256 x top-10
-/// over 512 experts that is ~508 active experts x ~5 rows — squarely in the
-/// `NUM_COLS <= 8` near-free regime — cutting the per-layer-chunk expert
-/// bytes ~4.7x (7.08 GB re-streamed -> ~1.5 GB with `ceil(rows/8)`
-/// re-reads). Measured at full scale (512 tok, 2026-08-28 sitting): the
-/// expert stage's GPU-busy fell ~3.5 s -> 1.95 s and wall 11.36 s -> 9.21 s
-/// (45.1 -> 55.6 tok/s at chunk 256; 45.7 -> 58.7 at 64) — less than the
-/// byte ratio because the E2M1+UE4M3 dequant ALU is INVARIANT under
-/// grouping (`mul_mat_vec.comp` dequantizes inside the NUM_COLS loop, once
-/// per (pair, element) either way), and ~1.9 s is that floor: the grouped
-/// stage reads ~74 GB/s effective where the re-streaming baseline read
-/// ~185 GB/s cache-amortized. Pushing past the floor means dequantizing A
-/// once per block instead of once per column — a vendored-shader change,
-/// not a grouping change.
+/// EXPERT-major over the FIXED class regions of a [`MoePlanLayout`], so each
+/// active expert's NVFP4 rows stream ONCE per projection instead of once per
+/// token that chose it (the measured ~4.7x expert-byte cut of the grouped
+/// round; see the layout's doc for why the regions are fixed).
 ///
-/// Everything here is HOST work that happens inside the per-layer ids fence
-/// (the ids are on host anyway); the products are a few KB of maps/lists the
-/// recording uploads before the grouped dispatches. Bit-exactness does not
-/// depend on the grouping: each pair's dot product is computed by the same
-/// kernel body at some `NUM_COLS` lane, and per-column arithmetic is
-/// independent of `NUM_COLS`, so ANY valid grouping reproduces the decode
-/// loop's values — the plan is still fully deterministic (expert-ascending,
-/// token-ascending, classes widest-first) so a failure reproduces.
+/// This host planner is the ORACLE for the device planner
+/// ([`Kernel::Qwen4MoePlanCount`] -> [`Kernel::Qwen4MoePlanScan`] ->
+/// [`Kernel::Qwen4MoePlanEmit`]) and the `ARLE_QWEN4_PREFILL_HOST_PLAN=1`
+/// fallback: `tests/qwen4_moe_plan.rs` asserts ELEMENT-FOR-ELEMENT equality
+/// of the two on randomized and real router ids. Both pin the same
+/// deterministic order — experts ascending, and WITHIN an expert the pairs in
+/// token-major arrival order (token ascending, slot ascending), so an
+/// expert's full blocks come out in chunk order and its remainder block last.
+/// Bit-exactness of the VALUES never depended on the grouping (each pair's
+/// dot product is the same kernel arithmetic at any `NUM_COLS` lane); the
+/// determinism is what makes a failure reproduce.
 ///
 /// DECODE STAYS UNTOUCHED — the single-token loop keeps its fused
-/// `gemv_id_nvfp4` path. This planner is the prefill/verify substrate: a
-/// future k-token speculative verify (k = 2..16 -> a union of ~20-140
-/// experts at 1-2 rows each) is the same regrouping at a smaller `t` and can
-/// call this as-is; that reuse is why the grouping lives in its own pure
-/// function rather than inline in `record_moe`.
+/// `gemv_id_nvfp4` path.
 #[derive(Debug)]
-struct MoeGroupPlan {
-    /// Widest-first classes; together they cover all `t * top_k` pairs.
-    classes: Vec<MoeClass>,
-    /// `Qwen4BlockPerm` map for the GATHER (block = hidden): gathered row
-    /// `g` reads the block input of token `gather[g]`.
-    gather: Vec<u32>,
-    /// `Qwen4BlockPerm` map for the return SCATTER (block = hidden): the
-    /// `[tok][slot]` down-output row reads gathered row
-    /// `scatter[tok * top_k + slot]` — token order restored for the untouched
-    /// weighted-accumulate, preserving decode's slot-order summation exactly.
-    scatter: Vec<u32>,
-    /// Class-major expert-id lists at each class's `list_at`; alignment
-    /// padding carries id 0, which no dispatch reads.
-    ids: Vec<i32>,
+pub struct MoeGroupPlan {
+    /// The fixed region geometry this plan was laid out in.
+    pub layout: MoePlanLayout,
+    /// Blocks of class `w` at index `w - 1` (the dispatch y extents).
+    pub n_blocks: [usize; PF_MOE_COLS_CAP],
+    /// `Qwen4BlockScatter` map (block = hidden): pair `p`'s row lands at
+    /// gathered row `scatter[p]`; the return permutation reads the same map
+    /// through `Qwen4BlockPerm` (`[tok][slot]` row `p` pulls gathered row
+    /// `scatter[p]`), restoring token order for the untouched
+    /// weighted-accumulate.
+    pub scatter: Vec<u32>,
+    /// Expert-id lists over the layout's full `list_capacity`; class `w`'s
+    /// live entries at `layout.list_base(w) .. + n_blocks[w-1]`, everything
+    /// else 0 (never read: no dispatch walks past its class's block count).
+    pub ids: Vec<i32>,
 }
 
 /// Build the [`MoeGroupPlan`] for one chunk's routed ids (`raw_ids` is the
 /// device's `[t][ids_stride]` i32 rows, first `top_k` entries live). Errors
 /// on an out-of-range expert id rather than binding garbage.
-fn plan_moe_groups(
+pub fn plan_moe_groups(
     raw_ids: &[i32],
     t: usize,
     ids_stride: usize,
@@ -4398,62 +4557,81 @@ fn plan_moe_groups(
         "ids rows under-span the chunk"
     );
     let pairs = t * top_k;
-    // Expert -> its routed pairs, both axes ascending (BTreeMap for a
-    // deterministic layout; the router never repeats an expert within a
-    // token, so each expert sees a token at most once).
-    let mut by_expert: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
-    for tok in 0..t {
-        for slot in 0..top_k {
-            let id = raw_ids[tok * ids_stride + slot];
-            ensure!(
-                usize::try_from(id).is_ok_and(|i| i < n_experts),
-                "routed expert id {id} is outside the {n_experts}-expert stack"
-            );
-            by_expert.entry(id).or_default().push(tok * top_k + slot);
+    let layout = MoePlanLayout::new(pairs, n_experts);
+    let cap = PF_MOE_COLS_CAP;
+
+    // Pass 1 (the device count kernel's twin): per-expert pair counts.
+    let mut counts = vec![0usize; n_experts];
+    let pair_expert = |p: usize| raw_ids[(p / top_k) * ids_stride + (p % top_k)];
+    for p in 0..pairs {
+        let id = pair_expert(p);
+        ensure!(
+            usize::try_from(id).is_ok_and(|i| i < n_experts),
+            "routed expert id {id} is outside the {n_experts}-expert stack"
+        );
+        counts[id as usize] += 1;
+    }
+
+    // Pass 2 (the scan kernel's twin): expert-ascending exclusive prefixes of
+    // block indices, plus the per-class totals.
+    let mut fullb = vec![0usize; n_experts];
+    let mut remb = vec![0usize; cap * n_experts];
+    let mut run = [0usize; PF_MOE_COLS_CAP + 1];
+    for e in 0..n_experts {
+        fullb[e] = run[cap];
+        for w in 1..cap {
+            remb[w * n_experts + e] = run[w];
+        }
+        run[cap] += counts[e] / cap;
+        let rem = counts[e] % cap;
+        if rem != 0 {
+            run[rem] += 1;
         }
     }
-    // Split every expert's rows into blocks of <= PF_MOE_COLS_CAP, bucketed
-    // by block width.
-    let mut buckets: Vec<Vec<(i32, &[usize])>> = vec![Vec::new(); PF_MOE_COLS_CAP + 1];
-    for (&expert, rows) in &by_expert {
-        for block in rows.chunks(PF_MOE_COLS_CAP) {
-            buckets[block.len()].push((expert, block));
-        }
+    let mut n_blocks = [0usize; PF_MOE_COLS_CAP];
+    for w in 1..=cap {
+        n_blocks[w - 1] = run[w];
+        ensure!(
+            run[w] <= layout.cap_blocks(w),
+            "class {w} overflows its fixed region ({} > {})",
+            run[w],
+            layout.cap_blocks(w)
+        );
     }
-    // Lay classes out widest-first; within a class, expert-ascending.
+
+    // Pass 3 (the emit kernel's twin): closed-form scatter rows in token-major
+    // arrival order (rank = pairs seen so far for that expert), and the
+    // class-major id lists.
     let mut plan = MoeGroupPlan {
-        classes: Vec::new(),
-        gather: vec![0u32; pairs],
+        layout,
+        n_blocks,
         scatter: vec![0u32; pairs],
-        ids: Vec::new(),
+        ids: vec![0i32; layout.list_capacity],
     };
-    let mut pair_at = 0usize;
-    for cols in (1..=PF_MOE_COLS_CAP).rev() {
-        let blocks = &buckets[cols];
-        if blocks.is_empty() {
-            continue;
-        }
-        while !plan.ids.len().is_multiple_of(PF_LIST_ALIGN) {
-            plan.ids.push(0);
-        }
-        let list_at = plan.ids.len();
-        for &(expert, rows) in blocks {
-            plan.ids.push(expert);
-            for &p in rows {
-                let g = pair_at;
-                pair_at += 1;
-                plan.gather[g] = u32::try_from(p / top_k)?;
-                plan.scatter[p] = u32::try_from(g)?;
-            }
-        }
-        plan.classes.push(MoeClass {
-            cols,
-            n_blocks: blocks.len(),
-            pair_at: pair_at - cols * blocks.len(),
-            list_at,
-        });
+    let mut next_rank = vec![0usize; n_experts];
+    for p in 0..pairs {
+        let e = pair_expert(p) as usize;
+        let r = next_rank[e];
+        next_rank[e] += 1;
+        let nfull = counts[e] / cap;
+        let (w, blk, pos) = if r < nfull * cap {
+            (cap, fullb[e] + r / cap, r % cap)
+        } else {
+            let w = counts[e] % cap;
+            (w, remb[w * n_experts + e], r - nfull * cap)
+        };
+        plan.scatter[p] = u32::try_from(layout.pair_base(w) + blk * w + pos)?;
     }
-    debug_assert_eq!(pair_at, pairs, "grouping must cover every routed pair");
+    for e in 0..n_experts {
+        let nfull = counts[e] / cap;
+        for k in 0..nfull {
+            plan.ids[layout.list_base(cap) + fullb[e] + k] = e as i32;
+        }
+        let rem = counts[e] % cap;
+        if rem != 0 {
+            plan.ids[layout.list_base(rem) + remb[rem * n_experts + e]] = e as i32;
+        }
+    }
     Ok(plan)
 }
 
@@ -4490,26 +4668,33 @@ struct PfSlots {
     shg: u64,
     /// Router logits `[T][num_experts]`.
     lgt: u64,
-    /// Routed gate activations, EXPERT-major `[T * top_k][inter]` (the
-    /// grouped-MoE class layout; same total size as token-major).
+    /// Routed gate activations, EXPERT-major over the [`MoePlanLayout`] class
+    /// regions, `[pair_capacity][inter]` (live rows are the routed pairs;
+    /// capacity gaps are never read).
     ge: u64,
-    /// Routed up activations, expert-major `[T * top_k][inter]`.
+    /// Routed up activations, expert-major `[pair_capacity][inter]`.
     gu: u64,
     /// Routed down outputs `[T][top_k * hidden]` — TOKEN order (the scatter's
     /// destination; the weighted-accumulate walks these rows unchanged).
     edown: u64,
-    /// Gathered block inputs, expert-major `[T * top_k][hidden]` (grouped-MoE
-    /// GEMV B operand).
+    /// Gathered block inputs, expert-major `[pair_capacity][hidden]`
+    /// (grouped-MoE GEMV B operand).
     xg: u64,
-    /// Routed down outputs, expert-major `[T * top_k][hidden]`, pre-scatter.
+    /// Routed down outputs, expert-major `[pair_capacity][hidden]`,
+    /// pre-scatter.
     edc: u64,
-    /// Grouped-MoE gather map `[T * top_k]` u32 ([`MoeGroupPlan::gather`]).
-    gmap: u64,
-    /// Grouped-MoE scatter map `[T * top_k]` u32 ([`MoeGroupPlan::scatter`]).
+    /// Grouped-MoE scatter map `[T * top_k]` u32 ([`MoeGroupPlan::scatter`]) —
+    /// device-written by [`Kernel::Qwen4MoePlanEmit`] (host-uploaded under
+    /// `ARLE_QWEN4_PREFILL_HOST_PLAN=1`). Serves BOTH permutations: the
+    /// write-side gather and the read-side return scatter.
     smap: u64,
     /// Grouped-MoE class-major expert-id lists ([`MoeGroupPlan::ids`]),
-    /// [`pf_moe_list_capacity`] i32s.
+    /// [`MoePlanLayout::list_capacity`] i32s.
     eids: u64,
+    /// Device planner scratch ([`qwen4_moe_plan_scratch_elems`] u32s): counts,
+    /// block-index prefixes, per-class totals and the
+    /// `VkDispatchIndirectCommand` triples the grouped GEMVs consume.
+    plan: u64,
     /// Shared-expert gate `[T][sh_inter]`.
     sg: u64,
     /// Shared-expert up `[T][sh_inter]`.
@@ -4613,13 +4798,25 @@ fn pf_chunked_gdn() -> bool {
     std::env::var("ARLE_QWEN4_PREFILL_CHUNKED_GDN").as_deref() == Ok("1")
 }
 
+/// `ARLE_QWEN4_PREFILL_HOST_PLAN=1`: plan the grouped MoE on the HOST (the
+/// pre-device-planner behavior — one ids fence per (layer, chunk)). Kept as
+/// the oracle fallback: [`plan_moe_groups`] and the device planner build the
+/// same fixed-layout plan, so the two modes record byte-identical GEMV work
+/// and the bit-exact prefill=decode gate covers both. Read at record time,
+/// per layer, like the other prefill lane gates.
+fn pf_host_plan() -> bool {
+    std::env::var("ARLE_QWEN4_PREFILL_HOST_PLAN").as_deref() == Ok("1")
+}
+
 /// The chunk arena + chunk permutation maps for [`VulkanQwen4ExpModel::forward_prompt`].
 ///
 /// Deliberately SEPARATE from [`DevSlots`] (the decode arena): scaling the
 /// decode slots by `T` would multiply `dense_y`'s vocab-sized region into
 /// gigabytes, and keeping the two apart leaves the decode path byte-for-byte
-/// untouched. ~240 MB at the default 256-token width (the grouped-MoE gather
-/// and pre-scatter regions are ~26 MB each) — allocated lazily on the first
+/// untouched. ~570 MB of HOST-CACHED memory at the default 256-token width —
+/// the grouped-MoE class regions are sized to [`MoePlanLayout`]'s worst case
+/// (~6x the live pairs, the price of record-time offsets with device-side
+/// block counts; see the layout's doc) — allocated lazily on the first
 /// `forward_prompt`, never for decode-only runs.
 pub struct Qwen4Prefill<'ctx> {
     buffer: DeviceBuffer<'ctx>,
@@ -4664,6 +4861,10 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         let top_k = cfg.num_experts_per_tok;
         let inter = cfg.moe_intermediate_size;
         let sh_inter = cfg.shared_expert_intermediate_size;
+        // Worst-case grouped-MoE class regions for the widest chunk; per-chunk
+        // layouts (`MoePlanLayout::new(t * top_k, ..)`) always fit inside
+        // (every class capacity is monotone in `pairs`).
+        let moe_layout = MoePlanLayout::new(max_tokens * top_k, cfg.num_experts);
         let lowrank = hc.hc_lowrank;
         let u_stride = if (lowrank * 4).is_multiple_of(256) {
             lowrank
@@ -4713,14 +4914,18 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             wts: take(f32s(PF_IDS_PAD)),
             shg: take(f32s(PF_IDS_PAD)),
             lgt: take(f32s(cfg.num_experts)),
-            ge: take(f32s(top_k * inter)),
-            gu: take(f32s(top_k * inter)),
+            ge: take((moe_layout.pair_capacity * inter * 4) as u64),
+            gu: take((moe_layout.pair_capacity * inter * 4) as u64),
             edown: take(f32s(top_k * h)),
-            xg: take(f32s(top_k * h)),
-            edc: take(f32s(top_k * h)),
-            gmap: take(f32s(top_k)),
+            xg: take((moe_layout.pair_capacity * h * 4) as u64),
+            edc: take((moe_layout.pair_capacity * h * 4) as u64),
             smap: take(f32s(top_k)),
-            eids: take((pf_moe_list_capacity(max_tokens * top_k) * 4) as u64),
+            eids: take((moe_layout.list_capacity * 4) as u64),
+            plan: take(
+                u64::from(qwen4_moe_plan_scratch_elems(u32::try_from(
+                    cfg.num_experts,
+                )?)) * 4,
+            ),
             sg: take(f32s(sh_inter)),
             su: take(f32s(sh_inter)),
             sd: take(f32s(h)),
@@ -4997,10 +5202,10 @@ impl<'ctx> Qwen4Prefill<'ctx> {
     }
 
     /// [`Self::record_perm_chunk`] over a DYNAMIC map living in the arena
-    /// rather than the static chunk maps: the grouped-MoE gather/scatter maps
-    /// only exist after each layer's ids fence, uploaded per (layer, chunk)
-    /// at `map_off` — no race, everything recorded before the fence has
-    /// drained by the time the host writes them.
+    /// rather than the static chunk maps: the grouped-MoE scatter map is
+    /// written per (layer, chunk) — by the device planner in the recorded
+    /// stream (barrier-ordered), or by the host after the fence under
+    /// `ARLE_QWEN4_PREFILL_HOST_PLAN=1`.
     #[expect(clippy::too_many_arguments, reason = "src/dst spans differ")]
     fn record_perm_dyn(
         &self,
@@ -5758,10 +5963,12 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         self.record_dense_chunk(dev, weights, &o_w, s.wc, q_dim, out_packed, s.y, h, t)
     }
 
-    /// The MoE block over the chunk, with ONE ids fence for the whole chunk:
-    /// per-token routers + top-k and the (ids-independent) shared expert
-    /// record first, then the fence reads `t * top_k` ids at once, then the
-    /// per-token NVFP4 expert tails and the accumulates record against them.
+    /// The MoE block over the chunk, FENCE-FREE by default: per-token routers
+    /// + top-k and the (ids-independent) shared expert record first, then the
+    /// device planner turns the resident ids into the grouped-MoE plan, and
+    /// the expert tails dispatch through `vkCmdDispatchIndirect` against it —
+    /// all in the same recorded stream. `ARLE_QWEN4_PREFILL_HOST_PLAN=1` (or
+    /// the `moe_ids` capture) restores the fenced host planning.
     fn record_moe(
         &mut self,
         dev: &mut Qwen4Dev<'ctx>,
@@ -5915,77 +6122,195 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             t,
         )?;
 
-        // ── THE chunk ids fence: one read of t * top_k ids. ──
-        prof::phase("pf.moe.ids_fence");
-        dev.flush()?;
-        let raw_ids = self.read_i32_at(s.ids, t * PF_IDS_PAD)?;
-        if moe_ids::enabled() {
-            let mut compact = Vec::with_capacity(t * top_k);
-            for row in 0..t {
-                compact.extend_from_slice(&raw_ids[row * PF_IDS_PAD..row * PF_IDS_PAD + top_k]);
-            }
-            moe_ids::push(layer, compact);
-        }
-
-        prof::phase("pf.moe.group");
-        // Host regrouping (see [`MoeGroupPlan`]): each active expert's rows
-        // stream ONCE per projection instead of once per choosing token. The
-        // fence just drained everything recorded so far, so the map/list
-        // uploads below cannot race the gather that reads them.
-        let plan = plan_moe_groups(&raw_ids, t, PF_IDS_PAD, top_k, cfg.num_experts)?;
+        // ── Group planning: DEVICE by default — the per-(layer,chunk) ids
+        // fence (measured 7.46 s of the 9.27 s chunk-256 prefill wall, 80%)
+        // exists only under `ARLE_QWEN4_PREFILL_HOST_PLAN=1` (the oracle
+        // fallback) or when the `moe_ids` capture needs the ids on host
+        // anyway. Both modes lay the SAME fixed class regions
+        // ([`MoePlanLayout`]) so every descriptor offset below is record-time
+        // and byte-identical between them; only where the maps/counts come
+        // from differs.
         let pairs = t * top_k;
-        let le32 = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        self.write_bytes_at(s.gmap, &le32(&plan.gather))?;
-        self.write_bytes_at(s.smap, &le32(&plan.scatter))?;
-        let id_bytes: Vec<u8> = plan.ids.iter().flat_map(|x| x.to_le_bytes()).collect();
-        self.write_bytes_at(s.eids, &id_bytes)?;
+        let layout = MoePlanLayout::new(pairs, cfg.num_experts);
+        let e32 = u32::try_from(cfg.num_experts)?;
+        let host_plan = pf_host_plan() || moe_ids::enabled();
+        let mut n_blocks = [0usize; PF_MOE_COLS_CAP];
+        if host_plan {
+            // THE chunk ids fence: one read of t * top_k ids after draining
+            // everything recorded so far, so the map/list uploads below
+            // cannot race the gather that reads them.
+            prof::phase("pf.moe.ids_fence");
+            dev.flush()?;
+            let raw_ids = self.read_i32_at(s.ids, t * PF_IDS_PAD)?;
+            if moe_ids::enabled() {
+                let mut compact = Vec::with_capacity(t * top_k);
+                for row in 0..t {
+                    compact.extend_from_slice(&raw_ids[row * PF_IDS_PAD..row * PF_IDS_PAD + top_k]);
+                }
+                moe_ids::push(layer, compact);
+            }
+            prof::phase("pf.moe.group");
+            let plan = plan_moe_groups(&raw_ids, t, PF_IDS_PAD, top_k, cfg.num_experts)?;
+            let map_bytes: Vec<u8> = plan.scatter.iter().flat_map(|x| x.to_le_bytes()).collect();
+            self.write_bytes_at(s.smap, &map_bytes)?;
+            let id_bytes: Vec<u8> = plan.ids.iter().flat_map(|x| x.to_le_bytes()).collect();
+            self.write_bytes_at(s.eids, &id_bytes)?;
+            n_blocks = plan.n_blocks;
+        } else {
+            // Device planner, three dispatches (count -> scan -> emit; the
+            // shader headers own the scratch layout): the ids never leave the
+            // device, and each class's block count lands as the y extent of a
+            // `VkDispatchIndirectCommand` in the `plan` scratch.
+            prof::phase("pf.moe.plan");
+            let plan_len = u64::from(qwen4_moe_plan_scratch_elems(e32)) * 4;
+            let push =
+                qwen4_moe_plan_count_params(pairs as u32, top_k as u32, PF_IDS_PAD as u32, e32)
+                    .to_le_bytes();
+            let d = qwen4_moe_plan_count_dispatch();
+            dev.rec(
+                Kernel::Qwen4MoePlanCount,
+                Kernel::Qwen4MoePlanCount.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.ids, (t * PF_IDS_PAD * 4) as u64),
+                    Bind::Ext(&self.buffer, s.plan, plan_len),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+            dev.barrier();
+            // x extents of the indirect triples are the projection out-dims —
+            // record-time facts the scan bakes in next to the device counts.
+            let push = qwen4_moe_plan_scan_params(e32, inter as u32, h as u32).to_le_bytes();
+            let d = qwen4_moe_plan_scan_dispatch();
+            dev.rec(
+                Kernel::Qwen4MoePlanScan,
+                Kernel::Qwen4MoePlanScan.specialization_u32(),
+                &push,
+                &[Bind::Ext(&self.buffer, s.plan, plan_len)],
+                [d.x, d.y, d.z],
+            )?;
+            dev.barrier();
+            let (pair_base, list_base) = layout.push_bases()?;
+            let push = qwen4_moe_plan_emit_params(
+                pairs as u32,
+                top_k as u32,
+                PF_IDS_PAD as u32,
+                e32,
+                pair_base,
+                list_base,
+            )
+            .to_le_bytes();
+            let d = qwen4_moe_plan_emit_dispatch(pairs as u32, e32);
+            dev.rec(
+                Kernel::Qwen4MoePlanEmit,
+                Kernel::Qwen4MoePlanEmit.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.ids, (t * PF_IDS_PAD * 4) as u64),
+                    Bind::Ext(&self.buffer, s.plan, plan_len),
+                    Bind::Ext(&self.buffer, s.smap, (pairs * 4) as u64),
+                    Bind::Ext(&self.buffer, s.eids, (layout.list_capacity * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+            // Widened barrier: the scan's args must be visible to the grouped
+            // GEMVs' DRAW_INDIRECT stage, which a compute-only dst mask does
+            // not cover.
+            dev.barrier_indirect();
+        }
         // `weight_scale_2` comes from the resident id-indexed table (seeded
         // here when decode has not touched this layer yet); the grouped GEMV
-        // reads it through the block's expert id, so no per-block scale list
-        // is built or uploaded.
+        // reads it through the block's expert id. First-touch is what makes
+        // this host write race-free with NO fence in front of it: rows that
+        // have never been bound cannot be read by any recorded dispatch.
         dev.ensure_scale0_rows(weights, layer)?;
 
         prof::phase("pf.moe.experts");
-        // Gather: ONE whole-chunk block permutation of the `x` rows into
-        // expert-major order — per-expert B is then a contiguous slice.
-        self.record_perm_dyn(dev, s.x, t * h, s.gmap, h, pairs, s.xg, pairs * h)?;
+        // Gather: write-side scatter of the LIVE pairs into the fixed class
+        // regions (`xg[smap[p]] = x[p / top_k]`) — capacity gaps are neither
+        // written nor read, so the region sparsity costs no bandwidth.
+        let push = qwen4_block_scatter_params(h as u32, pairs as u32, top_k as u32).to_le_bytes();
+        let d = qwen4_block_scatter_dispatch(pairs as u32);
+        dev.rec(
+            Kernel::Qwen4BlockScatter,
+            Kernel::Qwen4BlockScatter.specialization_u32(),
+            &push,
+            &[
+                Bind::Ext(&self.buffer, s.x, (t * h * 4) as u64),
+                Bind::Ext(&self.buffer, s.smap, (pairs * 4) as u64),
+                Bind::Ext(&self.buffer, s.xg, (layout.pair_capacity * h * 4) as u64),
+            ],
+            [d.x, d.y, d.z],
+        )?;
         dev.barrier();
-        let list_bind = |base: u64, elems_at: usize, n: usize| {
-            Bind::Ext(&self.buffer, base + (elems_at * 4) as u64, (n * 4) as u64)
+        // The classes worth recording: a zero-CAPACITY class can never have
+        // blocks; host mode additionally skips classes it KNOWS are empty,
+        // while device mode records them all and lets the indirect y extent
+        // (possibly 0) decide on the GPU.
+        let classes: Vec<usize> = (1..=PF_MOE_COLS_CAP)
+            .rev()
+            .filter(|&w| layout.cap_blocks(w) > 0 && (!host_plan || n_blocks[w - 1] > 0))
+            .collect();
+        // Push-word block bound per class: the exact count when the host
+        // knows it, the class CAPACITY otherwise — either satisfies the
+        // grouped contract (`expert_i0 % ne11 == expert_i0` needs only
+        // bound >= every dispatched block index + 1; words 8/11 are unread).
+        let bound = |w: usize| {
+            if host_plan {
+                n_blocks[w - 1]
+            } else {
+                layout.cap_blocks(w)
+            }
+        };
+        let drive = |args_at: u32| {
+            (!host_plan).then(|| GroupedIndirect {
+                buffer: &self.buffer,
+                args_offset: s.plan + u64::from(args_at) * 4,
+            })
+        };
+        let list_bind = |w: usize| {
+            Bind::Ext(
+                &self.buffer,
+                s.eids + (layout.list_base(w) * 4) as u64,
+                (layout.cap_blocks(w) * 4) as u64,
+            )
         };
         // Gate/up over every class: outputs are disjoint expert-major slices,
         // so the whole lot records with no intervening barriers.
-        for c in &plan.classes {
-            let rows = c.cols * c.n_blocks;
+        for &w in &classes {
+            let rows = w * layout.cap_blocks(w);
             for (proj, dst) in [(ExpertProj::Gate, s.ge), (ExpertProj::Up, s.gu)] {
                 let scale0 = dev.scale0_rows_bind(layer, proj);
                 dev.gemv_id_nvfp4_grouped(
                     weights,
                     layer,
                     proj,
-                    c.cols,
-                    c.n_blocks,
+                    w,
+                    bound(w),
+                    drive(qwen4_moe_plan_args_gateup_at(e32, w as u32)),
                     h,
                     inter,
                     Bind::Ext(
                         &self.buffer,
-                        s.xg + (c.pair_at * h * 4) as u64,
+                        s.xg + (layout.pair_base(w) * h * 4) as u64,
                         (rows * h * 4) as u64,
                     ),
                     Bind::Ext(
                         &self.buffer,
-                        dst + (c.pair_at * inter * 4) as u64,
+                        dst + (layout.pair_base(w) * inter * 4) as u64,
                         (rows * inter * 4) as u64,
                     ),
                     scale0,
-                    list_bind(s.eids, c.list_at, c.n_blocks),
+                    list_bind(w),
                 )?;
             }
         }
         dev.barrier();
-        // SwiGLU over the expert-major rows — elementwise, so the layout
-        // change is invisible to the values.
-        let n_act = (pairs * inter) as u32;
+        // SwiGLU over the whole class-region span — elementwise, so the
+        // capacity gaps it also touches hold garbage-in/garbage-out values
+        // nothing ever reads (the ~6x span costs ~0.1 ms/layer-chunk of
+        // bandwidth, noise next to the expert GEMVs).
+        let n_act = u32::try_from(layout.pair_capacity * inter)?;
         let push = swiglu_params(n_act).to_le_bytes();
         let d = swiglu_dispatch(n_act);
         dev.rec(
@@ -6002,38 +6327,49 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         dev.barrier();
         // Down over the same classes: B is the expert-major SwiGLU output,
         // already block-contiguous — the chain never leaves expert order.
-        for c in &plan.classes {
-            let rows = c.cols * c.n_blocks;
+        for &w in &classes {
+            let rows = w * layout.cap_blocks(w);
             let scale0 = dev.scale0_rows_bind(layer, ExpertProj::Down);
             dev.gemv_id_nvfp4_grouped(
                 weights,
                 layer,
                 ExpertProj::Down,
-                c.cols,
-                c.n_blocks,
+                w,
+                bound(w),
+                drive(qwen4_moe_plan_args_down_at(e32, w as u32)),
                 inter,
                 h,
                 Bind::Ext(
                     &self.buffer,
-                    s.ge + (c.pair_at * inter * 4) as u64,
+                    s.ge + (layout.pair_base(w) * inter * 4) as u64,
                     (rows * inter * 4) as u64,
                 ),
                 Bind::Ext(
                     &self.buffer,
-                    s.edc + (c.pair_at * h * 4) as u64,
+                    s.edc + (layout.pair_base(w) * h * 4) as u64,
                     (rows * h * 4) as u64,
                 ),
                 scale0,
-                list_bind(s.eids, c.list_at, c.n_blocks),
+                list_bind(w),
             )?;
         }
         dev.barrier();
-        // Scatter: expert-major down outputs back to the `[tok][slot]` rows.
-        // `weight_scale_2` was already fused in the GEMV (SCALE0, as decode
-        // fuses it), so this is a pure permutation and the weighted
-        // accumulate below runs UNCHANGED — decode's slot-order summation is
-        // preserved bit for bit.
-        self.record_perm_dyn(dev, s.edc, pairs * h, s.smap, h, pairs, s.edown, pairs * h)?;
+        // Scatter: expert-major down outputs back to the `[tok][slot]` rows,
+        // through the READ-side permutation over the same map (`edown[p] =
+        // edc[smap[p]]`). `weight_scale_2` was already fused in the GEMV
+        // (SCALE0, as decode fuses it), so this is a pure permutation and the
+        // weighted accumulate below runs UNCHANGED — decode's slot-order
+        // summation is preserved bit for bit.
+        self.record_perm_dyn(
+            dev,
+            s.edc,
+            layout.pair_capacity * h,
+            s.smap,
+            h,
+            pairs,
+            s.edown,
+            pairs * h,
+        )?;
         dev.barrier();
         prof::phase("pf.moe.accum");
         let acc_push = qwen36_moe_weighted_accum_params(h as u32, top_k as u32, true).to_le_bytes();
@@ -6078,9 +6414,10 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         Ok(())
     }
 
-    /// One chunk end to end: host staging, the layer walk (with one MoE ids
-    /// fence per layer), the end-of-chunk flush, and the PLE ring hand-back.
-    /// Leaves each token's final hyper residual in the `h` rows.
+    /// One chunk end to end: host staging, the layer walk (ONE recorded
+    /// stream — the device-planned MoE needs no intra-chunk fence), the
+    /// end-of-chunk flush, and the PLE ring hand-back. Leaves each token's
+    /// final hyper residual in the `h` rows.
     #[expect(
         clippy::too_many_arguments,
         reason = "the chunk driver owns the split state"
@@ -8209,71 +8546,77 @@ mod tests {
         (raw, t, top_k, n_experts)
     }
 
-    /// The load-bearing invariants of [`plan_moe_groups`]: the scatter map is
-    /// a bijection over the pairs, the gather map puts each pair's TOKEN row
-    /// at its gathered position, classes tile the pair range widest-first,
-    /// and every block's id list entry is the expert that owns its rows.
+    /// The load-bearing invariants of [`plan_moe_groups`] over the FIXED
+    /// class regions: the scatter map is injective into the layout, the
+    /// classes' live blocks tile exactly the routed pairs, every block's
+    /// rows belong to the expert its id-list entry names, and the pinned
+    /// token-major arrival order makes an expert's rows CONSECUTIVE within
+    /// each of its blocks.
     #[test]
     fn moe_grouping_maps_are_a_bijection_and_blocks_match_their_experts() {
         let (raw, t, top_k, n_experts) = grouping_fixture();
         let plan = plan_moe_groups(&raw, t, PF_IDS_PAD, top_k, n_experts).expect("plan");
         let pairs = t * top_k;
+        let lay = plan.layout;
+        assert_eq!(lay, MoePlanLayout::new(pairs, n_experts), "layout drifted");
 
-        // scatter: bijection pairs -> gathered rows.
-        let mut seen = vec![false; pairs];
-        for &g in &plan.scatter {
-            assert!(!seen[g as usize], "gathered row {g} claimed twice");
-            seen[g as usize] = true;
-        }
-        // gather agrees with scatter: pair p's gathered row holds token p/top_k.
-        for p in 0..pairs {
-            assert_eq!(
-                plan.gather[plan.scatter[p] as usize],
-                (p / top_k) as u32,
-                "pair {p}: gathered row reads the wrong token"
+        // scatter: injective into the pair capacity.
+        let mut owner: Vec<Option<usize>> = vec![None; lay.pair_capacity];
+        for (p, &g) in plan.scatter.iter().enumerate() {
+            assert!((g as usize) < lay.pair_capacity, "row {g} out of capacity");
+            assert!(
+                owner[g as usize].is_none(),
+                "gathered row {g} claimed twice"
             );
+            owner[g as usize] = Some(p);
         }
-        // classes tile [0, pairs) in order, widest-first, within the cap.
-        let mut at = 0usize;
-        let mut prev_cols = PF_MOE_COLS_CAP + 1;
-        for c in &plan.classes {
-            assert!(c.cols >= 1 && c.cols <= PF_MOE_COLS_CAP);
-            assert!(c.cols < prev_cols, "classes must be widest-first");
-            prev_cols = c.cols;
-            assert_eq!(c.pair_at, at, "class slices must be contiguous");
-            assert!(c.list_at.is_multiple_of(PF_LIST_ALIGN), "unaligned list");
-            at += c.cols * c.n_blocks;
-        }
-        assert_eq!(at, pairs, "classes must cover every routed pair");
-
-        // Every block's rows belong to the expert its id list names.
-        for c in &plan.classes {
-            for g in 0..c.n_blocks {
-                let expert = plan.ids[c.list_at + g];
-                for i in 0..c.cols {
-                    let row = c.pair_at + g * c.cols + i;
-                    let p = plan
-                        .scatter
-                        .iter()
-                        .position(|&s| s as usize == row)
-                        .expect("bijection");
+        // Live blocks tile exactly the routed pairs.
+        let live: usize = (1..=PF_MOE_COLS_CAP)
+            .map(|w| w * plan.n_blocks[w - 1])
+            .sum();
+        assert_eq!(live, pairs, "blocks must cover every routed pair");
+        // Every block: within its class capacity, rows all owned by pairs of
+        // the id-list expert, in ARRIVAL (pair-index ascending) order.
+        for w in 1..=PF_MOE_COLS_CAP {
+            assert!(
+                plan.n_blocks[w - 1] <= lay.cap_blocks(w),
+                "class {w} overflow"
+            );
+            assert!(
+                lay.list_base(w).is_multiple_of(PF_LIST_ALIGN),
+                "unaligned list"
+            );
+            for b in 0..plan.n_blocks[w - 1] {
+                let expert = plan.ids[lay.list_base(w) + b];
+                let mut prev_pair = None;
+                for i in 0..w {
+                    let row = lay.pair_base(w) + b * w + i;
+                    let p = owner[row]
+                        .unwrap_or_else(|| panic!("class {w} block {b} row {i} is a hole"));
                     let (tok, slot) = (p / top_k, p % top_k);
                     assert_eq!(
                         raw[tok * PF_IDS_PAD + slot],
                         expert,
-                        "class cols={} block {g} row {i}: wrong expert",
-                        c.cols
+                        "class {w} block {b} row {i}: wrong expert"
                     );
+                    if let Some(q) = prev_pair {
+                        assert!(p > q, "class {w} block {b}: arrival order broken");
+                    }
+                    prev_pair = Some(p);
+                }
+            }
+            // Capacity rows past the live blocks stay unclaimed.
+            for b in plan.n_blocks[w - 1]..lay.cap_blocks(w) {
+                for i in 0..w {
+                    assert!(owner[lay.pair_base(w) + b * w + i].is_none());
                 }
             }
         }
         // The hot expert (12 rows) must split into a full block and a tail.
-        let hot_blocks: usize = plan
-            .classes
-            .iter()
-            .map(|c| {
-                (0..c.n_blocks)
-                    .filter(|&g| plan.ids[c.list_at + g] == 5)
+        let hot_blocks: usize = (1..=PF_MOE_COLS_CAP)
+            .map(|w| {
+                (0..plan.n_blocks[w - 1])
+                    .filter(|&b| plan.ids[lay.list_base(w) + b] == 5)
                     .count()
             })
             .sum();
@@ -8281,10 +8624,42 @@ mod tests {
             hot_blocks, 2,
             "12 rows at cap 8 is one 8-block + one 4-block"
         );
+        assert_eq!(
+            plan.n_blocks[PF_MOE_COLS_CAP - 1],
+            1,
+            "exactly one full block"
+        );
     }
 
-    /// Garbage ids (the fence read the wrong region, or the topk kernel
-    /// broke) must refuse loudly, not bind a wrong stack offset.
+    /// The fixed regions must be disjoint, list bases aligned, and every
+    /// capacity MONOTONE in `pairs` — the arena is laid out once at
+    /// `max_tokens` and every smaller chunk's layout must fit inside it.
+    #[test]
+    fn moe_layout_regions_are_disjoint_aligned_and_monotone() {
+        let cases = [(4usize, 32usize), (40, 32), (240, 512), (2560, 512)];
+        for (pairs, n_experts) in cases {
+            let lay = MoePlanLayout::new(pairs, n_experts);
+            let mut at = 0usize;
+            for w in (1..=PF_MOE_COLS_CAP).rev() {
+                assert_eq!(lay.pair_base(w), at, "pair regions must be contiguous");
+                at += w * lay.cap_blocks(w);
+                assert!(lay.list_base(w).is_multiple_of(PF_LIST_ALIGN));
+                assert!(lay.list_base(w) + lay.cap_blocks(w) <= lay.list_capacity);
+            }
+            assert_eq!(at, lay.pair_capacity);
+        }
+        for (small, big) in [(4usize, 40usize), (40, 2560)] {
+            let (a, b) = (MoePlanLayout::new(small, 512), MoePlanLayout::new(big, 512));
+            for w in 1..=PF_MOE_COLS_CAP {
+                assert!(a.cap_blocks(w) <= b.cap_blocks(w), "capacity not monotone");
+            }
+            assert!(a.pair_capacity <= b.pair_capacity);
+            assert!(a.list_capacity <= b.list_capacity);
+        }
+    }
+
+    /// Garbage ids (the topk kernel broke, or a wrong region was read) must
+    /// refuse loudly, not bind a wrong stack offset.
     #[test]
     fn moe_grouping_rejects_out_of_range_ids() {
         let (mut raw, t, top_k, n_experts) = grouping_fixture();
@@ -8302,15 +8677,18 @@ mod tests {
         let mut raw = vec![0i32; PF_IDS_PAD];
         raw[..top_k].copy_from_slice(&[9, 2, 30, 17]);
         let plan = plan_moe_groups(&raw, 1, PF_IDS_PAD, top_k, 32).expect("plan");
-        assert_eq!(plan.classes.len(), 1);
-        assert_eq!(plan.classes[0].cols, 1);
-        assert_eq!(plan.classes[0].n_blocks, top_k);
+        for w in 2..=PF_MOE_COLS_CAP {
+            assert_eq!(plan.n_blocks[w - 1], 0, "class {w} must be empty");
+        }
+        assert_eq!(plan.n_blocks[0], top_k);
         // Blocks are expert-ascending; scatter routes each slot to the row
         // whose id-list entry names its expert.
-        assert_eq!(&plan.ids[..top_k], &[2, 9, 17, 30]);
+        let base1 = plan.layout.list_base(1);
+        assert_eq!(&plan.ids[base1..base1 + top_k], &[2, 9, 17, 30]);
         for (slot, &id) in [9i32, 2, 30, 17].iter().enumerate() {
             let g = plan.scatter[slot] as usize;
-            assert_eq!(plan.ids[g], id, "slot {slot}");
+            let blk = g - plan.layout.pair_base(1);
+            assert_eq!(plan.ids[base1 + blk], id, "slot {slot}");
         }
     }
 }

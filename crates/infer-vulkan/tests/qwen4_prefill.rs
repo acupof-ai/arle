@@ -269,7 +269,8 @@ fn prefill_equals_decode_on_a_truncated_model() {
     assert_eq!(model.state().seq_len, n);
     let decode = capture(&model, &cfg, logits, n);
 
-    // ── prefill passes: uneven multi-chunk, then one chunk. ──
+    // ── prefill passes: uneven multi-chunk, then one chunk (both on the
+    // DEFAULT device-planned grouped MoE — no ids fence). ──
     for chunk in [7usize, 24] {
         let logits = model
             .forward_prompt_chunked(0, &toks, 0, chunk)
@@ -278,6 +279,17 @@ fn prefill_equals_decode_on_a_truncated_model() {
         let prefill = capture(&model, &cfg, logits, n);
         assert_close(&prefill, &decode, 1e-4, &format!("chunk={chunk}"));
     }
+
+    // ── the fenced host-plan fallback (`ARLE_QWEN4_PREFILL_HOST_PLAN=1`):
+    // the oracle path lays the same fixed class regions, so it must hit the
+    // same gate. Env removed BEFORE the asserts — a red bar must not leak the
+    // mode into tests running later in this process. ──
+    unsafe { std::env::set_var("ARLE_QWEN4_PREFILL_HOST_PLAN", "1") };
+    let run = model.forward_prompt_chunked(0, &toks, 0, 24);
+    unsafe { std::env::remove_var("ARLE_QWEN4_PREFILL_HOST_PLAN") };
+    let logits = run.unwrap_or_else(|e| panic!("host-plan forward_prompt: {e:#}"));
+    let prefill = capture(&model, &cfg, logits, n);
+    assert_close(&prefill, &decode, 1e-4, "chunk=24 host-plan");
 }
 
 /// The opt-in coopmat GEMM lane (`ARLE_QWEN4_PREFILL_GEMM=1`) vs the same
@@ -570,6 +582,37 @@ fn full_scale_prefill_tok_s() {
         );
         // SAFETY: as above.
         unsafe { std::env::remove_var("ARLE_QWEN4_GEMV_COLS") };
+    }
+
+    // Matched A/B of the grouped-MoE planner in the SAME load
+    // (`ARLE_QWEN4_PREFILL_PLAN_AB=1`): chunk 256 again on the fenced HOST
+    // planner — the pre-device-planner fence structure — so the ids-fence
+    // share and tok/s delta come from one sitting. `pf_host_plan` is read per
+    // recorded layer, so the runtime env flip is a real arm switch.
+    if std::env::var("ARLE_QWEN4_PREFILL_PLAN_AB").as_deref() == Ok("1") {
+        let _ = prof::take();
+        if let Some(d) = model.dev_mut() {
+            let _ = d.take_gpu_profile();
+        }
+        prof::set_enabled(true);
+        // SAFETY: device suites run --test-threads=1; removed below.
+        unsafe { std::env::set_var("ARLE_QWEN4_PREFILL_HOST_PLAN", "1") };
+        let t0 = std::time::Instant::now();
+        let run = model.forward_prompt_chunked(0, &toks, 0, 256);
+        let secs = t0.elapsed().as_secs_f64();
+        // SAFETY: as above — removed BEFORE any assert can leak the mode.
+        unsafe { std::env::remove_var("ARLE_QWEN4_PREFILL_HOST_PLAN") };
+        prof::set_enabled(false);
+        let logits = run.expect("host-plan prefill");
+        assert!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
+        eprintln!(
+            "\n== chunk 256, ARLE_QWEN4_PREFILL_HOST_PLAN=1 (fenced host planner): {n_tokens} \
+             tok in {secs:.2}s = {:.1} tok/s ==",
+            n_tokens as f64 / secs
+        );
+        for (stage, ms, calls) in aggregate_ms(&prof::take()) {
+            eprintln!("  {stage:<22} {ms:>10.1} ms  ({calls} calls)");
+        }
     }
 
     // Parity LAST, so a numeric regression cannot eat the measurement above.
