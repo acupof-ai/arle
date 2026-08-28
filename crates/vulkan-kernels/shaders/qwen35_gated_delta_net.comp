@@ -93,8 +93,11 @@ void main() {
             q_sumsq += qv * qv;
             k_sumsq += kv * kv;
         }
-        const float q_norm = inversesqrt(q_sumsq + 1.0e-12);
-        const float k_norm = inversesqrt(k_sumsq + 1.0e-12);
+        // l2norm eps 1e-6: the reference's FLA-style epsilon (HF modeling and
+        // llama.cpp's ggml_l2_norm(eps_norm) both use it, qwen35 and qwen4exp
+        // alike), and the same constant the qwen4 host oracle applies.
+        const float q_norm = inversesqrt(q_sumsq + 1.0e-6);
+        const float k_norm = inversesqrt(k_sumsq + 1.0e-6);
 
         const float a_val = a_proj[token * p.num_value_heads + v_head];
         const float b_val = b_proj[token * p.num_value_heads + v_head];
