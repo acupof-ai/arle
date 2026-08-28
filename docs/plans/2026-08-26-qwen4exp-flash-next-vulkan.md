@@ -280,11 +280,11 @@ into "measured". Build it before chasing the first token, not after.
 | S4 ✅ | fused hyper-connection + PLE kernels vs host oracles | done |
 | S5 ✅ | PLE + n-gram → **first token** (indexer stubbed, ≤2048 ctx) | done |
 | perf ✅ | decode 899 → 84.9 ms/token: resident linattn/PLE/full-attn, staged loop (50 fences), BF16 tiers | done |
-| prefill ✅ | chunked `forward_prompt` 11.8 → 31 tok/s, prefill=decode BIT-EXACT at full scale (0.000e0): seq-mode linattn/PLE, batched flash, chunk perm maps, per-token MoE + one ids fence per layer-chunk (87% of wall — S7's grouped experts are the 100 tok/s lever). Coopmat BF16 GEMM lane (61 tok/s) opt-in `ARLE_QWEN4_PREFILL_GEMM=1`: any sub-f32 staging saturates to an argmax flip at 48 layers (expert-flip boundaries) | done |
+| prefill ✅ | chunked `forward_prompt` 11.8 → 31 tok/s, prefill=decode BIT-EXACT at full scale (0.000e0): seq-mode linattn/PLE, batched flash, chunk perm maps, per-token MoE + one ids fence per layer-chunk (read as 87% of wall — CORRECTED 2026-08-28: that phase absorbed each layer's GPU drain, the fence's own cost was ~3%). Coopmat BF16 GEMM lane (61 tok/s) opt-in `ARLE_QWEN4_PREFILL_GEMM=1`: any sub-f32 staging saturates to an argmax flip at 48 layers (expert-flip boundaries) | done |
 | Q4 ✅ | W4A16 Q4_K dense default: 79.0 → 55.5 ms/token (18 tok/s); teacher-forced step-agree 84.4% vs near-lossless Q8's 90.6% (2/32 gap at razor margins); the W4A8 q8_1-activation detour was built, measured, and deleted — A16 is the contract | done |
-| S6 | QSA indexer → contexts >2051 | 40 h |
-| S7 | requantize experts (Q8_0 returns MTP+vision); batched MoE prefill + verify (cols k≤8 / WMMA k≥16, measured) | 40 h |
-| S8 ✅ | MTP speculative decode: greedy-LOSSLESS at full scale (15/15 configs, 3 prompt classes x 5 depths x 40 tok), acceptance 57.9-71.9%/step at k=2 (vendor band 50-70%), best k=**1** at +10-15% (46.0/46.3/49.6 vs 50.6/51.1/56.8 ms/tok). Rollback = 2 device-to-device copies, 0.19-1.90 ms/cycle. NOT a default flip — chat regresses at k>1. Measured next wall: the verify amortizes the DENSE tier 1.31x and nothing else (the 512-expert union grows ~linearly in k; the per-position hc/router dispatch floor does not batch) | done |
+| S6 | QSA indexer → contexts >2051. Semantics now fully lifted from llama.cpp and verified (tail block forced by a +1e9 bias, incomplete blocks -inf, pooling before norm/rope, relu-sum over 4 heads) — port should COMPACT the ≤2051 selected rows rather than copy their full-cache mask surgery. This is capability parity: upstream serves ctx>2048 on this box today | 40 h |
+| S7 ✅ | grouped MoE prefill (45→56 tok/s, bit-exact) then DEVICE-side group planning + `vkCmdDispatchIndirect` — ids never visit the host, plan-equality gate (device == host oracle, element-for-element) plus full-scale prefill=decode 0.000e0. The fence's true cost was +3.2% at chunk 256 (62.7→64.7 tok/s); what died is the chunk-count pathology (chunk 64: 0.6→58.7 tok/s). NUM_COLS≤8 dense batching (from S8) is default and took prefill 57.6→68.2 (+18.4%). Residual is kernel-side: NVFP4 dequant-ALU floor, linattn occupancy, GEMV-vs-GEMM shape | done |
+| S8 ✅ | MTP speculative decode: greedy-LOSSLESS at full scale (15/15 configs, 3 prompt classes x 5 depths x 40 tok), acceptance 57.9-71.9%/step at k=2 (vendor band 50-70%), best k=**1** at +10-15% against the then-current 50.6/51.1/56.8 ms/tok baseline — but the post-merge re-measure against the fence-free 43.5 ms/token decode INVERTS the perf verdict (1.09x code, 0.88x chat, 0.66x factual-qa): losslessness holds, the speedup does not, because `forward_verify` is GPU-bound on the same chunked path (69-123 ms/cycle, unchanged by the fence removal). Ships opt-in and shelved as a perf feature. Rollback = 2 device-to-device copies, 0.19-1.90 ms/cycle. NOT a default flip — chat regresses at k>1. Measured next wall: the verify amortizes the DENSE tier 1.31x and nothing else (the 512-expert union grows ~linearly in k; the per-position hc/router dispatch floor does not batch) | done |
 
 Hours are CC-execution, not calendar.
 
@@ -292,10 +292,16 @@ Hours are CC-execution, not calendar.
 
 llama.cpp merged qwen4exp on 2026-08-27 (PR #27742) — one day into this
 plan's S7. Coverage: everything except MTP (WIP; the closed #27739 carries
-the only public MTP-draft code). Its Vulkan path ships with qwen4exp-specific
-breakage (ggml_vk_topk assert, Windows crashes #27431/#27560), so ARLE is
-plausibly ahead on this exact platform — a same-box UD-Q4_K_XL llama-bench
-baseline is being measured to replace that "plausibly" with a number.
+the only public MTP-draft code). The reported qwen4exp Vulkan breakage
+(ggml_vk_topk assert, #27431/#27560) did NOT reproduce here: llama-bench
+built from master (ca3d5a3e1, GGML_VULKAN) on this box reads pp128 187.1,
+pp4096 236.3, tg32 21.96 tok/s on UD-Q4_K_XL — QSA active, no crash. Against
+ARLE the same day (Balanced powercfg, ratios only): decode 43.5 ms/token
+(23.0 tok/s) is AHEAD; prefill 64.7 vs their 187 is ~3x behind, and the
+device-planning round proved that gap is NOT structural (fences, host
+round-trips: worth 3%) but kernel-shape: GEMV-vs-GEMM arithmetic intensity,
+the NVFP4 dequant-ALU floor on a part with `fp4: 0`, and our bit-exact
+contract forbidding the staging/reassociation they use freely.
 Lifted intel: MTP n-max=2 / dense-attention drafting / one-batched-verify;
 KV stays f16 under rotated QSA (S6 landmine); PLE graph-input reuse was
 worth +22%@b16 upstream (ARLE's staged loop already amortizes this).
