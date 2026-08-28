@@ -284,3 +284,27 @@ Env: `ARLE_QWEN4_MTP=0` drops the head from a full load;
 `ARLE_QWEN4_GEMV_COLS=1` disables the NUM_COLS dense batching;
 `ARLE_QWEN4_MTP_WARMUP` bounds the KV-canon warmup;
 `ARLE_QWEN4_SPEC_FAULT=skip-gdn|skip-ple|skip-ngram` injects a rollback fault.
+
+## Post-merge re-measure (same day): the speedup did not survive the faster baseline
+
+Merged onto the fence-free + resident-PLE + pipelined mainline (decode 43.5
+ms/token) and re-run at full scale, exclusive box: LOSSLESSNESS HOLDS
+(sequences token-for-token equal, gate green), but the throughput verdict
+inverts —
+
+| prompt | k | accept/step | verify ms/cyc | eff ms/tok | baseline | speedup |
+|---|---|---|---|---|---|---|
+| factual-qa | 1 | 85.7% | 119.4 | 66.6 | 43.7 | 0.66x |
+| code | 1 | 85.7% | 67.9 | 40.0 | 43.5 | **1.09x** |
+| chat | 1 | 77.3% | 79.4 | 49.8 | 43.8 | 0.88x |
+
+The decode loop got the fence-free MoE, the resident PLE ring and depth-2
+submit pipelining; `forward_verify` — built on the grouped-prefill machinery
+— got none of them and still pays the per-layer ids fence, so a 2-position
+verify chunk costs 68-119 ms against an 87 ms two-token baseline. Speculation
+is shelved as a perf feature until the verify chunk inherits the same
+structure, and the three open walls are now ONE wall: the chunked path's
+per-(layer,chunk) ids fence (80% of prefill, the whole verify overhead, and
+the reason k=1 no longer pays). Device-side expert grouping — router, top-k
+and group planning on GPU with indirect dispatch, ids never visiting the
+host — is the structural fix that pays all three at once.

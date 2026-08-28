@@ -1700,7 +1700,7 @@ mod real {
                 };
 
             let fence_create = vk::FenceCreateInfo::default();
-            let mut mk_fence = || match unsafe { ctx.device.create_fence(&fence_create, None) } {
+            let mk_fence = || match unsafe { ctx.device.create_fence(&fence_create, None) } {
                 Ok(fence) => Ok(fence),
                 Err(e) => {
                     unsafe { ctx.device.destroy_command_pool(pool, None) };
