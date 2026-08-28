@@ -431,6 +431,20 @@ pub enum Kernel {
     /// f32): the HF<->GGUF head-map bridge for qwen4_exp's linear attention.
     /// See [`qwen4_block_perm_params`].
     Qwen4BlockPerm,
+    /// Chunked (WY-form) gated-delta prefill, intra-chunk half: per
+    /// (64-token chunk, value head) it builds the decay-masked matrices, the
+    /// `(I + tril(k_beta K^T))^{-1}` triangular inverse and the T-applied
+    /// chunk quantities into scratch — everything with no cross-chunk data
+    /// dependence, parallel over chunks. Port of llama.cpp
+    /// `build_delta_net_chunking` (non-KDA arm); see
+    /// [`qwen4_gdn_chunk_params`] and the shader header.
+    Qwen4GdnChunkIntra,
+    /// Chunked gated-delta prefill, state half: the serial-in-`n_chunks`
+    /// state propagation + output blend over [`Kernel::Qwen4GdnChunkIntra`]'s
+    /// scratch, advancing the SAME resident f32 state the serial
+    /// [`Kernel::Qwen35GatedDeltaNet`] scan does. See
+    /// [`qwen4_gdn_chunk_params`].
+    Qwen4GdnChunkState,
 }
 
 const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
@@ -605,6 +619,8 @@ impl Kernel {
         Self::Qwen4HcCombineBf16,
         Self::Qwen4BlockPerm,
         Self::Qwen4HcCombine,
+        Self::Qwen4GdnChunkIntra,
+        Self::Qwen4GdnChunkState,
     ];
 
     pub const fn shader_name(self) -> &'static str {
@@ -672,6 +688,8 @@ impl Kernel {
             Kernel::Qwen4HcCombineBf16 => "qwen4_hc_combine_bf16",
             Kernel::Qwen4BlockPerm => "qwen4_block_perm",
             Kernel::Qwen4HcCombine => "qwen4_hc_combine",
+            Kernel::Qwen4GdnChunkIntra => "qwen4_gdn_chunk_intra",
+            Kernel::Qwen4GdnChunkState => "qwen4_gdn_chunk_state",
         }
     }
 
@@ -726,7 +744,9 @@ impl Kernel {
             | Kernel::Qwen4HcCombine
             | Kernel::Qwen4HcMixBf16
             | Kernel::Qwen4HcCombineBf16
-            | Kernel::Qwen4BlockPerm => &[],
+            | Kernel::Qwen4BlockPerm
+            | Kernel::Qwen4GdnChunkIntra
+            | Kernel::Qwen4GdnChunkState => &[],
             // `mul_mmq`'s tile geometry is chosen per call from the matmul shape
             // (see [`MmqSpec::choose`]); there is no single default, and running
             // it with the shader's built-in defaults would silently pick a tile
@@ -2475,6 +2495,91 @@ pub fn qwen35_gated_delta_net_params(
 /// the whole sequence, so the recurrence needs no shared memory or barriers.
 pub fn qwen35_gated_delta_net_dispatch(num_value_heads: u32) -> Dispatch {
     Dispatch::x(num_value_heads.max(1))
+}
+
+/// Chunk size of the WY-form chunked gated-delta prefill pair — llama.cpp's
+/// non-KDA `CS`, and a compile-time constant in both shaders (the triangular
+/// inverse lives in shared memory).
+pub const QWEN4_GDN_CHUNK: u32 = 64;
+
+/// Per-workgroup value-column stripe of `qwen4_gdn_chunk_state.comp` —
+/// `val_dim` must be a multiple of this.
+pub const QWEN4_GDN_STATE_COLS: u32 = 32;
+
+/// Push-constant block SHARED by `qwen4_gdn_chunk_intra.comp` and
+/// `qwen4_gdn_chunk_state.comp` = `{num_key_heads, num_value_heads, key_dim,
+/// val_dim, seq_len, n_chunks}` (6 `uint`s); `n_chunks` must equal
+/// `seq_len.div_ceil(QWEN4_GDN_CHUNK)`. One block for both because the two
+/// kernels also share the scratch-section layout the offsets derive from.
+///
+/// Intra bindings: `0 = Qkv [seq_len*(2*nk*kd + nv*vd)] f32` (post-conv,
+/// token-major — the same buffer [`Kernel::Qwen35GatedDeltaNet`] reads),
+/// `1 = BProj [seq_len*nv] f32`, `2 = AProj [seq_len*nv] f32`, `3 = DtBias
+/// [nv] f32`, `4 = ALog [nv] f32` (GGUF `ssm_a` = `-exp(A_log)`),
+/// `5 = Scratch [qwen4_gdn_chunk_scratch_elems] f32` (write).
+///
+/// State bindings: `0 = Scratch` (read), `1 = State [nv*kd*vd] f32`
+/// (read+write, val contiguous — the resident buffer decode advances),
+/// `2 = Output [seq_len*nv*vd] f32` (write, token-major).
+///
+/// Scratch is SoA over `pair = chunk * nv + v_head` with `CS =
+/// QWEN4_GDN_CHUNK` and `nh = n_chunks * nv`: `kq [nh][CS*CS]` at 0, then
+/// `kcd [nh][CS*kd]`, `u [nh][CS*vd]`, `qg [nh][CS*kd]`, `kg [nh][CS*kd]`,
+/// `g_last_exp [nh]`. Rows `i >= L` of a short trailing chunk are unwritten
+/// and unread.
+pub fn qwen4_gdn_chunk_params(
+    num_key_heads: u32,
+    num_value_heads: u32,
+    key_dim: u32,
+    val_dim: u32,
+    seq_len: u32,
+    n_chunks: u32,
+) -> KernelParams {
+    KernelParams::from_words(vec![
+        num_key_heads,
+        num_value_heads,
+        key_dim,
+        val_dim,
+        seq_len,
+        n_chunks,
+    ])
+}
+
+/// Scratch element count (f32s) for the chunked gated-delta pair at a given
+/// shape — the single sizing authority for callers allocating the buffer.
+#[must_use]
+pub fn qwen4_gdn_chunk_scratch_elems(
+    n_chunks: u32,
+    num_value_heads: u32,
+    key_dim: u32,
+    val_dim: u32,
+) -> usize {
+    let cs = QWEN4_GDN_CHUNK as usize;
+    let per = cs * cs + 3 * cs * key_dim as usize + cs * val_dim as usize + 1;
+    n_chunks as usize * num_value_heads as usize * per
+}
+
+/// Dispatch grid for `qwen4_gdn_chunk_intra.comp`: one workgroup per
+/// (chunk, value head) — the whole point of the lane is that this grid scales
+/// with the prompt where the serial scan's `num_value_heads` workgroups do
+/// not.
+pub fn qwen4_gdn_chunk_intra_dispatch(n_chunks: u32, num_value_heads: u32) -> Dispatch {
+    Dispatch {
+        x: n_chunks.max(1),
+        y: num_value_heads.max(1),
+        z: 1,
+    }
+}
+
+/// Dispatch grid for `qwen4_gdn_chunk_state.comp`: one workgroup per
+/// (value head, [`QWEN4_GDN_STATE_COLS`]-column state stripe); each walks the
+/// chunks serially, which is the only serial dimension left.
+pub fn qwen4_gdn_chunk_state_dispatch(num_value_heads: u32, val_dim: u32) -> Dispatch {
+    Dispatch {
+        x: num_value_heads.max(1),
+        y: (val_dim / QWEN4_GDN_STATE_COLS).max(1),
+        z: 1,
+    }
 }
 
 /// Push-constant block for `qwen36_router_topk.comp` = `{n_expert, top_k,

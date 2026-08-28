@@ -741,6 +741,20 @@ const LOCAL: &[ShaderSpec] = &[
         source: "crates/vulkan-kernels/shaders/qwen4_hc_combine.comp",
         defines: &[("WEIGHTS_BF16", "1")],
     },
+    // Chunked (WY-form) gated-delta prefill: the intra-chunk kernel is
+    // parallel over (chunk, head), the state kernel is serial in n_chunks
+    // only — together they replace the serial `qwen35_gated_delta_net` scan
+    // on the opt-in `ARLE_QWEN4_PREFILL_CHUNKED_GDN=1` prefill lane.
+    ShaderSpec {
+        name: "qwen4_gdn_chunk_intra",
+        source: "crates/vulkan-kernels/shaders/qwen4_gdn_chunk_intra.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_gdn_chunk_state",
+        source: "crates/vulkan-kernels/shaders/qwen4_gdn_chunk_state.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {

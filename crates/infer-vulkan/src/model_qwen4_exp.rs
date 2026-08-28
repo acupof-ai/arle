@@ -93,13 +93,15 @@ use crate::qwen4_upload::{
 
 use vulkan_kernels::{
     CoopmatShape, FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams,
-    MAT_VEC_FUSION_SCALE0, MmSpec, f16_kv_pack_dispatch, f16_kv_pack_dispatch_rows,
-    f16_kv_pack_params, f16_kv_pack_params_rows, flash_attn_dispatch, flash_attn_dispatch_batched,
-    flash_attn_params, flash_attn_params_batched, gemv_dense_dispatch, gemv_dispatch,
-    gemv_id_dispatch, gemv_id_params_fused, gemv_id_params_grouped, gemv_nvfp4_spec_cols,
-    gemv_params_f32_b, mm_dispatch, mmq_params, qwen4_block_perm_dispatch, qwen4_block_perm_params,
-    qwen4_hc_combine_dispatch, qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params,
-    qwen4_ple_conv_dispatch, qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
+    MAT_VEC_FUSION_SCALE0, MmSpec, QWEN4_GDN_CHUNK, QWEN4_GDN_STATE_COLS, f16_kv_pack_dispatch,
+    f16_kv_pack_dispatch_rows, f16_kv_pack_params, f16_kv_pack_params_rows, flash_attn_dispatch,
+    flash_attn_dispatch_batched, flash_attn_params, flash_attn_params_batched, gemv_dense_dispatch,
+    gemv_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_id_params_grouped,
+    gemv_nvfp4_spec_cols, gemv_params_f32_b, mm_dispatch, mmq_params, qwen4_block_perm_dispatch,
+    qwen4_block_perm_params, qwen4_gdn_chunk_intra_dispatch, qwen4_gdn_chunk_params,
+    qwen4_gdn_chunk_scratch_elems, qwen4_gdn_chunk_state_dispatch, qwen4_hc_combine_dispatch,
+    qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch,
+    qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
     qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
     qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
@@ -4419,6 +4421,12 @@ struct PfSlots {
     mask: u64,
     /// RoPE positions `[T]` i32.
     pos: u64,
+    /// Chunked-GDN inter-kernel scratch (`ARLE_QWEN4_PREFILL_CHUNKED_GDN=1`
+    /// lane), sized for `T.div_ceil(64)` chunks — layout owned by
+    /// [`qwen4_gdn_chunk_params`]. ~7 MiB per 64-token chunk at this model's
+    /// head shape; allocated unconditionally like `b16`, the other opt-in
+    /// lane's staging slot.
+    gdn: u64,
     total: u64,
 }
 
@@ -4457,6 +4465,21 @@ fn pf_gemm_route(
         Qwen4DeviceFormat::F16 => Some((Kernel::MmCmF16, Kernel::F16KvPack, shape)),
         _ => None,
     }
+}
+
+/// The chunked (WY-form) gated-delta prefill lane
+/// (`ARLE_QWEN4_PREFILL_CHUNKED_GDN=1`) — OPT-IN like the coopmat GEMM lane
+/// (see [`pf_gemm_route`]), and for the same reason: the default per-token
+/// scan records the SAME kernel decode runs, so the prefill=decode gate is
+/// bit-exact, and the WY reassociation cannot honor that. Unlike the GEMM
+/// lane no sub-f32 staging enters anywhere — the scratch, the state and
+/// every accumulation stay f32 — so the drift is pure reassociation: the
+/// first linear layer's S agrees with the serial scan to ~4e-7 absolute, and
+/// the calibrated envelope + expert-flip receipts live in
+/// `tests/qwen4_prefill.rs` (`chunked_gdn_drift_*`, `_CHUNKED_AB`). Read at
+/// record time, per layer, like the GEMM gate.
+fn pf_chunked_gdn() -> bool {
+    std::env::var("ARLE_QWEN4_PREFILL_CHUNKED_GDN").as_deref() == Ok("1")
 }
 
 /// The chunk arena + chunk permutation maps for [`VulkanQwen4ExpModel::forward_prompt`].
@@ -4578,6 +4601,15 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             b16: take(t * hh as u64 * 2),
             mask: take(t * cfg.max_context as u64 * 2),
             pos: take(t * 4),
+            gdn: take(
+                qwen4_gdn_chunk_scratch_elems(
+                    (max_tokens.div_ceil(QWEN4_GDN_CHUNK as usize)) as u32,
+                    nv as u32,
+                    cfg.linear_key_head_dim as u32,
+                    vd as u32,
+                ) as u64
+                    * 4,
+            ),
             total: off,
         };
 
@@ -5182,25 +5214,75 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             [d.x, d.y, d.z],
         )?;
         dev.barrier();
-        let push =
-            qwen35_gated_delta_net_params(nk as u32, nv as u32, kd as u32, vd as u32, t as u32)
-                .to_le_bytes();
-        let d = qwen35_gated_delta_net_dispatch(nv as u32);
-        dev.rec(
-            Kernel::Qwen35GatedDeltaNet,
-            Kernel::Qwen35GatedDeltaNet.specialization_u32(),
-            &push,
-            &[
-                Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
-                Bind::Ext(&self.buffer, s.b2, (t * nv * 4) as u64),
-                Bind::Ext(&self.buffer, s.a2, (t * nv * 4) as u64),
-                Bind::Ext(&rl.aux, alog_at + 64 * 4, (nv * 4) as u64),
-                Bind::Ext(&rl.aux, alog_at, (nv * 4) as u64),
-                Bind::Ext(&rl.state, state_base, (nv * kd * vd * 4) as u64),
-                Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
-            ],
-            [d.x, d.y, d.z],
-        )?;
+        if pf_chunked_gdn() {
+            // Chunked WY-form lane: same inputs (post-conv qkv in slot order,
+            // packed a/b, resident dt_bias/ssm_a), same resident f32 state,
+            // same output layout — only the recurrence is reassociated. Two
+            // dispatches instead of one, against a serial scan that was the
+            // largest single slice of the prefill GPU drain (2.8 s of 7.2 s
+            // at chunk 256); the intra kernel is parallel over
+            // (64-token chunk, head) where the scan had ~nv near-serial
+            // workgroups for the whole chunk.
+            ensure!(
+                vd as u32 % QWEN4_GDN_STATE_COLS == 0,
+                "chunked GDN needs val_dim ({vd}) divisible by {QWEN4_GDN_STATE_COLS}"
+            );
+            let n_chunks = t.div_ceil(QWEN4_GDN_CHUNK as usize) as u32;
+            let scratch_len =
+                qwen4_gdn_chunk_scratch_elems(n_chunks, nv as u32, kd as u32, vd as u32) as u64 * 4;
+            let push = qwen4_gdn_chunk_params(
+                nk as u32, nv as u32, kd as u32, vd as u32, t as u32, n_chunks,
+            )
+            .to_le_bytes();
+            let d = qwen4_gdn_chunk_intra_dispatch(n_chunks, nv as u32);
+            dev.rec(
+                Kernel::Qwen4GdnChunkIntra,
+                Kernel::Qwen4GdnChunkIntra.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
+                    Bind::Ext(&self.buffer, s.b2, (t * nv * 4) as u64),
+                    Bind::Ext(&self.buffer, s.a2, (t * nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at + 64 * 4, (nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at, (nv * 4) as u64),
+                    Bind::Ext(&self.buffer, s.gdn, scratch_len),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+            dev.barrier();
+            let d = qwen4_gdn_chunk_state_dispatch(nv as u32, vd as u32);
+            dev.rec(
+                Kernel::Qwen4GdnChunkState,
+                Kernel::Qwen4GdnChunkState.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.gdn, scratch_len),
+                    Bind::Ext(&rl.state, state_base, (nv * kd * vd * 4) as u64),
+                    Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        } else {
+            let push =
+                qwen35_gated_delta_net_params(nk as u32, nv as u32, kd as u32, vd as u32, t as u32)
+                    .to_le_bytes();
+            let d = qwen35_gated_delta_net_dispatch(nv as u32);
+            dev.rec(
+                Kernel::Qwen35GatedDeltaNet,
+                Kernel::Qwen35GatedDeltaNet.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
+                    Bind::Ext(&self.buffer, s.b2, (t * nv * 4) as u64),
+                    Bind::Ext(&self.buffer, s.a2, (t * nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at + 64 * 4, (nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at, (nv * 4) as u64),
+                    Bind::Ext(&rl.state, state_base, (nv * kd * vd * 4) as u64),
+                    Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        }
         dev.barrier();
         let push = rms_norm_params_rows(vd as u32, (t * nv) as u32, vd as u32, cfg.rms_norm_eps)
             .to_le_bytes();
@@ -5645,6 +5727,13 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         prof::phase("pf.moe.ids_fence");
         dev.flush()?;
         let raw_ids = self.read_i32_at(s.ids, t * PF_IDS_PAD)?;
+        if moe_ids::enabled() {
+            let mut compact = Vec::with_capacity(t * top_k);
+            for row in 0..t {
+                compact.extend_from_slice(&raw_ids[row * PF_IDS_PAD..row * PF_IDS_PAD + top_k]);
+            }
+            moe_ids::push(layer, compact);
+        }
 
         prof::phase("pf.moe.group");
         // Host regrouping (see [`MoeGroupPlan`]): each active expert's rows
@@ -6192,8 +6281,48 @@ impl<'ctx> Qwen4Dev<'ctx> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-stage wall-clock profile (additive instrumentation; see `prof`).
+// Additive instrumentation: wall-clock profile (`prof`), expert-id capture
+// (`moe_ids`).
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Opt-in capture of the prefill's per-(layer, chunk) MoE expert selections,
+/// read at the ids fence the prefill performs anyway — zero extra device
+/// traffic. Exists for the chunked-GDN receipt in `tests/qwen4_prefill.rs`:
+/// "does the reassociated recurrence flip any router selection over a real
+/// prompt?" is a question about these exact ids, and nothing else exposes
+/// them. Disabled (the default) it is one relaxed atomic load per chunk.
+pub mod moe_ids {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static ROWS: Mutex<Vec<(usize, Vec<i32>)>> = Mutex::new(Vec::new());
+
+    /// Turn capture on or off (it starts off).
+    pub fn set_enabled(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub(crate) fn enabled() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    /// Record one chunk's compacted `[t * top_k]` ids for `layer`.
+    pub(crate) fn push(layer: usize, ids: Vec<i32>) {
+        if let Ok(mut rows) = ROWS.lock() {
+            rows.push((layer, ids));
+        }
+    }
+
+    /// Drain everything captured so far, in record order.
+    #[must_use]
+    pub fn take() -> Vec<(usize, Vec<i32>)> {
+        ROWS.lock()
+            .map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default()
+    }
+}
 
 /// Where a token's wall clock goes, charged so the buckets PARTITION it.
 ///
