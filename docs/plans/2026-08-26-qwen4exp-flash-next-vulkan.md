@@ -284,7 +284,7 @@ into "measured". Build it before chasing the first token, not after.
 | Q4 ✅ | W4A16 Q4_K dense default: 79.0 → 55.5 ms/token (18 tok/s); teacher-forced step-agree 84.4% vs near-lossless Q8's 90.6% (2/32 gap at razor margins); the W4A8 q8_1-activation detour was built, measured, and deleted — A16 is the contract | done |
 | S6 | QSA indexer → contexts >2051 | 40 h |
 | S7 | requantize experts (Q8_0 returns MTP+vision); batched MoE prefill + verify (cols k≤8 / WMMA k≥16, measured) | 40 h |
-| S8 | MTP speculative decode (needs S7's batched verify) | 20 h |
+| S8 ✅ | MTP speculative decode: greedy-LOSSLESS at full scale (15/15 configs, 3 prompt classes x 5 depths x 40 tok), acceptance 57.9-71.9%/step at k=2 (vendor band 50-70%), best k=**1** at +10-15% (46.0/46.3/49.6 vs 50.6/51.1/56.8 ms/tok). Rollback = 2 device-to-device copies, 0.19-1.90 ms/cycle. NOT a default flip — chat regresses at k>1. Measured next wall: the verify amortizes the DENSE tier 1.31x and nothing else (the 512-expert union grows ~linearly in k; the per-position hc/router dispatch floor does not batch) | done |
 
 Hours are CC-execution, not calendar.
 

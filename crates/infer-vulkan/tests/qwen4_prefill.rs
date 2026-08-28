@@ -438,6 +438,27 @@ fn full_scale_prefill_tok_s() {
         }
     }
 
+    // Matched A/B of the NUM_COLS dense batching in the SAME load
+    // (`qwen4_gemv_cols_cap` is read per recorded dispatch, so a runtime env
+    // flip is a real arm switch): chunk 256 again with the batching off.
+    if std::env::var("ARLE_QWEN4_PREFILL_COLS_AB").as_deref() == Ok("1") {
+        // SAFETY: device suites run --test-threads=1; removed below.
+        unsafe { std::env::set_var("ARLE_QWEN4_GEMV_COLS", "1") };
+        let t0 = std::time::Instant::now();
+        let logits = model
+            .forward_prompt_chunked(0, &toks, 0, 256)
+            .expect("cols-off prefill");
+        let secs = t0.elapsed().as_secs_f64();
+        assert!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
+        eprintln!(
+            "\n== chunk 256, ARLE_QWEN4_GEMV_COLS=1 (cols batching OFF): {n_tokens} tok in \
+             {secs:.2}s = {:.1} tok/s ==",
+            n_tokens as f64 / secs
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ARLE_QWEN4_GEMV_COLS") };
+    }
+
     // Parity LAST, so a numeric regression cannot eat the measurement above.
     // The GEMM route stages activations to f16 (2^-11) where decode's GEMVs
     // read f32, so exact equality is not on offer at full scale — the drift

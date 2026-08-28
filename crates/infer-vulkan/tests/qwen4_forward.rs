@@ -624,6 +624,7 @@ fn dense_gemv_f16_matches_the_host_matvec() {
         layers: Some(layers.to_vec()),
         experts: Some(0),
         lm_head: false,
+        mtp: false,
     };
     // `dense_format` defaults to F16 — the shipping tier. Spelled out because
     // it is the whole point of this test.

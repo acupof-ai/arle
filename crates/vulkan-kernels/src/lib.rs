@@ -675,6 +675,32 @@ impl Kernel {
         }
     }
 
+    /// The `NUM_COLS = num_cols` twin of this GEMV's default specialization —
+    /// the shader's own batch axis (constant_id 2), for a k-token verify or a
+    /// chunked prefill that wants each weight row read ONCE for k activation
+    /// columns. Per-column arithmetic is a `temp[NUM_COLS][NUM_ROWS]` unroll of
+    /// the single-column loop, so column `j`'s result is bit-identical to a
+    /// `NUM_COLS = 1` dispatch of the same column (pinned on device by
+    /// `tests/device_batched_crossover.rs`). `None` for kernels whose B operand
+    /// is not the plain-f32 `mul_mat_vec` contract — the quantized-B and
+    /// MUL_MAT_ID families batch along different axes.
+    pub const fn gemv_cols_spec(self, num_cols: u32) -> Option<GemvDenseSpec> {
+        match self {
+            // BLOCK_SIZE/NUM_ROWS must match the k=1 spec (SPEC_GEMV_DENSE,
+            // SPEC_GEMV_Q4K_DENSE, SPEC_GEMV_Q8_0_DENSE) or the two paths
+            // would no longer be the same kernel geometry, only cols apart.
+            Kernel::GemvF16 | Kernel::GemvBf16 => Some(GemvDenseSpec::with_cols(
+                GEMV_DENSE_BLOCK_SIZE,
+                GEMV_DENSE_NUM_ROWS,
+                num_cols,
+            )),
+            Kernel::GemvQ4KDense | Kernel::GemvQ8_0Dense => {
+                Some(GemvDenseSpec::with_cols(64, 1, num_cols))
+            }
+            _ => None,
+        }
+    }
+
     pub const fn specialization_u32(self) -> &'static [(u32, u32)] {
         match self {
             Kernel::MmvqIq2Xxs => SPEC_MMVQ_IQ2_XXS,

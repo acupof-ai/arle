@@ -26,6 +26,8 @@ pub mod model_qwen4_exp;
 pub mod prefill;
 pub mod qwen4_config;
 pub mod qwen4_hc;
+#[cfg(feature = "vulkan")]
+pub mod qwen4_mtp;
 pub mod qwen4_names;
 pub mod qwen4_ngram_gather;
 pub mod qwen4_ple;

@@ -1960,9 +1960,14 @@ mod real {
             let to_transfer = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            // SHADER_READ rides along with HOST_READ because a copy can also
+            // feed later dispatches in the SAME submit (the speculative-decode
+            // state restore copies a snapshot back over live recurrent state
+            // that the next chunk's kernels read) — a host-only barrier would
+            // leave that read unordered.
             let to_host = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ);
+                .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ);
             // SAFETY: `command_buffer` is live and recording (between `begin`
             // and `submit_and_wait`). Both buffers outlive this call via the
             // borrows, and both carry TRANSFER_SRC|TRANSFER_DST usage. `region`
@@ -1986,7 +1991,7 @@ mod real {
                 self.ctx.device.cmd_pipeline_barrier(
                     self.command_buffer,
                     vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
                     &[to_host],
                     &[],

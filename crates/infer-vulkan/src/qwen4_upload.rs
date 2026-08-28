@@ -123,6 +123,8 @@ pub const TEXT_PREFIX: &str = "model.language_model.";
 /// The stream-level `hyper_connection_mixer` (`use_combine=false`, so no
 /// `block_inject_weight`); it is this model's missing final norm.
 pub const MIXER_PREFIX: &str = "model.language_model.hyper_connection_mixer";
+/// `mtp.` — the 1-layer multi-token-prediction head's prefix.
+pub const MTP_PREFIX: &str = "mtp.";
 /// Untied output projection (`tie_word_embeddings: false`).
 pub const LM_HEAD_NAME: &str = "lm_head.weight";
 /// The host-resident token embedding table.
@@ -197,14 +199,52 @@ pub fn expert_stack_name(layer: usize, proj: ExpertProj) -> String {
     format!("{TEXT_PREFIX}layers.{layer}.mlp.experts.{proj}_proj._stack")
 }
 
+/// The pseudo layer index that addresses the MTP head's hyper-connection
+/// sites through [`hyper_connection_prefix`].
+///
+/// The MTP block is `mtp.layers.0.*` — a 49th decoder layer in every respect
+/// except its name — and unlike the text stream it has its OWN
+/// `hyper_connection_mixer` (use_combine=False, collapsing its 10240 output
+/// to 2560 before the shared `lm_head`). `usize::MAX` cannot collide with a
+/// real text layer, so the existing `(layer, site)` plumbing (`Qwen4Dev::
+/// hc_pre` / `hc_combine`) drives the MTP sites with no second code path.
+pub const MTP_HC_LAYER: usize = usize::MAX;
+
+/// `mtp.layers.0.mlp.experts.<expert>.<proj>_proj.weight` — the synthetic name
+/// of one MTP routed expert's slice of the stacked BF16 parameters.
+///
+/// The checkpoint stores the MTP experts STACKED (`experts.gate_up_proj`
+/// `[512, 1280, 2560]`, `experts.down_proj` `[512, 2560, 640]` — the
+/// quant-excluded `Qwen4ExpTextExperts` layout, gate rows first then up, per
+/// `chunk(2, dim=-1)` in modeling_qwen4_exp.py:889). The plan slices them
+/// per-expert so each slice is an ordinary dense-GEMV tensor: the MoE of one
+/// DRAFTED token touches 10 of 512 experts, and a per-expert suballocation is
+/// what lets those ten record as plain `record_dense_at` GEMVs (and lets the
+/// spill tier demote the cold 98% without splitting logic). No such per-expert
+/// tensor exists in the file — the classifier would reject the name — which is
+/// exactly what keeps it collision-free, like [`expert_stack_name`].
+#[must_use]
+pub fn mtp_expert_slice_name(expert: u32, proj: ExpertProj) -> String {
+    let proj = match proj {
+        ExpertProj::Gate => "gate",
+        ExpertProj::Up => "up",
+        ExpertProj::Down => "down",
+    };
+    format!("{MTP_PREFIX}layers.0.mlp.experts.{expert}.{proj}_proj.weight")
+}
+
 /// Prefix of one `Qwen4ExpTextGatedResidual`'s four weights.
 ///
 /// `(Some(l), Attn | Mlp)` for a layer's two sites, `(None, Mixer)` for the
-/// stream-level one. The other two combinations do not exist in this
-/// architecture and are refused rather than formatted into a name that will
-/// simply not be resident.
+/// stream-level one, and [`MTP_HC_LAYER`] for the MTP head's three (the MTP
+/// block carries its own mixer). The remaining combinations do not exist in
+/// this architecture and are refused rather than formatted into a name that
+/// will simply not be resident.
 pub fn hyper_connection_prefix(layer: Option<usize>, site: HcSite) -> Result<String> {
     Ok(match (layer, site) {
+        (Some(MTP_HC_LAYER), HcSite::Attn) => format!("{MTP_PREFIX}layers.0.attn_hyper_connection"),
+        (Some(MTP_HC_LAYER), HcSite::Mlp) => format!("{MTP_PREFIX}layers.0.mlp_hyper_connection"),
+        (Some(MTP_HC_LAYER), HcSite::Mixer) => format!("{MTP_PREFIX}hyper_connection_mixer"),
         (Some(l), HcSite::Attn) => layer_tensor_name(l, "attn_hyper_connection"),
         (Some(l), HcSite::Mlp) => layer_tensor_name(l, "mlp_hyper_connection"),
         (None, HcSite::Mixer) => MIXER_PREFIX.to_string(),
@@ -379,6 +419,16 @@ pub fn device_format(kind: Qwen4TensorKind, dense: Qwen4DeviceFormat) -> Option<
         | AttnVProj | AttnOProj | IndexerQkProj | SharedExpertGateProj | SharedExpertUpProj
         | PleKeyProj | PleValueProj | LmHead => Some(dense),
 
+        // The two MTP fusion projections are ordinary [2560, 2560] GEMV
+        // weights and ride the dense tier like every other plain-GEMV family.
+        MtpFcEmbedding | MtpFcHidden => Some(dense),
+
+        // The fusion norms are `Qwen4ExpTextRMSNorm` weights; the MTP forward
+        // currently norms on the HOST (the fuse is 12800 elements), so they
+        // upload RAW F32 — a future device consumer through the vendored
+        // `rms_norm.comp` must move them into `folds_norm_bias` first.
+        MtpPreFcNormEmbedding | MtpPreFcNormHidden => Some(F32),
+
         // Host-resident tables (see `Qwen4HostTables`).
         EmbedTokens
         | PleNgramShard
@@ -387,14 +437,24 @@ pub fn device_format(kind: Qwen4TensorKind, dense: Qwen4DeviceFormat) -> Option<
         | PleNgramHeadsOffsets
         | PleNgramHeadsVocabSizes => None,
 
-        // Not uploaded for a text-only decode.
-        ExpertsStackedGateUp
-        | ExpertsStackedDown
-        | MtpFcEmbedding
-        | MtpFcHidden
-        | MtpPreFcNormEmbedding
-        | MtpPreFcNormHidden
-        | Vision(_) => None,
+        // The stacked MTP experts never upload WHOLE — the plan slices them
+        // per expert with an explicit format (see `mtp_expert_slice_name`) —
+        // and the vision tower is not uploaded for a text-only decode.
+        ExpertsStackedGateUp | ExpertsStackedDown | Vision(_) => None,
+    }
+}
+
+/// Device format of one MTP routed-expert slice under the run's dense tier.
+///
+/// gate/up (2560-wide) follow the dense format; the 640-wide down is not a
+/// whole number of Q4_K superblocks and rides Q8_0 under a Q4_K tier — the
+/// same rule as [`Qwen4TensorKind::SharedExpertDownProj`], and for the same
+/// reason (`GemvQ8_0Dense` takes `ncols % 8`).
+#[must_use]
+pub fn mtp_expert_slice_format(proj: ExpertProj, dense: Qwen4DeviceFormat) -> Qwen4DeviceFormat {
+    match (proj, dense) {
+        (ExpertProj::Down, Qwen4DeviceFormat::Q4K) => Qwen4DeviceFormat::Q8_0,
+        _ => dense,
     }
 }
 
@@ -504,6 +564,11 @@ pub struct Qwen4UploadScope {
     pub experts: Option<usize>,
     /// Upload `lm_head.weight` (1.18 GiB of F16).
     pub lm_head: bool,
+    /// Upload the `mtp.*` head — the speculative-decode drafter: its dense
+    /// tensors plus the stacked experts sliced per expert
+    /// ([`mtp_expert_slice_name`]). Independent of `layers`, which scopes
+    /// TEXT layers only.
+    pub mtp: bool,
 }
 
 impl Default for Qwen4UploadScope {
@@ -516,23 +581,29 @@ impl Default for Qwen4UploadScope {
 }
 
 impl Qwen4UploadScope {
-    /// Everything the checkpoint has.
+    /// Everything the checkpoint has. `mtp` rides along: the MTP head is the
+    /// speculative-decode lever and an explicit product keep (see
+    /// `qwen4_names`' residency docs) — a run that wants it out sets the
+    /// field, it does not get dropped silently.
     #[must_use]
     pub fn full() -> Self {
         Self {
             layers: None,
             experts: None,
             lm_head: true,
+            mtp: true,
         }
     }
 
-    /// Named layers only, with every expert and `lm_head`.
+    /// Named layers only, with every expert and `lm_head`; no MTP (a subset
+    /// bring-up opts in explicitly).
     #[must_use]
     pub fn layers(layers: &[usize]) -> Self {
         Self {
             layers: Some(layers.to_vec()),
             experts: None,
             lm_head: true,
+            mtp: false,
         }
     }
 
@@ -570,6 +641,13 @@ pub enum Qwen4Source {
     /// One BF16 checkpoint tensor, converted to the entry's format. `fold_bias`
     /// is [`folds_norm_bias`] for its kind.
     Bf16 { fold_bias: bool },
+    /// A contiguous row range of one BF16 checkpoint tensor, converted like
+    /// [`Qwen4Source::Bf16`] (never bias-folded — the only sliced tensors are
+    /// the stacked MTP experts). `tensor` is the real checkpoint name;
+    /// `row_offset` counts rows of the flattened `[rows, ncols]` view, so
+    /// expert `e`'s gate slice of `experts.gate_up_proj` `[512, 1280, 2560]`
+    /// starts at row `e * 1280` and its up slice at `e * 1280 + 640`.
+    Bf16Slice { tensor: String, row_offset: usize },
     /// `n_experts` NVFP4 `(weight, weight_scale)` plane pairs, repacked into
     /// ggml `block_nvfp4` and stacked expert-major into one suballocation.
     Nvfp4Stack {
@@ -824,11 +902,18 @@ impl Qwen4Plan {
 
     /// Sort key for [`Self::spill_to_fit`]: coldest bytes first, then largest.
     fn spill_rank(item: &Qwen4PlanItem) -> (u8, std::cmp::Reverse<u64>) {
-        let class = match item.source {
+        let class = match (&item.source, item.role.stream) {
+            // Coldest of all: an MTP expert slice is read only when a token
+            // is being SPECULATED, and then 10 of 512 — heap-0 residency was
+            // priced at ~2% of GPU read bandwidth, so these bytes go first.
+            (Qwen4Source::Bf16Slice { .. }, _) => 0,
+            // The rest of the MTP head: read once per drafted token, never
+            // during a plain decode.
+            (_, Qwen4Stream::Mtp) => 1,
             // Sparsely read: 10 of `n_experts` slices per token.
-            Qwen4Source::Nvfp4Stack { .. } => 0,
+            (Qwen4Source::Nvfp4Stack { .. }, _) => 2,
             // Read in full every token.
-            Qwen4Source::Bf16 { .. } => 1,
+            (Qwen4Source::Bf16 { .. }, _) => 3,
         };
         (class, std::cmp::Reverse(item.bytes))
     }
@@ -1046,9 +1131,20 @@ pub fn plan_qwen4_upload(
         let role = classify_qwen4_tensor(&info.name)
             .with_context(|| format!("classifying {}", info.name))?;
 
-        if role.stream != Qwen4Stream::Text {
-            plan.dropped_bytes += info.len;
-            continue;
+        match role.stream {
+            Qwen4Stream::Text => {}
+            // The MTP head plans through its own arm: its stacked experts
+            // become per-expert slices and nothing of it may touch the TEXT
+            // layer bookkeeping (its `layers.0` would otherwise masquerade as
+            // text layer 0).
+            Qwen4Stream::Mtp if scope.mtp => {
+                plan_mtp_tensor(&mut plan, cfg, info, role)?;
+                continue;
+            }
+            _ => {
+                plan.dropped_bytes += info.len;
+                continue;
+            }
         }
         if role.residency == Qwen4Residency::HostGather {
             plan.host_bytes += info.len;
@@ -1250,11 +1346,136 @@ pub fn plan_qwen4_upload(
 
 fn push_item(plan: &mut Qwen4Plan, item: Qwen4PlanItem) {
     plan.device_bytes += item.bytes;
-    match item.role.layer {
-        Some(layer) => *plan.layer_bytes.entry(layer).or_insert(0) += item.bytes,
-        None => plan.global_bytes += item.bytes,
+    match (item.role.stream, item.role.layer) {
+        // `layer_bytes` is a TEXT-layer ledger (it feeds the layer-at-a-time
+        // bring-up); the MTP head's `layers.0` is a different tree and books
+        // as stream-global instead of shadowing text layer 0.
+        (Qwen4Stream::Text, Some(layer)) => {
+            *plan.layer_bytes.entry(layer).or_insert(0) += item.bytes;
+        }
+        _ => plan.global_bytes += item.bytes,
     }
     plan.items.push(item);
+}
+
+/// Plan one `mtp.*` tensor: the stacked experts slice per expert into dense
+/// GEMV suballocations, everything else follows [`device_format`] like the
+/// text stream. Fails loud on an MTP family with no device destination — a
+/// silently absent draft weight would surface as a wrong draft, which greedy
+/// verification then quietly eats as a 0% acceptance rate.
+fn plan_mtp_tensor(
+    plan: &mut Qwen4Plan,
+    cfg: &Qwen4UploadConfig,
+    info: &SafeTensorInfo,
+    role: Qwen4TensorRole,
+) -> Result<()> {
+    ensure!(
+        info.dtype == "BF16",
+        "{}: the MTP head is quant-excluded, expected BF16, found {}",
+        info.name,
+        info.dtype
+    );
+    let stacked = match role.kind {
+        Qwen4TensorKind::ExpertsStackedGateUp => Some((ExpertProj::Gate, true)),
+        Qwen4TensorKind::ExpertsStackedDown => Some((ExpertProj::Down, false)),
+        _ => None,
+    };
+    let Some((_, is_gate_up)) = stacked else {
+        let format = device_format(role.kind, cfg.dense_format).ok_or_else(|| {
+            anyhow!(
+                "{}: MTP family {:?} has no device format — wire it before speculating",
+                info.name,
+                role.kind
+            )
+        })?;
+        let (ncols, nrows) = dense_shape(info)?;
+        let bytes = format.bytes_for(ncols, nrows).ok_or_else(|| {
+            anyhow!(
+                "{}: [{nrows}, {ncols}] has no {format:?} device layout",
+                info.name
+            )
+        })?;
+        push_item(
+            plan,
+            Qwen4PlanItem {
+                name: info.name.clone(),
+                role,
+                format,
+                bytes,
+                tier: Qwen4Tier::Device,
+                ncols,
+                nrows,
+                source: Qwen4Source::Bf16 {
+                    fold_bias: folds_norm_bias(role.kind),
+                },
+            },
+        );
+        return Ok(());
+    };
+
+    // Stacked experts: `dims` is GGUF ne order (innermost first), so
+    // gate_up `[512, 1280, 2560]` reads back as `[2560, 1280, 512]`.
+    ensure!(
+        info.dims.len() == 3,
+        "{}: expected a 3-D expert stack, dims {:?}",
+        info.name,
+        info.dims
+    );
+    let ncols = usize::try_from(info.dims[0])?;
+    let rows_per_expert = usize::try_from(info.dims[1])?;
+    let n_experts = usize::try_from(info.dims[2])?;
+    ensure!(
+        n_experts > 0 && rows_per_expert > 0,
+        "{}: degenerate expert stack",
+        info.name
+    );
+    // gate_up is the FUSED `[gate; up]` layout: gate rows first, up rows
+    // second (`chunk(2, dim=-1)` of the linear output in
+    // modeling_qwen4_exp.py's Qwen4ExpTextExperts.forward).
+    let slices: &[(ExpertProj, usize, usize)] = if is_gate_up {
+        ensure!(
+            rows_per_expert.is_multiple_of(2),
+            "{}: fused gate_up rows {rows_per_expert} are odd",
+            info.name
+        );
+        &[
+            (ExpertProj::Gate, 0, rows_per_expert / 2),
+            (ExpertProj::Up, rows_per_expert / 2, rows_per_expert / 2),
+        ]
+    } else {
+        &[(ExpertProj::Down, 0, rows_per_expert)]
+    };
+    for expert in 0..n_experts {
+        for &(proj, at, nrows) in slices {
+            let format = mtp_expert_slice_format(proj, cfg.dense_format);
+            let bytes = format.bytes_for(ncols, nrows).ok_or_else(|| {
+                anyhow!(
+                    "{}: expert slice [{nrows}, {ncols}] has no {format:?} layout",
+                    info.name
+                )
+            })?;
+            push_item(
+                plan,
+                Qwen4PlanItem {
+                    name: mtp_expert_slice_name(u32::try_from(expert)?, proj),
+                    role: Qwen4TensorRole {
+                        sub_index: Some(u32::try_from(expert)?),
+                        ..role
+                    },
+                    format,
+                    bytes,
+                    tier: Qwen4Tier::Device,
+                    ncols,
+                    nrows,
+                    source: Qwen4Source::Bf16Slice {
+                        tensor: info.name.clone(),
+                        row_offset: expert * rows_per_expert + at,
+                    },
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Stable ordering for the `(layer, proj)` group keys so a plan is reproducible.
@@ -2370,64 +2591,27 @@ pub fn upload_qwen4<'ctx, 'st>(
         let dst = &mut scratch[..len];
 
         match &item.source {
+            Qwen4Source::Bf16Slice { tensor, row_offset } => {
+                // A row range of a stacked tensor is bytewise just a smaller
+                // BF16 matrix, so it stages through the same per-format arms
+                // below via a recursive view — minus the bias fold, which no
+                // sliced family carries.
+                let all = st.tensor_data(tensor)?;
+                let row_bytes = item.ncols * 2;
+                let start = row_offset * row_bytes;
+                let end = start + item.nrows * row_bytes;
+                ensure!(
+                    end <= all.len(),
+                    "{}: slice rows {row_offset}..{} overrun `{tensor}` ({} B)",
+                    item.name,
+                    row_offset + item.nrows,
+                    all.len()
+                );
+                stage_bf16_dense(&item.name, item, &all[start..end], false, dst)?;
+            }
             Qwen4Source::Bf16 { fold_bias } => {
                 let src = st.tensor_data(&item.name)?;
-                match item.format {
-                    Qwen4DeviceFormat::Bf16 => {
-                        ensure!(
-                            !*fold_bias,
-                            "{}: the 1+w fold needs a converting format, not verbatim BF16",
-                            item.name
-                        );
-                        ensure!(
-                            src.len() == dst.len(),
-                            "{}: {} B of BF16 into a {} B buffer",
-                            item.name,
-                            src.len(),
-                            dst.len()
-                        );
-                        dst.copy_from_slice(src);
-                    }
-                    Qwen4DeviceFormat::Q4K => {
-                        ensure!(
-                            !*fold_bias,
-                            "{}: the 1+w fold needs a converting format, not Q4_K",
-                            item.name
-                        );
-                        quantize_rows_threaded(
-                            &item.name,
-                            src,
-                            item.nrows,
-                            item.ncols,
-                            dst,
-                            256,
-                            144,
-                            vulkan_kernels::quantize_q4_k_from_bf16,
-                        )?;
-                    }
-                    Qwen4DeviceFormat::Q8_0 => {
-                        ensure!(
-                            !*fold_bias,
-                            "{}: the 1+w fold needs a float format, not Q8_0",
-                            item.name
-                        );
-                        quantize_rows_threaded(
-                            &item.name,
-                            src,
-                            item.nrows,
-                            item.ncols,
-                            dst,
-                            32,
-                            34,
-                            vulkan_kernels::quantize_q8_0_from_bf16,
-                        )?;
-                    }
-                    Qwen4DeviceFormat::F16 => write_bf16_as_f16(&item.name, src, dst)?,
-                    Qwen4DeviceFormat::F32 => write_bf16_as_f32(&item.name, src, dst, *fold_bias)?,
-                    Qwen4DeviceFormat::Nvfp4 => {
-                        bail!("{}: a BF16 source cannot land as NVFP4", item.name)
-                    }
-                }
+                stage_bf16_dense(&item.name, item, src, *fold_bias, dst)?;
             }
             Qwen4Source::Nvfp4Stack {
                 layer,
@@ -2484,6 +2668,73 @@ pub fn upload_qwen4<'ctx, 'st>(
         layer_kinds: plan.layer_kinds.clone(),
         host: Qwen4HostTables::build(st)?,
     })
+}
+
+/// Stage one BF16 matrix (`src`, row-major `[item.nrows, item.ncols]`) into
+/// `dst` in `item.format` — the shared body of the [`Qwen4Source::Bf16`] and
+/// [`Qwen4Source::Bf16Slice`] arms, so a sliced stack cannot drift from the
+/// whole-tensor conversion.
+#[cfg(feature = "vulkan")]
+fn stage_bf16_dense(
+    name: &str,
+    item: &Qwen4PlanItem,
+    src: &[u8],
+    fold_bias: bool,
+    dst: &mut [u8],
+) -> Result<()> {
+    match item.format {
+        Qwen4DeviceFormat::Bf16 => {
+            ensure!(
+                !fold_bias,
+                "{name}: the 1+w fold needs a converting format, not verbatim BF16"
+            );
+            ensure!(
+                src.len() == dst.len(),
+                "{name}: {} B of BF16 into a {} B buffer",
+                src.len(),
+                dst.len()
+            );
+            dst.copy_from_slice(src);
+        }
+        Qwen4DeviceFormat::Q4K => {
+            ensure!(
+                !fold_bias,
+                "{name}: the 1+w fold needs a converting format, not Q4_K"
+            );
+            quantize_rows_threaded(
+                name,
+                src,
+                item.nrows,
+                item.ncols,
+                dst,
+                256,
+                144,
+                vulkan_kernels::quantize_q4_k_from_bf16,
+            )?;
+        }
+        Qwen4DeviceFormat::Q8_0 => {
+            ensure!(
+                !fold_bias,
+                "{name}: the 1+w fold needs a float format, not Q8_0"
+            );
+            quantize_rows_threaded(
+                name,
+                src,
+                item.nrows,
+                item.ncols,
+                dst,
+                32,
+                34,
+                vulkan_kernels::quantize_q8_0_from_bf16,
+            )?;
+        }
+        Qwen4DeviceFormat::F16 => write_bf16_as_f16(name, src, dst)?,
+        Qwen4DeviceFormat::F32 => write_bf16_as_f32(name, src, dst, fold_bias)?,
+        Qwen4DeviceFormat::Nvfp4 => {
+            bail!("{name}: a BF16 source cannot land as NVFP4")
+        }
+    }
+    Ok(())
 }
 
 /// Repack one layer's expert planes into `dst`, expert-major, and collect the
@@ -2611,6 +2862,7 @@ mod tests {
             layers: Some(vec![0]),
             experts: Some(128),
             lm_head: false,
+            mtp: false,
         }
     }
 
@@ -2667,11 +2919,16 @@ mod tests {
             SharedExpertGate,
             PleNormKey,
             PleConv1d,
+            // The MTP fusion norms are currently host-applied (raw upload);
+            // F32 keeps them exact for a future device consumer.
+            MtpPreFcNormEmbedding,
+            MtpPreFcNormHidden,
         ] {
             assert_eq!(fmt(kind), Some(F32), "{kind:?} must stay F32");
         }
 
-        // The dense GEMV weights follow the config.
+        // The dense GEMV weights follow the config — the MTP fusion fcs
+        // included since the S8 reclassification.
         for kind in [
             LinearAttnInProjQkv,
             AttnQProj,
@@ -2679,6 +2936,8 @@ mod tests {
             SharedExpertDownProj,
             PleKeyProj,
             LmHead,
+            MtpFcEmbedding,
+            MtpFcHidden,
         ] {
             assert_eq!(fmt(kind), Some(F16), "{kind:?} at dense=F16");
             assert_eq!(
@@ -2688,17 +2947,35 @@ mod tests {
             );
         }
 
-        // Host tables and dropped families get no buffer.
+        // Host tables, the vision tower, and the stacked MTP experts (which
+        // upload only as per-expert SLICES with their own format policy) get
+        // no whole-tensor buffer.
         for kind in [
             EmbedTokens,
             PleNgramShard,
             PleNgramWeightScale,
             ExpertsStackedGateUp,
-            MtpFcHidden,
+            ExpertsStackedDown,
             Vision(crate::qwen4_names::VisionSlot::Merger),
         ] {
             assert_eq!(fmt(kind), None, "{kind:?} must not get a device buffer");
         }
+
+        // The slice policy mirrors SharedExpertDownProj's Q4_K exception.
+        use crate::qwen4_names::ExpertProj;
+        assert_eq!(
+            mtp_expert_slice_format(ExpertProj::Gate, Qwen4DeviceFormat::Q4K),
+            Qwen4DeviceFormat::Q4K
+        );
+        assert_eq!(
+            mtp_expert_slice_format(ExpertProj::Up, Qwen4DeviceFormat::Q4K),
+            Qwen4DeviceFormat::Q4K
+        );
+        assert_eq!(
+            mtp_expert_slice_format(ExpertProj::Down, Qwen4DeviceFormat::Q4K),
+            Qwen4DeviceFormat::Q8_0
+        );
+        assert_eq!(mtp_expert_slice_format(ExpertProj::Down, F16), F16);
     }
 
     /// The fold is a per-CONSUMER decision, not a per-class one: three
@@ -3027,6 +3304,89 @@ mod tests {
         );
         assert!(hyper_connection_prefix(Some(3), HcSite::Mixer).is_err());
         assert!(hyper_connection_prefix(None, HcSite::Attn).is_err());
+        // The MTP pseudo layer addresses all THREE of the head's sites —
+        // unlike a text layer it carries its own mixer.
+        assert_eq!(
+            hyper_connection_prefix(Some(MTP_HC_LAYER), HcSite::Attn).unwrap(),
+            "mtp.layers.0.attn_hyper_connection"
+        );
+        assert_eq!(
+            hyper_connection_prefix(Some(MTP_HC_LAYER), HcSite::Mlp).unwrap(),
+            "mtp.layers.0.mlp_hyper_connection"
+        );
+        assert_eq!(
+            hyper_connection_prefix(Some(MTP_HC_LAYER), HcSite::Mixer).unwrap(),
+            "mtp.hyper_connection_mixer"
+        );
+    }
+
+    /// The per-expert slice geometry over the REAL stacked headers: 3 slices
+    /// per expert, gate rows before up rows, formats per the dense tier, and
+    /// none of it books against a TEXT layer's byte ledger.
+    #[test]
+    fn mtp_plan_slices_the_stacked_experts() {
+        let Some(dir) = checkpoint_dir() else {
+            eprintln!("SKIP: no qwen3.8-flash-next checkpoint (set {CKPT_ENV})");
+            return;
+        };
+        let st = SafeTensorsDir::open_dir(&dir).expect("open the whole checkpoint");
+        let cfg = Qwen4UploadConfig {
+            dense_format: Qwen4DeviceFormat::Q4K,
+            ..Qwen4UploadConfig::default()
+        };
+        let plan = plan_qwen4_upload(&st, &cfg, &Qwen4UploadScope::full()).expect("plan");
+        let slice = |name: &str| {
+            plan.items
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("plan has no `{name}`"))
+        };
+        let gate = slice("mtp.layers.0.mlp.experts.7.gate_proj.weight");
+        let up = slice("mtp.layers.0.mlp.experts.7.up_proj.weight");
+        let down = slice("mtp.layers.0.mlp.experts.7.down_proj.weight");
+        assert_eq!((gate.nrows, gate.ncols), (640, 2560));
+        assert_eq!((up.nrows, up.ncols), (640, 2560));
+        assert_eq!((down.nrows, down.ncols), (2560, 640));
+        assert_eq!(gate.format, Qwen4DeviceFormat::Q4K);
+        assert_eq!(up.format, Qwen4DeviceFormat::Q4K);
+        // 640 is not a whole number of Q4_K superblocks.
+        assert_eq!(down.format, Qwen4DeviceFormat::Q8_0);
+        // Fused [gate; up]: expert 7's gate at row 7 * 1280, up 640 later.
+        let row_of = |i: &Qwen4PlanItem| match &i.source {
+            Qwen4Source::Bf16Slice { row_offset, .. } => *row_offset,
+            s => panic!("expected a slice source, got {s:?}"),
+        };
+        assert_eq!(row_of(gate), 7 * 1280);
+        assert_eq!(row_of(up), 7 * 1280 + 640);
+        assert_eq!(row_of(down), 7 * 2560);
+        // MTP bytes book stream-global, never against text layer 0.
+        let mtp_bytes: u64 = plan
+            .items
+            .iter()
+            .filter(|i| i.role.stream == Qwen4Stream::Mtp)
+            .map(|i| i.bytes)
+            .sum();
+        assert!(
+            plan.global_bytes >= mtp_bytes,
+            "MTP bytes must be inside the global ledger"
+        );
+        // And a scope without the head plans none of it.
+        let no_mtp = plan_qwen4_upload(
+            &st,
+            &cfg,
+            &Qwen4UploadScope {
+                mtp: false,
+                ..Qwen4UploadScope::full()
+            },
+        )
+        .expect("plan without mtp");
+        assert!(
+            no_mtp
+                .items
+                .iter()
+                .all(|i| i.role.stream != Qwen4Stream::Mtp),
+            "scope.mtp = false must drop every mtp item"
+        );
     }
 
     #[test]
@@ -3142,6 +3502,7 @@ mod tests {
                 layers: Some(vec![0]),
                 experts: None,
                 lm_head: false,
+                mtp: false,
             },
         )
         .expect_err("layer 0 has no experts here");
@@ -3157,6 +3518,7 @@ mod tests {
                 layers: Some(vec![0]),
                 experts: Some(0),
                 lm_head: false,
+                mtp: false,
             },
         )
         .expect("experts: Some(0) skips the MoE on purpose");
@@ -3666,16 +4028,49 @@ mod tests {
             gib(plan.host_bytes)
         );
 
-        // The plan fits the heap SIZE with the default reserve...
-        plan.ensure_fits(&heap_size_budget(), DEFAULT_RESERVE_BYTES)
-            .expect("the plan fits the 74.43 GiB heap size");
-        // ...and does NOT fit what the driver GRANTS. This is the defect the
-        // budget change exists for: at HEAD the guard above was the only one
-        // running, so 72.64 GiB of plan sailed past a 70.71 GiB budget.
+        // The MTP head plans as per-expert slices (3 per expert) plus its
+        // dense tensors, and since S8 it is IN the default full scope.
+        let slice_items = plan
+            .items
+            .iter()
+            .filter(|i| matches!(i.source, Qwen4Source::Bf16Slice { .. }))
+            .count();
+        assert_eq!(
+            slice_items,
+            512 * 3,
+            "one gate/up/down slice per MTP expert"
+        );
+        assert!(
+            plan.items
+                .iter()
+                .any(|i| i.name == "mtp.fc_embedding.weight"),
+            "the MTP fusion fcs must plan"
+        );
+
+        // With the MTP head aboard the F16-tier plan no longer fits even the
+        // heap SIZE — the spill tier is now load-bearing on every full load,
+        // not only against the driver budget.
+        let over_size = plan
+            .ensure_fits(&heap_size_budget(), DEFAULT_RESERVE_BYTES)
+            .expect_err("F16 dense + BF16-sized MTP slices must exceed the 74.43 GiB heap");
+        eprintln!("qwen4 full plan vs heap size: {over_size}");
         let over = plan
             .ensure_fits(&driver_budget(), DEFAULT_RESERVE_BYTES)
-            .expect_err("72.64 GiB must not fit a 70.71 GiB budget");
+            .expect_err("the plan must not fit a 70.71 GiB budget");
         eprintln!("qwen4 full plan vs driver budget: {over}");
+
+        // Against the heap-size budget the spill takes ONLY the coldest class
+        // — the MTP expert slices, read 10-of-512 and only while speculating.
+        let mut size_spilled = plan.clone();
+        size_spilled
+            .spill_to_fit(&heap_size_budget(), DEFAULT_RESERVE_BYTES, 35 << 30)
+            .expect("the size overshoot fits inside the MTP slice mass");
+        assert!(
+            size_spilled
+                .tier_items(Qwen4Tier::HostSpill)
+                .all(|i| matches!(i.source, Qwen4Source::Bf16Slice { .. })),
+            "the heap-size overshoot must be covered by MTP slices alone"
+        );
         assert!(
             plan.device_bytes > BUDGET - DEFAULT_RESERVE_BYTES,
             "the plan is {:.3} GiB against {:.3} GiB usable — if this ever stops \
@@ -3701,11 +4096,27 @@ mod tests {
         spilled
             .ensure_fits(&driver_budget(), DEFAULT_RESERVE_BYTES)
             .expect("the spilled plan fits");
+        // Cold-first: the MTP head's bytes (slices, then its dense tensors),
+        // then NVFP4 stacks — and no stack moves while MTP bytes remain. The
+        // rank order IS the residency policy, so pin it.
         assert!(
-            spilled
-                .tier_items(Qwen4Tier::HostSpill)
-                .all(|i| matches!(i.source, Qwen4Source::Nvfp4Stack { .. })),
-            "only expert stacks should have had to move"
+            spilled.tier_items(Qwen4Tier::HostSpill).all(|i| {
+                matches!(i.source, Qwen4Source::Nvfp4Stack { .. })
+                    || i.role.stream == Qwen4Stream::Mtp
+            }),
+            "only the MTP head and NVFP4 stacks should have had to move"
+        );
+        let any_stack_spilled = spilled
+            .tier_items(Qwen4Tier::HostSpill)
+            .any(|i| matches!(i.source, Qwen4Source::Nvfp4Stack { .. }));
+        let all_mtp_spilled = spilled
+            .items
+            .iter()
+            .filter(|i| i.role.stream == Qwen4Stream::Mtp)
+            .all(|i| i.tier == Qwen4Tier::HostSpill);
+        assert!(
+            !any_stack_spilled || all_mtp_spilled,
+            "an NVFP4 stack spilled while MTP bytes stayed on device — the cold-first rank broke"
         );
         assert_eq!(
             spilled.device_bytes + spilled.spill_bytes,
@@ -3745,12 +4156,16 @@ mod tests {
             return;
         };
         let st = SafeTensorsDir::open_dir(&dir).expect("open the whole checkpoint");
-        let plan = plan_qwen4_upload(
+        let mut plan = plan_qwen4_upload(
             &st,
             &Qwen4UploadConfig::default(),
             &Qwen4UploadScope::full(),
         )
         .expect("plan the full model");
+        // Mirror the loader: the MTP-inclusive plan over-commits and spills
+        // its coldest suballocations BEFORE any packing question is asked.
+        plan.spill_to_fit(&driver_budget(), DEFAULT_RESERVE_BYTES, 35 << 30)
+            .expect("spill the full plan to the driver budget");
 
         // 2 GiB is `maxMemoryAllocationSize` on this part — the size a loader
         // that did not sweep would naturally pick.
@@ -3790,12 +4205,14 @@ mod tests {
             "chosen packing wastes {:.2}%",
             100.0 * chosen.waste_fraction()
         );
-        // The whole point: the default reserve is actually available.
+        // The whole point: the default reserve is actually available — against
+        // the DRIVER budget, the number the loader is gated on (post-spill the
+        // device tier fits the heap size either way).
         chosen
-            .ensure_fits(HEAP, DEFAULT_RESERVE_BYTES)
+            .ensure_fits(BUDGET, DEFAULT_RESERVE_BYTES)
             .expect("the chosen packing must leave the reserve");
         assert!(
-            naive.ensure_fits(HEAP, DEFAULT_RESERVE_BYTES).is_err(),
+            naive.ensure_fits(BUDGET, DEFAULT_RESERVE_BYTES).is_err(),
             "at the device maximum the reserve is NOT available — that is the bug              this sweep exists to avoid"
         );
     }

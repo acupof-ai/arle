@@ -97,11 +97,12 @@ use vulkan_kernels::{
     f16_kv_pack_params, f16_kv_pack_params_rows, flash_attn_dispatch, flash_attn_dispatch_batched,
     flash_attn_params, flash_attn_params_batched, gemv_dense_dispatch, gemv_dispatch,
     gemv_id_dispatch, gemv_id_params_fused, gemv_id_params_grouped, gemv_nvfp4_spec_cols,
-    gemv_params_f32_b, mm_dispatch, mmq_params, qwen4_block_perm_dispatch, qwen4_block_perm_params,
-    qwen4_hc_combine_dispatch, qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params,
-    qwen4_ple_conv_dispatch, qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
-    qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
-    qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
+    gemv_params_f32_b, gemv_params_f32_b_cols, mm_dispatch, mmq_params, qwen4_block_perm_dispatch,
+    qwen4_block_perm_params, qwen4_hc_combine_dispatch, qwen4_hc_combine_params,
+    qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch, qwen4_ple_conv_params,
+    qwen4_ple_gate_dispatch, qwen4_ple_gate_params, qwen35_gated_delta_net_dispatch,
+    qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
+    qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
     qwen36_router_topk_params, record_dispatch, repack_nvfp4_planes, rms_norm_dispatch_rows,
     rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch, rope_neox_dispatch_batched,
@@ -118,11 +119,11 @@ fn sigmoid64(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn sigmoid32(x: f32) -> f32 {
+pub(crate) fn sigmoid32(x: f32) -> f32 {
     sigmoid64(f64::from(x)) as f32
 }
 
-fn silu32(x: f32) -> f32 {
+pub(crate) fn silu32(x: f32) -> f32 {
     (f64::from(x) * sigmoid64(f64::from(x))) as f32
 }
 
@@ -146,7 +147,7 @@ fn round_to_bf16(x: f32) -> f32 {
 }
 
 /// f32 → f16 → f32 round trip (RNE), the device KV cache's storage rounding.
-fn round_to_f16(x: f32) -> f32 {
+pub(crate) fn round_to_f16(x: f32) -> f32 {
     infer_gguf::dequant::f16_to_f32(f32_to_f16(x))
 }
 
@@ -226,7 +227,37 @@ pub struct HostDense<'st> {
 }
 
 impl<'st> HostDense<'st> {
-    fn load(st: &'st SafeTensorsDir, name: &str, in_dim: usize, out_dim: usize) -> Result<Self> {
+    /// A borrowed view over raw BF16 rows that is NOT a whole checkpoint
+    /// tensor — the MTP head's per-expert slices of the stacked
+    /// `experts.gate_up_proj`/`down_proj`. `name` should be the slice's
+    /// device-twin key ([`crate::qwen4_upload::mtp_expert_slice_name`]) so
+    /// [`DenseGemv`] can route it; the byte length is checked against the
+    /// declared shape.
+    pub(crate) fn from_bf16_rows(
+        name: String,
+        bytes: &'st [u8],
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<Self> {
+        ensure!(
+            bytes.len() == in_dim * out_dim * 2,
+            "`{name}`: {} B of BF16 for a [{out_dim}, {in_dim}] view",
+            bytes.len()
+        );
+        Ok(Self {
+            name,
+            bytes,
+            in_dim,
+            out_dim,
+        })
+    }
+
+    pub(crate) fn load(
+        st: &'st SafeTensorsDir,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<Self> {
         let info = st
             .tensor(name)
             .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
@@ -329,7 +360,7 @@ fn dense_many(
 }
 
 /// Load a small bf16 tensor as f32, checking its element count.
-fn f32_tensor(st: &SafeTensorsDir, name: &str, expect: usize) -> Result<Vec<f32>> {
+pub(crate) fn f32_tensor(st: &SafeTensorsDir, name: &str, expect: usize) -> Result<Vec<f32>> {
     let info = st
         .tensor(name)
         .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
@@ -419,7 +450,7 @@ pub struct HostLayer<'st> {
     pub ple: Option<PleLayer>,
 }
 
-fn load_hc(
+pub(crate) fn load_hc(
     st: &SafeTensorsDir,
     prefix: &str,
     hc: &HyperConnectionConfig,
@@ -876,7 +907,7 @@ pub struct FullTaps {
 
 /// Rotate the leading `rotary_dim` lanes of one `head_dim`-wide head in place:
 /// pairs `(d, d + rotary_dim/2)`, angle `pos · theta^(-2d/rotary_dim)`.
-fn rope_partial(head: &mut [f32], rotary_dim: usize, pos: usize, theta: f32) {
+pub(crate) fn rope_partial(head: &mut [f32], rotary_dim: usize, pos: usize, theta: f32) {
     let half = rotary_dim / 2;
     for d in 0..half {
         let freq = f64::from(theta).powf(-2.0 * d as f64 / rotary_dim as f64);
@@ -890,7 +921,7 @@ fn rope_partial(head: &mut [f32], rotary_dim: usize, pos: usize, theta: f32) {
 }
 
 /// `x * inv_rms * (1 + w)` over one head (the `Qwen4ExpTextRMSNorm` form).
-fn head_rms_norm_bias(head: &mut [f32], w: &[f32], eps: f32) {
+pub(crate) fn head_rms_norm_bias(head: &mut [f32], w: &[f32], eps: f32) {
     let mean: f64 = head
         .iter()
         .map(|&v| f64::from(v) * f64::from(v))
@@ -1477,6 +1508,32 @@ impl<'ctx> Qwen4Dev<'ctx> {
         if self.open {
             self.recorder.barrier();
         }
+    }
+
+    /// Record one buffer-to-buffer copy into the open command buffer (opening
+    /// it if needed) — the speculative-decode state snapshot/restore, which
+    /// must ride the SAME submit as the dispatches around it: recorded before
+    /// a verify chunk it captures the pre-chunk recurrent state for free, and
+    /// as a restore it is ordered before the next chunk's reads by
+    /// `copy_buffer`'s own barriers.
+    fn record_copy(
+        &mut self,
+        src: &DeviceBuffer<'_>,
+        src_offset: u64,
+        dst: &DeviceBuffer<'_>,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let _p = prof::span("record");
+        if !self.open {
+            self.recorder
+                .begin()
+                .map_err(|e| anyhow!("recorder begin: {e}"))?;
+            self.open = true;
+        }
+        self.recorder
+            .copy_buffer(src, src_offset, dst, dst_offset, len);
+        Ok(())
     }
 
     /// Drain the recorder's per-dispatch GPU timestamp totals — `(label,
@@ -2797,6 +2854,13 @@ pub struct DevResidentLinAttn<'ctx> {
     /// Per linear layer, stride [`Self::state_stride`]: GDN S `[nv][kd][vd]`
     /// then conv ring `[channel][kernel-1]`, both GGUF layout.
     state: DeviceBuffer<'ctx>,
+    /// Device twin of `state` for the speculative-decode rollback: a verify
+    /// chunk snapshots the WHOLE recurrent state into it with one recorded
+    /// copy (~117 MB device-to-device, riding the chunk's own submit) and a
+    /// rejected speculation copies it back. Device-side on purpose: reading
+    /// the state to the host is the write-combined ~0.10 GB/s trap, over a
+    /// second per snapshot. `None` until the first speculative cycle.
+    snapshot: Option<DeviceBuffer<'ctx>>,
     /// Linear layer id -> dense index into `aux` / `state`.
     index: BTreeMap<usize, usize>,
 }
@@ -2897,8 +2961,41 @@ impl<'ctx> DevResidentLinAttn<'ctx> {
             maps: maps_buf,
             aux: aux_buf,
             state,
+            snapshot: None,
             index,
         })
+    }
+
+    /// Allocate the rollback snapshot buffer (idempotent). Separate from
+    /// construction so a plain decode never pays the second state-sized
+    /// allocation.
+    pub fn ensure_snapshot(&mut self, ctx: &'ctx VulkanContext) -> Result<()> {
+        if self.snapshot.is_none() {
+            let buf = DeviceBuffer::alloc_uma(ctx, self.state.len())
+                .map_err(|e| anyhow!("resident state snapshot alloc: {e}"))?;
+            self.snapshot = Some(buf);
+        }
+        Ok(())
+    }
+
+    /// Record `state -> snapshot` (every layer) into the open command buffer.
+    /// Recorded BEFORE a verify chunk's dispatches, it captures the pre-chunk
+    /// state in the same submit.
+    pub fn record_state_save(&self, dev: &mut Qwen4Dev<'ctx>) -> Result<()> {
+        let snap = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow!("state snapshot not allocated (ensure_snapshot)"))?;
+        dev.record_copy(&self.state, 0, snap, 0, self.state.len() as u64)
+    }
+
+    /// Record `snapshot -> state`: the rollback of a rejected speculation.
+    pub fn record_state_restore(&self, dev: &mut Qwen4Dev<'ctx>) -> Result<()> {
+        let snap = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow!("state snapshot not allocated (ensure_snapshot)"))?;
+        dev.record_copy(snap, 0, &self.state, 0, self.state.len() as u64)
     }
 
     /// Sequence start: zero every layer's S and ring.
@@ -3194,7 +3291,7 @@ impl<'ctx> DevResidentLinAttn<'ctx> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `sigmoid(shared_expert_gate · x) · down(silu(gate·x) ⊙ up·x)` on host.
-fn host_shared_expert(
+pub(crate) fn host_shared_expert(
     moe: &HostMoe<'_>,
     x: &[f32],
     mut gemv: Option<&mut DenseGemv<'_, '_, '_>>,
@@ -3355,7 +3452,14 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                     },
                     Ok(other) => bail!("ARLE_QWEN4_DENSE={other}: bf16 | q4k | q8"),
                 };
-                let plan = plan_qwen4_upload(st, &ucfg, &Qwen4UploadScope::full())?;
+                // The MTP head rides the full residency by default (~2 GiB
+                // at the Q4_K tier; the speculative-decode drafter).
+                // ARLE_QWEN4_MTP=0 drops it for a plain decode.
+                let mut scope = Qwen4UploadScope::full();
+                if matches!(std::env::var("ARLE_QWEN4_MTP").as_deref(), Ok("0" | "off")) {
+                    scope.mtp = false;
+                }
+                let plan = plan_qwen4_upload(st, &ucfg, &scope)?;
                 let weights = upload_qwen4(ctx, st, &plan, &ucfg)?;
                 // KV planes for every full-attention layer (~4 MB each at
                 // ctx 2048) — without them full_attention_ready is false and
@@ -3373,10 +3477,18 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 (Some(weights), Some(dev), Some(resident))
             }
             (Some(ctx), Qwen4ExpDeviceMode::SubsetF32(subset)) => {
-                let scope = Qwen4UploadScope {
+                let mut scope = Qwen4UploadScope {
                     lm_head: false,
                     ..Qwen4UploadScope::layers(subset)
                 };
+                // The speculative harness opts the MTP head into a subset
+                // load explicitly (F32/BF16 per ARLE_QWEN4_SUBSET_DENSE).
+                if matches!(
+                    std::env::var("ARLE_QWEN4_SUBSET_MTP").as_deref(),
+                    Ok("1" | "on")
+                ) {
+                    scope.mtp = true;
+                }
                 // The dense tier defaults to F32 (the parity harness's
                 // zero-slack residency: decode and prefill then record the
                 // SAME GEMV dispatches). ARLE_QWEN4_SUBSET_DENSE=bf16 stages
@@ -3800,10 +3912,20 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             }
         }
 
-        // Stream mixer (use_combine = false) collapses 10240 → 2560; there is
-        // NO other final norm. Then lm_head — on device when it is resident,
-        // which is worth 52 ms of the 899 ms token measured before this lane
-        // existed: 1212.5 MiB in ONE projection.
+        let logits = self.mixer_lm_head(&h)?;
+        self.state.seq_len += 1;
+        Ok(logits)
+    }
+
+    /// The decode TAIL: stream mixer (use_combine = false) collapses
+    /// 10240 → 2560 — there is NO other final norm — then `lm_head`, each
+    /// through the device when resident and the host transcription otherwise.
+    /// One helper on purpose: decode, the prefill's last-token tail and the
+    /// batched verify's per-position fallback all route through it, so the
+    /// three cannot pick different (and subtly different-valued) routes for
+    /// the same `h`. On-device `lm_head` is worth 52 ms of the 899 ms token
+    /// measured before that lane existed: 1212.5 MiB in ONE projection.
+    fn mixer_lm_head(&mut self, h: &[f32]) -> Result<Vec<f32>> {
         let mixer_dev = self
             .weights
             .as_ref()
@@ -3811,20 +3933,16 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
         let x = if mixer_dev {
             let d = self.dev.as_mut().expect("mixer_dev checked");
             let w = self.weights.as_ref().expect("mixer_dev checked");
-            d.hc_pre(w, &self.hc, None, HcSite::Mixer, &h)?
+            d.hc_pre(w, &self.hc, None, HcSite::Mixer, h)?
         } else {
             let _s = prof::stage("host.hc_pre");
-            qwen4_hc::gated_residual(&self.hc, &self.mixer, &h)?.block_input
+            qwen4_hc::gated_residual(&self.hc, &self.mixer, h)?.block_input
         };
-        let lm_span = prof::stage("host.lm_head");
-        let logits = match self.dev.as_mut().zip(self.weights.as_ref()) {
-            Some((d, w)) => DenseGemv::new(d, w).matvec(&self.lm_head, &x)?,
-            None => self.lm_head.matvec(&x),
-        };
-        drop(lm_span);
-
-        self.state.seq_len += 1;
-        Ok(logits)
+        let _lm_span = prof::stage("host.lm_head");
+        match self.dev.as_mut().zip(self.weights.as_ref()) {
+            Some((d, w)) => DenseGemv::new(d, w).matvec(&self.lm_head, &x),
+            None => Ok(self.lm_head.matvec(&x)),
+        }
     }
 }
 
@@ -3863,6 +3981,20 @@ pub fn qwen4_prefill_chunk_tokens() -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|&t| (1..=1024).contains(&t))
         .unwrap_or(256)
+}
+
+/// `NUM_COLS` cap for the chunked DENSE projections (the batched-verify /
+/// prefill weight-read amortization). 8 is the same measured crossover as
+/// [`PF_MOE_COLS_CAP`], and the two caps are deliberately the same number for
+/// the same part. `ARLE_QWEN4_GEMV_COLS` overrides for a matched A/B; `1`
+/// disables the batching (per-token GEMV loop, the pre-cols behavior).
+#[must_use]
+pub fn qwen4_gemv_cols_cap() -> usize {
+    std::env::var("ARLE_QWEN4_GEMV_COLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&t| (1..=8).contains(&t))
+        .unwrap_or(8)
 }
 
 /// f16 bit patterns for the causal mask (the flash kernel ADDS the mask to the
@@ -4278,7 +4410,17 @@ pub struct Qwen4Prefill<'ctx> {
     /// GEMM route for `mix_down`, which cannot write strided rows).
     u_stride: usize,
     max_tokens: usize,
+    /// Per-position logits of a VERIFY chunk, `[t][vocab]` f32 — allocated on
+    /// the first `record_verify_tail` (a plain prompt prefill never needs
+    /// per-position logits and never pays the ~16 MB). HOST_CACHED: the whole
+    /// point of the buffer is a fast host read-back of every position.
+    verify_logits: Option<DeviceBuffer<'ctx>>,
 }
+
+/// Cap on a verify chunk's positions: pending (≤ k+2 after a rejection) plus
+/// k fresh drafts stays ≤ 2k+2, so 16 covers every draft depth this box will
+/// see (the vendor caps at 2, the sweep at 4) with headroom.
+pub const QWEN4_VERIFY_MAX_TOKENS: usize = 16;
 
 impl<'ctx> Qwen4Prefill<'ctx> {
     pub fn new(
@@ -4397,6 +4539,7 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             slots,
             u_stride,
             max_tokens,
+            verify_logits: None,
         })
     }
 
@@ -4521,6 +4664,56 @@ impl<'ctx> Qwen4Prefill<'ctx> {
                     [d.x, d.y, d.z],
                 );
             }
+        }
+        // NUM_COLS batching: the vendored shader's own batch axis. One
+        // dispatch computes up to [`qwen4_gemv_cols_cap`] activation columns
+        // with the weight row read ONCE — for a k-token verify this is what
+        // divides the dense bytes by the accepted length, and per-column
+        // arithmetic is bit-identical to the per-token loop below (the
+        // prefill=decode gate covers it at full scale). Packed rows only:
+        // column `j` must sit at `j * ncols` (B) and `j * nrows` (D), which is
+        // exactly the `gemv_params_f32_b_cols` stride contract.
+        // The width gates mirror `record_dense_binds`' own ensures; a shape
+        // that fails them falls to the loop and fails THERE, identically.
+        let cap = qwen4_gemv_cols_cap();
+        let cols_kernel = match w.format {
+            Qwen4DeviceFormat::Bf16 if k.is_multiple_of(4) => Some(Kernel::GemvBf16),
+            Qwen4DeviceFormat::F16 if k.is_multiple_of(4) => Some(Kernel::GemvF16),
+            Qwen4DeviceFormat::Q4K if k.is_multiple_of(256) => Some(Kernel::GemvQ4KDense),
+            Qwen4DeviceFormat::Q8_0 if k.is_multiple_of(8) => Some(Kernel::GemvQ8_0Dense),
+            _ => None,
+        };
+        if let Some(kernel) = cols_kernel
+            && cap > 1
+            && t > 1
+            && src_stride == k
+            && dst_stride == m
+        {
+            let (wb, wo, wl) = weights.binding(w)?;
+            let push = gemv_params_f32_b_cols(u32::try_from(k)?, u32::try_from(m)?).to_le_bytes();
+            let mut tok = 0usize;
+            while tok < t {
+                let g = (t - tok).min(cap);
+                let spec = kernel
+                    .gemv_cols_spec(u32::try_from(g)?)
+                    .expect("cols kernels all carry a cols spec");
+                let d = gemv_dense_dispatch(u32::try_from(m)?, &spec);
+                dev.rec(
+                    kernel,
+                    spec.specialization_u32(),
+                    &push,
+                    &[
+                        Bind::Ext(wb, wo, wl),
+                        Bind::Ext(&self.buffer, Self::row(src32, tok, k), (g * k * 4) as u64),
+                        Bind::Ext(&self.buffer, Self::row(dst, tok, m), (g * m * 4) as u64),
+                        Bind::A(dev.slots.dummy, 8),
+                        Bind::A(dev.slots.dummy, 8),
+                    ],
+                    [d.x, d.y, d.z],
+                )?;
+                tok += g;
+            }
+            return Ok(());
         }
         for tok in 0..t {
             dev.record_dense_binds(
@@ -5712,6 +5905,100 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         }
         Ok(())
     }
+
+    /// One post-chunk pre-mixer residual row: `h` at chunk index `tok`,
+    /// `[hc_hidden]`. Valid after [`Self::run_chunk`]'s flush; the arena is
+    /// HOST_CACHED, so a 40 KB row read is microseconds, not the WC trap.
+    fn read_h_row(&self, tok: usize, hh: usize) -> Result<Vec<f32>> {
+        self.read_f32_at(Self::row(self.slots.h, tok, hh), hh)
+    }
+
+    /// Record the VERIFY tail after a chunk: the stream mixer for every one of
+    /// the chunk's `t` positions (decode's own kernels, per token) and then
+    /// `lm_head` over all `t` block inputs as NUM_COLS-batched GEMVs — the
+    /// 1.2 GiB projection read once per chunk instead of once per position.
+    /// Logits land row-per-position in [`Self::read_verify_logits`]'s buffer.
+    fn record_verify_tail(
+        &mut self,
+        dev: &mut Qwen4Dev<'ctx>,
+        weights: &Qwen4Weights<'_, '_>,
+        hc: &HyperConnectionConfig,
+        lm: &Qwen4DeviceTensor,
+        t: usize,
+    ) -> Result<()> {
+        let _s = prof::stage("pf.verify_tail");
+        ensure!(
+            (1..=QWEN4_VERIFY_MAX_TOKENS).contains(&t),
+            "verify tail over {t} positions (cap {QWEN4_VERIFY_MAX_TOKENS})"
+        );
+        let (k, m) = (lm.ncols, lm.nrows);
+        ensure!(k == hc.hidden_size, "lm_head ncols {k} != hidden");
+        if self.verify_logits.is_none() {
+            let bytes = QWEN4_VERIFY_MAX_TOKENS * m * 4;
+            self.verify_logits = Some(
+                DeviceBuffer::alloc_host_cached(dev.ctx, bytes)
+                    .map_err(|e| anyhow!("alloc verify logits ({bytes} B): {e}"))?,
+            );
+        }
+        // Mixer per position: writes the block input rows at `slots.x`.
+        self.record_hc_pre(dev, weights, hc, None, HcSite::Mixer, t)?;
+        dev.barrier();
+        let logits_buf = self.verify_logits.as_ref().expect("allocated above");
+        let cols_kernel = match lm.format {
+            Qwen4DeviceFormat::Bf16 => Kernel::GemvBf16,
+            Qwen4DeviceFormat::F16 => Kernel::GemvF16,
+            Qwen4DeviceFormat::Q4K => Kernel::GemvQ4KDense,
+            Qwen4DeviceFormat::Q8_0 => Kernel::GemvQ8_0Dense,
+            f => bail!("verify tail: lm_head in unsupported format {f:?}"),
+        };
+        let (wb, wo, wl) = weights.binding(lm)?;
+        let push = gemv_params_f32_b_cols(u32::try_from(k)?, u32::try_from(m)?).to_le_bytes();
+        let cap = qwen4_gemv_cols_cap();
+        let mut tok = 0usize;
+        while tok < t {
+            let g = (t - tok).min(cap);
+            let spec = cols_kernel
+                .gemv_cols_spec(u32::try_from(g)?)
+                .expect("dense GEMV kernels carry a cols spec");
+            let d = gemv_dense_dispatch(u32::try_from(m)?, &spec);
+            dev.rec(
+                cols_kernel,
+                spec.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(wb, wo, wl),
+                    Bind::Ext(
+                        &self.buffer,
+                        Self::row(self.slots.x, tok, k),
+                        (g * k * 4) as u64,
+                    ),
+                    Bind::Ext(logits_buf, (tok * m * 4) as u64, (g * m * 4) as u64),
+                    Bind::A(dev.slots.dummy, 8),
+                    Bind::A(dev.slots.dummy, 8),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+            tok += g;
+        }
+        Ok(())
+    }
+
+    /// The logits row of chunk position `tok` after a
+    /// [`Self::record_verify_tail`] flush.
+    fn read_verify_logits(&self, tok: usize, vocab: usize) -> Result<Vec<f32>> {
+        let buf = self
+            .verify_logits
+            .as_ref()
+            .ok_or_else(|| anyhow!("no verify tail was recorded"))?;
+        let _p = prof::span_bytes("d2h", (vocab * 4) as u64);
+        let mut bytes = vec![0u8; vocab * 4];
+        buf.copy_to_host_at((tok * vocab * 4) as u64, &mut bytes)
+            .map_err(|e| anyhow!("verify logits read at {tok}: {e}"))?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
 }
 
 impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
@@ -5919,21 +6206,7 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             let p = self.prefill.as_ref().expect("built above");
             p.read_f32_at(Qwen4Prefill::row(p.slots.h, t_last, hh), hh)?
         };
-        let mixer_dev = self
-            .weights
-            .as_ref()
-            .is_some_and(|w| self.dev.is_some() && w.hyper_connection(None, HcSite::Mixer).is_ok());
-        let x = if mixer_dev {
-            let d = self.dev.as_mut().expect("mixer_dev checked");
-            let w = self.weights.as_ref().expect("mixer_dev checked");
-            d.hc_pre(w, &self.hc, None, HcSite::Mixer, &last_h)?
-        } else {
-            qwen4_hc::gated_residual(&self.hc, &self.mixer, &last_h)?.block_input
-        };
-        match self.dev.as_mut().zip(self.weights.as_ref()) {
-            Some((d, w)) => DenseGemv::new(d, w).matvec(&self.lm_head, &x),
-            None => Ok(self.lm_head.matvec(&x)),
-        }
+        self.mixer_lm_head(&last_h)
     }
 
     /// The resident linear-attention state, for the equivalence harness.
@@ -5946,6 +6219,663 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
     #[must_use]
     pub fn dev_ref(&self) -> Option<&Qwen4Dev<'ctx>> {
         self.dev.as_ref()
+    }
+
+    /// The device route pair the MTP head's forward takes — for harnesses
+    /// that drive [`crate::qwen4_mtp::MtpHead::forward`] directly.
+    pub fn dev_and_weights(&mut self) -> Option<(&mut Qwen4Dev<'ctx>, &Qwen4Weights<'ctx, 'st>)> {
+        self.dev.as_mut().zip(self.weights.as_ref())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Speculative decode: batched verify + state rollback.
+//
+// The MTP head (`crate::qwen4_mtp`) DRAFTS k tokens; the target model verifies
+// pending ++ drafts in ONE prefill chunk (grouped experts, NUM_COLS-batched
+// dense — the dense bytes divide by the chunk length) and greedy acceptance
+// keeps the longest prefix whose target argmax equals the draft. Rollback is
+// the whole trick on a recurrent model: the chunk ADVANCES the gated-delta S,
+// the conv rings, the PLE ring, the KV rows and the n-gram window for every
+// chunk position, accepted or not. The contract here:
+//
+// - KV rows and RoPE positions are POSITIONAL — rows past the kept `seq_len`
+//   are never read and the next chunk rewrites them, so KV "rollback" is just
+//   not advancing `seq_len`.
+// - GDN S + conv rings are device-resident and snapshot/restored by one
+//   recorded buffer copy each way (`DevResidentLinAttn::record_state_save` /
+//   `record_state_restore`).
+// - The PLE ring and the n-gram window are host-side and clone-restored.
+// - A rejected suffix is NOT replayed on its own: the accepted-but-rolled-back
+//   tokens simply ride the FRONT of the next cycle's chunk (`pending`), whose
+//   recomputation is deterministic — one weight sweep per cycle, always.
+//
+// Greedy speculative output therefore EQUALS plain greedy decode token for
+// token BY CONSTRUCTION — the verify chunk runs decode's own kernels (the
+// prefill=decode bit-exact gate) and emits only target argmaxes —
+// so any mismatch is a rollback bug. `tests/qwen4_speculative.rs` holds that
+// gate, plus the fault-injection knob below that proves the gate can fail.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-position outputs of one verify chunk.
+pub struct Qwen4VerifyOutput {
+    /// Target greedy argmax after each chunk position.
+    pub argmax: Vec<u32>,
+    /// Pre-mixer residual `[hc_hidden]` at each chunk position — what the MTP
+    /// head conditions on.
+    pub h_rows: Vec<Vec<f32>>,
+}
+
+/// One speculative cycle's outcome.
+pub struct Qwen4SpecCycle {
+    /// Newly emitted tokens: the accepted drafts plus the bonus token the
+    /// verify pass computed after them (always at least 1).
+    pub emitted: Vec<u32>,
+    /// Accepted draft count `L` (0..=k).
+    pub accepted: usize,
+    /// Whether the recurrent state was rolled back (`L < k`).
+    pub rolled_back: bool,
+    /// Wall seconds the rollback itself took (restore submit + host clone
+    /// restores); 0 on a full accept.
+    pub rollback_s: f64,
+    /// The next cycle's `pending`: tokens that are part of the output but not
+    /// yet inside the recurrent state.
+    pub pending: Vec<u32>,
+    /// `(absolute position, pre-mixer h)` for the last accepted region — the
+    /// drafter's catch-up inputs; the LAST entry is the `h` the next draft
+    /// step 1 conditions on.
+    pub h_rows: Vec<(usize, Vec<f32>)>,
+}
+
+/// Greedy argmax with `infer_plan::sample_token`'s tie-break (first index
+/// wins), so the speculative driver and the engine sampler cannot disagree on
+/// a razor-thin tie.
+#[must_use]
+pub fn greedy_argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// Rollback fault injection for the equivalence gate, so the gate is proven
+/// able to fail: `ARLE_QWEN4_SPEC_FAULT=skip-gdn|skip-ple|skip-ngram` makes
+/// [`VulkanQwen4ExpModel::speculative_verify_cycle`] deliberately SKIP that
+/// piece of the state restore. Read per rollback (tests toggle it at runtime);
+/// unset = no fault, the only production value.
+fn spec_fault() -> Option<String> {
+    std::env::var("ARLE_QWEN4_SPEC_FAULT")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
+    /// Run `tokens` (= pending ++ drafts) as ONE verify chunk from
+    /// `start_pos`, advancing every piece of recurrent state exactly like
+    /// [`Self::forward_prompt`], and return each position's target argmax and
+    /// pre-mixer residual. The per-position tail runs the stream mixer with
+    /// decode's kernels and `lm_head` as a NUM_COLS-batched GEMV when both are
+    /// resident, and falls back to [`Self::mixer_lm_head`] per position
+    /// otherwise (the subset harness) — the same value either way.
+    pub fn forward_verify(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Qwen4VerifyOutput> {
+        ensure!(!tokens.is_empty(), "verify with no tokens");
+        ensure!(
+            tokens.len() <= QWEN4_VERIFY_MAX_TOKENS,
+            "verify chunk of {} tokens (cap {QWEN4_VERIFY_MAX_TOKENS})",
+            tokens.len()
+        );
+        for &tok in tokens {
+            ensure!(
+                (tok as usize) < self.cfg.vocab_size,
+                "token {tok} outside the vocab"
+            );
+        }
+        ensure!(
+            start_pos + tokens.len() <= self.cfg.max_context,
+            "verify end {} > max_context {}",
+            start_pos + tokens.len(),
+            self.cfg.max_context
+        );
+        if let Some(reason) = self.prefill_unsupported_reason() {
+            bail!("qwen4_exp verify unavailable: {reason}");
+        }
+        ensure!(
+            start_pos == self.state.seq_len,
+            "verify at {start_pos} but the state holds {} tokens",
+            self.state.seq_len
+        );
+        let t = tokens.len();
+        let width = qwen4_prefill_chunk_tokens().max(t);
+        if self.prefill.as_ref().is_none_or(|p| p.max_tokens() < t) {
+            let ctx = self.dev.as_ref().expect("checked resident").ctx;
+            self.prefill = Some(Qwen4Prefill::new(ctx, &self.cfg, &self.hc, width)?);
+        }
+
+        let _stage = prof::stage("spec.verify");
+        let toks_i64: Vec<i64> = tokens.iter().map(|&v| i64::from(v)).collect();
+        let ple_emb = if self.cfg.ple_layer_ids.is_empty() {
+            Vec::new()
+        } else {
+            let ids = self.hash.row_ids(&self.state.ngram, &toks_i64)?;
+            self.gather_ple_embedding(&ids)?
+        };
+        self.state.ngram.push(&toks_i64);
+        let seed = {
+            let mut seed = Vec::with_capacity(t * self.hc.hc_hidden());
+            for &tok in tokens {
+                let embed = self.tables.embed_row(tok as usize)?;
+                seed.extend(qwen4_hc::seed_hyper_state(&self.hc, &embed)?);
+            }
+            seed
+        };
+        {
+            let Self {
+                cfg,
+                hc,
+                dev,
+                weights,
+                resident_linear,
+                state,
+                prefill,
+                ..
+            } = self;
+            let d = dev.as_mut().expect("checked resident");
+            let w = weights.as_ref().expect("checked resident");
+            let rl = resident_linear.as_ref().expect("checked resident");
+            prefill
+                .as_mut()
+                .expect("built above")
+                .run_chunk(d, w, rl, cfg, hc, state, &seed, &ple_emb, t, start_pos)?;
+            state.seq_len += t;
+        }
+
+        let hh = self.hc.hc_hidden();
+        let mut h_rows = Vec::with_capacity(t);
+        for tok in 0..t {
+            h_rows.push(
+                self.prefill
+                    .as_ref()
+                    .expect("built above")
+                    .read_h_row(tok, hh)?,
+            );
+        }
+
+        // Batched tail when the mixer and `lm_head` are device-resident (the
+        // shipping residency); the per-position decode tail otherwise.
+        let lm_resident = self
+            .weights
+            .as_ref()
+            .and_then(|w| w.tensor(&self.lm_head.name).ok().copied())
+            .filter(|lm| lm.ncols == self.cfg.hidden_size && lm.nrows == self.cfg.vocab_size);
+        let mixer_resident = self
+            .weights
+            .as_ref()
+            .is_some_and(|w| w.hyper_connection(None, HcSite::Mixer).is_ok());
+        let mut argmax = Vec::with_capacity(t);
+        match lm_resident {
+            Some(lm) if mixer_resident => {
+                let Self {
+                    hc,
+                    dev,
+                    weights,
+                    prefill,
+                    ..
+                } = self;
+                let d = dev.as_mut().expect("checked resident");
+                let w = weights.as_ref().expect("checked resident");
+                let p = prefill.as_mut().expect("built above");
+                p.record_verify_tail(d, w, hc, &lm, t)?;
+                d.flush()?;
+                for tok in 0..t {
+                    let logits = self
+                        .prefill
+                        .as_ref()
+                        .expect("built above")
+                        .read_verify_logits(tok, self.cfg.vocab_size)?;
+                    argmax.push(greedy_argmax(&logits));
+                }
+            }
+            _ => {
+                for row in &h_rows {
+                    let row = row.clone();
+                    let logits = self.mixer_lm_head(&row)?;
+                    argmax.push(greedy_argmax(&logits));
+                }
+            }
+        }
+        Ok(Qwen4VerifyOutput { argmax, h_rows })
+    }
+
+    /// One speculative cycle: verify `pending ++ drafts` in one chunk, accept
+    /// the longest matching draft prefix, and either keep the advanced state
+    /// (full accept) or roll every recurrent piece back to the pre-chunk
+    /// snapshot — the accepted-but-rolled-back tokens then ride the front of
+    /// the next cycle's chunk. See the section docs above for why this is
+    /// lossless under greedy acceptance.
+    pub fn speculative_verify_cycle(
+        &mut self,
+        pending: &[u32],
+        drafts: &[u32],
+    ) -> Result<Qwen4SpecCycle> {
+        ensure!(
+            !pending.is_empty(),
+            "speculative cycle with no pending token"
+        );
+        ensure!(!drafts.is_empty(), "speculative cycle with no drafts");
+        let start_pos = self.state.seq_len;
+
+        // Pre-chunk snapshot: host pieces by clone, device GDN state by a
+        // recorded copy that rides the chunk's own submit.
+        let snap_ngram = self.state.ngram.clone();
+        let snap_ple: BTreeMap<usize, PleConvState> = self.state.ple_conv.clone();
+        {
+            let _s = prof::stage("spec.save");
+            let ctx = self
+                .dev
+                .as_ref()
+                .ok_or_else(|| anyhow!("speculative decode needs device residency"))?
+                .ctx;
+            let rl = self
+                .resident_linear
+                .as_mut()
+                .ok_or_else(|| anyhow!("speculative decode needs resident linear attention"))?;
+            rl.ensure_snapshot(ctx)?;
+            let d = self.dev.as_mut().expect("checked above");
+            self.resident_linear
+                .as_ref()
+                .expect("checked above")
+                .record_state_save(d)?;
+        }
+
+        let tokens: Vec<u32> = pending.iter().chain(drafts.iter()).copied().collect();
+        let out = self.forward_verify(&tokens, start_pos)?;
+
+        let p = pending.len();
+        let mut accepted = 0usize;
+        while accepted < drafts.len() && out.argmax[p - 1 + accepted] == drafts[accepted] {
+            accepted += 1;
+        }
+        let bonus = out.argmax[p - 1 + accepted];
+        let mut emitted: Vec<u32> = drafts[..accepted].to_vec();
+        emitted.push(bonus);
+
+        let rolled_back = accepted < drafts.len();
+        let mut rollback_s = 0.0f64;
+        let pending_next = if rolled_back {
+            let _s = prof::stage("spec.rollback");
+            let t0 = std::time::Instant::now();
+            let fault = spec_fault();
+            let skip = |what: &str| fault.as_deref() == Some(what);
+            if !skip("skip-gdn") {
+                let d = self.dev.as_mut().expect("checked above");
+                self.resident_linear
+                    .as_ref()
+                    .expect("checked above")
+                    .record_state_restore(d)?;
+                d.flush()?;
+            }
+            if !skip("skip-ngram") {
+                self.state.ngram = snap_ngram;
+            }
+            if !skip("skip-ple") {
+                self.state.ple_conv = snap_ple;
+            }
+            // KV + RoPE are positional: winding `seq_len` back IS their
+            // rollback (rows past it are never read and get rewritten).
+            self.state.seq_len = start_pos;
+            let mut next = pending.to_vec();
+            next.extend_from_slice(&emitted);
+            rollback_s = t0.elapsed().as_secs_f64();
+            next
+        } else {
+            vec![bonus]
+        };
+
+        let h_rows = (0..=accepted)
+            .map(|j| (start_pos + p - 1 + j, out.h_rows[p - 1 + j].clone()))
+            .collect();
+        Ok(Qwen4SpecCycle {
+            emitted,
+            accepted,
+            rolled_back,
+            rollback_s,
+            pending: pending_next,
+            h_rows,
+        })
+    }
+
+    /// Load the MTP drafter's host weights off this model's checkpoint.
+    pub fn mtp_drafter(&self) -> Result<crate::qwen4_mtp::MtpDrafter<'st>> {
+        Ok(crate::qwen4_mtp::MtpDrafter::new(
+            crate::qwen4_mtp::MtpHead::load(self.st, &self.cfg)?,
+        ))
+    }
+
+    /// Pre-mixer `h` at index `idx` of the LAST prefill/verify chunk (rows of
+    /// earlier chunks are overwritten) — the drafter's conditioning inputs.
+    pub fn prefill_h_row(&self, idx: usize) -> Result<Vec<f32>> {
+        let p = self
+            .prefill
+            .as_ref()
+            .ok_or_else(|| anyhow!("no prefill chunk has run"))?;
+        p.read_h_row(idx, self.hc.hc_hidden())
+    }
+
+    /// Draft `k` tokens through the MTP head.
+    ///
+    /// Order of operations per call: drop the previous call's speculative KV
+    /// tail, absorb the queued catch-up positions as canonical KV entries
+    /// (KV-only forwards), then draft recurrently — step 1 conditions on
+    /// (`h_last`, `last_token`), each later step on the MTP's own `h_out` and
+    /// its previous draft. `h_last_pos` is the absolute position `h_last` was
+    /// read at; the canon's contiguity is asserted, not assumed.
+    pub fn mtp_draft(
+        &mut self,
+        drafter: &mut crate::qwen4_mtp::MtpDrafter<'st>,
+        h_last: &[f32],
+        h_last_pos: usize,
+        last_token: u32,
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        ensure!(k >= 1, "draft depth 0");
+        let _stage = prof::stage("spec.draft");
+        let Self {
+            cfg,
+            hc,
+            tables,
+            dev,
+            weights,
+            lm_head,
+            ..
+        } = self;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let (head, kv, base_pos, canonical, catchup) = drafter.parts();
+        kv.k.truncate(*canonical * kv_dim);
+        kv.v.truncate(*canonical * kv_dim);
+
+        for (pos, h, tok) in catchup.drain(..) {
+            if base_pos.is_none() {
+                *base_pos = Some(pos);
+            }
+            let expect = base_pos.expect("set above") + *canonical;
+            // A position BEHIND the canon is a legal re-verification: after a
+            // rollback the accepted tokens ride the next chunk again (and an
+            // absorb re-verifies all of `pending`), so their rows come back a
+            // second time — with identical values, the replay being
+            // deterministic — and the canonical entry already built from them
+            // stands. Only a gap ahead of the canon is a driver bug.
+            if pos < expect {
+                continue;
+            }
+            ensure!(
+                pos == expect,
+                "MTP catch-up at {pos}, canon expects {expect}"
+            );
+            let embed = tables.embed_row(tok as usize)?;
+            head.forward(
+                cfg,
+                hc,
+                &h,
+                &embed,
+                pos + 1,
+                kv,
+                true,
+                dev.as_mut().zip(weights.as_ref()),
+                None,
+            )?;
+            *canonical += 1;
+        }
+
+        if base_pos.is_none() {
+            *base_pos = Some(h_last_pos);
+        }
+        let expect = base_pos.expect("set above") + *canonical;
+        ensure!(
+            h_last_pos == expect,
+            "MTP draft at {h_last_pos}, canon expects {expect}"
+        );
+        let mut cur_h = h_last.to_vec();
+        let mut cur_tok = last_token;
+        let mut drafts = Vec::with_capacity(k);
+        for j in 0..k {
+            let embed = tables.embed_row(cur_tok as usize)?;
+            let rope_pos = base_pos.expect("set above") + kv.k.len() / kv_dim + 1;
+            let out = head.forward(
+                cfg,
+                hc,
+                &cur_h,
+                &embed,
+                rope_pos,
+                kv,
+                false,
+                dev.as_mut().zip(weights.as_ref()),
+                Some(lm_head),
+            )?;
+            let logits = out.logits.expect("lm_head was requested");
+            let d = greedy_argmax(&logits);
+            drafts.push(d);
+            if j == 0 {
+                // Draft step 1's entry is CANONICAL: its inputs are the true
+                // target h and a real emitted token.
+                *canonical += 1;
+            }
+            cur_h = out.h_out;
+            cur_tok = d;
+        }
+        Ok(drafts)
+    }
+
+    /// Greedy speculative generation: prefill the prompt, then loop
+    /// draft-k / verify-once / rollback until `n_new` tokens exist. The
+    /// output token stream EQUALS plain greedy decode's by construction
+    /// (`tests/qwen4_speculative.rs` holds the gate). `warmup_cap` bounds
+    /// how many tail-of-prompt positions seed the MTP KV canon.
+    /// Greedy speculative generation with any [`Qwen4DraftSource`]: prefill
+    /// the prompt, then loop draft-k / verify-once / rollback until `n_new`
+    /// tokens exist. The output token stream EQUALS plain greedy decode's by
+    /// construction (`tests/qwen4_speculative.rs` holds the gate) — for ANY
+    /// draft source, which is exactly what lets the gate drive adversarial
+    /// drafters through the same loop the MTP head uses.
+    pub fn generate_speculative<D: Qwen4DraftSource<'ctx, 'st>>(
+        &mut self,
+        drafter: &mut D,
+        prompt: &[u32],
+        n_new: usize,
+        k: usize,
+    ) -> Result<(Vec<u32>, Qwen4SpecStats)> {
+        ensure!(!prompt.is_empty(), "empty prompt");
+        ensure!(n_new >= 1 && k >= 1, "degenerate generation request");
+        ensure!(
+            k + 2 < QWEN4_VERIFY_MAX_TOKENS,
+            "draft depth {k} leaves no room in the verify chunk"
+        );
+        let mut stats = Qwen4SpecStats::new(k);
+
+        let t_pf = std::time::Instant::now();
+        let logits = self.forward_prompt(0, prompt, 0)?;
+        stats.prefill_s = t_pf.elapsed().as_secs_f64();
+        let t_all = std::time::Instant::now();
+
+        // The prompt's last chunk still sits in the prefill arena: its rows
+        // seed the first draft's conditioning (and the MTP KV canon).
+        let width = qwen4_prefill_chunk_tokens().clamp(1, 1024);
+        let last_len = ((prompt.len() - 1) % width) + 1;
+        let chunk_start = prompt.len() - last_len;
+        let mut h_last_pos = prompt.len() - 1;
+        let mut h_last = self.prefill_h_row(h_last_pos - chunk_start)?;
+        drafter.warmup(self, prompt, chunk_start)?;
+
+        let mut pending = vec![greedy_argmax(&logits)];
+        let mut out: Vec<u32> = pending.clone();
+        while out.len() < n_new {
+            // A long rejection streak grows `pending`; absorb it as one plain
+            // (non-speculative) chunk before it can overflow the verify cap.
+            if pending.len() + k + 1 > QWEN4_VERIFY_MAX_TOKENS {
+                let start = self.state.seq_len;
+                let v = self.forward_verify(&pending, start)?;
+                for j in 0..pending.len() - 1 {
+                    drafter.note_accepted(start + j, &v.h_rows[j], pending[j + 1]);
+                }
+                h_last_pos = start + pending.len() - 1;
+                h_last = v.h_rows[pending.len() - 1].clone();
+                let bonus = v.argmax[pending.len() - 1];
+                out.push(bonus);
+                pending = vec![bonus];
+                stats.absorbs += 1;
+                continue;
+            }
+            let td = std::time::Instant::now();
+            let drafts = drafter.draft(
+                self,
+                &h_last,
+                h_last_pos,
+                *pending.last().expect("non-empty"),
+                k,
+            )?;
+            ensure!(
+                drafts.len() == k,
+                "draft source returned {} of {k}",
+                drafts.len()
+            );
+            stats.draft_s += td.elapsed().as_secs_f64();
+
+            let tv = std::time::Instant::now();
+            let cycle = self.speculative_verify_cycle(&pending, &drafts)?;
+            stats.verify_s += tv.elapsed().as_secs_f64() - cycle.rollback_s;
+            stats.rollback_s += cycle.rollback_s;
+            stats.cycles += 1;
+            stats.drafted += drafts.len();
+            stats.accepted_total += cycle.accepted;
+            stats.accept_hist[cycle.accepted] += 1;
+            if !cycle.rolled_back {
+                stats.full_accepts += 1;
+            }
+
+            for (j, (pos, h)) in cycle.h_rows.iter().take(cycle.accepted).enumerate() {
+                drafter.note_accepted(*pos, h, cycle.emitted[j]);
+            }
+            let (lp, lh) = cycle.h_rows.last().expect("at least the bonus row");
+            h_last_pos = *lp;
+            h_last = lh.clone();
+            out.extend_from_slice(&cycle.emitted);
+            pending = cycle.pending;
+        }
+        out.truncate(n_new);
+        stats.emitted = out.len();
+        stats.wall_s = t_all.elapsed().as_secs_f64();
+        Ok((out, stats))
+    }
+}
+
+/// A supplier of draft tokens for [`VulkanQwen4ExpModel::generate_speculative`].
+///
+/// The MTP head is the production implementation
+/// ([`crate::qwen4_mtp::MtpDrafter`]); the equivalence gate drives synthetic
+/// ones (always-right, always-wrong, mixed) through the same loop, because the
+/// loop's correctness must not depend on WHAT is proposed.
+pub trait Qwen4DraftSource<'ctx, 'st> {
+    /// One-time seeding after the prompt prefill: the rows of the prompt's
+    /// last chunk (`chunk_start..prompt.len()`) are still readable via
+    /// [`VulkanQwen4ExpModel::prefill_h_row`]. Default: nothing.
+    fn warmup(
+        &mut self,
+        model: &VulkanQwen4ExpModel<'ctx, 'st>,
+        prompt: &[u32],
+        chunk_start: usize,
+    ) -> Result<()> {
+        let _ = (model, prompt, chunk_start);
+        Ok(())
+    }
+
+    /// A verified position: the target's pre-mixer `h` at `pos` and the
+    /// (now-final) token at `pos + 1`. Default: nothing.
+    fn note_accepted(&mut self, pos: usize, h: &[f32], next_token: u32) {
+        let _ = (pos, h, next_token);
+    }
+
+    /// Produce `k` draft tokens continuing `last_token`, whose conditioning
+    /// `h` (the target's pre-mixer residual at `h_last_pos`) is provided.
+    fn draft(
+        &mut self,
+        model: &mut VulkanQwen4ExpModel<'ctx, 'st>,
+        h_last: &[f32],
+        h_last_pos: usize,
+        last_token: u32,
+        k: usize,
+    ) -> Result<Vec<u32>>;
+}
+
+/// Counters of one speculative generation.
+#[derive(Debug, Clone)]
+pub struct Qwen4SpecStats {
+    pub cycles: usize,
+    /// Total drafted tokens (`cycles * k`).
+    pub drafted: usize,
+    /// Total accepted drafts.
+    pub accepted_total: usize,
+    /// Cycles with every draft accepted (no rollback).
+    pub full_accepts: usize,
+    /// Histogram over the accepted prefix length `L` (index 0..=k).
+    pub accept_hist: Vec<usize>,
+    /// Emitted new tokens (`>= cycles`, includes each cycle's bonus).
+    pub emitted: usize,
+    /// Non-speculative absorb chunks (a rejection streak overflowed the
+    /// verify cap and `pending` was flushed at baseline speed).
+    pub absorbs: usize,
+    pub prefill_s: f64,
+    /// Decode-phase wall (drafting + verify + rollback + bookkeeping).
+    pub wall_s: f64,
+    pub draft_s: f64,
+    pub verify_s: f64,
+    pub rollback_s: f64,
+}
+
+impl Qwen4SpecStats {
+    fn new(k: usize) -> Self {
+        Self {
+            cycles: 0,
+            drafted: 0,
+            accepted_total: 0,
+            full_accepts: 0,
+            accept_hist: vec![0; k + 1],
+            emitted: 0,
+            absorbs: 0,
+            prefill_s: 0.0,
+            wall_s: 0.0,
+            draft_s: 0.0,
+            verify_s: 0.0,
+            rollback_s: 0.0,
+        }
+    }
+
+    /// Mean accepted drafts per cycle — the `L` in "dense bytes divide by
+    /// `L + 1`".
+    #[must_use]
+    pub fn mean_accepted(&self) -> f64 {
+        if self.cycles == 0 {
+            0.0
+        } else {
+            self.accepted_total as f64 / self.cycles as f64
+        }
+    }
+
+    /// Per-step draft acceptance rate (accepted / drafted).
+    #[must_use]
+    pub fn acceptance(&self) -> f64 {
+        if self.drafted == 0 {
+            0.0
+        } else {
+            self.accepted_total as f64 / self.drafted as f64
+        }
     }
 }
 
