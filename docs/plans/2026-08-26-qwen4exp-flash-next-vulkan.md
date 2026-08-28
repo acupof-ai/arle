@@ -288,6 +288,18 @@ into "measured". Build it before chasing the first token, not after.
 
 Hours are CC-execution, not calendar.
 
+## Upstream (surveyed 2026-08-28)
+
+llama.cpp merged qwen4exp on 2026-08-27 (PR #27742) — one day into this
+plan's S7. Coverage: everything except MTP (WIP; the closed #27739 carries
+the only public MTP-draft code). Its Vulkan path ships with qwen4exp-specific
+breakage (ggml_vk_topk assert, Windows crashes #27431/#27560), so ARLE is
+plausibly ahead on this exact platform — a same-box UD-Q4_K_XL llama-bench
+baseline is being measured to replace that "plausibly" with a number.
+Lifted intel: MTP n-max=2 / dense-attention drafting / one-batched-verify;
+KV stays f16 under rotated QSA (S6 landmine); PLE graph-input reuse was
+worth +22%@b16 upstream (ARLE's staged loop already amortizes this).
+
 ## Risks
 
 **The device budget is 93% committed at Config B.** Several plausible
