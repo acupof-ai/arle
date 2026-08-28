@@ -43,6 +43,15 @@
 //! and the parity's argmax assert then fails loudly — which is exactly why
 //! that lane is not the default.
 //!
+//! `ARLE_GPU_TIMESTAMPS=1` adds a GPU-busy table per chunk width, keyed by
+//! the stage that RECORDED each dispatch. The host table books nearly all
+//! wall against `pf.moe.ids_fence` — the per-layer drain of everything
+//! recorded since the previous fence — so this second table is what actually
+//! decomposes the drain (measured 2026-08-28 at chunk 256: linattn 2.8 s,
+//! grouped MoE experts 1.9 s, hc.pre 1.4 s, fullattn 0.5 s of a 7.2 s
+//! drain). The timestamps themselves cost ~5% tok/s; keep the headline
+//! number from a run without them.
+//!
 //! Skips cleanly when the checkpoint (`ARLE_QWEN4_CKPT`) or a Vulkan device is
 //! absent, and says so loudly when the subset load fails on device memory (the
 //! GPU may be contended).
@@ -396,6 +405,9 @@ fn full_scale_prefill_tok_s() {
 
     for chunk in [64usize, 256] {
         let _ = prof::take();
+        if let Some(d) = model.dev_mut() {
+            let _ = d.take_gpu_profile(); // drop load/previous-chunk samples
+        }
         prof::set_enabled(true);
         let t0 = std::time::Instant::now();
         let logits = model
@@ -410,6 +422,19 @@ fn full_scale_prefill_tok_s() {
         );
         for (stage, ms, calls) in aggregate_ms(&prof::take()) {
             eprintln!("  {stage:<22} {ms:>10.1} ms  ({calls} calls)");
+        }
+        // The host table above books the ids-fence DRAIN wall against the
+        // stage that happened to flush; this attributes GPU-busy time to the
+        // stage that RECORDED each dispatch — inside-the-drain decomposition.
+        if let Some(d) = model.dev_mut() {
+            let mut gpu = d.take_gpu_profile();
+            if !gpu.is_empty() {
+                gpu.sort_by(|a, b| b.2.total_cmp(&a.2));
+                eprintln!("  ── GPU-busy by recording stage (ARLE_GPU_TIMESTAMPS=1) ──");
+                for (label, dispatches, ms) in gpu {
+                    eprintln!("  {label:<22} {ms:>10.1} ms  ({dispatches} dispatches)");
+                }
+            }
         }
     }
 

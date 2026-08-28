@@ -1812,6 +1812,127 @@ pub fn gemv_id_dispatch(nrows: u32, n_experts: u32) -> Dispatch {
     }
 }
 
+/// [`SPEC_GEMV_NVFP4`] with `NUM_COLS = num_cols` — the NVFP4 GEMV pair's
+/// batch axis, for a chunked prefill that has grouped several activation rows
+/// onto ONE expert. `mul_mat_vec.comp` reads column `j`'s activation at
+/// `j * batch_stride_b` and writes its outputs at `j * batch_stride_d`, while
+/// the expert's weight row is fetched ONCE for all `num_cols` columns — the
+/// amortization `tests/device_batched_crossover.rs` measured near-free through
+/// `NUM_COLS <= 8` on this part. Per-column arithmetic is untouched: `temp[j]`
+/// accumulates and reduces exactly as the `NUM_COLS = 1` decode pipeline does,
+/// which is what lets a regrouped prefill stay BIT-EXACT against the decode
+/// loop (`tests/qwen4_prefill.rs` holds that gate at 0.000e0).
+#[must_use]
+pub fn gemv_nvfp4_spec_cols(num_cols: u32) -> [(u32, u32); 3] {
+    [
+        SPEC_GEMV_NVFP4[0],                      // (0, BLOCK_SIZE)
+        SPEC_GEMV_NVFP4[1],                      // (1, NUM_ROWS)
+        (SPEC_GEMV_NVFP4[2].0, num_cols.max(1)), // (2, NUM_COLS)
+    ]
+}
+
+/// [`gemv_id_params_fused`] regrouped EXPERT-major: one dispatch runs
+/// `n_blocks` blocks (y dimension), block `g` being `data_ids[g]`'s expert
+/// matrix times `cols` activation rows that a router sent to that expert —
+/// the inversion of the decode layout, where y walked one TOKEN's top-k
+/// experts. Pair with a [`gemv_nvfp4_spec_cols`]`(cols)` pipeline and
+/// [`gemv_id_dispatch`]`(nrows, n_blocks)`.
+///
+/// Field derivation against `mul_mat_vec_base.glsl`'s `MUL_MAT_ID` offsets,
+/// with `expert_i1 = 0` so the `expert_i1 * batch_stride_*` terms vanish and
+/// `batch_stride_b/d` are free to serve as the NUM_COLS column strides:
+///
+/// - B: `b_offset = (expert_i0 % ne11) * stride_b` with `ne11 = n_blocks` →
+///   block `g` starts at `g * cols * ncols`, and column `j` rides
+///   `j * batch_stride_b = j * ncols` — i.e. the B binding is a DENSE
+///   `[n_blocks * cols][ncols]` block of gathered activation rows.
+/// - D: `d_offset = expert_i0 * stride_d = g * cols * nrows`, column `j` at
+///   `j * batch_stride_d = j * nrows` — dst is `[n_blocks * cols][nrows]`,
+///   same row order as B. `stride_d` keeps its second job as `main()`'s
+///   row-count guard: the x grid is `nrows` workgroups and
+///   `nrows <= cols * nrows`, so every dispatched row computes.
+/// - A: `expert_id * (batch_stride_a / QUANT_K)` with `batch_stride_a =
+///   ncols * nrows`, byte-identical to the decode layout — the whole stack
+///   stays bound at its base, no per-expert rebinding.
+/// - SCALE0/SCALE1 fusion reads `data_fuse{0,1}[gl_GlobalInvocationID.y]` =
+///   `[g]`: per-BLOCK vectors (the block's expert's `weight_scale_2`), not
+///   per-slot ones.
+pub fn gemv_id_params_grouped(
+    ncols: u32,
+    nrows: u32,
+    cols: u32,
+    n_blocks: u32,
+    fusion_flags: u32,
+) -> KernelParams {
+    KernelParams::from_words(vec![
+        ncols,         // ncols: per-row width in elements
+        ncols,         // stride_a: weight row stride (elements)
+        cols * ncols,  // stride_b: BLOCK stride (each block = `cols` B rows)
+        cols * nrows,  // stride_d: block dst stride + (loose) row-count guard
+        ncols * nrows, // batch_stride_a: full expert matrix (elements)
+        ncols,         // batch_stride_b: column j of B at j*ncols
+        nrows,         // batch_stride_d: column j of D at j*nrows
+        fusion_flags,  // fusion_flags: bindings 3/4 are read only when set
+        n_blocks,      // nei0 (unread by the shader body; the honest count)
+        n_blocks,      // ne11: expert_i0 % ne11 == expert_i0 for every block
+        0,             // expert_i1: kept 0 so batch_stride_b/d are column strides
+        n_blocks,      // nbi1: id-buffer row stride (irrelevant at expert_i1=0)
+    ])
+}
+
+#[cfg(test)]
+mod gemv_grouped_params_tests {
+    use super::{gemv_id_params_fused, gemv_id_params_grouped, gemv_nvfp4_spec_cols};
+
+    /// At `cols = 1` a grouped block IS one decode expert-slot, and all but
+    /// TWO words coincide with the decode layout ([`gemv_id_params_fused`]).
+    /// The two that diverge are the regrouping's essence: `batch_stride_d`
+    /// (word 6) becomes the NUM_COLS column stride instead of the whole-dst
+    /// stride, and `ne11` (word 9) becomes an identity modulus over the y
+    /// grid instead of decode's shared-activation `1`. Pinning the overlap
+    /// keeps the two layouts from drifting apart silently.
+    #[test]
+    fn grouped_words_agree_with_decode_where_the_contracts_overlap() {
+        let (ncols, nrows, blocks, flags) = (2560u32, 640u32, 7u32, 0x4u32);
+        let grouped = gemv_id_params_grouped(ncols, nrows, 1, blocks, flags);
+        let decode = gemv_id_params_fused(ncols, nrows, blocks, flags);
+        let (g, d) = (grouped.words(), decode.words());
+        for i in [0usize, 1, 2, 3, 4, 5, 7, 8, 10, 11] {
+            assert_eq!(g[i], d[i], "word {i} diverged from the decode contract");
+        }
+        // The redefined words, written out so a change here is a decision:
+        assert_eq!(g[6], nrows, "batch_stride_d: column stride");
+        assert_eq!(g[9], blocks, "ne11: identity modulus over the y grid");
+    }
+
+    /// `stride_b`/`stride_d` scale with the block width; the column strides
+    /// do not — that split is the whole layout.
+    #[test]
+    fn grouped_block_strides_scale_with_cols_and_column_strides_do_not() {
+        let (ncols, nrows) = (640u32, 2560u32);
+        for cols in 1..=8u32 {
+            let w = gemv_id_params_grouped(ncols, nrows, cols, 11, 0);
+            let w = w.words();
+            assert_eq!(w[2], cols * ncols, "stride_b at cols={cols}");
+            assert_eq!(w[3], cols * nrows, "stride_d at cols={cols}");
+            assert_eq!(w[5], ncols, "batch_stride_b at cols={cols}");
+            assert_eq!(w[6], nrows, "batch_stride_d at cols={cols}");
+        }
+    }
+
+    /// The spec only ever moves constant 2 (`NUM_COLS`); geometry stays the
+    /// decode pipeline's.
+    #[test]
+    fn nvfp4_cols_spec_moves_only_num_cols() {
+        for cols in 1..=8u32 {
+            let spec = gemv_nvfp4_spec_cols(cols);
+            assert_eq!(spec[0], (0, 64), "BLOCK_SIZE pinned to the wave width");
+            assert_eq!(spec[1], (1, 1), "NUM_ROWS pinned");
+            assert_eq!(spec[2], (2, cols), "NUM_COLS follows the batch");
+        }
+    }
+}
+
 pub const Q8_1_X4_VALUES_PER_GROUP: u32 = 128;
 
 pub fn q8_1_quantize_params(ne: u32) -> KernelParams {
