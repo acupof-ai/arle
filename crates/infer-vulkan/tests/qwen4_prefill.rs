@@ -28,6 +28,11 @@
 //! the piece the bit-exact gate structurally cannot see (F32 has no GEMM
 //! kernel). Its bound is a drift envelope, not equality; see the test.
 //!
+//! `chunked_gdn_drift_stays_in_the_reassociation_envelope` does the same for
+//! the opt-in chunked-GDN lane (`ARLE_QWEN4_PREFILL_CHUNKED_GDN=1`, the
+//! WY-form linear-attention prefill): in `SubsetF32` every GEMV is decode's
+//! own, so the drift it pins is the recurrence reassociation alone.
+//!
 //! ## The env-gated full-scale measurement
 //!
 //! `full_scale_prefill_tok_s` (`ARLE_QWEN4_PREFILL=1`, use `--release`) loads
@@ -42,6 +47,12 @@
 //! flips in the 512-expert routers, near-identical for bf16 and f16 staging)
 //! and the parity's argmax assert then fails loudly — which is exactly why
 //! that lane is not the default.
+//!
+//! `ARLE_QWEN4_PREFILL_CHUNKED_AB=1` appends a same-sitting A/B of the
+//! chunked-GDN lane at chunk 256: tok/s off/on, the linattn GPU-drain share
+//! (when timestamps are on), every MoE expert selection over the whole
+//! prompt, and the final-logits drift — the lane's perf receipt and its
+//! expert-flip verdict in one load.
 //!
 //! `ARLE_GPU_TIMESTAMPS=1` adds a GPU-busy table per chunk width, keyed by
 //! the stage that RECORDED each dispatch. The host table books nearly all
@@ -61,7 +72,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use infer_gguf::safetensors::SafeTensorsDir;
-use infer_vulkan::model_qwen4_exp::{Qwen4ExpDeviceMode, VulkanQwen4ExpModel, prof};
+use infer_vulkan::model_qwen4_exp::{Qwen4ExpDeviceMode, VulkanQwen4ExpModel, moe_ids, prof};
 use infer_vulkan::qwen4_config::{Qwen4ExpConfig, Qwen4LayerType};
 use vulkan_sys::VulkanContext;
 
@@ -346,6 +357,108 @@ fn gemm_route_drift_stays_in_the_f16_envelope() {
     );
 }
 
+/// The opt-in chunked-GDN lane (`ARLE_QWEN4_PREFILL_CHUNKED_GDN=1`) vs the
+/// same decode loop, on the truncated model in the bit-exact gate's own
+/// `SubsetF32` residency — the dense tier is F32, so every GEMV is decode's
+/// own dispatch and the ONLY difference on the whole path is the WY-form
+/// reassociation of the gated-delta recurrence (all-f32; no staging format
+/// enters, unlike the GEMM lane). The 96-token prompt makes one prefill call
+/// span two 64-token sub-chunks, so the inter-chunk state pass runs inside a
+/// single dispatch, not just across calls.
+///
+/// Calibration, measured on this box at 4 layers: the FIRST linear layer's S
+/// agrees to ~4e-7 ABSOLUTE — the pure reassociation drift, same level the
+/// kernel test pins — and everything larger is downstream amplification
+/// through the 512-expert MoE + hyper connections (S drift by layer at chunk
+/// 96: 2.8e-4, 1.8e-2, 4.6e-2 under the metric's 1e-3 floor; worst overall
+/// 3.7e-1 across the widths, on near-zero KV elements of absolute ~5e-4).
+/// That is 5x below the GEMM lane's honest f16 drift (2.0e0) on the same
+/// metric. The device-test mutations (flipped decay mask, dropped state
+/// decay) read non-finite and O(1e0..1e2) at the kernel and blow through
+/// everything downstream, so the 1.0 bound separates both ways — and the
+/// argmax equality assert is the sharper end-to-end signal.
+#[test]
+fn chunked_gdn_drift_stays_in_the_reassociation_envelope() {
+    let Some(dir) = checkpoint_dir() else { return };
+    let Some(ctx) = device() else { return };
+    let st = SafeTensorsDir::open_dir(&dir).expect("open checkpoint");
+    let mut cfg = Qwen4ExpConfig::from_model_dir(&dir).expect("parse config");
+    assert!(cfg.num_hidden_layers >= 4, "fewer than 4 layers");
+    cfg.num_hidden_layers = 4;
+    cfg.layer_types.truncate(4);
+
+    let mut model = match VulkanQwen4ExpModel::load(
+        Some(&ctx),
+        &st,
+        cfg.clone(),
+        &Qwen4ExpDeviceMode::SubsetF32(vec![0, 1, 2, 3]),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP: subset load failed ({e:#}) — device memory likely contended");
+            return;
+        }
+    };
+
+    // 96 in-vocab tokens, same generator as the 24-token gate prompt.
+    let toks: Vec<u32> = (0..96u32)
+        .map(|i| {
+            let id = (1009 + i * 37) % (cfg.vocab_size.min(30_000) as u32);
+            if cfg.stop_token_ids.contains(&id) {
+                id + 1
+            } else {
+                id
+            }
+        })
+        .collect();
+    let n = toks.len();
+    let mut logits = Vec::new();
+    for (i, &tok) in toks.iter().enumerate() {
+        logits = model
+            .forward_token(0, 0, tok, i)
+            .unwrap_or_else(|e| panic!("decode token {i}: {e:#}"));
+    }
+    let decode = capture(&model, &cfg, logits, n);
+    let am = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i)
+    };
+
+    // SAFETY: device tests run --test-threads=1; the gate is read at record
+    // time and removed below BEFORE any assert can panic — a leaked gate
+    // would silently turn the chunked lane on for the bit-exact test in this
+    // same process.
+    unsafe { std::env::set_var("ARLE_QWEN4_PREFILL_CHUNKED_GDN", "1") };
+    let runs: Vec<(usize, Result<CapturedState, String>)> = [96usize, 24, 7]
+        .into_iter()
+        .map(|chunk| {
+            let run = model
+                .forward_prompt_chunked(0, &toks, 0, chunk)
+                .map(|logits| capture(&model, &cfg, logits, n))
+                .map_err(|e| format!("{e:#}"));
+            (chunk, run)
+        })
+        .collect();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("ARLE_QWEN4_PREFILL_CHUNKED_GDN") };
+
+    for (chunk, run) in runs {
+        let prefill = run.unwrap_or_else(|e| panic!("chunked-GDN prefill chunk={chunk}: {e}"));
+        let worst = report_close(&prefill, &decode, &format!("chunked GDN, chunk={chunk}"));
+        assert_eq!(
+            am(&prefill.logits),
+            am(&decode.logits),
+            "chunk={chunk}: chunked-GDN prefill flips the argmax"
+        );
+        assert!(
+            worst < 1.0,
+            "chunk={chunk}: chunked-GDN drift {worst:.3e} above the reassociation envelope"
+        );
+    }
+}
+
 fn aggregate_ms(rows: &[prof::Row]) -> Vec<(String, f64, u64)> {
     let mut by_stage: BTreeMap<String, (f64, u64)> = BTreeMap::new();
     for r in rows {
@@ -503,5 +616,147 @@ fn full_scale_prefill_tok_s() {
             argmax.0, argmax.1,
             "prefill flips the argmax token at full scale"
         );
+    }
+
+    // ── Same-sitting chunked-GDN A/B (`ARLE_QWEN4_PREFILL_CHUNKED_AB=1`):
+    // the lane's perf-and-selection receipt. Chunk 256 over the SAME prompt,
+    // lane off then on, back to back in one load: tokens/s, the linattn
+    // GPU-drain share (populated only when ARLE_GPU_TIMESTAMPS=1 — keep the
+    // tok/s headline from a run without it), EVERY MoE expert selection over
+    // all tokens x layers, and the final-token logits drift. Expert flips are
+    // the downstream question that decides whether the lane may ever become a
+    // default; the numbers land in the test log either way. ──
+    if std::env::var("ARLE_QWEN4_PREFILL_CHUNKED_AB").as_deref() == Ok("1") {
+        let chunk = 256usize;
+        struct Pass {
+            secs: f64,
+            logits: Vec<f32>,
+            ids: Vec<(usize, Vec<i32>)>,
+            gpu: Vec<(&'static str, u64, f64)>,
+        }
+        let mut passes = Vec::new();
+        for on in [false, true] {
+            // SAFETY: this test is single-threaded and env-gated; the var is
+            // read at record time and removed right after the pass.
+            unsafe {
+                if on {
+                    std::env::set_var("ARLE_QWEN4_PREFILL_CHUNKED_GDN", "1");
+                } else {
+                    std::env::remove_var("ARLE_QWEN4_PREFILL_CHUNKED_GDN");
+                }
+            }
+            moe_ids::set_enabled(true);
+            let _ = moe_ids::take();
+            if let Some(d) = model.dev_mut() {
+                let _ = d.take_gpu_profile();
+            }
+            let t0 = std::time::Instant::now();
+            let logits = model
+                .forward_prompt_chunked(0, &toks, 0, chunk)
+                .expect("A/B prefill");
+            let secs = t0.elapsed().as_secs_f64();
+            moe_ids::set_enabled(false);
+            let ids = moe_ids::take();
+            let gpu = model
+                .dev_mut()
+                .map(|d| d.take_gpu_profile())
+                .unwrap_or_default();
+            passes.push(Pass {
+                secs,
+                logits,
+                ids,
+                gpu,
+            });
+        }
+        // SAFETY: as above — leave the environment as the test found it.
+        unsafe { std::env::remove_var("ARLE_QWEN4_PREFILL_CHUNKED_GDN") };
+        let [off, on] = &passes[..] else {
+            unreachable!()
+        };
+        eprintln!(
+            "\n== chunked-GDN A/B, chunk {chunk}, {n_tokens} tok: \
+             OFF {:.2}s = {:.1} tok/s, ON {:.2}s = {:.1} tok/s ==",
+            off.secs,
+            n_tokens as f64 / off.secs,
+            on.secs,
+            n_tokens as f64 / on.secs
+        );
+        for (label, pass) in [("OFF", off), ("ON", on)] {
+            let total: f64 = pass.gpu.iter().map(|&(_, _, ms)| ms).sum();
+            if total > 0.0 {
+                let lin: f64 = pass
+                    .gpu
+                    .iter()
+                    .filter(|(s, _, _)| *s == "pf.linattn")
+                    .map(|&(_, _, ms)| ms)
+                    .sum();
+                eprintln!(
+                    "  {label}: GPU busy {total:.0} ms, pf.linattn {lin:.0} ms ({:.1}%)",
+                    100.0 * lin / total
+                );
+            }
+        }
+        // Expert selections: positionally comparable because both passes
+        // record the identical (layer, chunk) sequence over the same prompt.
+        assert_eq!(
+            off.ids.len(),
+            on.ids.len(),
+            "A/B captured different chunk counts"
+        );
+        let (mut rows, mut set_flips, mut order_flips) = (0u64, 0u64, 0u64);
+        for ((l_off, ids_off), (l_on, ids_on)) in off.ids.iter().zip(&on.ids) {
+            assert_eq!(l_off, l_on, "A/B layer order diverged");
+            assert_eq!(ids_off.len(), ids_on.len(), "A/B ids length diverged");
+            for (row_off, row_on) in ids_off
+                .chunks_exact(cfg.num_experts_per_tok)
+                .zip(ids_on.chunks_exact(cfg.num_experts_per_tok))
+            {
+                rows += 1;
+                if row_off != row_on {
+                    order_flips += 1;
+                    let mut a = row_off.to_vec();
+                    let mut b = row_on.to_vec();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    if a != b {
+                        set_flips += 1;
+                    }
+                }
+            }
+        }
+        let mut worst = 0f32;
+        for (&p, &d) in on.logits.iter().zip(&off.logits) {
+            worst = worst.max((p - d).abs() / d.abs().max(1e-3));
+        }
+        let (am_off, am_on) = (
+            off.logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i),
+            on.logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i),
+        );
+        eprintln!(
+            "  expert selections: {rows} (token,layer) rows, {set_flips} set flips, \
+             {order_flips} order flips; final logits max rel {worst:.3e}, \
+             argmax OFF {am_off} vs ON {am_on}"
+        );
+        // MEASURED VERDICT, not a gate: on this checkpoint the full 48 layers
+        // amplify the WY reassociation into ~23% expert-set flips and a final
+        // argmax change (5627/24576 rows, OFF 198 vs ON 271 on 2026-08-28) —
+        // the same amplification that keeps the coopmat GEMM lane opt-in. The
+        // A/B exists to print that receipt; the lane's default-OFF status is
+        // the enforcement. A run where the flip count reaches zero is what
+        // would reopen the default question.
+        if am_off != am_on {
+            eprintln!(
+                "  VERDICT: chunked-GDN lane flips the final argmax — stays \
+                 env-gated (ARLE_QWEN4_PREFILL_CHUNKED_GDN=1)"
+            );
+        }
     }
 }

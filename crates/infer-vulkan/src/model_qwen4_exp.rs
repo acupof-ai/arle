@@ -49,9 +49,9 @@
 //!   cache is f16; error ≤ 2^-11 relative, below bf16's own 2^-8);
 //! - the gated-delta recurrence accumulates in f32 in the kernel's serial
 //!   order (torch also holds this state in f32). The kernel l2-normalizes q/k
-//!   with eps 1e-12 where the reference uses 1e-6; on 128-wide heads with O(1)
-//!   post-conv values the difference is O(1e-8) relative and is part of the
-//!   reported parity error.
+//!   with the reference's eps 1e-6, same as the host oracle (an earlier
+//!   1e-12 deviation was retired once llama.cpp's qwen35/qwen4exp graphs
+//!   confirmed `ggml_l2_norm(eps_norm=1e-6)` on both lanes).
 //!
 //! ## HF-vs-GGUF head-mapping trap (the V-slot permutation)
 //!
@@ -93,16 +93,17 @@ use crate::qwen4_upload::{
 
 use vulkan_kernels::{
     CoopmatShape, FlashAttentionSpec, GemvDenseSpec, Kernel, KernelCache, KernelParams,
-    MAT_VEC_FUSION_SCALE0, MmSpec, f16_kv_pack_dispatch, f16_kv_pack_dispatch_rows,
-    f16_kv_pack_params, f16_kv_pack_params_rows, flash_attn_dispatch, flash_attn_dispatch_batched,
-    flash_attn_params, flash_attn_params_batched, gemv_dense_dispatch, gemv_dispatch,
-    gemv_id_dispatch, gemv_id_params_fused, gemv_id_params_grouped, gemv_nvfp4_spec_cols,
-    gemv_params_f32_b, gemv_params_f32_b_cols, mm_dispatch, mmq_params, qwen4_block_perm_dispatch,
-    qwen4_block_perm_params, qwen4_hc_combine_dispatch, qwen4_hc_combine_params,
-    qwen4_hc_mix_dispatch, qwen4_hc_mix_params, qwen4_ple_conv_dispatch, qwen4_ple_conv_params,
-    qwen4_ple_gate_dispatch, qwen4_ple_gate_params, qwen35_gated_delta_net_dispatch,
-    qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
-    qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
+    MAT_VEC_FUSION_SCALE0, MmSpec, QWEN4_GDN_CHUNK, QWEN4_GDN_STATE_COLS, f16_kv_pack_dispatch,
+    f16_kv_pack_dispatch_rows, f16_kv_pack_params, f16_kv_pack_params_rows, flash_attn_dispatch,
+    flash_attn_dispatch_batched, flash_attn_params, flash_attn_params_batched, gemv_dense_dispatch,
+    gemv_dispatch, gemv_id_dispatch, gemv_id_params_fused, gemv_id_params_grouped,
+    gemv_nvfp4_spec_cols, gemv_params_f32_b, gemv_params_f32_b_cols, mm_dispatch, mmq_params,
+    qwen4_block_perm_dispatch, qwen4_block_perm_params, qwen4_gdn_chunk_intra_dispatch,
+    qwen4_gdn_chunk_params, qwen4_gdn_chunk_scratch_elems, qwen4_gdn_chunk_state_dispatch,
+    qwen4_hc_combine_dispatch, qwen4_hc_combine_params, qwen4_hc_mix_dispatch, qwen4_hc_mix_params,
+    qwen4_ple_conv_dispatch, qwen4_ple_conv_params, qwen4_ple_gate_dispatch, qwen4_ple_gate_params,
+    qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch,
+    qwen35_ssm_conv_params, qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
     qwen36_router_topk_params, record_dispatch, repack_nvfp4_planes, rms_norm_dispatch_rows,
     rms_norm_params_grouped, rms_norm_params_rows, rope_neox_dispatch, rope_neox_dispatch_batched,
@@ -1263,6 +1264,12 @@ fn dense_batch_offsets(rows: &[usize]) -> (Vec<usize>, usize) {
     (offs, cursor)
 }
 
+/// Shape of the resident `weight_scale_2` table in the `scale0` slot.
+/// `DevSlots` is shape-static like its neighbors (`logits: take(512)`), so
+/// these are literals; the seeder bounds-checks the real stacks against them.
+const SCALE0_LAYERS: u64 = 48;
+const SCALE0_EXPERTS: u64 = 512;
+
 impl DevSlots {
     fn layout() -> Self {
         let mut off = 0u64;
@@ -1290,10 +1297,12 @@ impl DevSlots {
             logits: take(512),
             ids: take(16),
             wts: take(16),
-            // Three projections' slot scales side by side (gate|up|down),
-            // ALL written before any expert GEMV is recorded — which is what
-            // lets the whole MoE tail share one submit.
-            scale0: take(48),
+            // The RESIDENT `weight_scale_2` table: 48 layers x 3 projections
+            // x 512 experts of f32, seeded once per layer on first touch.
+            // The expert GEMV indexes it by expert id straight off the
+            // router's device-side ids buffer, so routing never round-trips
+            // through the host — deleting 48 per-layer fences per token.
+            scale0: take(SCALE0_LAYERS * 3 * SCALE0_EXPERTS),
             one: take(1),
             gate: take(6400),
             up: take(6400),
@@ -1386,6 +1395,16 @@ pub struct Qwen4Dev<'ctx> {
     /// `layer id -> full_idx` for the KV cache, fixed at construction.
     full_idx: BTreeMap<usize, usize>,
     open: bool,
+    /// Bitmask of layers whose `weight_scale_2` rows are already seeded into
+    /// the resident scale table (first `moe` touch of the layer seeds them).
+    scale0_seeded: u64,
+    /// Which PLE layer's conv ring is live in the `ple_ring` slot, if any.
+    /// [`Self::ple_record_resident`] advances the ring in place, so staged
+    /// decode never round-trips the 9x10240 rows through the host; a
+    /// host-canonical consumer syncs out via [`Self::read_ple_ring`].
+    ple_ring_layer: Option<usize>,
+    /// The resident ring's next write slot (the conv kernel's `ring_pos`).
+    ple_ring_pos: u32,
 }
 
 impl<'ctx> Qwen4Dev<'ctx> {
@@ -1427,6 +1446,9 @@ impl<'ctx> Qwen4Dev<'ctx> {
             kv,
             full_idx,
             open: false,
+            scale0_seeded: 0,
+            ple_ring_layer: None,
+            ple_ring_pos: 0,
         })
     }
 
@@ -1560,6 +1582,22 @@ impl<'ctx> Qwen4Dev<'ctx> {
             self.open = false;
         }
         self.live.clear();
+        Ok(())
+    }
+
+    /// Submit the open batch WITHOUT waiting — the depth-2 pipeline half of
+    /// [`Self::flush`]: the GPU chews this batch while the host records the
+    /// next. Descriptor sets are NOT cleared (they must outlive the batch);
+    /// the next [`Self::flush`] is the drain, and its fence wait covers every
+    /// earlier submission on the in-order queue.
+    fn flush_async(&mut self) -> Result<()> {
+        if self.open {
+            let _p = prof::span("submit");
+            self.recorder
+                .submit_async()
+                .map_err(|e| anyhow!("async submit: {e}"))?;
+            self.open = false;
+        }
         Ok(())
     }
 
@@ -1917,10 +1955,10 @@ impl<'ctx> Qwen4Dev<'ctx> {
     }
 
     /// [`Self::moe`] minus the trailing flush/read: `x` is already staged and
-    /// the result stays in the `acc` slot. The ONE unavoidable fence remains —
-    /// the ids read-back that feeds the slot-ordered `weight_scale_2` gather —
-    /// and it flushes everything recorded so far, which in the staged loop is
-    /// the whole layer up to this point.
+    /// the result stays in the `acc` slot. Fence-free on the hot path: the
+    /// router's ids stay on device and the expert GEMV reads its
+    /// `weight_scale_2` from the resident id-indexed table, so nothing here
+    /// submits — `collect_taps` alone pays for read-backs.
     pub fn moe_record(
         &mut self,
         weights: &Qwen4Weights<'_, '_>,
@@ -1967,36 +2005,31 @@ impl<'ctx> Qwen4Dev<'ctx> {
             ],
             [d.x, d.y, d.z],
         )?;
-        self.flush()?;
-        let logits = self.read_f32(s.logits, cfg.num_experts)?;
-        let ids = self.read_i32(s.ids, top_k)?;
-        let route_weights = self.read_f32(s.wts, top_k)?;
+        // The per-layer ids fence used to live here: flush + read logits/ids/
+        // wts back so the host could gather a slot-ordered `weight_scale_2`
+        // list. The scale table is device-resident now and the expert GEMV
+        // indexes it by expert id — the very ids buffer the router just
+        // wrote — so the hot path records straight through: 48 fences per
+        // token became zero. The reads survive only as harness taps.
+        let (logits, ids, route_weights) = if collect_taps {
+            self.flush()?;
+            (
+                self.read_f32(s.logits, cfg.num_experts)?,
+                self.read_i32(s.ids, top_k)?,
+                self.read_f32(s.wts, top_k)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        self.ensure_scale0_rows(weights, layer)?;
+        // The deleted flush was ALSO the top-k → expert-GEMV sync: without a
+        // submission boundary the GEMVs race the router's ids/wts writes, so
+        // the ordering must now be said out loud.
+        self.barrier();
 
-        // Fused expert GEMVs. `weight_scale_2` rides SCALE0, indexed by SLOT.
-        // All three projections' slot scales are computed from `ids` and
-        // written BEFORE anything is recorded, so no host write races a
-        // recorded read and no flush is needed until the read at the end —
-        // this was 5 submits per layer (one per projection plus the swiglu
-        // firebreak) and is now part of ONE.
         prof::phase("dev.moe.gate_up");
-        let mut scale0_all = vec![0.0f32; 3 * top_k];
-        for (i, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
-            .into_iter()
-            .enumerate()
-        {
-            let mut part = Vec::new();
-            weights
-                .expert_stack(layer, proj)?
-                .scale0_for_route(&ids, &mut part)?;
-            scale0_all[i * top_k..(i + 1) * top_k].copy_from_slice(&part);
-        }
-        self.write_f32(s.scale0, &scale0_all)?;
-        let sc = |i: usize| (i * top_k * 4) as u64;
-        for (i, (proj, dst_off)) in [(ExpertProj::Gate, s.gate), (ExpertProj::Up, s.up)]
-            .into_iter()
-            .enumerate()
-        {
-            self.gemv_id_nvfp4(weights, layer, proj, &ids, h, inter, s.x, 1, dst_off, sc(i))?;
+        for (proj, dst_off) in [(ExpertProj::Gate, s.gate), (ExpertProj::Up, s.up)] {
+            self.gemv_id_nvfp4(weights, layer, proj, top_k, h, inter, s.x, 1, dst_off)?;
         }
         self.barrier();
         prof::phase("dev.moe.swiglu");
@@ -2022,13 +2055,12 @@ impl<'ctx> Qwen4Dev<'ctx> {
             weights,
             layer,
             ExpertProj::Down,
-            &ids,
+            top_k,
             inter,
             h,
             s.gate,
             top_k,
             s.down,
-            sc(2),
         )?;
         self.barrier();
         // acc = Σ_e w_e · down[e].
@@ -2068,28 +2100,80 @@ impl<'ctx> Qwen4Dev<'ctx> {
         })
     }
 
-    /// One fused NVFP4 expert GEMV over the selected `ids`, with the stack's
-    /// slot-ordered `weight_scale_2` on SCALE0 and `ne11` activation rows at
-    /// `b_off` (1 = shared across slots, `top_k` = one row per slot).
+    /// Byte offset of `(layer, proj)`'s row block inside the resident
+    /// `weight_scale_2` table (the `scale0` slot).
+    fn scale0_rows_off(layer: usize, proj: ExpertProj) -> u64 {
+        let pi = match proj {
+            ExpertProj::Gate => 0u64,
+            ExpertProj::Up => 1,
+            ExpertProj::Down => 2,
+        };
+        (layer as u64 * 3 + pi) * SCALE0_EXPERTS * 4
+    }
+
+    /// The SCALE0 binding for one expert stack: its id-indexed
+    /// `weight_scale_2` rows in the resident table.
+    fn scale0_rows_bind(&self, layer: usize, proj: ExpertProj) -> Bind<'static> {
+        Bind::A(
+            self.slots.scale0 + Self::scale0_rows_off(layer, proj),
+            SCALE0_EXPERTS * 4,
+        )
+    }
+
+    /// Seed `layer`'s three `weight_scale_2` row blocks into the resident
+    /// table on first touch. First-touch is what makes the host write
+    /// race-free without a fence: no recorded-but-unsubmitted dispatch can be
+    /// reading rows that have never been bound.
+    fn ensure_scale0_rows(&mut self, weights: &Qwen4Weights<'_, '_>, layer: usize) -> Result<()> {
+        ensure!(
+            (layer as u64) < SCALE0_LAYERS,
+            "layer {layer} outside the {SCALE0_LAYERS}-layer scale0 table"
+        );
+        if self.scale0_seeded & (1 << layer) != 0 {
+            return Ok(());
+        }
+        let mut rows = vec![0.0f32; (3 * SCALE0_EXPERTS) as usize];
+        for (i, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
+            .into_iter()
+            .enumerate()
+        {
+            let ws2 = &weights.expert_stack(layer, proj)?.weight_scale_2;
+            ensure!(
+                ws2.len() <= SCALE0_EXPERTS as usize,
+                "{} experts overflow the {SCALE0_EXPERTS}-row scale0 table",
+                ws2.len()
+            );
+            rows[i * SCALE0_EXPERTS as usize..][..ws2.len()].copy_from_slice(ws2);
+        }
+        self.write_f32(
+            self.slots.scale0 + Self::scale0_rows_off(layer, ExpertProj::Gate),
+            &rows,
+        )?;
+        self.scale0_seeded |= 1 << layer;
+        Ok(())
+    }
+
+    /// One fused NVFP4 expert GEMV over the router's device-resident ids,
+    /// with the stack's id-indexed `weight_scale_2` table on SCALE0 and
+    /// `ne11` activation rows at `b_off` (1 = shared across slots, `top_k` =
+    /// one row per slot).
     #[expect(clippy::too_many_arguments, reason = "a dispatch is this wide")]
     fn gemv_id_nvfp4(
         &mut self,
         weights: &Qwen4Weights<'_, '_>,
         layer: usize,
         proj: ExpertProj,
-        ids: &[i32],
+        top_k: usize,
         ncols: usize,
         nrows: usize,
         b_off: u64,
         ne11: usize,
         dst_off: u64,
-        scale0_off: u64,
     ) -> Result<()> {
-        let top_k = ids.len();
         let s = self.slots;
         let b = Bind::A(b_off, (ncols * ne11 * 4) as u64);
         let dst = Bind::A(dst_off, (top_k * nrows * 4) as u64);
-        let scale0 = Bind::A(s.scale0 + scale0_off, (top_k * 4) as u64);
+        let scale0 = self.scale0_rows_bind(layer, proj);
         let ids_b = Bind::A(s.ids, (top_k * 4) as u64);
         self.gemv_id_nvfp4_binds(
             weights, layer, proj, top_k, ncols, nrows, b, ne11, dst, scale0, ids_b,
@@ -2149,8 +2233,9 @@ impl<'ctx> Qwen4Dev<'ctx> {
     /// each `cols` gathered activation rows, through a `NUM_COLS = cols`
     /// `GemvIdNvfp4` pipeline — the y axis walks BLOCKS (expert-major) where
     /// the decode dispatch walks one token's slots. `weight_scale_2` rides
-    /// the same `MAT_VEC_FUSION_SCALE0` seam as decode, indexed by block:
-    /// `scale0` is a per-block f32 list, not a per-slot one.
+    /// the same `MAT_VEC_FUSION_SCALE0` seam as decode: `scale0` is the
+    /// resident id-indexed `weight_scale_2` table, read through each block's
+    /// expert id.
     #[expect(clippy::too_many_arguments, reason = "a dispatch is this wide")]
     fn gemv_id_nvfp4_grouped(
         &mut self,
@@ -2284,11 +2369,13 @@ impl<'ctx> Qwen4Dev<'ctx> {
 
 /// What the device MoE hands back for parity.
 pub struct DevMoeTaps {
-    /// Router logits `[num_experts]`.
+    /// Router logits `[num_experts]`. Empty unless `collect_taps` — the hot
+    /// path leaves routing entirely on device.
     pub logits: Vec<f32>,
-    /// Selected expert ids (slot order).
+    /// Selected expert ids (slot order). Empty unless `collect_taps`.
     pub ids: Vec<i32>,
-    /// Selected routing weights (renormalised on device).
+    /// Selected routing weights (renormalised on device). Empty unless
+    /// `collect_taps`.
     pub weights: Vec<f32>,
     /// Routed-expert accumulator (before the shared expert).
     pub routed: Vec<f32>,
@@ -2379,20 +2466,111 @@ impl<'ctx> Qwen4Dev<'ctx> {
         ring_rows: &[f32],
         add_into_h: bool,
     ) -> Result<()> {
+        // Upload mode clobbers the ring slot, so any resident ring dies here.
+        self.ple_ring_layer = None;
+        self.ple_record_inner(
+            weights,
+            cfg,
+            layer,
+            embeddings,
+            Some(ring_rows),
+            0,
+            add_into_h,
+        )
+    }
+
+    /// [`Self::ple_record`] against the RESIDENT ring: no upload, no
+    /// read-back — the conv kernel advances the ring in place at the current
+    /// `ring_pos`. Requires a prior [`Self::seed_ple_ring`] for `layer`.
+    pub fn ple_record_resident(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        embeddings: &[f32],
+        add_into_h: bool,
+    ) -> Result<()> {
+        ensure!(
+            self.ple_ring_layer == Some(layer),
+            "PLE ring not resident for layer {layer}"
+        );
+        let pos = self.ple_ring_pos;
+        self.ple_record_inner(weights, cfg, layer, embeddings, None, pos, add_into_h)?;
+        let len = ple_config(cfg).short_conv_state_len() as u32;
+        self.ple_ring_pos = (pos + 1) % len;
+        Ok(())
+    }
+
+    /// Seed the resident ring for `layer` from host oldest-first rows. At
+    /// `ring_pos = 0` the kernel's layout matches the host's verbatim (the
+    /// newest row, lag 1, sits at slot `state_len - 1`), so the upload is a
+    /// straight copy.
+    pub fn seed_ple_ring(&mut self, layer: usize, rows: &[f32]) -> Result<()> {
+        self.write_f32(self.slots.ple_ring, rows)?;
+        self.ple_ring_layer = Some(layer);
+        self.ple_ring_pos = 0;
+        Ok(())
+    }
+
+    /// Sync-out half of the resident-ring lifecycle: flush, read the ring
+    /// back in host oldest-first order (oldest = the next write slot), and
+    /// drop residency. `None` when nothing is resident. Host-canonical
+    /// consumers (the fallback loop, batched prefill) call this before
+    /// trusting `PleConvState` again.
+    pub fn read_ple_ring(&mut self, cfg: &Qwen4ExpConfig) -> Result<Option<(usize, Vec<f32>)>> {
+        let Some(layer) = self.ple_ring_layer.take() else {
+            return Ok(None);
+        };
+        let pc = ple_config(cfg);
+        let hh = pc.hc_hidden();
+        let state_len = pc.short_conv_state_len();
+        self.flush()?;
+        let dev_ring = self.read_f32(self.slots.ple_ring, state_len * hh)?;
+        let mut rows = vec![0.0f32; dev_ring.len()];
+        let p = self.ple_ring_pos as usize;
+        for t in 0..state_len {
+            let src = (p + t) % state_len;
+            rows[t * hh..(t + 1) * hh].copy_from_slice(&dev_ring[src * hh..(src + 1) * hh]);
+        }
+        Ok(Some((layer, rows)))
+    }
+
+    /// Drop ring residency WITHOUT syncing — for sequence resets, where the
+    /// host state was just zeroed and the device rows are garbage history.
+    pub fn invalidate_ple_ring(&mut self) {
+        self.ple_ring_layer = None;
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the two public modes share this body"
+    )]
+    fn ple_record_inner(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        embeddings: &[f32],
+        ring_upload: Option<&[f32]>,
+        ring_pos: u32,
+        add_into_h: bool,
+    ) -> Result<()> {
         let _s = prof::stage("dev.ple");
         let pc = ple_config(cfg);
         let hh = pc.hc_hidden();
         ensure!(embeddings.len() == pc.ple_embed_dim, "ple embeddings width");
-        ensure!(
-            ring_rows.len() == pc.short_conv_state_len() * hh,
-            "ple ring rows"
-        );
         let name = |suffix: &str| layer_tensor_name(layer, suffix);
         let kp = *weights.tensor(&name("ple.key_proj.weight"))?;
         let vp = *weights.tensor(&name("ple.value_proj.weight"))?;
         let s = self.slots;
         self.write_f32(s.ple_emb, embeddings)?;
-        self.write_f32(s.ple_ring, ring_rows)?;
+        if let Some(ring_rows) = ring_upload {
+            ensure!(
+                ring_rows.len() == pc.short_conv_state_len() * hh,
+                "ple ring rows"
+            );
+            self.write_f32(s.ple_ring, ring_rows)?;
+        }
         // key/value projections from whichever format the tier holds — the
         // F32-only assert this replaced was the audit-noted blocker that kept
         // the whole PLE on the host once the dense tier went F16.
@@ -2436,7 +2614,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             1,
             pc.conv_kernel_size as u32,
             pc.conv_dilation as u32,
-            0,
+            ring_pos,
         )
         .to_le_bytes();
         let d = qwen4_ple_conv_dispatch(hh as u32);
@@ -3633,6 +3811,10 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             if let Some(rl) = self.resident_linear.as_mut() {
                 rl.reset()?;
             }
+            if let Some(d) = self.dev.as_mut() {
+                // Fresh sequence: the resident PLE ring is garbage history.
+                d.invalidate_ple_ring();
+            }
         }
         ensure!(
             start_pos == self.state.seq_len,
@@ -3707,13 +3889,19 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                     .get(&layer)
                     .ok_or_else(|| anyhow!("host layer {layer} not loaded"))?;
                 if hl.ple.is_some() {
-                    let ring = state
-                        .ple_conv
-                        .get_mut(&layer)
-                        .ok_or_else(|| anyhow!("no PLE conv state for layer {layer}"))?;
-                    d.ple_record(w, cfg, layer, &ple_emb, ring.rows(), true)?;
-                    let (_out, ring_rows) = d.finish_ple(cfg)?;
-                    ring.rows_mut().copy_from_slice(&ring_rows);
+                    if d.ple_ring_layer != Some(layer) {
+                        let ring = state
+                            .ple_conv
+                            .get(&layer)
+                            .ok_or_else(|| anyhow!("no PLE conv state for layer {layer}"))?;
+                        d.seed_ple_ring(layer, ring.rows())?;
+                    }
+                    d.ple_record_resident(w, cfg, layer, &ple_emb, true)?;
+                    // The retired finish_ple flush doubled as the PLE -> hc_pre
+                    // sync (same trap as the MoE ids fence); the ordering is
+                    // explicit now. Host `PleConvState` goes stale here — the
+                    // fallback loop and batched prefill sync out before use.
+                    d.barrier();
                 }
                 d.hc_pre_record(w, hc, Some(layer), HcSite::Attn)?;
                 d.barrier();
@@ -3736,6 +3924,13 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let acc_off = d.slots.acc;
                 d.hc_combine_record(w, hc, Some(layer), HcSite::Mlp, acc_off)?;
                 d.barrier();
+                // Depth-2 pipelining: hand the GPU a 12-layer batch while the
+                // host records the next. The trailing barrier above orders
+                // the next batch's first dispatch against this one on the
+                // in-order queue, so the split is timing, not semantics.
+                if layer % 12 == 11 {
+                    d.flush_async()?;
+                }
             }
             d.hc_pre_record(w, hc, None, HcSite::Mixer)?;
             d.barrier();
@@ -3750,6 +3945,15 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             return Ok(logits);
         }
 
+        // A staged token may have left the PLE ring device-resident; this
+        // lane trusts the host `PleConvState`, so sync it out first.
+        if let Some(d) = dev.as_mut() {
+            if let Some((l, rows)) = d.read_ple_ring(cfg)? {
+                if let Some(ring) = state.ple_conv.get_mut(&l) {
+                    ring.rows_mut().copy_from_slice(&rows);
+                }
+            }
+        }
         for layer in 0..cfg.num_hidden_layers {
             let hl = layers
                 .get(&layer)
@@ -4306,9 +4510,6 @@ struct PfSlots {
     /// Grouped-MoE class-major expert-id lists ([`MoeGroupPlan::ids`]),
     /// [`pf_moe_list_capacity`] i32s.
     eids: u64,
-    /// Per-block `weight_scale_2`, `[3][list capacity]` f32 (gate|up|down),
-    /// laid out exactly like `eids` so one `list_at` addresses both.
-    esc: u64,
     /// Shared-expert gate `[T][sh_inter]`.
     sg: u64,
     /// Shared-expert up `[T][sh_inter]`.
@@ -4351,6 +4552,12 @@ struct PfSlots {
     mask: u64,
     /// RoPE positions `[T]` i32.
     pos: u64,
+    /// Chunked-GDN inter-kernel scratch (`ARLE_QWEN4_PREFILL_CHUNKED_GDN=1`
+    /// lane), sized for `T.div_ceil(64)` chunks — layout owned by
+    /// [`qwen4_gdn_chunk_params`]. ~7 MiB per 64-token chunk at this model's
+    /// head shape; allocated unconditionally like `b16`, the other opt-in
+    /// lane's staging slot.
+    gdn: u64,
     total: u64,
 }
 
@@ -4389,6 +4596,21 @@ fn pf_gemm_route(
         Qwen4DeviceFormat::F16 => Some((Kernel::MmCmF16, Kernel::F16KvPack, shape)),
         _ => None,
     }
+}
+
+/// The chunked (WY-form) gated-delta prefill lane
+/// (`ARLE_QWEN4_PREFILL_CHUNKED_GDN=1`) — OPT-IN like the coopmat GEMM lane
+/// (see [`pf_gemm_route`]), and for the same reason: the default per-token
+/// scan records the SAME kernel decode runs, so the prefill=decode gate is
+/// bit-exact, and the WY reassociation cannot honor that. Unlike the GEMM
+/// lane no sub-f32 staging enters anywhere — the scratch, the state and
+/// every accumulation stay f32 — so the drift is pure reassociation: the
+/// first linear layer's S agrees with the serial scan to ~4e-7 absolute, and
+/// the calibrated envelope + expert-flip receipts live in
+/// `tests/qwen4_prefill.rs` (`chunked_gdn_drift_*`, `_CHUNKED_AB`). Read at
+/// record time, per layer, like the GEMM gate.
+fn pf_chunked_gdn() -> bool {
+    std::env::var("ARLE_QWEN4_PREFILL_CHUNKED_GDN").as_deref() == Ok("1")
 }
 
 /// The chunk arena + chunk permutation maps for [`VulkanQwen4ExpModel::forward_prompt`].
@@ -4499,7 +4721,6 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             gmap: take(f32s(top_k)),
             smap: take(f32s(top_k)),
             eids: take((pf_moe_list_capacity(max_tokens * top_k) * 4) as u64),
-            esc: take((3 * pf_moe_list_capacity(max_tokens * top_k) * 4) as u64),
             sg: take(f32s(sh_inter)),
             su: take(f32s(sh_inter)),
             sd: take(f32s(h)),
@@ -4521,6 +4742,15 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             b16: take(t * hh as u64 * 2),
             mask: take(t * cfg.max_context as u64 * 2),
             pos: take(t * 4),
+            gdn: take(
+                qwen4_gdn_chunk_scratch_elems(
+                    (max_tokens.div_ceil(QWEN4_GDN_CHUNK as usize)) as u32,
+                    nv as u32,
+                    cfg.linear_key_head_dim as u32,
+                    vd as u32,
+                ) as u64
+                    * 4,
+            ),
             total: off,
         };
 
@@ -5176,25 +5406,75 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             [d.x, d.y, d.z],
         )?;
         dev.barrier();
-        let push =
-            qwen35_gated_delta_net_params(nk as u32, nv as u32, kd as u32, vd as u32, t as u32)
-                .to_le_bytes();
-        let d = qwen35_gated_delta_net_dispatch(nv as u32);
-        dev.rec(
-            Kernel::Qwen35GatedDeltaNet,
-            Kernel::Qwen35GatedDeltaNet.specialization_u32(),
-            &push,
-            &[
-                Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
-                Bind::Ext(&self.buffer, s.b2, (t * nv * 4) as u64),
-                Bind::Ext(&self.buffer, s.a2, (t * nv * 4) as u64),
-                Bind::Ext(&rl.aux, alog_at + 64 * 4, (nv * 4) as u64),
-                Bind::Ext(&rl.aux, alog_at, (nv * 4) as u64),
-                Bind::Ext(&rl.state, state_base, (nv * kd * vd * 4) as u64),
-                Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
-            ],
-            [d.x, d.y, d.z],
-        )?;
+        if pf_chunked_gdn() {
+            // Chunked WY-form lane: same inputs (post-conv qkv in slot order,
+            // packed a/b, resident dt_bias/ssm_a), same resident f32 state,
+            // same output layout — only the recurrence is reassociated. Two
+            // dispatches instead of one, against a serial scan that was the
+            // largest single slice of the prefill GPU drain (2.8 s of 7.2 s
+            // at chunk 256); the intra kernel is parallel over
+            // (64-token chunk, head) where the scan had ~nv near-serial
+            // workgroups for the whole chunk.
+            ensure!(
+                vd as u32 % QWEN4_GDN_STATE_COLS == 0,
+                "chunked GDN needs val_dim ({vd}) divisible by {QWEN4_GDN_STATE_COLS}"
+            );
+            let n_chunks = t.div_ceil(QWEN4_GDN_CHUNK as usize) as u32;
+            let scratch_len =
+                qwen4_gdn_chunk_scratch_elems(n_chunks, nv as u32, kd as u32, vd as u32) as u64 * 4;
+            let push = qwen4_gdn_chunk_params(
+                nk as u32, nv as u32, kd as u32, vd as u32, t as u32, n_chunks,
+            )
+            .to_le_bytes();
+            let d = qwen4_gdn_chunk_intra_dispatch(n_chunks, nv as u32);
+            dev.rec(
+                Kernel::Qwen4GdnChunkIntra,
+                Kernel::Qwen4GdnChunkIntra.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
+                    Bind::Ext(&self.buffer, s.b2, (t * nv * 4) as u64),
+                    Bind::Ext(&self.buffer, s.a2, (t * nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at + 64 * 4, (nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at, (nv * 4) as u64),
+                    Bind::Ext(&self.buffer, s.gdn, scratch_len),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+            dev.barrier();
+            let d = qwen4_gdn_chunk_state_dispatch(nv as u32, vd as u32);
+            dev.rec(
+                Kernel::Qwen4GdnChunkState,
+                Kernel::Qwen4GdnChunkState.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.gdn, scratch_len),
+                    Bind::Ext(&rl.state, state_base, (nv * kd * vd * 4) as u64),
+                    Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        } else {
+            let push =
+                qwen35_gated_delta_net_params(nk as u32, nv as u32, kd as u32, vd as u32, t as u32)
+                    .to_le_bytes();
+            let d = qwen35_gated_delta_net_dispatch(nv as u32);
+            dev.rec(
+                Kernel::Qwen35GatedDeltaNet,
+                Kernel::Qwen35GatedDeltaNet.specialization_u32(),
+                &push,
+                &[
+                    Bind::Ext(&self.buffer, s.wc, (t * conv_dim * 4) as u64),
+                    Bind::Ext(&self.buffer, s.b2, (t * nv * 4) as u64),
+                    Bind::Ext(&self.buffer, s.a2, (t * nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at + 64 * 4, (nv * 4) as u64),
+                    Bind::Ext(&rl.aux, alog_at, (nv * 4) as u64),
+                    Bind::Ext(&rl.state, state_base, (nv * kd * vd * 4) as u64),
+                    Bind::Ext(&self.buffer, s.gcore, (t * nv * vd * 4) as u64),
+                ],
+                [d.x, d.y, d.z],
+            )?;
+        }
         dev.barrier();
         let push = rms_norm_params_rows(vd as u32, (t * nv) as u32, vd as u32, cfg.rms_norm_eps)
             .to_le_bytes();
@@ -5639,6 +5919,13 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         prof::phase("pf.moe.ids_fence");
         dev.flush()?;
         let raw_ids = self.read_i32_at(s.ids, t * PF_IDS_PAD)?;
+        if moe_ids::enabled() {
+            let mut compact = Vec::with_capacity(t * top_k);
+            for row in 0..t {
+                compact.extend_from_slice(&raw_ids[row * PF_IDS_PAD..row * PF_IDS_PAD + top_k]);
+            }
+            moe_ids::push(layer, compact);
+        }
 
         prof::phase("pf.moe.group");
         // Host regrouping (see [`MoeGroupPlan`]): each active expert's rows
@@ -5647,22 +5934,16 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         // uploads below cannot race the gather that reads them.
         let plan = plan_moe_groups(&raw_ids, t, PF_IDS_PAD, top_k, cfg.num_experts)?;
         let pairs = t * top_k;
-        let sc_cap = pf_moe_list_capacity(self.max_tokens * top_k);
         let le32 = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         self.write_bytes_at(s.gmap, &le32(&plan.gather))?;
         self.write_bytes_at(s.smap, &le32(&plan.scatter))?;
         let id_bytes: Vec<u8> = plan.ids.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.write_bytes_at(s.eids, &id_bytes)?;
-        for (pi, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
-            .into_iter()
-            .enumerate()
-        {
-            // `weight_scale_2` is ID-order; the list is block-order. Padding
-            // entries carry id 0 — the scale written there is never read.
-            let ws2 = &weights.expert_stack(layer, proj)?.weight_scale_2;
-            let sc: Vec<f32> = plan.ids.iter().map(|&id| ws2[id as usize]).collect();
-            self.write_f32_at(s.esc + (pi * sc_cap * 4) as u64, &sc)?;
-        }
+        // `weight_scale_2` comes from the resident id-indexed table (seeded
+        // here when decode has not touched this layer yet); the grouped GEMV
+        // reads it through the block's expert id, so no per-block scale list
+        // is built or uploaded.
+        dev.ensure_scale0_rows(weights, layer)?;
 
         prof::phase("pf.moe.experts");
         // Gather: ONE whole-chunk block permutation of the `x` rows into
@@ -5676,10 +5957,8 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         // so the whole lot records with no intervening barriers.
         for c in &plan.classes {
             let rows = c.cols * c.n_blocks;
-            for (pi, (proj, dst)) in [(ExpertProj::Gate, s.ge), (ExpertProj::Up, s.gu)]
-                .into_iter()
-                .enumerate()
-            {
+            for (proj, dst) in [(ExpertProj::Gate, s.ge), (ExpertProj::Up, s.gu)] {
+                let scale0 = dev.scale0_rows_bind(layer, proj);
                 dev.gemv_id_nvfp4_grouped(
                     weights,
                     layer,
@@ -5698,7 +5977,7 @@ impl<'ctx> Qwen4Prefill<'ctx> {
                         dst + (c.pair_at * inter * 4) as u64,
                         (rows * inter * 4) as u64,
                     ),
-                    list_bind(s.esc, pi * sc_cap + c.list_at, c.n_blocks),
+                    scale0,
                     list_bind(s.eids, c.list_at, c.n_blocks),
                 )?;
             }
@@ -5725,6 +6004,7 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         // already block-contiguous — the chain never leaves expert order.
         for c in &plan.classes {
             let rows = c.cols * c.n_blocks;
+            let scale0 = dev.scale0_rows_bind(layer, ExpertProj::Down);
             dev.gemv_id_nvfp4_grouped(
                 weights,
                 layer,
@@ -5743,7 +6023,7 @@ impl<'ctx> Qwen4Prefill<'ctx> {
                     s.edc + (c.pair_at * h * 4) as u64,
                     (rows * h * 4) as u64,
                 ),
-                list_bind(s.esc, 2 * sc_cap + c.list_at, c.n_blocks),
+                scale0,
                 list_bind(s.eids, c.list_at, c.n_blocks),
             )?;
         }
@@ -6134,12 +6414,25 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             if let Some(rl) = self.resident_linear.as_mut() {
                 rl.reset()?;
             }
+            if let Some(d) = self.dev.as_mut() {
+                // Fresh sequence: the resident PLE ring is garbage history.
+                d.invalidate_ple_ring();
+            }
         }
         ensure!(
             start_pos == self.state.seq_len,
             "forward_prompt at {start_pos} but the state holds {} tokens",
             self.state.seq_len
         );
+        // A staged decode may hold the PLE ring on device; batched prefill
+        // reads and re-seeds the host rows per chunk, so sync out first.
+        if let Some(d) = self.dev.as_mut() {
+            if let Some((l, rows)) = d.read_ple_ring(&self.cfg)? {
+                if let Some(ring) = self.state.ple_conv.get_mut(&l) {
+                    ring.rows_mut().copy_from_slice(&rows);
+                }
+            }
+        }
         let width = chunk_width.clamp(1, 1024);
         if self.prefill.as_ref().is_none_or(|p| p.max_tokens() < width) {
             let ctx = self.dev.as_ref().expect("checked resident").ctx;
@@ -6917,8 +7210,48 @@ impl<'ctx> Qwen4Dev<'ctx> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-stage wall-clock profile (additive instrumentation; see `prof`).
+// Additive instrumentation: wall-clock profile (`prof`), expert-id capture
+// (`moe_ids`).
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Opt-in capture of the prefill's per-(layer, chunk) MoE expert selections,
+/// read at the ids fence the prefill performs anyway — zero extra device
+/// traffic. Exists for the chunked-GDN receipt in `tests/qwen4_prefill.rs`:
+/// "does the reassociated recurrence flip any router selection over a real
+/// prompt?" is a question about these exact ids, and nothing else exposes
+/// them. Disabled (the default) it is one relaxed atomic load per chunk.
+pub mod moe_ids {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static ROWS: Mutex<Vec<(usize, Vec<i32>)>> = Mutex::new(Vec::new());
+
+    /// Turn capture on or off (it starts off).
+    pub fn set_enabled(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub(crate) fn enabled() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    /// Record one chunk's compacted `[t * top_k]` ids for `layer`.
+    pub(crate) fn push(layer: usize, ids: Vec<i32>) {
+        if let Ok(mut rows) = ROWS.lock() {
+            rows.push((layer, ids));
+        }
+    }
+
+    /// Drain everything captured so far, in record order.
+    #[must_use]
+    pub fn take() -> Vec<(usize, Vec<i32>)> {
+        ROWS.lock()
+            .map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default()
+    }
+}
 
 /// Where a token's wall clock goes, charged so the buckets PARTITION it.
 ///
