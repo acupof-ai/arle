@@ -106,3 +106,21 @@ parity, not just speed.
   synchronized before removing it.
 - Suspicions about the other side's math earn a verdict only after the file
   that implements it is read — D3 died in 40 lines of `set_input_qsa`.
+
+## Correction: the power-mode label on this day's numbers
+
+Every measurement in this entry and its siblings from 2026-08-28 was
+labelled "Performance mode" in the commit messages. That label was
+UNVERIFIED: `powercfg -getactivescheme` read **Balanced
+(381b4222-f694-41f0-9685-ff5bb260df2e)**, not the Performance fingerprint
+(27fa6203), when the device-MoE-planning agent checked it at the end of the
+day. Treat the absolute tok/s and ms/token figures here as
+Balanced-mode numbers, not comparable to prior sittings' Performance-mode
+absolutes.
+
+What survives untouched: every ratio and A/B in this day's work, because
+each was measured in ONE sitting on ONE machine — including the ARLE vs
+llama.cpp comparison (ARLE 43.5 ms/token decode, llama.cpp tg32 21.96 tok/s
+= 45.5 ms/token), which was run back to back on the same box under the same
+scheme. The house rule is exactly why this is recoverable: record the power
+mode with every number, and trust ratios from one sitting over absolutes.
