@@ -1366,6 +1366,13 @@ pub struct Qwen4Dev<'ctx> {
     /// Bitmask of layers whose `weight_scale_2` rows are already seeded into
     /// the resident scale table (first `moe` touch of the layer seeds them).
     scale0_seeded: u64,
+    /// Which PLE layer's conv ring is live in the `ple_ring` slot, if any.
+    /// [`Self::ple_record_resident`] advances the ring in place, so staged
+    /// decode never round-trips the 9x10240 rows through the host; a
+    /// host-canonical consumer syncs out via [`Self::read_ple_ring`].
+    ple_ring_layer: Option<usize>,
+    /// The resident ring's next write slot (the conv kernel's `ring_pos`).
+    ple_ring_pos: u32,
 }
 
 impl<'ctx> Qwen4Dev<'ctx> {
@@ -1408,6 +1415,8 @@ impl<'ctx> Qwen4Dev<'ctx> {
             full_idx,
             open: false,
             scale0_seeded: 0,
+            ple_ring_layer: None,
+            ple_ring_pos: 0,
         })
     }
 
@@ -1515,6 +1524,22 @@ impl<'ctx> Qwen4Dev<'ctx> {
             self.open = false;
         }
         self.live.clear();
+        Ok(())
+    }
+
+    /// Submit the open batch WITHOUT waiting — the depth-2 pipeline half of
+    /// [`Self::flush`]: the GPU chews this batch while the host records the
+    /// next. Descriptor sets are NOT cleared (they must outlive the batch);
+    /// the next [`Self::flush`] is the drain, and its fence wait covers every
+    /// earlier submission on the in-order queue.
+    fn flush_async(&mut self) -> Result<()> {
+        if self.open {
+            let _p = prof::span("submit");
+            self.recorder
+                .submit_async()
+                .map_err(|e| anyhow!("async submit: {e}"))?;
+            self.open = false;
+        }
         Ok(())
     }
 
@@ -2383,20 +2408,111 @@ impl<'ctx> Qwen4Dev<'ctx> {
         ring_rows: &[f32],
         add_into_h: bool,
     ) -> Result<()> {
+        // Upload mode clobbers the ring slot, so any resident ring dies here.
+        self.ple_ring_layer = None;
+        self.ple_record_inner(
+            weights,
+            cfg,
+            layer,
+            embeddings,
+            Some(ring_rows),
+            0,
+            add_into_h,
+        )
+    }
+
+    /// [`Self::ple_record`] against the RESIDENT ring: no upload, no
+    /// read-back — the conv kernel advances the ring in place at the current
+    /// `ring_pos`. Requires a prior [`Self::seed_ple_ring`] for `layer`.
+    pub fn ple_record_resident(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        embeddings: &[f32],
+        add_into_h: bool,
+    ) -> Result<()> {
+        ensure!(
+            self.ple_ring_layer == Some(layer),
+            "PLE ring not resident for layer {layer}"
+        );
+        let pos = self.ple_ring_pos;
+        self.ple_record_inner(weights, cfg, layer, embeddings, None, pos, add_into_h)?;
+        let len = ple_config(cfg).short_conv_state_len() as u32;
+        self.ple_ring_pos = (pos + 1) % len;
+        Ok(())
+    }
+
+    /// Seed the resident ring for `layer` from host oldest-first rows. At
+    /// `ring_pos = 0` the kernel's layout matches the host's verbatim (the
+    /// newest row, lag 1, sits at slot `state_len - 1`), so the upload is a
+    /// straight copy.
+    pub fn seed_ple_ring(&mut self, layer: usize, rows: &[f32]) -> Result<()> {
+        self.write_f32(self.slots.ple_ring, rows)?;
+        self.ple_ring_layer = Some(layer);
+        self.ple_ring_pos = 0;
+        Ok(())
+    }
+
+    /// Sync-out half of the resident-ring lifecycle: flush, read the ring
+    /// back in host oldest-first order (oldest = the next write slot), and
+    /// drop residency. `None` when nothing is resident. Host-canonical
+    /// consumers (the fallback loop, batched prefill) call this before
+    /// trusting `PleConvState` again.
+    pub fn read_ple_ring(&mut self, cfg: &Qwen4ExpConfig) -> Result<Option<(usize, Vec<f32>)>> {
+        let Some(layer) = self.ple_ring_layer.take() else {
+            return Ok(None);
+        };
+        let pc = ple_config(cfg);
+        let hh = pc.hc_hidden();
+        let state_len = pc.short_conv_state_len();
+        self.flush()?;
+        let dev_ring = self.read_f32(self.slots.ple_ring, state_len * hh)?;
+        let mut rows = vec![0.0f32; dev_ring.len()];
+        let p = self.ple_ring_pos as usize;
+        for t in 0..state_len {
+            let src = (p + t) % state_len;
+            rows[t * hh..(t + 1) * hh].copy_from_slice(&dev_ring[src * hh..(src + 1) * hh]);
+        }
+        Ok(Some((layer, rows)))
+    }
+
+    /// Drop ring residency WITHOUT syncing — for sequence resets, where the
+    /// host state was just zeroed and the device rows are garbage history.
+    pub fn invalidate_ple_ring(&mut self) {
+        self.ple_ring_layer = None;
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the two public modes share this body"
+    )]
+    fn ple_record_inner(
+        &mut self,
+        weights: &Qwen4Weights<'_, '_>,
+        cfg: &Qwen4ExpConfig,
+        layer: usize,
+        embeddings: &[f32],
+        ring_upload: Option<&[f32]>,
+        ring_pos: u32,
+        add_into_h: bool,
+    ) -> Result<()> {
         let _s = prof::stage("dev.ple");
         let pc = ple_config(cfg);
         let hh = pc.hc_hidden();
         ensure!(embeddings.len() == pc.ple_embed_dim, "ple embeddings width");
-        ensure!(
-            ring_rows.len() == pc.short_conv_state_len() * hh,
-            "ple ring rows"
-        );
         let name = |suffix: &str| layer_tensor_name(layer, suffix);
         let kp = *weights.tensor(&name("ple.key_proj.weight"))?;
         let vp = *weights.tensor(&name("ple.value_proj.weight"))?;
         let s = self.slots;
         self.write_f32(s.ple_emb, embeddings)?;
-        self.write_f32(s.ple_ring, ring_rows)?;
+        if let Some(ring_rows) = ring_upload {
+            ensure!(
+                ring_rows.len() == pc.short_conv_state_len() * hh,
+                "ple ring rows"
+            );
+            self.write_f32(s.ple_ring, ring_rows)?;
+        }
         // key/value projections from whichever format the tier holds — the
         // F32-only assert this replaced was the audit-noted blocker that kept
         // the whole PLE on the host once the dense tier went F16.
@@ -2440,7 +2556,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             1,
             pc.conv_kernel_size as u32,
             pc.conv_dilation as u32,
-            0,
+            ring_pos,
         )
         .to_le_bytes();
         let d = qwen4_ple_conv_dispatch(hh as u32);
@@ -3582,6 +3698,10 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             if let Some(rl) = self.resident_linear.as_mut() {
                 rl.reset()?;
             }
+            if let Some(d) = self.dev.as_mut() {
+                // Fresh sequence: the resident PLE ring is garbage history.
+                d.invalidate_ple_ring();
+            }
         }
         ensure!(
             start_pos == self.state.seq_len,
@@ -3656,13 +3776,19 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                     .get(&layer)
                     .ok_or_else(|| anyhow!("host layer {layer} not loaded"))?;
                 if hl.ple.is_some() {
-                    let ring = state
-                        .ple_conv
-                        .get_mut(&layer)
-                        .ok_or_else(|| anyhow!("no PLE conv state for layer {layer}"))?;
-                    d.ple_record(w, cfg, layer, &ple_emb, ring.rows(), true)?;
-                    let (_out, ring_rows) = d.finish_ple(cfg)?;
-                    ring.rows_mut().copy_from_slice(&ring_rows);
+                    if d.ple_ring_layer != Some(layer) {
+                        let ring = state
+                            .ple_conv
+                            .get(&layer)
+                            .ok_or_else(|| anyhow!("no PLE conv state for layer {layer}"))?;
+                        d.seed_ple_ring(layer, ring.rows())?;
+                    }
+                    d.ple_record_resident(w, cfg, layer, &ple_emb, true)?;
+                    // The retired finish_ple flush doubled as the PLE -> hc_pre
+                    // sync (same trap as the MoE ids fence); the ordering is
+                    // explicit now. Host `PleConvState` goes stale here — the
+                    // fallback loop and batched prefill sync out before use.
+                    d.barrier();
                 }
                 d.hc_pre_record(w, hc, Some(layer), HcSite::Attn)?;
                 d.barrier();
@@ -3685,6 +3811,13 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
                 let acc_off = d.slots.acc;
                 d.hc_combine_record(w, hc, Some(layer), HcSite::Mlp, acc_off)?;
                 d.barrier();
+                // Depth-2 pipelining: hand the GPU a 12-layer batch while the
+                // host records the next. The trailing barrier above orders
+                // the next batch's first dispatch against this one on the
+                // in-order queue, so the split is timing, not semantics.
+                if layer % 12 == 11 {
+                    d.flush_async()?;
+                }
             }
             d.hc_pre_record(w, hc, None, HcSite::Mixer)?;
             d.barrier();
@@ -3699,6 +3832,15 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             return Ok(logits);
         }
 
+        // A staged token may have left the PLE ring device-resident; this
+        // lane trusts the host `PleConvState`, so sync it out first.
+        if let Some(d) = dev.as_mut() {
+            if let Some((l, rows)) = d.read_ple_ring(cfg)? {
+                if let Some(ring) = state.ple_conv.get_mut(&l) {
+                    ring.rows_mut().copy_from_slice(&rows);
+                }
+            }
+        }
         for layer in 0..cfg.num_hidden_layers {
             let hl = layers
                 .get(&layer)
@@ -5897,12 +6039,25 @@ impl<'ctx, 'st> VulkanQwen4ExpModel<'ctx, 'st> {
             if let Some(rl) = self.resident_linear.as_mut() {
                 rl.reset()?;
             }
+            if let Some(d) = self.dev.as_mut() {
+                // Fresh sequence: the resident PLE ring is garbage history.
+                d.invalidate_ple_ring();
+            }
         }
         ensure!(
             start_pos == self.state.seq_len,
             "forward_prompt at {start_pos} but the state holds {} tokens",
             self.state.seq_len
         );
+        // A staged decode may hold the PLE ring on device; batched prefill
+        // reads and re-seeds the host rows per chunk, so sync out first.
+        if let Some(d) = self.dev.as_mut() {
+            if let Some((l, rows)) = d.read_ple_ring(&self.cfg)? {
+                if let Some(ring) = self.state.ple_conv.get_mut(&l) {
+                    ring.rows_mut().copy_from_slice(&rows);
+                }
+            }
+        }
         let width = chunk_width.clamp(1, 1024);
         if self.prefill.as_ref().is_none_or(|p| p.max_tokens() < width) {
             let ctx = self.dev.as_ref().expect("checked resident").ctx;

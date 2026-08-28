@@ -1648,10 +1648,16 @@ mod real {
         fence: vk::Fence,
         /// Optional per-dispatch GPU timestamp profiler (ARLE_GPU_TIMESTAMPS).
         prof: Option<GpuProf>,
-        /// True between `submit_and_wait()`'s `queue_submit` and the next
-        /// `begin()`'s fence wait — guards against re-recording a buffer whose
-        /// prior submission has not yet been waited on.
+        /// True between `queue_submit` and the fence wait for the CURRENT
+        /// buffer — guards against re-recording a buffer whose prior
+        /// submission has not yet been waited on.
         pending: bool,
+        /// The rotation partner for depth-2 pipelining: `begin()` after a
+        /// [`Self::submit_async`] swaps the spare in so recording proceeds
+        /// while the submitted buffer executes.
+        spare_command_buffer: vk::CommandBuffer,
+        spare_fence: vk::Fence,
+        spare_pending: bool,
         /// Number of dispatches recorded into the CURRENTLY-OPEN batch (reset by
         /// `begin()`, read by the batch-cadence cap so a token's recorder can
         /// submit before the command buffer trips the APU TDR watchdog).
@@ -1673,31 +1679,36 @@ mod real {
             let alloc = vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let command_buffer = match unsafe { ctx.device.allocate_command_buffers(&alloc) } {
-                Ok(buffers) => match buffers.first().copied() {
-                    Some(buffer) => buffer,
-                    None => {
+                // Two: `submit_async` leaves one in flight while the next
+                // batch records into the other (depth-2 pipelining).
+                .command_buffer_count(2);
+            let (command_buffer, spare_command_buffer) =
+                match unsafe { ctx.device.allocate_command_buffers(&alloc) } {
+                    Ok(buffers) => match (buffers.first().copied(), buffers.get(1).copied()) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => {
+                            unsafe { ctx.device.destroy_command_pool(pool, None) };
+                            return Err(VulkanError::Runtime(
+                                "Vulkan command buffer allocation returned no buffers".to_string(),
+                            ));
+                        }
+                    },
+                    Err(e) => {
                         unsafe { ctx.device.destroy_command_pool(pool, None) };
-                        return Err(VulkanError::Runtime(
-                            "Vulkan command buffer allocation returned no buffers".to_string(),
-                        ));
+                        return Err(vk_error("allocating Vulkan command buffer", e));
                     }
-                },
-                Err(e) => {
-                    unsafe { ctx.device.destroy_command_pool(pool, None) };
-                    return Err(vk_error("allocating Vulkan command buffer", e));
-                }
-            };
+                };
 
             let fence_create = vk::FenceCreateInfo::default();
-            let fence = match unsafe { ctx.device.create_fence(&fence_create, None) } {
-                Ok(fence) => fence,
+            let mut mk_fence = || match unsafe { ctx.device.create_fence(&fence_create, None) } {
+                Ok(fence) => Ok(fence),
                 Err(e) => {
                     unsafe { ctx.device.destroy_command_pool(pool, None) };
-                    return Err(vk_error("creating Vulkan fence", e));
+                    Err(vk_error("creating Vulkan fence", e))
                 }
             };
+            let fence = mk_fence()?;
+            let spare_fence = mk_fence()?;
 
             let prof = if std::env::var("ARLE_GPU_TIMESTAMPS").is_ok() {
                 let (period_ns, valid_bits) = ctx.timestamp_info();
@@ -1739,6 +1750,9 @@ mod real {
                 pool,
                 command_buffer,
                 fence,
+                spare_command_buffer,
+                spare_fence,
+                spare_pending: false,
                 prof,
                 pending: false,
                 dispatches_in_batch: 0,
@@ -1786,6 +1800,15 @@ mod real {
         /// numeric corruption), resets the fence, then resets + begins the
         /// command buffer.
         pub fn begin(&mut self) -> Result<()> {
+            if self.pending {
+                // The current buffer was handed off by `submit_async` and may
+                // still be executing: rotate the spare in and record there.
+                // If the spare's own prior submission is also outstanding,
+                // the wait below is the depth-2 back-pressure.
+                std::mem::swap(&mut self.command_buffer, &mut self.spare_command_buffer);
+                std::mem::swap(&mut self.fence, &mut self.spare_fence);
+                std::mem::swap(&mut self.pending, &mut self.spare_pending);
+            }
             if self.pending {
                 unsafe {
                     self.ctx
@@ -2000,6 +2023,32 @@ mod real {
         /// Mirrors `ggml-vulkan.cpp:2278-2355` (one submit) +
         /// `2037-2067`/`13474-13485` (one fence wait per batch). A YIELD-spin
         /// tail-latency variant can replace the blocking wait later.
+        /// Submit the current buffer WITHOUT waiting: the depth-2 pipelining
+        /// half. The next `begin()` rotates to the spare buffer, so recording
+        /// overlaps this batch's GPU execution; a later [`Self::submit_and_wait`]
+        /// (whose fence wait covers everything earlier on the in-order queue)
+        /// is the drain. With the GPU timestamp profiler active this falls
+        /// back to the synchronous path — the profiler's query pool is reset
+        /// per `begin()` and cannot span two buffers in flight.
+        pub fn submit_async(&mut self) -> Result<()> {
+            if self.prof.is_some() {
+                return self.submit_and_wait();
+            }
+            unsafe { self.ctx.device.end_command_buffer(self.command_buffer) }
+                .map_err(|e| vk_error("ending Vulkan command buffer", e))?;
+            let command_buffers = [self.command_buffer];
+            let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            unsafe {
+                self.ctx
+                    .device
+                    .queue_submit(self.ctx.queue, &submits, self.fence)
+            }
+            .map_err(|e| vk_error("submitting Vulkan command buffer", e))?;
+            self.pending = true;
+            self.submit_count += 1;
+            Ok(())
+        }
+
         pub fn submit_and_wait(&mut self) -> Result<()> {
             unsafe { self.ctx.device.end_command_buffer(self.command_buffer) }
                 .map_err(|e| vk_error("ending Vulkan command buffer", e))?;
@@ -2053,18 +2102,25 @@ mod real {
     impl Drop for CommandRecorder<'_> {
         fn drop(&mut self) {
             unsafe {
-                // The fence guarantees the GPU is done with the buffer before we
-                // free its pool; only wait if a submission is still in flight.
+                // The fences guarantee the GPU is done with the buffers before
+                // we free their pool; only wait on in-flight submissions.
                 if self.pending {
                     let _ = self
                         .ctx
                         .device
                         .wait_for_fences(&[self.fence], true, u64::MAX);
                 }
+                if self.spare_pending {
+                    let _ = self
+                        .ctx
+                        .device
+                        .wait_for_fences(&[self.spare_fence], true, u64::MAX);
+                }
                 if let Some(p) = self.prof.as_ref() {
                     self.ctx.device.destroy_query_pool(p.pool, None);
                 }
                 self.ctx.device.destroy_fence(self.fence, None);
+                self.ctx.device.destroy_fence(self.spare_fence, None);
                 self.ctx.device.destroy_command_pool(self.pool, None);
             }
         }
@@ -2863,6 +2919,10 @@ mod stub {
         }
 
         pub fn submit_and_wait(&mut self) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn submit_async(&mut self) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)
         }
     }
