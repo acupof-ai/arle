@@ -106,8 +106,10 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
+                    // Indexed by expert *id* (like BIAS0 above), so fuse0 can
+                    // bind a resident per-expert scale table and the router's
+                    // ids never need a host round-trip to build a slot list.
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_id]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;
@@ -161,8 +163,10 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
+                    // Indexed by expert *id* (like BIAS0 above), so fuse0 can
+                    // bind a resident per-expert scale table and the router's
+                    // ids never need a host round-trip to build a slot list.
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_id]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;
@@ -206,8 +210,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[expert_i0]);
+                    // Indexed by expert *id* — see the SCALE0 comment in the
+                    // subgroup-add variant.
+                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[expert_id]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;

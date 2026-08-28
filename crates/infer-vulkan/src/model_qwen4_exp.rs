@@ -49,9 +49,9 @@
 //!   cache is f16; error ≤ 2^-11 relative, below bf16's own 2^-8);
 //! - the gated-delta recurrence accumulates in f32 in the kernel's serial
 //!   order (torch also holds this state in f32). The kernel l2-normalizes q/k
-//!   with eps 1e-12 where the reference uses 1e-6; on 128-wide heads with O(1)
-//!   post-conv values the difference is O(1e-8) relative and is part of the
-//!   reported parity error.
+//!   with the reference's eps 1e-6, same as the host oracle (an earlier
+//!   1e-12 deviation was retired once llama.cpp's qwen35/qwen4exp graphs
+//!   confirmed `ggml_l2_norm(eps_norm=1e-6)` on both lanes).
 //!
 //! ## HF-vs-GGUF head-mapping trap (the V-slot permutation)
 //!
@@ -1232,6 +1232,12 @@ fn dense_batch_offsets(rows: &[usize]) -> (Vec<usize>, usize) {
     (offs, cursor)
 }
 
+/// Shape of the resident `weight_scale_2` table in the `scale0` slot.
+/// `DevSlots` is shape-static like its neighbors (`logits: take(512)`), so
+/// these are literals; the seeder bounds-checks the real stacks against them.
+const SCALE0_LAYERS: u64 = 48;
+const SCALE0_EXPERTS: u64 = 512;
+
 impl DevSlots {
     fn layout() -> Self {
         let mut off = 0u64;
@@ -1259,10 +1265,12 @@ impl DevSlots {
             logits: take(512),
             ids: take(16),
             wts: take(16),
-            // Three projections' slot scales side by side (gate|up|down),
-            // ALL written before any expert GEMV is recorded — which is what
-            // lets the whole MoE tail share one submit.
-            scale0: take(48),
+            // The RESIDENT `weight_scale_2` table: 48 layers x 3 projections
+            // x 512 experts of f32, seeded once per layer on first touch.
+            // The expert GEMV indexes it by expert id straight off the
+            // router's device-side ids buffer, so routing never round-trips
+            // through the host — deleting 48 per-layer fences per token.
+            scale0: take(SCALE0_LAYERS * 3 * SCALE0_EXPERTS),
             one: take(1),
             gate: take(6400),
             up: take(6400),
@@ -1355,6 +1363,9 @@ pub struct Qwen4Dev<'ctx> {
     /// `layer id -> full_idx` for the KV cache, fixed at construction.
     full_idx: BTreeMap<usize, usize>,
     open: bool,
+    /// Bitmask of layers whose `weight_scale_2` rows are already seeded into
+    /// the resident scale table (first `moe` touch of the layer seeds them).
+    scale0_seeded: u64,
 }
 
 impl<'ctx> Qwen4Dev<'ctx> {
@@ -1396,6 +1407,7 @@ impl<'ctx> Qwen4Dev<'ctx> {
             kv,
             full_idx,
             open: false,
+            scale0_seeded: 0,
         })
     }
 
@@ -1860,10 +1872,10 @@ impl<'ctx> Qwen4Dev<'ctx> {
     }
 
     /// [`Self::moe`] minus the trailing flush/read: `x` is already staged and
-    /// the result stays in the `acc` slot. The ONE unavoidable fence remains —
-    /// the ids read-back that feeds the slot-ordered `weight_scale_2` gather —
-    /// and it flushes everything recorded so far, which in the staged loop is
-    /// the whole layer up to this point.
+    /// the result stays in the `acc` slot. Fence-free on the hot path: the
+    /// router's ids stay on device and the expert GEMV reads its
+    /// `weight_scale_2` from the resident id-indexed table, so nothing here
+    /// submits — `collect_taps` alone pays for read-backs.
     pub fn moe_record(
         &mut self,
         weights: &Qwen4Weights<'_, '_>,
@@ -1910,36 +1922,31 @@ impl<'ctx> Qwen4Dev<'ctx> {
             ],
             [d.x, d.y, d.z],
         )?;
-        self.flush()?;
-        let logits = self.read_f32(s.logits, cfg.num_experts)?;
-        let ids = self.read_i32(s.ids, top_k)?;
-        let route_weights = self.read_f32(s.wts, top_k)?;
+        // The per-layer ids fence used to live here: flush + read logits/ids/
+        // wts back so the host could gather a slot-ordered `weight_scale_2`
+        // list. The scale table is device-resident now and the expert GEMV
+        // indexes it by expert id — the very ids buffer the router just
+        // wrote — so the hot path records straight through: 48 fences per
+        // token became zero. The reads survive only as harness taps.
+        let (logits, ids, route_weights) = if collect_taps {
+            self.flush()?;
+            (
+                self.read_f32(s.logits, cfg.num_experts)?,
+                self.read_i32(s.ids, top_k)?,
+                self.read_f32(s.wts, top_k)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        self.ensure_scale0_rows(weights, layer)?;
+        // The deleted flush was ALSO the top-k → expert-GEMV sync: without a
+        // submission boundary the GEMVs race the router's ids/wts writes, so
+        // the ordering must now be said out loud.
+        self.barrier();
 
-        // Fused expert GEMVs. `weight_scale_2` rides SCALE0, indexed by SLOT.
-        // All three projections' slot scales are computed from `ids` and
-        // written BEFORE anything is recorded, so no host write races a
-        // recorded read and no flush is needed until the read at the end —
-        // this was 5 submits per layer (one per projection plus the swiglu
-        // firebreak) and is now part of ONE.
         prof::phase("dev.moe.gate_up");
-        let mut scale0_all = vec![0.0f32; 3 * top_k];
-        for (i, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
-            .into_iter()
-            .enumerate()
-        {
-            let mut part = Vec::new();
-            weights
-                .expert_stack(layer, proj)?
-                .scale0_for_route(&ids, &mut part)?;
-            scale0_all[i * top_k..(i + 1) * top_k].copy_from_slice(&part);
-        }
-        self.write_f32(s.scale0, &scale0_all)?;
-        let sc = |i: usize| (i * top_k * 4) as u64;
-        for (i, (proj, dst_off)) in [(ExpertProj::Gate, s.gate), (ExpertProj::Up, s.up)]
-            .into_iter()
-            .enumerate()
-        {
-            self.gemv_id_nvfp4(weights, layer, proj, &ids, h, inter, s.x, 1, dst_off, sc(i))?;
+        for (proj, dst_off) in [(ExpertProj::Gate, s.gate), (ExpertProj::Up, s.up)] {
+            self.gemv_id_nvfp4(weights, layer, proj, top_k, h, inter, s.x, 1, dst_off)?;
         }
         self.barrier();
         prof::phase("dev.moe.swiglu");
@@ -1965,13 +1972,12 @@ impl<'ctx> Qwen4Dev<'ctx> {
             weights,
             layer,
             ExpertProj::Down,
-            &ids,
+            top_k,
             inter,
             h,
             s.gate,
             top_k,
             s.down,
-            sc(2),
         )?;
         self.barrier();
         // acc = Σ_e w_e · down[e].
@@ -2011,28 +2017,80 @@ impl<'ctx> Qwen4Dev<'ctx> {
         })
     }
 
-    /// One fused NVFP4 expert GEMV over the selected `ids`, with the stack's
-    /// slot-ordered `weight_scale_2` on SCALE0 and `ne11` activation rows at
-    /// `b_off` (1 = shared across slots, `top_k` = one row per slot).
+    /// Byte offset of `(layer, proj)`'s row block inside the resident
+    /// `weight_scale_2` table (the `scale0` slot).
+    fn scale0_rows_off(layer: usize, proj: ExpertProj) -> u64 {
+        let pi = match proj {
+            ExpertProj::Gate => 0u64,
+            ExpertProj::Up => 1,
+            ExpertProj::Down => 2,
+        };
+        (layer as u64 * 3 + pi) * SCALE0_EXPERTS * 4
+    }
+
+    /// The SCALE0 binding for one expert stack: its id-indexed
+    /// `weight_scale_2` rows in the resident table.
+    fn scale0_rows_bind(&self, layer: usize, proj: ExpertProj) -> Bind<'static> {
+        Bind::A(
+            self.slots.scale0 + Self::scale0_rows_off(layer, proj),
+            SCALE0_EXPERTS * 4,
+        )
+    }
+
+    /// Seed `layer`'s three `weight_scale_2` row blocks into the resident
+    /// table on first touch. First-touch is what makes the host write
+    /// race-free without a fence: no recorded-but-unsubmitted dispatch can be
+    /// reading rows that have never been bound.
+    fn ensure_scale0_rows(&mut self, weights: &Qwen4Weights<'_, '_>, layer: usize) -> Result<()> {
+        ensure!(
+            (layer as u64) < SCALE0_LAYERS,
+            "layer {layer} outside the {SCALE0_LAYERS}-layer scale0 table"
+        );
+        if self.scale0_seeded & (1 << layer) != 0 {
+            return Ok(());
+        }
+        let mut rows = vec![0.0f32; (3 * SCALE0_EXPERTS) as usize];
+        for (i, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
+            .into_iter()
+            .enumerate()
+        {
+            let ws2 = &weights.expert_stack(layer, proj)?.weight_scale_2;
+            ensure!(
+                ws2.len() <= SCALE0_EXPERTS as usize,
+                "{} experts overflow the {SCALE0_EXPERTS}-row scale0 table",
+                ws2.len()
+            );
+            rows[i * SCALE0_EXPERTS as usize..][..ws2.len()].copy_from_slice(ws2);
+        }
+        self.write_f32(
+            self.slots.scale0 + Self::scale0_rows_off(layer, ExpertProj::Gate),
+            &rows,
+        )?;
+        self.scale0_seeded |= 1 << layer;
+        Ok(())
+    }
+
+    /// One fused NVFP4 expert GEMV over the router's device-resident ids,
+    /// with the stack's id-indexed `weight_scale_2` table on SCALE0 and
+    /// `ne11` activation rows at `b_off` (1 = shared across slots, `top_k` =
+    /// one row per slot).
     #[expect(clippy::too_many_arguments, reason = "a dispatch is this wide")]
     fn gemv_id_nvfp4(
         &mut self,
         weights: &Qwen4Weights<'_, '_>,
         layer: usize,
         proj: ExpertProj,
-        ids: &[i32],
+        top_k: usize,
         ncols: usize,
         nrows: usize,
         b_off: u64,
         ne11: usize,
         dst_off: u64,
-        scale0_off: u64,
     ) -> Result<()> {
-        let top_k = ids.len();
         let s = self.slots;
         let b = Bind::A(b_off, (ncols * ne11 * 4) as u64);
         let dst = Bind::A(dst_off, (top_k * nrows * 4) as u64);
-        let scale0 = Bind::A(s.scale0 + scale0_off, (top_k * 4) as u64);
+        let scale0 = self.scale0_rows_bind(layer, proj);
         let ids_b = Bind::A(s.ids, (top_k * 4) as u64);
         self.gemv_id_nvfp4_binds(
             weights, layer, proj, top_k, ncols, nrows, b, ne11, dst, scale0, ids_b,
@@ -2092,8 +2150,9 @@ impl<'ctx> Qwen4Dev<'ctx> {
     /// each `cols` gathered activation rows, through a `NUM_COLS = cols`
     /// `GemvIdNvfp4` pipeline — the y axis walks BLOCKS (expert-major) where
     /// the decode dispatch walks one token's slots. `weight_scale_2` rides
-    /// the same `MAT_VEC_FUSION_SCALE0` seam as decode, indexed by block:
-    /// `scale0` is a per-block f32 list, not a per-slot one.
+    /// the same `MAT_VEC_FUSION_SCALE0` seam as decode: `scale0` is the
+    /// resident id-indexed `weight_scale_2` table, read through each block's
+    /// expert id.
     #[expect(clippy::too_many_arguments, reason = "a dispatch is this wide")]
     fn gemv_id_nvfp4_grouped(
         &mut self,
@@ -2227,11 +2286,13 @@ impl<'ctx> Qwen4Dev<'ctx> {
 
 /// What the device MoE hands back for parity.
 pub struct DevMoeTaps {
-    /// Router logits `[num_experts]`.
+    /// Router logits `[num_experts]`. Empty unless `collect_taps` — the hot
+    /// path leaves routing entirely on device.
     pub logits: Vec<f32>,
-    /// Selected expert ids (slot order).
+    /// Selected expert ids (slot order). Empty unless `collect_taps`.
     pub ids: Vec<i32>,
-    /// Selected routing weights (renormalised on device).
+    /// Selected routing weights (renormalised on device). Empty unless
+    /// `collect_taps`.
     pub weights: Vec<f32>,
     /// Routed-expert accumulator (before the shared expert).
     pub routed: Vec<f32>,
@@ -4174,9 +4235,6 @@ struct PfSlots {
     /// Grouped-MoE class-major expert-id lists ([`MoeGroupPlan::ids`]),
     /// [`pf_moe_list_capacity`] i32s.
     eids: u64,
-    /// Per-block `weight_scale_2`, `[3][list capacity]` f32 (gate|up|down),
-    /// laid out exactly like `eids` so one `list_at` addresses both.
-    esc: u64,
     /// Shared-expert gate `[T][sh_inter]`.
     sg: u64,
     /// Shared-expert up `[T][sh_inter]`.
@@ -4357,7 +4415,6 @@ impl<'ctx> Qwen4Prefill<'ctx> {
             gmap: take(f32s(top_k)),
             smap: take(f32s(top_k)),
             eids: take((pf_moe_list_capacity(max_tokens * top_k) * 4) as u64),
-            esc: take((3 * pf_moe_list_capacity(max_tokens * top_k) * 4) as u64),
             sg: take(f32s(sh_inter)),
             su: take(f32s(sh_inter)),
             sd: take(f32s(h)),
@@ -5454,22 +5511,16 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         // uploads below cannot race the gather that reads them.
         let plan = plan_moe_groups(&raw_ids, t, PF_IDS_PAD, top_k, cfg.num_experts)?;
         let pairs = t * top_k;
-        let sc_cap = pf_moe_list_capacity(self.max_tokens * top_k);
         let le32 = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         self.write_bytes_at(s.gmap, &le32(&plan.gather))?;
         self.write_bytes_at(s.smap, &le32(&plan.scatter))?;
         let id_bytes: Vec<u8> = plan.ids.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.write_bytes_at(s.eids, &id_bytes)?;
-        for (pi, proj) in [ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down]
-            .into_iter()
-            .enumerate()
-        {
-            // `weight_scale_2` is ID-order; the list is block-order. Padding
-            // entries carry id 0 — the scale written there is never read.
-            let ws2 = &weights.expert_stack(layer, proj)?.weight_scale_2;
-            let sc: Vec<f32> = plan.ids.iter().map(|&id| ws2[id as usize]).collect();
-            self.write_f32_at(s.esc + (pi * sc_cap * 4) as u64, &sc)?;
-        }
+        // `weight_scale_2` comes from the resident id-indexed table (seeded
+        // here when decode has not touched this layer yet); the grouped GEMV
+        // reads it through the block's expert id, so no per-block scale list
+        // is built or uploaded.
+        dev.ensure_scale0_rows(weights, layer)?;
 
         prof::phase("pf.moe.experts");
         // Gather: ONE whole-chunk block permutation of the `x` rows into
@@ -5483,10 +5534,8 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         // so the whole lot records with no intervening barriers.
         for c in &plan.classes {
             let rows = c.cols * c.n_blocks;
-            for (pi, (proj, dst)) in [(ExpertProj::Gate, s.ge), (ExpertProj::Up, s.gu)]
-                .into_iter()
-                .enumerate()
-            {
+            for (proj, dst) in [(ExpertProj::Gate, s.ge), (ExpertProj::Up, s.gu)] {
+                let scale0 = dev.scale0_rows_bind(layer, proj);
                 dev.gemv_id_nvfp4_grouped(
                     weights,
                     layer,
@@ -5505,7 +5554,7 @@ impl<'ctx> Qwen4Prefill<'ctx> {
                         dst + (c.pair_at * inter * 4) as u64,
                         (rows * inter * 4) as u64,
                     ),
-                    list_bind(s.esc, pi * sc_cap + c.list_at, c.n_blocks),
+                    scale0,
                     list_bind(s.eids, c.list_at, c.n_blocks),
                 )?;
             }
@@ -5532,6 +5581,7 @@ impl<'ctx> Qwen4Prefill<'ctx> {
         // already block-contiguous — the chain never leaves expert order.
         for c in &plan.classes {
             let rows = c.cols * c.n_blocks;
+            let scale0 = dev.scale0_rows_bind(layer, ExpertProj::Down);
             dev.gemv_id_nvfp4_grouped(
                 weights,
                 layer,
@@ -5550,7 +5600,7 @@ impl<'ctx> Qwen4Prefill<'ctx> {
                     s.edc + (c.pair_at * h * 4) as u64,
                     (rows * h * 4) as u64,
                 ),
-                list_bind(s.esc, 2 * sc_cap + c.list_at, c.n_blocks),
+                scale0,
                 list_bind(s.eids, c.list_at, c.n_blocks),
             )?;
         }

@@ -1836,8 +1836,9 @@ pub struct Qwen4ExpertStack {
     ///
     /// `block_nvfp4` has nowhere to keep the per-tensor second-level scale, so
     /// it rides the fused GEMV's `MAT_VEC_FUSION_SCALE0` output scale, whose
-    /// binding is indexed by expert **slot**. Use [`Self::scale0_for_route`] to
-    /// reorder; do not bind this array.
+    /// binding is indexed by expert **id** (like BIAS0). The forward seeds
+    /// this array verbatim into its resident scale table once per layer and
+    /// binds rows of that table — the router's ids never visit the host.
     pub weight_scale_2: Vec<f32>,
     /// `input_scale`, one f32 per expert id. The static W4A4 ACTIVATION
     /// quantizer scale, unused by this f32-activation lane; carried because all
@@ -1854,15 +1855,14 @@ impl Qwen4ExpertStack {
         self.tensor.ncols * self.tensor.nrows
     }
 
-    /// Gather `weight_scale_2` for one token's routed experts into SLOT order.
+    /// Gather `weight_scale_2` for a routed-expert list into SLOT order.
     ///
-    /// The trap this exists to close: `MAT_VEC_FUSION_SCALE0` makes binding 3 an
-    /// `f32[n_experts]` read at `gl_GlobalInvocationID.y` — the expert SLOT,
-    /// i.e. the position in `expert_ids`, NOT the expert id.
-    /// [`Self::weight_scale_2`] is in ID order, so binding it directly scales
-    /// every expert by some other expert's second-level scale and still produces
-    /// finite logits. `out` is reused rather than returned so a decode step that
-    /// runs this 144 times does not allocate.
+    /// Historical seam: `MAT_VEC_FUSION_SCALE0` used to read binding 3 at the
+    /// expert SLOT, which forced the decode to fence every layer just to see
+    /// the router's ids and build this list. The shader now indexes SCALE0 by
+    /// expert id (matching BIAS0) and the forward binds the resident table,
+    /// so the hot paths no longer call this; it stays as the host-side
+    /// oracle of the slot→id mapping and for its unit test.
     ///
     /// `MAT_VEC_FUSION_SCALE1` is free for the routing weight, which would save
     /// the MoE accumulate a multiply; that is the forward's call, not this one's.

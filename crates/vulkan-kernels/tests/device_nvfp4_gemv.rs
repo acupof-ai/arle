@@ -392,17 +392,15 @@ fn nvfp4_gemv_matches_cpu_oracle_on_real_expert_bytes() {
 
         // --- Claim 3b: the fused expert GEMV (Kernel::GemvIdNvfp4). ---
         // ids are out of order so a slot->id mixup cannot pass, and
-        // `weight_scale_2` rides binding 3 under SCALE0, indexed by SLOT.
+        // `weight_scale_2` rides binding 3 under SCALE0, indexed by EXPERT
+        // ID — the binding is a resident per-expert table, not a slot list.
         let ids: [i32; 2] = [1, 0];
         let stacked: Vec<u8> = packed.concat();
-        let scales_by_slot: Vec<f32> = ids
-            .iter()
-            .map(|&id| experts[id as usize].weight_scale_2)
-            .collect();
+        let scales_by_id: Vec<f32> = experts.iter().map(|e| e.weight_scale_2).collect();
 
         let buf_stacked = upload(&ctx, &stacked);
         let buf_ids = upload(&ctx, &i32_bytes(&ids));
-        let buf_scale = upload(&ctx, &f32_bytes(&scales_by_slot));
+        let buf_scale = upload(&ctx, &f32_bytes(&scales_by_id));
         let buf_fused =
             DeviceBuffer::alloc_host_cached(&ctx, ids.len() * nrows * 4).expect("alloc fused dst");
         launch_cached(
