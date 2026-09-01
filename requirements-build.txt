@@ -21,7 +21,7 @@ z3-solver==4.15.4
 # (2026-08-18). Unpinned, a breaking release of any silently changes the
 # trusted producer's codegen environment. apache-tvm-ffi is the codegen core
 # (tilelang bounds it <0.1.13, so the float is within 0.1.12.x).
-apache-tvm-ffi==0.1.12
+apache-tvm-ffi==0.1.13.post3
 cloudpickle==3.1.2
 ml-dtypes==0.6.0
 psutil==7.2.2
@@ -30,4 +30,4 @@ tqdm==4.70.0
 typing-extensions==4.16.0
 
 # Model downloads in setup.sh use huggingface_hub.snapshot_download.
-huggingface_hub==1.25.1
+huggingface_hub==1.29.0
