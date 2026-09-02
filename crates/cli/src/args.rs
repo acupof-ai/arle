@@ -305,8 +305,8 @@ pub(crate) struct RenderArgs {
 #[derive(Parser)]
 #[command(
     name = "arle",
-    about = "ARLE local agent, training, and dataset CLI",
-    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive agent REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle serve --model-path /path/to/model      Start the OpenAI-compatible server.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train opd --smoke --steps 5            Run the OPD smoke path.",
+    about = "ARLE: local inference server for coding agents (Anthropic + OpenAI APIs), agent REPL, and OPD training",
+    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive agent REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle serve --model-path /path/to/model      Serve over the Anthropic and OpenAI APIs.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train opd --smoke --steps 5            Run the OPD smoke path.",
     group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
 )]
 pub(crate) struct Args {
@@ -421,7 +421,7 @@ pub(crate) enum CliCommand {
     Run(Box<RunArgs>),
     /// One-shot image OCR with DeepSeek-OCR (auto-downloads the model).
     Ocr(Box<OcrArgs>),
-    /// OpenAI-compatible serving through the matching backend binary.
+    /// Serve a model over the Anthropic Messages and OpenAI APIs, in-process on the chosen backend.
     Serve(Box<ServeArgs>),
     /// Training jobs.
     Train(Box<TrainArgs>),

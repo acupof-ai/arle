@@ -50,7 +50,7 @@ For implementation details.
 
 ## 2. Current Classification
 
-This reflects repository state as of 2026-04-21. Per-surface support status
+This reflects repository state as of 2026-09-02. Per-surface support status
 lives in [support-matrix.md](support-matrix.md); this section names which
 surfaces fall under each tier.
 
@@ -60,8 +60,7 @@ surfaces fall under each tier.
   - `POST /v1/completions`
   - `POST /v1/chat/completions`
   - `GET /v1/models`
-  - `GET /healthz`
-  - `GET /readyz`
+  - `GET /health`
 - `GET /metrics`
 - `GET /v1/stats`
 - documented build, test, lint, and format workflows in `README.md` and
@@ -69,18 +68,21 @@ surfaces fall under each tier.
 
 ### Beta
 
-- `POST /v1/responses` (current text/tool-call subset with non-streaming and SSE forms; structured outputs still pending)
+- `POST /v1/messages` and `POST /v1/messages/count_tokens` (Anthropic Messages
+  surface: streaming events, tool use, thinking blocks; Claude Code is the
+  reference client)
 - CLI agent behavior
-- Metal serving path
-- Metal DFlash speculative decode path
+- Metal serving path, including cross-turn prefix restore
+- Metal DFlash / MTP speculative decode path
+- OPD training (`arle train opd`)
 - GGUF loading path
 - benchmark tooling in `scripts/`
 
 ### Experimental
 
-- fast-moving quantization paths (W2, new quant formats)
-- speculative decoding framework on CUDA (CPU stubs only today)
-- tensor-parallel scaffolding (sharding math shipped, NCCL comm not wired)
+- fast-moving quantization paths (new quant formats)
+- Vulkan and HIP backends (bring-up)
+- KV disk tier (`--kv-disk`) and cluster-shared KV
 - undocumented flags or undocumented environment variables
 
 ### Internal
