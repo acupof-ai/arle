@@ -528,8 +528,11 @@ impl infer_seam::PrefixReuse for MetalExecutor {
     ) -> anyhow::Result<()> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {
-            real.page_store
-                .save_prefix_sidecar(&_tokens[.._matched_len.min(_tokens.len())], _prefix_pages);
+            real.page_store.save_prefix_sidecar(
+                &_tokens[.._matched_len.min(_tokens.len())],
+                _prefix_pages,
+                _slot_pages,
+            );
         }
         Ok(())
     }
@@ -2094,6 +2097,7 @@ mod tests {
             0,
             pool.slot_epoch(0),
             8,
+            0,
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
@@ -2130,6 +2134,7 @@ mod tests {
             1,
             pool.slot_epoch(1),
             8,
+            0,
             vec![kv_array(8, 20)],
             vec![gdr_array(2)],
         );
@@ -2177,6 +2182,7 @@ mod tests {
             0,
             pool.slot_epoch(0),
             4,
+            0,
             vec![kv_array(4, 10)],
             vec![gdr_array(1)],
         );
@@ -2198,6 +2204,7 @@ mod tests {
             0,
             pool.slot_epoch(0),
             8,
+            0,
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
@@ -2218,6 +2225,114 @@ mod tests {
         );
     }
 
+    // A restore-derived occupant republishes the pages it was materialized
+    // from. They are the same logical pages, so the earlier boundary snapshots
+    // must survive — pruning them made every turn after the first restore
+    // re-prefill the whole prompt.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn restore_republish_keeps_prior_boundary_snapshots() {
+        use infer_seam::{KvAllocator, KvQuery};
+        let _guard = mlx_sys::mlx_guard();
+        let mut store = MetalPageStore::default();
+        let mut pool = MetalKvPool::new(1, 8, 4);
+
+        pool.alloc(0, 4).unwrap();
+        let first: Vec<u32> = pool.page_indices(0).to_vec();
+        let state = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            4,
+            0,
+            vec![kv_array(4, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+        let first_key = store.logical_key_for_pages(&first).unwrap();
+
+        // Next turn: the slot is recycled, restores the shared page, and
+        // re-prefills one more page.
+        pool.free_slot(0);
+        pool.alloc(0, 8).unwrap();
+        let pages: Vec<u32> = pool.page_indices(0).to_vec();
+        assert_eq!(
+            pages[0], first[0],
+            "test premise: the restored page leads the chain"
+        );
+        let state = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            8,
+            4,
+            vec![kv_array(8, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+
+        assert!(
+            store.prefixes.contains_key(&first_key),
+            "restored page must keep its snapshot"
+        );
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&first)),
+            1
+        );
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&pages)),
+            2
+        );
+    }
+
+    // Radix dedup keeps the ORIGINAL page for a block the slot recomputed, so
+    // the radix hands out a chain the slot never published under. The sidecar
+    // re-keys the slot's boundary snapshots onto that canonical chain.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn sidecar_aliases_snapshots_onto_radix_canonical_chain() {
+        use infer_seam::{KvAllocator, KvQuery};
+        let _guard = mlx_sys::mlx_guard();
+        let mut store = MetalPageStore::default();
+        let mut pool = MetalKvPool::new(2, 16, 4);
+
+        pool.alloc(0, 4).unwrap();
+        let a = pool.page_indices(0)[0];
+        let state = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            4,
+            0,
+            vec![kv_array(4, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+
+        // Slot 1 recomputed block 0 (dedup keeps `a`) and added block 1 (`d`).
+        pool.alloc(1, 8).unwrap();
+        let slot_chain: Vec<u32> = pool.page_indices(1).to_vec();
+        let d = slot_chain[1];
+        let state = MetalSlotState::from_arrays(
+            1,
+            pool.slot_epoch(1),
+            8,
+            0,
+            vec![kv_array(8, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+        let canonical = [a, d];
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&canonical)),
+            1
+        );
+
+        let tokens: Vec<u32> = (0..8u32).collect();
+        store.save_prefix_sidecar(&tokens, &canonical, &slot_chain);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&canonical)),
+            2
+        );
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn release_pages_drops_mirrors_and_prefix_snapshots() {
@@ -2232,6 +2347,7 @@ mod tests {
             0,
             pool.slot_epoch(0),
             8,
+            0,
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
@@ -2277,6 +2393,7 @@ mod tests {
             0,
             pool.slot_epoch(0),
             8,
+            0,
             vec![kv_bf16_array(8, 10)],
             vec![gdr_array(7)],
         );
@@ -2284,7 +2401,7 @@ mod tests {
         // Two 4-token pages; the sidecar binds their content keys and persists
         // the restore snapshot under the key of the last one.
         let tokens: Vec<u32> = (0..8u32).collect();
-        store.save_prefix_sidecar(&tokens, &pages);
+        store.save_prefix_sidecar(&tokens, &pages, &pages);
         let content_keys = infer_seam::prefix_content_keys(&tokens, 4);
         assert!(
             store.has_disk_prefix(content_keys[1]),

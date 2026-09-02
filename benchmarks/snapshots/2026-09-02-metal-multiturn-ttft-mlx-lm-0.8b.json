@@ -1,0 +1,74 @@
+{
+ "summary": {
+  "label": "mlx-lm-0.8B",
+  "url": "http://localhost:8011",
+  "model": "/Users/bytedance/code/agent-infer/models/Qwen3.5-0.8B-MLX-4bit",
+  "turns": 12,
+  "turn1_ttft_ms": 1256.6,
+  "turnN_ttft_ms": 248.3,
+  "turn2plus_median_ttft_ms": 248.8,
+  "final_prompt_tokens": 8649
+ },
+ "rows": [
+  {
+   "turn": 1,
+   "prompt_tokens": 4848,
+   "ttft_ms": 1256.6
+  },
+  {
+   "turn": 2,
+   "prompt_tokens": 5193,
+   "ttft_ms": 235.8
+  },
+  {
+   "turn": 3,
+   "prompt_tokens": 5538,
+   "ttft_ms": 240.6
+  },
+  {
+   "turn": 4,
+   "prompt_tokens": 5883,
+   "ttft_ms": 240.3
+  },
+  {
+   "turn": 5,
+   "prompt_tokens": 6228,
+   "ttft_ms": 241.5
+  },
+  {
+   "turn": 6,
+   "prompt_tokens": 6574,
+   "ttft_ms": 267.8
+  },
+  {
+   "turn": 7,
+   "prompt_tokens": 6919,
+   "ttft_ms": 249.6
+  },
+  {
+   "turn": 8,
+   "prompt_tokens": 7264,
+   "ttft_ms": 252.8
+  },
+  {
+   "turn": 9,
+   "prompt_tokens": 7609,
+   "ttft_ms": 248.8
+  },
+  {
+   "turn": 10,
+   "prompt_tokens": 7955,
+   "ttft_ms": 259.1
+  },
+  {
+   "turn": 11,
+   "prompt_tokens": 8302,
+   "ttft_ms": 264.9
+  },
+  {
+   "turn": 12,
+   "prompt_tokens": 8649,
+   "ttft_ms": 248.3
+  }
+ ]
+}

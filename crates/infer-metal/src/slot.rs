@@ -12,6 +12,9 @@ pub struct MetalSlotState {
     /// admission is validated against this, not `cache_len`, so the prequeued
     /// step does not trip the seam's length invariant.
     pub(super) committed_len: usize,
+    /// Leading tokens materialized from the page store's own pages; on
+    /// republish those pages keep their logical identity (same content).
+    pub(super) restored_len: usize,
     pub(super) kv_flat: Vec<mlx::MlxArray>,
     pub(super) gdr_flat: Vec<mlx::MlxArray>,
     pub(super) session_active: bool,
@@ -82,6 +85,7 @@ impl MetalSlotState {
             slot_epoch,
             cache_len: 0,
             committed_len: 0,
+            restored_len: 0,
             kv_flat,
             gdr_flat,
             session_active: false,
@@ -98,6 +102,7 @@ impl MetalSlotState {
         slot: usize,
         slot_epoch: u64,
         cache_len: usize,
+        restored_len: usize,
         kv_flat: Vec<mlx::MlxArray>,
         gdr_flat: Vec<mlx::MlxArray>,
     ) -> Self {
@@ -106,6 +111,7 @@ impl MetalSlotState {
             slot_epoch,
             cache_len,
             committed_len: cache_len,
+            restored_len,
             kv_flat,
             gdr_flat,
             session_active: false,

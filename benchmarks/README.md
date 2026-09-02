@@ -33,6 +33,20 @@ wins: [2026-06-14-bench-metal-m4pro-local-model-ladder](../docs/experience/wins/
 | z-lab Qwen3.5-4B-DFlash · Qwen3.6-35B-A3B-DFlash | draft-only checkpoints, no standard tokenizer to load |
 | Qwen2.5-0.5B / 1.5B-bf16, Llama-3.2-1B-bf16, Qwen3-0.6B | non-Qwen3.5 family — `R3a Metal executor requires Qwen3.5 layer_types` (the 1.5B hung in init, killed at 120s) |
 
+### Metal — multi-turn TTFT, Qwen3.5-0.8B-MLX-4bit, M4 Pro (48 GB)
+
+12-turn agent-shaped conversation (4.8K-token system prompt, +~350 tokens of tool
+output per turn, 8.6K tokens at turn 12), greedy, TTFT to first streamed delta.
+Script: `scripts/bench_multiturn_ttft.py --turns 12 --warmup`. Snapshots:
+[`arle`](snapshots/2026-09-02-metal-multiturn-ttft-arle-0.8b.json) ·
+[`mlx-lm`](snapshots/2026-09-02-metal-multiturn-ttft-mlx-lm-0.8b.json) ·
+wins: [2026-09-02-metal-prefix-restore-survives-turns](../docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md)
+
+| Server | Turn 1 | Turns 2–12 median | Turn 12 |
+|---|---:|---:|---:|
+| `arle serve --backend metal` | 1.95 s | 180 ms | 202 ms |
+| `mlx_lm.server --prompt-cache-size 4` (0.31.2) | 1.26 s | 249 ms | 248 ms |
+
 ### CUDA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE)
 
 Recorded from the 2026-06-13 → 06-14 decode campaign wins entries (no local CUDA;
