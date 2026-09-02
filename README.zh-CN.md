@@ -3,22 +3,24 @@
 </p>
 
 <p align="center">
- <em>Pure-Rust 运行时,统一服务、本地 agent、On-Policy Distillation 训练与评测。<code>arle serve</code> 是 OpenAI 兼容的服务入口;<code>arle</code> 是统一的用户入口。</em>
+ <b>给 coding agent 用的本地推理服务器。</b><br>
+ 纯 Rust，单个二进制，Apple Silicon 与 NVIDIA。Anthropic 与 OpenAI 两套 API。KV cache 跨轮常驻，第 20 轮和第 2 轮一样快。
 </p>
 
 <p align="center">
- <a href="https://cklxx.github.io/arle/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Farle-D97757?style=flat-square" alt="Website"></a>
- <a href="https://github.com/cklxx/arle/actions/workflows/ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
- <a href="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml/badge.svg" alt="Metal CI"></a>
+ <a href="https://acupof-ai.github.io/arle/"><img src="https://img.shields.io/badge/website-acupof--ai.github.io%2Farle-D97757?style=flat-square" alt="Website"></a>
+ <a href="https://github.com/acupof-ai/arle/actions/workflows/ci.yml"><img src="https://github.com/acupof-ai/arle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+ <a href="https://github.com/acupof-ai/arle/actions/workflows/metal-ci.yml"><img src="https://github.com/acupof-ai/arle/actions/workflows/metal-ci.yml/badge.svg" alt="Metal CI"></a>
  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
- <a href="https://github.com/cklxx/arle/releases"><img src="https://img.shields.io/github/v/release/cklxx/arle?include_prereleases" alt="Release"></a>
+ <a href="https://github.com/acupof-ai/arle/releases"><img src="https://img.shields.io/github/v/release/acupof-ai/arle?include_prereleases" alt="Release"></a>
 </p>
 
 <p align="center">
  <a href="#快速开始">快速开始</a> ·
+ <a href="#为什么多轮不变慢">为什么多轮不变慢</a> ·
+ <a href="#性能">性能</a> ·
  <a href="docs/http-api.md">HTTP API</a> ·
  <a href="docs/support-matrix.md">支持矩阵</a> ·
- <a href="docs/onboarding.md">新人指南</a> ·
  <a href="docs/architecture.md">架构</a> ·
  <a href="CHANGELOG.md">变更日志</a>
 </p>
@@ -31,148 +33,166 @@
 
 ## 快速开始
 
+### 1. 安装
+
 ```bash
-# Apple Silicon — Homebrew
+# Apple Silicon（Homebrew）
 brew install cklxx/tap/arle
 
-# Apple Silicon 或 Linux x86_64 — 一行安装
-curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | sh
+# Apple Silicon 或 Linux x86_64（一行安装）
+curl -fsSL https://github.com/acupof-ai/arle/releases/latest/download/install.sh | sh
 
-# Linux + NVIDIA — Docker,无需编译
-docker run --rm --gpus all -p 8000:8000 -v /path/to/Qwen3.5-4B:/model:ro \
- ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /model
+# Linux + NVIDIA（Docker，无需编译）
+docker run --rm --gpus all -p 8000:8000 -v $PWD/models:/models:ro \
+ ghcr.io/acupof-ai/arle:latest serve --backend cuda --model-path /models/Qwen3.6-27B
+```
 
-# 启动服务
-arle serve --backend cuda --model-path /path/to/Qwen3.5-4B --port 8000
+### 2. 启动服务
+
+```bash
+# MacBook：35B 混合专家模型 4-bit（约 19 GB），首次运行自动从 Hugging Face 拉取
 arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8000
+
+# NVIDIA
+arle serve --backend cuda --model-path /path/to/Qwen3.6-27B --port 8000
+```
+
+### 3. 把 agent 指过来
+
+```bash
+# Claude Code（Anthropic Messages API，流式，工具调用）
+ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY=local claude
+
+# 任何说 OpenAI API 的工具（opencode、aider、openai SDK……）
+export OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=local
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="local")
 print(client.chat.completions.create(
- model="qwen3.5-4b",
- messages=[{"role": "user", "content": "你好,ARLE"}],
+ model="default",
+ messages=[{"role": "user", "content": "你好，ARLE"}],
 ).choices[0].message.content)
 ```
 
-源码构建、完整安装矩阵与卸载:[docs/install.md](docs/install.md) · 更多即用样例:[`examples/`](examples/)。
+> **源码构建必须选后端。** 单独 `cargo build --release` 只得到一个纯 CLI 二进制。
+> 加 `--features cuda`（NVIDIA）或 `--no-default-features --features metal,no-cuda,cli`（Apple Silicon）。
+> 见 [docs/install.md](docs/install.md)。
 
-`arle` 是唯一的二进制:
+### 一个二进制，四种用法
 
 | 命令 | 含义 |
 |---|---|
-| `arle`(无参) | 交互式 agent REPL,内置 `python` 与 `shell` 工具。 |
-| `arle run --prompt "…"` | 一次性 prompt。`--no-tools` 关闭工具。 |
-| `arle serve --backend …` | OpenAI 兼容 HTTP 服务。 |
-| `arle train opd` | **On-Policy Distillation** —— teacher 跑在服务运行时,student 跑 `train`。使用手册。 |
-| `arle --doctor [--json]` | 后端 / 硬件 / 模型解析自检。 |
+| `arle serve --backend …` | HTTP 服务：Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions`，均支持流式。 |
+| `arle` | 交互式 REPL，内置带工具的 agent。 |
+| `arle run --prompt "…"` | 一次性 agent 执行。`--no-tools` 关闭工具。 |
+| `arle train opd` | On-Policy Distillation：student 在自己的 rollout 上训练，teacher 就跑在这台服务器上。 |
+| `arle --doctor` | 后端 / 硬件 / 模型自检。 |
+
+完整安装矩阵、卸载与源码构建：[docs/install.md](docs/install.md) · 示例：[`examples/`](examples/)。
+
+---
+
+## 为什么多轮不变慢
+
+coding agent 每一轮都会把整段对话重发一遍：系统提示、之前所有工具结果、之前所有回复。多数本地服务器会把这些全部重新 prefill。ARLE 把上一轮的 KV 留在加速器上，前缀页经 radix cache 跨请求共享，每轮只 prefill 新增的 token。
+
+同一台机器、同一份权重，12 轮 agent 形状的对话（4.8K token 系统提示，之后每轮追加约 350 token 工具输出，第 12 轮 8.6K token）。每轮首 token 时间：
+
+| Qwen3.5-0.8B 4-bit · M4 Pro 48 GB | 第 1 轮（冷） | 第 2 到 12 轮（中位数） | 第 12 轮 |
+|---|---:|---:|---:|
+| **ARLE** `arle serve --backend metal` | 1.95 s | **180 ms** | 202 ms |
+| mlx-lm `mlx_lm.server --prompt-cache-size 4`（0.31.2） | 1.26 s | 249 ms | 248 ms |
+
+<sub>greedy，两台服务器收到的请求字节完全一致，2026-09-02 · 脚本：<code>scripts/bench_multiturn_ttft.py</code> · 方法与原始行：<a href="docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md">wins 记录</a>。ARLE 在这个模型上的冷 prefill 更慢；每轮那个数字才是一次 20 轮会话的体感。Qwen3.6-35B-A3B 上的同一张表待一台没有 swap 压力的机器复测。</sub>
+
+恢复前缀后的输出与冷 prefill 逐字一致（needle 阶梯 115 到 8000 token ×3，每个长度均确定）。
+
+CUDA 上同一套 cache 在内存压力下把前缀页下沉到主机内存，下次命中再提回。INT8/FP8 分页 KV 通过 `--kv-cache-dtype` 开启（Qwen3.5/3.6 系列，默认关闭）。
 
 ---
 
 ## 性能
 
-数字都是运行时实测，不是估算 —— 新鲜的 `arle serve` bench，一个二进制。
+真实硬件实测。这里只放头条行；每个数字都能在 [benchmarks/](benchmarks/README.md) 的快照或 [docs/experience/wins/](docs/experience/wins/) 的带日期记录里找到来源。
 
-**Apple Silicon —— 一台 M4 Pro 笔记本(48 GB),单用户。** 35B-A3B MoE 的 decode 和 4B dense 一样快、是 9B 的 1.7×,因为每个 token 只激活 ~3B 参数:
+### Apple Silicon（M4 Pro，48 GB，单流）
 
-| 模型 · Metal 4-bit | Decode | TPOT | TTFT |
+35B 混合专家模型的 decode 和 4B dense 一样快：每个 token 只激活约 3B 参数。
+
+| 模型（Metal 4-bit） | Decode | 每 token 时间 | 首 token 时间（512 token 提示） |
 |---|---:|---:|---:|
 | Qwen3.5-0.8B | **318 tok/s** | 3.2 ms | 0.17 s |
 | Qwen3.5-4B | 84 tok/s | 11.9 ms | 0.82 s |
 | Qwen3.5-9B | 50 tok/s | 20.0 ms | 1.45 s |
-| **Qwen3.6-35B-A3B** · MoE | **85 tok/s** | 11.7 ms | 1.23 s |
+| **Qwen3.6-35B-A3B（MoE）** | **85 tok/s** | 11.7 ms | 1.23 s |
 
-<sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = 单流生成速率 · <a href="benchmarks/README.md">快照 + 方法</a></sub>
+Qwen3.6-27B 上的推测解码：模型自带的多 token 预测头出草稿，基座模型校验。输出与 greedy 比特一致，decode 12.3 → 17.75 tok/s（+44%），越过单 token 解码器无法跨过的 15.2 tok/s 内存带宽上限。
 
-**推测解码击穿 HBM 带宽墙。** Qwen3.6-27B(OptiQ 4/8-bit):模型自带的 NextN/MTP 头出草稿、base 校验,**输出与 greedy 比特一致** —— **12.3 → 17.75 tok/s(+44%)**,越过任何 kernel 都够不到的 15.2 tok/s HBM 下限。
+### NVIDIA（单卡 H20，32K token 多轮 agent 提示）
 
-<sub>质量不掉:PPL 7.82(vs uniform-4bit 8.56)· 68.8% 草稿接受率 · 默认开,<code>--no-speculative</code> 可关。</sub>
-
-**NVIDIA —— 单卡 H20,32K 多轮 agent prompt**(不是短 prompt 合成负载):
-
-| Qwen3.6 · 1×H20 · 单请求 decode tok/s | c=1 | c=8 | c=16 |
+| Qwen3.6 · 单请求 decode tok/s | c=1 | c=8 | c=16 |
 |---|---:|---:|---:|
-| 35B-A3B MoE | 61.7 | 22.7 | 13.6 |
-| 27B dense + DSpark 草稿器 | **100.7** | 20.9 | 11.1 |
+| 35B-A3B MoE | 149.3 | 27.7 | 15.1 |
+| 27B dense + 块草稿推测解码（DSpark） | **91.8** | 20.5 | 11.2 |
 
-<sub><code>decode tok/s</code> 是单请求 decode 速度(1000 / ITL mean),prefill 单独按 TTFT 报告 · DSpark 在 c=1 是普通 decode 的 2.9×,到 c=16 抹平 —— GPU 有空闲算力时 verify 才免费 · 见 <a href="docs/baselines.md">baselines</a></sub>
+对比 SGLang 0.5.13，同一块卡、同一个量化 kernel（Qwen3.6-27B，33K 提示，单请求）：decode 每 token 16.69 ms 对 17.16 ms（快 2.8%）；prefill 25.0 s 对 21.0 s（慢 19%，在做）。
 
-**DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);开 DSpark 块草稿器后 B=1 **72.4 tok/s**(+37%,接受率 58.7%);并发批量 decode lane 在 c=8 再 **+48%**。
+CUDA 上另有 DeepSeek-V4-Flash（2×、4×、8×H20；FP8 与 4-bit 专家权重）和 NVFP4 的 Qwen3.8-27B（比 FP8 少 24% 字节，c=1 到 16 decode +5% 到 +21%）。完整行、配置、CUDA graph 与量化细节：[docs/baselines.md](docs/baselines.md)。
 
-**Qwen3.8-27B-NVFP4,单卡 H20 —— 真正更小的 4-bit。** 混合精度:NVFP4 MLP(group 16)+ 其余全是 per-channel FP8,只有 54% 的参数是 4-bit,所以文件 23.4 GB 对 FP8 模型的 30.9 GB,少 24% 而不是一半。
+### On-Policy Distillation
 
-sm_90 没有 FP4 张量核,所以真正的 GEMM 必须先把 nibble 展宽,唯一的问题是展宽成什么。Marlin 展成 BF16 跑 84 TFLOPS;展成 E4M3 交给 DeepGEMM 跑 274,是这块卡 FP8 峰值的 93%。解码仍归 Marlin —— 那里读一半字节才是赢面。DeepGEMM 要的操作数每次调用从 Marlin 的常驻布局派生到 scratch,**没有任何权重存两份**(第一版两种布局都留,常驻比它要打败的 FP8 模型还多 10 GB)。
+teacher 就是这台服务器。student 在自己的 rollout 上训练：
 
-对 Qwen3.6-27B-FP8,32K 智能体提示词,同一二进制两条臂背靠背:decode(ITL)**+21.3% / +20.7% / +13.2% / +5.5%**,端到端 **+5.0% / +15.3% / +9.1% / +1.8%**(c=1/4/8/16)。常驻 **22.4 GB** 对 29.4,KV 池 1,779,114 token 对 1,582,506。预填充这条路不改变准确率:开臂 188/200 对关臂 189/200,196/200 答案完全相同。见 [docs/baselines.md](docs/baselines.md)。
+- Qwen3.5-4B：MATH-500 **+27pp**（0.518 → 0.792）
+- Qwen3.5-27B：Terminal-Bench pass@1 **+5.1pp**（20.5 → 25.6%）
 
-**对比 SGLang。** 同一份权重、同一块卡、同一个量化 kernel —— SGLang 跑的是我们 checkpoint 的重打包版。Qwen3.6-27B,单卡 H20,33K prompt,单请求:decode 每 token **16.69 ms vs 17.16**,快 2.8%;33K prefill **25.0 s vs 21.0**,慢 19% —— 这是当前在做的事。数据见 [docs/baselines.md](docs/baselines.md)。
-
-<p align="center">
- <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode 33.5 → 53.3 tok/s,2026-06-13 → 06-14 campaign" width="720">
-</p>
-<p align="center"><sub>DSv4 B=1 decode,<b>33.5 → 53.3 tok/s</b>,2026-06-13 → 06-14 campaign —— 每一步都对应一条 <code>docs/experience/wins/</code> 记录。</sub></p>
-
-**On-Policy Distillation 在 student 自己的 rollout 上真能提升它** —— teacher 就是生产服务本身。Qwen3.5-4B:MATH-500 **+27pp**(0.518 → 0.792,CI 完全分离)· BFCL-live abstention **0.60 → 1.00**。27B 在 **Terminal-Bench** 上:pass@1 **+5.1pp**(20.5 → 25.6%),蒸馏的梯度是输出格式规范性。
-
-<p align="center">
- <img src="docs/assets/tbench-opd-loss-curve.png" alt="Terminal-Bench OPD 蒸馏 loss:逐步 masked-CE + EMA 趋势,3 epoch 均值 0.2165 → 0.1796 → 0.1453" width="720">
-</p>
-<p align="center"><sub>TB-OPD 蒸馏 loss,27B student · 41 records × 3 epochs · <b>0.2165 → 0.1796 → 0.1453</b>。<a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">MATH</a> · <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">Terminal-Bench</a></sub></p>
-
-**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5/3.6(hybrid·MoE)on CUDA + Metal(Metal 另支持 Qwen3-dense);DeepSeek-V4-Flash + GLM-5.2(CUDA 8×H20 TP=8/EP=8;GLM-5.2 verify pending)· DeepSeek-OCR VLM (Metal)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
+方法与原始数据：[benchmarks/README.md](benchmarks/README.md) · [docs/experience/wins/](docs/experience/wins/)。
 
 ---
 
-## 为什么是 ARLE
+## 架构
 
-agent 与 RL 工作负载每轮都在重复处理同样的 prompt + 历史 + 工具输出。ARLE 把这件事解决一次,serving 与训练共享:
-
-- **跨轮 KV 常驻。** 上一轮 KV 留在 GPU,只 prefill 新 token;前缀页经 host radix cache 跨请求共享,内存压力下下沉到 host-RAM 层(可选盘 spill),下次命中再提回,不重复 prefill。([support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix))
-- **CUDA 量化 KV。** INT8/FP8 paged-KV kernel,`--kv-cache-dtype` serve flag —— 正确性 gate 过、opt-in(默认仍 BF16)。
-- **一套运行时、三个表面。** serving、本地 agent、OPD 训练共用同一套 Rust + 模型代码 —— OPD teacher 就是生产 server。
+一套运行时、三个表面、两个后端。serving、本地 agent、OPD 训练跑同一份 Rust 与模型代码；OPD 的 teacher 就是生产服务。
 
 ```mermaid
 flowchart TB
- classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
- classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
- classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
- classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
-
- Serve["arle serve<br/><sub>OpenAI v1</sub>"]
+ Serve["arle serve<br/><sub>Anthropic + OpenAI API</sub>"]
  Agent["arle<br/><sub>本地 agent</sub>"]
- Train["arle train opd<br/><sub>OPD</sub>"]
-
- Core["infer-core<br/><sub>device-neutral Engine · 调度器 · KV cache</sub>"]
-
+ Train["arle train opd<br/><sub>on-policy distillation</sub>"]
+ Core["infer-core<br/><sub>设备无关 engine · 调度器 · KV cache</sub>"]
  Seam["infer-seam<br/><sub>两个 trait：BackendExecutor · KvPool</sub>"]
-
  CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
  Metal["infer-metal<br/><sub>MLX bridge</sub>"]
-
  Serve --> Core
  Agent --> Core
  Train --> Core
  Core --> Seam
  Seam --> CUDA
  Seam --> Metal
-
- class Serve,Agent,Train entry
- class Core core
- class Seam seam
- class CUDA,Metal exec
 ```
 
-一套运行时、三个表面、两个可插拔后端。新后端只需实现 seam 的两个
-trait，无需改动 scheduler、cache 或 server。
+新后端只需实现 seam 的两个 trait；调度器、cache、server 不用改。
 
-架构详解:[docs/onboarding.md](docs/onboarding.md)(新人 30 分钟)· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
+深入阅读：[docs/onboarding.md](docs/onboarding.md)（30 分钟）· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
+
+---
+
+## 状态
+
+| | CUDA | Metal | OPD 训练 |
+|---|---|---|---|
+| **稳定度** | Stable | Beta | Beta |
+| **模型** | Qwen3.5/3.6/3.8、DeepSeek-V4-Flash、GLM-5.2 | Qwen3-dense、Qwen3.5/3.6、DeepSeek-OCR | CUDA 模型 |
+
+完整等级：[docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md)。
 
 ---
 
 ## 文档
 
-[http-api](docs/http-api.md) · [support-matrix](docs/support-matrix.md) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md) · [environment](docs/environment.md) · [troubleshooting](docs/troubleshooting.md) · [CONTRIBUTING](CONTRIBUTING.md) · [docs/index.md](docs/index.md)
+[HTTP API](docs/http-api.md) · [支持矩阵](docs/support-matrix.md) · [架构](docs/architecture.md) · [代码地图](docs/codebase-map.md) · [环境变量](docs/environment.md) · [排障](docs/troubleshooting.md) · [贡献指南](CONTRIBUTING.md) · [全部文档](docs/index.md)
 
 ---
 
