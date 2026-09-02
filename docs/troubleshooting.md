@@ -79,25 +79,18 @@ You built without selecting a backend feature. Rebuild with one of `cuda` /
 Same root cause as the `bare` doctor message — backend feature was not
 compiled in. Pass the matching `--features` flag at build time.
 
-### `Model 'qwen3.5-4b' is not available on this server; loaded model is 'Qwen3.5-0.8B-MLX-4bit'`
+### Which `model` name do I send?
 
-The server matches the request body's `model` field (case-insensitive, last
-path segment) against the loaded model's id. Either:
+Any string. The server routes every request to the single served model
+reported by `GET /v1/models`, so Claude Code's `claude-*` ids and the OpenAI
+SDK's `model="default"` both work. Omitting `model` is accepted too.
 
-1. Match the loaded model name in your client request, or
-2. Use [`examples/openai_chat.py`](../examples/openai_chat.py), which lists
-   `/v1/models` first and uses whatever the server reports, or
-3. Set `ARLE_MODEL=<id>` to override the default in the example.
+### Server is up but the first request hangs or returns 503
 
-Note: omitting the `model` field entirely is also accepted — the server uses
-the loaded model.
-
-### Server starts but `/healthz` is fine and `/readyz` is 503
-
-The scheduler reports not-ready while it is loading weights or warming up. Wait
-a few seconds and retry; for prebuilt CUDA images the warm-up usually finishes
-within ~10s of the binary launching. Persistent 503s indicate the model failed
-to load — see stderr for the underlying error (typically a missing tokenizer
+`GET /health` answers as soon as the HTTP layer is bound; weight loading and
+warm-up happen before that, so a bound port means the model is loaded. If a
+request still stalls, `GET /v1/stats` shows the scheduler state, and stderr
+carries the underlying error for a failed load (typically a missing tokenizer
 or an incompatible weight format).
 
 ### `bind: address already in use` on `:8000`

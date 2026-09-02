@@ -41,7 +41,7 @@ export const DOCS_NAV: DocsGroup[] = [
       { label: "arle run", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
       { label: "arle serve", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
       { label: "arle train", href: "https://github.com/acupof-ai/arle/tree/main/crates/train", badge: "beta" },
-      { label: "arle data", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
+      { label: "arle model", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
     ],
   },
   {

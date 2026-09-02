@@ -128,6 +128,20 @@ Rules:
 - KV budget is the usual failure: 32k × concurrency must fit, or the run
   measures preemption. Record the slot line and the queue/preempt counters.
 
+### 3.4 Per-turn TTFT — the agent-loop measurement
+
+`scripts/bench_multiturn_ttft.py` measures what a coding-agent session feels:
+one conversation, `--turns` (default 12) turns, a `--system-words` system
+prompt (default ~4.8K tokens) and `--tool-words` of synthetic tool output per
+turn (default ~350 tokens), every turn re-sending the whole history over
+`/v1/chat/completions`. Content and the assistant replies are fixed, so two
+servers receive byte-identical requests. Report turn 1 (cold), the median of
+turns 2..N, and turn N; always `--warmup` so turn 1 is prefill, not model
+load. A cross-server row needs the same weights on the same machine in the
+same hour (§3.1), and the prefix-restore path must be proven engaged
+(`prefix-attach` count in the serve log). Snapshots go to
+`benchmarks/snapshots/`, the row to `benchmarks/README.md`.
+
 ### 3.0 Rolling baseline — the default iteration path
 
 [`docs/baselines.md`](baselines.md) holds the champion row per config

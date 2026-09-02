@@ -85,9 +85,9 @@ rm -f ~/.local/bin/arle
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
-  -v /path/to/Qwen3.5-4B:/model:ro \
+  -v $PWD/models:/models:ro \
   ghcr.io/acupof-ai/arle:latest \
-  serve --backend cuda --model-path /model --port 8000
+  serve --backend cuda --model-path /models/Qwen3.6-27B --port 8000
 ```
 
 The `:latest` tag tracks the newest non-prerelease release image. Tagged

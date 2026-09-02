@@ -37,6 +37,10 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 
 ## Positioning (fact)
 
+- Front door (README / landing, 2026-09-02): the local inference server for
+  coding agents — Anthropic `/v1/messages` + OpenAI `/v1/chat/completions`,
+  KV cache that survives across turns, one binary on Apple Silicon and NVIDIA.
+  H20 / DSv4 / NVFP4 detail lives in `docs/baselines.md`, not the first screen.
 - Runtime-first: `infer-plan` → `infer-seam` → `infer-core` →
   `infer-cuda`/`infer-metal` → `infer-server`/`infer-api`. Monolith `infer/` deleted.
 - `arle` = CLI front door; `infer-api` (`LoadedInferenceEngine`) = programmatic front door.
