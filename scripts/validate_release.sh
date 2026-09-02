@@ -36,10 +36,10 @@ if [[ -d "$SOURCE" ]]; then
     cp "$SOURCE/$file" "$SOURCE/$file.sha256" "$tmp/"
     [[ -f "$SOURCE/$file.qualification.json" ]] && cp "$SOURCE/$file.qualification.json" "$tmp/"
 else
-    gh release download "$SOURCE" -R "${GITHUB_REPOSITORY:-cklxx/arle}" \
+    gh release download "$SOURCE" -R "${GITHUB_REPOSITORY:-acupof-ai/arle}" \
         -p "$file" -p "$file.sha256" -D "$tmp"
     # Optional formal sidecar — present only after multi-SM qualify-publish.
-    gh release download "$SOURCE" -R "${GITHUB_REPOSITORY:-cklxx/arle}" \
+    gh release download "$SOURCE" -R "${GITHUB_REPOSITORY:-acupof-ai/arle}" \
         -p "$file.qualification.json" -D "$tmp" 2>/dev/null || true
 fi
 [[ -f "$tmp/$file" && -f "$tmp/$file.sha256" ]] || {

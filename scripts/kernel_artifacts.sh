@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GEN="$ROOT/crates/cuda-kernels/generated"
 REL="${ARLE_KERNEL_RELEASE_TAG:-kernel-artifacts}"
-REPO="${GITHUB_REPOSITORY:-cklxx/arle}"
+REPO="${GITHUB_REPOSITORY:-acupof-ai/arle}"
 LANE="${ARLE_KERNEL_BUNDLE_LANE:-t1}"
 ARCHS="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;8.9;9.0}"
 CUDA_HOME="${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}"
