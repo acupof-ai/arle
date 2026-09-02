@@ -29,6 +29,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | CUDA operator organization | [plans/2026-08-20-cuda-operator-organization.md](plans/2026-08-20-cuda-operator-organization.md) |
 | Bench + trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) |
 | Rolling baselines | [baselines.md](baselines.md) |
+| Design theses (depth track) | [plans/2026-09-02-design-theses.md](plans/2026-09-02-design-theses.md) |
 | Env / flags | [environment.md](environment.md) |
 | Capability evals | [eval.md](eval.md) |
 | OPD capability curve | [opd-capability-curve.md](opd-capability-curve.md) |
