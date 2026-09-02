@@ -114,7 +114,7 @@ jobs:
       # Enforced 2026-08-23: tree clean (zero advisories; paste 1.0.15 is an
       # unmaintained warning, which does not fail the lane).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
           tool: cargo-audit
 
