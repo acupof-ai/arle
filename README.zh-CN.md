@@ -192,7 +192,7 @@ flowchart TB
 
 ## 文档
 
-[HTTP API](docs/http-api.md) · [支持矩阵](docs/support-matrix.md) · [架构](docs/architecture.md) · [代码地图](docs/codebase-map.md) · [环境变量](docs/environment.md) · [排障](docs/troubleshooting.md) · [贡献指南](CONTRIBUTING.md) · [全部文档](docs/index.md)
+[设计笔记](docs/design/hybrid-prefix-cache.md) · [HTTP API](docs/http-api.md) · [支持矩阵](docs/support-matrix.md) · [架构](docs/architecture.md) · [代码地图](docs/codebase-map.md) · [环境变量](docs/environment.md) · [排障](docs/troubleshooting.md) · [贡献指南](CONTRIBUTING.md) · [全部文档](docs/index.md)
 
 ---
 

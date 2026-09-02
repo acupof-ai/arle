@@ -192,7 +192,7 @@ Full tiers: [docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-
 
 ## Documentation
 
-[HTTP API](docs/http-api.md) · [Support Matrix](docs/support-matrix.md) · [Architecture](docs/architecture.md) · [Codebase Map](docs/codebase-map.md) · [Environment](docs/environment.md) · [Troubleshooting](docs/troubleshooting.md) · [Contributing](CONTRIBUTING.md) · [All docs](docs/index.md)
+[Design notes](docs/design/hybrid-prefix-cache.md) · [HTTP API](docs/http-api.md) · [Support Matrix](docs/support-matrix.md) · [Architecture](docs/architecture.md) · [Codebase Map](docs/codebase-map.md) · [Environment](docs/environment.md) · [Troubleshooting](docs/troubleshooting.md) · [Contributing](CONTRIBUTING.md) · [All docs](docs/index.md)
 
 ---
 
