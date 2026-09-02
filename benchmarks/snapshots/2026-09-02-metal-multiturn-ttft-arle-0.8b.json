@@ -1,0 +1,74 @@
+{
+ "summary": {
+  "label": "arle-0.8B",
+  "url": "http://localhost:8010",
+  "model": "Qwen3.5-0.8B-MLX-4bit",
+  "turns": 12,
+  "turn1_ttft_ms": 1949.7,
+  "turnN_ttft_ms": 201.9,
+  "turn2plus_median_ttft_ms": 180.0,
+  "final_prompt_tokens": 8651
+ },
+ "rows": [
+  {
+   "turn": 1,
+   "prompt_tokens": 4850,
+   "ttft_ms": 1949.7
+  },
+  {
+   "turn": 2,
+   "prompt_tokens": 5195,
+   "ttft_ms": 170.1
+  },
+  {
+   "turn": 3,
+   "prompt_tokens": 5540,
+   "ttft_ms": 164.7
+  },
+  {
+   "turn": 4,
+   "prompt_tokens": 5885,
+   "ttft_ms": 172.7
+  },
+  {
+   "turn": 5,
+   "prompt_tokens": 6230,
+   "ttft_ms": 176.0
+  },
+  {
+   "turn": 6,
+   "prompt_tokens": 6576,
+   "ttft_ms": 162.0
+  },
+  {
+   "turn": 7,
+   "prompt_tokens": 6921,
+   "ttft_ms": 190.5
+  },
+  {
+   "turn": 8,
+   "prompt_tokens": 7266,
+   "ttft_ms": 186.4
+  },
+  {
+   "turn": 9,
+   "prompt_tokens": 7611,
+   "ttft_ms": 193.2
+  },
+  {
+   "turn": 10,
+   "prompt_tokens": 7957,
+   "ttft_ms": 182.8
+  },
+  {
+   "turn": 11,
+   "prompt_tokens": 8304,
+   "ttft_ms": 180.0
+  },
+  {
+   "turn": 12,
+   "prompt_tokens": 8651,
+   "ttft_ms": 201.9
+  }
+ ]
+}

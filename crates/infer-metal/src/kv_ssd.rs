@@ -270,7 +270,13 @@ impl MetalPageStore {
     /// Bind published pages to their engine content keys and write them (plus
     /// the prefix restore snapshot ending at the last page) through to the
     /// durable tier.
-    pub(super) fn save_prefix_sidecar(&mut self, tokens: &[u32], prefix_pages: &[u32]) {
+    pub(super) fn save_prefix_sidecar(
+        &mut self,
+        tokens: &[u32],
+        prefix_pages: &[u32],
+        slot_pages: &[u32],
+    ) {
+        self.alias_snapshots_to_canonical_chain(prefix_pages, slot_pages);
         if self.page_size == 0 {
             return;
         }
@@ -321,6 +327,33 @@ impl MetalPageStore {
         // just-written pages recoverable now rather than at shutdown.
         if let Some(tier) = self.tier.as_mut() {
             tier.sync_manifest();
+        }
+    }
+
+    /// Radix dedup keeps a block's ORIGINAL page, so a boundary snapshot keyed
+    /// to the slot's recomputed chain is unreachable from the chain the radix
+    /// hands out on the next match. Re-key it onto the canonical pages (same
+    /// content, per the seam contract).
+    // ponytail: O(pages^2) key rebuild per publish; index snapshots by length if it shows up.
+    fn alias_snapshots_to_canonical_chain(&mut self, prefix_pages: &[u32], slot_pages: &[u32]) {
+        let n = prefix_pages.len().min(slot_pages.len());
+        if prefix_pages[..n] == slot_pages[..n] {
+            return;
+        }
+        let aliases: Vec<(Vec<u64>, MetalPrefixSnapshot)> = (1..=n)
+            .filter(|&k| prefix_pages[..k] != slot_pages[..k])
+            .filter_map(|k| {
+                let slot_key = self.logical_key_for_pages(&slot_pages[..k])?;
+                let canonical_key = self.logical_key_for_pages(&prefix_pages[..k])?;
+                if self.prefixes.contains_key(&canonical_key) {
+                    return None;
+                }
+                let snapshot = self.prefixes.get(&slot_key)?.clone();
+                Some((canonical_key, snapshot))
+            })
+            .collect();
+        for (key, snapshot) in aliases {
+            self.prefixes.insert(key, snapshot);
         }
     }
 
@@ -395,21 +428,21 @@ impl MetalPageStore {
                 slot_epoch: slot.slot_epoch,
                 page_idx,
             };
-            let logical_id = if self
-                .pages
-                .get(page_id)
-                .and_then(|block| block.owner)
-                .is_some_and(|old| {
-                    old.slot == owner.slot
-                        && old.slot_epoch == owner.slot_epoch
-                        && old.page_idx == owner.page_idx
-                }) {
-                self.pages
-                    .get(page_id)
-                    .expect("page checked above")
-                    .logical_id
-            } else {
-                self.next_logical_id()
+            // A restored page is the very block this slot was materialized
+            // from, so it is the same logical page under a new occupant.
+            let restored = page_idx < slot.restored_len / page_size;
+            let logical_id = match self.pages.get(page_id) {
+                Some(block)
+                    if restored
+                        || block.owner.is_some_and(|old| {
+                            old.slot == owner.slot
+                                && old.slot_epoch == owner.slot_epoch
+                                && old.page_idx == owner.page_idx
+                        }) =>
+                {
+                    block.logical_id
+                }
+                _ => self.next_logical_id(),
             };
             // Host page ids may be reused after the seam frees a slot. Overwrite
             // with the current slot's contents; retained/shared pages cannot be
@@ -435,6 +468,7 @@ impl MetalPageStore {
         // recycled to a new occupant. Any surviving prefix containing the old
         // logical id would pair NEW K/V with a STALE restore snapshot. Keep
         // only exact prefixes of the live occupant's logical page list.
+        let prefixes_before = self.prefixes.len();
         if !overwritten_logical_ids.is_empty()
             && let Some(live_key) = self.logical_key_for_pages(&page_ids[..publish_pages])
         {
@@ -445,6 +479,17 @@ impl MetalPageStore {
                     || (key.len() <= live_key.len() && live_key[..key.len()] == key[..])
             });
         }
+        log::debug!(
+            "publish_slot: slot={} epoch={} cache_len={} publish_pages={} overwritten={} prefixes {}->{} aligned={}",
+            slot.slot,
+            slot.slot_epoch,
+            slot.cache_len,
+            publish_pages,
+            overwritten_logical_ids.len(),
+            prefixes_before,
+            self.prefixes.len(),
+            slot.cache_len.is_multiple_of(page_size) && publish_pages == full_pages
+        );
 
         // A reusable prefix boundary is valid only when the page-id prefix and
         // every prefix-wide side state describe the same token length. Publish
@@ -584,6 +629,7 @@ impl MetalPageStore {
         Ok(MetalSlotState::from_arrays(
             slot,
             slot_epoch,
+            prefix_tokens,
             prefix_tokens,
             kv_flat,
             snapshot.gdr_flat.clone(),
