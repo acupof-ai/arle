@@ -7,10 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `.cargo/config.toml` pins `rustc-wrapper = "sccache"`, but the release lanes
-  # don't install sccache (unlike ci.yml/metal-ci.yml). Disable the wrapper here
-  # so cargo doesn't fail on the missing binary — release builds are one-shot
-  # cold, sccache buys nothing. Empty value = no wrapper (overrides config.toml).
+  # Release lanes don't install sccache (unlike metal-ci.yml). Keep the wrapper
+  # off even if a wrapper pin comes back — release builds are one-shot cold, so
+  # sccache buys nothing. Empty value = no wrapper.
   RUSTC_WRAPPER: ""
 
 concurrency:

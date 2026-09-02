@@ -29,9 +29,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # .cargo/config.toml pins `rustc-wrapper = "sccache"` for local dev; in CI
-  # the empty override disables it. sccache's GHA backend flooded the 10 GB
-  # Actions cache quota with per-object entries (10.7 GB / 2581 entries,
+  # Belt-and-braces: keep the wrapper off even if a wrapper pin comes back.
+  # sccache's GHA backend flooded the 10 GB Actions cache quota with per-object
+  # entries (10.7 GB / 2581 entries,
   # 2026-07-02), evicting the rust-cache snapshots below — every run built
   # cold (~50 min, was 5m39s warm) until the runner died OOM ("lost
   # communication"). One cache system per lane: Swatinem only on ubuntu.
