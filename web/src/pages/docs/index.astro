@@ -25,11 +25,11 @@ const tabPanes = [
     lang: "cuda",
     lines: [
       '<span class="p">$</span> arle serve --backend cuda \\',
-      '    --model-path /path/to/Qwen3-4B \\',
+      '    --model-path /path/to/Qwen3.6-27B-FP8 \\',
       '    --port 8000',
       '',
-      '<span class="p">▸</span> arle 0.1.5 · backend=<b>cuda</b> · device=<b>L4</b>',
-      '<span class="p">▸</span> loaded <b>Qwen3-4B</b> in 1.4s · 8.0 GiB',
+      '<span class="p">▸</span> arle 0.5.8 · backend=<b>cuda</b> · device=<b>H20</b>',
+      '<span class="p">▸</span> loaded <b>Qwen3.6-27B-FP8</b> · 29.4 GiB resident',
       '<span class="p">▸</span> listening on <b>http://0.0.0.0:8000</b>',
     ],
   },
@@ -39,7 +39,7 @@ const tabPanes = [
     lang: "metal",
     lines: [
       '<span class="p">$</span> arle serve --backend metal \\',
-      '    --model-path /path/to/Qwen3.5-0.8B \\',
+      '    --model-path mlx-community/Qwen3.6-35B-A3B-4bit \\',
       '    --port 8000',
     ],
   },
@@ -49,9 +49,9 @@ const tabPanes = [
     lang: "docker",
     lines: [
       '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
-      '    -v /path/to/Qwen3-4B:/model:ro \\',
+      '    -v $PWD/models:/models:ro \\',
       '    ghcr.io/acupof-ai/arle:latest \\',
-      '    serve --backend cuda --model-path /model',
+      '    serve --backend cuda --model-path /models/Qwen3.6-27B-FP8',
     ],
   },
 ];
@@ -60,7 +60,7 @@ const requestLines = [
   '<span class="p">$</span> curl -s http://127.0.0.1:8000/v1/chat/completions \\',
   '  -H <i>\'Content-Type: application/json\'</i> \\',
   '  -d <i>\'{',
-  '    "model": "qwen3-4b",',
+  '    "model": "default",',
   '    "messages": [',
   '      {"role": "user",',
   '       "content": "Define ARLE in 8 words."}',
@@ -71,12 +71,12 @@ const requestLines = [
 const responseLines = [
   '{',
   '  "id": <i>"cmpl-1a2b3c"</i>,',
-  '  "model": <i>"qwen3-4b"</i>,',
+  '  "model": <i>"default"</i>,',
   '  "choices": [{',
   '    "message": {',
   '      "role": <i>"assistant"</i>,',
-  '      "content": <i>"runtime-first Rust workspace',
-  '                   serving local agents."</i>',
+  '      "content": <i>"Local inference server',
+  '                   for coding agents."</i>',
   '    },',
   '    "finish_reason": <i>"stop"</i>',
   '  }],',
@@ -84,11 +84,18 @@ const responseLines = [
   '}',
 ];
 
+const claudeLines = [
+  '<span class="p">$</span> ANTHROPIC_BASE_URL=http://127.0.0.1:8000 ANTHROPIC_API_KEY=local claude',
+  '<span class="c"># Claude Code talks to POST /v1/messages; any model name is routed to the served model</span>',
+  '<span class="p">$</span> export OPENAI_BASE_URL=http://127.0.0.1:8000/v1 OPENAI_API_KEY=local',
+  '<span class="c"># opencode, aider, the openai SDK</span>',
+];
+
 const verifyLines = [
   '<span class="p">$</span> curl -s http://127.0.0.1:8000/v1/stats | jq',
   '{',
   '  "backend": <i>"cuda"</i>,',
-  '  "model":   <i>"qwen3-4b"</i>,',
+  '  "model":   <i>"default"</i>,',
   '  "throughput_tok_s": <b>118.2</b>,',
   '  "itl_p50_ms":       <b>59.93</b>,',
   '  "first_token_ms":   <b>412</b>,',
@@ -103,13 +110,15 @@ const verifyLines = [
       <span aria-hidden="true">·</span>
       <span>5 min read</span>
       <span aria-hidden="true">·</span>
-      <span>Updated 2026-04-26</span>
+      <span>Updated 2026-09-02</span>
     </div>
     <h1>Quickstart</h1>
     <p class="lede">
-      Run a Qwen3 model end-to-end on your laptop or a single GPU. Three
-      commands, no glue. By the end you will have an OpenAI-compatible
-      server answering <code>POST /v1/chat/completions</code> on port 8000.
+      Run a Qwen3.6 model end-to-end on your laptop or a single GPU. Three
+      commands, no glue. By the end you will have a server answering
+      Anthropic <code>POST /v1/messages</code> and OpenAI
+      <code>POST /v1/chat/completions</code> on port 8000, with Claude Code
+      pointed at it.
     </p>
 
     <div class="hero-card">
@@ -123,9 +132,10 @@ const verifyLines = [
 
     <h2 id="prereqs">Prerequisites <span class="anchor">#prereqs</span></h2>
     <p>
-      You need a model directory on disk. <code>arle</code> does not download
-      model weights for you — bring a Qwen3 checkpoint, point at it, and the
-      runtime takes care of the rest.
+      On Metal, pass a Hugging Face id such as
+      <code>mlx-community/Qwen3.6-35B-A3B-4bit</code>; the weights land in the
+      Hugging Face cache on first run. On CUDA, point <code>--model-path</code>
+      at a Qwen3.5 / 3.6 / 3.8 or DeepSeek-V4-Flash checkpoint directory.
     </p>
     <ul class="body">
       <li>Rust toolchain not required — prebuilt binaries ship on every release.</li>
@@ -148,10 +158,12 @@ const verifyLines = [
 
     <h2 id="talk">Talk to it <span class="anchor">#talk</span></h2>
     <p>
-      Any client expecting <code>v1/chat/completions</code> works. The wire
-      format matches OpenAI, including streaming via
-      <code>text/event-stream</code>.
+      Two wire formats on one port. Claude Code uses the Anthropic Messages
+      API at <code>/v1/messages</code> (streaming events, tool use, extended
+      thinking); everything else uses OpenAI <code>/v1/chat/completions</code>,
+      including streaming via <code>text/event-stream</code>.
     </p>
+    <CodeBlock file="$ shell" lang="agent" lines={claudeLines} />
 
     <div class="req-res">
       <div>
@@ -184,8 +196,8 @@ const verifyLines = [
     <h2 id="next">What's next <span class="anchor">#next</span></h2>
     <p>You now have a runtime serving real traffic. From here:</p>
     <ul class="body">
-      <li>Swap the model — point <code>--model-path</code> at any Qwen3 / Qwen3.5 directory.</li>
-      <li>Train a small adapter — see <code>arle train</code>.</li>
+      <li>Swap the model — any Qwen3.5 / 3.6 / 3.8 directory on CUDA, any Qwen3.5 / 3.6 MLX checkpoint on Metal.</li>
+      <li>Distill your agent traces into a smaller model — <code>arle train opd</code>, the teacher is this server.</li>
       <li>Wire it into your app — same SDKs you use against OpenAI, just change the base URL.</li>
     </ul>
 
