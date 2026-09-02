@@ -30,6 +30,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | Bench + trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) |
 | Rolling baselines | [baselines.md](baselines.md) |
 | Design theses (depth track) | [plans/2026-09-02-design-theses.md](plans/2026-09-02-design-theses.md) |
+| Design notes | [design/hybrid-prefix-cache.md](design/hybrid-prefix-cache.md) |
 | Env / flags | [environment.md](environment.md) |
 | Capability evals | [eval.md](eval.md) |
 | OPD capability curve | [opd-capability-curve.md](opd-capability-curve.md) |
