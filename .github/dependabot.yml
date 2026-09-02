@@ -69,3 +69,8 @@ updates:
         update-types:
           - patch
           - minor
+    ignore:
+      # Ceiling set upstream: tilelang 0.1.13 declares apache-tvm-ffi<0.1.13.
+      # Drop this entry only with a tilelang bump that lifts the bound (#245).
+      - dependency-name: "apache-tvm-ffi"
+        versions: [">=0.1.13"]
