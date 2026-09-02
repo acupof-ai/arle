@@ -232,6 +232,16 @@ jobs:
       - name: Install Python dependencies
         run: pip install -e ".[dev]"
 
+      # requirements-build.txt is otherwise only installed by kernels-publish.yml,
+      # which is push-to-main only — an unsatisfiable pin lands red after merge
+      # (#245, and 82f89b497 before it). Metadata-only resolve, no wheel download.
+      - name: Resolve requirements-build.txt (metadata only)
+        run: |
+          pip install -q uv==0.9.24
+          uv pip compile --index-strategy unsafe-best-match \
+            --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+            -o "$RUNNER_TEMP/build-req.lock" requirements-build.txt
+
       - name: Run pytest
         run: |
           python -m pytest tests/python/ -v
