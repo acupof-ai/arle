@@ -1,7 +1,7 @@
 # Troubleshooting
 
 Common errors and how to resolve them. If your problem is not here, open a
-[GitHub issue](https://github.com/cklxx/arle/issues/new) with the output of
+[GitHub issue](https://github.com/acupof-ai/arle/issues/new) with the output of
 `arle --doctor --json` and the exact command you ran.
 
 ---
@@ -124,7 +124,7 @@ cargo build --release --features cuda --bin arle
 
 `arle --doctor` reports which backend the current binary was compiled with.
 The release tarballs at
-[GitHub Releases](https://github.com/cklxx/arle/releases) ship the `arle`
+[GitHub Releases](https://github.com/acupof-ai/arle/releases) ship the `arle`
 binary built for the platform's backend. `--bind` is honored in-process by
 every backend (the old "Metal-only `--bind`" limitation died with the
 monolith's spawn-a-binary front door).

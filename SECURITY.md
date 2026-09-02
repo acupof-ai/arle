@@ -13,7 +13,7 @@
 If you discover a security vulnerability, please report it responsibly:
 
 1. **Do NOT open a public issue.**
-2. Use [GitHub Security Advisories](https://github.com/cklxx/arle/security/advisories/new) to report privately.
+2. Use [GitHub Security Advisories](https://github.com/acupof-ai/arle/security/advisories/new) to report privately.
 3. If the advisory flow is unavailable, open a minimal public issue requesting a private contact channel **without** including exploit details or reproduction steps.
 4. Include: description, reproduction steps, affected surface, and potential impact.
 

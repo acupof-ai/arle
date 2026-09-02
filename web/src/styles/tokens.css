@@ -1,5 +1,5 @@
 /* ARLE design tokens — paper, ink, hairlines.
-   Mirrors the live cklxx/arle palette: near-monochrome with one coral
+   Mirrors the live acupof-ai/arle palette: near-monochrome with one coral
    accent (the wordmark dot) and two pinpoint status colors. */
 
 /* Font loading lives in Site.astro <head> — a <link> starts the fetch at

@@ -208,7 +208,7 @@ jobs:
           homebrew-tap: cklxx/homebrew-tap
           base-branch: main
           tag-name: ${{ github.ref_name }}
-          download-url: https://github.com/cklxx/arle/releases/download/${{ github.ref_name }}/arle-${{ github.ref_name }}-macos-arm64.tar.gz
+          download-url: https://github.com/acupof-ai/arle/releases/download/${{ github.ref_name }}/arle-${{ github.ref_name }}-macos-arm64.tar.gz
           commit-message: |
             arle ${{ github.ref_name }}
 

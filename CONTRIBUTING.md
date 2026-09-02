@@ -20,7 +20,7 @@ or release-related, also read:
 > contributors hacking on the runtime.
 
 ```bash
-git clone https://github.com/cklxx/arle && cd arle
+git clone https://github.com/acupof-ai/arle && cd arle
 ./setup.sh                 # Installs Rust, Python venv, builds, downloads model
 ./setup.sh --check         # Linux/CUDA workstation check
 make hygiene               # Public docs/templates/link guardrails
@@ -90,7 +90,7 @@ cargo deny check advisories bans licenses sources
 
 ### Frontend (`web/` — public landing site)
 
-The landing at <https://cklxx.github.io/arle/> is built from `web/` (Astro + Vite,
+The landing at <https://acupof-ai.github.io/arle/> is built from `web/` (Astro + Vite,
 bun-managed). It deploys via `.github/workflows/pages.yml`. Touch this only when
 you are editing the public landing or the future docs site.
 

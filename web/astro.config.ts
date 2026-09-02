@@ -1,7 +1,7 @@
 import { defineConfig } from "astro/config";
 
 export default defineConfig({
-  site: "https://cklxx.github.io",
+  site: "https://acupof-ai.github.io",
   base: "/arle/",
   outDir: "./dist",
   trailingSlash: "ignore",

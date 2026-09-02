@@ -1,6 +1,6 @@
 services:
   arle:
-    image: ghcr.io/cklxx/arle:latest
+    image: ghcr.io/acupof-ai/arle:latest
     command:
       - serve
       - --backend

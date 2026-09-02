@@ -219,7 +219,7 @@ const INSTALL_CARDS_EN: InstallCard[] = [
     label: "Linux x86_64 / macOS · curl",
     channel: "sh-compatible",
     lines: [
-      '<span class="p">$</span> curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh \\',
+      '<span class="p">$</span> curl -fsSL https://github.com/acupof-ai/arle/releases/latest/download/install.sh \\',
       '    | sh',
       '<span class="p">$</span> arle --doctor',
     ],
@@ -230,7 +230,7 @@ const INSTALL_CARDS_EN: InstallCard[] = [
     lines: [
       '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
       '    -v /path/to/Qwen3-4B:/model:ro \\',
-      '    ghcr.io/cklxx/arle:latest \\',
+      '    ghcr.io/acupof-ai/arle:latest \\',
       '    serve --backend cuda --model-path /model',
     ],
   },
@@ -238,7 +238,7 @@ const INSTALL_CARDS_EN: InstallCard[] = [
     label: "Source · Cargo",
     channel: "workspace",
     lines: [
-      '<span class="p">$</span> git clone https://github.com/cklxx/arle &amp;&amp; cd arle',
+      '<span class="p">$</span> git clone https://github.com/acupof-ai/arle &amp;&amp; cd arle',
       '<span class="p">$</span> cargo build --release --features cuda --bin arle',
       '<span class="c"># cli is default-on; cpu: --no-default-features --features cpu,no-cuda</span>',
     ],
@@ -258,7 +258,7 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
     label: "Linux x86_64 / macOS · curl",
     channel: "sh 兼容",
     lines: [
-      '<span class="p">$</span> curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh \\',
+      '<span class="p">$</span> curl -fsSL https://github.com/acupof-ai/arle/releases/latest/download/install.sh \\',
       '    | sh',
       '<span class="p">$</span> arle --doctor',
     ],
@@ -269,7 +269,7 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
     lines: [
       '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
       '    -v /path/to/Qwen3-4B:/model:ro \\',
-      '    ghcr.io/cklxx/arle:latest \\',
+      '    ghcr.io/acupof-ai/arle:latest \\',
       '    serve --backend cuda --model-path /model',
     ],
   },
@@ -277,7 +277,7 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
     label: "源码 · Cargo",
     channel: "workspace",
     lines: [
-      '<span class="p">$</span> git clone https://github.com/cklxx/arle &amp;&amp; cd arle',
+      '<span class="p">$</span> git clone https://github.com/acupof-ai/arle &amp;&amp; cd arle',
       '<span class="p">$</span> cargo build --release --features cuda --bin arle',
       '<span class="c"># cli 默认开启; cpu: --no-default-features --features cpu,no-cuda</span>',
     ],
@@ -298,7 +298,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "needle gate", value: "0", unit: "errors · exact=3 DET" },
     ],
     cmd: "arle serve --spec-type dspark · bench-agent-32k-16x8 c-sweep",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-29-dspark-batched-linear-capture.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/experience/wins/2026-07-29-dspark-batched-linear-capture.md",
   },
   {
     date: "2026-07-28",
@@ -313,7 +313,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "c=1", value: "±0", unit: "% · wash by design" },
     ],
     cmd: "arle serve · bench-agent-32k-16x8, matched A/B",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-28-fa3-one-launch-per-layer.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/experience/wins/2026-07-28-fa3-one-launch-per-layer.md",
   },
   {
     date: "2026-06-10",
@@ -328,7 +328,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "needle-exact", value: "230K", unit: "ctx" },
     ],
     cmd: "scripts/lever_gate.sh",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
   },
   {
     date: "2026-05-21",
@@ -342,7 +342,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "held-out overlap 5k", value: "82.8", unit: "% (from 50)" },
     ],
     cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
-    href: "https://github.com/cklxx/arle/blob/main/CHANGELOG.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/CHANGELOG.md",
   },
   {
     date: "2026-05-18",
@@ -356,7 +356,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "vs mlx-lm", value: "≈100", unit: "%" },
     ],
     cmd: "arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8010",
-    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md#3-model-family-matrix",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md#3-model-family-matrix",
   },
   {
     date: "2026-04-28",
@@ -370,7 +370,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "kv util", value: "69", unit: "%" },
     ],
     cmd: "python3 scripts/bench_throughput.py --concurrency-grid 16 --max-tokens 256",
-    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md",
   },
 ];
 
@@ -388,7 +388,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "needle 闸门", value: "0", unit: "错误 · exact=3 DET" },
     ],
     cmd: "arle serve --spec-type dspark · bench-agent-32k-16x8 c-sweep",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-29-dspark-batched-linear-capture.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/experience/wins/2026-07-29-dspark-batched-linear-capture.md",
   },
   {
     date: "2026-07-28",
@@ -403,7 +403,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "c=1", value: "±0", unit: "% · 设计上不变" },
     ],
     cmd: "arle serve · bench-agent-32k-16x8，matched A/B",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-28-fa3-one-launch-per-layer.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/experience/wins/2026-07-28-fa3-one-launch-per-layer.md",
   },
   {
     date: "2026-06-10",
@@ -418,7 +418,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "needle 精确", value: "230K", unit: "ctx" },
     ],
     cmd: "scripts/lever_gate.sh",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
   },
   {
     date: "2026-05-21",
@@ -432,7 +432,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "held-out 5k overlap", value: "82.8", unit: "%（自 50）" },
     ],
     cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
-    href: "https://github.com/cklxx/arle/blob/main/CHANGELOG.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/CHANGELOG.md",
   },
   {
     date: "2026-05-18",
@@ -446,7 +446,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "对比 mlx-lm", value: "≈100", unit: "%" },
     ],
     cmd: "arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8010",
-    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md#3-model-family-matrix",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md#3-model-family-matrix",
   },
   {
     date: "2026-04-28",
@@ -460,7 +460,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "KV 利用率", value: "69", unit: "%" },
     ],
     cmd: "python3 scripts/bench_throughput.py --concurrency-grid 16 --max-tokens 256",
-    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md",
+    href: "https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md",
   },
 ];
 
@@ -535,7 +535,7 @@ const WHY_CELLS_EN: WhyCell[] = [
     no: "conviction · 03",
     title: "Numbers are dated.",
     body:
-      'Every benchmark is a dated snapshot in <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> with env, params, and regressions. Nothing is curated. “Fast” is a number with a date, or it’s nothing.',
+      'Every benchmark is a dated snapshot in <a href="https://github.com/acupof-ai/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> with env, params, and regressions. Nothing is curated. “Fast” is a number with a date, or it’s nothing.',
   },
   {
     no: "conviction · 04",
@@ -562,7 +562,7 @@ const WHY_CELLS_ZH: WhyCell[] = [
     no: "conviction · 03",
     title: "数字都有日期。",
     body:
-      '每个基准都是 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 里带日期的快照，环境、参数、回归俱全。没有精选。「快」要么是带日期的数字，要么什么都不是。',
+      '每个基准都是 <a href="https://github.com/acupof-ai/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 里带日期的快照，环境、参数、回归俱全。没有精选。「快」要么是带日期的数字，要么什么都不是。',
   },
   {
     no: "conviction · 04",
@@ -693,35 +693,35 @@ const BATTLE_ROWS_ZH: BattleRow[] = [
 ];
 
 const FILES_EN: FileRow[] = [
-  { path: "/README.md", desc: "public overview · install · CLI · architecture", href: "https://github.com/cklxx/arle/blob/main/README.md" },
-  { path: "/docs/codebase-map.md", desc: "canonical workspace topology", href: "https://github.com/cklxx/arle/blob/main/docs/codebase-map.md" },
-  { path: "/docs/http-api.md", desc: "HTTP contract · streaming behavior", href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md" },
-  { path: "/docs/support-matrix.md", desc: "backend / model / quant support", href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md" },
-  { path: "/docs/experience/wins/", desc: "dated benchmark snapshots", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
-  { path: "/crates/cli/", desc: "arle binary · verbs · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
-  { path: "/crates/infer-api/", desc: "the single public front door", href: "https://github.com/cklxx/arle/tree/main/crates/infer-api" },
-  { path: "/crates/infer-core/", desc: "runtime spine · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
-  { path: "/crates/train/", desc: "OPD loop · autograd tape · seq-chunked recompute", href: "https://github.com/cklxx/arle/tree/main/crates/train" },
-  { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
-  { path: "/crates/mlx-sys/", desc: "metal bridge · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
-  { path: "/examples/", desc: "copyable curl · Docker · Metal · tiny train smokes", href: "https://github.com/cklxx/arle/tree/main/examples" },
-  { path: "/releases", desc: "tagged binaries · checksums", href: "https://github.com/cklxx/arle/releases" },
+  { path: "/README.md", desc: "public overview · install · CLI · architecture", href: "https://github.com/acupof-ai/arle/blob/main/README.md" },
+  { path: "/docs/codebase-map.md", desc: "canonical workspace topology", href: "https://github.com/acupof-ai/arle/blob/main/docs/codebase-map.md" },
+  { path: "/docs/http-api.md", desc: "HTTP contract · streaming behavior", href: "https://github.com/acupof-ai/arle/blob/main/docs/http-api.md" },
+  { path: "/docs/support-matrix.md", desc: "backend / model / quant support", href: "https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md" },
+  { path: "/docs/experience/wins/", desc: "dated benchmark snapshots", href: "https://github.com/acupof-ai/arle/tree/main/docs/experience/wins" },
+  { path: "/crates/cli/", desc: "arle binary · verbs · doctor", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
+  { path: "/crates/infer-api/", desc: "the single public front door", href: "https://github.com/acupof-ai/arle/tree/main/crates/infer-api" },
+  { path: "/crates/infer-core/", desc: "runtime spine · engine · scheduler · radix cache", href: "https://github.com/acupof-ai/arle/tree/main/crates/infer-core" },
+  { path: "/crates/train/", desc: "OPD loop · autograd tape · seq-chunked recompute", href: "https://github.com/acupof-ai/arle/tree/main/crates/train" },
+  { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/acupof-ai/arle/tree/main/crates/cuda-kernels" },
+  { path: "/crates/mlx-sys/", desc: "metal bridge · cmake + cc", href: "https://github.com/acupof-ai/arle/tree/main/crates/mlx-sys" },
+  { path: "/examples/", desc: "copyable curl · Docker · Metal · tiny train smokes", href: "https://github.com/acupof-ai/arle/tree/main/examples" },
+  { path: "/releases", desc: "tagged binaries · checksums", href: "https://github.com/acupof-ai/arle/releases" },
 ];
 
 const FILES_ZH: FileRow[] = [
-  { path: "/README.zh-CN.md", desc: "中文公共入口：安装 · CLI · 架构", href: "https://github.com/cklxx/arle/blob/main/README.zh-CN.md" },
-  { path: "/docs/codebase-map.md", desc: "权威 workspace 拓扑", href: "https://github.com/cklxx/arle/blob/main/docs/codebase-map.md" },
-  { path: "/docs/http-api.md", desc: "HTTP 契约 · 流式行为", href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md" },
-  { path: "/docs/support-matrix.md", desc: "后端 / 模型 / 量化支持", href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md" },
-  { path: "/docs/experience/wins/", desc: "带日期的基准快照", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
-  { path: "/crates/cli/", desc: "arle 二进制 · 子命令 · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
-  { path: "/crates/infer-api/", desc: "唯一的公共前门", href: "https://github.com/cklxx/arle/tree/main/crates/infer-api" },
-  { path: "/crates/infer-core/", desc: "运行时主干 · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
-  { path: "/crates/train/", desc: "OPD 循环 · autograd tape · seq-chunked recompute", href: "https://github.com/cklxx/arle/tree/main/crates/train" },
-  { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
-  { path: "/crates/mlx-sys/", desc: "metal 桥接 · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
-  { path: "/examples/", desc: "curl · Docker · Metal · tiny train 冒烟示例", href: "https://github.com/cklxx/arle/tree/main/examples" },
-  { path: "/releases", desc: "发版二进制 · 校验和", href: "https://github.com/cklxx/arle/releases" },
+  { path: "/README.zh-CN.md", desc: "中文公共入口：安装 · CLI · 架构", href: "https://github.com/acupof-ai/arle/blob/main/README.zh-CN.md" },
+  { path: "/docs/codebase-map.md", desc: "权威 workspace 拓扑", href: "https://github.com/acupof-ai/arle/blob/main/docs/codebase-map.md" },
+  { path: "/docs/http-api.md", desc: "HTTP 契约 · 流式行为", href: "https://github.com/acupof-ai/arle/blob/main/docs/http-api.md" },
+  { path: "/docs/support-matrix.md", desc: "后端 / 模型 / 量化支持", href: "https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md" },
+  { path: "/docs/experience/wins/", desc: "带日期的基准快照", href: "https://github.com/acupof-ai/arle/tree/main/docs/experience/wins" },
+  { path: "/crates/cli/", desc: "arle 二进制 · 子命令 · doctor", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
+  { path: "/crates/infer-api/", desc: "唯一的公共前门", href: "https://github.com/acupof-ai/arle/tree/main/crates/infer-api" },
+  { path: "/crates/infer-core/", desc: "运行时主干 · engine · scheduler · radix cache", href: "https://github.com/acupof-ai/arle/tree/main/crates/infer-core" },
+  { path: "/crates/train/", desc: "OPD 循环 · autograd tape · seq-chunked recompute", href: "https://github.com/acupof-ai/arle/tree/main/crates/train" },
+  { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/acupof-ai/arle/tree/main/crates/cuda-kernels" },
+  { path: "/crates/mlx-sys/", desc: "metal 桥接 · cmake + cc", href: "https://github.com/acupof-ai/arle/tree/main/crates/mlx-sys" },
+  { path: "/examples/", desc: "curl · Docker · Metal · tiny train 冒烟示例", href: "https://github.com/acupof-ai/arle/tree/main/examples" },
+  { path: "/releases", desc: "发版二进制 · 校验和", href: "https://github.com/acupof-ai/arle/releases" },
 ];
 
 export const EN: Locale = {
@@ -734,8 +734,8 @@ export const EN: Locale = {
     ogTitle: "arle — inference stops being magic",
     ogDescription:
       "The whole modern inference stack — continuous batching, radix prefix cache, paged KV, CUDA graphs, speculative decode — hand-built in Rust, small enough to read in a weekend.",
-    ogUrl: "https://cklxx.github.io/arle/",
-    canonical: "https://cklxx.github.io/arle/",
+    ogUrl: "https://acupof-ai.github.io/arle/",
+    canonical: "https://acupof-ai.github.io/arle/",
   },
   masthead: {
     left: "arle(1)",
@@ -746,7 +746,7 @@ export const EN: Locale = {
       { label: "install", href: "#install" },
       { label: "bench", href: "#bench" },
       { label: "contribute", href: "#contribute" },
-      { label: "github ↗", href: "https://github.com/cklxx/arle" },
+      { label: "github ↗", href: "https://github.com/acupof-ai/arle" },
     ],
   },
   hero: {
@@ -757,7 +757,7 @@ export const EN: Locale = {
       "The whole modern inference stack — continuous batching, radix prefix cache, paged KV, CUDA graphs, speculative decode — hand-built in Rust, <b>small enough to read in a weekend</b>.",
     signals: SIGNALS,
     ctas: [
-      { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+      { label: "★ Star acupof-ai/arle", href: "https://github.com/acupof-ai/arle" },
       { label: "$ Quickstart", href: "#install" },
       { label: "contribute →", href: "#contribute" },
     ],
@@ -777,50 +777,50 @@ export const EN: Locale = {
     architecture: {
       title: "Architecture",
       caption:
-        'Post-cutover (2026-06-04) the monolithic <code>infer</code> crate is gone. The runtime is a device-neutral crate graph — dependencies flow strictly downward, <b>infer-core carries no backend dependency</b>, and backends plug in at the front door. Canonical topology lives in <a href="https://github.com/cklxx/arle/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>.',
+        'Post-cutover (2026-06-04) the monolithic <code>infer</code> crate is gone. The runtime is a device-neutral crate graph — dependencies flow strictly downward, <b>infer-core carries no backend dependency</b>, and backends plug in at the front door. Canonical topology lives in <a href="https://github.com/acupof-ai/arle/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>.',
       rows: ARCH_ROWS,
       foot: ARCH_FOOT_EN,
     },
     install: {
       title: "Install",
       caption:
-        'One runnable line per platform. Pre-built tarballs and SHAs on each <a href="https://github.com/cklxx/arle/releases">GitHub Release</a>; the curl installer verifies SHA256 before extracting.',
+        'One runnable line per platform. Pre-built tarballs and SHAs on each <a href="https://github.com/acupof-ai/arle/releases">GitHub Release</a>; the curl installer verifies SHA256 before extracting.',
       cards: INSTALL_CARDS_EN,
     },
     bench: {
       title: "Bench",
       caption:
-        'Dated, reproducible snapshots straight from <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a>. Numbers come out of <code>scripts/bench_throughput.py</code> and the <code>bench-agent</code> workload driver — nothing is curated.',
+        'Dated, reproducible snapshots straight from <a href="https://github.com/acupof-ai/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a>. Numbers come out of <code>scripts/bench_throughput.py</code> and the <code>bench-agent</code> workload driver — nothing is curated.',
       rows: BENCH_ROWS_EN,
     },
     matrix: {
       title: "Support matrix",
       caption:
-        'Three backends, one runtime contract. Authoritative truth lives in <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md"><code>docs/support-matrix.md</code></a>.',
+        'Three backends, one runtime contract. Authoritative truth lives in <a href="https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md"><code>docs/support-matrix.md</code></a>.',
       head: ["backend", "stability", "os / hardware", "models", "quants", "api"],
       rows: MATRIX_ROWS_EN,
     },
     contribute: {
       title: "Where a contribution lands",
       caption:
-        'No queue, no committee — <b>a weekend PR here can move a headline number</b>, and the battlefields are public: one tracked <a href="https://github.com/cklxx/arle/issues">GitHub issue</a> per front. Start with <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>.',
+        'No queue, no committee — <b>a weekend PR here can move a headline number</b>, and the battlefields are public: one tracked <a href="https://github.com/acupof-ai/arle/issues">GitHub issue</a> per front. Start with <a href="https://github.com/acupof-ai/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>.',
       rows: BATTLE_ROWS_EN,
       starAsk: {
         html:
           "<b>Stars are the only metric a solo project has.</b> If this repo saved you a read of someone else’s CUDA — or just proved it can be done in Rust — leave one. It decides how much time this gets.",
-        cta: { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+        cta: { label: "★ Star acupof-ai/arle", href: "https://github.com/acupof-ai/arle" },
       },
     },
     files: {
       title: "Files",
       caption:
-        'The repo at a glance. Everything links back to canonical paths in <code>cklxx/arle</code>.',
+        'The repo at a glance. Everything links back to canonical paths in <code>acupof-ai/arle</code>.',
       rows: FILES_EN,
     },
   },
   footer: {
     left: "arle(1) · July 2026 · v0.5.0",
-    right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
+    right: { label: "github.com/acupof-ai/arle", href: "https://github.com/acupof-ai/arle" },
   },
 };
 
@@ -834,8 +834,8 @@ export const ZH: Locale = {
     ogTitle: "arle — 推理，不再是魔法",
     ogDescription:
       "现代推理栈的全部 —— continuous batching、radix 前缀缓存、paged KV、CUDA graphs、投机解码 —— 一个人用 Rust 手写，小到一个周末就能读完。",
-    ogUrl: "https://cklxx.github.io/arle/zh-cn/",
-    canonical: "https://cklxx.github.io/arle/zh-cn/",
+    ogUrl: "https://acupof-ai.github.io/arle/zh-cn/",
+    canonical: "https://acupof-ai.github.io/arle/zh-cn/",
   },
   masthead: {
     left: "arle(1)",
@@ -846,7 +846,7 @@ export const ZH: Locale = {
       { label: "安装", href: "#install" },
       { label: "基准", href: "#bench" },
       { label: "参与", href: "#contribute" },
-      { label: "github ↗", href: "https://github.com/cklxx/arle" },
+      { label: "github ↗", href: "https://github.com/acupof-ai/arle" },
     ],
   },
   hero: {
@@ -857,7 +857,7 @@ export const ZH: Locale = {
       "现代推理栈的全部 —— continuous batching、radix 前缀缓存、paged KV、CUDA graphs、投机解码 —— 一个人用 Rust 手写，<b>小到一个周末就能读完</b>。",
     signals: SIGNALS,
     ctas: [
-      { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+      { label: "★ Star acupof-ai/arle", href: "https://github.com/acupof-ai/arle" },
       { label: "$ Quickstart", href: "#install" },
       { label: "参与贡献 →", href: "#contribute" },
     ],
@@ -877,49 +877,49 @@ export const ZH: Locale = {
     architecture: {
       title: "架构",
       caption:
-        '2026-06-04 cutover 之后，单体 <code>infer</code> crate 已经不在了。运行时是一张设备无关的 crate 图 —— 依赖严格向下流动，<b>infer-core 不依赖任何后端</b>，后端在前门接入。权威拓扑见 <a href="https://github.com/cklxx/arle/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>。',
+        '2026-06-04 cutover 之后，单体 <code>infer</code> crate 已经不在了。运行时是一张设备无关的 crate 图 —— 依赖严格向下流动，<b>infer-core 不依赖任何后端</b>，后端在前门接入。权威拓扑见 <a href="https://github.com/acupof-ai/arle/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>。',
       rows: ARCH_ROWS,
       foot: ARCH_FOOT_ZH,
     },
     install: {
       title: "安装",
       caption:
-        '每个平台一行能跑的命令。预编译 tarball 与 SHA 见每次 <a href="https://github.com/cklxx/arle/releases">GitHub Release</a>；curl 安装脚本会先校验 SHA256 再解压。',
+        '每个平台一行能跑的命令。预编译 tarball 与 SHA 见每次 <a href="https://github.com/acupof-ai/arle/releases">GitHub Release</a>；curl 安装脚本会先校验 SHA256 再解压。',
       cards: INSTALL_CARDS_ZH,
     },
     bench: {
       title: "基准",
       caption:
-        '直接来自 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 的带日期快照。数字出自 <code>scripts/bench_throughput.py</code> 与 <code>bench-agent</code> 工作负载驱动，未做挑选。',
+        '直接来自 <a href="https://github.com/acupof-ai/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 的带日期快照。数字出自 <code>scripts/bench_throughput.py</code> 与 <code>bench-agent</code> 工作负载驱动，未做挑选。',
       rows: BENCH_ROWS_ZH,
     },
     matrix: {
       title: "支持矩阵",
       caption:
-        '三种后端，一份运行时契约。权威矩阵见 <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md"><code>docs/support-matrix.md</code></a>。',
+        '三种后端，一份运行时契约。权威矩阵见 <a href="https://github.com/acupof-ai/arle/blob/main/docs/support-matrix.md"><code>docs/support-matrix.md</code></a>。',
       head: ["后端", "稳定度", "系统 / 硬件", "模型", "量化", "API"],
       rows: MATRIX_ROWS_ZH,
     },
     contribute: {
       title: "贡献会落在哪",
       caption:
-        '没有排队，没有委员会 —— <b>一个周末的 PR 就能改动头条数字</b>，战场全部公开：每条战线一个 <a href="https://github.com/cklxx/arle/issues">GitHub 跟踪 issue</a>。从 <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> 开始。',
+        '没有排队，没有委员会 —— <b>一个周末的 PR 就能改动头条数字</b>，战场全部公开：每条战线一个 <a href="https://github.com/acupof-ai/arle/issues">GitHub 跟踪 issue</a>。从 <a href="https://github.com/acupof-ai/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> 开始。',
       rows: BATTLE_ROWS_ZH,
       starAsk: {
         html:
           "<b>Star 是个人项目唯一的指标。</b>如果这个仓库帮你省下了啃别人 CUDA 的时间 —— 或者只是证明了这件事 Rust 写得出来 —— 留一颗。它决定这件事能得到多少时间。",
-        cta: { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+        cta: { label: "★ Star acupof-ai/arle", href: "https://github.com/acupof-ai/arle" },
       },
     },
     files: {
       title: "文件",
       caption:
-        '仓库一览。每条都指回 <code>cklxx/arle</code> 的标准路径。',
+        '仓库一览。每条都指回 <code>acupof-ai/arle</code> 的标准路径。',
       rows: FILES_ZH,
     },
   },
   footer: {
     left: "arle(1) · 2026 年 7 月 · v0.5.0",
-    right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
+    right: { label: "github.com/acupof-ai/arle", href: "https://github.com/acupof-ai/arle" },
   },
 };

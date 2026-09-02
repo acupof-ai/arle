@@ -41,7 +41,7 @@ brew untap cklxx/tap   # optional: remove the tap entirely
 ## 2. One-line installer (macOS arm64 / Linux x86_64)
 
 ```bash
-curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/acupof-ai/arle/releases/latest/download/install.sh | sh
 ```
 
 What it does:
@@ -66,11 +66,11 @@ Examples:
 
 ```bash
 # Pin a version, system-wide:
-curl -fsSL https://github.com/cklxx/arle/releases/download/v0.1.0/install.sh \
+curl -fsSL https://github.com/acupof-ai/arle/releases/download/v0.1.0/install.sh \
   | INSTALL_DIR=/usr/local/bin sudo sh
 
 # Inspect the script before running:
-curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh -o install.sh
+curl -fsSL https://github.com/acupof-ai/arle/releases/latest/download/install.sh -o install.sh
 less install.sh
 sh install.sh
 ```
@@ -86,12 +86,12 @@ rm -f ~/.local/bin/arle
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
   -v /path/to/Qwen3.5-4B:/model:ro \
-  ghcr.io/cklxx/arle:latest \
+  ghcr.io/acupof-ai/arle:latest \
   serve --backend cuda --model-path /model --port 8000
 ```
 
 The `:latest` tag tracks the newest non-prerelease release image. Tagged
-releases are published as `ghcr.io/cklxx/arle:X.Y.Z` (no `v` prefix - docker
+releases are published as `ghcr.io/acupof-ai/arle:X.Y.Z` (no `v` prefix - docker
 metadata-action strips it).
 
 ## 4. From source

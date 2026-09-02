@@ -2,7 +2,7 @@
 # ARLE installer.
 #
 # Usage:
-#   curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/acupof-ai/arle/releases/latest/download/install.sh | sh
 #
 # Environment overrides:
 #   ARLE_VERSION   Tag to install (default: latest). Example: v0.1.0
@@ -11,7 +11,7 @@
 
 set -eu
 
-REPO="cklxx/arle"
+REPO="acupof-ai/arle"
 VERSION="${ARLE_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
