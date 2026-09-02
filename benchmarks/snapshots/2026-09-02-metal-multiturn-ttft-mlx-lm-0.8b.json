@@ -2,7 +2,7 @@
  "summary": {
   "label": "mlx-lm-0.8B",
   "url": "http://localhost:8011",
-  "model": "/Users/bytedance/code/agent-infer/models/Qwen3.5-0.8B-MLX-4bit",
+  "model": "models/Qwen3.5-0.8B-MLX-4bit",
   "turns": 12,
   "turn1_ttft_ms": 1256.6,
   "turnN_ttft_ms": 248.3,
