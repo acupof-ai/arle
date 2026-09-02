@@ -1,5 +1,9 @@
-[build]
-rustc-wrapper = "sccache"
+# No `[build] rustc-wrapper` here: a repo-level wrapper pin makes `cargo
+# metadata` hard-fail on any host without sccache, which killed every
+# Dependabot cargo run from 2026-06-30 (358335265) on — including RUSTSEC
+# security PRs. Opt in per environment instead: RUSTC_WRAPPER=sccache in your
+# shell rc (or ~/.cargo/config.toml), scripts/pod-build-env.sh on the pod, and
+# the env block in metal-ci.yml.
 
 # CUDA stub lib is Linux/NVIDIA-only; scoping avoids a spurious linker warning
 # on macOS from a path that doesn't exist.

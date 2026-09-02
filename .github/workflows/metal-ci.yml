@@ -36,9 +36,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # .cargo/config.toml pins `rustc-wrapper = "sccache"`; install via
-  # mozilla-actions/sccache-action so cargo doesn't fail on missing wrapper.
+  # sccache installed below via mozilla-actions/sccache-action; that action
+  # installs the binary but does not export RUSTC_WRAPPER, so set both here.
+  # This lane is the only CI consumer — .cargo/config.toml deliberately carries
+  # no wrapper pin (it broke Dependabot's cargo lane).
   SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 concurrency:
   group: metal-ci-${{ github.ref }}

@@ -33,7 +33,7 @@ jobs:
     name: Advisories / Bans / Licenses
     runs-on: ubuntu-latest
     env:
-      # config.toml pins rustc-wrapper=sccache for local dev; not installed here.
+      # sccache is not installed here; stay off even if a wrapper pin comes back.
       RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

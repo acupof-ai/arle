@@ -64,8 +64,8 @@ fi
 # Shared compile cache: sccache caches each rustc compilation keyed by content, so a
 # FRESH tree (or a toolchain-switch rebuild) reuses unchanged crates instead of
 # recompiling — the cross-POD_TREE / cross-restart reuse the per-tree target/ can't give.
-# Cache lives on /host (persistent). .cargo/config.toml sets rustc-wrapper = "sccache";
-# if sccache is absent we must explicitly clear RUSTC_WRAPPER to override that config.
+# Cache lives on /host (persistent). This is the pod's opt-in — .cargo/config.toml
+# carries no wrapper pin, so RUSTC_WRAPPER must be exported here to get sccache.
 # Install: scripts/pod.sh setup-sccache.
 if command -v sccache >/dev/null 2>&1; then
   export SCCACHE_DIR="${SCCACHE_DIR:-/host/sccache}"
