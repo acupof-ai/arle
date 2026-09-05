@@ -1,0 +1,146 @@
+#version 450
+// ARLE Vulkan shader: Qwen3.8-Flash-Next (`qwen4_exp`) hyper-connection MIX —
+// the up-projection, its sigmoid, and the cross-stream mean, fused.
+//
+// Host oracle: `infer_vulkan::qwen4_hc::gated_residual` (`mix_gate` +
+// `block_input`). The math this dispatch owns is
+//
+//     m = sigmoid(W_up @ silu(u_raw / hc_count))      # [hc_count*hidden]
+//     x = mean_s( m[s*hidden + i] * hn[s*hidden + i] ) # [hidden]
+//
+// ## Why one workgroup per HIDDEN channel and not per output row of W_up
+//
+// The obvious layout — one workgroup per row of `W_up` — is 10240 workgroups
+// that each write one element of `m`, forcing a SECOND dispatch to do the
+// cross-stream mean and a [10240] scratch buffer to carry `m` between them.
+// Decode on this box is dispatch-bound (~2787 dispatches/token at ~3.4us of
+// host recording each), and this site occurs 97 times per token, so every
+// avoidable dispatch is ~330us/token of host time.
+//
+// So the grid is `hidden` workgroups instead: workgroup `i` owns hidden channel
+// `i` and computes the FOUR values `m[s*hidden + i]` itself — four dots of
+// length `hc_lowrank` against the four `W_up` rows `s*hidden + i` — then
+// immediately folds them into `x[i]`. The sigmoid, the `* hn` and the mean all
+// collapse into the GEMV epilogue and `m` is never written to memory at all.
+//
+// ## Why `silu(u_raw / hc_count)` is applied HERE
+//
+// Binding 2 is the RAW `W_down @ hn` dot, not the activated bottleneck: the
+// preceding dispatch is the generic f32 GEMV (`qwen36_router_gemv`), which
+// carries a sigmoid epilogue but not a silu-after-scale one, and it is not this
+// model's file to extend. Folding the activation into the consumer is free —
+// `hc_lowrank` (320) values per workgroup versus the 4*320 weight elements each
+// workgroup already streams — and it keeps the sequence at four dispatches
+// rather than five. The divide is INSIDE the nonlinearity: `silu(z/hc_count)`,
+// not `silu(z)/hc_count`. Both are finite and only one is right.
+//
+// Bindings: `0 = hn` [hc_count*hidden] f32 (grouped-RMSNorm output),
+// `1 = W_up` [hc_count*hidden, hc_lowrank] f32 row-major, `2 = u_raw`
+// [hc_lowrank] f32 (RAW down-projection), `3 = x` [hidden] f32 (block input).
+#extension GL_EXT_control_flow_attributes : enable
+
+// The Radeon 8060S is wave64, so a 64-lane workgroup is exactly one wave and
+// the tree reduction below never crosses a wave boundary.
+#define BLOCK 64
+// Compile-time bound on `hc_count`. It exists so `acc[]` / `inj[]`-style local
+// arrays are indexed by literals after `[[unroll]]` and stay in VGPRs; a
+// runtime-bounded loop would make the index dynamic and spill them to scratch.
+// The guarded iterations above `hc_count` are workgroup-uniform, so the wave
+// skips them outright.
+#define HC_MAX 8
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint hidden;      // hidden_size (2560) — also the workgroup count
+    uint hc_count;    // residual streams (4); must be <= HC_MAX
+    uint hc_lowrank;  // bottleneck width (320)
+} p;
+
+layout(binding = 0) readonly buffer Normed {
+    float hn[]; // [hc_count * hidden], stream-major
+};
+#ifdef WEIGHTS_BF16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(binding = 1) readonly buffer WeightUp {
+    uint16_t w_up_raw[]; // [hc_count * hidden, hc_lowrank] bf16, row-major
+};
+// bf16 is the top half of an f32.
+float w_up_at(uint i) { return uintBitsToFloat(uint(w_up_raw[i]) << 16); }
+#else
+layout(binding = 1) readonly buffer WeightUp {
+    float w_up[]; // [hc_count * hidden, hc_lowrank], row-major [out, in]
+};
+float w_up_at(uint i) { return w_up[i]; }
+#endif
+layout(binding = 2) readonly buffer LowrankRaw {
+    float u_raw[]; // [hc_lowrank] — RAW W_down @ hn, NOT silu'd
+};
+layout(binding = 3) writeonly buffer BlockInput {
+    float x[]; // [hidden]
+};
+
+shared float partial[HC_MAX][BLOCK];
+
+void main() {
+    const uint ch = gl_WorkGroupID.x;
+    // Workgroup-uniform, so returning before the barriers below is legal.
+    if (ch >= p.hidden) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint hc = p.hc_count;
+    const float inv_hc = 1.0 / float(hc);
+
+    float acc[HC_MAX];
+    [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+        acc[s] = 0.0;
+    }
+
+    // Lane `tid` walks the bottleneck in BLOCK-strided order so the 64 lanes
+    // read CONTIGUOUS `W_up` elements per step. All four streams share the same
+    // column, so `silu` is evaluated once per (lane, column) and reused.
+    for (uint c = tid; c < p.hc_lowrank; c += BLOCK) {
+        const float z = u_raw[c] * inv_hc;
+        const float uc = z / (1.0 + exp(-z));
+        [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+            if (s < hc) {
+                acc[s] += w_up_at((s * p.hidden + ch) * p.hc_lowrank + c) * uc;
+            }
+        }
+    }
+
+    [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+        if (s < hc) {
+            partial[s][tid] = acc[s];
+        }
+    }
+    barrier();
+    // One barrier chain reduces all `hc_count` streams together — separate
+    // trees would pay the same barriers `hc_count` times over.
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+                if (s < hc) {
+                    partial[s][tid] += partial[s][tid + stride];
+                }
+            }
+        }
+        barrier();
+    }
+
+    // The whole reason the grid is `hidden`-wide: the mean over streams is a
+    // register accumulation here, not a second pass over a [hc_count*hidden]
+    // scratch buffer.
+    if (tid == 0u) {
+        float sum = 0.0;
+        [[unroll]] for (uint s = 0u; s < HC_MAX; ++s) {
+            if (s < hc) {
+                const float m = 1.0 / (1.0 + exp(-partial[s][0]));
+                sum += m * hn[s * p.hidden + ch];
+            }
+        }
+        x[ch] = sum * inv_hc;
+    }
+}

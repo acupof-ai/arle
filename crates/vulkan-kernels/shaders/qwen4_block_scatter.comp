@@ -1,0 +1,36 @@
+#version 450
+// Block SCATTER-WRITE: pair `pr` copies src block `pr / top_k` to dst block
+// `map[pr]` — the write-side inverse of `qwen4_block_perm.comp` (whose map
+// sits on the READ side: dst block b pulls src block map[b]).
+//
+// Exists for the grouped-MoE gather into FIXED per-class regions: the live
+// gathered rows are a sparse subset of the region capacity, so a read-side
+// permutation would have to dispatch (and write) every capacity row, ~6x the
+// live bandwidth. Walking the PAIRS instead touches exactly the live rows,
+// and the pair count is a record-time constant — no indirect dispatch needed.
+// Capacity rows nothing scatters to keep stale data; no grouped dispatch
+// reads them (each block's rows are all live by construction).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src { float src[]; };
+layout(binding = 1) readonly buffer Map { uint map[]; };
+layout(binding = 2) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Push {
+    uint block; // elements per block
+    uint pairs; // number of pairs (= map length = dispatched workgroups)
+    uint top_k; // pairs per src block: src block index = pair / top_k
+} p;
+
+void main() {
+    const uint pr = gl_WorkGroupID.x;
+    if (pr >= p.pairs) {
+        return;
+    }
+    const uint s = (pr / p.top_k) * p.block;
+    const uint d = map[pr] * p.block;
+    for (uint i = gl_LocalInvocationID.x; i < p.block; i += gl_WorkGroupSize.x) {
+        dst[d + i] = src[s + i];
+    }
+}

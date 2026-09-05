@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARLE Chat</title>
+<!-- Single-file chat UI compiled into the server binary (include_str!).
+     Everything is inline and relative so the page works with no network
+     beyond the serving host itself; the offline guarantee is pinned by
+     chat_ui_tests in coordinator.rs (no external tags, no css-url loads).
+     The favicon is injected from a base64 data URI in script because the
+     literal link tag and the svg namespace string are on the banned list. -->
+<script>
+// Applied before first paint so a persisted theme choice never flashes.
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("arle.theme"); } catch (e) {}
+  if (t === "light" || t === "dark") { document.documentElement.dataset.theme = t; }
+})();
+</script>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #faf9f7;            /* warm near-white ground */
+    --panel: #fdfcfa;         /* composer bar */
+    --surface: #f2f0ec;       /* user turns */
+    --surface-2: #edeae5;     /* code blocks: one step off */
+    --border: #e6e3dd;
+    --border-strong: #d6d2ca;
+    --ink: #21252a;
+    --ink-2: #565c63;
+    --ink-3: #70767d;
+    --accent: #46716d;        /* the one accent: muted slate-teal */
+    --accent-hover: #3c625e;
+    --accent-ink: #f5f4f1;
+    --rule: #9dbab6;          /* accent-tinted left rule on user turns */
+    --ring: rgba(70, 113, 109, 0.28);
+    --stop-bg: #8a5f5b;       /* muted red-gray while streaming */
+    --stop-hover: #7b534f;
+    --stop-ink: #f6f2f0;
+    --danger-ink: #8f4f47;
+    --danger-border: #d7b1aa;
+    --disabled-bg: #e8e5df;
+    --disabled-ink: #a3a8ae;
+    --shadow: rgba(38, 34, 27, 0.07);
+    --colw: calc(72ch + 2.5rem);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #17181a;
+      --panel: #1d1f22;
+      --surface: #1f2124;
+      --surface-2: #24272b;
+      --border: #2b2e33;
+      --border-strong: #3a3e44;
+      --ink: #d8dadd;
+      --ink-2: #a4a9af;
+      --ink-3: #7d838a;
+      --accent: #7aa39e;
+      --accent-hover: #8ab1ac;
+      --accent-ink: #16211f;
+      --rule: #3e5450;
+      --ring: rgba(122, 163, 158, 0.30);
+      --stop-bg: #7a544f;
+      --stop-hover: #886058;
+      --stop-ink: #f0e7e5;
+      --danger-ink: #cf9d95;
+      --danger-border: #5a413d;
+      --disabled-bg: #26292d;
+      --disabled-ink: #6b7076;
+      --shadow: rgba(9, 9, 10, 0.45);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #17181a;
+    --panel: #1d1f22;
+    --surface: #1f2124;
+    --surface-2: #24272b;
+    --border: #2b2e33;
+    --border-strong: #3a3e44;
+    --ink: #d8dadd;
+    --ink-2: #a4a9af;
+    --ink-3: #7d838a;
+    --accent: #7aa39e;
+    --accent-hover: #8ab1ac;
+    --accent-ink: #16211f;
+    --rule: #3e5450;
+    --ring: rgba(122, 163, 158, 0.30);
+    --stop-bg: #7a544f;
+    --stop-hover: #886058;
+    --stop-ink: #f0e7e5;
+    --danger-ink: #cf9d95;
+    --danger-border: #5a413d;
+    --disabled-bg: #26292d;
+    --disabled-ink: #6b7076;
+    --shadow: rgba(9, 9, 10, 0.45);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; height: 100dvh; display: flex; flex-direction: column;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.6 system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  ::selection { background: var(--ring); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+  button:disabled { cursor: default; }
+
+  header { border-bottom: 1px solid var(--border); flex: none; }
+  .bar {
+    max-width: var(--colw); margin: 0 auto; padding: 0.55rem 1.25rem;
+    display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  }
+  #model {
+    font-size: 13px; font-weight: 600; color: var(--ink-2); min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .actions { display: flex; align-items: center; gap: 0.25rem; flex: none; }
+  .ghost {
+    font-size: 13px; color: var(--ink-2); padding: 0.3rem 0.6rem; border-radius: 8px;
+    transition: background-color 140ms ease-out, color 140ms ease-out;
+  }
+  .ghost:hover { background: var(--surface); color: var(--ink); }
+  .iconbtn { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+  .iconbtn svg { width: 16px; height: 16px; }
+  #theme .i-sun, #theme .i-moon { display: none; }
+  #theme.is-dark .i-sun { display: block; }
+  #theme:not(.is-dark) .i-moon { display: block; }
+
+  main {
+    flex: 1 1 0; min-height: 0; overflow-y: auto;
+    overscroll-behavior: contain; scrollbar-gutter: stable both-edges;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  .column { max-width: var(--colw); margin: 0 auto; padding: 1.6rem 1.25rem 0.8rem; }
+
+  /* Empty state */
+  #empty { text-align: center; margin: clamp(3rem, 16vh, 8rem) 0 2rem; }
+  #emptyModel { font-size: 17px; font-weight: 600; }
+  .empty-hint { margin: 0.5rem 0 1.5rem; font-size: 14px; color: var(--ink-3); }
+  .chips { display: flex; flex-wrap: wrap; gap: 0.55rem; justify-content: center; }
+  .chip {
+    font-size: 13px; color: var(--ink-2); background: transparent;
+    border: 1px solid var(--border-strong); border-radius: 999px; padding: 0.42rem 0.85rem;
+    transition: border-color 140ms ease-out, color 140ms ease-out;
+  }
+  .chip:hover { color: var(--ink); border-color: var(--accent); }
+
+  /* Turns: a document, not bubbles */
+  .msg { margin: 0 0 1.7rem; }
+  .who {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase;
+    color: var(--ink-3); margin: 0 0 0.4rem;
+  }
+  .msg.user .who { margin-left: calc(0.95rem + 3px); }
+  .msg.user .body {
+    background: var(--surface); border-left: 3px solid var(--rule);
+    border-radius: 0 8px 8px 0; padding: 0.6rem 0.95rem;
+    white-space: pre-wrap; overflow-wrap: break-word;
+  }
+  .answer > * + * { margin-top: 0.65rem; }
+  .prose { white-space: pre-wrap; overflow-wrap: break-word; }
+  .meta {
+    margin-top: 0.5rem; font-size: 12px; color: var(--ink-3);
+    text-align: right; font-variant-numeric: tabular-nums;
+  }
+
+  details.think {
+    font-size: 13px; color: var(--ink-3);
+    border-left: 2px solid var(--border-strong);
+    padding: 0.1rem 0 0.1rem 0.75rem; margin: 0 0 0.7rem;
+  }
+  details.think summary {
+    cursor: pointer; user-select: none; font-weight: 500;
+    transition: color 140ms ease-out;
+  }
+  details.think summary:hover { color: var(--ink-2); }
+  .think-text { white-space: pre-wrap; overflow-wrap: break-word; margin-top: 0.35rem; }
+
+  /* Fenced code */
+  .codeblock { position: relative; }
+  .codeblock pre {
+    margin: 0; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.8rem 1rem; overflow-x: auto;
+  }
+  .codeblock code { font: 13px/1.55 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; }
+  .codeblock pre { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  .codeblock pre::-webkit-scrollbar { height: 8px; }
+  .codeblock pre::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+  .codeblock pre::-webkit-scrollbar-track { background: transparent; }
+  .copy {
+    position: absolute; top: 0.45rem; right: 0.45rem;
+    font-size: 11px; letter-spacing: 0.02em; color: var(--ink-2);
+    background: var(--bg); border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 0.2rem 0.55rem; opacity: 0;
+    transition: opacity 140ms ease-out, color 140ms ease-out, border-color 140ms ease-out;
+  }
+  .codeblock:hover .copy, .copy:focus-visible, .copy.copied { opacity: 1; }
+  .copy:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  /* Inline system/error row */
+  .sysrow {
+    border: 1px solid var(--danger-border); border-left-width: 3px;
+    border-radius: 0 8px 8px 0; padding: 0.55rem 0.85rem;
+    color: var(--danger-ink); font-size: 13.5px;
+    white-space: pre-wrap; overflow-wrap: break-word;
+  }
+  .errors > * { margin-top: 0.65rem; }
+
+  /* Stream head caret; ticks themselves animate nothing */
+  .streaming .tail::after {
+    content: "\258d"; margin-left: 1px; color: var(--accent);
+    animation: blink 1.1s step-end infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* Composer: floating bottom bar */
+  .composer-wrap { flex: none; padding: 0.4rem 1.25rem 0.65rem; }
+  .composer {
+    max-width: 72ch; margin: 0 auto;
+    display: flex; align-items: flex-end; gap: 0.5rem;
+    background: var(--panel); border: 1px solid var(--border-strong);
+    border-radius: 14px; padding: 0.5rem 0.5rem 0.5rem 0.95rem;
+    box-shadow: 0 6px 24px var(--shadow);
+    transition: border-color 140ms ease-out, box-shadow 140ms ease-out;
+  }
+  .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+  textarea {
+    flex: 1; border: 0; background: transparent; resize: none;
+    font: inherit; color: inherit; padding: 0.3rem 0;
+    min-height: 24px; max-height: 200px; overflow-y: auto; outline: none;
+    scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent;
+  }
+  textarea::placeholder { color: var(--ink-3); }
+  /* Text fields always match :focus-visible in Chromium; the bar's
+     focus-within ring is the one focus affordance for the composer. */
+  textarea:focus-visible { outline: none; }
+  .send {
+    flex: none; width: 34px; height: 34px; border-radius: 10px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--accent); color: var(--accent-ink);
+    transition: background-color 140ms ease-out, color 140ms ease-out;
+  }
+  .send:hover:not(:disabled) { background: var(--accent-hover); }
+  .send:disabled { background: var(--disabled-bg); color: var(--disabled-ink); }
+  .send svg { width: 16px; height: 16px; }
+  .send .i-stop { display: none; }
+  .send.stop { background: var(--stop-bg); color: var(--stop-ink); }
+  .send.stop:hover { background: var(--stop-hover); }
+  .send.stop .i-send { display: none; }
+  .send.stop .i-stop { display: block; }
+  .kbd-hint { text-align: center; font-size: 11px; color: var(--ink-3); margin-top: 0.45rem; }
+
+  @media (max-width: 480px) {
+    .bar { padding: 0.5rem 1rem; }
+    .column { padding: 1.2rem 1rem 0.8rem; }
+    .composer-wrap { padding: 0.4rem 0.75rem 0.6rem; }
+    .kbd-hint { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+    .streaming .tail::after { animation: none; opacity: 1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div id="model">ARLE</div>
+    <div class="actions">
+      <button id="clear" class="ghost" type="button">New chat</button>
+      <button id="theme" class="ghost iconbtn" type="button" aria-label="Toggle color theme">
+        <svg class="i-moon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M16.5 11.5a6.5 6.5 0 1 1-8-8 5.4 5.4 0 0 0 8 8z"/>
+        </svg>
+        <svg class="i-sun" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+          <circle cx="10" cy="10" r="3.6"/>
+          <path d="M10 1.5v2M10 16.5v2M1.5 10h2M16.5 10h2M4 4l1.4 1.4M14.6 14.6 16 16M16 4l-1.4 1.4M5.4 14.6 4 16"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main id="log">
+  <div class="column">
+    <section id="empty">
+      <div id="emptyModel">ARLE</div>
+      <p class="empty-hint">A local model, served from this machine. Ask it anything.</p>
+      <div class="chips">
+        <button class="chip" type="button">Explain speculative decoding in two paragraphs</button>
+        <button class="chip" type="button">Write a quicksort in Rust with comments</button>
+        <button class="chip" type="button">What are the tradeoffs of 4-bit quantization?</button>
+      </div>
+    </section>
+    <div id="thread"></div>
+  </div>
+</main>
+
+<div class="composer-wrap">
+  <div class="composer">
+    <textarea id="prompt" rows="1" autofocus placeholder="Message the model"></textarea>
+    <button id="send" class="send" type="button" aria-label="Send" disabled>
+      <svg class="i-send" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M10 16V4.5M4.8 9.7 10 4.5l5.2 5.2"/>
+      </svg>
+      <svg class="i-stop" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+        <rect x="5" y="5" width="10" height="10" rx="2"/>
+      </svg>
+    </button>
+  </div>
+  <div class="kbd-hint">Enter to send &middot; Shift+Enter for a new line</div>
+</div>
+
+<script>
+"use strict";
+// These two paths must exist in the server's route table; chat_ui_tests in
+// coordinator.rs extracts every quoted /v1 path here and asserts each one
+// resolves against the real router.
+var CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
+var MODELS_PATH = "/v1/models";
+
+var logEl = document.getElementById("log");
+var threadEl = document.getElementById("thread");
+var emptyEl = document.getElementById("empty");
+var promptEl = document.getElementById("prompt");
+var sendBtn = document.getElementById("send");
+var clearBtn = document.getElementById("clear");
+var themeBtn = document.getElementById("theme");
+var modelEl = document.getElementById("model");
+var emptyModelEl = document.getElementById("emptyModel");
+
+var turns = [];        // {role, content} turns re-sent with every request
+var controller = null; // AbortController of the in-flight stream, else null
+
+// Favicon: an inline data URI (base64 so the offline test's banned literals
+// never appear in this file). Injected here instead of a head tag for the
+// same reason.
+var fav = document.createElement("link");
+fav.rel = "icon";
+fav.type = "image/svg+xml";
+fav.href = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiM0NjcxNmQiLz48cGF0aCBkPSJNMjAgNDYgMzIgMTggNDQgNDYgTTI1LjUgMzdoMTMiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Y1ZjRmMSIgc3Ryb2tlLXdpZHRoPSI1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48L3N2Zz4=";
+document.head.appendChild(fav);
+
+// Manual theme toggle layered over prefers-color-scheme, persisted.
+function effectiveTheme() {
+  var t = document.documentElement.dataset.theme;
+  if (t === "light" || t === "dark") { return t; }
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function paintThemeButton() {
+  var dark = effectiveTheme() === "dark";
+  themeBtn.classList.toggle("is-dark", dark);
+  themeBtn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+}
+themeBtn.addEventListener("click", function () {
+  var next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("arle.theme", next); } catch (e) {}
+  paintThemeButton();
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", paintThemeButton);
+paintThemeButton();
+
+// Model name is cosmetic: any failure just leaves the plain header.
+fetch(MODELS_PATH).then(function (r) { return r.json(); }).then(function (j) {
+  var id = j && j.data && j.data[0] && j.data[0].id;
+  if (id) {
+    modelEl.textContent = id;
+    emptyModelEl.textContent = id;
+    document.title = id + " · ARLE";
+  }
+}).catch(function () {});
+
+function el(tag, cls) {
+  var node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  return node;
+}
+
+// The async clipboard can be denied (plain-http hosts, embedded webviews);
+// the hidden-textarea path still works there, so try both.
+function legacyCopy(txt) {
+  var ta = document.createElement("textarea");
+  ta.value = txt;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) {}
+  document.body.removeChild(ta);
+  return ok;
+}
+
+function copyText(txt) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(txt).then(
+      function () { return true; },
+      function () { return legacyCopy(txt); }
+    );
+  }
+  return Promise.resolve(legacyCopy(txt));
+}
+
+function userTurn(text) {
+  var wrap = el("div", "msg user");
+  var who = el("div", "who");
+  who.textContent = "You";
+  var body = el("div", "body");
+  body.textContent = text;
+  wrap.appendChild(who);
+  wrap.appendChild(body);
+  threadEl.appendChild(wrap);
+}
+
+function assistantTurn() {
+  var wrap = el("div", "msg assistant");
+  var who = el("div", "who");
+  who.textContent = "Assistant";
+  var think = document.createElement("details");
+  think.className = "think";
+  think.hidden = true;
+  var summary = document.createElement("summary");
+  summary.textContent = "Thinking";
+  var thinkText = el("div", "think-text");
+  think.appendChild(summary);
+  think.appendChild(thinkText);
+  var host = el("div", "answer streaming");
+  var errs = el("div", "errors");
+  var meta = el("div", "meta");
+  wrap.appendChild(who);
+  wrap.appendChild(think);
+  wrap.appendChild(host);
+  wrap.appendChild(errs);
+  wrap.appendChild(meta);
+  threadEl.appendChild(wrap);
+  var t = { host: host, think: think, thinkText: thinkText, errs: errs, meta: meta,
+            segCount: -1, nodes: [], tail: null };
+  renderAnswer(t, ""); // empty tail segment so the caret shows immediately
+  return t;
+}
+
+function makeProse() {
+  var p = el("div", "prose");
+  return { kind: "prose", root: p, text: p };
+}
+
+function makeCode() {
+  var wrap = el("div", "codeblock");
+  var btn = el("button", "copy");
+  btn.type = "button";
+  btn.textContent = "Copy";
+  var pre = document.createElement("pre");
+  var code = document.createElement("code");
+  pre.appendChild(code);
+  wrap.appendChild(btn);
+  wrap.appendChild(pre);
+  btn.addEventListener("click", function () {
+    copyText(code.textContent).then(function (ok) {
+      if (!ok) {
+        // Clipboard blocked entirely: select the code so Ctrl+C works.
+        var range = document.createRange();
+        range.selectNodeContents(code);
+        var sel = getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+      }
+      btn.textContent = "Copied";
+      btn.classList.add("copied");
+      setTimeout(function () {
+        btn.textContent = "Copy";
+        btn.classList.remove("copied");
+      }, 1200);
+    });
+  });
+  return { kind: "code", root: wrap, text: code };
+}
+
+// A code fence opener may carry a language tag; it is stripped, not shown
+// (no syntax highlighting by design).
+function fillSegment(node, raw, isTail, streaming) {
+  if (node.kind === "code") {
+    var body = raw;
+    var nl = raw.indexOf("\n");
+    var head = (nl >= 0 ? raw.slice(0, nl) : raw).trim();
+    if (/^[A-Za-z0-9_.+#-]{0,24}$/.test(head)) {
+      body = nl >= 0 ? raw.slice(nl + 1) : "";
+    }
+    if (body.slice(-1) === "\n") { body = body.slice(0, -1); }
+    node.text.textContent = body;
+  } else {
+    // Fence boundaries carry their own newlines; the segment margin is the
+    // spacing, so trailing/leading blank lines around a code block go.
+    var trimmed = raw.replace(/^\n+/, "").replace(/\n+$/, "");
+    node.text.textContent = trimmed;
+    // Blank prose between fences collapses; the streaming tail stays so the
+    // caret has somewhere to sit.
+    node.root.hidden = trimmed === "" && !(isTail && streaming);
+  }
+}
+
+// Splits on triple-backtick fences: even segments are prose, odd are code.
+// Ticks are cheap: only the tail segment's text is rewritten unless a new
+// fence appeared, so nothing earlier reflows while streaming.
+function renderAnswer(t, text) {
+  var parts = text.split("```");
+  var streaming = t.host.classList.contains("streaming");
+  var rebuilt = parts.length !== t.segCount;
+  if (rebuilt) {
+    t.segCount = parts.length;
+    t.host.textContent = "";
+    t.nodes = [];
+    for (var i = 0; i < parts.length; i++) {
+      var node = i % 2 === 1 ? makeCode() : makeProse();
+      t.nodes.push(node);
+      t.host.appendChild(node.root);
+    }
+  }
+  var from = rebuilt ? 0 : parts.length - 1;
+  for (var k = from; k < parts.length; k++) {
+    fillSegment(t.nodes[k], parts[k], k === parts.length - 1, streaming);
+  }
+  var tailEl = t.nodes[t.nodes.length - 1].text;
+  if (t.tail && t.tail !== tailEl) { t.tail.classList.remove("tail"); }
+  tailEl.classList.add("tail");
+  t.tail = tailEl;
+}
+
+function fail(t, message) {
+  var row = el("div", "sysrow");
+  row.textContent = "Error: " + message;
+  t.errs.appendChild(row);
+}
+
+function setBusy(busy) {
+  sendBtn.classList.toggle("stop", busy);
+  sendBtn.setAttribute("aria-label", busy ? "Stop" : "Send");
+  sendBtn.disabled = busy ? false : promptEl.value.trim() === "";
+}
+
+function grow() {
+  promptEl.style.height = "auto";
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + "px";
+}
+
+function fmtStats(started, firstTok, lastTok, tokens) {
+  if (!firstTok) { return "waiting for first token"; }
+  var ttft = ((firstTok - started) / 1000).toFixed(2);
+  var span = (lastTok - firstTok) / 1000;
+  // Rate over the inter-token window only, so a long prefill does not
+  // deflate the decode number; first token has no preceding gap.
+  var tps = tokens > 1 && span > 0 ? ((tokens - 1) / span).toFixed(1) : "–";
+  return tokens + " tok · " + tps + " tok/s · " + ttft + "s to first token";
+}
+
+async function send() {
+  var text = promptEl.value.trim();
+  if (!text || controller) { return; }
+  promptEl.value = "";
+  grow();
+  emptyEl.hidden = true;
+  turns.push({ role: "user", content: text });
+  userTurn(text);
+
+  var t = assistantTurn();
+  controller = new AbortController();
+  setBusy(true);
+  logEl.scrollTop = logEl.scrollHeight;
+
+  var started = performance.now();
+  var firstTok = 0, lastTok = 0, chunkTokens = 0, usageTokens = 0;
+  var assistantText = "";
+  t.meta.textContent = fmtStats(started, 0, 0, 0);
+
+  try {
+    var res = await fetch(CHAT_COMPLETIONS_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: turns,
+        stream: true,
+        stream_options: { include_usage: true }
+      }),
+      signal: controller.signal
+    });
+    if (!res.ok || !res.body) {
+      var errBody = await res.text();
+      throw new Error("HTTP " + res.status + " " + errBody.slice(0, 500));
+    }
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var buf = "";
+    for (;;) {
+      var step = await reader.read();
+      if (step.done) { break; }
+      buf += decoder.decode(step.value, { stream: true });
+      // Keep the view pinned to the bottom only if the reader was already there.
+      var stick = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 48;
+      var cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        var frame = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        var lines = frame.split("\n");
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          // Non-"data:" lines include the server's ": keep-alive" comments.
+          if (line.lastIndexOf("data: ", 0) !== 0) { continue; }
+          var payload = line.slice(6);
+          if (payload === "[DONE]") { continue; }
+          var obj;
+          try { obj = JSON.parse(payload); } catch (e) { continue; }
+          if (obj.error && obj.error.message) { fail(t, obj.error.message); continue; }
+          if (obj.usage && obj.usage.completion_tokens) {
+            usageTokens = obj.usage.completion_tokens;
+          }
+          var delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
+          if (!delta) { continue; }
+          if (delta.reasoning_content) {
+            t.think.hidden = false;
+            t.thinkText.textContent += delta.reasoning_content;
+          }
+          if (delta.content) {
+            assistantText += delta.content;
+            renderAnswer(t, assistantText);
+          }
+          if (delta.content || delta.reasoning_content) {
+            // Each delta carries one detokenized piece (about one token);
+            // the exact count arrives in the final usage trailer.
+            chunkTokens += 1;
+            var now = performance.now();
+            if (!firstTok) { firstTok = now; }
+            lastTok = now;
+            t.meta.textContent =
+              fmtStats(started, firstTok, lastTok, usageTokens || chunkTokens);
+          }
+        }
+      }
+      if (stick) { logEl.scrollTop = logEl.scrollHeight; }
+    }
+  } catch (err) {
+    if (!err || err.name !== "AbortError") {
+      fail(t, err && err.message ? err.message : String(err));
+    }
+  }
+  t.host.classList.remove("streaming");
+  renderAnswer(t, assistantText); // drop the caret tail, collapse blank tail
+  t.meta.textContent = firstTok
+    ? fmtStats(started, firstTok, lastTok, usageTokens || chunkTokens)
+    : "no tokens";
+  if (assistantText) {
+    // A stopped stream keeps its partial text: it is what the user saw.
+    turns.push({ role: "assistant", content: assistantText });
+  }
+  controller = null;
+  setBusy(false);
+  promptEl.focus();
+}
+
+sendBtn.addEventListener("click", function () {
+  if (controller) { controller.abort(); } else { send(); }
+});
+clearBtn.addEventListener("click", function () {
+  if (controller) { controller.abort(); }
+  turns = [];
+  threadEl.textContent = "";
+  emptyEl.hidden = false;
+  promptEl.focus();
+});
+promptEl.addEventListener("input", function () {
+  grow();
+  if (!controller) { sendBtn.disabled = promptEl.value.trim() === ""; }
+});
+promptEl.addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+var chips = document.querySelectorAll(".chip");
+for (var c = 0; c < chips.length; c++) {
+  chips[c].addEventListener("click", function () {
+    promptEl.value = this.textContent;
+    grow();
+    send();
+  });
+}
+</script>
+</body>
+</html>

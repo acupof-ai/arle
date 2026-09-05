@@ -711,6 +711,106 @@ c=16 produced 131204 errors in 60 s with `[coordinator] lockstep stalled`. The
 TP lockstep proposal path deadlocks at world_size=1 — needs a TP=1 fast path
 before this arm is retried.
 
+## Qwen3.8-27B-Q4_K_M · Radeon 8060S (gfx1151) · Vulkan — STRIX HALO ANCHOR
+
+**`9bbc13eca` (2026-08-26)** — first Vulkan row. Batched coopmat prefill.
+`arle serve --backend vulkan`, `ARLE_VULKAN_PREFILL_CHUNK=256`, greedy.
+
+**Fingerprint additions for this box.** Beyond the usual list, an ARMOURY CRATE
+OPERATING MODE change re-anchors every row here. The same binary on the same
+file reads 37.0 tok/s prefill in Silent and 129.9 in Performance — 3.5x — and
+Silent additionally makes the chunk-width curve go FLAT, which reads as
+"saturated" and is not. Record the mode with every number. All rows below:
+**Performance mode, on AC**, `powercfg` scheme `27fa6203-…`.
+
+| metric | ARLE | llama.cpp `726704a16` | gap |
+| --- | ---: | ---: | ---: |
+| prefill (pp256) | 129.9 tok/s | 250.88 ± 2.91 | **1.93x** |
+| decode (tg128) | 8.81 tok/s | 12.50 ± 0.02 | **1.42x** |
+
+Same box, same GGUF, same Vulkan driver (26.7.1 LLPC), same session.
+llama.cpp run as `llama-bench -p 256,512 -n 128 -ngl 99 -fa 1`.
+
+Decode roofline is 256 GB/s ÷ 15.93 GiB = **15.0 tok/s** at one token per weight
+sweep. ARLE is at **59%** of it, llama.cpp at **83%** — so the decode gap is real
+headroom, not a wall.
+
+Prefill by chunk width (Performance; rises monotonically, do not read the Silent
+sweep which was flat):
+
+| width | 32 | 64 | 96 | 128 | 256 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tok/s | 86.9 | 113.4 | 113.9 | 124.3 | 125.9 |
+
+GEMM route A/B at width 256: coopmat 129.9 vs `mul_mmq` 81.2 = **1.60x**, routes
+agree token-for-token.
+
+### Device budget (this box, measured `vulkaninfo`)
+
+| heap | size | budget free | flags |
+| --- | ---: | ---: | --- |
+| 0 | 37.22 GiB | 35.36 GiB | (host) |
+| 1 | **74.43 GiB** | 70.71 GiB | DEVICE_LOCAL |
+
+An earlier entry recorded 63.6 GB unified; the device-local heap is 74.43 GiB.
+This is what decides whether a 63.65 GiB checkpoint fits.
+
+### llama.cpp reference rows on this box (not ARLE — competitor anchors)
+
+| model | size | pp512 | tg128 | pp4096+tg128 |
+| --- | ---: | ---: | ---: | ---: |
+| qwen35 27B Q8_0 (dense) | 26.62 GiB | 140.96 ± 4.32 | 7.24 ± 0.02 | — |
+| qwen35 27B Q8_0, KV q8_0 | 26.62 GiB | 132.87 ± 3.96 | 6.96 ± 0.04 | 80.88 ± 2.20 |
+| qwen35 27B Q8_0, **CPU** | 26.62 GiB | 13.38 ± 0.22 | — | — |
+| qwen35moe 35B.A3B Q4_K_M | 20.60 GiB | 822.71 ± 41.05 | 47.29 ± 0.41 | — |
+| qwen35moe 35B.A3B Q8_0 | 34.36 GiB | 735.74 ± 39.65 | 42.86 ± 0.51 | 325.95 ± 19.56 |
+| qwen35moe 122B.A10B Q4_K_M | 63.65 GiB | 200.28 ± 9.04 | 23.41 ± 0.19 | 162.72 ± 1.46 |
+
+Three things these rows say that a single pp512 number does not:
+
+- **The GPU is worth 10.5x over the CPU** on the same file (27B Q8_0, 140.96 vs
+  13.38 pp512) — worth remembering before blaming the Vulkan lane for anything.
+- **Long context costs 20-55%**: `pp4096+tg128` vs `pp512` is 445 -> 80.9 on the
+  dense 27B (KV q8_0) but only 200 -> 163 on the 122B MoE. The MoE degrades far
+  less, because its per-token cost is dominated by the active experts rather
+  than by attention over a longer prefix.
+- **KV `q8_0` is roughly free** (27B: 140.96 -> 132.87 pp512, -5.7%).
+
+### Quantization quality — 35B-A3B, wiki.test.raw, ctx 8192
+
+| quant | PPL | vs Q8_0 |
+| --- | ---: | ---: |
+| Q8_0 | 5.3646 +/- 0.04342 | — |
+| Q4_K_M | 5.3825 +/- 0.04361 | **+0.0179 (+0.33%)** |
+
+Q4_K_M costs a third of a percent of perplexity for 40% of the bytes. On a
+bandwidth-bound box that is not a trade-off, it is free money — which is why
+every ARLE row here is Q4_K_M.
+
+Raw logs preserved at `models/llamacpp-baselines/` (21.6 KB); the GGUFs they
+were measured on have since been deleted to reclaim disk, so these rows cannot
+be re-run without re-downloading.
+
+### Qwen3.5-122B-A10B · same box · Vulkan — MoE BRING-UP (2026-08-26)
+
+`332e345ba` — first load. Per-token prefill (the MoE lane has no batched path).
+
+| metric | ARLE | llama.cpp | gap |
+| --- | ---: | ---: | ---: |
+| decode | ~12.5 tok/s | 23.41 ± 0.19 | **1.87x** |
+| prefill | ~7.3 tok/s | 200.28 ± 9.04 | **27x** |
+
+The prefill gap is not a kernel problem: `forward_tokens_batched` and the
+resident-sequence prefix reuse are `Qwen35`-only arms
+(`crates/infer-vulkan/src/executor.rs:115-155`), so the MoE lane falls to the
+per-token GEMV loop the dense lane left behind in `2ff2672cc`. Wiring the MoE
+model into the existing batched path is the next lever and needs no new kernel.
+
+63.65 GiB of weights plan to ~63 GiB device-resident (MXFP4 kept packed) against
+the 74.43 GiB device-local heap.
+
+---
+
 ---
 
 # Training baselines — OPD writeback

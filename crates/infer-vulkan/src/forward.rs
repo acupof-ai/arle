@@ -65,8 +65,9 @@ use vulkan_kernels::{
     qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
     qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
     qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
-    qwen36_router_topk_params, rms_norm_dispatch, rms_norm_params, rope_neox_dispatch,
-    rope_neox_params, sigmoid_mul_dispatch, sigmoid_mul_params, swiglu_dispatch, swiglu_params,
+    qwen36_router_topk_params, rms_norm_dispatch, rms_norm_dispatch_rows, rms_norm_params,
+    rms_norm_params_rows, rope_neox_dispatch, rope_neox_params, sigmoid_mul_dispatch,
+    sigmoid_mul_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -133,13 +134,13 @@ impl Qwen35ForwardState {
 
 /// Bytes for the q8_1_x4 quantized form of an `ncols`-element activation vector
 /// (the shader groups 128 values into one x4 super-block of 4×36 B).
-fn q8_1_x4_bytes(ncols: usize) -> usize {
+pub(crate) fn q8_1_x4_bytes(ncols: usize) -> usize {
     let num_x4 = ncols.div_ceil(Q8_1_X4_VALUES_PER_GROUP as usize);
     num_x4 * 4 * BLOCK_Q8_1_BYTES
 }
 
 /// Round `n` up to the next multiple of `align` (a power-of-two device limit).
-fn align_up(n: usize, align: usize) -> usize {
+pub(crate) fn align_up(n: usize, align: usize) -> usize {
     if align == 0 {
         return n;
     }
@@ -169,12 +170,12 @@ pub const KV_CACHE_MAX_SEQ: usize = 8192;
 /// dispatch needs only the head's base offset. RoPE is applied to K at write
 /// time (matching the host cache contract); V is stored raw.
 pub struct DeviceKvCache<'a> {
-    buffer: DeviceBuffer<'a>,
+    pub(crate) buffer: DeviceBuffer<'a>,
     /// Byte offset of the V block (K block starts at 0).
     v_base: u64,
     head_dim: usize,
     /// Bytes per `(layer, kv_head)` `[max_seq, head_dim]` f16 plane.
-    plane_bytes: u64,
+    pub(crate) plane_bytes: u64,
     /// Bytes per `(layer)` slab (`n_kv_heads` planes).
     layer_bytes: u64,
 }
@@ -205,12 +206,12 @@ impl<'a> DeviceKvCache<'a> {
     }
 
     /// Byte offset of the K plane base for `(full_idx, kv_head)`.
-    fn k_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
+    pub(crate) fn k_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
         full_idx as u64 * self.layer_bytes + kv_head as u64 * self.plane_bytes
     }
 
     /// Byte offset of the V plane base for `(full_idx, kv_head)`.
-    fn v_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
+    pub(crate) fn v_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
         self.v_base + self.k_plane_off(full_idx, kv_head)
     }
 
@@ -225,7 +226,13 @@ impl<'a> DeviceKvCache<'a> {
     /// a host readback — the same `[K block | V block]` × `[layer, kv_head, pos,
     /// head_dim]` address math the host pack used, exposed so the on-device pack
     /// lands the row at the identical cache position.
-    fn row_dst(&self, full_idx: usize, kv_head: usize, pos: usize, is_v: bool) -> (u64, u64) {
+    pub(crate) fn row_dst(
+        &self,
+        full_idx: usize,
+        kv_head: usize,
+        pos: usize,
+        is_v: bool,
+    ) -> (u64, u64) {
         let plane = if is_v {
             self.v_plane_off(full_idx, kv_head)
         } else {
@@ -243,9 +250,9 @@ impl<'a> DeviceKvCache<'a> {
 
 /// One `(offset, len)` named slot inside the arena's backing buffer.
 #[derive(Clone, Copy)]
-struct Slot {
-    offset: u64,
-    len: usize,
+pub(crate) struct Slot {
+    pub(crate) offset: u64,
+    pub(crate) len: usize,
 }
 
 /// A single `DeviceLocal|HostVisible|HostCoherent` (UMA) buffer holding all the
@@ -266,6 +273,15 @@ struct Slot {
 /// killing the per-GEMV host round-trip that dominated decode.
 pub struct DeviceArena<'a> {
     buffer: DeviceBuffer<'a>,
+    /// HOST_CACHED staging for the ONE thing the host reads every token: the
+    /// `[vocab]` logits. `buffer` is write-combined — great for GPU access and
+    /// host writes, ~0.10 GB/s for host reads — so reading 970 KB of logits
+    /// straight out of it cost 10.04 ms per token, a third of the decode step,
+    /// and no GPU profile could see it because no dispatch is involved. A
+    /// device-to-device copy into cached memory (recorded into the command
+    /// buffer that was going to be submitted anyway) makes the same read
+    /// 0.023 ms. Sized to the widest GEMV output row, which IS the vocab row.
+    readback: DeviceBuffer<'a>,
     /// q8_1_x4 quantized activation.
     quant: Slot,
     /// f32 destination rows (widest GEMV output rows).
@@ -464,8 +480,11 @@ impl<'a> DeviceArena<'a> {
 
         let buffer = DeviceBuffer::alloc_uma(ctx, total)
             .map_err(|e| anyhow!("alloc GEMV device arena ({total} B): {e}"))?;
+        let readback = DeviceBuffer::alloc_host_cached(ctx, dst_len.max(4))
+            .map_err(|e| anyhow!("alloc host-cached readback ({dst_len} B): {e}"))?;
         Ok(Self {
             buffer,
+            readback,
             quant,
             dst,
             fuse0,
@@ -508,6 +527,22 @@ impl<'a> DeviceArena<'a> {
             .map_err(|e| anyhow!("write arena @{off}: {e}"))
     }
 
+    /// Read `len` f32 out of the HOST_CACHED [`Self::readback`] buffer, which
+    /// a prior [`Self::record_readback`] filled. Pair the two; reading without
+    /// the recorded copy returns whatever the last copy left behind.
+    fn read_staged(&self, len: usize) -> Result<Vec<f32>> {
+        let mut bytes = vec![0u8; len * std::mem::size_of::<f32>()];
+        self.readback
+            .copy_to_host(&mut bytes[..])
+            .map_err(|e| anyhow!("read staged logits: {e}"))?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+
     /// Read `len` f32 from the arena at byte `off` (UMA, no staging).
     fn read_at(&self, off: u64, len: usize) -> Result<Vec<f32>> {
         let mut bytes = vec![0u8; len * std::mem::size_of::<f32>()];
@@ -547,6 +582,9 @@ pub struct DecodeResources<'a> {
     pub arena: DeviceArena<'a>,
     pub cache: KernelCache<'a>,
     pub recorder: CommandRecorder<'a>,
+    /// Batched-prefill scratch (a whole token chunk per slot). Separate from the
+    /// one-token `arena` so the decode path is untouched.
+    pub(crate) prefill: crate::prefill::PrefillArena<'a>,
     /// Persistent storage-buffer descriptor-set layouts, one per binding count
     /// used on the decode path (2 = q8_1 quantize, 3 = rms_norm / swiglu / add,
     /// 5 = GEMV). Built once; the rings allocate their sets against them. Kept
@@ -557,38 +595,38 @@ pub struct DecodeResources<'a> {
     /// [`DescriptorSetRing::next_updated`] only runs `vkUpdateDescriptorSets` on a
     /// pre-allocated set — no per-dispatch `VkDescriptorPool` create/destroy
     /// (perf-parity Step 5a). Reset per token via [`Self::reset_rings`].
-    ring2: DescriptorSetRing<'a>,
-    ring3: DescriptorSetRing<'a>,
+    pub(crate) ring2: DescriptorSetRing<'a>,
+    pub(crate) ring3: DescriptorSetRing<'a>,
     /// 4-binding ring for the depthwise conv1d ([XSeq, ConvWeight, ConvState,
     /// OutSeq]). One dispatch per linear layer.
-    ring4: DescriptorSetRing<'a>,
-    ring5: DescriptorSetRing<'a>,
+    pub(crate) ring4: DescriptorSetRing<'a>,
+    pub(crate) ring5: DescriptorSetRing<'a>,
     /// 6-binding ring for the fused MoE `mul_mat_vec_id` ([A,B,D,F0,F1,IDS]).
-    ring6: DescriptorSetRing<'a>,
+    pub(crate) ring6: DescriptorSetRing<'a>,
     /// 7-binding ring for flash-attn ([Q,K,V,M,S,O,MO]) AND the gated-delta net
     /// ([Qkv,BProj,AProj,DtBias,ALog,State,Output]). Both record one dispatch per
     /// submit on the linear path; the full-attn records one per query head, so it
     /// is sized to `num_attention_heads`.
-    ring7: DescriptorSetRing<'a>,
+    pub(crate) ring7: DescriptorSetRing<'a>,
     /// Per-slot full-attention KV cache (device-resident f16). RoPE is applied to
     /// K at write time; V is stored raw. flash-attn reads each head's plane.
-    kv_cache: DeviceKvCache<'a>,
+    pub(crate) kv_cache: DeviceKvCache<'a>,
     /// Persistent device-resident gated-delta linear-attention state, one block
     /// per LINEAR layer (the conv ring + the recurrent S matrix). Resident across
     /// tokens, read+written each token by the conv / gated-delta dispatches;
     /// zeroed for a fresh generation via [`Self::reset_linear_state`]. Sized
     /// `[n_linear * qkv_dim * (kernel-1)]` and `[n_linear * nv * kd * vd]` f32.
-    lin_conv_state: DeviceBuffer<'a>,
-    lin_gdr_state: DeviceBuffer<'a>,
+    pub(crate) lin_conv_state: DeviceBuffer<'a>,
+    pub(crate) lin_gdr_state: DeviceBuffer<'a>,
     /// Per-linear-layer byte strides into the two state buffers above.
-    lin_conv_stride: u64,
-    lin_gdr_stride: u64,
+    pub(crate) lin_conv_stride: u64,
+    pub(crate) lin_gdr_stride: u64,
     /// Lightweight per-call accumulators (nanoseconds) so a decode loop can
     /// attribute time between the GPU GEMV submits and the surrounding host
     /// prep/readback. Drained + printed via [`Self::take_profile`].
     gemv_submit_ns: u128,
     gemv_other_ns: u128,
-    gemv_count: u64,
+    pub(crate) gemv_count: u64,
 }
 
 impl<'a> DecodeResources<'a> {
@@ -694,10 +732,19 @@ impl<'a> DecodeResources<'a> {
         zero_device_buffer(&mut lin_conv_state, conv_total as usize)?;
         zero_device_buffer(&mut lin_gdr_state, gdr_total as usize)?;
 
+        // Batched-prefill scratch: one whole token chunk per activation slot.
+        // Separate from `arena` because `widest_gemv` folds in `vocab_size`
+        // (151936), and scaling THAT by the chunk width would allocate GBs for a
+        // quantize slot the batched path never uses — the LM head runs on the
+        // last token only, through the decode arena.
+        let prefill =
+            crate::prefill::PrefillArena::new(ctx, config, crate::prefill::prefill_chunk_tokens())?;
+
         Ok(Self {
             arena,
             cache,
             recorder,
+            prefill,
             _layouts: vec![l2, l3, l4, l5, l6, l7],
             ring2,
             ring3,
@@ -1053,7 +1100,7 @@ fn forward_layers_resident<'a>(
 /// `[vocab]` rows read back. The end-of-token boundary is the only host
 /// dependency, so collapsing the standalone norm submit + the GEMV submit into
 /// one saves a submit/token (perf-parity Step 4).
-fn final_norm_lm_head<'a>(
+pub(crate) fn final_norm_lm_head<'a>(
     ctx: &'a VulkanContext,
     weights: &ResidentWeights<'_>,
     res: &mut DecodeResources<'a>,
@@ -1116,13 +1163,28 @@ fn final_norm_lm_head<'a>(
         normed_off,
         dst_off,
     )?;
+    // Stage the logits into HOST_CACHED memory on the way out: this rides the
+    // submit that was already going to happen, and turns the host read below
+    // from 10.04 ms into 0.023 ms.
+    {
+        let DecodeResources {
+            recorder, arena, ..
+        } = &mut *res;
+        recorder.copy_buffer(
+            &arena.buffer,
+            dst_off,
+            &arena.readback,
+            0,
+            (vocab * std::mem::size_of::<f32>()) as u64,
+        );
+    }
     let t_submit = std::time::Instant::now();
     res.recorder
         .submit_and_wait()
         .map_err(|e| anyhow!("final_norm: submit: {e}"))?;
     let submit_ns = t_submit.elapsed().as_nanos();
 
-    let logits = res.arena.read_at(dst_off, vocab)?;
+    let logits = res.arena.read_staged(vocab)?;
     let total_ns = t_start.elapsed().as_nanos();
     res.gemv_submit_ns += submit_ns;
     res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
@@ -1271,12 +1333,23 @@ fn record_full_attention<'a>(
     )?;
     res.recorder.barrier();
     res.gemv_count += 3;
-    for hh in 0..nq {
-        // query half of head hh in q_full (stride 2*hd): bytes [hh*2*hd .. +hd].
-        let qsrc = qkv_off + (hh * 2 * hd) as u64 * f32_b;
-        let qdst = q_off + (hh * hd) as u64 * f32_b;
-        record_rms_norm(ctx, res, &q_norm.buffer, "attn_q_norm", hd, eps, qsrc, qdst)?;
-    }
+    // One dispatch for ALL query heads: head `hh`'s query half sits at
+    // `hh * 2*hd` in the interleaved `[query|gate]` block, so a `2*hd` source
+    // row stride extracts it and the result lands packed at `hh * hd`. This was
+    // a per-head loop; see `record_rms_norm_rows` for why the dispatch COUNT
+    // was the thing that mattered.
+    record_rms_norm_rows(
+        ctx,
+        res,
+        &q_norm.buffer,
+        "attn_q_norm",
+        hd,
+        nq,
+        2 * hd,
+        eps,
+        qkv_off,
+        q_off,
+    )?;
     res.recorder.barrier();
     for hh in 0..nq {
         let qdst = q_off + (hh * hd) as u64 * f32_b;
@@ -1292,10 +1365,20 @@ fn record_full_attention<'a>(
             qdst,
         )?;
     }
-    for hh in 0..nkv {
-        let ksrc = k_off + (hh * hd) as u64 * f32_b;
-        record_rms_norm(ctx, res, &k_norm.buffer, "attn_k_norm", hd, eps, ksrc, ksrc)?;
-    }
+    // In-place is safe here: the K heads are already packed, so
+    // `src_row_stride == ncols` and no row reads another row's output.
+    record_rms_norm_rows(
+        ctx,
+        res,
+        &k_norm.buffer,
+        "attn_k_norm",
+        hd,
+        nkv,
+        hd,
+        eps,
+        k_off,
+        k_off,
+    )?;
     res.recorder.barrier();
     for hh in 0..nkv {
         let kdst = k_off + (hh * hd) as u64 * f32_b;
@@ -1386,7 +1469,7 @@ pub fn set_submit_cap(cap: usize) {
     }
 }
 
-fn submit_dispatch_cap() -> usize {
+pub(crate) fn submit_dispatch_cap() -> usize {
     SUBMIT_DISPATCH_CAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1678,11 +1761,21 @@ fn record_linear_attention<'a>(
     // conv→gdr chain consumed it; qkv_dim ≥ v_dim_total so it fits).
     let gated_normed_off = res.arena.lin_qkv_conv.offset;
     res.recorder.barrier(); // gated-norm reads the gdr Output written above.
-    for vh in 0..nv {
-        let src = out_off + (vh * vd) as u64 * std::mem::size_of::<f32>() as u64;
-        let dst = gated_normed_off + (vh * vd) as u64 * std::mem::size_of::<f32>() as u64;
-        record_rms_norm(ctx, res, ssm_norm_buf, "ssm_norm", vd, eps, src, dst)?;
-    }
+    // `nv` value heads in one dispatch — 64 of them per linear layer on the
+    // 122B, and there are 36 linear layers, so this loop alone was 2304 of the
+    // 2809 `norm` dispatches per token.
+    record_rms_norm_rows(
+        ctx,
+        res,
+        ssm_norm_buf,
+        "ssm_norm",
+        vd,
+        nv,
+        vd,
+        eps,
+        out_off,
+        gated_normed_off,
+    )?;
     res.recorder.barrier(); // the swiglu reads every head's normed output + z.
     // out = silu(z) * normed over [v_dim_total]; reuse lin_out for the result.
     record_swiglu(
@@ -1727,7 +1820,7 @@ fn record_linear_attention<'a>(
 /// residency), checking it holds at least `len` f32. The conv1d weight, `ssm_a`,
 /// and `ssm_dt.bias` are stored on-device as plain f32 in the exact layout the
 /// `qwen35_*` shaders bind, so they bind directly with no host round-trip.
-fn ssm_weight_buffer<'b>(
+pub(crate) fn ssm_weight_buffer<'b>(
     weights: &'b ResidentWeights<'_>,
     layer: usize,
     suffix: &str,
@@ -1925,7 +2018,7 @@ fn record_gemv_only<'a>(
 /// `dims = [ne0=in, ne1=out]` and the bytes are row-major `[out, in]`, which is
 /// exactly the GEMV's `[nrows, ncols]` contract. The loader records these at
 /// upload time ([`DeviceTensor::gemv_dims`]).
-fn weight_dims(weight: &DeviceTensor<'_>, name: &str) -> Result<(usize, usize)> {
+pub(crate) fn weight_dims(weight: &DeviceTensor<'_>, name: &str) -> Result<(usize, usize)> {
     weight
         .gemv_dims
         .ok_or_else(|| anyhow!("{name}: resident tensor has no GEMV dims recorded"))
@@ -1947,6 +2040,7 @@ fn gemv_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
         GgmlType::Q5K => Kernel::GemvQ5K,
         GgmlType::Q6K => Kernel::GemvQ6K,
         GgmlType::Q8_0 => Kernel::GemvQ8_0,
+        GgmlType::Mxfp4 => Kernel::GemvMxfp4,
         other => bail!("{name}: no registered GEMV kernel for packed type {other:?}"),
     })
 }
@@ -1966,6 +2060,7 @@ fn gemv_id_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
         GgmlType::Q5K => Kernel::GemvIdQ5K,
         GgmlType::Q6K => Kernel::GemvIdQ6K,
         GgmlType::Q8_0 => Kernel::GemvIdQ8_0,
+        GgmlType::Mxfp4 => Kernel::GemvIdMxfp4,
         other => bail!("{name}: no registered fused expert GEMV for packed type {other:?}"),
     })
 }
@@ -2111,6 +2206,76 @@ fn record_gemv_id<'a>(
 /// `[ncols]` row: input from arena byte `in_off`, weight from the device tensor
 /// `w_buf` sub-range, output to arena byte `out_off`. Bindings 0=A(in), 1=B(w),
 /// 2=D(out); spec `do_multiply=1`; push = [`rms_norm_params`]; one workgroup.
+/// Multi-row RMSNorm on the DECODE arena: `nrows` independent rows of `ncols`,
+/// row `r` read at `r * src_row_stride` and written PACKED at `r * ncols`.
+/// In-place is safe only when `src_row_stride == ncols`.
+///
+/// This is the per-head loop collapsed into ONE dispatch, and it is the single
+/// biggest lever on decode wall-clock. The loops it replaces issued one
+/// dispatch per head — 2809 `norm` dispatches per token on the 122B — each
+/// occupying a single workgroup on a 20-WGP part and costing ~3.37 us of HOST
+/// command recording. That host time is pure idle for the memory link: the
+/// GEMVs already stream at ~81% of DRAM peak, so the loss was never bandwidth,
+/// it was duty cycle (the link sat idle 47% of a decode step).
+///
+/// `src_row_stride > ncols` extracts a strided sub-block for free, which is what
+/// the `[query|gate]`-interleaved q projection needs. Mirrors
+/// [`crate::prefill`]'s `pf_rms_norm_rows`; the two differ only in which buffer
+/// they bind (decode uses the arena, prefill its own chunk scratch).
+#[allow(clippy::too_many_arguments)]
+fn record_rms_norm_rows<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    w_buf: &DeviceBuffer<'_>,
+    name: &str,
+    ncols: usize,
+    nrows: usize,
+    src_row_stride: usize,
+    eps: f32,
+    in_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    debug_assert!(
+        src_row_stride >= ncols,
+        "{name}: src_row_stride {src_row_stride} < ncols {ncols}"
+    );
+    let push =
+        rms_norm_params_rows(ncols as u32, nrows as u32, src_row_stride as u32, eps).to_le_bytes();
+    let groups = {
+        let d = rms_norm_dispatch_rows(nrows as u32);
+        [d.x, d.y, d.z]
+    };
+    let src_bytes = (nrows * src_row_stride * 4) as u64;
+    let dst_bytes = (nrows * ncols * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(
+            ctx,
+            Kernel::RmsNorm,
+            Kernel::RmsNorm.specialization_u32(),
+            push.len() as u32,
+            3,
+        )
+        .map_err(|e| anyhow!("{name}: build rms_norm pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, in_off, src_bytes),
+            (w_buf, 0, w_buf.len() as u64),
+            (arena_buf, out_off, dst_bytes),
+        ])
+        .map_err(|e| anyhow!("{name}: bind rms_norm ring set: {e}"))?;
+    recorder.label_next("norm");
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
 fn record_rms_norm<'a>(
     ctx: &'a VulkanContext,
     res: &mut DecodeResources<'a>,
@@ -2476,7 +2641,7 @@ fn record_f16_kv_pack<'a>(
 /// Fetch a per-layer F32-resident norm weight tensor (`attn_q_norm` /
 /// `attn_k_norm`), erroring if missing or not F32-resident. The device rms_norm
 /// binds its `.buffer` directly (head_dim-wide, broadcast across heads).
-fn packed_or_f32_norm<'w>(
+pub(crate) fn packed_or_f32_norm<'w>(
     weights: &'w ResidentWeights<'_>,
     layer: usize,
     suffix: &str,
@@ -2496,7 +2661,7 @@ fn packed_or_f32_norm<'w>(
 
 /// Fetch a per-layer packed-quant weight tensor, erroring if it is missing or
 /// F32-resident (the dense FFN weights are always packed quant).
-fn packed_layer_weight<'w>(
+pub(crate) fn packed_layer_weight<'w>(
     weights: &'w ResidentWeights<'_>,
     layer: usize,
     suffix: &str,
@@ -2702,6 +2867,22 @@ fn record_router_gemv<'a>(
 /// `weights_off`. Single-thread kernel; all three buffers are arena. 3-binding →
 /// `ring3`.
 #[allow(clippy::too_many_arguments)]
+/// Lanes in `qwen36_router_topk.comp` (`#define BLOCK 256`). Each lane now walks
+/// a STRIDE of experts, so this is no longer the expert ceiling — but the
+/// ceiling is still finite: the shader tracks which of a lane's strides are
+/// already selected in a 32-bit `taken` bitmask, so it holds at most 32 strides.
+/// `1u << stride` with `stride >= 32` is undefined in GLSL and would corrupt
+/// selection silently, which is exactly the failure this constant exists to
+/// prevent.
+const QWEN36_ROUTER_TOPK_BLOCK: usize = 256;
+
+/// Largest `n_expert` the strided shader can score: 32 strides of `BLOCK`.
+const QWEN36_ROUTER_TOPK_MAX_EXPERTS: usize = 32 * QWEN36_ROUTER_TOPK_BLOCK;
+
+/// `shared int sel[64]` in the shader. Nothing checks `top_k` against it, and
+/// overrunning it is an out-of-bounds shared-memory write, not an error.
+const QWEN36_ROUTER_TOPK_MAX_K: usize = 64;
+
 fn record_router_topk<'a>(
     ctx: &'a VulkanContext,
     res: &mut DecodeResources<'a>,
@@ -2713,6 +2894,18 @@ fn record_router_topk<'a>(
     ids_off: u64,
     weights_off: u64,
 ) -> Result<()> {
+    // Both caps are silent when exceeded, which is why they are checked here
+    // rather than trusted: past `MAX_EXPERTS` the shader's `taken` bitmask
+    // overflows and selection is corrupted; past `MAX_K` it writes off the end
+    // of `shared int sel[64]`.
+    anyhow::ensure!(
+        n_expert <= QWEN36_ROUTER_TOPK_MAX_EXPERTS,
+        "{name}: router top-k shader scores at most {QWEN36_ROUTER_TOPK_MAX_EXPERTS}          experts (32 strides of {QWEN36_ROUTER_TOPK_BLOCK}), got {n_expert}"
+    );
+    anyhow::ensure!(
+        top_k <= QWEN36_ROUTER_TOPK_MAX_K,
+        "{name}: router top-k shader holds at most {QWEN36_ROUTER_TOPK_MAX_K} selected          experts (`shared int sel[64]`), got top_k {top_k}"
+    );
     let spec = Kernel::Qwen36RouterTopk.specialization_u32();
     let push = qwen36_router_topk_params(n_expert as u32, top_k as u32, norm_topk).to_le_bytes();
     let groups = {

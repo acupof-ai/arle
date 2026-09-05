@@ -6,4 +6,5 @@
 pub mod deepseek4;
 pub mod dequant;
 pub mod gguf;
+pub mod safetensors;
 pub mod tokenizer;

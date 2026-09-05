@@ -178,13 +178,30 @@ pub(crate) fn run_captured(
 fn kill_group(pgid: i32) {
     // Never signal our own group: a mis-derived pgid must not SIGKILL the
     // caller's session (observed under `cargo test -p train --features cuda`).
+    #[cfg(unix)]
     // SAFETY: getpgrp takes no arguments and cannot fail.
     if pgid <= 1 || pgid == unsafe { libc::getpgrp() } {
         return;
     }
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("-{pgid}"))
+    #[cfg(not(unix))]
+    if pgid <= 1 {
+        return;
+    }
+    // Windows has no process groups to signal; taskkill /T walks the child tree,
+    // which is what the negative-pgid SIGKILL achieves on POSIX.
+    #[cfg(not(unix))]
+    let mut cmd = {
+        let mut c = Command::new("taskkill");
+        c.arg("/F").arg("/T").arg("/PID").arg(pgid.to_string());
+        c
+    };
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = Command::new("kill");
+        c.arg("-KILL").arg(format!("-{pgid}"));
+        c
+    };
+    let _ = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

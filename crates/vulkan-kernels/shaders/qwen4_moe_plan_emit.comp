@@ -1,0 +1,104 @@
+#version 450
+// Grouped-MoE device planner, pass 3 of 3: the scatter map + expert-id lists.
+//
+// With pass 2's prefixes in hand every pair's gathered row is CLOSED-FORM,
+// so this pass is embarrassingly parallel and still element-for-element equal
+// to the host oracle (`plan_moe_groups`). The pinned intra-expert order is
+// ARRIVAL order in the token-major scan (token ascending, slot ascending
+// within a token): pair `pr`'s rank is |{pr' < pr with the same expert}| —
+// computed here by a direct rescan of the ids (pairs <= a few thousand, and
+// the whole region is L1-resident), which makes the order a property of the
+// INDEX, not of any atomic race.
+//
+// Rank r of expert e (c = counts[e], nfull = c / CAP) then lands at:
+//   r <  nfull*CAP: class CAP, block fullb[e] + r/CAP, position r%CAP
+//   r >= nfull*CAP: class c%CAP, block remb[c%CAP][e], position r - nfull*CAP
+//   row = pair_base[class] + block * class + position
+// where `pair_base`/`list_base` are the FIXED per-class region bases the host
+// computes from (pairs, E) alone — record-time constants, which is what lets
+// the grouped GEMV keep record-time descriptor offsets while the block
+// counts stay on device (only the dispatch y extent is indirect).
+//
+// The same launch also writes the class-major expert-id lists (one lane per
+// expert): expert `e`'s full blocks at list_base[CAP] + fullb[e].., its
+// remainder block at list_base[rem] + remb[rem][e]. List entries past a
+// class's block total are left STALE deliberately — no dispatch reads past
+// its indirect y extent.
+
+#define CAP 8u
+#define BLOCK 256
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ids { int ids[]; };
+layout(binding = 1) readonly buffer Plan { uint plan[]; };
+layout(binding = 2) writeonly buffer Scatter { uint scatter[]; };
+layout(binding = 3) writeonly buffer List { int list[]; };
+
+layout(push_constant) uniform Push {
+    uint pairs;
+    uint top_k;
+    uint ids_stride;
+    uint n_experts;
+    uvec4 pair_base_lo; // pair row base of classes 1..4 (component w-1)
+    uvec4 pair_base_hi; // classes 5..8
+    uvec4 list_base_lo; // id-list element base of classes 1..4
+    uvec4 list_base_hi; // classes 5..8
+} p;
+
+uint pair_base(uint w) {
+    return w <= 4u ? p.pair_base_lo[w - 1u] : p.pair_base_hi[w - 5u];
+}
+
+uint list_base(uint w) {
+    return w <= 4u ? p.list_base_lo[w - 1u] : p.list_base_hi[w - 5u];
+}
+
+int pair_id(uint pr) {
+    return ids[(pr / p.top_k) * p.ids_stride + (pr % p.top_k)];
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint E = p.n_experts;
+
+    if (gid < p.pairs) {
+        const int id = pair_id(gid);
+        if (id >= 0 && uint(id) < E) {
+            const uint e = uint(id);
+            uint r = 0u;
+            for (uint q = 0u; q < gid; ++q) {
+                if (pair_id(q) == id) {
+                    ++r;
+                }
+            }
+            const uint c = plan[e];
+            const uint nfull = c / CAP;
+            uint w;
+            uint blk;
+            uint pos;
+            if (r < nfull * CAP) {
+                w = CAP;
+                blk = plan[E + e] + r / CAP;
+                pos = r % CAP;
+            } else {
+                w = c % CAP;
+                blk = plan[2u * E + w * E + e];
+                pos = r - nfull * CAP;
+            }
+            scatter[gid] = pair_base(w) + blk * w + pos;
+        }
+    }
+
+    if (gid < E) {
+        const uint c = plan[gid];
+        const uint nfull = c / CAP;
+        const uint fullb = plan[E + gid];
+        for (uint k = 0u; k < nfull; ++k) {
+            list[list_base(CAP) + fullb + k] = int(gid);
+        }
+        const uint rem = c % CAP;
+        if (rem != 0u) {
+            list[list_base(rem) + plan[2u * E + rem * E + gid]] = int(gid);
+        }
+    }
+}

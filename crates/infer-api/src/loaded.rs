@@ -756,7 +756,6 @@ mod backend {
                 Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("offload_engine_weights is only available on CUDA")
                 }
-                #[cfg(feature = "metal")]
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
                     anyhow::bail!("offload_engine_weights is only available on CUDA")
@@ -821,7 +820,6 @@ mod backend {
                 Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("reload_engine_weights is only available on CUDA")
                 }
-                #[cfg(feature = "metal")]
                 #[cfg(feature = "vulkan")]
                 Self::Vulkan(_) => {
                     anyhow::bail!("reload_engine_weights is only available on CUDA")
@@ -2276,14 +2274,33 @@ mod backend {
             !config.kv_ssd_requested(),
             "--kv-disk: the Vulkan backend has no KV tier store"
         );
-        let gguf_path = resolve_gguf_path(model_path, "Vulkan")?;
-        let tokenizer_dir = gguf_path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map_or_else(
-                || std::path::PathBuf::from("."),
-                std::path::Path::to_path_buf,
-            );
+        // A directory with config.json + *.safetensors is a qwen4_exp
+        // checkpoint: hand the DIRECTORY to the loader (whose dir arm routes
+        // to load_qwen4_dir) instead of demanding a .gguf that will never
+        // exist for this model. Everything else keeps the GGUF contract.
+        let path = std::path::Path::new(model_path);
+        let is_safetensors_dir = path.is_dir()
+            && path.join("config.json").is_file()
+            && std::fs::read_dir(path).is_ok_and(|rd| {
+                rd.filter_map(std::result::Result::ok).any(|e| {
+                    e.path()
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
+                })
+            });
+        let (gguf_path, tokenizer_dir) = if is_safetensors_dir {
+            (path.to_path_buf(), path.to_path_buf())
+        } else {
+            let gguf = resolve_gguf_path(model_path, "Vulkan")?;
+            let tok = gguf
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map_or_else(
+                    || std::path::PathBuf::from("."),
+                    std::path::Path::to_path_buf,
+                );
+            (gguf, tok)
+        };
         let tokenizer = OpenAiTokenizer::from_model_dir(&tokenizer_dir)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);
 

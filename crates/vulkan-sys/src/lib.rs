@@ -46,6 +46,238 @@ impl std::fmt::Display for VulkanError {
 
 impl std::error::Error for VulkanError {}
 
+/// Round `value` up to the next multiple of `alignment` (a power of two).
+fn align_up(value: u64, alignment: u64) -> u64 {
+    debug_assert!(
+        alignment.is_power_of_two(),
+        "alignment must be a power of 2"
+    );
+    value.div_ceil(alignment) * alignment
+}
+
+/// Smallest slab a [`SlabAllocator`] will fall back to under heap pressure.
+///
+/// The floor exists because shrinking slabs trades one scarce resource for
+/// another: at 64 MiB a 71 GiB residency still needs only 71 GiB / 64 MiB =
+/// 1136 `vkAllocateMemory` calls, inside the 4096 that `maxMemoryAllocationCount`
+/// is *guaranteed* to allow on any conformant device. Halving past this point
+/// would start racing that limit instead of the size limit.
+pub const MIN_SLAB_BYTES: u64 = 64 << 20;
+
+/// Where a [`SlabAllocator`]'s slabs live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlabMemory {
+    /// `DEVICE_LOCAL`, not host-mappable. The right home for resident weights:
+    /// written once through staging, then only ever read by the GPU.
+    DeviceLocal,
+    /// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`, falling back to plain
+    /// host-visible. On a UMA part the big device-local heap is mappable, so
+    /// the loader can write weights straight into the slab with no staging
+    /// copy. Note the memory is WRITE-COMBINED: host *writes* run at full
+    /// speed, host *reads* do not (see [`DeviceBuffer::alloc_host_cached`]).
+    Uma,
+}
+
+/// One suballocation: which slab, at what byte offset, for how many bytes.
+///
+/// `offset` already honours the plan's alignment, so it goes straight into
+/// [`DescriptorSet::storage_buffers_ranged`] as a descriptor offset — a
+/// slab-backed tensor binds as `(slab buffer, offset, len)` with no copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlabAlloc {
+    slab: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl SlabAlloc {
+    /// Index of the owning slab, for [`SlabAllocator::slab`].
+    pub fn slab(&self) -> usize {
+        self.slab
+    }
+
+    /// Byte offset within the slab buffer; aligned, bindable as-is.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// One past the last byte, within the slab.
+    pub fn end(&self) -> u64 {
+        self.offset + self.len
+    }
+}
+
+/// The placement arithmetic behind [`SlabAllocator`], with no device attached.
+///
+/// [`SlabAllocator`] drives its allocations through this exact type, so a
+/// dry-run plan and the real residency cannot drift apart. Alone, it answers
+/// "does this checkpoint fit, and in how many allocations?" before a byte of
+/// GPU memory is touched.
+///
+/// The constraint that forces slabs is `maxMemoryAllocationSize`: one
+/// `vkAllocateMemory` may not exceed it, and this driver reports 2 GiB
+/// (measured), so a 71 GiB model has no single-buffer form. The other Vulkan
+/// cap, `maxMemoryAllocationCount`, is often quoted as the reason too — its
+/// spec-guaranteed floor is 4096, against 296 475 tensors here — but it is NOT
+/// binding on this part: the 8060S driver reports 4294967295 (measured). Treat
+/// the count as a portability constraint and the size as the local one.
+///
+/// Placement is first-fit across every open slab, not a bump pointer into the
+/// newest one. That matters: a slab holds five 400 MB PLE shards and no more,
+/// so a newest-slab-only bump strands a 147 MB tail (6.9%) in every slab it
+/// touches. First-fit gives those tails to the small tensors that dominate the
+/// checkpoint by count.
+///
+/// **Feed it largest-first if you can.** Measured over all 296 475 tensors of
+/// the qwen4_exp checkpoint at a 2 GiB slab size (122.75 GiB placeable):
+///
+/// ```text
+///   floor (ceil(bytes/slab))         62 slabs
+///   arrival order, first-fit         64 slabs   4.10% waste
+///   arrival order, best-fit          64 slabs   4.10% waste
+///   largest-first, first-fit         62 slabs   1.01% waste
+/// ```
+///
+/// Best-fit buys nothing over first-fit, which is why the cheaper scan is the
+/// one implemented; the ordering is where the two slabs are. A loader that
+/// knows all its tensor sizes up front should sort descending before placing.
+#[derive(Debug, Clone)]
+pub struct SlabPlan {
+    slab_size: u64,
+    alignment: u64,
+    /// `(capacity, bump cursor)` per slab, in allocation order. Capacity is
+    /// per-slab rather than global because a real slab can come back smaller
+    /// than nominal when the heap is nearly full.
+    slabs: Vec<(u64, u64)>,
+    used: u64,
+}
+
+impl SlabPlan {
+    /// `slab_size` is the nominal size of a fresh slab (cap it at the device's
+    /// `maxMemoryAllocationSize`); `alignment` must be a power of two and at
+    /// least the device's `minStorageBufferOffsetAlignment`.
+    pub fn new(slab_size: u64, alignment: u64) -> Result<Self> {
+        if slab_size == 0 {
+            return Err(VulkanError::Runtime(
+                "slab size must be non-zero".to_string(),
+            ));
+        }
+        if !alignment.is_power_of_two() {
+            return Err(VulkanError::Runtime(format!(
+                "slab alignment {alignment} is not a power of two"
+            )));
+        }
+        if alignment > slab_size {
+            return Err(VulkanError::Runtime(format!(
+                "slab alignment {alignment} exceeds slab size {slab_size}"
+            )));
+        }
+        Ok(Self {
+            slab_size,
+            alignment,
+            slabs: Vec::new(),
+            used: 0,
+        })
+    }
+
+    pub fn slab_size(&self) -> u64 {
+        self.slab_size
+    }
+
+    pub fn alignment(&self) -> u64 {
+        self.alignment
+    }
+
+    pub fn slab_count(&self) -> usize {
+        self.slabs.len()
+    }
+
+    /// Bytes handed to `vkAllocateMemory`, summed over slabs — what the device
+    /// heap actually gives up, including alignment padding and slab tails.
+    pub fn committed_bytes(&self) -> u64 {
+        self.slabs.iter().map(|(capacity, _)| *capacity).sum()
+    }
+
+    /// Bytes handed out to callers, excluding padding and tails.
+    pub fn used_bytes(&self) -> u64 {
+        self.used
+    }
+
+    /// `committed - used`: what the packing costs.
+    pub fn wasted_bytes(&self) -> u64 {
+        self.committed_bytes().saturating_sub(self.used)
+    }
+
+    /// Dry run: place `len` bytes, opening nominal-size slabs as needed. No
+    /// device memory is touched, so this can run on a box with no GPU.
+    pub fn place(&mut self, len: u64) -> Result<SlabAlloc> {
+        if let Some(alloc) = self.find(len)? {
+            self.commit(alloc);
+            return Ok(alloc);
+        }
+        let slab = self.push_slab(self.slab_size);
+        // `find` already rejected `len > slab_size`, so offset 0 of a fresh
+        // nominal-size slab always fits.
+        let alloc = SlabAlloc {
+            slab,
+            offset: 0,
+            len,
+        };
+        self.commit(alloc);
+        Ok(alloc)
+    }
+
+    /// First open slab with room for `len`, or `None` if a new slab is needed.
+    /// Errors on a request no slab could ever hold.
+    fn find(&self, len: u64) -> Result<Option<SlabAlloc>> {
+        if len == 0 {
+            return Err(VulkanError::Runtime(
+                "slab suballocation size must be non-zero".to_string(),
+            ));
+        }
+        if len > self.slab_size {
+            return Err(VulkanError::Runtime(format!(
+                "suballocation of {len} B exceeds the {} B slab size \
+                 (maxMemoryAllocationSize); such a tensor must be split across \
+                 several bindings",
+                self.slab_size
+            )));
+        }
+        Ok(self
+            .slabs
+            .iter()
+            .enumerate()
+            .find_map(|(slab, (capacity, cursor))| {
+                (cursor + len <= *capacity).then_some(SlabAlloc {
+                    slab,
+                    offset: *cursor,
+                    len,
+                })
+            }))
+    }
+
+    /// Record a slab of `capacity` bytes; returns its index.
+    fn push_slab(&mut self, capacity: u64) -> usize {
+        self.slabs.push((capacity, 0));
+        self.slabs.len() - 1
+    }
+
+    /// Consume the space `alloc` occupies, re-aligning the slab's cursor.
+    fn commit(&mut self, alloc: SlabAlloc) {
+        let (capacity, cursor) = &mut self.slabs[alloc.slab];
+        *cursor = align_up(alloc.end(), self.alignment).min(*capacity);
+        self.used += alloc.len;
+    }
+}
+
 #[cfg(feature = "vulkan")]
 mod real {
     use super::{Result, VulkanError};
@@ -120,6 +352,62 @@ mod real {
         unsafe { Entry::load() }.map_err(|e| runtime_error("loading Vulkan loader", e))
     }
 
+    /// The `f16 x f16 -> f32` cooperative-matrix tile the device advertises.
+    ///
+    /// `VK_KHR_cooperative_matrix` exposes a *set* of supported shapes; only the
+    /// ones with `AType == BType == float16`, `scope == Subgroup` and an f32
+    /// accumulator are usable by the tiled prefill GEMM (matching what
+    /// `ggml-vulkan` selects). On RDNA3/3.5 that is 16x16x16.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CoopmatShape {
+        pub m: u32,
+        pub n: u32,
+        pub k: u32,
+    }
+
+    /// Pick the usable `f16 x f16 -> f32` subgroup-scoped tile, or `None` when
+    /// the device has no matrix cores (or exposes only f16-accumulate shapes,
+    /// which we reject for the same accuracy reason `ggml-vulkan` does).
+    ///
+    /// Called before `vkCreateDevice`: the query is a *physical device*
+    /// function, so the loader resolves it through `vkGetInstanceProcAddr`
+    /// without the extension being enabled anywhere yet.
+    fn query_coopmat(
+        entry: &Entry,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> Option<CoopmatShape> {
+        if !has_device_extension(instance, physical_device, vk::KHR_COOPERATIVE_MATRIX_NAME)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut coopmat);
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+        if !vk_bool(coopmat.cooperative_matrix) {
+            return None;
+        }
+        let ext = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+        let props =
+            unsafe { ext.get_physical_device_cooperative_matrix_properties(physical_device) }
+                .ok()?;
+        props
+            .iter()
+            .find(|p| {
+                p.a_type == vk::ComponentTypeKHR::FLOAT16
+                    && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                    && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                    && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                    && p.scope == vk::ScopeKHR::SUBGROUP
+            })
+            .map(|p| CoopmatShape {
+                m: p.m_size,
+                n: p.n_size,
+                k: p.k_size,
+            })
+    }
+
     fn pick_compute_queue(
         instance: &ash::Instance,
     ) -> Result<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> {
@@ -171,6 +459,10 @@ mod real {
         /// pipelines that share a backend, collapsing redundant compile work.
         /// Created once at context init; destroyed before the device in `Drop`.
         pipeline_cache: vk::PipelineCache,
+        /// `Some` when `VK_KHR_cooperative_matrix` was found *and* enabled on
+        /// the device, carrying the f16xf16->f32 tile the prefill GEMM should
+        /// compile for. `None` means no matrix cores: `mul_mmq` stays the route.
+        coopmat: Option<CoopmatShape>,
     }
 
     impl VulkanContext {
@@ -189,10 +481,14 @@ mod real {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&priorities)];
-            let extensions = [
+            let coopmat = query_coopmat(&entry, &instance, physical_device);
+            let mut extensions = vec![
                 vk::KHR_SHADER_INTEGER_DOT_PRODUCT_NAME.as_ptr(),
                 vk::EXT_SUBGROUP_SIZE_CONTROL_NAME.as_ptr(),
             ];
+            if coopmat.is_some() {
+                extensions.push(vk::KHR_COOPERATIVE_MATRIX_NAME.as_ptr());
+            }
             let base_features = vk::PhysicalDeviceFeatures::default().shader_int16(true);
             let mut storage16 =
                 vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
@@ -209,12 +505,17 @@ mod real {
             let mut size_control = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
                 .subgroup_size_control(true)
                 .compute_full_subgroups(true);
+            let mut coopmat_features =
+                vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .features(base_features)
                 .push_next(&mut integer_dot)
                 .push_next(&mut vulkan12)
                 .push_next(&mut storage16)
                 .push_next(&mut size_control);
+            if coopmat.is_some() {
+                features2 = features2.push_next(&mut coopmat_features);
+            }
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&extensions)
@@ -248,7 +549,15 @@ mod real {
                 queue,
                 device_name: device_name_from_properties(&props),
                 pipeline_cache,
+                coopmat,
             })
+        }
+
+        /// The cooperative-matrix tile enabled on this device, or `None` when
+        /// the device has no usable matrix cores. Callers must treat `None` as
+        /// "compile the `mul_mmq` fallback", never as an error.
+        pub fn coopmat(&self) -> Option<CoopmatShape> {
+            self.coopmat
         }
 
         pub fn device_name(&self) -> &str {
@@ -288,6 +597,74 @@ mod real {
                     .get_physical_device_properties(self.physical_device)
             };
             props.limits.min_storage_buffer_offset_alignment
+        }
+
+        /// `maxComputeSharedMemorySize` (bytes) — the ceiling on a compute
+        /// pipeline's `shared` declarations. The tiled `mul_mmq` prefill GEMM
+        /// sizes its shared A/B caches from spec constants, so the tile must be
+        /// chosen against this limit (see `MmqSpec::choose`); an oversized tile
+        /// fails at pipeline creation, not at dispatch.
+        pub fn max_compute_shared_memory_size(&self) -> u32 {
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+            };
+            props.limits.max_compute_shared_memory_size
+        }
+
+        /// `maxMemoryAllocationSize` (bytes) — the hard ceiling on ONE
+        /// `vkAllocateMemory`, from `VkPhysicalDeviceMaintenance3Properties`
+        /// (core since Vulkan 1.1, so always present at our required 1.2).
+        /// This driver reports 2 GiB, which is why a 71 GiB model cannot be one
+        /// buffer and has to be sliced into slabs — see [`SlabAllocator`].
+        ///
+        /// Returns the Vulkan required-limits minimum (2^30) if the driver
+        /// leaves the struct zeroed, so callers never divide by zero.
+        pub fn max_memory_allocation_size(&self) -> u64 {
+            let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+            // SAFETY: `physical_device` is owned by this context and alive;
+            // `props2` and the `maintenance3` it chains both outlive the call
+            // and are only read afterwards.
+            unsafe {
+                self.instance
+                    .get_physical_device_properties2(self.physical_device, &mut props2);
+            }
+            if maintenance3.max_memory_allocation_size == 0 {
+                1 << 30
+            } else {
+                maintenance3.max_memory_allocation_size
+            }
+        }
+
+        /// `maxMemoryAllocationCount` — the ceiling on how many
+        /// `vkAllocateMemory` results may be live at once. The spec's required
+        /// minimum is 4096, which a one-`DeviceBuffer`-per-tensor loader would
+        /// blow past 72x on the qwen4_exp checkpoint's 296 475 tensors — but do
+        /// not assume that floor is the local value. Measured on the 8060S:
+        /// 4294967295, i.e. unlimited in practice. Query it, then decide.
+        pub fn max_memory_allocation_count(&self) -> u32 {
+            // SAFETY: `physical_device` is owned by this context and alive; the
+            // query only fills a `VkPhysicalDeviceProperties` by value.
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+            };
+            props.limits.max_memory_allocation_count
+        }
+
+        /// `maxStorageBufferRange` (bytes) — the largest range one storage
+        /// buffer descriptor may cover. A slab suballocation is bound as a
+        /// range, so a tensor bigger than this cannot be one binding even when
+        /// it fits in a slab.
+        pub fn max_storage_buffer_range(&self) -> u32 {
+            // SAFETY: `physical_device` is owned by this context and alive; the
+            // query only fills a `VkPhysicalDeviceProperties` by value.
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+            };
+            props.limits.max_storage_buffer_range
         }
 
         /// `(timestampPeriod ns/tick, timestampValidBits)` for GPU timestamp
@@ -334,6 +711,51 @@ mod real {
             )
         }
 
+        /// AMD shader-core topology, or `None` off an AMD driver.
+        ///
+        /// Returns `(compute_units, simd_per_cu, wavefronts_per_simd,
+        /// wavefront_size, vgprs_per_simd)`.
+        ///
+        /// Why this is worth a query: on RDNA the scheduling unit is the WGP
+        /// (Work Group Processor) = 2 CUs = 4 SIMD32, and a workgroup is
+        /// resident on ONE of them. Reasoning in "40 CUs" hides the fact that
+        /// the part is really 20 WGPs / 80 SIMDs, so a kernel launching e.g. 48
+        /// workgroups is not "48 of 40" but ~2.4 per WGP — and the wave-per-SIMD
+        /// occupancy that actually hides memory latency is a third number
+        /// again. Nothing in ARLE printed any of this, which is how a launch
+        /// geometry gets chosen against an imagined machine.
+        ///
+        /// `vgprs_per_simd` is the other half of the same story: it is the
+        /// budget that decides how many waves fit, and it is what made
+        /// llama.cpp's coopmat warptile run at 0.57x here (32 live accumulators
+        /// ~= 128 VGPR/lane). See [`vulkan_kernels::MmSpec`].
+        pub fn amd_shader_core(&self) -> Option<(u32, u32, u32, u32, u32)> {
+            if !self.device_name().contains("AMD") && !self.device_name().contains("Radeon") {
+                return None;
+            }
+            let mut core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut core);
+            // SAFETY: `physical_device` is owned by this context and alive;
+            // `props2` (with its pushed `core`) outlives the call and is only
+            // read afterwards. Querying an unsupported extension struct leaves
+            // it zeroed rather than failing, which the check below catches.
+            unsafe {
+                self.instance
+                    .get_physical_device_properties2(self.physical_device, &mut props2);
+            }
+            (core.compute_units_per_shader_array != 0).then(|| {
+                (
+                    core.compute_units_per_shader_array
+                        * core.shader_arrays_per_engine_count
+                        * core.shader_engine_count,
+                    core.simd_per_compute_unit,
+                    core.wavefronts_per_simd,
+                    core.wavefront_size,
+                    core.vgprs_per_simd,
+                )
+            })
+        }
+
         pub fn memory_heaps(&self) -> Vec<(u64, bool)> {
             let props = unsafe {
                 self.instance
@@ -348,6 +770,35 @@ mod real {
                     )
                 })
                 .collect()
+        }
+
+        /// Per-heap `(budget, usage)` bytes from `VK_EXT_memory_budget`,
+        /// index-aligned with [`Self::memory_heaps`]. `None` when the driver
+        /// does not fill the struct (extension unsupported) — fall back to
+        /// heap size, never treat it as budget 0.
+        ///
+        /// The distinction matters on this box: heap 1 reports 74.43 GiB of
+        /// *size* but only 70.71 GiB of *budget*, and planning residency
+        /// against the size over-commits by more than a gigabyte before the
+        /// first token.
+        pub fn memory_budgets(&self) -> Option<Vec<(u64, u64)>> {
+            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            // SAFETY: physical_device outlives the instance borrow; the
+            // chained struct is stack-owned for the duration of the call. As
+            // with `amd_shader_core` above, an unsupported extension leaves
+            // the chained struct zeroed rather than failing.
+            unsafe {
+                self.instance
+                    .get_physical_device_memory_properties2(self.physical_device, &mut props2);
+            }
+            let n = props2.memory_properties.memory_heap_count as usize;
+            let filled = (0..n).any(|i| budget.heap_budget[i] != 0);
+            filled.then(|| {
+                (0..n)
+                    .map(|i| (budget.heap_budget[i], budget.heap_usage[i]))
+                    .collect()
+            })
         }
 
         pub fn memory_types(&self) -> Vec<(u32, bool, bool)> {
@@ -463,12 +914,22 @@ mod real {
             Self::alloc_with_usage(
                 ctx,
                 len,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
+                Self::DEFAULT_USAGE,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
         }
+
+        /// Usage every `alloc*` constructor sets. `INDIRECT_BUFFER` rides along
+        /// so any arena can hold `VkDispatchIndirectCommand` triples for
+        /// [`CommandRecorder::dispatch_indirect`] — usage flags cost nothing at
+        /// allocation time, and one uniform set avoids a second buffer flavor
+        /// whose only difference is a flag.
+        const DEFAULT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+            vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+                | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+                | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+                | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
+        );
 
         /// Allocate a UMA storage buffer: `DEVICE_LOCAL | HOST_VISIBLE |
         /// HOST_COHERENT`. On the Strix Halo APU the big device-local heap is
@@ -478,9 +939,7 @@ mod real {
         /// the device exposes no device-local + host-visible memory type (keeps
         /// non-UMA boxes working, just without the device-local win).
         pub fn alloc_uma(ctx: &'a VulkanContext, len: usize) -> Result<Self> {
-            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST;
+            let usage = Self::DEFAULT_USAGE;
             Self::alloc_with_usage(
                 ctx,
                 len,
@@ -488,6 +947,45 @@ mod real {
                 vk::MemoryPropertyFlags::DEVICE_LOCAL
                     | vk::MemoryPropertyFlags::HOST_VISIBLE
                     | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .or_else(|_| {
+                Self::alloc_with_usage(
+                    ctx,
+                    len,
+                    usage,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+            })
+        }
+
+        /// Allocate a READ-BACK buffer: `HOST_VISIBLE | HOST_COHERENT |
+        /// HOST_CACHED`, falling back to plain host-visible if the device has
+        /// no cached type.
+        ///
+        /// The distinction is not cosmetic. `alloc`/`alloc_uma` memory on this
+        /// APU is write-combined: the host can WRITE it at full speed but reads
+        /// are uncached, and every read is a partial-line fetch. Measured on the
+        /// 8060S reading one token's logits (248320 f32 = 970 KB):
+        ///
+        /// ```text
+        ///   alloc_uma  9.80 ms   0.10 GB/s     <- 811x slower than memcpy
+        ///   alloc     10.03 ms   0.10 GB/s
+        ///   memcpy     0.01 ms  82.19 GB/s
+        /// ```
+        ///
+        /// A per-token readback out of write-combined memory is therefore ~10 ms
+        /// of pure host stall that no GPU profile can see, because no dispatch
+        /// is involved. Anything the host READS every step belongs here; use
+        /// [`Self::alloc_uma`] for buffers the host only writes.
+        pub fn alloc_host_cached(ctx: &'a VulkanContext, len: usize) -> Result<Self> {
+            let usage = Self::DEFAULT_USAGE;
+            Self::alloc_with_usage(
+                ctx,
+                len,
+                usage,
+                vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+                    | vk::MemoryPropertyFlags::HOST_CACHED,
             )
             .or_else(|_| {
                 Self::alloc_with_usage(
@@ -663,6 +1161,52 @@ mod real {
             })?;
             Ok(dst)
         }
+
+        /// Read this buffer back through a temporary host-visible staging
+        /// buffer — the inverse of [`Self::alloc_device_local_from_host`].
+        ///
+        /// [`Self::copy_to_host`] maps the buffer's own memory, so it fails with
+        /// `ERROR_MEMORY_MAP_FAILED` on anything allocated DEVICE_LOCAL-only,
+        /// which is every resident weight. This is the read-back path for those.
+        ///
+        /// Verification-only: it allocates, submits, and blocks. Never put it on
+        /// a per-token path — see the write-combined read-back trap that made the
+        /// MoE router 20x slower than it looked.
+        pub fn copy_to_host_staged(&self, dst: &mut [u8]) -> Result<()> {
+            if dst.is_empty() {
+                return Ok(());
+            }
+            if dst.len() > self.len {
+                return Err(VulkanError::Runtime(format!(
+                    "staged D2H of {} B from a {} B buffer",
+                    dst.len(),
+                    self.len
+                )));
+            }
+            let staging = Self::alloc_with_usage(
+                self.ctx,
+                dst.len(),
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let pool = CommandPool::create(self.ctx)?;
+            pool.one_shot_submit(|cmd| {
+                let region = vk::BufferCopy::default().size(dst.len() as vk::DeviceSize);
+                // SAFETY: `cmd` is the live, recording command buffer supplied by
+                // `one_shot_submit`. Both buffers outlive the submit (`self` by
+                // `&self`, `staging` by this scope) and carry the required usage
+                // flags — `self` TRANSFER_SRC from `alloc_device_local_from_host`,
+                // `staging` TRANSFER_DST above. `region` copies `dst.len()` bytes,
+                // checked against `self.len` and equal to `staging`'s size.
+                unsafe {
+                    self.ctx
+                        .device
+                        .cmd_copy_buffer(cmd, self.buffer, staging.buffer, &[region]);
+                }
+                Ok(())
+            })?;
+            staging.copy_to_host(dst)
+        }
     }
 
     impl Drop for DeviceBuffer<'_> {
@@ -671,6 +1215,337 @@ mod real {
                 self.ctx.device.destroy_buffer(self.buffer, None);
                 self.ctx.device.free_memory(self.memory, None);
             }
+        }
+    }
+
+    /// Staging window for [`SlabAllocator::write`] into DEVICE_LOCAL slabs.
+    ///
+    /// Sized to bound host memory while keeping the submit count negligible:
+    /// at 32 MiB a 71 GiB upload is ~2270 `vkQueueSubmit`s total, versus one
+    /// per tensor (296 475) for a naive per-tensor staging buffer. The buffer
+    /// is allocated once per allocator and reused for every write.
+    const STAGING_CHUNK_BYTES: usize = 32 << 20;
+
+    /// Suballocates a large model out of a handful of big device allocations.
+    ///
+    /// The hard limit it exists for is
+    /// [`VulkanContext::max_memory_allocation_size`]: one `vkAllocateMemory`
+    /// may not exceed it, and this driver reports 2 GiB (measured), so a ~71
+    /// GiB model has no single-buffer form no matter how the loader is written.
+    ///
+    /// The other half — one `DeviceBuffer` per tensor — is a cost argument, not
+    /// a limit argument, and the distinction matters because it is easy to get
+    /// backwards. The qwen4_exp checkpoint has 296 475 tensors, which would be
+    /// 296 475 `vkAllocateMemory` + `vkBindBufferMemory` pairs and 296 475 live
+    /// allocations in the WDDM residency list. That is 72x the 4096 floor
+    /// [`VulkanContext::max_memory_allocation_count`] is *guaranteed* to allow,
+    /// so the per-tensor path is not portable — but on this part it would not
+    /// actually fail that check: the 8060S reports 4294967295 (measured).
+    ///
+    /// So: allocate slabs of `maxMemoryAllocationSize`, and hand out
+    /// `(slab, offset, len)` triples aligned to
+    /// [`VulkanContext::min_storage_buffer_offset_alignment`]. Each
+    /// suballocation binds through the existing ranged descriptor path with no
+    /// copy and no extra object:
+    ///
+    /// ```ignore
+    /// let w = slabs.alloc(bytes)?;
+    /// let (buf, offset, len) = slabs.binding(&w)?;
+    /// DescriptorSet::storage_buffers_ranged(ctx, &layout, &[(buf, offset, len)])?;
+    /// ```
+    ///
+    /// Placement lives in [`SlabPlan`] so a dry run and the real residency
+    /// cannot diverge. Slabs are freed when the allocator drops; there is no
+    /// per-suballocation free, which suits a load-once weight set.
+    pub struct SlabAllocator<'a> {
+        ctx: &'a VulkanContext,
+        slabs: Vec<DeviceBuffer<'a>>,
+        plan: super::SlabPlan,
+        memory: super::SlabMemory,
+        /// Reused host-visible upload window; `None` until the first staged
+        /// write, and never allocated at all for [`SlabMemory::Uma`].
+        staging: Option<DeviceBuffer<'a>>,
+        max_binding_range: u64,
+    }
+
+    impl<'a> SlabAllocator<'a> {
+        /// DEVICE_LOCAL slabs of the device's `maxMemoryAllocationSize`.
+        pub fn new(ctx: &'a VulkanContext) -> Result<Self> {
+            Self::with_slab_size(ctx, ctx.max_memory_allocation_size())
+        }
+
+        /// As [`Self::new`], but with an explicit nominal slab size (clamped to
+        /// the device's `maxMemoryAllocationSize`). Useful for tests and for
+        /// leaving headroom on a shared heap.
+        pub fn with_slab_size(ctx: &'a VulkanContext, slab_size: u64) -> Result<Self> {
+            Self::with_slab_size_and_memory(ctx, slab_size, super::SlabMemory::DeviceLocal)
+        }
+
+        pub fn with_slab_size_and_memory(
+            ctx: &'a VulkanContext,
+            slab_size: u64,
+            memory: super::SlabMemory,
+        ) -> Result<Self> {
+            let slab_size = slab_size.min(ctx.max_memory_allocation_size());
+            // A descriptor offset must satisfy `minStorageBufferOffsetAlignment`;
+            // the 16-byte floor on top of it is for the shaders that read these
+            // bindings as `uvec4`, and matches the NVFP4 group of 16 so a
+            // quantized tensor never starts mid-group.
+            let alignment = ctx.min_storage_buffer_offset_alignment().max(16);
+            Ok(Self {
+                ctx,
+                slabs: Vec::new(),
+                plan: super::SlabPlan::new(slab_size, alignment)?,
+                memory,
+                staging: None,
+                max_binding_range: u64::from(ctx.max_storage_buffer_range()),
+            })
+        }
+
+        /// Reserve `len` bytes, opening a slab if none has room.
+        pub fn alloc(&mut self, len: u64) -> Result<super::SlabAlloc> {
+            if len > self.max_binding_range {
+                return Err(VulkanError::Runtime(format!(
+                    "suballocation of {len} B exceeds maxStorageBufferRange ({} B); \
+                     it cannot be bound as one storage buffer descriptor",
+                    self.max_binding_range
+                )));
+            }
+            if let Some(alloc) = self.plan.find(len)? {
+                self.plan.commit(alloc);
+                return Ok(alloc);
+            }
+            let (buffer, capacity) = self.alloc_slab(len)?;
+            self.slabs.push(buffer);
+            self.plan.push_slab(capacity);
+            let alloc = self.plan.find(len)?.ok_or_else(|| {
+                VulkanError::Runtime(format!(
+                    "a fresh {capacity} B slab did not fit a {len} B suballocation"
+                ))
+            })?;
+            self.plan.commit(alloc);
+            Ok(alloc)
+        }
+
+        /// Allocate one slab, at least `needed` bytes.
+        ///
+        /// Halves on failure down to [`MIN_SLAB_BYTES`]: near the end of a 71
+        /// GiB residency the heap can have several GiB free yet not one
+        /// contiguous nominal slab, and failing there with free memory left
+        /// would be a worse outcome than a smaller final slab.
+        fn alloc_slab(&self, needed: u64) -> Result<(DeviceBuffer<'a>, u64)> {
+            let mut size = self.plan.slab_size().max(needed);
+            loop {
+                let bytes = usize::try_from(size)
+                    .map_err(|e| runtime_error("converting slab size to usize", e))?;
+                match self.try_alloc_slab(bytes) {
+                    Ok(buffer) => return Ok((buffer, size)),
+                    Err(e) => {
+                        let halved = size / 2;
+                        if halved < needed || halved < super::MIN_SLAB_BYTES {
+                            return Err(e);
+                        }
+                        size = halved;
+                    }
+                }
+            }
+        }
+
+        fn try_alloc_slab(&self, bytes: usize) -> Result<DeviceBuffer<'a>> {
+            // TRANSFER_SRC/DST so slabs can be staged into and read back for
+            // verification, matching `alloc_device_local_from_host`.
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST;
+            match self.memory {
+                super::SlabMemory::DeviceLocal => DeviceBuffer::alloc_with_usage(
+                    self.ctx,
+                    bytes,
+                    usage,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                ),
+                super::SlabMemory::Uma => DeviceBuffer::alloc_with_usage(
+                    self.ctx,
+                    bytes,
+                    usage,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .or_else(|_| {
+                    DeviceBuffer::alloc_with_usage(
+                        self.ctx,
+                        bytes,
+                        usage,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                }),
+            }
+        }
+
+        /// The slab buffer backing `alloc`, plus its descriptor offset and
+        /// range — feed straight to
+        /// [`DescriptorSet::storage_buffers_ranged`].
+        pub fn binding(&self, alloc: &super::SlabAlloc) -> Result<(&DeviceBuffer<'a>, u64, u64)> {
+            let buffer = self.slab(alloc.slab()).ok_or_else(|| {
+                VulkanError::Runtime(format!(
+                    "slab index {} out of range ({} slabs) — handle from another allocator?",
+                    alloc.slab(),
+                    self.slabs.len()
+                ))
+            })?;
+            Ok((buffer, alloc.offset(), alloc.len()))
+        }
+
+        pub fn slab(&self, index: usize) -> Option<&DeviceBuffer<'a>> {
+            self.slabs.get(index)
+        }
+
+        pub fn slab_count(&self) -> usize {
+            self.slabs.len()
+        }
+
+        /// Device memory actually allocated, summed over slabs.
+        pub fn committed_bytes(&self) -> u64 {
+            self.plan.committed_bytes()
+        }
+
+        /// Bytes handed out to callers, excluding alignment padding and tails.
+        pub fn used_bytes(&self) -> u64 {
+            self.plan.used_bytes()
+        }
+
+        pub fn slab_size(&self) -> u64 {
+            self.plan.slab_size()
+        }
+
+        pub fn alignment(&self) -> u64 {
+            self.plan.alignment()
+        }
+
+        /// `committed - used`: alignment padding plus slab tails.
+        pub fn wasted_bytes(&self) -> u64 {
+            self.plan.wasted_bytes()
+        }
+
+        /// Fill `alloc` from host memory.
+        ///
+        /// UMA slabs are mapped and written in place. DEVICE_LOCAL slabs are
+        /// not host-mappable, so the bytes go through a reused
+        /// [`STAGING_CHUNK_BYTES`] window and a `cmd_copy_buffer` per chunk —
+        /// the same trick as [`DeviceBuffer::alloc_device_local_from_host`],
+        /// minus its per-tensor allocate/free pair.
+        pub fn write(&mut self, alloc: &super::SlabAlloc, src: &[u8]) -> Result<()> {
+            let len = u64::try_from(src.len())
+                .map_err(|e| runtime_error("converting host slice length", e))?;
+            if len > alloc.len() {
+                return Err(VulkanError::Runtime(format!(
+                    "writing {len} B into a {} B suballocation",
+                    alloc.len()
+                )));
+            }
+            if src.is_empty() {
+                return Ok(());
+            }
+            // Split the borrow: the staging buffer and the destination slab are
+            // disjoint fields, but both are reached through `self`.
+            // Copy the context out first: `slabs` and `staging` are disjoint
+            // fields but both are reached through `self`, so the write below
+            // needs them borrowed separately.
+            let ctx = self.ctx;
+            let Self {
+                slabs,
+                staging,
+                memory,
+                ..
+            } = self;
+            let slab = slabs.get_mut(alloc.slab()).ok_or_else(|| {
+                VulkanError::Runtime(format!("slab index {} out of range", alloc.slab()))
+            })?;
+            if matches!(memory, super::SlabMemory::Uma) {
+                return slab.copy_from_host_at(alloc.offset(), src);
+            }
+            let chunk = STAGING_CHUNK_BYTES.min(src.len());
+            if staging.as_ref().is_none_or(|buf| buf.len() < chunk) {
+                *staging = Some(DeviceBuffer::alloc_with_usage(
+                    ctx,
+                    chunk,
+                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )?);
+            }
+            let staging = staging.as_mut().ok_or_else(|| {
+                VulkanError::Runtime("staging buffer missing after allocation".to_string())
+            })?;
+            let pool = CommandPool::create(ctx)?;
+            for (index, part) in src.chunks(chunk).enumerate() {
+                staging.copy_from_host(part)?;
+                let dst_offset = alloc.offset()
+                    + u64::try_from(index * chunk)
+                        .map_err(|e| runtime_error("converting staging chunk offset", e))?;
+                pool.one_shot_submit(|cmd| {
+                    let region = vk::BufferCopy::default()
+                        .src_offset(0)
+                        .dst_offset(dst_offset)
+                        .size(part.len() as vk::DeviceSize);
+                    // SAFETY: `cmd` is the live recording command buffer from
+                    // `one_shot_submit`. Both buffers outlive the submit and
+                    // carry the needed usage: `staging` TRANSFER_SRC, the slab
+                    // TRANSFER_DST. `dst_offset + part.len()` is inside the
+                    // suballocation, itself checked inside the slab.
+                    unsafe {
+                        ctx.device
+                            .cmd_copy_buffer(cmd, staging.raw(), slab.raw(), &[region]);
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        }
+
+        /// Read `alloc` back into `dst` through a temporary staging buffer.
+        ///
+        /// Verification-only, exactly like
+        /// [`DeviceBuffer::copy_to_host_staged`]: it allocates, submits and
+        /// blocks. Never put it on a per-token path.
+        pub fn read_back(&self, alloc: &super::SlabAlloc, dst: &mut [u8]) -> Result<()> {
+            let len = u64::try_from(dst.len())
+                .map_err(|e| runtime_error("converting host slice length", e))?;
+            if len > alloc.len() {
+                return Err(VulkanError::Runtime(format!(
+                    "reading {len} B from a {} B suballocation",
+                    alloc.len()
+                )));
+            }
+            if dst.is_empty() {
+                return Ok(());
+            }
+            let (slab, offset, _) = self.binding(alloc)?;
+            let staging = DeviceBuffer::alloc_with_usage(
+                self.ctx,
+                dst.len(),
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let pool = CommandPool::create(self.ctx)?;
+            pool.one_shot_submit(|cmd| {
+                let region = vk::BufferCopy::default()
+                    .src_offset(offset)
+                    .dst_offset(0)
+                    .size(dst.len() as vk::DeviceSize);
+                // SAFETY: `cmd` is the live recording command buffer from
+                // `one_shot_submit`. The slab (TRANSFER_SRC) and `staging`
+                // (TRANSFER_DST) both outlive the submit, and the source range
+                // was bounds-checked against the suballocation above.
+                unsafe {
+                    self.ctx
+                        .device
+                        .cmd_copy_buffer(cmd, slab.raw(), staging.raw(), &[region]);
+                }
+                Ok(())
+            })?;
+            staging.copy_to_host(dst)
         }
     }
 
@@ -779,10 +1654,16 @@ mod real {
         fence: vk::Fence,
         /// Optional per-dispatch GPU timestamp profiler (ARLE_GPU_TIMESTAMPS).
         prof: Option<GpuProf>,
-        /// True between `submit_and_wait()`'s `queue_submit` and the next
-        /// `begin()`'s fence wait — guards against re-recording a buffer whose
-        /// prior submission has not yet been waited on.
+        /// True between `queue_submit` and the fence wait for the CURRENT
+        /// buffer — guards against re-recording a buffer whose prior
+        /// submission has not yet been waited on.
         pending: bool,
+        /// The rotation partner for depth-2 pipelining: `begin()` after a
+        /// [`Self::submit_async`] swaps the spare in so recording proceeds
+        /// while the submitted buffer executes.
+        spare_command_buffer: vk::CommandBuffer,
+        spare_fence: vk::Fence,
+        spare_pending: bool,
         /// Number of dispatches recorded into the CURRENTLY-OPEN batch (reset by
         /// `begin()`, read by the batch-cadence cap so a token's recorder can
         /// submit before the command buffer trips the APU TDR watchdog).
@@ -804,31 +1685,36 @@ mod real {
             let alloc = vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let command_buffer = match unsafe { ctx.device.allocate_command_buffers(&alloc) } {
-                Ok(buffers) => match buffers.first().copied() {
-                    Some(buffer) => buffer,
-                    None => {
+                // Two: `submit_async` leaves one in flight while the next
+                // batch records into the other (depth-2 pipelining).
+                .command_buffer_count(2);
+            let (command_buffer, spare_command_buffer) =
+                match unsafe { ctx.device.allocate_command_buffers(&alloc) } {
+                    Ok(buffers) => match (buffers.first().copied(), buffers.get(1).copied()) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => {
+                            unsafe { ctx.device.destroy_command_pool(pool, None) };
+                            return Err(VulkanError::Runtime(
+                                "Vulkan command buffer allocation returned no buffers".to_string(),
+                            ));
+                        }
+                    },
+                    Err(e) => {
                         unsafe { ctx.device.destroy_command_pool(pool, None) };
-                        return Err(VulkanError::Runtime(
-                            "Vulkan command buffer allocation returned no buffers".to_string(),
-                        ));
+                        return Err(vk_error("allocating Vulkan command buffer", e));
                     }
-                },
-                Err(e) => {
-                    unsafe { ctx.device.destroy_command_pool(pool, None) };
-                    return Err(vk_error("allocating Vulkan command buffer", e));
-                }
-            };
+                };
 
             let fence_create = vk::FenceCreateInfo::default();
-            let fence = match unsafe { ctx.device.create_fence(&fence_create, None) } {
-                Ok(fence) => fence,
+            let mk_fence = || match unsafe { ctx.device.create_fence(&fence_create, None) } {
+                Ok(fence) => Ok(fence),
                 Err(e) => {
                     unsafe { ctx.device.destroy_command_pool(pool, None) };
-                    return Err(vk_error("creating Vulkan fence", e));
+                    Err(vk_error("creating Vulkan fence", e))
                 }
             };
+            let fence = mk_fence()?;
+            let spare_fence = mk_fence()?;
 
             let prof = if std::env::var("ARLE_GPU_TIMESTAMPS").is_ok() {
                 let (period_ns, valid_bits) = ctx.timestamp_info();
@@ -870,6 +1756,9 @@ mod real {
                 pool,
                 command_buffer,
                 fence,
+                spare_command_buffer,
+                spare_fence,
+                spare_pending: false,
                 prof,
                 pending: false,
                 dispatches_in_batch: 0,
@@ -917,6 +1806,15 @@ mod real {
         /// numeric corruption), resets the fence, then resets + begins the
         /// command buffer.
         pub fn begin(&mut self) -> Result<()> {
+            if self.pending {
+                // The current buffer was handed off by `submit_async` and may
+                // still be executing: rotate the spare in and record there.
+                // If the spare's own prior submission is also outstanding,
+                // the wait below is the depth-2 back-pressure.
+                std::mem::swap(&mut self.command_buffer, &mut self.spare_command_buffer);
+                std::mem::swap(&mut self.fence, &mut self.spare_fence);
+                std::mem::swap(&mut self.pending, &mut self.spare_pending);
+            }
             if self.pending {
                 unsafe {
                     self.ctx
@@ -1011,6 +1909,61 @@ mod real {
                 }
                 device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
+            self.after_dispatch();
+        }
+
+        /// [`Self::dispatch`] with the workgroup counts read on the GPU from a
+        /// `VkDispatchIndirectCommand` (three consecutive `u32`s) at
+        /// `args_offset` in `args` — the y (or any) extent can then be a value
+        /// a previous dispatch computed, with no host read-back in between.
+        /// `args` must carry `INDIRECT_BUFFER` usage (every `alloc*`
+        /// constructor here sets it) and `args_offset` must be 4-byte aligned;
+        /// order the args WRITE before this READ with
+        /// [`Self::barrier_indirect`], not the plain [`Self::barrier`] (the
+        /// indirect read happens in the `DRAW_INDIRECT` stage, which a
+        /// compute-only dstStageMask does not cover).
+        pub fn dispatch_indirect(
+            &mut self,
+            pipeline: &ComputePipeline<'_>,
+            set: &DescriptorSet<'_>,
+            push: &[u8],
+            args: &DeviceBuffer<'_>,
+            args_offset: u64,
+        ) {
+            let device = &self.ctx.device;
+            let cmd = self.command_buffer;
+            // SAFETY: `cmd` is the recorder's begun command buffer; `pipeline`,
+            // `set` and `args` are live objects from this context (their
+            // lifetimes tie them to it), the caller keeps `set`/`args` alive
+            // until the submit completes, and `args_offset` addressing a valid
+            // 12-byte triple inside `args` is the documented contract above.
+            unsafe {
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.raw());
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.layout(),
+                    0,
+                    &[set.raw()],
+                    &[],
+                );
+                if !push.is_empty() {
+                    device.cmd_push_constants(
+                        cmd,
+                        pipeline.layout(),
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        push,
+                    );
+                }
+                device.cmd_dispatch_indirect(cmd, args.raw(), args_offset);
+            }
+            self.after_dispatch();
+        }
+
+        /// The per-dispatch bookkeeping both dispatch flavors share: the batch
+        /// counter and (under `ARLE_GPU_TIMESTAMPS`) the trailing timestamp.
+        fn after_dispatch(&mut self) {
             self.dispatches_in_batch += 1;
             let slot = self.prof.as_mut().and_then(|p| {
                 if p.idx < p.capacity {
@@ -1024,9 +1977,12 @@ mod real {
                 }
             });
             if let Some((pool, idx)) = slot {
+                // SAFETY: the command buffer is begun (a dispatch was just
+                // recorded into it) and `pool`/`idx` name a slot the profiler
+                // reserved in its own live query pool.
                 unsafe {
                     self.ctx.device.cmd_write_timestamp(
-                        cmd,
+                        self.command_buffer,
                         vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                         pool,
                         idx,
@@ -1057,11 +2013,146 @@ mod real {
             }
         }
 
+        /// [`Self::barrier`] widened so a compute WRITE of
+        /// `VkDispatchIndirectCommand` args is visible to a later
+        /// [`Self::dispatch_indirect`]'s args READ. That read happens in the
+        /// `DRAW_INDIRECT` stage, which is logically EARLIER than
+        /// `COMPUTE_SHADER` — a dstStageMask of only `COMPUTE_SHADER` does not
+        /// cover it (dst masks implicitly extend to logically LATER stages
+        /// only). The reverse hazard (this dispatch's args read vs a NEXT
+        /// compute write over the same args) is already ordered by any plain
+        /// [`Self::barrier`]: srcStageMask extends to logically EARLIER stages,
+        /// so waiting on prior `COMPUTE_SHADER` work waits on its
+        /// `DRAW_INDIRECT` reads too.
+        pub fn barrier_indirect(&mut self) {
+            let memory_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                );
+            // SAFETY: `command_buffer` is this recorder's begun buffer; a
+            // global memory barrier has no buffer/image references to keep
+            // alive.
+            unsafe {
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
+                    vk::DependencyFlags::empty(),
+                    &[memory_barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
+
+        /// Record a device-to-device buffer copy into THIS command buffer, so
+        /// it rides the submit that is already happening.
+        ///
+        /// The point is read-back staging: the arena is write-combined (fast for
+        /// the GPU and for host writes, ~0.10 GB/s for host READS), so anything
+        /// the host reads per token should be copied into a
+        /// [`DeviceBuffer::alloc_host_cached`] buffer first. On the 8060S that
+        /// turns a 970 KB logits read from 10.04 ms into 0.023 ms. Recording the
+        /// copy here rather than in a `one_shot_submit` keeps it free: no extra
+        /// submit, no extra fence.
+        ///
+        /// Both buffers need the matching `TRANSFER_SRC`/`TRANSFER_DST` usage,
+        /// which every `alloc*` constructor here sets.
+        pub fn copy_buffer(
+            &mut self,
+            src: &DeviceBuffer<'_>,
+            src_offset: u64,
+            dst: &DeviceBuffer<'_>,
+            dst_offset: u64,
+            size: u64,
+        ) {
+            if size == 0 {
+                return;
+            }
+            let region = vk::BufferCopy::default()
+                .src_offset(src_offset)
+                .dst_offset(dst_offset)
+                .size(size);
+            // The copy must see the compute writes that produced the data, and
+            // the host must see the copy — hence TRANSFER on both sides of the
+            // surrounding barriers rather than the COMPUTE-only `barrier()`.
+            let to_transfer = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            // SHADER_READ rides along with HOST_READ because a copy can also
+            // feed later dispatches in the SAME submit (the speculative-decode
+            // state restore copies a snapshot back over live recurrent state
+            // that the next chunk's kernels read) — a host-only barrier would
+            // leave that read unordered.
+            let to_host = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ);
+            // SAFETY: `command_buffer` is live and recording (between `begin`
+            // and `submit_and_wait`). Both buffers outlive this call via the
+            // borrows, and both carry TRANSFER_SRC|TRANSFER_DST usage. `region`
+            // is bounds-checked by the caller against both buffer lengths.
+            unsafe {
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[to_transfer],
+                    &[],
+                    &[],
+                );
+                self.ctx.device.cmd_copy_buffer(
+                    self.command_buffer,
+                    src.buffer,
+                    dst.buffer,
+                    &[region],
+                );
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[to_host],
+                    &[],
+                    &[],
+                );
+            }
+        }
+
         /// End the buffer, submit it with **one** `vkQueueSubmit` **on the
         /// fence** (no NULL fence, no `queue_wait_idle`), then wait the fence.
         /// Mirrors `ggml-vulkan.cpp:2278-2355` (one submit) +
         /// `2037-2067`/`13474-13485` (one fence wait per batch). A YIELD-spin
         /// tail-latency variant can replace the blocking wait later.
+        /// Submit the current buffer WITHOUT waiting: the depth-2 pipelining
+        /// half. The next `begin()` rotates to the spare buffer, so recording
+        /// overlaps this batch's GPU execution; a later [`Self::submit_and_wait`]
+        /// (whose fence wait covers everything earlier on the in-order queue)
+        /// is the drain. With the GPU timestamp profiler active this falls
+        /// back to the synchronous path — the profiler's query pool is reset
+        /// per `begin()` and cannot span two buffers in flight.
+        pub fn submit_async(&mut self) -> Result<()> {
+            if self.prof.is_some() {
+                return self.submit_and_wait();
+            }
+            unsafe { self.ctx.device.end_command_buffer(self.command_buffer) }
+                .map_err(|e| vk_error("ending Vulkan command buffer", e))?;
+            let command_buffers = [self.command_buffer];
+            let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            unsafe {
+                self.ctx
+                    .device
+                    .queue_submit(self.ctx.queue, &submits, self.fence)
+            }
+            .map_err(|e| vk_error("submitting Vulkan command buffer", e))?;
+            self.pending = true;
+            self.submit_count += 1;
+            Ok(())
+        }
+
         pub fn submit_and_wait(&mut self) -> Result<()> {
             unsafe { self.ctx.device.end_command_buffer(self.command_buffer) }
                 .map_err(|e| vk_error("ending Vulkan command buffer", e))?;
@@ -1115,18 +2206,25 @@ mod real {
     impl Drop for CommandRecorder<'_> {
         fn drop(&mut self) {
             unsafe {
-                // The fence guarantees the GPU is done with the buffer before we
-                // free its pool; only wait if a submission is still in flight.
+                // The fences guarantee the GPU is done with the buffers before
+                // we free their pool; only wait on in-flight submissions.
                 if self.pending {
                     let _ = self
                         .ctx
                         .device
                         .wait_for_fences(&[self.fence], true, u64::MAX);
                 }
+                if self.spare_pending {
+                    let _ = self
+                        .ctx
+                        .device
+                        .wait_for_fences(&[self.spare_fence], true, u64::MAX);
+                }
                 if let Some(p) = self.prof.as_ref() {
                     self.ctx.device.destroy_query_pool(p.pool, None);
                 }
                 self.ctx.device.destroy_fence(self.fence, None);
+                self.ctx.device.destroy_fence(self.spare_fence, None);
                 self.ctx.device.destroy_command_pool(self.pool, None);
             }
         }
@@ -1448,6 +2546,19 @@ mod real {
             self.next = 0;
         }
 
+        /// Slots left before the cursor wraps and starts OVERWRITING sets that
+        /// the currently-recorded command buffer may still reference.
+        ///
+        /// `next_updated` wraps silently — it cannot fail, it just corrupts the
+        /// bindings of an already-recorded dispatch. A caller that records more
+        /// than `ring_size` dispatches in one batch (batched prefill, which
+        /// scales dispatch count with the chunk width) must consult this and
+        /// submit + [`reset`](Self::reset) before it runs out.
+        #[must_use]
+        pub fn remaining(&self) -> usize {
+            self.sets.len().saturating_sub(self.next)
+        }
+
         /// Bind `buffers` (each `(buffer, offset_bytes, range_bytes)`) into the
         /// next ring slot via one `vkUpdateDescriptorSets` and return its raw
         /// `VkDescriptorSet`. No pool / set creation. The caller must record the
@@ -1678,13 +2789,14 @@ mod real {
 
 #[cfg(feature = "vulkan")]
 pub use real::{
-    CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
-    DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
+    CommandPool, CommandRecorder, ComputePipeline, CoopmatShape, DescriptorSet,
+    DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, ShaderModule, SlabAllocator,
+    VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(not(feature = "vulkan"))]
 mod stub {
-    use super::{Result, VULKAN_NOT_COMPILED};
+    use super::{Result, SlabAlloc, SlabMemory, VULKAN_NOT_COMPILED};
     use std::marker::PhantomData;
 
     pub fn init() -> Result<()> {
@@ -1697,6 +2809,13 @@ mod stub {
 
     pub fn device_name(_device_index: usize) -> Result<String> {
         Err(VULKAN_NOT_COMPILED)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CoopmatShape {
+        pub m: u32,
+        pub n: u32,
+        pub k: u32,
     }
 
     pub struct VulkanContext {
@@ -1712,12 +2831,98 @@ mod stub {
             ""
         }
 
+        pub fn coopmat(&self) -> Option<CoopmatShape> {
+            None
+        }
+
         pub fn queue_family_index(&self) -> u32 {
             0
         }
 
         pub fn min_storage_buffer_offset_alignment(&self) -> u64 {
             0
+        }
+
+        pub fn max_compute_shared_memory_size(&self) -> u32 {
+            0
+        }
+
+        pub fn max_memory_allocation_size(&self) -> u64 {
+            0
+        }
+
+        pub fn max_memory_allocation_count(&self) -> u32 {
+            0
+        }
+
+        pub fn max_storage_buffer_range(&self) -> u32 {
+            0
+        }
+    }
+
+    pub struct SlabAllocator<'a> {
+        _marker: PhantomData<&'a VulkanContext>,
+    }
+
+    impl<'a> SlabAllocator<'a> {
+        pub fn new(_ctx: &'a VulkanContext) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn with_slab_size(_ctx: &'a VulkanContext, _slab_size: u64) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn with_slab_size_and_memory(
+            _ctx: &'a VulkanContext,
+            _slab_size: u64,
+            _memory: SlabMemory,
+        ) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn alloc(&mut self, _len: u64) -> Result<SlabAlloc> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn binding(&self, _alloc: &SlabAlloc) -> Result<(&DeviceBuffer<'a>, u64, u64)> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn slab(&self, _index: usize) -> Option<&DeviceBuffer<'a>> {
+            None
+        }
+
+        pub fn slab_count(&self) -> usize {
+            0
+        }
+
+        pub fn committed_bytes(&self) -> u64 {
+            0
+        }
+
+        pub fn used_bytes(&self) -> u64 {
+            0
+        }
+
+        pub fn slab_size(&self) -> u64 {
+            0
+        }
+
+        pub fn alignment(&self) -> u64 {
+            0
+        }
+
+        pub fn wasted_bytes(&self) -> u64 {
+            0
+        }
+
+        pub fn write(&mut self, _alloc: &SlabAlloc, _src: &[u8]) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn read_back(&self, _alloc: &SlabAlloc, _dst: &mut [u8]) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
         }
     }
 
@@ -1731,6 +2936,10 @@ mod stub {
         }
 
         pub fn alloc_uma(_ctx: &'a VulkanContext, _len: usize) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn alloc_host_cached(_ctx: &'a VulkanContext, _len: usize) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
 
@@ -1755,6 +2964,10 @@ mod stub {
         }
 
         pub fn copy_to_host_at(&self, _offset: u64, _dst: &mut [u8]) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn copy_to_host_staged(&self, _dst: &mut [u8]) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)
         }
     }
@@ -1791,7 +3004,29 @@ mod stub {
         ) {
         }
 
+        pub fn dispatch_indirect(
+            &mut self,
+            _pipeline: &ComputePipeline<'_>,
+            _set: &DescriptorSet<'_>,
+            _push: &[u8],
+            _args: &DeviceBuffer<'_>,
+            _args_offset: u64,
+        ) {
+        }
+
         pub fn barrier(&mut self) {}
+
+        pub fn barrier_indirect(&mut self) {}
+
+        pub fn copy_buffer(
+            &mut self,
+            _src: &DeviceBuffer<'_>,
+            _src_offset: u64,
+            _dst: &DeviceBuffer<'_>,
+            _dst_offset: u64,
+            _size: u64,
+        ) {
+        }
 
         pub fn label_next(&mut self, _label: &'static str) {}
 
@@ -1800,6 +3035,10 @@ mod stub {
         }
 
         pub fn submit_and_wait(&mut self) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn submit_async(&mut self) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)
         }
     }
@@ -1861,6 +3100,11 @@ mod stub {
         }
 
         pub fn reset(&mut self) {}
+
+        #[must_use]
+        pub fn remaining(&self) -> usize {
+            0
+        }
     }
 
     pub struct ComputePipeline<'a> {
@@ -1910,13 +3154,343 @@ mod stub {
 
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
-    CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
-    DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
+    CommandPool, CommandRecorder, ComputePipeline, CoopmatShape, DescriptorSet,
+    DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, ShaderModule, SlabAllocator,
+    VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nominal slab size used by the device-free plan tests.
+    ///
+    /// `maxMemoryAllocationSize` measured on this box's driver (Radeon 8060S,
+    /// Vulkan). [`SlabAllocator::new`] queries the device rather than trusting
+    /// this; the constant only lets the planning tests run with no GPU.
+    const DRIVER_MAX_ALLOC_BYTES: u64 = 2 << 30;
+
+    #[test]
+    fn slab_plan_packs_to_ceil_not_one_slab_per_tensor() {
+        const SLAB: u64 = 512 << 20;
+        const SUB: u64 = 4 << 20;
+        const N: u64 = 768;
+        let mut plan = SlabPlan::new(SLAB, 64).expect("plan");
+        for _ in 0..N {
+            plan.place(SUB).expect("place");
+        }
+        assert_eq!(
+            plan.slab_count() as u64,
+            (N * SUB).div_ceil(SLAB),
+            "packing must be ceil(total / slab_size), not one slab per tensor"
+        );
+        assert_eq!(plan.slab_count(), 6);
+        assert_eq!(plan.used_bytes(), N * SUB);
+        assert_eq!(
+            plan.wasted_bytes(),
+            0,
+            "evenly-dividing suballocations must leave no tail"
+        );
+        assert_eq!(plan.committed_bytes(), 6 * SLAB);
+    }
+
+    /// The reason placement is first-fit rather than a bump pointer into the
+    /// newest slab.
+    ///
+    /// `SHARD` is a real tensor size from this checkpoint — one PLE n-gram
+    /// embedding shard, `model.language_model.layers.1.ple.ple_embedding
+    /// .ngram_embedding.shard_N.weight`. Five fill 2.00 of a 2 GiB slab and the
+    /// sixth cannot follow, so a newest-slab-only bump pointer would strand a
+    /// 147 MB tail (6.9%) in every slab it touches. First-fit gives that tail
+    /// back to the small tensors, which dominate this checkpoint by count.
+    #[test]
+    fn slab_plan_backfills_tails_instead_of_stranding_them() {
+        const SHARD: u64 = 400_001_920;
+        let mut plan = SlabPlan::new(DRIVER_MAX_ALLOC_BYTES, 256).expect("plan");
+        for _ in 0..5 {
+            plan.place(SHARD).expect("shard");
+        }
+        assert_eq!(plan.slab_count(), 1, "5 PLE shards fit one 2 GiB slab");
+        plan.place(SHARD).expect("sixth shard");
+        assert_eq!(plan.slab_count(), 2, "the sixth shard needs a new slab");
+
+        let small = plan.place(1 << 20).expect("small tensor");
+        assert_eq!(
+            small.slab(),
+            0,
+            "first-fit must backfill slab 0's tail, not append to the newest slab"
+        );
+        assert!(
+            small.offset() >= 5 * SHARD,
+            "backfill must land after the shards already in slab 0"
+        );
+        assert_eq!(plan.slab_count(), 2, "backfilling must not open a slab");
+    }
+
+    #[test]
+    fn slab_plan_rejects_a_tensor_larger_than_one_allocation() {
+        let mut plan = SlabPlan::new(DRIVER_MAX_ALLOC_BYTES, 256).expect("plan");
+        let err = plan
+            .place(DRIVER_MAX_ALLOC_BYTES + 1)
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("maxMemoryAllocationSize"), "{msg}");
+        assert_eq!(
+            plan.slab_count(),
+            0,
+            "a rejected request must not commit a slab"
+        );
+        assert!(plan.place(0).is_err(), "zero-length suballocation");
+    }
+
+    #[test]
+    fn slab_plan_rejects_bad_geometry() {
+        assert!(SlabPlan::new(0, 256).is_err(), "zero slab size");
+        assert!(
+            SlabPlan::new(1 << 30, 96).is_err(),
+            "non-power-of-two alignment"
+        );
+        assert!(
+            SlabPlan::new(128, 256).is_err(),
+            "alignment larger than the slab"
+        );
+    }
+
+    /// Directory of the qwen4_exp checkpoint, overridable for other boxes.
+    fn qwen4_exp_dir() -> std::path::PathBuf {
+        std::env::var_os("ARLE_QWEN4_EXP_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(r"C:\Users\Asus\models\qwen3.8-flash-next-nvfp4")
+            })
+    }
+
+    /// Byte length of every tensor in a `.safetensors` file, with its name.
+    ///
+    /// Only the header is read (an 8-byte little-endian length followed by that
+    /// many bytes of JSON — the safetensors format), so this walks a 126 GiB
+    /// checkpoint in well under a second. A tensor's size is the span of its
+    /// `data_offsets` pair; the name is the object key that opens the record,
+    /// which is enough structure to skip a JSON dependency this crate does not
+    /// have.
+    fn safetensors_tensor_sizes(path: &std::path::Path) -> Option<Vec<(String, u64)>> {
+        use std::io::Read;
+
+        fn skip_ws(bytes: &[u8], index: &mut usize) {
+            while bytes.get(*index).is_some_and(u8::is_ascii_whitespace) {
+                *index += 1;
+            }
+        }
+        fn take(bytes: &[u8], index: &mut usize, want: u8) -> Option<()> {
+            skip_ws(bytes, index);
+            if *bytes.get(*index)? != want {
+                return None;
+            }
+            *index += 1;
+            Some(())
+        }
+        fn take_u64(bytes: &[u8], index: &mut usize) -> Option<u64> {
+            skip_ws(bytes, index);
+            let start = *index;
+            while bytes.get(*index).is_some_and(u8::is_ascii_digit) {
+                *index += 1;
+            }
+            std::str::from_utf8(bytes.get(start..*index)?)
+                .ok()?
+                .parse()
+                .ok()
+        }
+        /// The object key that opens the record containing byte `at`.
+        fn key_before(header: &str, at: usize) -> String {
+            let bytes = header.as_bytes();
+            let back = |end: usize, needle: u8| -> Option<usize> {
+                bytes.get(..end)?.iter().rposition(|byte| *byte == needle)
+            };
+            let Some(brace) = back(at, b'{') else {
+                return String::new();
+            };
+            let Some(close) = back(brace, b'"') else {
+                return String::new();
+            };
+            let Some(open) = back(close, b'"') else {
+                return String::new();
+            };
+            header.get(open + 1..close).unwrap_or_default().to_string()
+        }
+
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut len_bytes = [0u8; 8];
+        file.read_exact(&mut len_bytes).ok()?;
+        let header_len = usize::try_from(u64::from_le_bytes(len_bytes)).ok()?;
+        // Guard against a truncated or foreign file claiming a huge header.
+        if header_len == 0 || header_len > (256 << 20) {
+            return None;
+        }
+        let mut header = vec![0u8; header_len];
+        file.read_exact(&mut header).ok()?;
+        let header = String::from_utf8(header).ok()?;
+
+        const KEY: &str = "\"data_offsets\"";
+        let bytes = header.as_bytes();
+        let mut out = Vec::new();
+        for (at, _) in header.match_indices(KEY) {
+            let mut index = at + KEY.len();
+            take(bytes, &mut index, b':')?;
+            take(bytes, &mut index, b'[')?;
+            let begin = take_u64(bytes, &mut index)?;
+            take(bytes, &mut index, b',')?;
+            let end = take_u64(bytes, &mut index)?;
+            take(bytes, &mut index, b']')?;
+            out.push((key_before(&header, at), end.saturating_sub(begin)));
+        }
+        Some(out)
+    }
+
+    /// Plan the REAL qwen4_exp checkpoint (296 475 tensors, 125.9 GiB) through
+    /// the same placement code [`SlabAllocator`] uses, with no GPU involved.
+    ///
+    /// One `vkAllocateMemory` per tensor would need 296 475 live allocations,
+    /// a 72x overrun of the 4096 floor `maxMemoryAllocationCount` is guaranteed
+    /// to allow (though not of what this driver actually reports — see
+    /// [`SlabPlan`]). Slabs turn it into 64.
+    ///
+    /// It also pins the one shape the slab scheme genuinely cannot express: a
+    /// tensor larger than `maxMemoryAllocationSize` has no contiguous home. The
+    /// test asserts every such tensor belongs to the MTP draft head, which the
+    /// base forward pass does not load.
+    #[test]
+    fn slab_plan_fits_the_real_qwen4_exp_checkpoint() {
+        /// The floor `maxMemoryAllocationCount` is guaranteed to allow on
+        /// any conformant device. Asserting against the floor rather than the
+        /// local value keeps the plan portable off this box.
+        const MIN_ALLOCATION_COUNT: usize = 4096;
+        // 16 B is the floor `SlabAllocator` applies on top of
+        // `minStorageBufferOffsetAlignment`; 256 is the largest value current
+        // desktop drivers report, so planning at 256 is the pessimistic case
+        // for padding.
+        const ALIGNMENT: u64 = 256;
+
+        let dir = qwen4_exp_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!(
+                "slab plan test: checkpoint not at {} — skipping (set ARLE_QWEN4_EXP_DIR)",
+                dir.display()
+            );
+            return;
+        };
+        let mut shards: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+            .collect();
+        shards.sort();
+        if shards.is_empty() {
+            eprintln!(
+                "slab plan test: no .safetensors in {} — skipping",
+                dir.display()
+            );
+            return;
+        }
+
+        let mut tensors = Vec::new();
+        for shard in &shards {
+            match safetensors_tensor_sizes(shard) {
+                Some(sizes) => tensors.extend(sizes),
+                None => panic!("failed to read safetensors header of {}", shard.display()),
+            }
+        }
+        assert!(
+            tensors.len() > 100_000,
+            "expected a six-figure tensor count, got {}",
+            tensors.len()
+        );
+
+        let mut plan = SlabPlan::new(DRIVER_MAX_ALLOC_BYTES, ALIGNMENT).expect("plan");
+        let mut last_end: Vec<u64> = Vec::new();
+        let mut oversize: Vec<(String, u64)> = Vec::new();
+        let mut placed = 0usize;
+        let mut total_bytes = 0u64;
+        for (name, len) in &tensors {
+            total_bytes += *len;
+            let Ok(alloc) = plan.place(*len) else {
+                oversize.push((name.clone(), *len));
+                continue;
+            };
+            assert_eq!(
+                alloc.offset() % ALIGNMENT,
+                0,
+                "{name} landed at unaligned offset {}",
+                alloc.offset()
+            );
+            if last_end.len() <= alloc.slab() {
+                last_end.resize(alloc.slab() + 1, 0);
+            }
+            assert!(
+                alloc.offset() >= last_end[alloc.slab()],
+                "{name} overlaps the previous tensor in slab {}",
+                alloc.slab()
+            );
+            assert!(
+                alloc.end() <= DRIVER_MAX_ALLOC_BYTES,
+                "{name} runs past the end of its slab"
+            );
+            last_end[alloc.slab()] = alloc.end();
+            placed += 1;
+        }
+
+        assert_eq!(placed + oversize.len(), tensors.len());
+        assert!(
+            oversize.iter().all(|(name, _)| name.starts_with("mtp.")),
+            "a non-MTP tensor exceeds maxMemoryAllocationSize and has no contiguous home: {oversize:?}"
+        );
+        assert!(
+            plan.slab_count() <= MIN_ALLOCATION_COUNT,
+            "slab count {} exceeds the guaranteed maxMemoryAllocationCount",
+            plan.slab_count()
+        );
+        assert!(
+            plan.slab_count() < tensors.len() / 1000,
+            "slabs ({}) must be orders of magnitude below tensors ({})",
+            plan.slab_count(),
+            tensors.len()
+        );
+        // The sharper statement of "packs well": how far above the information
+        // -theoretic floor of ceil(bytes / slab_size) the online placement
+        // lands. Measured here: 64 slabs against a 62-slab floor, i.e. 2 slabs
+        // (4 GiB) of fragmentation over 122.75 GiB, 4.10% waste. Feeding the
+        // same sizes largest-first reaches the floor exactly (1.01% waste), so
+        // a loader that can sort its tensors should — see [`SlabPlan`].
+        let placed_bytes = plan.used_bytes();
+        let floor = usize::try_from(placed_bytes.div_ceil(DRIVER_MAX_ALLOC_BYTES))
+            .expect("slab floor fits usize");
+        assert!(
+            plan.slab_count() <= floor + 4,
+            "online placement used {} slabs against a {floor}-slab floor",
+            plan.slab_count()
+        );
+        // Alignment padding plus slab tails, over the whole checkpoint.
+        let waste_pct = plan.wasted_bytes() as f64 / plan.committed_bytes() as f64 * 100.0;
+
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "slab plan: {} tensors / {:.2} GiB across {} shards -> {} slabs of {} GiB \
+             (floor {floor}, {:.2} GiB committed, {:.2}% waste); \
+             {} oversize tensor(s) excluded",
+            tensors.len(),
+            gib(total_bytes),
+            shards.len(),
+            plan.slab_count(),
+            DRIVER_MAX_ALLOC_BYTES >> 30,
+            gib(plan.committed_bytes()),
+            waste_pct,
+            oversize.len(),
+        );
+        for (name, len) in &oversize {
+            eprintln!(
+                "slab plan: {name} is {:.2} GiB — must be split across bindings",
+                gib(*len)
+            );
+        }
+    }
 
     #[cfg(not(feature = "vulkan"))]
     #[test]
@@ -1959,6 +3533,15 @@ mod tests {
             ctx.device_name(),
             ctx.queue_family_index()
         );
+        // Diagnostic, not an assertion: a device without matrix cores is a
+        // supported configuration (the prefill GEMM falls back to `mul_mmq`).
+        match ctx.coopmat() {
+            Some(s) => eprintln!(
+                "vulkan-sys smoke: coopmat f16xf16->f32 = {}x{}x{}",
+                s.m, s.n, s.k
+            ),
+            None => eprintln!("vulkan-sys smoke: coopmat = unsupported"),
+        }
 
         let src: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
         let mut buf = match DeviceBuffer::alloc(&ctx, src.len()) {
@@ -2193,6 +3776,262 @@ void main() {
             "CommandRecorder test: 3 barrier-chained dispatches via ONE submit_and_wait == 3 one_shot_submits ({} elems, +{} each elem)",
             N,
             ADDENDS.iter().sum::<i32>()
+        );
+    }
+
+    /// The GPU half of the slab story: gigabytes of real device memory handed
+    /// out as many small suballocations from a handful of `vkAllocateMemory`
+    /// calls, and a suballocation at a NONZERO offset that a compute shader
+    /// actually writes through the existing ranged-descriptor path.
+    ///
+    /// The load-bearing assertion is the last one. The dispatch is pointed at
+    /// the second suballocation in slab 0; if the descriptor offset were
+    /// dropped anywhere between [`SlabAllocator::binding`] and
+    /// [`DescriptorSet::storage_buffers_ranged`], the shader would write slab
+    /// offset 0 instead and corrupt its neighbour — which is exactly what the
+    /// neighbour check catches.
+    ///
+    /// Kept to ~3 GiB: this box shares one GPU between agents.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn slab_allocator_suballocates_gigabytes_in_few_slabs() {
+        // A forced 512 MiB slab (rather than the device's 2 GiB) keeps the test
+        // inside 3 GiB while still crossing several slab boundaries.
+        const SLAB: u64 = 512 << 20;
+        const SUB: u64 = 4 << 20;
+        const COUNT: u64 = 768;
+
+        if init().is_err() {
+            eprintln!("slab allocator test: loader unavailable — skipping");
+            return;
+        }
+        match device_count() {
+            Ok(0) | Err(_) => {
+                eprintln!("slab allocator test: no devices — skipping");
+                return;
+            }
+            Ok(_) => {}
+        }
+        let ctx = match VulkanContext::create() {
+            Ok(ctx) => ctx,
+            Err(VulkanError::NoComputeDevice) => {
+                eprintln!("slab allocator test: no compute queue — skipping");
+                return;
+            }
+            Err(e) => panic!("failed to create Vulkan context: {e}"),
+        };
+        eprintln!(
+            "slab allocator: {} — maxMemoryAllocationSize {} MiB,              maxMemoryAllocationCount {}, maxStorageBufferRange {} MiB,              minStorageBufferOffsetAlignment {} B",
+            ctx.device_name(),
+            ctx.max_memory_allocation_size() >> 20,
+            ctx.max_memory_allocation_count(),
+            u64::from(ctx.max_storage_buffer_range()) >> 20,
+            ctx.min_storage_buffer_offset_alignment(),
+        );
+
+        let mut slabs = match SlabAllocator::with_slab_size(&ctx, SLAB) {
+            Ok(slabs) => slabs,
+            Err(e) => panic!("failed to create slab allocator: {e}"),
+        };
+        let slab_size = slabs.slab_size();
+        assert_eq!(
+            SUB % slabs.alignment(),
+            0,
+            "test assumes suballocations that pack a slab exactly"
+        );
+
+        let mut allocs = Vec::with_capacity(COUNT as usize);
+        for index in 0..COUNT {
+            match slabs.alloc(SUB) {
+                Ok(alloc) => allocs.push(alloc),
+                Err(e) => {
+                    // Another agent may hold the heap; that is not a defect.
+                    eprintln!(
+                        "slab allocator test: device out of memory after {index} of {COUNT}                          suballocations — skipping ({e})"
+                    );
+                    return;
+                }
+            }
+        }
+
+        for alloc in &allocs {
+            assert_eq!(
+                alloc.offset() % slabs.alignment(),
+                0,
+                "suballocation at {} violates minStorageBufferOffsetAlignment",
+                alloc.offset()
+            );
+            assert!(alloc.slab() < slabs.slab_count(), "slab index out of range");
+            assert!(alloc.end() <= slab_size, "suballocation runs past its slab");
+        }
+        let mut sorted = allocs.clone();
+        sorted.sort_by_key(|alloc| (alloc.slab(), alloc.offset()));
+        for pair in sorted.windows(2) {
+            let (lhs, rhs) = (pair[0], pair[1]);
+            if lhs.slab() == rhs.slab() {
+                assert!(
+                    lhs.end() <= rhs.offset(),
+                    "suballocations overlap in slab {}: [{}, {}) vs [{}, {})",
+                    lhs.slab(),
+                    lhs.offset(),
+                    lhs.end(),
+                    rhs.offset(),
+                    rhs.end()
+                );
+            }
+        }
+
+        let total = COUNT * SUB;
+        assert_eq!(
+            slabs.slab_count() as u64,
+            total.div_ceil(slab_size),
+            "slab count must be ceil(total / slab size), not one per suballocation"
+        );
+        assert!(
+            (slabs.slab_count() as u64) * 100 < COUNT,
+            "{} slabs for {COUNT} suballocations is not a suballocator",
+            slabs.slab_count()
+        );
+        assert_eq!(slabs.used_bytes(), total);
+        assert_eq!(
+            slabs.committed_bytes(),
+            slabs.slab_count() as u64 * slab_size
+        );
+        let live = u32::try_from(slabs.slab_count()).expect("slab count fits u32");
+        assert!(
+            live <= ctx.max_memory_allocation_count(),
+            "{live} live allocations exceeds maxMemoryAllocationCount {}",
+            ctx.max_memory_allocation_count()
+        );
+
+        // The slab size must come from the device, not a hardcoded 2 GiB:
+        // a default allocator's geometry has to match what this driver reports,
+        // and a request past it has to be refused rather than silently split.
+        {
+            let mut device_sized = SlabAllocator::new(&ctx).expect("default slab allocator");
+            assert_eq!(
+                device_sized.slab_size(),
+                ctx.max_memory_allocation_size(),
+                "default slab size must be the queried maxMemoryAllocationSize"
+            );
+            let err = device_sized
+                .alloc(ctx.max_memory_allocation_size() + 1)
+                .expect_err("a suballocation past maxMemoryAllocationSize must be refused");
+            assert!(err.to_string().contains("maxMemoryAllocationSize"), "{err}");
+            assert_eq!(
+                device_sized.slab_count(),
+                0,
+                "a refused request must not have committed device memory"
+            );
+        }
+
+        // Round-trip the last suballocation: it is in the last slab at a
+        // nonzero offset, so both the staged write and the staged read have to
+        // get the offset right.
+        let target = *allocs.last().expect("at least one suballocation");
+        assert!(target.slab() > 0, "expected the last slab");
+        let payload: Vec<u8> = (0..4096u32).map(|byte| (byte % 251) as u8).collect();
+        slabs.write(&target, &payload).expect("staged write");
+        let mut back = vec![0u8; payload.len()];
+        slabs.read_back(&target, &mut back).expect("staged read");
+        assert_eq!(payload, back, "staged round-trip through a slab mismatched");
+
+        eprintln!(
+            "slab allocator: {COUNT} x {} MiB suballocations -> {} slabs of {} MiB              ({} MiB committed, {} MiB used)",
+            SUB >> 20,
+            slabs.slab_count(),
+            slab_size >> 20,
+            slabs.committed_bytes() >> 20,
+            slabs.used_bytes() >> 20,
+        );
+
+        // UMA slabs take the mapped-write branch of `write` instead of the
+        // staging one; the offset arithmetic differs and needs its own proof.
+        {
+            let mut uma =
+                match SlabAllocator::with_slab_size_and_memory(&ctx, 64 << 20, SlabMemory::Uma) {
+                    Ok(uma) => uma,
+                    Err(e) => panic!("failed to create UMA slab allocator: {e}"),
+                };
+            let head = uma.alloc(1 << 20).expect("uma head");
+            let tail = uma.alloc(1 << 20).expect("uma tail");
+            assert_eq!(uma.slab_count(), 1, "two 1 MiB subs fit one 64 MiB slab");
+            assert!(tail.offset() >= head.end());
+            uma.write(&tail, &payload).expect("mapped write");
+            let mut uma_back = vec![0u8; payload.len()];
+            uma.read_back(&tail, &mut uma_back).expect("uma read");
+            assert_eq!(
+                payload, uma_back,
+                "mapped write at a slab offset mismatched"
+            );
+        }
+
+        let Some(glslc) = find_glslc() else {
+            eprintln!("slab allocator test: glslc not found — skipping the bind-at-offset half");
+            return;
+        };
+        let Some(spirv) = compile_add_shader(&glslc) else {
+            eprintln!("slab allocator test: shader compile failed — skipping bind-at-offset");
+            return;
+        };
+
+        const N: usize = 1024;
+        const ADDEND: i32 = 7;
+        let first = allocs[0];
+        let second = allocs[1];
+        assert_eq!(first.slab(), second.slab(), "expected two subs in slab 0");
+        assert_eq!(first.offset(), 0);
+        assert!(
+            second.offset() > 0,
+            "the neighbour check needs a real offset"
+        );
+
+        let pattern: Vec<u8> = (0..N as i32).flat_map(i32::to_le_bytes).collect();
+        slabs.write(&first, &pattern).expect("seed neighbour");
+        slabs.write(&second, &pattern).expect("seed target");
+
+        let shader = ShaderModule::from_spirv_bytes(&ctx, &spirv).expect("add shader");
+        let layout = DescriptorSetLayout::storage_buffers(&ctx, 1).expect("layout");
+        // push = { uint n; int addend; } = 8 bytes.
+        let pipeline = ComputePipeline::create_with_push_constants(&ctx, &shader, &[&layout], 8)
+            .expect("pipeline");
+        let (buffer, offset, len) = slabs.binding(&second).expect("binding");
+        let set = DescriptorSet::storage_buffers_ranged(&ctx, &layout, &[(buffer, offset, len)])
+            .expect("ranged descriptor set");
+        let push = [(N as u32).to_le_bytes(), ADDEND.to_le_bytes()].concat();
+        let mut rec = CommandRecorder::new(&ctx).expect("recorder");
+        rec.begin().expect("begin");
+        rec.dispatch(&pipeline, &set, &push, [(N as u32).div_ceil(64), 1, 1]);
+        rec.submit_and_wait().expect("submit");
+
+        let ints = |bytes: &[u8]| -> Vec<i32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| i32::from_le_bytes(*chunk))
+                .collect()
+        };
+        let mut target_back = vec![0u8; pattern.len()];
+        slabs
+            .read_back(&second, &mut target_back)
+            .expect("read target");
+        let mut neighbour_back = vec![0u8; pattern.len()];
+        slabs
+            .read_back(&first, &mut neighbour_back)
+            .expect("read neighbour");
+        assert_eq!(
+            ints(&target_back),
+            (0..N as i32).map(|v| v + ADDEND).collect::<Vec<_>>(),
+            "the ranged bind never reached the suballocation"
+        );
+        assert_eq!(
+            ints(&neighbour_back),
+            (0..N as i32).collect::<Vec<_>>(),
+            "the dispatch wrote slab offset 0 — the descriptor offset was ignored"
+        );
+        eprintln!(
+            "slab allocator: dispatch through a slab binding at offset {offset} hit the              suballocation and left its neighbour at offset 0 untouched"
         );
     }
 }

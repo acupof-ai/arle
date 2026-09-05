@@ -96,6 +96,19 @@ pub struct Qwen35TensorRole {
     pub layer: Option<usize>,
 }
 
+/// A tensor belonging to a trailing MTP block — any `blk.<N>` at or past the
+/// decode graph's last layer. Qwen3.8-27B's blk.64 is a *complete* transformer
+/// block (attn_q, ffn_down, …) that additionally carries the four `nextn.*`
+/// weights, so matching the `nextn.` suffix alone leaves the rest behind.
+/// Speculative decode is not wired on Vulkan, so the whole block is dropped
+/// rather than spending device bytes nothing dispatches against.
+pub fn is_mtp_tensor(name: &str, num_layers: usize) -> bool {
+    name.strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .and_then(|(index, _)| index.parse::<usize>().ok())
+        .is_some_and(|layer| layer >= num_layers)
+}
+
 /// Map a GGUF tensor name to its role + layer. Fails loud on an unknown name so
 /// a schema surprise (new tensor, renamed weight) is caught at load, not
 /// silently dropped.
@@ -171,8 +184,17 @@ pub fn plan_residency(kind: Qwen35TensorKind, ty: GgmlType) -> Residency {
     }
     match ty {
         // Quant tiers with a registered device GEMV stay packed (raw bytes):
-        // K-quants via `mul_mat_vecq`, Q8_0 via `q8_0_gemv`.
-        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0 => Residency::KeepQuant(ty),
+        // K-quants and MXFP4 via `mul_mat_vecq`, Q8_0 via `q8_0_gemv`.
+        //
+        // MXFP4 is not optional here the way the others are. Unsloth's
+        // "UD-Q4_K_XL" dynamic quants store the routed experts in MXFP4 — 90%
+        // of a 122B-A10B's elements — and 17 packed bytes per 32 values
+        // expands to 64 as F16. Falling through to `DequantF16` plans 213 GiB
+        // against a 74.43 GiB device-local heap, so the default arm does not
+        // merely waste memory, it makes the model unloadable.
+        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0 | GgmlType::Mxfp4 => {
+            Residency::KeepQuant(ty)
+        }
         GgmlType::F32 => Residency::DequantF32,
         _ => Residency::DequantF16,
     }
@@ -206,6 +228,118 @@ pub struct PlannedTensor {
     pub bytes: u64,
 }
 
+// ------------------------------------------------------------- device budget
+
+/// Device-local bytes held back from any residency plan for the KV cache, the
+/// activation arena and the descriptor pools — all of which are allocated
+/// *after* the weights, so a plan that exactly fills the heap fails later and
+/// less legibly.
+///
+/// Module-level rather than a function-body `const` so a test can name the same
+/// number the loader uses; a reserve nobody can reach from a test is a reserve
+/// nobody can check. `crate::qwen4_upload::DEFAULT_RESERVE_BYTES` is the
+/// smaller sibling for a model that does not fit with 3 GiB held back.
+pub const RESERVE_BYTES: u64 = 3 << 30;
+
+/// Which number a residency plan was sized against.
+///
+/// **The budget is advisory, and that is exactly why it has to be the planning
+/// number.** Measured on this box: 1 GiB DEVICE_LOCAL slabs kept allocating past
+/// the reported 70.711 GiB budget and only failed at **74 GiB**, with
+/// `heapUsage` climbing straight through the budget line. So going over does not
+/// produce `ERROR_OUT_OF_DEVICE_MEMORY` at the allocation that crosses it — it
+/// produces a residency the driver has told you it cannot back, which on a UMA
+/// part means silent page demotion. A guard sized against the heap SIZE would
+/// happily let that happen and see nothing wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceBudgetSource {
+    /// `VK_EXT_memory_budget`: `heapBudget - heapUsage`, i.e. what the driver
+    /// says this process may still commit. The number to plan against.
+    DriverBudget,
+    /// `VkMemoryHeap::size`, because the extension is absent. An upper bound,
+    /// not a promise — on this APU the two differ by 3.72 GiB.
+    HeapSize,
+}
+
+impl DeviceBudgetSource {
+    /// For the "over by N GiB" message: a reader who sees a plan refused needs
+    /// to know whether the limit came from the driver or from a fallback.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DriverBudget => "driver budget (heapBudget - heapUsage)",
+            Self::HeapSize => "heap size (VK_EXT_memory_budget unsupported)",
+        }
+    }
+}
+
+/// What a residency plan may commit on the device-local heap, and where the
+/// number came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceBudget {
+    /// The limit to plan against, before any reserve.
+    pub bytes: u64,
+    pub source: DeviceBudgetSource,
+    /// Index into `VulkanContext::memory_heaps()`, so a caller can cross-check.
+    pub heap_index: usize,
+    /// `VkMemoryHeap::size` for that heap, kept for the error message: "74.43
+    /// GiB of heap, 70.71 GiB of budget" is the whole story in one line.
+    pub heap_size: u64,
+}
+
+/// Pick the device-local heap and decide what may be committed on it.
+///
+/// Takes slices rather than a `VulkanContext` so the policy — prefer the
+/// driver's budget, fall back to heap size, REFUSE when there is no
+/// device-local heap at all — is testable on a box with no GPU. That last case
+/// used to be `.unwrap_or(u64::MAX)`, which turned the one guard whose whole job
+/// is failing loud into a guard that passes everything.
+///
+/// `heaps` is `VulkanContext::memory_heaps()`; `budgets` is
+/// `memory_budgets()`, index-aligned with it, `None` when the extension is
+/// unsupported.
+pub fn device_local_budget_from(
+    heaps: &[(u64, bool)],
+    budgets: Option<&[(u64, u64)]>,
+) -> Result<DeviceBudget> {
+    let (heap_index, &(heap_size, _)) = heaps
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(_, device_local))| device_local)
+        .max_by_key(|&(_, &(size, _))| size)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no DEVICE_LOCAL memory heap among the {} the driver reports — refusing to \
+                 plan a device residency against an unknown limit",
+                heaps.len()
+            )
+        })?;
+    // `budget - usage` is the bytes still grantable. Clamped to the heap size
+    // because the plan is also bounded by physical geometry, and a driver that
+    // reports a budget above its own heap should not widen the guard.
+    let (bytes, source) = match budgets.and_then(|b| b.get(heap_index)) {
+        Some(&(budget, usage)) => (
+            budget.saturating_sub(usage).min(heap_size),
+            DeviceBudgetSource::DriverBudget,
+        ),
+        None => (heap_size, DeviceBudgetSource::HeapSize),
+    };
+    Ok(DeviceBudget {
+        bytes,
+        source,
+        heap_index,
+        heap_size,
+    })
+}
+
+/// [`device_local_budget_from`] against a live context.
+#[cfg(feature = "vulkan")]
+pub fn device_local_budget(ctx: &vulkan_sys::VulkanContext) -> Result<DeviceBudget> {
+    let heaps = ctx.memory_heaps();
+    let budgets = ctx.memory_budgets();
+    device_local_budget_from(&heaps, budgets.as_deref())
+}
+
 #[derive(Debug, Default)]
 pub struct ResidencyPlan {
     pub tensors: Vec<PlannedTensor>,
@@ -215,12 +349,56 @@ pub struct ResidencyPlan {
     pub device_bytes: u64,
 }
 
+impl ResidencyPlan {
+    /// Refuse a plan that will not fit the device-local heap, BEFORE any upload
+    /// starts.
+    ///
+    /// Without this the failure arrives thousands of tensors deep as an opaque
+    /// `ERROR_OUT_OF_DEVICE_MEMORY` from whichever allocation happened to be
+    /// unlucky, after minutes of staging. The plan already knows the answer; ask
+    /// it. `headroom` is what must survive for the KV cache, activation arena
+    /// and descriptor pools — a plan that fits with zero bytes to spare does not
+    /// fit.
+    ///
+    /// Sized against the DEVICE_LOCAL heap rather than total system memory on
+    /// purpose: on this APU the two differ by the BIOS carve-out (measured: a
+    /// 60 GiB device-local allocation moved OS-visible free RAM by only 4.2 GiB,
+    /// so the heaps are largely disjoint and the host figure says nothing about
+    /// what the device can hold). And against [`DeviceBudget`] rather than a
+    /// bare byte count so the refusal says WHICH limit it used — over-committing
+    /// this UMA part is silent page demotion, not `OUT_OF_DEVICE_MEMORY`, so the
+    /// difference between 74.43 GiB of heap and 70.71 GiB of budget is the
+    /// difference between a load that works and one that is quietly 5x slow.
+    pub fn ensure_fits(&self, budget: &DeviceBudget, headroom: u64) -> Result<()> {
+        let usable = budget.bytes.saturating_sub(headroom);
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        ensure!(
+            self.device_bytes <= usable,
+            "residency plan needs {:.2} GiB but heap {} grants {:.2} GiB — {} (heap size \
+             {:.2} GiB); {:.2} GiB reserved for KV + activations leaves {:.2} GiB usable, \
+             so the plan is over by {:.2} GiB",
+            gib(self.device_bytes),
+            budget.heap_index,
+            gib(budget.bytes),
+            budget.source.label(),
+            gib(budget.heap_size),
+            gib(headroom),
+            gib(usable),
+            gib(self.device_bytes.saturating_sub(usable)),
+        );
+        Ok(())
+    }
+}
+
 pub fn plan_model(gguf: &GgufFile, num_layers: usize) -> Result<ResidencyPlan> {
     let mut plan = ResidencyPlan {
         layer_bytes: vec![0; num_layers],
         ..Default::default()
     };
     for info in gguf.tensors() {
+        if is_mtp_tensor(&info.name, num_layers) {
+            continue;
+        }
         let role = classify_qwen35_tensor(&info.name)?;
         let residency = plan_residency(role.kind, info.ggml_type);
         let bytes = device_bytes(residency, info)?;
@@ -423,6 +601,13 @@ pub mod upload {
         gguf: &GgufFile,
         plan: &ResidencyPlan,
     ) -> Result<ResidentWeights<'a>> {
+        // Refuse an over-budget plan before staging a single byte, against the
+        // DRIVER'S budget and not the heap size — see `device_local_budget`.
+        // A driver that reports no device-local heap is a refusal, not a
+        // free pass.
+        let budget = super::device_local_budget(ctx)?;
+        plan.ensure_fits(&budget, super::RESERVE_BYTES)?;
+
         let mut tensors = std::collections::HashMap::new();
         let mut embedding: Option<HostEmbeddingTable> = None;
 
@@ -517,6 +702,86 @@ pub mod upload {
         Ok(ResidentWeights { tensors, embedding })
     }
 
+    /// Minimal synthetic-GGUF writer for the device test below.
+    ///
+    /// This used to live in `infer_gguf::gguf::test_writer`, `pub` purely so
+    /// cross-crate test builds could reach it. `a7c9ee395` ("remove inline unit
+    /// tests") deleted it together with its in-crate callers and missed this
+    /// one, leaving `infer-vulkan`'s whole test target uncompilable. Since this
+    /// is now the only consumer, it lives here under `#[cfg(test)]` instead of
+    /// going back to being a `pub` item in a shipping crate.
+    #[cfg(test)]
+    mod test_writer {
+        /// GGUF's default `general.alignment`; tensor data is padded to it.
+        const ALIGNMENT: usize = 32;
+
+        pub enum V {
+            Str(&'static str),
+        }
+
+        pub struct T {
+            pub name: String,
+            pub dims: Vec<u64>,
+            pub type_id: u32,
+            pub data: Vec<u8>,
+        }
+
+        fn put_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+
+        /// GGUF v3: magic, version, tensor count, kv count, the kv block, the
+        /// tensor-info block (each info's `offset` is relative to the start of
+        /// the aligned data section), then the padded data section.
+        pub fn write(kvs: &[(&str, V)], tensors: &[T]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"GGUF");
+            buf.extend_from_slice(&3u32.to_le_bytes());
+            buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+            for (key, value) in kvs {
+                put_str(&mut buf, key);
+                match value {
+                    V::Str(v) => {
+                        buf.extend_from_slice(&8u32.to_le_bytes());
+                        put_str(&mut buf, v);
+                    }
+                }
+            }
+            let mut offset = 0usize;
+            for t in tensors {
+                put_str(&mut buf, &t.name);
+                buf.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+                for d in &t.dims {
+                    buf.extend_from_slice(&d.to_le_bytes());
+                }
+                buf.extend_from_slice(&t.type_id.to_le_bytes());
+                buf.extend_from_slice(&(offset as u64).to_le_bytes());
+                offset += t.data.len().div_ceil(ALIGNMENT) * ALIGNMENT;
+            }
+            while !buf.len().is_multiple_of(ALIGNMENT) {
+                buf.push(0);
+            }
+            for t in tensors {
+                buf.extend_from_slice(&t.data);
+                while !buf.len().is_multiple_of(ALIGNMENT) {
+                    buf.push(0);
+                }
+            }
+            buf
+        }
+
+        pub fn write_to_temp(kvs: &[(&str, V)], tensors: &[T], tag: &str) -> std::path::PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "arle-infer-vulkan-{tag}-{}.gguf",
+                std::process::id()
+            ));
+            std::fs::write(&path, write(kvs, tensors)).unwrap();
+            path
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -542,16 +807,18 @@ pub mod upload {
             assert_eq!(nan & 0x7C00, 0x7C00);
             assert_ne!(nan & 0x03FF, 0);
             // Smallest normal/subnormal halves round-trip sanity.
-            assert_eq!(f32_to_f16(6.103515625e-5), 0x0400); // 2^-14 smallest normal
+            // 2^-14, written as a ratio of powers of two so it stays exact
+            // without a 10-digit decimal (clippy::excessive_precision).
+            assert_eq!(f32_to_f16(1.0 / 16384.0), 0x0400); // smallest normal
             assert_eq!(f32_to_f16(5.9604645e-8), 0x0001); // smallest subnormal
         }
 
         #[cfg(feature = "vulkan")]
         #[test]
         fn upload_plan_lands_bytes_on_device() {
+            use super::test_writer::{T, V, write_to_temp};
             use crate::loader::plan_model;
             use infer_gguf::gguf::GgufFile;
-            use infer_gguf::gguf::test_writer::{T, V, write_to_temp};
             use vulkan_sys::VulkanContext;
 
             let ctx = match VulkanContext::create() {
@@ -643,13 +910,17 @@ pub mod upload {
             }
 
             // KeepQuant Q4_K round-trips byte-for-byte (raw quant bytes uploaded).
+            //
+            // Read back STAGED: resident weights live in DEVICE_LOCAL-only
+            // memory, so `copy_to_host` — which maps the buffer itself — fails
+            // with `ERROR_MEMORY_MAP_FAILED` on them.
             let q4 = resident.get("blk.0.ffn_gate_exps.weight").unwrap();
             assert!(matches!(
                 q4.residency,
                 Residency::KeepQuant(infer_gguf::gguf::GgmlType::Q4K)
             ));
             let mut back = vec![0u8; q4.buffer.len()];
-            q4.buffer.copy_to_host(&mut back).expect("D2H Q4_K");
+            q4.buffer.copy_to_host_staged(&mut back).expect("D2H Q4_K");
             assert_eq!(back, q4_k, "Q4_K device round-trip mismatch");
 
             // Q8_0 now stays PACKED (KeepQuant), not dequantized to F16: the raw
@@ -666,7 +937,9 @@ pub mod upload {
                 "Q8_0 kept packed at 34 B (not 64 B F16)"
             );
             let mut q8_back = vec![0u8; q8.buffer.len()];
-            q8.buffer.copy_to_host(&mut q8_back).expect("D2H Q8_0");
+            q8.buffer
+                .copy_to_host_staged(&mut q8_back)
+                .expect("D2H Q8_0");
             assert_eq!(q8_back, q8_0, "Q8_0 device round-trip mismatch");
 
             let row0 = resident.embedding.embed_row(0).expect("embed_row(0)");
@@ -797,5 +1070,157 @@ mod tests {
     #[test]
     fn dequant_row_rejects_mxfp4() {
         assert!(dequant_row_f32(GgmlType::Mxfp4, &[0u8; 64], 32).is_err());
+    }
+
+    // ------------------------------------------------------- device budget
+    //
+    // The numbers are the 8060S's, read off the device with
+    // `VulkanContext::{memory_heaps, memory_budgets}` (see
+    // `tests/qwen4_residency_plan.rs::device_budget_is_the_planning_number`,
+    // which pins them against the live driver). They are spelled out here so
+    // the policy is testable with no GPU in the room.
+
+    /// heap 0: host, 37.22 GiB size / 35.36 GiB budget.
+    const HOST_HEAP: (u64, bool) = (39_960_444_928, false);
+    /// heap 1: DEVICE_LOCAL, 74.43 GiB size / 70.71 GiB budget.
+    const DEVICE_HEAP: (u64, bool) = (79_920_955_392, true);
+    const HOST_BUDGET: (u64, u64) = (37_962_424_320, 0);
+    const DEVICE_BUDGET: (u64, u64) = (75_924_905_984, 0);
+
+    #[test]
+    fn budget_beats_heap_size_when_the_driver_reports_one() {
+        let heaps = [HOST_HEAP, DEVICE_HEAP];
+        let b = device_local_budget_from(&heaps, Some(&[HOST_BUDGET, DEVICE_BUDGET])).unwrap();
+        assert_eq!(b.heap_index, 1, "the DEVICE_LOCAL heap");
+        assert_eq!(b.source, DeviceBudgetSource::DriverBudget);
+        assert_eq!(b.bytes, 75_924_905_984, "70.71 GiB of budget, not 74.43");
+        assert_eq!(b.heap_size, 79_920_955_392);
+        // The 3.72 GiB this recovers is the whole point of the change.
+        assert_eq!(b.heap_size - b.bytes, 3_996_049_408);
+    }
+
+    #[test]
+    fn budget_subtracts_what_is_already_committed() {
+        let heaps = [HOST_HEAP, DEVICE_HEAP];
+        let used = 8u64 << 30;
+        let b = device_local_budget_from(&heaps, Some(&[HOST_BUDGET, (DEVICE_BUDGET.0, used)]))
+            .unwrap();
+        assert_eq!(b.bytes, 75_924_905_984 - used, "budget minus usage");
+    }
+
+    #[test]
+    fn budget_falls_back_to_heap_size_without_the_extension() {
+        let heaps = [HOST_HEAP, DEVICE_HEAP];
+        let b = device_local_budget_from(&heaps, None).unwrap();
+        assert_eq!(b.source, DeviceBudgetSource::HeapSize);
+        assert_eq!(b.bytes, b.heap_size);
+        // A budgets array too short to cover the chosen heap is the same case:
+        // guessing from a neighbouring heap's budget would be worse than
+        // falling back.
+        let short = device_local_budget_from(&heaps, Some(&[HOST_BUDGET])).unwrap();
+        assert_eq!(short.source, DeviceBudgetSource::HeapSize);
+        assert_eq!(short.bytes, short.heap_size);
+    }
+
+    #[test]
+    fn a_driver_budget_above_its_own_heap_does_not_widen_the_guard() {
+        let heaps = [DEVICE_HEAP];
+        let b = device_local_budget_from(&heaps, Some(&[(u64::MAX, 0)])).unwrap();
+        assert_eq!(b.bytes, DEVICE_HEAP.0, "clamped to the heap");
+    }
+
+    #[test]
+    fn no_device_local_heap_refuses_instead_of_passing_everything() {
+        // This is the `.unwrap_or(u64::MAX)` case. It must be an Err: a guard
+        // that cannot find the heap it guards has to say so, not wave the
+        // plan through and let the failure land 70 GiB into the upload.
+        let err = device_local_budget_from(&[HOST_HEAP], None)
+            .expect_err("no DEVICE_LOCAL heap must refuse");
+        assert!(
+            err.to_string().contains("no DEVICE_LOCAL"),
+            "message should name the missing heap: {err}"
+        );
+        assert!(device_local_budget_from(&[], None).is_err(), "no heaps");
+    }
+
+    #[test]
+    fn budget_picks_the_largest_device_local_heap() {
+        // Two device-local heaps (a discrete part's small BAR window plus its
+        // VRAM) — the plan belongs on the big one, and the budget must come
+        // from that one's index, not from whichever came first.
+        let heaps = [(256u64 << 20, true), HOST_HEAP, (16u64 << 30, true)];
+        let budgets = [(256u64 << 20, 0), HOST_BUDGET, (15u64 << 30, 1 << 30)];
+        let b = device_local_budget_from(&heaps, Some(&budgets)).unwrap();
+        assert_eq!(b.heap_index, 2);
+        assert_eq!(b.bytes, (15u64 << 30) - (1 << 30));
+    }
+
+    // -------------------------------------------------------- ensure_fits
+
+    fn plan_of(device_bytes: u64) -> ResidencyPlan {
+        ResidencyPlan {
+            device_bytes,
+            ..Default::default()
+        }
+    }
+
+    fn budget_of(bytes: u64, source: DeviceBudgetSource) -> DeviceBudget {
+        DeviceBudget {
+            bytes,
+            source,
+            heap_index: 1,
+            heap_size: DEVICE_HEAP.0,
+        }
+    }
+
+    #[test]
+    fn ensure_fits_is_exact_at_the_boundary() {
+        let budget = budget_of(DEVICE_BUDGET.0, DeviceBudgetSource::DriverBudget);
+        let usable = DEVICE_BUDGET.0 - RESERVE_BYTES;
+        plan_of(usable)
+            .ensure_fits(&budget, RESERVE_BYTES)
+            .expect("exactly budget - reserve fits");
+        let err = plan_of(usable + 1)
+            .ensure_fits(&budget, RESERVE_BYTES)
+            .expect_err("one byte over budget - reserve must not fit");
+        assert!(
+            err.to_string().contains("over by"),
+            "message must quantify the overage: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_fits_says_which_limit_it_used() {
+        let plan = plan_of(72 << 30);
+        // 72 GiB fits the 74.43 GiB heap with a 1 GiB reserve, and does NOT fit
+        // the 70.71 GiB driver budget. Same plan, same reserve, opposite
+        // verdicts — which is the bug this pair exists to hold shut.
+        plan.ensure_fits(
+            &budget_of(DEVICE_HEAP.0, DeviceBudgetSource::HeapSize),
+            1 << 30,
+        )
+        .expect("fits the heap size");
+        let err = plan
+            .ensure_fits(
+                &budget_of(DEVICE_BUDGET.0, DeviceBudgetSource::DriverBudget),
+                1 << 30,
+            )
+            .expect_err("must not fit the driver budget");
+        let msg = err.to_string();
+        assert!(msg.contains("heapBudget"), "names the source: {msg}");
+        assert!(msg.contains("74.43"), "quotes the heap size too: {msg}");
+        assert!(msg.contains("70.71"), "quotes the budget: {msg}");
+    }
+
+    #[test]
+    fn ensure_fits_treats_an_oversized_reserve_as_zero_usable() {
+        // `saturating_sub` must not wrap a reserve larger than the budget into
+        // a gigantic allowance.
+        let budget = budget_of(1 << 30, DeviceBudgetSource::DriverBudget);
+        assert!(plan_of(1).ensure_fits(&budget, 4 << 30).is_err());
+        assert!(
+            plan_of(0).ensure_fits(&budget, 4 << 30).is_ok(),
+            "empty fits"
+        );
     }
 }

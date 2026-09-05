@@ -1,0 +1,130 @@
+#version 450
+// ARLE Vulkan shader: chunked (WY-form) gated-delta-net prefill, INTER-chunk
+// STATE half — the partner of `qwen4_gdn_chunk_intra.comp` (see its header
+// for the math and the scratch-section contract). Port of the chunk loop in
+// llama.cpp `build_delta_net_chunking` (delta-net-base.cpp, ca3d5a3e1):
+//
+//     v_new[i] = u[i] - kcd[i] @ S            (delta with the carried state)
+//     out[i]   = qg[i] @ S + sum_m kq[i][m] v_new[m]
+//     S       <- S * gl + sum_i kg[i] (x) v_new[i]
+//
+// The chunk loop is serial (each chunk reads the state the previous one
+// wrote), so it runs INSIDE the workgroup — the dispatch is serial in
+// n_chunks, not in n_tokens, which is the whole point of the lane.
+//
+// Grid: (num_value_heads, val_dim / VT) workgroups. The `[key_dim, val_dim]`
+// state splits cleanly by value COLUMN — v_new, out and the state update for
+// column `val` touch no other column — so each workgroup owns a VT-column
+// stripe of one head's state for the whole sequence and never synchronizes
+// with any other. Only `kq` and the per-chunk scalars are read by more than
+// one stripe. `out[i]` needs `v_new[m]` for every m in the chunk (not just
+// this thread's), which is why v_new stages through shared memory and the
+// two phases are barrier-separated.
+//
+// State reads/writes are f32 in the resident state buffer — the same buffer,
+// layout and precision the serial kernel advances, so a chunked prefill can
+// hand off to per-token decode with no conversion.
+//
+// Bindings: `0 = Scratch` (read; written by the intra kernel — layout at
+// `qwen4_gdn_chunk_params`), `1 = State [nv*kd*vd] f32` (read+write, val
+// contiguous), `2 = Output [seq_len*nv*vd] f32` (write, token-major).
+
+#define CS 64
+// Columns per workgroup: 4 stripes at vd=128 gives nv*4 workgroups, and an
+// 8 KiB shared v_new tile (CS * VT f32).
+#define VT 32
+#define BLOCK 128
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint num_key_heads;
+    uint num_value_heads;
+    uint key_dim;
+    uint val_dim;
+    uint seq_len;
+    uint n_chunks;
+} p;
+
+layout(binding = 0) readonly buffer Scratch {
+    float scratch[];
+};
+layout(binding = 1) buffer State {
+    float state[];
+};
+layout(binding = 2) buffer Output {
+    float output_data[];
+};
+
+shared float sh_vnew[CS * VT];
+
+void main() {
+    const uint v_head = gl_WorkGroupID.x;
+    const uint val0 = gl_WorkGroupID.y * VT;
+    if (v_head >= p.num_value_heads || val0 >= p.val_dim) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kd = p.key_dim;
+    const uint vd = p.val_dim;
+    const uint nh = p.n_chunks * p.num_value_heads;
+    const uint out_stride = p.num_value_heads * vd;
+    const uint state_base = v_head * kd * vd;
+
+    for (uint c = 0; c < p.n_chunks; ++c) {
+        const uint L = min(CS, p.seq_len - c * CS);
+        const uint pair = c * p.num_value_heads + v_head;
+        const uint kq_at = pair * CS * CS;
+        const uint kcd_at = nh * CS * CS + pair * CS * kd;
+        const uint u_at = nh * (CS * CS + CS * kd) + pair * CS * vd;
+        const uint qg_at = nh * (CS * CS + CS * kd + CS * vd) + pair * CS * kd;
+        const uint kg_at = nh * (CS * CS + 2 * CS * kd + CS * vd) + pair * CS * kd;
+        const float gl = scratch[nh * (CS * CS + 3 * CS * kd + CS * vd) + pair];
+
+        // v_new = u - kcd @ S, into shared: out[i] below contracts v_new over
+        // the whole chunk, not just this thread's rows.
+        for (uint e = tid; e < L * VT; e += BLOCK) {
+            const uint i = e / VT;
+            const uint v = e % VT;
+            float acc = scratch[u_at + i * vd + val0 + v];
+            for (uint d = 0; d < kd; ++d) {
+                acc -= scratch[kcd_at + i * kd + d] * state[state_base + d * vd + val0 + v];
+            }
+            sh_vnew[i * VT + v] = acc;
+        }
+        barrier();
+
+        // out = qg @ S + kq @ v_new. Reads the PRE-update state, so the
+        // barrier below keeps the state update from overwriting it early.
+        for (uint e = tid; e < L * VT; e += BLOCK) {
+            const uint i = e / VT;
+            const uint v = e % VT;
+            float acc = 0.0;
+            for (uint d = 0; d < kd; ++d) {
+                acc += scratch[qg_at + i * kd + d] * state[state_base + d * vd + val0 + v];
+            }
+            // kq is zero above the diagonal (the intra kernel wrote it), so
+            // the full m < L contraction is already causal.
+            for (uint m = 0; m < L; ++m) {
+                acc += scratch[kq_at + i * CS + m] * sh_vnew[m * VT + v];
+            }
+            output_data[(c * CS + i) * out_stride + v_head * vd + val0 + v] = acc;
+        }
+        barrier();
+
+        // S <- S * gl + kg^T @ v_new. Each (d, val) element belongs to
+        // exactly one thread of exactly one stripe workgroup, so the
+        // read-modify-write races with nothing.
+        for (uint e = tid; e < kd * VT; e += BLOCK) {
+            const uint d = e / VT;
+            const uint v = e % VT;
+            const uint idx = state_base + d * vd + val0 + v;
+            float acc = state[idx] * gl;
+            for (uint i = 0; i < L; ++i) {
+                acc += scratch[kg_at + i * kd + d] * sh_vnew[i * VT + v];
+            }
+            state[idx] = acc;
+        }
+        barrier();
+    }
+}
