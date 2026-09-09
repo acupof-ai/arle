@@ -150,7 +150,7 @@ fn build_pipeline<'a>(
         &[&layout],
         push_bytes,
         specialization_u32,
-        kernel.required_subgroup_size(),
+        kernel.required_subgroup_size(specialization_u32),
     )
     .map_err(|e| KernelError::Runtime(e.to_string()))?;
     Ok((pipeline, layout))
@@ -179,6 +179,22 @@ pub fn record_dispatch(
     groups: [u32; 3],
 ) {
     recorder.dispatch(pipeline, set, push, groups);
+}
+
+/// [`record_dispatch`] with the workgroup counts read on the GPU from a
+/// `VkDispatchIndirectCommand` at `args_offset` inside `args` — for dispatch
+/// extents a previous dispatch computed (e.g. the grouped-MoE planner's
+/// per-class block counts). Order the args write before this read with
+/// `CommandRecorder::barrier_indirect`, not the plain `barrier`.
+pub fn record_dispatch_indirect(
+    recorder: &mut CommandRecorder<'_>,
+    pipeline: &ComputePipeline<'_>,
+    set: &DescriptorSet<'_>,
+    push: &[u8],
+    args: &vulkan_sys::DeviceBuffer<'_>,
+    args_offset: u64,
+) {
+    recorder.dispatch_indirect(pipeline, set, push, args, args_offset);
 }
 
 /// One-shot cached launch: fetch (or build-once) the pipeline for this call,

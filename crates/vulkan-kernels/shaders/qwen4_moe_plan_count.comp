@@ -1,0 +1,54 @@
+#version 450
+// Grouped-MoE device planner, pass 1 of 3: per-expert routed-pair COUNTS.
+//
+// Replaces the host side of the prefill's per-(layer,chunk) ids fence: the
+// router top-k ids stay on device and this pass turns them into
+// `counts[e]` = how many (token, slot) pairs the chunk routed to expert `e`
+// — the input `plan_moe_groups` (the host oracle) derives everything else
+// from. Scratch layout (u32 elements, shared with the scan/emit passes and
+// mirrored by `qwen4_moe_plan_scratch_elems`):
+//
+//   [0,       E)      counts[e]
+//   [E,       2E)     full-block exclusive prefix (written by the scan pass)
+//   [2E,      10E)    remainder-block exclusive prefixes, [w][e] (scan pass)
+//   [10E,     10E+8)  per-class block totals, class w at [w-1] (scan pass)
+//   [10E+8,   10E+32) gate/up VkDispatchIndirectCommand triples (scan pass)
+//   [10E+32,  10E+56) down VkDispatchIndirectCommand triples (scan pass)
+//
+// ONE workgroup: zero the counts, barrier, then stride the pairs with
+// atomicAdd. Atomic ORDER does not matter here — only totals come out — so
+// the pass is deterministic. An id outside [0, E) (impossible from the topk
+// kernel, which selects real logit indices) is SKIPPED rather than let
+// scribble outside the counts region; the resulting count shortfall makes the
+// plan-equality gate fail loudly instead.
+
+#define BLOCK 256
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ids { int ids[]; };
+layout(binding = 1) buffer Plan { uint plan[]; };
+
+layout(push_constant) uniform Push {
+    uint pairs;      // t * top_k routed (token, slot) pairs
+    uint top_k;      // live ids per token row
+    uint ids_stride; // elements between token rows of `ids`
+    uint n_experts;  // E
+} p;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint e = tid; e < p.n_experts; e += BLOCK) {
+        plan[e] = 0u;
+    }
+    // The zeroes must be visible to every lane's atomics below.
+    memoryBarrierBuffer();
+    barrier();
+    for (uint pr = tid; pr < p.pairs; pr += BLOCK) {
+        const uint tok = pr / p.top_k;
+        const uint slot = pr % p.top_k;
+        const int id = ids[tok * p.ids_stride + slot];
+        if (id >= 0 && uint(id) < p.n_experts) {
+            atomicAdd(plan[uint(id)], 1u);
+        }
+    }
+}

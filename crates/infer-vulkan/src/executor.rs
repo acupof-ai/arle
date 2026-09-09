@@ -13,12 +13,40 @@ use crate::kv_pool::VulkanKvPool;
 
 pub const DEFAULT_PAGE_SIZE: usize = 64;
 
+/// `ARLE_VULKAN_BATCHED_PREFILL=0` forces the per-token prefill loop.
+///
+/// The batched path is a different arithmetic shape (`mul_mmq` over a chunk vs a
+/// chain of GEMVs), so it is not bit-identical to the serial one — the parity
+/// gate compares them, and needs a way to run the old path in the same binary.
+#[cfg(feature = "vulkan")]
+fn batched_prefill_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_VULKAN_BATCHED_PREFILL").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VulkanModelKind {
     Qwen3Dense,
     Dsv4,
     Qwen35Hybrid,
     Qwen36Moe,
+    /// Qwen3.8-Flash-Next (`qwen4_exp`). Recognised by NAME and routed to its
+    /// OWN model ([`crate::model_qwen4_exp`], loaded from the safetensors
+    /// directory) rather than being mistaken for a plain MoE — it has 512
+    /// experts (top-10), a
+    /// hyper-connection residual stream 4x the hidden width, a PLE/n-gram
+    /// lookup table, and a sparse-attention indexer, none of which the
+    /// `Qwen36Moe` path implements.
+    ///
+    /// The misroute this prevents is silent, not loud: `expert_count > 0` used
+    /// to catch it, and the resulting forward would have run
+    /// `qwen36_router_topk.comp` with `n_expert = 512` against its `BLOCK 256`
+    /// — routing every token through only the first half of the expert table,
+    /// with the top-k renormalisation hiding the wrong softmax denominator.
+    /// Coherent output, no crash, silently wrong model.
+    Qwen4Exp,
 }
 
 pub fn classify_vulkan_architecture(
@@ -30,6 +58,11 @@ pub fn classify_vulkan_architecture(
     let name = model_name.unwrap_or_default().to_ascii_lowercase();
     if arch.contains("deepseek4") || arch.contains("deepseek_v4") {
         return VulkanModelKind::Dsv4;
+    }
+    // `qwen4_exp` BEFORE the expert-count clause below: it reports 512 experts
+    // and would otherwise be classified as an ordinary MoE.
+    if arch.contains("qwen4_exp") || arch.contains("qwen4exp") {
+        return VulkanModelKind::Qwen4Exp;
     }
     // MoE first: `qwen35moe` / `qwen3moe` archs and anything with experts. Note
     // `qwen35moe.contains("qwen35")` is true, so this MUST precede the dense
@@ -72,6 +105,11 @@ pub enum VulkanLoadedModel {
     Qwen3(Box<crate::model_qwen3::VulkanQwen3Model>),
     Qwen35(Box<crate::model_qwen35::VulkanQwen35Model>),
     Qwen36(Box<crate::model_qwen36::VulkanQwen36Model>),
+    /// Qwen3.8-Flash-Next from a safetensors DIRECTORY (there is no GGUF of
+    /// this checkpoint). `'static` because the executor owns the model for the
+    /// process lifetime: the `VulkanContext` and the `SafeTensorsDir` are
+    /// leaked at load, exactly like the leaked context the other arms use.
+    Qwen4Exp(Box<crate::model_qwen4_exp::VulkanQwen4ExpModel<'static, 'static>>),
 }
 
 #[cfg(feature = "vulkan")]
@@ -87,6 +125,58 @@ impl VulkanLoadedModel {
             Self::Qwen3(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen35(model) => model.forward_token(slot, epoch, token, start_pos),
             Self::Qwen36(model) => model.forward_token(slot, epoch, token, start_pos),
+            Self::Qwen4Exp(model) => model.forward_token(slot, epoch, token, start_pos),
+        }
+    }
+
+    /// Materialize `tokens` in one GEMM-shaped batched pass, returning the LAST
+    /// token's logits — or `None` when this model has no batched path, in which
+    /// case the caller falls back to the per-token loop.
+    ///
+    /// Only the Qwen3.5 hybrid has one so far. Prefill is where the per-token
+    /// loop hurts most: every layer's weights are re-read from LPDDR5X once per
+    /// TOKEN, so a GEMV chain runs at memory bandwidth no matter how many tokens
+    /// are queued. Batching turns each projection into a `mul_mmq` over the whole
+    /// chunk, amortizing the weight read across `T` rows.
+    fn forward_tokens_batched(
+        &mut self,
+        slot: usize,
+        epoch: u64,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        match self {
+            Self::Qwen35(model) => model.forward_tokens(slot, epoch, tokens, start_pos),
+            Self::Qwen4Exp(model) => model.forward_tokens(slot, epoch, tokens, start_pos),
+            _ => Ok(None),
+        }
+    }
+
+    /// Leading prefix of `tokens` this model already holds materialized. Only
+    /// the Qwen3.5 hybrid tracks its resident sequence; the rest recompute.
+    fn cached_prefix_len(&self, tokens: &[u32]) -> usize {
+        match self {
+            Self::Qwen35(model) => model.cached_prefix_len(tokens),
+            _ => 0,
+        }
+    }
+
+    fn adopt_cached_prefix(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(model) => model.adopt_cached_prefix(slot, tokens, matched_len),
+            _ => bail!("this Vulkan model has no position-0 prefix store"),
+        }
+    }
+
+    fn materialize_finish(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
+        match self {
+            Self::Qwen35(model) => model.materialize_finish(slot, tokens),
+            _ => Ok(()),
         }
     }
 }
@@ -161,9 +251,28 @@ impl VulkanExecutor {
         );
         #[cfg(feature = "vulkan")]
         if let Some(model) = self.model.as_mut() {
+            // Multi-token steps take the batched path when the model has one.
+            // A 1-token step IS decode, which the per-token path already
+            // records optimally, so don't pay the chunk staging for it.
+            if tokens.len() > 1
+                && batched_prefill_enabled()
+                && let Some(logits) =
+                    model.forward_tokens_batched(slot, epoch, tokens, start_pos)?
+            {
+                return Ok(infer_plan::sample_token(&logits, params, position));
+            }
             let mut logits = Vec::new();
+            let t0 = std::time::Instant::now();
             for (i, &token) in tokens.iter().enumerate() {
                 logits = model.forward_token(slot, epoch, token, start_pos + i)?;
+            }
+            if tokens.len() > 1 {
+                let secs = t0.elapsed().as_secs_f64();
+                log::info!(
+                    "vulkan per-token prefill: {} tok @ {start_pos} in {secs:.3}s ({:.1} tok/s)",
+                    tokens.len(),
+                    tokens.len() as f64 / secs.max(f64::MIN_POSITIVE),
+                );
             }
             return Ok(infer_plan::sample_token(&logits, params, position));
         }
@@ -247,6 +356,193 @@ impl BackendExecutor for VulkanExecutor {
     fn model_stop_token_ids(&self) -> Vec<u32> {
         self.stop_tokens.clone()
     }
+
+    fn prefix_reuse(&mut self) -> Option<&mut dyn infer_seam::PrefixReuse> {
+        Some(self)
+    }
+}
+
+/// Prefix reuse for the single-slot Vulkan lane.
+///
+/// The page-radix route is **fail-closed on purpose**: this lane's device KV is
+/// one flat `[layer, kv_head, pos, head_dim]` buffer indexed by ABSOLUTE
+/// position ([`crate::forward::DeviceKvCache`]), so a host page id names no
+/// device bytes and re-attaching pages at a new position would serve another
+/// sequence's KV. `reusable_prefix_blocks` returning 0 states that, and matches
+/// what the engine already assumed when this executor reported no
+/// `prefix_reuse` capability at all.
+///
+/// What IS reusable is the sequence the lane is holding right now, at the
+/// positions it already occupies — the position-0 seam
+/// ([`infer_seam::PrefixReuse::cached_prefix_match_len`]). That covers the case
+/// that actually costs users minutes: turn N+1 of a conversation, whose prompt
+/// is turn N's prompt plus what turn N generated.
+impl infer_seam::PrefixReuse for VulkanExecutor {
+    /// Zero: see the type doc — host pages do not name device KV here.
+    fn reusable_prefix_blocks(&self, _blocks: &[infer_seam::PrefixBlock]) -> usize {
+        0
+    }
+
+    fn reusable_prefix_blocks_for_prompt(
+        &self,
+        blocks: &[infer_seam::PrefixBlock],
+        _tokens: &[u32],
+    ) -> usize {
+        self.reusable_prefix_blocks(blocks)
+    }
+
+    /// Nothing below the seam is keyed to page ids, so eviction needs no mirror
+    /// drop.
+    fn release_prefix_pages(&mut self, _pages: &[u32]) {}
+
+    fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
+
+    fn cached_prefix_match_len(&self, tokens: &[u32]) -> Result<usize> {
+        #[cfg(feature = "vulkan")]
+        if let Some(model) = self.model.as_ref() {
+            return Ok(model.cached_prefix_len(tokens));
+        }
+        let _ = tokens;
+        Ok(0)
+    }
+
+    fn restore_cached_prefix(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+        _slot_pages: &[u32],
+    ) -> Result<()> {
+        #[cfg(feature = "vulkan")]
+        if let Some(model) = self.model.as_mut() {
+            return model.adopt_cached_prefix(slot, tokens, matched_len);
+        }
+        let _ = (slot, tokens, matched_len);
+        bail!("Vulkan executor has no model loaded")
+    }
+
+    /// Unreachable while `reusable_prefix_blocks` is 0 (the engine only calls
+    /// this after a page-radix attach). `matched_len` is the answer that means
+    /// "restored exactly the page-aligned prefix", i.e. no change.
+    fn restore_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        matched_len: usize,
+        _prefix_pages: &[u32],
+    ) -> Result<usize> {
+        Ok(matched_len)
+    }
+
+    /// Feed the one token this request sampled but never fed, so the resident
+    /// sequence covers the finished turn exactly and the next turn resumes past
+    /// the whole generated region rather than one token short of it.
+    fn capture_finish_frontier(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        _slot_pages: &[u32],
+    ) -> Result<()> {
+        #[cfg(feature = "vulkan")]
+        if let Some(model) = self.model.as_mut() {
+            return model.materialize_finish(slot, tokens);
+        }
+        let _ = (slot, tokens);
+        Ok(())
+    }
+
+    /// No radix publish to ride: the resident sequence IS the store.
+    fn save_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+        _prefix_pages: &[u32],
+        _slot_pages: &[u32],
+        _newly_cached: &[u32],
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Load a `qwen4_exp` (Qwen3.8-Flash-Next) safetensors DIRECTORY into a
+/// single-slot executor. The checkpoint has no GGUF form, so this is its own
+/// entry point; [`load_qwen3_gguf`] also routes here when handed a directory
+/// (or a GGUF whose metadata classifies as `Qwen4Exp` and whose parent
+/// directory holds the safetensors checkpoint).
+///
+/// Device residency defaults to the hybrid split: everything resident — NVFP4
+/// experts, the F32 small tier, and the F16 dense tier including `lm_head` —
+/// with `upload_qwen4`'s spill placing whatever exceeds the driver's
+/// heapBudget on the host heap. `ARLE_QWEN4_DEVICE_MODE=host` forces the pure
+/// host transcription; `=subset:0,1,3` uploads only those layers with the
+/// dense tier F32-resident (bring-up).
+pub fn load_qwen4_dir(
+    dir: impl AsRef<std::path::Path>,
+    num_slots: usize,
+    max_seq_len: usize,
+) -> Result<(VulkanExecutor, VulkanKvPool)> {
+    ensure!(num_slots > 0, "Vulkan load requires at least one slot");
+    ensure!(max_seq_len > 0, "Vulkan load requires max_seq_len > 0");
+    #[cfg(feature = "vulkan")]
+    {
+        use crate::model_qwen4_exp::{Qwen4ExpDeviceMode, VulkanQwen4ExpModel};
+        let dir = dir.as_ref();
+        let cfg = crate::qwen4_config::Qwen4ExpConfig::from_model_dir(dir)?;
+        let mode = match std::env::var("ARLE_QWEN4_DEVICE_MODE").as_deref() {
+            Ok("host") => Qwen4ExpDeviceMode::HostOnly,
+            Ok(s) if s.starts_with("subset:") => {
+                let layers: Vec<usize> = s["subset:".len()..]
+                    .split(',')
+                    .map(|p| p.trim().parse::<usize>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| anyhow::anyhow!("ARLE_QWEN4_DEVICE_MODE subset list: {e}"))?;
+                Qwen4ExpDeviceMode::SubsetF32(layers)
+            }
+            _ => Qwen4ExpDeviceMode::HybridExperts,
+        };
+        // Process-lifetime residents, same leak pattern as the GGUF arms: the
+        // model borrows both for `'static`.
+        let ctx: Option<&'static vulkan_sys::VulkanContext> =
+            if mode == Qwen4ExpDeviceMode::HostOnly {
+                None
+            } else {
+                Some(Box::leak(Box::new(vulkan_sys::VulkanContext::create()?)))
+            };
+        let st: &'static infer_gguf::safetensors::SafeTensorsDir = Box::leak(Box::new(
+            infer_gguf::safetensors::SafeTensorsDir::open_dir(dir)?,
+        ));
+        let model = VulkanQwen4ExpModel::load(ctx, st, cfg, &mode)?;
+        let stop_tokens = model.stop_token_ids.clone();
+        // The dense QSA stub is exact only inside `max_context`; the model
+        // enforces it per forward, so size the pool to the enforced window.
+        let seq_cap = max_seq_len.min(model.cfg.max_context);
+        if seq_cap < max_seq_len {
+            log::warn!(
+                "qwen4_exp: max_seq_len {max_seq_len} clamped to max_context {seq_cap} \
+                 (the bound that keeps the stubbed QSA indexer exact)"
+            );
+        }
+        let pages_per_slot = seq_cap.div_ceil(DEFAULT_PAGE_SIZE);
+        let pool = VulkanKvPool::new(
+            num_slots,
+            num_slots * pages_per_slot,
+            DEFAULT_PAGE_SIZE,
+            seq_cap,
+        );
+        let exec = VulkanExecutor {
+            model: Some(VulkanLoadedModel::Qwen4Exp(Box::new(model))),
+            stop_tokens,
+        };
+        Ok((exec, pool))
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = dir;
+        Err(anyhow::anyhow!(
+            "Vulkan backend not compiled: rebuild with --features vulkan"
+        ))
+    }
 }
 
 pub fn load_qwen3_gguf(
@@ -256,6 +552,11 @@ pub fn load_qwen3_gguf(
 ) -> Result<(VulkanExecutor, VulkanKvPool)> {
     ensure!(num_slots > 0, "Vulkan load requires at least one slot");
     ensure!(max_seq_len > 0, "Vulkan load requires max_seq_len > 0");
+    // A DIRECTORY is the qwen4_exp safetensors checkpoint (no GGUF exists for
+    // it); everything else stays on the GGUF path below.
+    if path.as_ref().is_dir() {
+        return load_qwen4_dir(path, num_slots, max_seq_len);
+    }
     let gguf = infer_gguf::gguf::GgufFile::open(&path)?;
     let kind = classify_vulkan_gguf(&gguf)?;
     #[cfg(feature = "vulkan")]
@@ -278,9 +579,27 @@ pub fn load_qwen3_gguf(
                 let model = crate::model_qwen36::VulkanQwen36Model::load(ctx, &gguf)?;
                 VulkanLoadedModel::Qwen36(Box::new(model))
             }
+            VulkanModelKind::Qwen4Exp => {
+                // The real qwen4_exp checkpoint is safetensors; a GGUF that
+                // classifies as it can only be a metadata stub sitting inside
+                // (or next to) the checkpoint directory. Route to the dir
+                // loader — it owns the safetensors residency and its own
+                // model/forward/arena.
+                let dir = path
+                    .as_ref()
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("qwen4_exp GGUF has no parent directory"))?;
+                ensure!(
+                    dir.join("config.json").is_file(),
+                    "qwen4_exp loads from its safetensors directory, and {} holds no config.json \
+                     — pass the checkpoint DIRECTORY instead of a GGUF",
+                    dir.display()
+                );
+                return load_qwen4_dir(dir, num_slots, max_seq_len);
+            }
             other => bail!(
                 "Vulkan {other:?} GGUF load is not wired yet \
-                 (only Qwen35Hybrid / Qwen36Moe land resident); \
+                 (only Qwen35Hybrid / Qwen36Moe / Qwen4Exp land resident); \
                  host GGUF parse + classification succeeded"
             ),
         };
@@ -376,6 +695,17 @@ mod tests {
         assert_eq!(
             classify_vulkan_architecture("qwen3", None, 0),
             VulkanModelKind::Qwen3Dense
+        );
+        // The regression this guards: `qwen4_exp` reports 512 experts, so the
+        // `expert_count > 0` clause claimed it as `Qwen36Moe` and the model ran
+        // on a path whose router shader tops out at 256 experts.
+        assert_eq!(
+            classify_vulkan_architecture("qwen4_exp", Some("Qwen3.8-Flash-Next"), 512),
+            VulkanModelKind::Qwen4Exp
+        );
+        assert_eq!(
+            classify_vulkan_architecture("qwen4_exp", None, 0),
+            VulkanModelKind::Qwen4Exp
         );
     }
 

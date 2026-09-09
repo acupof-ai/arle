@@ -222,6 +222,16 @@ impl VulkanQwen36Model {
     /// Qwen3.5 path; only the per-layer FFN differs, and the shared forward
     /// already branches `is_moe_layer` → the routed+shared MoE FFN. `slot` /
     /// `epoch` are accepted for executor-signature parity (single-slot state).
+    /// `start_pos == 0` means "a new sequence starts here" and resets the
+    /// carried state, exactly as the dense lane does
+    /// ([`crate::model_qwen35::VulkanQwen35Model::forward_token`]). Without it
+    /// a second request reuses the slot at `start_pos` 0 while `state.seq_len`
+    /// still carries the first request's length, and the position check in
+    /// [`crate::forward::forward_token`] takes the whole server down —
+    /// "start_pos 0 != materialized seq_len 50", one request into a fresh
+    /// serve. This lane has no resident-sequence store (`cached_prefix_len`
+    /// returns 0 for it), so unlike the dense path there is no restore case to
+    /// protect: position 0 is unconditionally a new sequence.
     pub fn forward_token(
         &mut self,
         _slot: usize,
@@ -229,6 +239,9 @@ impl VulkanQwen36Model {
         token: u32,
         start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
+        if start_pos == 0 {
+            self.reset_state();
+        }
         crate::forward::forward_token(
             self.ctx,
             &self.config,

@@ -54,6 +54,15 @@
 #define TO_FLOAT_TYPE FLOAT_TYPE
 #endif
 
+// ARLE patch: a SEPARATE decode for the B operand. Upstream routes both
+// operands through one TO_FLOAT_TYPE, which forces A and B to share an
+// encoding — a bf16-A build could only take bf16 B (activations rounded to
+// 2^-8). Defaulting to TO_FLOAT_TYPE keeps every upstream variant identical;
+// the bf16 build overrides it so B can stay f16 (2^-11).
+#if !defined(TO_FLOAT_TYPE_B)
+#define TO_FLOAT_TYPE_B TO_FLOAT_TYPE
+#endif
+
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};

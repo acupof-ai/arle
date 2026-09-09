@@ -1,0 +1,243 @@
+#version 450
+// ARLE Vulkan shader: chunked (WY-form) gated-delta-net prefill, INTRA-chunk
+// half. Port of llama.cpp `build_delta_net_chunking` (delta-net-base.cpp,
+// ca3d5a3e1), non-KDA arm (per-value-head scalar log-decay, chunk size 64) —
+// the MATH is ported, not the ggml graph. The serial recurrence
+// (`qwen35_gated_delta_net.comp`) walks seq_len tokens with ~num_value_heads
+// near-serial workgroups; this pair collapses the serial dimension from
+// n_tokens to n_chunks: everything with no cross-chunk dependence lands here,
+// parallel over (chunk, value_head) workgroups, and only the state pass
+// (`qwen4_gdn_chunk_state.comp`) stays serial-in-chunks. Two dispatches per
+// (layer, prefill chunk) instead of one — prefill records ~10 dispatches per
+// linear layer already, and the serial scan those two replace was the largest
+// single GPU-drain slice, so the +1 is noise.
+//
+// Per chunk c and value head vh (key head vh % num_key_heads — the device
+// slot order; the load-time V-slot permutation makes the tiled map compute
+// HF's repeat_interleave), over tokens i,j inside the chunk, with q l2-normed
+// and 1/sqrt(kd)-scaled, k l2-normed (eps 1e-6, same as the serial kernel),
+// g_i = ssm_a * softplus(a + dt_bias), beta_i = sigmoid(b), G = cumsum(g):
+//
+//     D[i][j] = exp(G_i - G_j)                       (j <= i, else 0)
+//     L[i][j] = beta_i (k_i . k_j) D[i][j]           (j <  i, strict)
+//     T       = (I + L)^{-1}                         (forward substitution)
+//     kq[i][j]= (q_i . k_j) D[i][j]                  -> scratch
+//     kcd[i]  = sum_m T[i][m] beta_m exp(G_m) k_m    -> scratch
+//     u[i]    = sum_m T[i][m] beta_m v_m             -> scratch
+//     qg[i]   = q_i exp(G_i)                         -> scratch
+//     kg[i]   = k_i exp(G_last - G_i)                -> scratch
+//     gl      = exp(G_last)                          -> scratch
+//
+// All decay factors are exp of a NON-POSITIVE argument (g <= 0 because
+// ssm_a < 0 and softplus > 0), so every factor is in (0, 1] and underflow to
+// 0 is the mathematically right limit — no clamps needed (the HF reference's
+// clamp(max=50) guards a positive range this parameterization cannot reach).
+//
+// A trailing partial chunk (L_c < 64) is handled by loop bounds, not padding:
+// rows i >= L_c of the scratch are left unwritten and the state pass never
+// reads them; the kq rows i < L_c are zero-filled above the diagonal because
+// the state pass contracts them over the full m < L_c range.
+//
+// Bindings: `0 = Qkv [seq_len*(2*nk*kd + nv*vd)] f32` (post-conv, token-major,
+// the SAME buffer the serial kernel reads), `1 = BProj [seq_len*nv] f32`,
+// `2 = AProj [seq_len*nv] f32`, `3 = DtBias [nv] f32`, `4 = ALog [nv] f32`
+// (GGUF `ssm_a` = -exp(A_log)), `5 = Scratch` (see `qwen4_gdn_chunk_params`
+// for the section layout shared with the state kernel).
+
+// Chunk size: llama.cpp's non-KDA CS. Compile-time because the T matrix lives
+// in shared memory (CS*CS f32 = 16 KiB; +6 CS-vectors ≈ 17.6 KiB, under the
+// 8060S's 64 KiB LDS).
+#define CS 64
+// 128 threads = two 8060S waves: matches the GEMM-ish phases (4096-entry
+// tiles); the forward substitution uses at most CS-1 lanes and is the only
+// under-occupied phase.
+#define BLOCK 128
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint num_key_heads;
+    uint num_value_heads;
+    uint key_dim;
+    uint val_dim;
+    uint seq_len;
+    uint n_chunks;
+} p;
+
+layout(binding = 0) readonly buffer Qkv {
+    float qkv[];
+};
+layout(binding = 1) readonly buffer BProj {
+    float b_proj[];
+};
+layout(binding = 2) readonly buffer AProj {
+    float a_proj[];
+};
+layout(binding = 3) readonly buffer DtBias {
+    float dt_bias[];
+};
+layout(binding = 4) readonly buffer ALog {
+    float a_log[];
+};
+layout(binding = 5) buffer Scratch {
+    float scratch[];
+};
+
+float softplus(float x) {
+    return x > 20.0 ? x : log(1.0 + exp(x));
+}
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+shared float sh_gcs[CS];   // inclusive cumsum of log-decays
+shared float sh_beta[CS];
+shared float sh_qn[CS];    // q l2-norm scale, 1/sqrt(kd) folded in
+shared float sh_kn[CS];    // k l2-norm scale
+shared float sh_eg[CS];    // exp(G_i)
+shared float sh_gd[CS];    // exp(G_last - G_i)
+shared float sh_m[CS * CS]; // L, inverted in place into T - I
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    const uint v_head = gl_WorkGroupID.y;
+    if (c >= p.n_chunks || v_head >= p.num_value_heads) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kd = p.key_dim;
+    const uint vd = p.val_dim;
+    const uint k_head = v_head % p.num_key_heads;
+    const uint q_dim_total = kd * p.num_key_heads;
+    const uint qkv_stride = 2 * q_dim_total + vd * p.num_value_heads;
+    const uint q_at = k_head * kd;
+    const uint k_at = q_dim_total + k_head * kd;
+    const uint v_at = 2 * q_dim_total + v_head * vd;
+    // Tokens this chunk actually holds (the trailing chunk may be short).
+    const uint L = min(CS, p.seq_len - c * CS);
+    const uint tok0 = c * CS;
+
+    // Scratch sections, SoA over (chunk, head) pairs — the layout contract
+    // with `qwen4_gdn_chunk_state.comp` (documented at the params helper).
+    const uint nh = p.n_chunks * p.num_value_heads;
+    const uint pair = c * p.num_value_heads + v_head;
+    const uint kq_at = pair * CS * CS;
+    const uint kcd_at = nh * CS * CS + pair * CS * kd;
+    const uint u_at = nh * (CS * CS + CS * kd) + pair * CS * vd;
+    const uint qg_at = nh * (CS * CS + CS * kd + CS * vd) + pair * CS * kd;
+    const uint kg_at = nh * (CS * CS + 2 * CS * kd + CS * vd) + pair * CS * kd;
+    const uint glast_at = nh * (CS * CS + 3 * CS * kd + CS * vd) + pair;
+
+    // ── Per-token scalars: same formulas and serial reduction order as the
+    // serial kernel, so the chunked lane's drift is pure reassociation of the
+    // recurrence, never a different per-token quantity. ──
+    for (uint i = tid; i < L; i += BLOCK) {
+        const uint tb = (tok0 + i) * qkv_stride;
+        float q_sumsq = 0.0;
+        float k_sumsq = 0.0;
+        for (uint d = 0; d < kd; ++d) {
+            const float qv = qkv[tb + q_at + d];
+            const float kv = qkv[tb + k_at + d];
+            q_sumsq += qv * qv;
+            k_sumsq += kv * kv;
+        }
+        sh_qn[i] = inversesqrt(q_sumsq + 1.0e-6) * inversesqrt(float(kd));
+        sh_kn[i] = inversesqrt(k_sumsq + 1.0e-6);
+        const uint ab = (tok0 + i) * p.num_value_heads + v_head;
+        sh_gcs[i] = a_log[v_head] * softplus(a_proj[ab] + dt_bias[v_head]);
+        sh_beta[i] = sigmoid(b_proj[ab]);
+    }
+    barrier();
+    // Serial inclusive cumsum by one thread: 63 adds, and a fixed
+    // association order shared with the host reference.
+    if (tid == 0) {
+        for (uint i = 1; i < L; ++i) {
+            sh_gcs[i] += sh_gcs[i - 1];
+        }
+    }
+    barrier();
+    for (uint i = tid; i < L; i += BLOCK) {
+        sh_eg[i] = exp(sh_gcs[i]);
+        sh_gd[i] = exp(sh_gcs[L - 1] - sh_gcs[i]);
+    }
+    barrier();
+
+    // ── L (strict lower, shared) and kq (lower incl diag, scratch). The two
+    // dots share the k_j read, so one pass computes both. ──
+    for (uint e = tid; e < CS * CS; e += BLOCK) {
+        const uint i = e / CS;
+        const uint j = e % CS;
+        if (i >= L) {
+            continue;
+        }
+        if (j > i || j >= L) {
+            sh_m[e] = 0.0;
+            if (j < L) {
+                scratch[kq_at + e] = 0.0;
+            }
+            continue;
+        }
+        const uint ib = (tok0 + i) * qkv_stride;
+        const uint jb = (tok0 + j) * qkv_stride;
+        float dot_qk = 0.0;
+        float dot_kk = 0.0;
+        for (uint d = 0; d < kd; ++d) {
+            const float kj = qkv[jb + k_at + d];
+            dot_qk += qkv[ib + q_at + d] * kj;
+            dot_kk += qkv[ib + k_at + d] * kj;
+        }
+        const float decay = exp(sh_gcs[i] - sh_gcs[j]);
+        scratch[kq_at + e] = dot_qk * sh_qn[i] * sh_kn[j] * decay;
+        sh_m[e] = (j < i) ? dot_kk * sh_kn[i] * sh_kn[j] * sh_beta[i] * decay : 0.0;
+    }
+    barrier();
+
+    // ── T = (I + L)^{-1} by forward substitution, in place: row i's own
+    // entries are still the original L values when row i is processed, rows
+    // m < i are already final (T - I). Each lane owns one column, computes
+    // into a register, and writes only after the row barrier — the one truly
+    // serial piece left, and it is CS steps, not seq_len. ──
+    for (uint i = 1; i < L; ++i) {
+        float acc = 0.0;
+        if (tid < i) {
+            acc = -sh_m[i * CS + tid];
+            for (uint m = tid + 1; m < i; ++m) {
+                acc -= sh_m[i * CS + m] * sh_m[m * CS + tid];
+            }
+        }
+        barrier();
+        if (tid < i) {
+            sh_m[i * CS + tid] = acc;
+        }
+        barrier();
+    }
+
+    // ── T-applied chunk quantities, straight to scratch. T[i][m] reads as
+    // sh_m below the diagonal, 1 on it. ──
+    for (uint e = tid; e < L * vd; e += BLOCK) {
+        const uint i = e / vd;
+        const uint d = e % vd;
+        float acc = sh_beta[i] * qkv[(tok0 + i) * qkv_stride + v_at + d];
+        for (uint m = 0; m < i; ++m) {
+            acc += sh_m[i * CS + m] * sh_beta[m] * qkv[(tok0 + m) * qkv_stride + v_at + d];
+        }
+        scratch[u_at + i * vd + d] = acc;
+    }
+    for (uint e = tid; e < L * kd; e += BLOCK) {
+        const uint i = e / kd;
+        const uint d = e % kd;
+        float acc = sh_beta[i] * sh_eg[i] * qkv[(tok0 + i) * qkv_stride + k_at + d] * sh_kn[i];
+        for (uint m = 0; m < i; ++m) {
+            acc += sh_m[i * CS + m] * sh_beta[m] * sh_eg[m]
+                * qkv[(tok0 + m) * qkv_stride + k_at + d] * sh_kn[m];
+        }
+        scratch[kcd_at + i * kd + d] = acc;
+        const uint tb = (tok0 + i) * qkv_stride;
+        scratch[qg_at + i * kd + d] = qkv[tb + q_at + d] * sh_qn[i] * sh_eg[i];
+        scratch[kg_at + i * kd + d] = qkv[tb + k_at + d] * sh_kn[i] * sh_gd[i];
+    }
+    if (tid == 0) {
+        scratch[glast_at] = sh_eg[L - 1];
+    }
+}

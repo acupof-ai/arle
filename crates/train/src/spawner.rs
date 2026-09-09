@@ -22,11 +22,19 @@
 //!
 //! Protocol: length-prefixed (u32-LE) JSON. One request, one response, serial.
 
+// ELKEID is a Linux kernel HIDS hook, so the helper transport is POSIX-only.
+// On other platforms `SpawnClient::from_env` yields `None` and `crate::sandbox`
+// spawns directly — the same path a Unix host takes with the env unset.
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +43,7 @@ pub const LISTEN_ENV: &str = "ARLE_SPAWNER_LISTEN";
 
 pub const SOCKET_ENV: &str = "ARLE_SPAWNER_SOCKET";
 
+#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +68,7 @@ pub struct SpawnResponse {
     pub timed_out: bool,
 }
 
+#[cfg(unix)]
 fn write_frame<W: Write>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
     let len = (bytes.len() as u32).to_le_bytes();
     w.write_all(&len)?;
@@ -66,6 +76,7 @@ fn write_frame<W: Write>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
     w.flush()
 }
 
+#[cfg(unix)]
 fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
@@ -75,6 +86,15 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// No Unix-socket transport off POSIX; the launcher never sets `LISTEN_ENV`
+/// there, so this arm is only reached if someone sets it by hand.
+#[cfg(not(unix))]
+pub fn serve_loop() -> i32 {
+    eprintln!("[arle sandbox-spawner] unsupported on this platform");
+    1
+}
+
+#[cfg(unix)]
 pub fn serve_loop() -> i32 {
     let sock = match std::env::var(LISTEN_ENV) {
         Ok(s) => s,
@@ -106,6 +126,7 @@ pub fn serve_loop() -> i32 {
     0
 }
 
+#[cfg(unix)]
 fn handle_conn(mut stream: UnixStream) {
     let req_bytes = match read_frame(&mut stream) {
         Ok(b) => b,
@@ -124,6 +145,7 @@ fn handle_conn(mut stream: UnixStream) {
     }
 }
 
+#[cfg(unix)]
 fn run_request(req: &SpawnRequest) -> SpawnResponse {
     if req.combined_timeout {
         match run_captured(req) {
@@ -159,6 +181,7 @@ fn run_request(req: &SpawnRequest) -> SpawnResponse {
     }
 }
 
+#[cfg(unix)]
 fn build_command(req: &SpawnRequest) -> Command {
     let mut cmd = Command::new(&req.program);
     cmd.args(&req.args);
@@ -181,6 +204,7 @@ fn build_command(req: &SpawnRequest) -> Command {
 /// Spawn in a new process group (`setpgid`, NOT `setsid` — ELKEID hooks
 /// `setsid` ancestry and kills arle). Output to a temp file (no pipe hang).
 /// `libc::kill` for group teardown (no extra `kill` fork).
+#[cfg(unix)]
 fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
     let tmp = tempfile::NamedTempFile::new()?;
     let stdout_handle = tmp.reopen()?;
@@ -220,6 +244,7 @@ fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bo
 }
 
 /// `libc::kill` directly — no external `kill` fork (extra forks can trigger ELKEID).
+#[cfg(unix)]
 fn kill_group(pgid: i32) {
     // SAFETY: kill(-pgid, SIGKILL) is well-defined; an empty or already-reaped
     // group returns ESRCH which we ignore.
@@ -228,12 +253,18 @@ fn kill_group(pgid: i32) {
 
 #[derive(Clone, Debug)]
 pub struct SpawnClient {
+    /// Only the Unix transport dials it; `from_env` never builds one elsewhere.
+    #[cfg_attr(not(unix), allow(dead_code))]
     socket: PathBuf,
 }
 
 impl SpawnClient {
-    /// `None` when `ARLE_SPAWNER_SOCKET` unset (direct-spawn path).
+    /// `None` when `ARLE_SPAWNER_SOCKET` unset (direct-spawn path), and always
+    /// `None` off POSIX — there is no helper to route through.
     pub fn from_env() -> Option<Self> {
+        #[cfg(not(unix))]
+        return None;
+        #[cfg(unix)]
         std::env::var(SOCKET_ENV)
             .ok()
             .filter(|s| !s.is_empty())
@@ -242,6 +273,15 @@ impl SpawnClient {
             })
     }
 
+    #[cfg(not(unix))]
+    pub fn run(&self, _req: &SpawnRequest) -> std::io::Result<SpawnResponse> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sandbox-spawner requires a Unix socket",
+        ))
+    }
+
+    #[cfg(unix)]
     pub fn run(&self, req: &SpawnRequest) -> std::io::Result<SpawnResponse> {
         let mut stream = UnixStream::connect(&self.socket)?;
         let bytes = serde_json::to_vec(req)
@@ -253,11 +293,24 @@ impl SpawnClient {
     }
 }
 
+#[cfg(unix)]
 pub struct SpawnerHandle {
     child: std::process::Child,
     socket: PathBuf,
 }
 
+/// Nothing to launch off POSIX; agent-OPD spawns sandboxes directly.
+#[cfg(not(unix))]
+pub struct SpawnerHandle;
+
+#[cfg(not(unix))]
+impl SpawnerHandle {
+    pub fn launch() -> anyhow::Result<Self> {
+        anyhow::bail!("sandbox-spawner helper requires a Unix socket")
+    }
+}
+
+#[cfg(unix)]
 impl SpawnerHandle {
     /// Re-exec `arle` as the spawner helper BEFORE any CUDA init (ELKEID kills
     /// CUDA-resident processes that fork `setsid`). Sets `ARLE_SPAWNER_SOCKET`
@@ -300,6 +353,7 @@ impl SpawnerHandle {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SpawnerHandle {
     fn drop(&mut self) {
         // SAFETY: drop happens at end of run; rollout threads are joined.

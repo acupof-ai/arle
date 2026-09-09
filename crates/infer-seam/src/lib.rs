@@ -490,6 +490,49 @@ pub trait PrefixReuse {
     /// are untouched.
     fn release_provisional_prefix_pages(&mut self, pages: &[u32]);
 
+    /// Length of the longest leading prefix of `tokens` for which the backend
+    /// holds a position-0-anchored cached KV snapshot it can restore into a
+    /// fresh slot. `0` (the default) means "no such store" and the engine never
+    /// calls [`Self::restore_cached_prefix`].
+    ///
+    /// This is the cross-request reuse seam for backends whose KV cannot be
+    /// page-reattached at arbitrary positions. Vulkan's `DeviceKvCache` is one
+    /// flat UMA buffer addressed by ABSOLUTE position — its `VulkanKvPool` page
+    /// ids are host bookkeeping that never reach the device, so the radix
+    /// page-attach route names no device bytes and reuse has to key on the
+    /// tokens actually materialized into the device state instead. (DSv4's
+    /// RoPE-rotated K, the sliding-window ring indexed by `abs_pos % window`,
+    /// and the DSA indexer keys are position-locked for the same reason.)
+    ///
+    /// Defaulted rather than required: a backend that cannot do this should not
+    /// have to say so. The previous required-method form was deleted in
+    /// `1b115e5f9` precisely because it forced two backends to carry an inert
+    /// stub each.
+    fn cached_prefix_match_len(&self, _tokens: &[u32]) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    /// Restore the cached position-0 prefix snapshot for `tokens[..matched_len]`
+    /// into `slot`, setting the slot's materialized length to `matched_len`.
+    ///
+    /// `matched_len` is what [`Self::cached_prefix_match_len`] returned, so the
+    /// default is unreachable: the engine only calls this after a non-zero
+    /// match, which the default match cannot produce. The engine has already
+    /// allocated `matched_len` tokens of host KV pages on `slot` and resumes
+    /// prefill from absolute position `matched_len` immediately after, so every
+    /// byte of restored KV/side state MUST land before returning.
+    fn restore_cached_prefix(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+        _slot_pages: &[u32],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "restore_cached_prefix called on a backend whose              cached_prefix_match_len never returns non-zero"
+        )
+    }
+
     /// Restore the sidecar side state for `slot` when reusing a page-radix prefix
     /// of length `matched_len`, returning the ABSOLUTE token length actually
     /// restored — the position the engine sets `prefill_start_pos` to. Called by

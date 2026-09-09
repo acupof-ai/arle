@@ -1,0 +1,72 @@
+#version 450
+// Grouped-MoE device planner, pass 2 of 3: prefix sums + indirect args.
+//
+// Over the counts of pass 1 (see `qwen4_moe_plan_count.comp` for the scratch
+// layout), expert `e` with `c = counts[e]` contributes `c / CAP` FULL blocks
+// (class CAP) and, when `c % CAP != 0`, one REMAINDER block of width
+// `c % CAP` (class `c % CAP`). This pass walks the experts ONCE, ascending —
+// the SAME deterministic order the host oracle (`plan_moe_groups`) pins — and
+// writes:
+//
+//   fullb[e]      exclusive prefix of full-block counts (block index base of
+//                 expert `e`'s full blocks inside class CAP)
+//   remb[w][e]    exclusive prefix of `[rem(e') == w]` over `e' < e` (the
+//                 block index of `e`'s width-`w` remainder block)
+//   nblk[w-1]     total blocks of class `w`
+//   args          per class, TWO VkDispatchIndirectCommand triples
+//                 (x = output rows from push, y = nblk, z = 1): one for the
+//                 gate/up projections, one for down. Classes are laid
+//                 widest-first, class `w` at triple index `CAP - w` — the
+//                 record path binds the triple, `vkCmdDispatchIndirect` reads
+//                 it, and no block count ever crosses the fence to the host.
+//
+// A single thread does the scan: it is 8 running sums over E = 512 experts,
+// microseconds of work, and serial is what makes the block order a FACT
+// rather than a race.
+
+#define CAP 8u
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Plan { uint plan[]; };
+
+layout(push_constant) uniform Push {
+    uint n_experts; // E
+    uint x_gateup;  // gate/up dispatch x extent (expert out-dim rows)
+    uint x_down;    // down dispatch x extent
+} p;
+
+void main() {
+    const uint E = p.n_experts;
+    const uint fullb_at = E;
+    const uint remb_at = 2u * E;
+    const uint nblk_at = 10u * E;
+    const uint args_gu_at = 10u * E + 8u;
+    const uint args_dn_at = 10u * E + 32u;
+
+    uint run[CAP + 1u]; // run[CAP] = full blocks; run[1..CAP-1] = remainder blocks
+    for (uint w = 0u; w <= CAP; ++w) {
+        run[w] = 0u;
+    }
+    for (uint e = 0u; e < E; ++e) {
+        const uint c = plan[e];
+        plan[fullb_at + e] = run[CAP];
+        for (uint w = 1u; w < CAP; ++w) {
+            plan[remb_at + w * E + e] = run[w];
+        }
+        run[CAP] += c / CAP;
+        const uint rem = c % CAP;
+        if (rem != 0u) {
+            run[rem] += 1u;
+        }
+    }
+    for (uint w = 1u; w <= CAP; ++w) {
+        plan[nblk_at + (w - 1u)] = run[w];
+        const uint cls = CAP - w; // widest-first triple index
+        plan[args_gu_at + cls * 3u + 0u] = p.x_gateup;
+        plan[args_gu_at + cls * 3u + 1u] = run[w];
+        plan[args_gu_at + cls * 3u + 2u] = 1u;
+        plan[args_dn_at + cls * 3u + 0u] = p.x_down;
+        plan[args_dn_at + cls * 3u + 1u] = run[w];
+        plan[args_dn_at + cls * 3u + 2u] = 1u;
+    }
+}

@@ -1,0 +1,96 @@
+#version 450
+// ARLE Vulkan shader: Qwen3.8-Flash-Next (`qwen4_exp`) PLE short conv, FUSED.
+//
+// Host oracle: `infer_vulkan::qwen4_ple::PleLayer::short_conv` plus the
+// residual add at the tail of `forward` (reference
+// `Qwen4ExpTextPLELayer._short_conv`). One dispatch covers the dilated
+// depthwise conv, its SiLU, the state roll AND the residual add — four records
+// collapsed into one on a decode path that is dispatch-bound.
+//
+// KERNEL 4, DILATION 3. The receptive field is 10 steps wide but only four are
+// read: t-9, t-6, t-3, t, weighted by `conv1d[c][0..4]` in that order (tap k
+// has lag `state_len - k*dilation`, so k=3 is the current step). The reference
+// gets there by concatenating a 9-step state, padding 9 more zeros and slicing
+// the last `9 + seq`; that is exactly "state then x" for a full state and a
+// zero left-pad at sequence start, which a zero-initialised ring reproduces.
+//
+// RING, NOT A SHIFT BUFFER. `ring_pos` names the slot the NEXT row goes into,
+// which is also the OLDEST row — so lag L lands at `(ring_pos + state_len - L)
+// % state_len` and a step costs three loads plus one store instead of a
+// nine-row memmove. At DECODE (`seq_len == 1`) that makes the history a pure
+// indexed read: no shader-side scan, no host-side state rewrite.
+//
+// TRAP — TWO DIFFERENT TENSORS. Binding 0 is `norm_conv`'s output and feeds
+// ONLY the taps and the ring. Binding 3 is the UN-normed gated value and is
+// what the residual adds. They have the same shape and wildly different
+// magnitudes; binding either buffer to both slots compiles, runs, and is a
+// different model. The reference is explicit about this
+// (`gated_value + self._short_conv(gated_value_normed, ...)`).
+#define BLOCK 256
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    // Depthwise channels = `hc_count * hidden` (10240). The conv is fully
+    // per-channel, so this is also the parallel extent.
+    uint channels;
+    uint seq_len;
+    // `ple_conv_kernel_size` (4) and the dilation the reference sets to
+    // `ngram_size` (3). `state_len = (kernel_size - 1) * dilation` = 9.
+    uint kernel_size;
+    uint dilation;
+    // Slot the next row is written into == the oldest row currently held.
+    // Advances by `seq_len` (mod state_len); the host tracks it, so nothing
+    // here has to write it back.
+    uint ring_pos;
+} p;
+
+// `gated_value_normed`, [seq][channels] — the CONV branch's input.
+layout(binding = 0) readonly buffer XNormed { float x_normed[]; };
+// `conv1d.weight` flattened to [channels][kernel_size] (depthwise, so the
+// reference's middle axis is always 1).
+layout(binding = 1) readonly buffer ConvW { float conv_w[]; };
+// The rolling history, [state_len][channels], read AND written.
+layout(binding = 2) buffer Ring { float ring[]; };
+// `gated_value`, UN-normed, [seq][channels] — the RESIDUAL branch's input.
+layout(binding = 3) readonly buffer Residual { float residual[]; };
+// [seq][channels]; what the decoder adds to its hyper residual.
+layout(binding = 4) writeonly buffer OutBuf { float out_buf[]; };
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= p.channels || p.kernel_size == 0u) {
+        return;
+    }
+
+    const int state_len = int((p.kernel_size - 1u) * p.dilation);
+    int pos = int(p.ring_pos);
+
+    for (uint t = 0u; t < p.seq_len; ++t) {
+        const uint row = t * p.channels + c;
+        const float xt = x_normed[row];
+
+        float acc = 0.0;
+        for (uint k = 0u; k < p.kernel_size; ++k) {
+            const int lag = state_len - int(k) * int(p.dilation);
+            // Only the last tap has lag 0 (state_len is defined as
+            // (kernel-1)*dilation), so every other tap is a ring read.
+            const float v =
+                (lag == 0)
+                    ? xt
+                    : ring[uint((pos + state_len - lag) % state_len) * p.channels + c];
+            acc += conv_w[c * p.kernel_size + k] * v;
+        }
+
+        // silu(acc), then the residual — the UN-normed tensor, binding 3.
+        out_buf[row] = residual[row] + acc / (1.0 + exp(-acc));
+
+        if (state_len > 0) {
+            // The slot just consumed as lag `state_len` becomes the newest row,
+            // so the write is safe after the tap loop and before `pos` moves.
+            // The stored value is the NORMED one: the reference's state holds
+            // `gated_value_normed`, which is what the next step's taps expect.
+            ring[uint(pos) * p.channels + c] = xt;
+            pos = (pos + 1) % state_len;
+        }
+    }
+}

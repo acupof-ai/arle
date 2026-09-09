@@ -1,0 +1,171 @@
+#version 450
+// ARLE Vulkan shader: Qwen3.8-Flash-Next (`qwen4_exp`) PLE gate, FUSED.
+//
+// Host oracle: `infer_vulkan::qwen4_ple::PleLayer::forward`, the block from the
+// two projections' outputs down to `gated_value` / `gated_value_normed`
+// (reference `Qwen4ExpTextPLELayer.forward`). One dispatch replaces what a
+// generic composition would spend eight on: two grouped RMSNorms, a per-stream
+// dot, the signed-sqrt gate, a sigmoid, a broadcast multiply and a third
+// grouped RMSNorm. Decode on this box is DISPATCH-BOUND (~3.4us of host
+// recording per dispatch), and the PLE runs once per layer, so collapsing eight
+// records into one is the whole point of writing this by hand.
+//
+// MAPPING: one workgroup per (token, hyper-connection stream). A stream owns
+// exactly one `hidden`-wide RMSNorm group of every tensor here, so all four
+// reductions (key sum-of-squares, query sum-of-squares, the dot, and the gated
+// sum-of-squares) are workgroup-local and need no global scratch.
+//
+// TWO OUTPUTS, DELIBERATELY: `gated` is the UN-normed gated value the residual
+// branch adds, `gated_normed` is `norm_conv`'s output which ONLY the conv
+// branch may consume. They are different tensors; aliasing them changes the
+// model. `norm_conv` is fused in here rather than left as a third dispatch
+// because this workgroup already holds the whole group it normalizes — the
+// extra cost is one more workgroup reduction over values still in registers,
+// against a full 10240-wide round trip through memory plus a dispatch record.
+//
+// THE `1.0 + weight` CORRECTION: `Qwen4ExpTextRMSNorm` scales by
+// `(1.0 + weight)`, not `weight` — the parameter is zero-initialised in this
+// model. Every one of the three norms below spells it out.
+#define BLOCK 256
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    // RMSNorm group width. Also the value_proj width and the gate divisor's
+    // radicand — `hidden_size`, 2560 in this checkpoint.
+    uint hidden;
+    // Hyper-connection streams sharing one PLE value (`hc_count`, 4). The
+    // key/query/gated tensors are `hc_count * hidden` wide; `value` is `hidden`.
+    uint hc_count;
+    uint seq_len;
+    // `rms_norm_eps` (1e-6), inside the sqrt of all three norms.
+    float eps;
+} p;
+
+// `key_proj(embeddings)`, [seq][hc_count*hidden].
+layout(binding = 0) readonly buffer KeyProj { float key_proj[]; };
+// The hyper residual the query norm reads, [seq][hc_count*hidden].
+layout(binding = 1) readonly buffer HiddenIn { float hidden_in[]; };
+// `value_proj(embeddings)`, [seq][hidden] — SHARED by all hc_count streams.
+layout(binding = 2) readonly buffer ValueProj { float value_proj[]; };
+// The three RMSNorm scales, each [hc_count*hidden] (one flat vector spanning
+// all groups, which is why the group's slice is `stream * hidden`).
+layout(binding = 3) readonly buffer NormKeyW { float norm_key_w[]; };
+layout(binding = 4) readonly buffer NormQueryW { float norm_query_w[]; };
+layout(binding = 5) readonly buffer NormConvW { float norm_conv_w[]; };
+// UN-normed gated value — the RESIDUAL branch's tensor, [seq][hc_count*hidden].
+layout(binding = 6) writeonly buffer Gated { float gated[]; };
+// `norm_conv(gated)` — the CONV branch's tensor, same shape. Not the same
+// numbers, and not interchangeable with binding 6.
+layout(binding = 7) writeonly buffer GatedNormed { float gated_normed[]; };
+
+// Two reduction lanes so the key and query sums of squares share one tree pass.
+shared float red_a[BLOCK];
+shared float red_b[BLOCK];
+shared float g_key_scale;
+shared float g_query_scale;
+shared float g_weight;
+shared float g_conv_scale;
+
+// Workgroup sum of two per-lane partials, left in red_a[0] / red_b[0].
+//
+// Called only from uniform control flow (every lane of the workgroup reaches
+// every call), which is what makes the barriers inside legal.
+void reduce_pair(float a, float b) {
+    const uint tid = gl_LocalInvocationID.x;
+    red_a[tid] = a;
+    red_b[tid] = b;
+    barrier();
+    for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red_a[tid] += red_a[tid + s];
+            red_b[tid] += red_b[tid + s];
+        }
+        barrier();
+    }
+}
+
+void main() {
+    const uint stream = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (stream >= p.hc_count || t >= p.seq_len || p.hidden == 0u) {
+        return;
+    }
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint hidden = p.hidden;
+    const uint hc_hidden = hidden * p.hc_count;
+    // This stream's group inside the wide row...
+    const uint base = t * hc_hidden + stream * hidden;
+    // ...and the matching slice of the flat, wide norm weight vectors.
+    const uint wbase = stream * hidden;
+    // `value` has no stream axis: one value row gates into every stream.
+    const uint vbase = t * hidden;
+    const float inv_n = 1.0 / float(hidden);
+
+    // 1. The two grouped RMS statistics, in one pass over both tensors.
+    float key_sq = 0.0;
+    float query_sq = 0.0;
+    for (uint i = tid; i < hidden; i += BLOCK) {
+        const float k = key_proj[base + i];
+        const float q = hidden_in[base + i];
+        key_sq += k * k;
+        query_sq += q * q;
+    }
+    reduce_pair(key_sq, query_sq);
+    if (tid == 0u) {
+        g_key_scale = 1.0 / sqrt(red_a[0] * inv_n + p.eps);
+        g_query_scale = 1.0 / sqrt(red_b[0] * inv_n + p.eps);
+    }
+    // Also fences the scratch: no lane may overwrite red_a/red_b for the next
+    // reduction until lane 0 has read red_a[0]/red_b[0] above.
+    barrier();
+
+    // 2. The gate: dot(key_normed, query_normed) over this stream's group.
+    //    Re-reading key/query from global rather than caching them in a local
+    //    array keeps the shader free of a compile-time cap on `hidden`; both
+    //    rows are ~10 KB and stay resident in L2 across the two passes.
+    float dot_acc = 0.0;
+    for (uint i = tid; i < hidden; i += BLOCK) {
+        const float kn = key_proj[base + i] * g_key_scale * (1.0 + norm_key_w[wbase + i]);
+        const float qn = hidden_in[base + i] * g_query_scale * (1.0 + norm_query_w[wbase + i]);
+        dot_acc += kn * qn;
+    }
+    reduce_pair(dot_acc, 0.0);
+    if (tid == 0u) {
+        // Scaled like an attention logit, then the signed sqrt with a 1e-6
+        // floor on the magnitude.
+        //
+        // TRAP: `sign(0) == 0` in GLSL (and in torch), so a gate that is
+        // exactly zero stays zero and the sigmoid stays exactly 0.5. Replacing
+        // this with `g < 0.0 ? -1.0 : 1.0` would map a zero gate to
+        // `sqrt(1e-6) = 1e-3` and shift every gated value by 5e-4 relative.
+        // Do not "simplify" it.
+        float g = red_a[0] / sqrt(float(hidden));
+        g = sign(g) * sqrt(max(abs(g), 1e-6));
+        g_weight = 1.0 / (1.0 + exp(-g));
+    }
+    barrier();
+
+    // 3. The gated value (the residual branch's tensor) and, in the same pass,
+    //    the sum of squares `norm_conv` needs. Note the gate is a scalar per
+    //    stream while `value` is shared, so the whole group is one broadcast
+    //    multiply.
+    float gated_sq = 0.0;
+    for (uint i = tid; i < hidden; i += BLOCK) {
+        const float gv = g_weight * value_proj[vbase + i];
+        gated[base + i] = gv;
+        gated_sq += gv * gv;
+    }
+    reduce_pair(gated_sq, 0.0);
+    if (tid == 0u) {
+        g_conv_scale = 1.0 / sqrt(red_a[0] * inv_n + p.eps);
+    }
+    barrier();
+
+    // 4. `norm_conv(gated)` — the conv branch's tensor. `gated` is writeonly,
+    //    so the value is recomputed rather than read back; it is a multiply.
+    for (uint i = tid; i < hidden; i += BLOCK) {
+        const float gv = g_weight * value_proj[vbase + i];
+        gated_normed[base + i] = gv * g_conv_scale * (1.0 + norm_conv_w[wbase + i]);
+    }
+}

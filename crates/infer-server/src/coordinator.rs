@@ -607,6 +607,9 @@ fn coordinator_handle(
 
 fn build_router(state: Arc<DpCoordinator>) -> Router {
     Router::new()
+        // The llama-server experience: `GET /` is a usable chat client, so
+        // "start the server, open the browser, type" needs zero extra setup.
+        .route("/", get(chat_ui_page))
         .route("/health", get(health))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
@@ -2188,6 +2191,19 @@ async fn dashboard_page() -> ([(header::HeaderName, &'static str); 1], &'static 
     )
 }
 
+/// Built-in chat client, one self-contained file compiled into the binary so
+/// the server works offline with no build step. Named `const` (not inlined in
+/// the handler) because `chat_ui_tests` cross-checks the HTML's fetch paths
+/// against the live route table.
+const CHAT_UI_HTML: &str = include_str!("chat_ui.html");
+
+async fn chat_ui_page() -> ([(header::HeaderName, &'static str); 1], &'static str) {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        CHAT_UI_HTML,
+    )
+}
+
 #[cfg(test)]
 mod dp_failure_domain_tests {
     use super::*;
@@ -2217,5 +2233,118 @@ mod dp_failure_domain_tests {
             .err()
             .expect("dead group must reject submits");
         assert!(err.message().contains("torn down"), "{}", err.message());
+    }
+}
+
+#[cfg(test)]
+mod chat_ui_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    /// The REAL route table with no coordinator groups behind it. Every
+    /// assertion below stays on stateless paths (`GET /`, method-mismatch
+    /// 405s, fallback 404s), which never call `DpCoordinator::select`.
+    fn ui_router() -> Router {
+        build_router(Arc::new(DpCoordinator::new(Vec::new())))
+    }
+
+    async fn request(method: Method, path: &str) -> Response {
+        ui_router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("infallible router call")
+    }
+
+    /// Every quoted "/v1/..." string in the UI source — the endpoints its
+    /// `fetch` calls hit. Extracted from the shipped HTML so a UI edit cannot
+    /// drift away from what the tests below check.
+    fn ui_api_paths() -> Vec<String> {
+        let mut rest = CHAT_UI_HTML;
+        let mut paths = Vec::new();
+        while let Some(pos) = rest.find("\"/v1/") {
+            let quoted = &rest[pos + 1..];
+            let end = quoted
+                .find('"')
+                .expect("unterminated string in chat_ui.html");
+            paths.push(quoted[..end].to_string());
+            rest = &quoted[end..];
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    #[tokio::test]
+    async fn get_root_serves_embedded_chat_ui() {
+        let response = request(Method::GET, "/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("content-type header")
+            .to_str()
+            .expect("ascii content-type");
+        assert_eq!(content_type, "text/html; charset=utf-8");
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("read body");
+        let html = std::str::from_utf8(&body).expect("utf-8 page");
+        assert!(html.contains("<title>ARLE"), "GET / must serve the chat UI");
+        assert!(
+            html.contains(r#""/v1/chat/completions""#),
+            "the UI must stream from the server's own chat endpoint"
+        );
+    }
+
+    /// Anti-drift: each endpoint the UI fetches must exist in the route table
+    /// it is served from. A wrong-method request distinguishes the two
+    /// failure modes — a registered path answers 405 (axum method mismatch),
+    /// an unregistered one falls through to `fallback_404`.
+    #[tokio::test]
+    async fn ui_fetch_paths_exist_in_route_table() {
+        let paths = ui_api_paths();
+        // The two endpoints the UI needs; extraction finding them proves the
+        // scan works (an empty vec would vacuously pass the loop below).
+        for expected in ["/v1/chat/completions", "/v1/models"] {
+            assert!(
+                paths.iter().any(|p| p == expected),
+                "chat_ui.html no longer references {expected}"
+            );
+        }
+        for path in paths {
+            let response = request(Method::DELETE, &path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "UI fetch path {path} does not match any route in build_router"
+            );
+        }
+    }
+
+    /// The offline guarantee: one file, no external loads, so the page works
+    /// with no internet and no CDN (the CSP-like invariant).
+    #[test]
+    fn ui_has_no_external_references() {
+        for banned in [
+            "http://",
+            "https://",
+            "<script src",
+            "<link ",
+            "@import",
+            "url(",
+        ] {
+            assert!(
+                !CHAT_UI_HTML.contains(banned),
+                "chat_ui.html must stay self-contained; found {banned:?}"
+            );
+        }
     }
 }

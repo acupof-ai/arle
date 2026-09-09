@@ -45,6 +45,11 @@ pub struct ServeHttpOptions {
     /// Speculative-decode request surface. The rewrite server keeps this
     /// fail-closed until a backend actually consumes it.
     pub spec: ServeSpecOptions,
+    /// `arle serve --open`: launch the OS default browser at the served
+    /// address (the built-in `/` chat UI) once the listener is bound — i.e.
+    /// after the model has loaded, which is when the page becomes usable.
+    /// In-process serve path only; the multiproc CUDA coordinator ignores it.
+    pub open_browser: bool,
 }
 
 /// The L3 (NVMe) KV spill root a bare `--kv-disk` resolves to:
@@ -282,13 +287,66 @@ pub fn serve_http(
         hook(engine)?;
     }
 
-    bind_and_serve(
-        opts.bind.as_str(),
-        opts.port,
-        router,
-        &opts.model_path,
-        shutdown,
-    )
+    // Bind here (not via `bind_and_serve`) so `--open` fires strictly after a
+    // successful bind: the OS accept backlog then holds the browser's
+    // connection until axum starts accepting a moment later, so the page can
+    // never load against a dead port.
+    let listener = std::net::TcpListener::bind((opts.bind.as_str(), opts.port))
+        .with_context(|| format!("failed to bind {}:{}", opts.bind, opts.port))?;
+    if opts.open_browser {
+        spawn_browser_open(browse_url(&opts.bind, opts.port));
+    }
+    serve_listener(listener, router, &opts.model_path, shutdown, true)
+}
+
+/// The URL a human can open for `bind`: a wildcard bind is reachable via
+/// loopback, anything else via the bound host itself.
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+fn browse_url(bind: &str, port: u16) -> String {
+    let host = match bind {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
+    };
+    // A bare IPv6 host needs brackets to survive URL parsing.
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}/")
+    } else {
+        format!("http://{host}:{port}/")
+    }
+}
+
+/// Launch the OS default browser at `url`, detached and best-effort: serving
+/// must never fail because a browser could not start.
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+fn spawn_browser_open(url: String) {
+    std::thread::spawn(move || {
+        // Windows: `start` is a cmd builtin; the explicit empty title keeps
+        // it from consuming the URL as the window-title argument.
+        #[cfg(target_os = "windows")]
+        let launched = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn();
+        #[cfg(target_os = "macos")]
+        let launched = std::process::Command::new("open").arg(&url).spawn();
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let launched = std::process::Command::new("xdg-open").arg(&url).spawn();
+        match launched {
+            Ok(_) => log::info!("--open: launched browser at {url}"),
+            Err(err) => log::warn!("--open: could not launch a browser for {url}: {err}"),
+        }
+    });
 }
 
 /// Multi-group DP variant: one relay per TP group, routed by a
@@ -315,13 +373,9 @@ pub fn serve_coordinator_http_dp(
     bind_and_serve(bind, port, router, model_path, shutdown)
 }
 
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
+// CUDA-only because its one remaining caller is `serve_coordinator_http_dp`;
+// the in-process `serve_http` binds inline so `--open` fires after the bind.
+#[cfg(feature = "cuda")]
 pub fn bind_and_serve(
     bind: &str,
     port: u16,
@@ -495,6 +549,30 @@ async fn shutdown_signal(shutdown: infer_server::ServeShutdown, process_signals:
     }
     shutdown.request();
     log::info!("shutdown signal received");
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "metal",
+        feature = "cuda",
+        feature = "hip",
+        feature = "vulkan",
+        feature = "cpu"
+    )
+))]
+mod browse_url_tests {
+    use super::browse_url;
+
+    /// A wildcard bind is not an openable host — the browser must land on
+    /// loopback instead of `http://0.0.0.0:.../`.
+    #[test]
+    fn wildcard_binds_open_loopback() {
+        assert_eq!(browse_url("0.0.0.0", 8080), "http://127.0.0.1:8080/");
+        assert_eq!(browse_url("::", 8080), "http://127.0.0.1:8080/");
+        assert_eq!(browse_url("127.0.0.1", 8000), "http://127.0.0.1:8000/");
+        assert_eq!(browse_url("::1", 9000), "http://[::1]:9000/");
+    }
 }
 
 #[cfg(test)]

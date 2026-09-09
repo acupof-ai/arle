@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 
 use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use crate::sandbox::{
@@ -369,9 +370,16 @@ impl CcHarness {
             .env(
                 "HOME",
                 crate::sandbox::agent_home(&self.work_root, &task_name),
-            )
-            .uid(self.rollout_user.uid)
-            .gid(self.rollout_user.gid);
+            );
+
+        // Drop to the unprivileged rollout user so the agent cannot reach the
+        // harness's own tree. Gated only so the workspace COMPILES off POSIX —
+        // it is not a Windows code path: `resolve_rollout_user` shells out to
+        // `getent passwd` and bails, so a rollout can never be constructed
+        // there in the first place. Do not read this cfg as "isolation is
+        // optional on Windows"; it is "there are no rollouts on Windows".
+        #[cfg(unix)]
+        cmd.uid(self.rollout_user.uid).gid(self.rollout_user.gid);
 
         let t_start_ms = epoch_ms();
         let spawned = run_captured(cmd, Duration::from_secs(self.cc_timeout_secs));

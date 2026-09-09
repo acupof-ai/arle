@@ -398,13 +398,12 @@ mod real {
             return 0.0;
         }
         if exp == 15 {
-            // NVIDIA E4M3: mant=7 → Inf; mant<7 → finite 2^8*(1+mant/8)
+            // e4m3fn has NO infinities: 0x7F/0xFF are NaN, everything else in
+            // this exponent is finite (max 448 — the same bound the encoder
+            // below clips to). The canonical decoder is
+            // infer-gguf/src/dequant.rs::fp8_e4m3_to_f32.
             if mant == 7 {
-                return if sign != 0 {
-                    f32::NEG_INFINITY
-                } else {
-                    f32::INFINITY
-                };
+                return f32::NAN;
             }
             let val = (1.0 + mant as f32 / 8.0) * 256.0; // 2^(15-7) = 256
             return if sign != 0 { -val } else { val };

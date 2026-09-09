@@ -191,8 +191,8 @@ fn host_gated_delta(
                 q_sumsq += q_head[j] * q_head[j];
                 k_sumsq += k_head[j] * k_head[j];
             }
-            let q_norm = 1.0 / (q_sumsq + 1.0e-12).sqrt();
-            let k_norm = 1.0 / (k_sumsq + 1.0e-12).sqrt();
+            let q_norm = 1.0 / (q_sumsq + 1.0e-6).sqrt();
+            let k_norm = 1.0 / (k_sumsq + 1.0e-6).sqrt();
             let q_scale = q_norm * (1.0 / (kd as f32).sqrt());
 
             let a_val = a_proj[token * nv + vh];

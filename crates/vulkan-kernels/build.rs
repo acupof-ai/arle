@@ -13,6 +13,162 @@ struct ShaderSpec {
     defines: &'static [(&'static str, &'static str)],
 }
 
+/// Shared `mul_mmq.comp` define set; only `DATA_A_*` differs per quant type.
+/// Kept as macros rather than a helper fn because `ShaderSpec::defines` is a
+/// `&'static [_]` in a `const` array.
+macro_rules! mmq_defines {
+    ($data_a:literal) => {
+        &[
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ($data_a, "1"),
+            ("D_TYPE", "float"),
+        ]
+    };
+}
+
+const MMQ_DEFINES_Q4_K: &[(&str, &str)] = mmq_defines!("DATA_A_Q4_K");
+const MMQ_DEFINES_Q5_K: &[(&str, &str)] = mmq_defines!("DATA_A_Q5_K");
+const MMQ_DEFINES_Q6_K: &[(&str, &str)] = mmq_defines!("DATA_A_Q6_K");
+const MMQ_DEFINES_Q8_0: &[(&str, &str)] = mmq_defines!("DATA_A_Q8_0");
+
+/// Shared `mul_mm.comp` COOPMAT define set. Mirrors llama.cpp's
+/// `matmul_shaders(fp16=true, coopmat=true, f16acc=false)` for the *unaligned*
+/// `<quant>_f16` variant (`vulkan-shaders-gen.cpp:584`), which is the one whose
+/// B operand is a plain `float16_t` row-major `[N][K]` — no `ALIGNED`/vec4
+/// packing, so N (the token count) is unconstrained.
+///
+/// `LOAD_VEC_A` is `load_vec_quant`, and it is NOT cosmetic: `load_a_to_shmem`
+/// computes `buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2`, so a wrong
+/// value silently aliases shared-memory rows. Q4_K/Q5_K/Q8_0 dequantize 4
+/// values per invocation (`LOAD_VEC_A = 4`), Q6_K only 2.
+macro_rules! mm_coopmat_defines {
+    ($data_a:literal, $load_vec_a:literal) => {
+        &[
+            ("FLOAT16", "1"),
+            ("FLOAT_TYPE", "float16_t"),
+            ("FLOAT_TYPEV2", "f16vec2"),
+            ("FLOAT_TYPEV4", "f16vec4"),
+            ("ACC_TYPE", "float"),
+            ("ACC_TYPEV2", "vec2"),
+            ("COOPMAT", "1"),
+            ($data_a, "1"),
+            ("LOAD_VEC_A", $load_vec_a),
+            ("B_TYPE", "float16_t"),
+            ("D_TYPE", "float"),
+        ]
+    };
+}
+
+const MM_CM_DEFINES_Q4_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q4_K", "4");
+const MM_CM_DEFINES_Q5_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q5_K", "4");
+const MM_CM_DEFINES_Q6_K: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q6_K", "2");
+const MM_CM_DEFINES_Q8_0: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_Q8_0", "4");
+/// F16 A: `types.glsl` supplies `A_TYPE float16_t` at `LOAD_VEC_A 1`, and the
+/// f16 arm of `mul_mm.comp` does its own two-at-a-time load (`LOAD_VEC_BATCH_A
+/// 2`), so 1 is correct here where the quants need their dequant width.
+const MM_CM_DEFINES_F16: &[(&str, &str)] = mm_coopmat_defines!("DATA_A_F16", "1");
+
+/// BF16 A, F16 B — spelled out rather than routed through
+/// `mm_coopmat_defines!` because its decode is asymmetric. `types.glsl` gives
+/// `DATA_A_BF16` an `A_TYPE uint16_t` at `LOAD_VEC_A 1` (raw bits, bf16 has no
+/// GLSL scalar), so every A load must decode through `TO_FLOAT_TYPE` — the
+/// default (`FLOAT_TYPE`, a numeric cast of the INTEGER bits) is silent
+/// garbage. Upstream routes B through the SAME macro, which would force bf16
+/// activations (2^-8 rounding — measured to compound to an argmax flip over
+/// 48 layers); the vendored `TO_FLOAT_TYPE_B` seam (ARLE patch, defaulting to
+/// `TO_FLOAT_TYPE`) lets B stay plain f16 (2^-11), staged by the same
+/// `f16_kv_pack` every other coopmat GEMM takes. `TO_FLOAT_TYPE` is a
+/// function-like macro so the `uint16_t -> uint32_t` widening is explicit —
+/// `bf16_to_fp32` takes `uint32_t`, and only `GL_EXT_shader_16bit_storage`
+/// (constructor conversions, no implicit ones) is enabled in this shader.
+const MM_CM_DEFINES_BF16: &[(&str, &str)] = &[
+    ("FLOAT16", "1"),
+    ("FLOAT_TYPE", "float16_t"),
+    ("FLOAT_TYPEV2", "f16vec2"),
+    ("FLOAT_TYPEV4", "f16vec4"),
+    ("ACC_TYPE", "float"),
+    ("ACC_TYPEV2", "vec2"),
+    ("COOPMAT", "1"),
+    ("DATA_A_BF16", "1"),
+    ("LOAD_VEC_A", "1"),
+    ("B_TYPE", "float16_t"),
+    ("D_TYPE", "float"),
+    ("TO_FLOAT_TYPE(x)", "bf16_to_fp32(uint(x))"),
+    ("TO_FLOAT_TYPE_B(x)", "(x)"),
+];
+
+/// Shared `mul_mat_vec.comp` define set for the two NVFP4 GEMVs. `MUL_MAT_ID`
+/// is the ONLY difference between the plain and the fused-expert variant, so it
+/// is passed as an extra rather than duplicated into a second literal list.
+///
+/// Note `B_TYPE = float`, not `block_q8_1_x4`: unlike every other GEMV this
+/// crate registers, the NVFP4 pair runs `mul_mat_vec.comp` (dequantize-to-float
+/// then `dot`), not `mul_mat_vecq.comp` (integer dot). See the `ShaderSpec`
+/// comment below for why.
+macro_rules! nvfp4_gemv_defines {
+    ($($extra:expr,)*) => {
+        &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_NVFP4", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+            $($extra,)*
+        ]
+    };
+}
+
+const NVFP4_GEMV_DEFINES: &[(&str, &str)] = nvfp4_gemv_defines!();
+const NVFP4_GEMV_ID_DEFINES: &[(&str, &str)] = nvfp4_gemv_defines!(("MUL_MAT_ID", "1"),);
+
+/// Shared `mul_mat_vec.comp` define set for the DENSE (non-quantized) tier —
+/// the attention projections and `lm_head` this checkpoint stores as BF16.
+/// `DATA_A_*` is the only difference between the two variants.
+///
+/// These are define-only: NO vendored GLSL was written or edited for them.
+/// `mul_mat_vec.comp:10` already branches on `DATA_A_F16`/`DATA_A_BF16` to
+/// `K_PER_ITER 4` plus an `iter_aligned_nonquant` fast path, and
+/// `dequant_funcs.glsl:25,43` already carries both dequantizers (BF16's is a
+/// `<< 16` bit shift, not a conversion instruction). `types.glsl:23,37` gives
+/// each one `QUANT_K = QUANT_R = 1` and an `A_TYPE_PACKED32`, so the aligned
+/// path loads four weights as two 32-bit words.
+///
+/// B is the same plain f32 activation vector the NVFP4 pair takes, and for the
+/// same structural reason: `mul_mat_vecq_funcs.glsl` has no non-quantized arm
+/// at all. Feeding these pipelines `block_q8_1_x4` bytes is silent garbage.
+macro_rules! dense_gemv_defines {
+    ($data_a:literal) => {
+        &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ($data_a, "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ]
+    };
+}
+
+const DENSE_GEMV_DEFINES_F16: &[(&str, &str)] = dense_gemv_defines!("DATA_A_F16");
+const DENSE_GEMV_DEFINES_BF16: &[(&str, &str)] = dense_gemv_defines!("DATA_A_BF16");
+/// The W8A16 rung of the dense tier: Q8_0 weights x a PLAIN f32 activation
+/// through the same float-B `mul_mat_vec.comp` — `dequant_funcs.glsl:122`
+/// already carries Q8_0's `dequantize4`, so unlike Q4_K (below) this needs no
+/// new vendored file, only a define. NOT `mul_mat_vecq_q8_0`, which is W4A8/
+/// W8A8: it quantizes the activations to 8 bits (`block_q8_1_x4` B), a
+/// different quality contract from the checkpoint's plain-f32 activations.
+const DENSE_GEMV_DEFINES_Q8_0: &[(&str, &str)] = dense_gemv_defines!("DATA_A_Q8_0");
+
 const VENDORED: &[ShaderSpec] = &[
     ShaderSpec {
         name: "mul_mat_vec_iq2_xxs",
@@ -94,13 +250,32 @@ const VENDORED: &[ShaderSpec] = &[
             ("USE_SUBGROUP_ADD", "1"),
         ],
     },
+    // MXFP4 (E8M0 shared exponent + 16 packed E2M1 nibbles per 32 values,
+    // 17 B/block). Unsloth's "UD-Q*_XL" dynamic quants store the routed
+    // experts and most attention projections in MXFP4 — 90% of a
+    // Qwen3.5-122B-A10B's elements — so without this variant that checkpoint
+    // has no GEMV at all. The vendored shader already carries the
+    // `DATA_A_MXFP4` arms (`mul_mat_vecq_funcs.glsl:19,115,135`,
+    // `types.glsl:1717`), so this is a define, not a new kernel.
+    ShaderSpec {
+        name: "mul_mat_vecq_mxfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_MXFP4", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
     // Fused MoE expert GEMV (`mul_mat_vec_id`) — the same `mul_mat_vecq.comp`
     // body compiled with `MUL_MAT_ID=1`, which swaps the batch-offset push tail
     // for the expert-id contract (`nei0/ne11/expert_i1/nbi1` + a 6th `IDS`
     // binding) so ONE dispatch runs a token through ALL its top-k routed experts
     // (gl_WorkGroupID.y = expert slot, expert_id = data_ids[...]). Collapses the
     // per-layer 8×3 per-expert GEMVs into 3 dispatches. The expert tensors in the
-    // 35B-A3B are Q4_K/Q5_K/Q6_K/Q8_0, so register those four DATA_A variants.
+    // 35B-A3B are Q4_K/Q5_K/Q6_K/Q8_0; the 122B-A10B adds MXFP4.
     ShaderSpec {
         name: "mul_mat_vec_id_q4_k",
         source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
@@ -152,6 +327,185 @@ const VENDORED: &[ShaderSpec] = &[
             ("MUL_MAT_ID", "1"),
             ("USE_SUBGROUP_ADD", "1"),
         ],
+    },
+    // The routed experts themselves. In the 122B-A10B every `ffn_gate_exps` /
+    // `ffn_up_exps` (48 layers) and most `ffn_down_exps` are MXFP4, so this is
+    // the variant the MoE hot path actually dispatches.
+    ShaderSpec {
+        name: "mul_mat_vec_id_mxfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_MXFP4", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
+    // NVFP4 (four UE4M3 sub-block scales, one per 16 values, then 32 packed
+    // E2M1 nibble bytes — 36 B per 64-value block; ggml-common.h:211). The
+    // routed experts of Qwen3.8-Flash-Next are NVFP4 and nothing else is, so
+    // without these two variants that checkpoint's MoE has no GEMV.
+    //
+    // These are the ONLY GEMVs here built from `mul_mat_vec.comp` rather than
+    // `mul_mat_vecq.comp`, and that is forced, not a preference:
+    // `mul_mat_vecq_funcs.glsl` has no `DATA_A_NVFP4` arm and cannot get one by
+    // a define. Its `mmvq_dot_product` contract is ONE `get_dm(ib)` scale per
+    // dot-product group, and it walks A in `QUANT_K_Q8_1`-sized (32-value)
+    // steps; NVFP4 carries FOUR scales per 64-value block, so an integer-dot
+    // arm would need a different accumulator decomposition, i.e. new vendored
+    // shader code on the hot path. Upstream llama.cpp made the same call —
+    // NVFP4 appears in `dequant_funcs.glsl` and `mul_mm_funcs.glsl`, never in
+    // `mul_mat_vecq_funcs.glsl`.
+    //
+    // Consequence for callers: B is a plain f32 activation vector, NOT
+    // `block_q8_1_x4`. The MoE path skips the `q8_1_quantize` dispatch for
+    // NVFP4 experts, and feeding these pipelines q8_1 bytes is silent garbage.
+    ShaderSpec {
+        name: "mul_mat_vec_nvfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: NVFP4_GEMV_DEFINES,
+    },
+    ShaderSpec {
+        name: "mul_mat_vec_id_nvfp4",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: NVFP4_GEMV_ID_DEFINES,
+    },
+    // The DENSE tier of Qwen3.8-Flash-Next: every full-attention q/k/v/o
+    // projection and the 1.27 GB `lm_head`, all BF16 on disk and all of it
+    // ~8 GB/token that had no GEMV at all before these two lines — so it ran on
+    // the host at ~55 GB/s instead of the GPU's ~205.
+    //
+    // Both are registered, but the measurement says which to reach for. F16 has
+    // 3 more mantissa bits than BF16, which makes an f16 tier the more precise
+    // one when it is fed from f32 — fed from a BF16 checkpoint it can only tie
+    // or lose, because the widening is exact in the normal band and f16's
+    // exponent range is the narrower of the two. Measured over all 685,834,240
+    // dense weights of this model (`tests/device_gemv_f16.rs`): 221,186 change
+    // value, all of them already below 2^-17, none by more than 2^-25. So BF16
+    // is the default for reading THESE bytes — same arithmetic, no convert
+    // pass, and the binding can point straight at the mmap. F16 is here for a
+    // tier built from something more precise than bf16, and for callers that
+    // need f16 weights for another reason.
+    ShaderSpec {
+        name: "mul_mat_vec_f16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: DENSE_GEMV_DEFINES_F16,
+    },
+    ShaderSpec {
+        name: "mul_mat_vec_bf16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: DENSE_GEMV_DEFINES_BF16,
+    },
+    // The W4A16 arm of the dense-tier flip: Q4_K weights x a PLAIN f32
+    // activation vector. This is deliberately NOT `mul_mat_vecq_q4_k` (that
+    // one is W4A8 — it takes `block_q8_1_x4` activations, i.e. the B side is
+    // requantized to 8 bits, a quality contract this checkpoint's dense tier
+    // was never signed up for). And it CANNOT ride the generic
+    // `mul_mat_vec.comp` either: the quantized arm there is `K_PER_ITER 8`,
+    // which demands a `dequantize4`, and the K-quants only carry the vec2
+    // `dequantize` (`dequant_funcs.glsl:600`) — a compile error, not a
+    // performance choice. Upstream's answer is this specialized per-superblock
+    // shader; `mul_mat_vec_q4_k.comp` is vendored VERBATIM from
+    // ggml-org/llama.cpp (tree `llama.cpp-claude-vulkan-ryzen-ai-optimization-
+    // Sl23N`, `ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp`),
+    // joining the same-family `mul_mat_vec_q2_k.comp` already here. It reads
+    // `p.stride_d` as its row bound and B through `data_b_v4`, 16 threads per
+    // 256-value super-block — see `SPEC_GEMV_Q4K_DENSE` in lib.rs for the
+    // geometry consequences.
+    ShaderSpec {
+        name: "mul_mat_vec_q4_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec_q4_k.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPE_VEC2", "vec2"),
+            ("DATA_A_Q4_K", "1"),
+            ("B_TYPE", "float"),
+            ("B_TYPEV2", "vec2"),
+            ("B_TYPEV4", "vec4"),
+            ("D_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
+        ],
+    },
+    // Q8_0's W8A16 rung — the per-family fallback where Q4_K's quality cost
+    // is refused (or its 256-wide constraint fails, e.g. the 640-wide shared-
+    // expert down_proj). Same float-B family and 5-buffer ABI as the dense
+    // F16/BF16 pair above; see DENSE_GEMV_DEFINES_Q8_0.
+    ShaderSpec {
+        name: "mul_mat_vec_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec.comp",
+        defines: DENSE_GEMV_DEFINES_Q8_0,
+    },
+    // Batched prefill GEMM (`mul_mmq`) — the integer-dot-product tiled matmul
+    // that consumes the SAME `block_q8_1_x4` activations the decode GEMVs
+    // already produce (`block_q8_1_x4` and `block_q8_1_x4_packed128` are
+    // byte-identical 144-byte blocks), so one `q8_1_quantize` dispatch feeds
+    // both lanes. `FLOAT16` picks the f16 shmem cache (halves the `block_a_cache`
+    // / `block_b_cache` scale footprint) while `ACC_TYPE=float` keeps the f32
+    // accumulator — the non-`f16acc` variant llama.cpp registers for AMD.
+    ShaderSpec {
+        name: "mul_mmq_q4_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q4_K,
+    },
+    ShaderSpec {
+        name: "mul_mmq_q5_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q5_K,
+    },
+    ShaderSpec {
+        name: "mul_mmq_q6_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q6_K,
+    },
+    ShaderSpec {
+        name: "mul_mmq_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mmq.comp",
+        defines: MMQ_DEFINES_Q8_0,
+    },
+    // Batched prefill GEMM on the MATRIX CORES (`mul_mm.comp` + `COOPMAT`). The
+    // 8060S advertises `VK_KHR_cooperative_matrix` with an f16xf16->f32 subgroup
+    // tile, and on a dense 27B that path is worth 3.32x over the integer-dot
+    // `mul_mmq` fallback (llama.cpp on this box: 61.96 t/s vs 18.64 t/s with
+    // `GGML_VK_DISABLE_COOPMAT=1`). Unlike `mul_mmq` the B operand is f16, not
+    // q8_1_x4 — the shader dequantizes A into shared memory and issues
+    // `coopMatMulAdd`, so the activation side is an `f16_kv_pack` away, not a
+    // `q8_1_quantize`. Registered unconditionally; `VulkanContext::coopmat()`
+    // decides at runtime whether these pipelines are ever built.
+    ShaderSpec {
+        name: "mul_mm_cm_f16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_F16,
+    },
+    ShaderSpec {
+        name: "mul_mm_cm_q4_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q4_K,
+    },
+    ShaderSpec {
+        name: "mul_mm_cm_q5_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q5_K,
+    },
+    ShaderSpec {
+        name: "mul_mm_cm_q6_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q6_K,
+    },
+    ShaderSpec {
+        name: "mul_mm_cm_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_Q8_0,
+    },
+    // BF16 A *and* B on the matrix cores — the batched (prefill) arm of the
+    // verbatim-BF16 dense tier, whose k=1 arm is `mul_mat_vec_bf16`. See
+    // `MM_CM_DEFINES_BF16` for why B is bf16 bits here and not f16.
+    ShaderSpec {
+        name: "mul_mm_cm_bf16",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mm.comp",
+        defines: MM_CM_DEFINES_BF16,
     },
     ShaderSpec {
         name: "rms_norm",
@@ -340,6 +694,91 @@ const LOCAL: &[ShaderSpec] = &[
         source: "crates/vulkan-kernels/shaders/qwen36_moe_weighted_accum.comp",
         defines: &[],
     },
+    // Qwen3.8-Flash-Next (`qwen4_exp`) PLE. Neither half exists in the vendored
+    // corpus: the grouped RMSNorm scales by `1.0 + weight` and the conv is
+    // dilated, so no `-D` of an upstream shader reaches either. Both are fused
+    // to this model's sequence rather than written as primitives because decode
+    // here is dispatch-bound — see the shader headers.
+    ShaderSpec {
+        name: "qwen4_ple_gate",
+        source: "crates/vulkan-kernels/shaders/qwen4_ple_gate.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_ple_conv",
+        source: "crates/vulkan-kernels/shaders/qwen4_ple_conv.comp",
+        defines: &[],
+    },
+    // Qwen3.8-Flash-Next hyper-connections: two of the four dispatches ONE
+    // `Qwen4ExpTextGatedResidual` costs. The other two need no new shader — the
+    // vendored `rms_norm` does the grouped norm through push constants alone
+    // (`rms_norm_params_grouped`) and the f32 `qwen36_router_gemv` does the
+    // down-projection. These two are fused rather than generic because the site
+    // occurs 97 times per token on a dispatch-bound decode: the naive
+    // composition is 10 dispatches per site, this is 4.
+    ShaderSpec {
+        name: "qwen4_block_perm",
+        source: "crates/vulkan-kernels/shaders/qwen4_block_perm.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_hc_mix",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_mix.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_hc_mix_bf16",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_mix.comp",
+        defines: &[("WEIGHTS_BF16", "1")],
+    },
+    ShaderSpec {
+        name: "qwen4_hc_combine",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_combine.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_hc_combine_bf16",
+        source: "crates/vulkan-kernels/shaders/qwen4_hc_combine.comp",
+        defines: &[("WEIGHTS_BF16", "1")],
+    },
+    // Chunked (WY-form) gated-delta prefill: the intra-chunk kernel is
+    // parallel over (chunk, head), the state kernel is serial in n_chunks
+    // only — together they replace the serial `qwen35_gated_delta_net` scan
+    // on the opt-in `ARLE_QWEN4_PREFILL_CHUNKED_GDN=1` prefill lane.
+    ShaderSpec {
+        name: "qwen4_gdn_chunk_intra",
+        source: "crates/vulkan-kernels/shaders/qwen4_gdn_chunk_intra.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_gdn_chunk_state",
+        source: "crates/vulkan-kernels/shaders/qwen4_gdn_chunk_state.comp",
+        defines: &[],
+    },
+    // Grouped-MoE device planner (count -> scan -> emit) + the write-side
+    // block scatter: together they replace the prefill's per-(layer,chunk)
+    // ids fence — the router ids never come back to the host, the block
+    // counts drive the grouped GEMVs through `vkCmdDispatchIndirect`.
+    ShaderSpec {
+        name: "qwen4_moe_plan_count",
+        source: "crates/vulkan-kernels/shaders/qwen4_moe_plan_count.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_moe_plan_scan",
+        source: "crates/vulkan-kernels/shaders/qwen4_moe_plan_scan.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_moe_plan_emit",
+        source: "crates/vulkan-kernels/shaders/qwen4_moe_plan_emit.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen4_block_scatter",
+        source: "crates/vulkan-kernels/shaders/qwen4_block_scatter.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {
@@ -390,6 +829,9 @@ fn main() {
         "flash_attn_dequant.glsl",
         "flash_attn_mmq_funcs.glsl",
         "mul_mmq_shmem_types.glsl",
+        "mul_mmq_funcs.glsl",
+        "mul_mm_funcs.glsl",
+        "mul_mm_id_funcs.glsl",
         "rope_head.glsl",
         "rope_funcs.glsl",
         "glu_head.glsl",

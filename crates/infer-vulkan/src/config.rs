@@ -89,7 +89,21 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
             .ok_or_else(|| anyhow!("GGUF missing required key {}", key(suffix)))
     };
 
-    let num_hidden_layers = req_usize("block_count")?;
+    // ── Core transformer dims. ────────────────────────────────────────────
+    // `block_count` includes the trailing MTP blocks (Qwen3.8-27B ships one at
+    // blk.64), which carry `nextn.*` weights and no attention tensor at all.
+    // They are not part of the decode graph, so trim them before any per-layer
+    // scan classifies a layer that has neither ssm_conv1d nor attn_q.
+    let block_count = req_usize("block_count")?;
+    let nextn_predict_layers = gguf.get_usize(&key("nextn_predict_layers")).unwrap_or(0);
+    let num_hidden_layers = block_count
+        .checked_sub(nextn_predict_layers)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| {
+            anyhow!(
+                "qwen35: block_count {block_count} <= nextn_predict_layers {nextn_predict_layers}"
+            )
+        })?;
     let hidden_size = req_usize("embedding_length")?;
     // Dense MLP width. The MoE GGUF (qwen35moe, all-sparse) ships NO
     // `feed_forward_length` — every layer is a MoE FFN sized by the
