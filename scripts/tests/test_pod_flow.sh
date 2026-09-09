@@ -122,31 +122,31 @@ printf target > "$TREE/target/keep"
 printf venv > "$TREE/crates/cuda-kernels/tools/tilelang/.venv/keep"
 printf bench > "$TREE/bench-output/keep"
 cp "$LOCAL/scripts/pod-remote-build.sh" "$TREE/scripts/"
-TN_FAIL_AT=0 "$LOCAL/scripts/pod.sh" sync >/dev/null 2>&1 && exit 1 || true
+TN_FAIL_AT=0 "$LOCAL/scripts/pod.sh" sync --dirty >/dev/null 2>&1 && exit 1 || true
 [ "$(cat "$TREE/sentinel")" = sentinel ]
 grep -Fq 'COPYFILE_DISABLE=1 tar ' "$LOCAL/scripts/pod.sh"
 
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 [ -f "$TREE/new name" ] && [ -f "$TREE/untracked space" ] && [ ! -e "$TREE/delete me" ] && [ ! -e "$TREE/old name" ]
 [ "$(cat "$TREE/target/keep")" = target ] && [ "$(cat "$TREE/crates/cuda-kernels/tools/tilelang/.venv/keep")" = venv ] && [ "$(cat "$TREE/bench-output/keep")" = bench ]
 
 digest_before="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 printf second > "$LOCAL/untracked space"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 digest_second="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 [ "$digest_second" != "$digest_before" ]
 printf third > "$LOCAL/untracked space"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 digest_third="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 [ "$digest_third" != "$digest_second" ]
 git -C "$LOCAL" add "untracked space"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 [ "$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")" = "$digest_third" ]
 # shellcheck disable=SC2016
 lock_expr='TREE_LOCK="/tmp/arle-build$(printf '\''%s'\'' "$TREE" | tr '\''/.'\'' '\''__'\'').lock"'
 grep -Fq "$lock_expr" "$LOCAL/scripts/pod-remote-build.sh"
 grep -Fq 'flock 9' "$LOCAL/scripts/pod-remote-build.sh"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 digest_before="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 
 mkdir -p "$STATE/builds/good" "$TREE/target/release"
@@ -345,5 +345,18 @@ PY
   [ "$status_rc" -ne 0 ] && [ "$kill_rc" -ne 0 ] && [ ! -e "$KILL_MARKER" ]
   mv "$TMP/process.good" "$STATE/runs/shared/process"
 done
+
+# Clean sync (default): ships committed content, ignores working-tree changes.
+git -C "$LOCAL" add -A && git -C "$LOCAL" commit -qm "clean-sync probe" 2>/dev/null || true
+printf uncommitted-edit > "$LOCAL/untracked space"
+"$LOCAL/scripts/pod.sh" sync >/dev/null
+[ "$(awk -F= '$1=="dirty" {print $2}' "$TREE/.arle-source-receipt")" = 0 ]
+# The remote holds the committed content, not the uncommitted edit.
+[ "$(cat "$TREE/untracked space")" = "$(git -C "$LOCAL" show "HEAD:untracked space")" ]
+# An uncommitted edit to a committed file does not move the clean digest.
+clean_digest="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
+printf more >> "$LOCAL/untracked space"
+"$LOCAL/scripts/pod.sh" sync >/dev/null
+[ "$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")" = "$clean_digest" ]
 
 echo "pod flow tests: PASS"
