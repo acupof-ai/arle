@@ -162,7 +162,11 @@ case "$cmd" in
         cp -R "$ROOT/crates/cuda-kernels/generated" "$stage/clean/crates/cuda-kernels/"
       fi
       : > "$stage/deletes"
-      COPYFILE_DISABLE=1 tar --no-xattrs -C "$stage/clean" -czf "$stage/tree.tgz" .
+      # Tar from a file list, not `.`: `tar ... .` prefixes every entry with
+      # `./`, and reconcile_untracked compares against `git ls-files` (no
+      # prefix), so every tracked file read as a stray and got deleted.
+      ( cd "$stage/clean" && find . \( -type f -o -type l \) | cut -c3- ) > "$stage/clean.files"
+      COPYFILE_DISABLE=1 tar --no-xattrs -C "$stage/clean" -T "$stage/clean.files" -czf "$stage/tree.tgz"
     fi
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
     pod_head="$("$POD" "git -C '$TREE' rev-parse HEAD" 2>/dev/null | tr -d '[:space:]' || true)"

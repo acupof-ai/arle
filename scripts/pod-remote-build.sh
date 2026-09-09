@@ -5,6 +5,14 @@ TREE="${POD_TREE:-/host/arle-build}"
 STATE="${POD_STATE:-/root/arle-ops}"
 TREE_LOCK="/tmp/arle-build$(printf '%s' "$TREE" | tr '/.' '__').lock"
 
+# /host is a host mount, so the tree's owner uid rarely matches the container's
+# git user and every `git -C "$TREE"` fails with "dubious ownership". Trust the
+# tree once per sync/build; idempotent, harmless on the Mac (owner matches).
+ensure_safe_directory() {
+  git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$TREE" ||
+    git config --global --add safe.directory "$TREE" 2>/dev/null || true
+}
+
 proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
 source_digest() {
@@ -182,6 +190,7 @@ case "${1:-}" in
     stage="${2:?missing sync stage}"
     exec 9>"$TREE_LOCK"
     flock 9
+    ensure_safe_directory
     meta="$stage.source.meta"
     archive="$stage.tree.tgz"
     deletes="$stage.deletes"
@@ -284,6 +293,7 @@ case "${1:-}" in
     # shellcheck disable=SC1091
     source "$TREE/scripts/cuda_prebuilt_manifest.sh"
     cd "$TREE" || exit 1
+    ensure_safe_directory
     source_receipt="$TREE/.arle-source-receipt"
     rc=1; binary=""
     if [ ! -f "$source_receipt" ]; then
