@@ -695,9 +695,39 @@ fn emit_resolve_paged_attn_v1(s: &mut String, reg: &Registry) {
     s.push_str("        _ => return None,\n    })\n}\n\n");
 }
 
+/// The pinned TileLang from `requirements-build.txt`. `None` only if the file
+/// is unreadable or carries no pin, in which case the version check is skipped
+/// rather than turned into a build failure of its own.
+fn tilelang_pin() -> Option<String> {
+    let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?)
+        .parent()?
+        .parent()?
+        .join("requirements-build.txt");
+    std::fs::read_to_string(root)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("tilelang==")
+                .map(|v| v.trim().to_string())
+        })
+}
+
+/// Importable is not enough: the candidate list falls back to `python3` on
+/// PATH, and a system TileLang older than the pin produces a JIT failure deep
+/// inside codegen ("14 stages vs 15 pipeline stages" on sm_90 with 0.1.8)
+/// whose message names neither the interpreter nor the version.
 fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
+    let script = match tilelang_pin() {
+        Some(pin) => format!(
+            "import tilelang, importlib.metadata as m\n\
+             v = m.version('tilelang')\n\
+             assert v == '{pin}', f'tilelang {{v}}, pinned {pin}'\n"
+        ),
+        None => "import tilelang".to_string(),
+    };
     let output = Command::new(candidate)
-        .args(["-c", "import tilelang"])
+        .args(["-c", &script])
         .output()
         .map_err(|err| format!("{candidate}: {err}"))?;
 
@@ -706,7 +736,11 @@ fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
     } else {
         Err(format!(
             "{candidate}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("")
         ))
     }
 }
