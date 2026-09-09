@@ -19,4 +19,6 @@ if [[ "${ARLE_SKIP_PRE_PUSH:-${AGENT_INFER_SKIP_PRE_PUSH:-0}}" == "1" ]]; then
     exit 0
 fi
 
-exec "${REPO_ROOT}/scripts/pre_push_checks.sh"
+# Not exec: exec replaces this process and discards the EXIT trap above, so the
+# detector never recorded the state the checks left behind.
+"${REPO_ROOT}/scripts/pre_push_checks.sh"
