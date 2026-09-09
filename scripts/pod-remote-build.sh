@@ -20,6 +20,28 @@ source_digest_for() {  # $1 = dirty flag from the receipt/meta
   if [ "$1" = 1 ]; then source_digest; else CLEAN=1 source_digest; fi
 }
 
+# A fresh lane tree ships an empty generated/ (the Mac builds no CUDA), so its
+# first build would JIT 105 cubins with the system tilelang — slow and version-
+# fragile. A sibling tree at the same commit has the same bundle identity, so
+# copy its generated/ in. build.rs re-verifies the identity against the source.
+provision_bundle() {
+  local donor="${ARLE_BUNDLE_DONOR:-/host/arle-build}" gen="$TREE/crates/cuda-kernels/generated"
+  [ "$donor" != "$TREE" ] || return 0
+  [ -d "$donor/crates/cuda-kernels/generated" ] || return 0
+  [ -n "$(find "$donor/crates/cuda-kernels/generated" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
+  if [ -d "$gen" ] && [ -n "$(find "$gen" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then return 0; fi
+  local this_id donor_id
+  this_id="$(bash "$TREE/scripts/kernel_artifacts.sh" id 2>/dev/null)" || return 0
+  donor_id="$(cd "$donor" && bash scripts/kernel_artifacts.sh id 2>/dev/null)" || return 0
+  if [ "$this_id" != "$donor_id" ]; then
+    echo "bundle donor $donor identity differs ($donor_id != $this_id); skipping" >&2
+    return 0
+  fi
+  rm -rf "$gen"
+  cp -R "$donor/crates/cuda-kernels/generated" "$gen"
+  echo "bundle provisioned from donor $donor (identity $this_id)"
+}
+
 proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
 source_digest() {
@@ -323,6 +345,7 @@ case "${1:-}" in
       if [ "$(git rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest_for "$source_dirty")" != "$source_digest_value" ]; then
         echo "source changed since receipt"
       else
+        provision_bundle
         # shellcheck disable=SC2016
         flock /tmp/arle-toolchain.lock bash -c 'toolchain_dir="${ARLE_RUST_TOOLCHAIN_DIR:-/root/.rustup/toolchains/1.98.0-x86_64-unknown-linux-gnu}"; [ -x "$toolchain_dir/bin/rustc" ] && ls "$toolchain_dir"/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1 || rustup toolchain install 1.98.0 --profile minimal -c rustfmt -c clippy'
         events="$DIR/cargo.jsonl"
