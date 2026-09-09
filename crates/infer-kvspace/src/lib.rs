@@ -1,0 +1,15 @@
+//! Backend-neutral KV host logic: capacity accounting, content indexing
+//! (prefix match, radix, sidecar lifecycle), and layout description. The
+//! kernel-operand role — the page table layout the attention kernel reads —
+//! stays in `infer-cuda`, because it tracks the kernel and needs a GPU to
+//! verify.
+//!
+//! Crate boundaries follow pipeline stages; modules inside may follow model
+//! families. The DSv4 byte codec lives in the `dsv4` module.
+
+mod dsv4;
+
+pub use dsv4::{
+    Dsv4LayerPageState, Dsv4PrefixPageEntry, MAX_PENDING_PREFIX_CAPTURES, PendingPrefixPage,
+    capture_epoch_matches, rekey_target_conflicts,
+};

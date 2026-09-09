@@ -183,7 +183,7 @@ jobs:
       - name: cargo test (device-neutral)
         run: >-
           cargo test --profile release-fast
-          -p infer-core -p infer-server -p infer-plan -p infer-seam
+          -p infer-core -p infer-server -p infer-plan -p infer-kvspace -p infer-seam
           -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
           -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys
           -p infer-quant

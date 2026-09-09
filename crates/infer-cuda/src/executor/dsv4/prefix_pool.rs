@@ -1,45 +1,7 @@
 use super::*;
-
-const MAX_PENDING_PREFIX_CAPTURES: usize = 2;
-
-struct PendingPrefixPage {
-    source_page: u32,
-    target_page: u32,
-    confirmed: bool,
-    cancelled: bool,
-    entry: crate::attention::Dsv4PrefixPageEntry,
-    frontier_tail: Option<Vec<u32>>,
-}
-
-impl PendingPrefixPage {
-    fn confirm(&mut self, pages: &[u32]) {
-        self.confirmed |= pages.contains(&self.target_page);
-    }
-
-    fn cancel_provisional(&mut self, pages: &[u32]) {
-        self.cancelled |= !self.confirmed && pages.contains(&self.source_page);
-    }
-
-    fn repair(&mut self, canonical: u32, own: u32, canonical_exists: bool) {
-        if self.source_page != own || self.cancelled {
-            return;
-        }
-        if canonical_exists {
-            self.cancelled = true;
-        } else {
-            self.target_page = canonical;
-            self.confirmed = true;
-        }
-    }
-}
-
-fn capture_epoch_matches(captured: u64, current: Option<u64>) -> bool {
-    current == Some(captured)
-}
-
-fn rekey_target_conflicts(source_page: u32, target_page: u32, target_exists: bool) -> bool {
-    source_page != target_page && target_exists
-}
+use infer_kvspace::{
+    MAX_PENDING_PREFIX_CAPTURES, PendingPrefixPage, capture_epoch_matches, rekey_target_conflicts,
+};
 
 pub(super) struct PendingPrefixCapture {
     slot: usize,
@@ -112,30 +74,30 @@ impl Dsv4CudaExecutor {
                 capture
                     .pages
                     .iter()
-                    .filter(|page| page.confirmed && !page.cancelled)
-                    .map(|page| page.target_page)
+                    .filter(|page| page.is_confirmed() && !page.is_cancelled())
+                    .map(|page| page.target_page())
                     .collect()
             };
             for page in capture.pages {
-                let target_exists = self.prefix_state.page_meta(page.target_page).is_some();
-                if page.cancelled
-                    || (!page.confirmed && !epoch_matches)
-                    || rekey_target_conflicts(page.source_page, page.target_page, target_exists)
+                let target_exists = self.prefix_state.page_meta(page.target_page()).is_some();
+                if page.is_cancelled()
+                    || (!page.is_confirmed() && !epoch_matches)
+                    || rekey_target_conflicts(page.source_page(), page.target_page(), target_exists)
                 {
                     continue;
                 }
                 if !self
                     .prefix_state
-                    .publish(page.target_page, &page.entry, &protected_pages)
+                    .publish(page.target_page(), page.entry(), &protected_pages)
                 {
                     continue;
                 }
-                if page.confirmed {
-                    self.prefix_state.confirm_pages(&[page.target_page]);
+                if page.is_confirmed() {
+                    self.prefix_state.confirm_pages(&[page.target_page()]);
                 }
-                if let Some(tokens) = page.frontier_tail {
+                if let Some(tokens) = page.frontier_tail() {
                     self.prefix_state
-                        .set_frontier_tail(page.target_page, tokens);
+                        .set_frontier_tail(page.target_page(), tokens.to_vec());
                 }
             }
         }
@@ -186,14 +148,7 @@ impl Dsv4CudaExecutor {
                 page_index,
                 boundary,
             ) {
-                Ok(entry) => captured.push(PendingPrefixPage {
-                    source_page: page_id,
-                    target_page: page_id,
-                    confirmed: false,
-                    cancelled: false,
-                    entry,
-                    frontier_tail: None,
-                }),
+                Ok(entry) => captured.push(PendingPrefixPage::new(page_id, page_id, entry, None)),
                 Err(err) => {
                     warn!("DSv4 prefix publish failed for slot {slot} page {page_index}: {err:#}");
                     capture_failed = true;
@@ -205,7 +160,7 @@ impl Dsv4CudaExecutor {
             return;
         }
         if capture_failed {
-            captured.iter_mut().for_each(|page| page.cancelled = true);
+            captured.iter_mut().for_each(PendingPrefixPage::cancel);
         }
         if let Err(err) = self.enqueue_prefix_capture(slot, slot_pages, captured) {
             warn!("DSv4 prefix publish fence failed for slot {slot}: {err:#}");
@@ -293,15 +248,13 @@ impl Dsv4CudaExecutor {
                 )
             };
             match entry {
-                Ok(entry) => captured.push(PendingPrefixPage {
-                    source_page: page_id,
-                    target_page: page_id,
-                    confirmed: false,
-                    cancelled: false,
+                Ok(entry) => captured.push(PendingPrefixPage::new(
+                    page_id,
+                    page_id,
                     entry,
-                    frontier_tail: (is_frontier && finish_len > matched_len)
+                    (is_frontier && finish_len > matched_len)
                         .then(|| tokens[matched_len..finish_len].to_vec()),
-                }),
+                )),
                 Err(err) => {
                     warn!(
                         "DSv4 finish frontier capture failed for slot {slot} page {page_index}: {err:#}"
@@ -315,7 +268,7 @@ impl Dsv4CudaExecutor {
             return Ok(());
         }
         if capture_failed {
-            captured.iter_mut().for_each(|page| page.cancelled = true);
+            captured.iter_mut().for_each(PendingPrefixPage::cancel);
         }
         self.enqueue_prefix_capture(slot, slot_pages, captured)?;
         Ok(())
@@ -326,7 +279,9 @@ impl Dsv4CudaExecutor {
     pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
         for capture in &mut self.pending_prefix_captures {
             for page in &mut capture.pages {
-                page.cancelled |= pages.contains(&page.target_page);
+                if pages.contains(&page.target_page()) {
+                    page.cancel();
+                }
             }
         }
         self.prefix_state.remove_pages(pages);

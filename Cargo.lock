@@ -1594,6 +1594,7 @@ dependencies = [
  "deepep-sys",
  "deepseek-spec",
  "half",
+ "infer-kvspace",
  "infer-moe",
  "infer-plan",
  "infer-quant",
@@ -1630,6 +1631,14 @@ dependencies = [
  "infer-gguf",
  "infer-plan",
  "infer-seam",
+]
+
+[[package]]
+name = "infer-kvspace"
+version = "0.5.8"
+dependencies = [
+ "anyhow",
+ "half",
 ]
 
 [[package]]
