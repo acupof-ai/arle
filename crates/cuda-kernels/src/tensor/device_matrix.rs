@@ -1256,13 +1256,15 @@ impl DeviceMatrix {
         self.weight_format
     }
 
-    /// Build the Marlin tensor-core layout for a W8A16 weight: re-encode signed
-    /// INT8 → uint8b128 (+128), pack to GPTQ `[K/4, N]` i32, GPU-repack to Marlin
-    /// tiles, and transpose+permute the BF16 group scales to `[K/gs, N]` (Marlin's
-    /// length-64 `scale_perm`). Stores into `marlin_packed`/`marlin_scales`; the
-    /// GEMM (`marlin_w8a16_gemm_cuda`) consumes them, scales stay BF16 (matches the
-    /// bf16 kernel). No-op (leaves marlin_* None → scalar fallback) when the shape
-    /// isn't Marlin tile-aligned. SM-gated by the caller (Ampere+).
+    /// Execute the Marlin W8A16 repack: re-encode signed INT8 → uint8b128
+    /// (+128), pack to GPTQ `[K/4, N]` i32, GPU-repack to Marlin tiles, and
+    /// transpose+permute the BF16 group scales to `[K/gs, N]` (Marlin's
+    /// length-64 `scale_perm`). Stores into `marlin_packed`/`marlin_scales`;
+    /// the GEMM (`marlin_w8a16_gemm_cuda`) consumes them, scales stay BF16.
+    ///
+    /// The layout decision (shape, group size, SM tier) belongs to
+    /// `infer_quant::plan_weight_layout`; this fn executes unconditionally for
+    /// a W8A16 matrix with its source buffers present.
     pub fn repack_for_marlin_w8a16(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.weight_format != WeightFormat::W8A16
             || self.qweight.is_none()
@@ -1271,26 +1273,8 @@ impl DeviceMatrix {
         {
             return Ok(());
         }
-        // Ampere+ only (Marlin uses mma.sync/cp.async). Below sm_80 leave marlin_*
-        // None so dispatch keeps the dequant→BF16 / scalar path — the shim would
-        // otherwise return NOT_SUPPORTED and fail the load.
-        if ctx.compute_capability().0 < 8 {
-            return Ok(());
-        }
         let n = self.rows; // output dim
         let k = self.cols; // input dim
-        // kU8B128 is instantiated only for gs ∈ {32,64,128}; other gs → no-op kernel.
-        if !k.is_multiple_of(16)
-            || !n.is_multiple_of(64)
-            || !k.is_multiple_of(self.group_size)
-            || !matches!(self.group_size, 32 | 64 | 128)
-        {
-            log::warn!(
-                "Marlin W8A16 repack skipped: [{n}x{k}] gs={} (need K%16, N%64, gs∈{{32,64,128}}); scalar path",
-                self.group_size
-            );
-            return Ok(());
-        }
 
         // element (n,k): u8 = int8+128, packed 4-per-word at bits (k%4)*8.
         let qw = self.qweight.as_ref().unwrap();
@@ -1418,6 +1402,10 @@ impl DeviceMatrix {
     /// (`marlin_fp8_to_e4m3_cuda`), so nothing reads the checkpoint copy.
     /// `scale_f32` is `[N]` and stays — that arm's post-GEMM channel scale
     /// reads it.
+    ///
+    /// The layout decision (per-channel discriminator, shape, SM tier) belongs
+    /// to `infer_quant::plan_weight_layout`; this fn executes unconditionally
+    /// for an Fp8BlockScaled matrix with its source buffers present.
     pub fn repack_for_marlin_fp8(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.weight_format != WeightFormat::Fp8BlockScaled
             || self.qweight_u8.is_none()
@@ -1425,27 +1413,8 @@ impl DeviceMatrix {
         {
             return Ok(());
         }
-        if ctx.compute_capability().0 < 8 {
-            return Ok(());
-        }
         let n = self.rows; // output dim
         let k = self.cols; // input dim
-        // Per-channel only: one scale per output row, spanning all of K.
-        // `block_m == 1` is the discriminator — a 128x128 block-scaled weight
-        // belongs to DeepGEMM and fails it. `block_k >= k` rather than `== k` so a
-        // TP shard, whose `cols` is a slice of the K the scale was defined over,
-        // still qualifies.
-        // K%64, not the repack's K%16: `min_thread_k = 64` and every thread config
-        // has thread_k in {64,128} (marlin.cuh:18, gptq_marlin.cuh:115-129), so a K
-        // the GEMM's `is_valid_config` rejects would repack cleanly here and then
-        // throw on every call. N%64 matches min_thread_n and the repack's tile_n.
-        if self.quant_block_m != 1
-            || self.quant_block_k < k
-            || !k.is_multiple_of(64)
-            || !n.is_multiple_of(64)
-        {
-            return Ok(());
-        }
 
         // Step 1: raw E4M3 [N, K] row-major -> GPTQ [K/4, N] i32, element (n,k) at
         // bit (k%4)*8 of word (k/4)*N + n. No bias: see the note above. Each (n,k)
@@ -1586,7 +1555,8 @@ impl DeviceMatrix {
     /// the smallest folded value at 0.332 against E4M3's 0.0156 normal minimum.
     ///
     /// Caller decides whether the arm is reachable at all (SM tier, DeepGEMM
-    /// built and enabled); this only checks that the shape and metadata fit.
+    /// built and enabled, shape); this asserts the shape and metadata fit and
+    /// fails on a planner disagreement.
     /// Reads the S0E5M3 scale tail of `marlin_packed`, so it must run after
     /// [`Self::repack_for_marlin_fp4`] and its absence means no arm.
     pub fn prepare_fp4_deepgemm_sfb(&mut self, ctx: &DeviceContext) -> Result<()> {
@@ -1598,10 +1568,14 @@ impl DeviceMatrix {
         }
         let n = self.rows;
         let k = self.cols;
-        // DeepGEMM's dense NT entry wants `k % 128` and `n % 8`; a Marlin FP4
-        // layout only exists at group_size 16 with `n % 64`.
+        // The layout plan approved this shape before calling; a mismatch here is
+        // a planner/executor disagreement, not a demotion.
         if self.group_size != 16 || !k.is_multiple_of(128) || !n.is_multiple_of(64) {
-            return Ok(());
+            bail!(
+                "fp4_deepgemm_sfb planned for [{n}x{k}] gs={} but the shape does not fit \
+                 (need gs 16, K%128, N%64)",
+                self.group_size
+            );
         }
         let packed = self.marlin_packed.as_ref().expect("checked above");
         let global = self.scale_f32.as_ref().expect("checked above");
@@ -1654,6 +1628,11 @@ impl DeviceMatrix {
     /// the kernel's weight dequant leaves a 2^-126 factor and the scale dequant
     /// reads an 8-bit `[E5|M3]` field, so the byte is the high half of
     /// `f16(scale * 2^7) << 1` and the leftover 2^119 is folded into the global
+    ///
+    /// The layout decision (group size, shape, SM tier — NVFP4 has no fallback
+    /// arm, so an impossible decision errors at plan time) belongs to
+    /// `infer_quant::plan_weight_layout`; this fn executes unconditionally for
+    /// an Fp4E2M1Group matrix with its source buffers present.
     pub fn repack_for_marlin_fp4(&mut self, ctx: &DeviceContext) -> Result<()> {
         if self.weight_format != WeightFormat::Fp4E2M1Group
             || self.qweight_u8.is_none()
@@ -1662,32 +1641,8 @@ impl DeviceMatrix {
         {
             return Ok(());
         }
-        let (major, minor) = ctx.compute_capability();
-        // NVFP4 has one serving path and it is Marlin's, so a shape or a tier it
-        // cannot take is a load failure with the reason, not a silent demotion to
-        // a scalar arm no gate has ever executed.
-        ensure!(
-            major >= 8,
-            "NVFP4 requires sm_80 or newer for the Marlin tensor-core path; this device is \
-             sm_{major}{minor}. Serve an FP8 or W4A16 checkpoint instead."
-        );
         let n = self.rows; // output dim
         let k = self.cols; // input dim
-        // kFE2M1f is instantiated only at group_blocks == 1 (group_size 16);
-        // the tile grid needs N % 64 and K % 64.
-        ensure!(
-            self.group_size == 16
-                && k.is_multiple_of(64)
-                && n.is_multiple_of(64)
-                && self.quant_scale_rows == n
-                && self.quant_scale_cols == k / 16,
-            "NVFP4 weight [{n}x{k}] gs={} scales=[{}x{}] cannot take the Marlin layout \
-             (kFE2M1f needs group_size 16, and the tile grid needs K%64 and N%64). NVFP4 has no \
-             other serving path.",
-            self.group_size,
-            self.quant_scale_rows,
-            self.quant_scale_cols
-        );
         let global_host: Vec<f32> = ctx
             .stream
             .clone_dtoh(self.scale_f32.as_ref().unwrap())
@@ -2032,6 +1987,31 @@ mod tests {
                 "from_safetensors/from_host mismatch at index {}",
                 idx
             );
+        }
+    }
+}
+
+impl From<&DeviceMatrix> for infer_quant::WeightLayoutQuery {
+    fn from(m: &DeviceMatrix) -> Self {
+        use infer_quant::WeightFormatKind;
+        let format = match m.weight_format {
+            WeightFormat::Fp8BlockScaled => WeightFormatKind::Fp8BlockScaled,
+            WeightFormat::Fp8PerShard => WeightFormatKind::Fp8PerShard,
+            WeightFormat::Fp4E2M1Group => WeightFormatKind::Fp4E2M1Group,
+            WeightFormat::W8A16 => WeightFormatKind::W8A16,
+            WeightFormat::W4A16 => WeightFormatKind::W4A16,
+            WeightFormat::Dsv4Fp8BlockScaled => WeightFormatKind::Dsv4Fp8BlockScaled,
+            _ => WeightFormatKind::Other,
+        };
+        Self {
+            format,
+            n: m.rows,
+            k: m.cols,
+            group_size: m.group_size,
+            quant_block_m: m.quant_block_m,
+            quant_block_k: m.quant_block_k,
+            scale_rows: m.quant_scale_rows,
+            scale_cols: m.quant_scale_cols,
         }
     }
 }

@@ -7,10 +7,7 @@ use half::bf16;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::QWEN_FP4_DEEPGEMM_MIN_M;
-use super::fp8::{
-    deepgemm_dense_nt, dense_deepgemm_prefill_floor, qwen_fp8_deepgemm_dense_enabled,
-    qwen_fp8_dense_sm_supports_deepgemm, with_e4m3_weight_scratch,
-};
+use super::fp8::{deepgemm_dense_nt, dense_deepgemm_prefill_floor, with_e4m3_weight_scratch};
 use super::{marlin_sm_supported, qwen_quant_profile, with_marlin_scratch};
 
 pub(super) static MARLIN_FP4_HITS: AtomicU64 = AtomicU64::new(0);
@@ -28,19 +25,6 @@ fn fp4_marlin_ready(ctx: &DeviceContext, weight: &DeviceMatrix) -> bool {
     weight.marlin_packed.is_some() && weight.marlin_scales.is_some() && marlin_sm_supported(ctx)
 }
 
-/// Whether the NVFP4 DeepGEMM prefill arm can serve this weight at some M. The
-/// loader asks before paying for the `sfb` the arm needs; the arm itself asks
-/// again per call.
-pub(crate) fn fp4_deepgemm_available(ctx: &DeviceContext, weight: &DeviceMatrix) -> bool {
-    weight.weight_format == WeightFormat::Fp4E2M1Group
-        && weight.group_size == 16
-        && weight.rows.is_multiple_of(64)
-        && weight.cols.is_multiple_of(128)
-        && qwen_fp8_dense_sm_supports_deepgemm(ctx)
-        && qwen_fp8_deepgemm_dense_enabled()
-        && dense_deepgemm_prefill_floor(QWEN_FP4_DEEPGEMM_MIN_M).is_some()
-}
-
 /// Compile the NVFP4 prefill arm's DeepGEMM kernel at load, and reserve the
 /// E4M3 weight scratch while doing it.
 ///
@@ -53,10 +37,10 @@ pub(crate) fn warm_fp4_deepgemm_dense(
     weight: &DeviceMatrix,
     seq_len: usize,
 ) -> Result<bool> {
-    if weight.weight_format != WeightFormat::Fp4E2M1Group
-        || weight.fp4_deepgemm_sfb.is_none()
-        || !fp4_deepgemm_available(ctx, weight)
-    {
+    // `sfb` is built only when the loader's layout plan enabled the prefill arm,
+    // so its presence already answers every gate the availability predicate
+    // used to check.
+    if weight.weight_format != WeightFormat::Fp4E2M1Group || weight.fp4_deepgemm_sfb.is_none() {
         return Ok(false);
     }
     let Some(floor) = dense_deepgemm_prefill_floor(QWEN_FP4_DEEPGEMM_MIN_M) else {
@@ -105,7 +89,7 @@ fn try_fp4_deepgemm_gemm(
     let Some(floor) = dense_deepgemm_prefill_floor(QWEN_FP4_DEEPGEMM_MIN_M) else {
         return Ok(false);
     };
-    if m < floor || !fp4_deepgemm_available(ctx, weight) {
+    if m < floor {
         return Ok(false);
     }
     let packed = weight
@@ -197,7 +181,6 @@ pub(super) enum Fp4Route {
 pub(super) struct Fp4Query {
     pub(super) marlin_ready: bool,
     pub(super) sfb: bool,
-    pub(super) prefill_shape: bool,
 }
 
 /// The NVFP4 storage states the load validator inspects. `repack_for_marlin_fp4`
@@ -237,11 +220,11 @@ pub(super) fn fp4_missing_representation(s: Fp4Storage, sm_marlin: bool) -> Opti
     None
 }
 
-/// The static part of the FP4 order. The DeepGEMM arm keeps the dynamic floor
-/// (`dense_deepgemm_prefill_floor`) and its own shape/SM gates; this fn only
-/// says which arm owns the M.
+/// The static part of the FP4 order. `sfb` is the load-time layout plan's
+/// decision (shape, SM tier, native bridge); this fn only says which arm owns
+/// the M, with the dynamic floor kept by the arm itself.
 pub(super) fn fp4_route(q: Fp4Query, m: usize) -> Fp4Route {
-    if q.sfb && q.prefill_shape && m >= QWEN_FP4_DEEPGEMM_MIN_M {
+    if q.sfb && m >= QWEN_FP4_DEEPGEMM_MIN_M {
         Fp4Route::DeepGemm
     } else {
         Fp4Route::Marlin
@@ -258,7 +241,6 @@ pub(super) fn run(
     let query = Fp4Query {
         marlin_ready: fp4_marlin_ready(ctx, weight),
         sfb: weight.fp4_deepgemm_sfb.is_some(),
-        prefill_shape: fp4_deepgemm_available(ctx, weight),
     };
     // DeepGEMM ahead of Marlin because Marlin claims every M — the two are
     // separated by the M floor inside the arm, not by `fp4_marlin_ready`.

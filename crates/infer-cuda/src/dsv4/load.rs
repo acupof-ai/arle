@@ -15,7 +15,9 @@ use safetensors::tensor::Dtype;
 
 use crate::loader::{SafetensorLoader, tensor_bytes_to_f32};
 use crate::moe_config::ExpertSplit;
-use infer_quant::{QuantFormat, ScaleApply};
+use infer_quant::{
+    DeviceCaps, LayoutPolicy, QuantFormat, ScaleApply, WeightLayoutQuery, plan_weight_layout,
+};
 
 use super::*;
 
@@ -2138,18 +2140,26 @@ impl SafetensorLoader {
         Ok(out)
     }
 
-    /// DeepGEMM repack of one decode projection weight, or `None`. Built only when the
-    /// decode-DeepGEMM alloc gate is on AND the weight is raw FP8 block-scaled — the
-    /// GLM
-    /// dialect dequantizes to bf16, so the FP8 check alone excludes it.
+    /// DeepGEMM repack of one decode projection weight, or `None`. The layout
+    /// plan carries the decision: the decode-DeepGEMM alloc gate on, and the
+    /// weight raw FP8 block-scaled — the GLM dialect dequantizes to bf16, so the
+    /// format check alone excludes it.
     fn decode_proj_cache(
         &self,
         ctx: &DeviceContext,
         weight: &DeviceMatrix,
     ) -> Result<Option<cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache>> {
-        if crate::attention::dsv4_fused_wqkv_decode_enabled()?
-            && weight.weight_format == WeightFormat::Dsv4Fp8BlockScaled
-        {
+        let plan = plan_weight_layout(
+            &WeightLayoutQuery::from(weight),
+            &DeviceCaps {
+                compute_capability: ctx.compute_capability(),
+            },
+            &LayoutPolicy {
+                dsv4_decode_enabled: crate::attention::dsv4_fused_wqkv_decode_enabled()?,
+                ..Default::default()
+            },
+        )?;
+        if plan.dsv4_decode_proj_cache {
             Ok(Some(
                 cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, weight)?,
             ))

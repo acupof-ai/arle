@@ -20,15 +20,13 @@ use safetensors::{SafeTensors, tensor::Dtype};
 
 // Re-exports keep `crate::loader::` paths stable for consumers of the moved
 // Qwen MoE upload machinery (now in `crate::qwen35::load`).
-use crate::ops::{
-    fp4_deepgemm_available, fp8_deepgemm_per_channel_available, upload_i32,
-    validate_quant_linear_storage,
-};
+use crate::ops::{qwen_fp8_deepgemm_dense_enabled, upload_i32, validate_quant_linear_storage};
 pub(crate) use crate::qwen35::load::{
     ExpertQuantDispatchSignature, MoeFp8ExpertGroup, MoeLayerHostSnapshot, MoeLayerWeights,
 };
 use infer_quant::{
-    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
+    DeviceCaps, LayoutPolicy, QuantFormat, QuantManifest, QuantTensorView, RepackTransform,
+    ScaleApply, TensorHeader, WeightLayoutQuery, detect_quant_format, plan_weight_layout,
     read_quant_manifest, reject_dsv4_e8m0_scale_abi,
 };
 
@@ -1380,9 +1378,27 @@ impl SafetensorLoader {
         }
         if repack {
             let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
-            fused
-                .repack_for_marlin_w8a16(ctx)
-                .with_context(|| format!("Marlin W8A16 repack fused {}", names.join("+")))?;
+            let plan = plan_weight_layout(
+                &WeightLayoutQuery::from(&fused),
+                &DeviceCaps {
+                    compute_capability: ctx.compute_capability(),
+                },
+                &LayoutPolicy::default(),
+            )
+            .with_context(|| format!("weight layout plan fused {}", names.join("+")))?;
+            if plan.transform == RepackTransform::MarlinW8a16 {
+                fused
+                    .repack_for_marlin_w8a16(ctx)
+                    .with_context(|| format!("Marlin W8A16 repack fused {}", names.join("+")))?;
+            } else {
+                log::warn!(
+                    "Marlin W8A16 repack skipped fused {}: [{}x{}] gs={} (need sm_80+, K%16, N%64, K%gs, gs∈{{32,64,128}}); scalar path",
+                    names.join("+"),
+                    fused.rows,
+                    fused.cols,
+                    fused.group_size
+                );
+            }
         }
         // NVFP4 fuses on device like every other format, then repacks once here.
         marlin_repack_dense(ctx, parts[0].0, fused, true)
@@ -2225,11 +2241,29 @@ impl SafetensorLoader {
         group_size: usize,
     ) -> Result<DeviceMatrix> {
         let mut matrix = self.load_w8a16_view_unpacked(ctx, view, shard, group_size)?;
-        // Build the Marlin tensor-core layout (Ampere+); no-op below sm_80 or on
-        // non-tile-aligned shapes → dispatch falls back to scalar/dequant.
-        matrix
-            .repack_for_marlin_w8a16(ctx)
-            .with_context(|| format!("Marlin W8A16 repack {}", view.name))?;
+        // Build the Marlin tensor-core layout when the plan says the shape and SM
+        // tier take it; otherwise dispatch keeps the scalar/dequant path.
+        let plan = plan_weight_layout(
+            &WeightLayoutQuery::from(&matrix),
+            &DeviceCaps {
+                compute_capability: ctx.compute_capability(),
+            },
+            &LayoutPolicy::default(),
+        )
+        .with_context(|| format!("weight layout plan {}", view.name))?;
+        if plan.transform == RepackTransform::MarlinW8a16 {
+            matrix
+                .repack_for_marlin_w8a16(ctx)
+                .with_context(|| format!("Marlin W8A16 repack {}", view.name))?;
+        } else {
+            log::warn!(
+                "Marlin W8A16 repack skipped {}: [{}x{}] gs={} (need sm_80+, K%16, N%64, K%gs, gs∈{{32,64,128}}); scalar path",
+                view.name,
+                matrix.rows,
+                matrix.cols,
+                matrix.group_size
+            );
+        }
         Ok(matrix)
     }
 
@@ -2761,11 +2795,13 @@ pub(crate) struct OwnedTensor {
     pub(crate) dtype: Dtype,
 }
 
-/// Give a dense projection its Marlin tensor-core layout at load time. Both
-/// repacks are format-gated no-ops, so one call covers NVFP4 (kFE2M1f) and
-/// per-channel FP8 (kFE4M3fn) — the mixed Qwen3.8-27B-NVFP4 checkpoint carries
-/// both. Every other format, and any shape or group size the vendored kernel is
-/// not instantiated for, keeps the scalar GEMV.
+/// Give a dense projection its Marlin tensor-core layout at load time. The
+/// layout decision comes from `infer_quant::plan_weight_layout` (format, shape,
+/// SM tier, DeepGEMM policy in, one plan out); this fn executes the planned
+/// transform. One call covers NVFP4 (kFE2M1f) and per-channel FP8 (kFE4M3fn) —
+/// the mixed Qwen3.8-27B-NVFP4 checkpoint carries both. Every other format, and
+/// any shape or group size the vendored kernel is not instantiated for, keeps
+/// the scalar GEMV.
 ///
 /// Routed MoE experts must NOT come here: their grouped-GEMM path reads the
 /// packed nibbles the repack replaces.
@@ -2784,23 +2820,40 @@ pub(crate) fn marlin_repack_dense(
     mut matrix: DeviceMatrix,
     prefill_batched: bool,
 ) -> Result<DeviceMatrix> {
-    matrix
-        .repack_for_marlin_fp4(ctx)
-        .with_context(|| format!("Marlin NVFP4 repack {name}"))?;
-    matrix
-        .repack_for_marlin_fp8(ctx)
-        .with_context(|| format!("Marlin FP8 per-channel repack {name}"))?;
-    // Both repacks release the pre-repack bytes themselves: every arm that
-    // reads a repacked weight reads the Marlin layout, DeepGEMM's prefill arms
-    // included. The `sfb` is built from the S0E5M3 scale tail, so it comes
-    // after the repack, not before.
-    if prefill_batched && fp4_deepgemm_available(ctx, &matrix) {
+    let plan = plan_weight_layout(
+        &WeightLayoutQuery::from(&matrix),
+        &DeviceCaps {
+            compute_capability: ctx.compute_capability(),
+        },
+        &LayoutPolicy {
+            prefill_batched,
+            deepgemm_native_available: qwen_fp8_deepgemm_dense_enabled(),
+            deepgemm_row_envelope: crate::runtime_flags::dense_gemm_row_envelope(),
+            ..Default::default()
+        },
+    )
+    .with_context(|| format!("weight layout plan {name}"))?;
+    match plan.transform {
+        RepackTransform::MarlinFp4 => matrix
+            .repack_for_marlin_fp4(ctx)
+            .with_context(|| format!("Marlin NVFP4 repack {name}"))?,
+        RepackTransform::MarlinFp8PerChannel => matrix
+            .repack_for_marlin_fp8(ctx)
+            .with_context(|| format!("Marlin FP8 per-channel repack {name}"))?,
+        // W8A16 reaches this fn only via the row-fusion path, whose own planned
+        // repack has already run and released the source buffers.
+        RepackTransform::MarlinW8a16 | RepackTransform::None => {}
+    }
+    // The repack releases the pre-repack bytes itself: every arm that reads a
+    // repacked weight reads the Marlin layout, DeepGEMM's prefill arms included.
+    // The `sfb` is built from the S0E5M3 scale tail, so it comes after the
+    // repack, not before.
+    if plan.fp4_deepgemm_sfb {
         matrix
             .prepare_fp4_deepgemm_sfb(ctx)
             .with_context(|| format!("NVFP4 DeepGEMM sfb {name}"))?;
     }
-    matrix.fp8_deepgemm_prefill =
-        prefill_batched && fp8_deepgemm_per_channel_available(ctx, &matrix);
+    matrix.fp8_deepgemm_prefill = plan.fp8_deepgemm_prefill;
     // Final-state gate: every M (gemv and gemm_batch alike) must have a resident
     // consumer now that the repacks have released their sources. Fail the load
     // here, never a serve-time missing-buffer error.
