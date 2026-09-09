@@ -44,6 +44,8 @@ cleanup() {
     if [[ -n "${STAGE_ROOT}" && -d "${STAGE_ROOT}" ]]; then
         rm -rf "${STAGE_ROOT}"
     fi
+    [[ -n "${FAST_STEP:-}" ]] && rm -f "${FAST_STEP}"
+    return 0
 }
 
 trap cleanup EXIT
@@ -85,8 +87,12 @@ done
 # This block runs in the background, so its failure surfaces only as the exit
 # status of `wait` and git then prints a bare "failed to push some refs". Record
 # the step in flight so the failure can name itself.
-FAST_STEP="${STAGE_ROOT}/fast-step"
-run_fast() { printf '%s\n' "$*" > "${FAST_STEP}"; run "$@"; }
+# Its own file, not one under STAGE_ROOT: that directory is the HEAD archive
+# staging area and does not outlive the snapshot refresh, so the write failed
+# and, under `set -e`, took the whole fast block down with it. A diagnostic must
+# never be able to fail the thing it is diagnosing — hence `|| true`.
+FAST_STEP="$(mktemp "${TMPDIR:-/tmp}/arle-pre-push-faststep.XXXXXX")"
+run_fast() { printf '%s\n' "$*" > "${FAST_STEP}" 2>/dev/null || true; run "$@"; }
 
 run_fast_checks() {
     run_fast python3 scripts/check_repo_hygiene.py
