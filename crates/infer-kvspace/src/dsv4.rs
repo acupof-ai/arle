@@ -4,6 +4,7 @@
 //! happens between capture and publish.
 
 use anyhow::{Result, ensure};
+use infer_seam::PrefixBlock;
 
 /// One layer's share of a per-page entry; empty vec = section absent. Boundary
 /// sections (`overlap_*`, `idx_overlap_*`, `ring`) only exist when the forward
@@ -287,6 +288,82 @@ pub fn rekey_target_conflicts(source_page: u32, target_page: u32, target_exists:
     source_page != target_page && target_exists
 }
 
+/// Content-index view the prefix-match policy reads. The real adapter wraps
+/// the executor's host pool; the fake in tests is in-memory.
+pub trait PrefixPoolIndex {
+    fn page_block_size(&self) -> usize;
+    /// `None` = the page has no pool entry (fail closed: stop the scan).
+    fn page_boundary(&self, page: u32) -> Option<bool>;
+    /// Frontier page's sub-page tail tokens, when it carries one.
+    fn frontier_tail_tokens(&self, page: u32) -> Option<&[u32]>;
+}
+
+/// Reuse license: a leading page is attachable only while every page up to
+/// and including it has a pool entry; committing additionally requires the
+/// page to carry the boundary sections. Pool presence covers host DRAM and
+/// disk alike — licensing never does capacity math.
+pub fn reusable_prefix_blocks<I: PrefixPoolIndex>(index: &I, blocks: &[PrefixBlock]) -> usize {
+    let page_tokens = index.page_block_size();
+    if page_tokens == 0 {
+        return 0;
+    }
+    let mut committed = 0usize;
+    for (idx, block) in blocks.iter().enumerate() {
+        // Fail closed on demoted keys: DSv4 pages never demote through the
+        // radix tier.
+        let PrefixBlock::ResidentPage(page_id) = *block else {
+            break;
+        };
+        let Some(boundary) = index.page_boundary(page_id) else {
+            break;
+        };
+        if boundary {
+            committed = idx + 1;
+        }
+    }
+    committed
+}
+
+/// Like [`reusable_prefix_blocks`], but a frontier page carrying a sub-page
+/// tail commits ONLY when `tokens` is a verified continuation through the
+/// finish position: the radix proves identity to the page boundary only, so
+/// a divergent prompt would otherwise restore a different request's KV (or
+/// over-restore into `seq_len > append_pos`).
+pub fn reusable_prefix_blocks_for_prompt<I: PrefixPoolIndex>(
+    index: &I,
+    blocks: &[PrefixBlock],
+    tokens: &[u32],
+) -> usize {
+    let page_tokens = index.page_block_size();
+    if page_tokens == 0 {
+        return 0;
+    }
+    let mut committed = 0usize;
+    for (idx, block) in blocks.iter().enumerate() {
+        let PrefixBlock::ResidentPage(page_id) = *block else {
+            break;
+        };
+        let Some(boundary) = index.page_boundary(page_id) else {
+            break;
+        };
+        if !boundary {
+            continue;
+        }
+        let page_end = (idx + 1) * page_tokens;
+        let commit = match index.frontier_tail_tokens(page_id) {
+            None => true,
+            Some(tail) => {
+                let finish = page_end + tail.len();
+                tokens.len() >= finish && tokens[page_end..finish] == *tail
+            }
+        };
+        if commit {
+            committed = idx + 1;
+        }
+    }
+    committed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +459,97 @@ mod tests {
         assert!(rekey_target_conflicts(1, 2, true));
         assert!(!rekey_target_conflicts(1, 2, false));
         assert!(!rekey_target_conflicts(1, 1, true));
+    }
+
+    /// In-memory [`PrefixPoolIndex`] for the contract tests.
+    struct FakeIndex {
+        page_block_size: usize,
+        boundaries: std::collections::HashMap<u32, bool>,
+        tails: std::collections::HashMap<u32, Vec<u32>>,
+    }
+
+    impl FakeIndex {
+        fn new(page_block_size: usize) -> Self {
+            Self {
+                page_block_size,
+                boundaries: std::collections::HashMap::new(),
+                tails: std::collections::HashMap::new(),
+            }
+        }
+    }
+
+    impl PrefixPoolIndex for FakeIndex {
+        fn page_block_size(&self) -> usize {
+            self.page_block_size
+        }
+        fn page_boundary(&self, page: u32) -> Option<bool> {
+            self.boundaries.get(&page).copied()
+        }
+        fn frontier_tail_tokens(&self, page: u32) -> Option<&[u32]> {
+            self.tails.get(&page).map(Vec::as_slice)
+        }
+    }
+
+    fn pages(ids: &[u32]) -> Vec<PrefixBlock> {
+        ids.iter()
+            .map(|&id| PrefixBlock::ResidentPage(id))
+            .collect()
+    }
+
+    #[test]
+    fn reuse_license_counts_boundary_prefix_and_fails_closed() {
+        let mut index = FakeIndex::new(16);
+        for &id in &[10, 11, 12] {
+            index.boundaries.insert(id, true);
+        }
+        // All resident + boundary: every page commits.
+        assert_eq!(reusable_prefix_blocks(&index, &pages(&[10, 11, 12])), 3);
+        // A demoted key stops the scan (fail closed).
+        let mut mixed = pages(&[10, 11]);
+        mixed.push(PrefixBlock::DemotedKey(99));
+        mixed.push(PrefixBlock::ResidentPage(12));
+        assert_eq!(reusable_prefix_blocks(&index, &mixed), 2);
+        // A missing entry stops the scan.
+        assert_eq!(reusable_prefix_blocks(&index, &pages(&[10, 99, 12])), 1);
+        // Non-boundary pages don't commit but don't break the scan.
+        index.boundaries.insert(11, false);
+        assert_eq!(reusable_prefix_blocks(&index, &pages(&[10, 11, 12])), 3);
+        // Zero page size: nothing is reusable.
+        assert_eq!(reusable_prefix_blocks(&FakeIndex::new(0), &pages(&[10])), 0);
+    }
+
+    #[test]
+    fn prompt_license_verifies_frontier_tails() {
+        let mut index = FakeIndex::new(16);
+        for &id in &[10, 11] {
+            index.boundaries.insert(id, true);
+        }
+        // Page 11 carries a tail; the prompt must continue it exactly.
+        index.tails.insert(11, vec![7, 8, 9]);
+        let mut tokens = vec![0u32; 35];
+        tokens[32..35].copy_from_slice(&[7, 8, 9]);
+        // Tail matches: both pages commit.
+        assert_eq!(
+            reusable_prefix_blocks_for_prompt(&index, &pages(&[10, 11]), &tokens),
+            2
+        );
+        // Tail mismatches: only the page without a tail commits.
+        tokens[34] ^= 0xFFFF;
+        assert_eq!(
+            reusable_prefix_blocks_for_prompt(&index, &pages(&[10, 11]), &tokens),
+            1
+        );
+        // Prompt shorter than the tail's finish: no commit of the tail page.
+        tokens[34] ^= 0xFFFF;
+        assert_eq!(
+            reusable_prefix_blocks_for_prompt(&index, &pages(&[10, 11]), &tokens[..33]),
+            1
+        );
+        // No tail on a boundary page commits unconditionally.
+        index.tails.remove(&11);
+        assert_eq!(
+            reusable_prefix_blocks_for_prompt(&index, &pages(&[10, 11]), &tokens),
+            2
+        );
     }
 }

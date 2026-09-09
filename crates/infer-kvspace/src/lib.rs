@@ -11,5 +11,6 @@ mod dsv4;
 
 pub use dsv4::{
     Dsv4LayerPageState, Dsv4PrefixPageEntry, MAX_PENDING_PREFIX_CAPTURES, PendingPrefixPage,
-    capture_epoch_matches, rekey_target_conflicts,
+    PrefixPoolIndex, capture_epoch_matches, rekey_target_conflicts, reusable_prefix_blocks,
+    reusable_prefix_blocks_for_prompt,
 };

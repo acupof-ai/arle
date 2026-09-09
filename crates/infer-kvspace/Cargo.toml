@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow = "1.0"
 half = "2.4"
+infer-seam = { path = "../infer-seam" }
 
 [lints]
 workspace = true
