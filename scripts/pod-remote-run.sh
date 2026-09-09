@@ -200,6 +200,7 @@ PY
       kernel_id="$(field "$BUILD_RECEIPT" kernel_id)"; producer_id="$(field "$BUILD_RECEIPT" producer_id)"; embedded_id="$(field "$BUILD_RECEIPT" embedded_id)"
       if [ "$(sha256 "$binary" 2>/dev/null)" != "$binary_sha" ]; then echo "binary SHA mismatch"
       elif [ ! -f "$TREE/.arle-source-receipt" ] || [ "$(field "$TREE/.arle-source-receipt" head)" != "$source_head" ] || [ "$(field "$TREE/.arle-source-receipt" digest)" != "$source_digest_value" ] || [ "$(git -C "$TREE" rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then echo "source changed since build"
+      elif [ "${LABEL#bench}" != "$LABEL" ] && [ "$(field "$BUILD_RECEIPT" profile)" != release ]; then echo "bench run requires a release build: build=$BUILD profile=$(field "$BUILD_RECEIPT" profile)"
       else
         claim_env=(ARLE_OP_ID="$OP" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$process_start")
         if [ "$GPU" = auto ]; then

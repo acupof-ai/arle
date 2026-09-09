@@ -108,7 +108,10 @@ pub use infer_cuda::{
 #[cfg(feature = "nccl")]
 pub use infer_cuda::{mint_nccl_unique_id_hex, nccl_unique_id_from_env};
 #[cfg(feature = "metal")]
-pub use infer_metal::recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes;
+pub use infer_metal::{
+    MetalKvCacheDtype, MetalResourcePlan, MetalResourceRequest, plan_resource_budget,
+    recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes,
+};
 #[cfg(feature = "cuda")]
 pub use student_lora::{LoraHalf, load_student_lora_update, parse_student_adapter_name};
 #[cfg(feature = "cuda")]

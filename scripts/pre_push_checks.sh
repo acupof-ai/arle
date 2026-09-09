@@ -25,7 +25,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SNAPSHOT_ROOT="${TMPDIR:-/tmp}/arle-pre-push-snapshot"
+# Per-worktree snapshot: a shared dir lets concurrent lane hooks rsync
+# different HEADs into one tree, and an interrupted rsync leaves a mix that
+# fails content-hash tests (kernel bundle id drift, 2026-09-09).
+SNAPSHOT_HASH="$(printf '%s' "$REPO_ROOT" | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-16)"
+SNAPSHOT_ROOT="${TMPDIR:-/tmp}/arle-pre-push-snapshot-${SNAPSHOT_HASH}"
 STAGE_ROOT=""
 
 info() { echo "[pre-push] $*"; }
@@ -139,10 +143,10 @@ fi
 METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 
 if [[ "${METAL_CHECKS}" == "1" && "$(uname -s)" == "Darwin" ]]; then
-    run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --release
-    run cargo build --no-default-features --features metal,no-cuda,cli -p arle --release --bin arle
+    run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --profile release-fast
+    run cargo build --no-default-features --features metal,no-cuda,cli -p arle --profile release-fast --bin arle
     # Metal correctness gate: needle ladder on the local 0.8B test model.
-    GATE_BIN="${CARGO_TARGET_DIR}/release/arle"
+    GATE_BIN="${CARGO_TARGET_DIR}/release-fast/arle"
     GATE_MODEL="${REPO_ROOT}/models/Qwen3.5-0.8B-MLX-4bit"
     if [[ -x "$GATE_BIN" && -d "$GATE_MODEL" ]]; then
         info "Metal needle gate (Qwen3.5-0.8B-MLX-4bit, lengths 115/300/446)"

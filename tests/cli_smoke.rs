@@ -91,7 +91,7 @@ fn doctor_json_reports_schema_and_compiled_backend() {
 
     let value: serde_json::Value =
         serde_json::from_str(&stdout(&output)).expect("doctor output is valid json");
-    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["schema_version"], 4);
     assert_eq!(value["mode"], "doctor");
     assert!(value.get("compiled_backend").is_some());
     assert!(value.get("gpu").is_some());

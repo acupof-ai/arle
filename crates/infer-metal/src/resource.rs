@@ -167,6 +167,12 @@ pub struct MetalResourcePlan {
     pub weight_bytes: usize,
     pub runtime_headroom_bytes: usize,
     pub static_state_bytes: usize,
+    /// Anti-swap reserve used to clamp `memory_limit` (available memory minus
+    /// this term is one of the limit candidates).
+    pub anti_swap_reserve_bytes: usize,
+    /// System reserve subtracted from total memory in the limit candidate,
+    /// when total memory is known.
+    pub system_reserve_bytes: Option<usize>,
     pub kv_budget_bytes: usize,
     pub kv_bytes_per_token: usize,
     pub requested_total_pages: usize,
@@ -310,6 +316,10 @@ pub fn plan_resource_budget(
     )?;
 
     let wired_limit_bytes = resolve_wired_limit_bytes(weight_bytes, available_memory_bytes)?;
+    let anti_swap_reserve_bytes = available_reserve_bytes(request.low_impact);
+    let system_reserve_bytes = request.system_reserve_bytes.or_else(|| {
+        total_memory_bytes.map(|total| default_system_reserve_bytes(total, request.low_impact))
+    });
     let static_state_bytes = gdr_state_bytes_per_slot(&model_config)
         .checked_mul(request.num_slots.max(1))
         .ok_or_else(|| anyhow::anyhow!("Metal GDR state estimate overflowed"))?;
@@ -384,6 +394,8 @@ pub fn plan_resource_budget(
         weight_bytes,
         runtime_headroom_bytes,
         static_state_bytes,
+        anti_swap_reserve_bytes,
+        system_reserve_bytes,
         kv_budget_bytes,
         kv_bytes_per_token,
         requested_total_pages,
@@ -461,6 +473,10 @@ pub fn plan_weight_only_resource_budget(
     )?;
 
     let wired_limit_bytes = resolve_wired_limit_bytes(weight_bytes, available_memory_bytes)?;
+    let anti_swap_reserve_bytes = available_reserve_bytes(request.low_impact);
+    let system_reserve_bytes = request.system_reserve_bytes.or_else(|| {
+        total_memory_bytes.map(|total| default_system_reserve_bytes(total, request.low_impact))
+    });
     let fixed_bytes = weight_bytes
         .checked_add(runtime_headroom_bytes)
         .ok_or_else(|| anyhow::anyhow!("Metal fixed memory estimate overflowed"))?;
@@ -490,6 +506,8 @@ pub fn plan_weight_only_resource_budget(
         weight_bytes,
         runtime_headroom_bytes,
         static_state_bytes: 0,
+        anti_swap_reserve_bytes,
+        system_reserve_bytes,
         kv_budget_bytes: memory_limit_bytes.saturating_sub(fixed_bytes),
         kv_bytes_per_token: 0,
         requested_total_pages: 0,
