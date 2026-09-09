@@ -260,8 +260,6 @@ gated, license-or-kill on a same-load resident A/B at the B=1 SLO shape, with
 KV-precision parity as the
 precondition for any default flip. Landed gated: FlashMLA fused sparse decode,
 FP8 fused `wqkv_a`, contiguous active-row MoE layout.
-Prefill at production shapes is in repair (a MoE padded-layout i32 work-size
-overflow at >~1560 tokens).
 
 Qwen3.6 hybrid+MoE now serves on CUDA (FP8 MoE via DeepGEMM, batched paged
 decode — no longer Metal-only); the next DSv4-family in-flight addition is
