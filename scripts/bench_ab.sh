@@ -16,7 +16,8 @@
 #     * launch a server that listens on $PORT (env var, default 8000)
 #     * background themselves (trailing &) — the harness will read the PID
 #       from $! inside eval
-#     * be idempotent across kill (we pkill -f <cmd snippet> at cleanup)
+#     * be idempotent across kill (cleanup sends pkill -x arle — comm-exact,
+#       so a profiler wrapper around the serve survives)
 #
 # Native runner flags are forwarded to bench_throughput.py. Artefacts land in
 # bench-output/<date>-<label-a>/ and bench-output/<date>-<label-b>/. No
@@ -185,12 +186,9 @@ fi
 die() { echo "error: $*" >&2; exit 3; }
 
 cleanup() {
-    # Best-effort kill. Uses the full command string so we don't hit
-    # unrelated processes.
-    if [[ -n "${CURRENT_CMD:-}" ]]; then
-        pkill -f "$(echo "$CURRENT_CMD" | awk '{print $1}')" 2>/dev/null || true
-    fi
-    pkill -f "target/release/arle" 2>/dev/null || true
+    # -x matches the comm exactly: pkill -f on the serve cmdline also kills
+    # profiler wrappers (nsys) whose own cmdline embeds it.
+    pkill -x arle 2>/dev/null || true
     sleep 1
 }
 trap cleanup EXIT INT TERM
@@ -212,7 +210,7 @@ run_side() {
     echo
     echo "=== $label ==="
     # Ensure the port is free before launching.
-    pkill -f "target/release/arle" 2>/dev/null || true
+    pkill -x arle 2>/dev/null || true
     sleep 2
     echo "launch: $cmd"
     eval "$cmd" || die "failed to launch: $cmd"
@@ -223,7 +221,7 @@ run_side() {
         --output "$out_dir/bench_throughput" "${PASSTHROUGH[@]}" \
         || die "bench run failed for $label"
 
-    pkill -f "target/release/arle" 2>/dev/null || true
+    pkill -x arle 2>/dev/null || true
     sleep 2
     CURRENT_CMD=""
 }

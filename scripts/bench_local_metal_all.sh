@@ -20,13 +20,15 @@ MODELS=(
   "qwen36-35b-a3b-4bit:mlx-community/Qwen3.6-35B-A3B-4bit:360"
 )
 
-pkill -f "arle serve" 2>/dev/null; sleep 2
+# -x matches the comm exactly: pkill -f "arle serve" also kills any wrapper
+# whose cmdline embeds that string.
+pkill -x arle 2>/dev/null; sleep 2
 
 for entry in "${MODELS[@]}"; do
   label="${entry%%:*}"; rest="${entry#*:}"; model="${rest%:*}"; timeout="${rest##*:}"
   mid="$(basename "$model")"
   echo "================ $label ($model) ================"
-  pkill -f "arle serve" 2>/dev/null; sleep 2
+  pkill -x arle 2>/dev/null; sleep 2
   "$BIN" serve --backend metal --model-path "$model" --port $PORT \
       --max-prompt-tokens 6144 --max-total-tokens 8192 > "/tmp/serve-$label.log" 2>&1 &
   SP=$!
@@ -48,6 +50,6 @@ for entry in "${MODELS[@]}"; do
   kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null; sleep 4
 done
 
-pkill -f "arle serve" 2>/dev/null
+pkill -x arle 2>/dev/null
 echo "================ SUMMARY ================"
 cat "$RESULTS"
