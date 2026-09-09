@@ -52,7 +52,7 @@ only its first phase is DSpark-specific:
 | phase | DSpark today | for MTP |
 |---|---|---|
 | draft | `dspark_draft_blocks` over N slots, one forward | **new**: batched MTP draft, `depth` levels x one forward per level |
-| pack | `DsparkChain { out, slot, start, row0, chain, partial_ctx }` into a flat `chains: Vec<u32>` | reuse — an MTP chain is a linear DSpark chain |
+| pack | `SpecChain { out, slot, start, row0, chain, partial_ctx }` into a flat `chains: Vec<u32>` | reuse — an MTP chain is a linear DSpark chain |
 | snapshot | per-slot linear state via `batched_copy` as the rollback base | reuse |
 | verify | `dspark_verify_forward(batch, chains, total_rows, host_kv)` — takes chain data, not DSpark state | reuse |
 | commit | per-slot accept path, ring restore, trunk truncate | reuse the accept, drop the ctx-ring parts |
