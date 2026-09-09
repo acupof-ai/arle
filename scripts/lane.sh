@@ -14,6 +14,7 @@ usage() {
     cat <<EOF
 usage: scripts/lane.sh <command>
 
+  doctor                repair core.bare in the shared .git/config, then report
   new <name>            worktree at $LANES/<name> on branch lane/<name>
   pr <name> [title]     push the branch and open a PR against main
   list                  worktrees and their branches
@@ -37,7 +38,25 @@ valid_name() {
     esac
 }
 
+# `core.bare = true` keeps appearing in the SHARED .git/config, which makes every
+# worktree fail with "this operation must be run in a work tree". The writer is
+# unidentified: all four lanes deny it, .githooks/pre-push does not touch config,
+# and `worktree add/list/prune`, `fetch` and `rev-list` were each measured not to
+# set it. chmod on the file does not help — git writes config.lock and renames,
+# which needs only directory write permission. So repair it instead of guarding.
+repair_bare() {
+    [ "$(git -C "$ROOT" config core.bare 2>/dev/null)" = "true" ] || return 0
+    chmod u+w "$ROOT/.git/config" 2>/dev/null || true
+    git -C "$ROOT" config core.bare false
+    echo "lane: repaired core.bare=true in the shared .git/config" >&2
+}
+
 case "${1:-help}" in
+doctor)
+    repair_bare
+    git -C "$ROOT" rev-parse --is-bare-repository
+    git -C "$ROOT" worktree list
+    ;;
 new)
     name="${2:?lane: new <name>}"; valid_name "$name"
     share_target
@@ -60,6 +79,7 @@ new)
     ;;
 pr)
     name="${2:?lane: pr <name> [title]}"; valid_name "$name"
+    repair_bare
     path="$LANES/$name"
     [ -d "$path" ] || { echo "lane: no worktree at $path" >&2; exit 2; }
     [ -n "$(git -C "$path" status --porcelain)" ] && {
