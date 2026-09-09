@@ -498,6 +498,26 @@ def check_prereg_no_stale_running() -> list[str]:
     ]
 
 
+AGENDA_WRITER = Path("scripts/agenda.py")
+
+
+def load_agenda():
+    """The ledger's own reader, so the format has exactly one definition."""
+    spec = importlib.util.spec_from_file_location("agenda", ROOT / AGENDA_WRITER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_agenda_ledger() -> list[str]:
+    """A task with no exit gate closes on someone's opinion; a task left open and
+    untouched is a lane nobody is running; a done task with no entry is a claim
+    with no evidence."""
+    if not (ROOT / AGENDA_WRITER).is_file():
+        return [f"missing required file: {AGENDA_WRITER}"]
+    return [f"docs/agenda.jsonl: {item}" for item in load_agenda().defects()]
+
+
 # --- selftest -------------------------------------------------------------
 #
 # A check that cannot fail is not a check. Five of the checks above reach the
@@ -591,6 +611,21 @@ def break_prereg_stale_running(root: Path) -> None:
     ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
 
+def break_agenda_stale_task(root: Path) -> None:
+    """Written by the real writer, then back-dated: the world exercises the same
+    add/read path the ledger uses, so a format drift between them shows up here."""
+    def run(*argv):
+        subprocess.run([sys.executable, str(root / AGENDA_WRITER), *argv],
+                       cwd=root, check=True, stdout=subprocess.DEVNULL)
+    run("goal", "add", "--id", "w", "--statement", "s", "--north-star", "m")
+    run("task", "add", "--id", "t", "--goal", "w", "--exit", "a named measurable event")
+    ledger = root / "docs/agenda.jsonl"
+    rows = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+    stale = datetime.now(timezone.utc) - timedelta(days=7)
+    rows[-1]["updated"] = stale.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
 SELFTEST_WORLDS = [
     ("launcher_boundary", check_launcher_boundary, (LAUNCHER_FIXTURE,), break_launcher_boundary),
     ("registry_covers_runtime_counters", check_registry_covers_runtime_counters,
@@ -601,6 +636,7 @@ SELFTEST_WORLDS = [
     ("archived_experience", check_archived_experience, (ARCHIVE_FIXTURE,), break_archive_seal),
     ("prereg_no_stale_running", check_prereg_no_stale_running,
      (str(PREREG_WRITER),), break_prereg_stale_running),
+    ("agenda_ledger", check_agenda_ledger, (str(AGENDA_WRITER),), break_agenda_stale_task),
 ]
 
 
@@ -651,6 +687,7 @@ def main() -> int:
     errors.extend(check_launcher_boundary())
     errors.extend(check_registry_covers_runtime_counters())
     errors.extend(check_prereg_no_stale_running())
+    errors.extend(check_agenda_ledger())
 
     if errors:
         print("[repo-hygiene] FAIL")
@@ -663,7 +700,7 @@ def main() -> int:
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
         "repo-wide marker bans, experience entry caps, frozen archive seal, "
         "workspace truth-surface, CUDA launcher-boundary, registry-coverage, "
-        "and prereg-ledger checks all passed"
+        "prereg-ledger, and agenda-ledger checks all passed"
     )
     return 0
 
