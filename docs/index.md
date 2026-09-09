@@ -29,6 +29,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | CUDA operator organization | [plans/2026-08-20-cuda-operator-organization.md](plans/2026-08-20-cuda-operator-organization.md) |
 | Bench + trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) |
 | Rolling baselines | [baselines.md](baselines.md) |
+| Agent task harness (goals, gates, execution, report) | [plans/2026-09-09-agent-task-harness.md](plans/2026-09-09-agent-task-harness.md) |
 | Design theses (depth track) | [plans/2026-09-02-design-theses.md](plans/2026-09-02-design-theses.md) |
 | Design notes | [design/hybrid-prefix-cache.md](design/hybrid-prefix-cache.md) |
 | Env / flags | [environment.md](environment.md) |
