@@ -144,9 +144,22 @@ attempts → hand-write the diff or re-brief a fresh agent with what was tried.
 execution — both hang (2026-04-19).
 
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `metal` `cuda`
-`scheduler` `qwen3` `qwen35` `http` `kv-tier` `docs`. Commit directly to `main`
-from the current workspace — no feature branches, no alternate worktree. Small
-tranches, each self-contained, simplify pass first. Never `git stash` others'
+`scheduler` `qwen3` `qwen35` `http` `kv-tier` `docs`. Small tranches, each
+self-contained, simplify pass first.
+
+**Lane worktrees (user order, 2026-09-09, superseding "commit directly to main,
+no alternate worktree").** Code changes go through a lane: `scripts/lane.sh new
+<name>` gives a worktree at `../arle-lanes/<name>` on branch `lane/<name>`,
+`scripts/lane.sh pr <name>` pushes it and opens a PR against main; ckl merges.
+Every lane compiles into the main checkout's `target/`, set by
+`../arle-lanes/.cargo/config.toml` — which sits above every worktree and outside
+every checkout, so the tracked `.cargo/config.toml` (which deliberately sets no
+`target-dir`) stays clean. A lane costs ~97 MB of tracked files and no build
+artifacts. **Cargo takes one lock per target directory, so lane builds
+serialize** — that is the price of not multiplying 8.5 GB by the lane count.
+The controller's ledger commits (`docs/agenda.jsonl`, CHANGELOG, doc indexes)
+still land directly on main: they are the progress record, and a PR round-trip
+would make them lag the work they describe. Never `git stash` others'
 work; commit only your own files by explicit path. After `git mv` + edits,
 re-check `git status` — the fmt hook de-stages renames.
 
