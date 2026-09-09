@@ -187,8 +187,16 @@ case "${1:-}" in
     dirty="$(awk -F= '$1=="dirty" {print $2}' "$receipt")"
     dirty="${dirty:-0}"
     echo "tree=$TREE head=$head dirty=$dirty"
-    recent_build="$(ls -t "$STATE/builds" 2>/dev/null | head -1)"
-    if [ -n "$recent_build" ] && [ -f "$STATE/builds/$recent_build/receipt" ]; then
+    # Builds live in a shared STATE dir across lanes; filter to this tree so a
+    # lane's status reports its own build sha, not the newest build on the box.
+    recent_build=""
+    for d in $(ls -t "$STATE/builds" 2>/dev/null); do
+      r="$STATE/builds/$d/receipt"
+      [ -f "$r" ] || continue
+      [ "$(awk -F= '$1=="tree" {print $2}' "$r")" = "$TREE" ] || continue
+      recent_build="$d"; break
+    done
+    if [ -n "$recent_build" ]; then
       build_head="$(awk -F= '$1=="source_head" {print $2}' "$STATE/builds/$recent_build/receipt")"
       echo "latest_build=$recent_build source_head=${build_head:-unknown}"
     fi

@@ -230,16 +230,22 @@ case "$cmd" in
   gpus)
     "$POD" "nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader"
     ;;
-  tree)
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' tree-status"
-    ;;
   ready)
     label="${1:-}"; timeout_s="${2:-1200}"
     valid_label "$label"
     case "$timeout_s" in ''|*[!0-9]*) echo "usage: pod.sh ready <run-label> [timeout_s]" >&2; exit 2;; esac
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' ready '$label' '$timeout_s'"
     ;;
-  status|log|kill)
+  status)
+    # No arg: the tree + latest build sha (W4). With a run-label: run status.
+    if [ $# -eq 0 ]; then
+      "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' tree-status"
+    else
+      label="$1"; valid_label "$label"
+      "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' '$cmd' '$label'"
+    fi
+    ;;
+  log|kill)
     label="${1:-}"
     valid_label "$label"
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' '$cmd' '$label'"
@@ -249,7 +255,8 @@ case "$cmd" in
       'pod.sh sync [--dirty] [--full]' \
       'pod.sh build [label] [cargo argv...]' \
       'pod.sh run <build-label> [run-label] [auto|GPU|GPU,...] -- [arle argv...]' \
-      'pod.sh status|ready|log|kill <run-label> [timeout]' \
-      'pod.sh tree | gpus | setup | setup-sccache | sccache-stats'
+      'pod.sh status [run-label] (no arg: tree head + latest build sha)' \
+      'pod.sh ready|log|kill <run-label> [timeout]' \
+      'pod.sh gpus | setup | setup-sccache | sccache-stats'
     ;;
 esac
