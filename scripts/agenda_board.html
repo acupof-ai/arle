@@ -1,0 +1,274 @@
+<title>ARLE Agenda</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f3f5f8; --surface:#fff; --sunk:#eceff4;
+  --ink:#111621; --body:#333b4a; --muted:#606a7b; --faint:#8d97a6;
+  --rule:#dde2e9; --rule-strong:#c6cdd8;
+  --accent:#3d4db8; --accent-soft:#eaecf8;
+  --ok:#1f6b47; --ok-soft:#e4f0ea;
+  --live:#3d4db8; --live-soft:#eaecf8;
+  --warn:#8a5c0f; --warn-soft:#f6eedd;
+  --kill:#8a4148; --kill-soft:#f7e8e9;
+  --idle:#5f6878; --idle-soft:#e8ebf0;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0f1319; --surface:#161b23; --sunk:#12171e;
+  --ink:#eef1f6; --body:#c3cad6; --muted:#98a2b1; --faint:#6f7987;
+  --rule:#242c37; --rule-strong:#333d4b;
+  --accent:#93a0f0; --accent-soft:#1b2140;
+  --ok:#68c79a; --ok-soft:#152a20;
+  --live:#93a0f0; --live-soft:#1b2140;
+  --warn:#d7a64c; --warn-soft:#2c2313;
+  --kill:#d98e94; --kill-soft:#2e1a1c;
+  --idle:#9aa4b3; --idle-soft:#1d232c;
+}}
+:root[data-theme="dark"]{
+  --bg:#0f1319; --surface:#161b23; --sunk:#12171e;
+  --ink:#eef1f6; --body:#c3cad6; --muted:#98a2b1; --faint:#6f7987;
+  --rule:#242c37; --rule-strong:#333d4b;
+  --accent:#93a0f0; --accent-soft:#1b2140;
+  --ok:#68c79a; --ok-soft:#152a20;
+  --live:#93a0f0; --live-soft:#1b2140;
+  --warn:#d7a64c; --warn-soft:#2c2313;
+  --kill:#d98e94; --kill-soft:#2e1a1c;
+  --idle:#9aa4b3; --idle-soft:#1d232c;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--body);
+  font-family:"IBM Plex Sans",system-ui,-apple-system,"Helvetica Neue",sans-serif;
+  font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:40px 24px 72px;display:flex;flex-direction:column;gap:34px}
+h1,h2,h3{font-family:Archivo,"IBM Plex Sans",system-ui,sans-serif;color:var(--ink);
+  margin:0;text-wrap:balance;letter-spacing:-.012em}
+h1{font-size:31px;font-weight:700;letter-spacing:-.022em}
+h2{font-size:20px;font-weight:600}
+code,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-variant-numeric:tabular-nums}
+a{color:var(--accent)}
+.lede{max-width:68ch;color:var(--muted);font-size:14.5px;margin:0}
+.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:500;
+  letter-spacing:.13em;text-transform:uppercase;color:var(--faint)}
+
+header{display:flex;flex-direction:column;gap:9px;
+  border-bottom:2px solid var(--rule-strong);padding-bottom:22px}
+.stamp{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--faint)}
+
+/* summary strip: goals as state tiles */
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:1px;
+  background:var(--rule);border:1px solid var(--rule);border-radius:7px;overflow:hidden}
+.tile{background:var(--surface);padding:13px 15px;display:flex;flex-direction:column;gap:5px}
+.tile .id{font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:600;color:var(--accent)}
+.tile .count{font-family:Archivo,sans-serif;font-size:24px;font-weight:700;color:var(--ink);
+  font-variant-numeric:tabular-nums;line-height:1.05}
+.tile .count small{font-size:14px;font-weight:500;color:var(--faint)}
+.tile .bar{height:3px;background:var(--sunk);border-radius:2px;overflow:hidden}
+.tile .bar i{display:block;height:100%;background:var(--ok)}
+
+/* GPU allocation — H20, 8 cards */
+.cards{display:flex;flex-wrap:wrap;gap:7px}
+.card{display:flex;flex-direction:column;gap:1px;padding:7px 11px;border-radius:5px;
+  border:1px solid var(--rule);background:var(--surface);min-width:92px}
+.card b{font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:600;color:var(--ink)}
+.card span{font-size:11.5px;color:var(--muted)}
+.card.ours{border-color:var(--accent);background:var(--accent-soft)}
+.card.ours span{color:var(--accent)}
+.card.theirs{background:var(--sunk);color:var(--faint)}
+.card.theirs b,.card.theirs span{color:var(--faint)}
+
+/* goal block */
+.goal{border-left:3px solid var(--accent);padding-left:19px;
+  display:flex;flex-direction:column;gap:13px}
+.goal-head{display:flex;flex-direction:column;gap:5px}
+.metric{font-size:13.5px;color:var(--muted)}
+.metric b{font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:500;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--faint);margin-right:8px}
+
+/* tasks — rows, not cards */
+.tasks{display:flex;flex-direction:column;border-top:1px solid var(--rule)}
+.task{display:grid;grid-template-columns:88px 1fr;gap:16px;padding:14px 0;
+  border-bottom:1px solid var(--rule);align-items:start}
+.chip{justify-self:start;font-family:"IBM Plex Mono",monospace;font-size:10.5px;font-weight:600;
+  letter-spacing:.09em;text-transform:uppercase;padding:3px 8px;border-radius:3px;white-space:nowrap}
+.s-done{color:var(--ok);background:var(--ok-soft)}
+.s-active{color:var(--live);background:var(--live-soft)}
+.s-blocked{color:var(--warn);background:var(--warn-soft)}
+.s-killed{color:var(--kill);background:var(--kill-soft)}
+.s-open{color:var(--idle);background:var(--idle-soft)}
+.task-body{display:flex;flex-direction:column;gap:6px;min-width:0}
+.task-top{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline}
+.task-id{font-family:"IBM Plex Mono",monospace;font-size:13.5px;font-weight:600;color:var(--ink)}
+.owner{font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--faint)}
+.gate{font-size:14px;color:var(--body);max-width:72ch}
+.gate b{font-family:"IBM Plex Mono",monospace;font-size:10.5px;font-weight:500;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--faint);margin-right:7px}
+.verdict{font-size:13.5px;color:var(--ink);background:var(--sunk);
+  border-left:2px solid var(--ok);padding:7px 11px;border-radius:0 4px 4px 0;max-width:74ch}
+.log{display:flex;flex-direction:column;gap:4px;margin-top:2px}
+.log div{font-size:13px;color:var(--muted);max-width:74ch;display:flex;gap:9px}
+.log time{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--faint);
+  white-space:nowrap;padding-top:2px}
+.runs{display:flex;flex-wrap:wrap;gap:6px}
+.run{font-family:"IBM Plex Mono",monospace;font-size:11.5px;padding:2px 7px;border-radius:3px;
+  background:var(--accent-soft);color:var(--accent)}
+.empty{font-size:13.5px;color:var(--faint);font-style:normal;padding:12px 0}
+
+footer{border-top:2px solid var(--rule-strong);padding-top:20px;
+  display:flex;flex-direction:column;gap:12px}
+.defects{border:1px solid var(--rule);border-left:3px solid var(--ok);border-radius:0 6px 6px 0;
+  background:var(--surface);padding:13px 16px;display:flex;flex-direction:column;gap:6px}
+.defects.bad{border-left-color:var(--kill)}
+.defects ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px}
+.defects li{font-size:13.5px;color:var(--body)}
+.how{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:14px}
+.how div{display:flex;flex-direction:column;gap:4px}
+.how b{font-size:13px;color:var(--ink);font-weight:600}
+.how code{font-size:12px;color:var(--muted);background:var(--sunk);padding:6px 9px;
+  border-radius:4px;overflow-x:auto;white-space:pre}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">ARLE · controller agent-infer-34</div>
+    <h1>Agenda</h1>
+    <p class="lede">Five standing goals, the measurable event each task exits on, and which agent
+      session is executing it. Rendered from <code>docs/agenda.jsonl</code> and
+      <code>docs/experience/prereg.jsonl</code>; nothing here is written by hand.</p>
+    <div class="stamp" id="stamp"></div>
+  </header>
+
+  <section>
+    <div class="eyebrow" style="margin-bottom:10px">Goals</div>
+    <div class="strip" id="strip"></div>
+  </section>
+
+  <section>
+    <div class="eyebrow" style="margin-bottom:10px">H20 allocation · 8 × 97,871 MiB</div>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <main id="goals" style="display:flex;flex-direction:column;gap:34px"></main>
+
+  <footer>
+    <div id="defects"></div>
+    <div class="how">
+      <div><b>Open a task</b><code>agenda.py task add --id X --goal G \
+  --exit "the event that closes it"</code></div>
+      <div><b>Report progress</b><code>agenda.py task update --id X \
+  --run &lt;prereg name&gt; --note "..."</code></div>
+      <div><b>Close it</b><code>agenda.py task close --id X --status done \
+  --verdict "..." --entry docs/experience/...</code></div>
+    </div>
+  </footer>
+</div>
+
+<script>
+const LEDGER = __AGENDA_JSON__;
+const PREREG = __PREREG_JSON__;
+const CARDS = __CARDS_JSON__;
+const STAMP = "__STAMP__";
+const DEFECTS = __DEFECTS_JSON__;
+
+const goals = LEDGER.filter(r => r.kind === "goal");
+const tasks = LEDGER.filter(r => r.kind === "task");
+const CLOSED = new Set(["done", "killed"]);
+const el = (t, c, x) => { const n = document.createElement(t); if (c) n.className = c;
+  if (x !== undefined) n.textContent = x; return n; };
+
+document.getElementById("stamp").textContent = "Rendered " + STAMP;
+
+const strip = document.getElementById("strip");
+for (const g of goals) {
+  const mine = tasks.filter(t => t.goal === g.id);
+  const done = mine.filter(t => CLOSED.has(t.status)).length;
+  const tile = el("div", "tile");
+  tile.append(el("div", "id", g.id));
+  const count = el("div", "count");
+  count.append(document.createTextNode(String(done)));
+  const small = el("small", null, " / " + mine.length + " closed");
+  count.append(small);
+  tile.append(count);
+  const bar = el("div", "bar"), fill = el("i");
+  fill.style.width = mine.length ? (100 * done / mine.length) + "%" : "0%";
+  bar.append(fill); tile.append(bar);
+  strip.append(tile);
+}
+
+const cardBox = document.getElementById("cards");
+for (const c of CARDS) {
+  const n = el("div", "card " + (c.mine ? "ours" : c.free ? "" : "theirs"));
+  n.append(el("b", null, "GPU " + c.id));
+  n.append(el("span", null, c.holder));
+  cardBox.append(n);
+}
+
+const main = document.getElementById("goals");
+for (const g of goals) {
+  const mine = tasks.filter(t => t.goal === g.id);
+  const sec = el("section", "goal");
+  const head = el("div", "goal-head");
+  head.append(el("div", "eyebrow", g.id));
+  head.append(el("h2", null, g.statement));
+  const m = el("div", "metric");
+  m.append(el("b", null, "Measured by"));
+  m.append(document.createTextNode(g.north_star));
+  head.append(m);
+  sec.append(head);
+
+  if (!mine.length) { sec.append(el("div", "empty", "No task assigned this round.")); main.append(sec); continue; }
+
+  const list = el("div", "tasks");
+  for (const t of mine) {
+    const row = el("div", "task");
+    row.append(el("span", "chip s-" + t.status, t.status));
+    const body = el("div", "task-body");
+    const top = el("div", "task-top");
+    top.append(el("span", "task-id", t.id));
+    top.append(el("span", "owner", t.owner || "unassigned"));
+    body.append(top);
+    const gate = el("div", "gate");
+    gate.append(el("b", null, "Exits on"));
+    gate.append(document.createTextNode(t.exit));
+    body.append(gate);
+
+    if (t.verdict) {
+      const v = el("div", "verdict");
+      if (t.status === "killed") v.style.borderLeftColor = "var(--kill)";
+      v.textContent = t.verdict;
+      if (t.entry) { v.append(document.createTextNode(" — ")); const a = el("a", null, t.entry);
+        a.href = "#"; a.style.pointerEvents = "none"; v.append(a); }
+      body.append(v);
+    }
+    const runs = PREREG.filter(r => (t.runs || []).includes(r.name));
+    if (runs.length) {
+      const rb = el("div", "runs");
+      for (const r of runs) rb.append(el("span", "run", r.name + " · " + (r.result || r.status)));
+      body.append(rb);
+    }
+    if ((t.notes || []).length) {
+      const log = el("div", "log");
+      for (const n of t.notes.slice(-4)) {
+        const d = el("div");
+        d.append(el("time", null, n.at.slice(5, 16).replace("T", " ")));
+        d.append(el("span", null, n.text));
+        log.append(d);
+      }
+      body.append(log);
+    }
+    row.append(body); list.append(row);
+  }
+  sec.append(list); main.append(sec);
+}
+
+const box = el("div", "defects" + (DEFECTS.length ? " bad" : ""));
+box.append(el("div", "eyebrow", "Ledger check"));
+if (!DEFECTS.length) {
+  box.append(el("div", null, "No defects. Every task carries an exit gate, every closed task carries an entry, and nothing open has gone untouched for 72 hours."));
+} else {
+  const ul = el("ul");
+  for (const d of DEFECTS) ul.append(el("li", null, d));
+  box.append(ul);
+}
+document.getElementById("defects").append(box);
+</script>

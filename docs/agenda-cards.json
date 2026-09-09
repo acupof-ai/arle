@@ -1,0 +1,8 @@
+[{"id":0,"holder":"another job","mine":false,"free":false},
+ {"id":1,"holder":"another job","mine":false,"free":false},
+ {"id":2,"holder":"lane A · MTP","mine":true,"free":false},
+ {"id":3,"holder":"another job","mine":false,"free":false},
+ {"id":4,"holder":"lane A · MTP","mine":true,"free":false},
+ {"id":5,"holder":"lane B · DSv4","mine":true,"free":false},
+ {"id":6,"holder":"another job","mine":false,"free":false},
+ {"id":7,"holder":"lane B · DSv4","mine":true,"free":false}]
