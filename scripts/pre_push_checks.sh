@@ -29,6 +29,7 @@ SNAPSHOT_ROOT="${TMPDIR:-/tmp}/arle-pre-push-snapshot"
 STAGE_ROOT=""
 
 info() { echo "[pre-push] $*"; }
+fail() { echo "[pre-push] $*" >&2; }
 
 run() {
     info "$*"
@@ -77,10 +78,16 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
 done
 
 # --- Fast checks (parallel with cargo) ------------------------------------
+# This block runs in the background, so its failure surfaces only as the exit
+# status of `wait` and git then prints a bare "failed to push some refs". Record
+# the step in flight so the failure can name itself.
+FAST_STEP="${STAGE_ROOT}/fast-step"
+run_fast() { printf '%s\n' "$*" > "${FAST_STEP}"; run "$@"; }
+
 run_fast_checks() {
-    run python3 scripts/check_repo_hygiene.py
-    run python3 scripts/check_repo_hygiene.py --selftest
-    run cargo fmt --all -- --check
+    run_fast python3 scripts/check_repo_hygiene.py
+    run_fast python3 scripts/check_repo_hygiene.py --selftest
+    run_fast cargo fmt --all -- --check
     for test in \
         test_cuda_prebuilt_export.sh \
         test_lever_gate.sh \
@@ -88,7 +95,7 @@ run_fast_checks() {
         test_validate_release.sh \
         test_pod_flow.sh \
         test_hook_disowns_git_env.sh; do
-        run bash "scripts/tests/${test}"
+        run_fast bash "scripts/tests/${test}"
     done
 }
 run_fast_checks &
@@ -123,7 +130,11 @@ else
 fi
 
 # --- Wait for fast checks ---------------------------------------------------
-wait "${FAST_PID}"
+if ! wait "${FAST_PID}"; then
+    fail "parallel fast-checks FAILED at: $(cat "${FAST_STEP}" 2>/dev/null || echo "unknown step")"
+    fail "its output is above, interleaved with the cargo steps"
+    exit 1
+fi
 
 METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 
