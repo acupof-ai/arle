@@ -95,11 +95,33 @@ operator sequence and the weight layout requirement. The real relation is
 model → operator sequence → weight layout requirement → kernel selection → launch
 ```
 
-Only the last is device-side. The first four are collapsed into
-`crates/infer-cuda/src/executor/qwen35.rs` (3,472 lines) and
-`executor/dsv4.rs` (650 lines). This gives those files a principled split:
-by which stage a line belongs to, not by whether it happens to call a device
-function.
+Only the last is device-side.
+
+The first version of this section said the four stages are collapsed into
+`crates/infer-cuda/src/executor/qwen35.rs`. A line-by-line read of all 3,529
+lines (2026-09-09) showed that is wrong, and the claim was made from the
+file's name and size without reading it. The executor file is ~80% outside
+this axis; it delegates through one-line calls such as
+`model.forward_tokens_recall(...)`. The stages actually live in the model
+modules: `qwen35_forward.rs` (1,024), `qwen35_decode.rs` (383),
+`qwen35_spec.rs` (648), `qwen35/dspark.rs` (1,994), `qwen35_load.rs` (3,287)
+— about 13,500 lines.
+
+What the executor file holds instead is a junction of six blocks, each of
+which already has a destination named elsewhere in this plan:
+
+| Block | Lines | Destination |
+|---|---:|---|
+| Speculative decode orchestration | ~1,040 | step scheduling, `infer-plan` |
+| The `submit` tree | ~570 | step scheduling, `infer-plan` |
+| Construction and weight setup | ~430 | weight axis, step 5 |
+| KV / tier / sidecar lifecycle | ~300 | `infer-kvspace`, step 2 |
+| Device scheduling (graph) | ~200 | `device_sched`, step 4 |
+| Launch and OPD surface | ~360 | stays in `infer-cuda` |
+
+The consequence for the plan is in step 3, which is split in two: the
+executor file disperses to homes that already exist, and `infer-model` takes
+the model modules, which is where the four stages actually are.
 
 ### 3.3 Scheduling has four levels and three names
 
@@ -138,6 +160,31 @@ and it is the reason the seam cannot be closed by moving reads alone. The
 correct end state is one writer: the backend reports the actual length, the
 engine applies it. Chain length cannot move above the seam, because it is a
 device result.
+
+The same four-stage read of `executor/dsv4.rs` (650 lines) found the same
+shape — the same delegation to a model module, the same graph path
+(`try_graph_decode_c1`, 114 lines, against `try_graph_decode_paged`, 122), the
+same submit tree. The boundary is therefore not overfitted to one model, which
+was the open risk in deriving it from qwen35 alone.
+
+DSv4 also carries a working prototype of the type this plan is built around:
+`Dsv4DecodeBatch` (`crates/infer-cuda/src/dsv4/kv_contract.rs:14`) is a pure
+host batch — slot ids, tokens, start positions, positions, rows — with a KV
+view built from it. Qwen35 has no equivalent and rebuilds device-bound
+`PageMeta` per call.
+
+Two types are still missing, both on the request axis:
+
+1. **Stage 2's output.** There is no host geometry descriptor.
+   `build_prefill_geometry` returns `(PageMeta, Option<Qwen35CpPrefill>)`, both
+   device-bound: the host arithmetic (slices, q/k positions, kv indices) is
+   uploaded the moment it is computed, so it is never a value anything else can
+   see or test. `Dsv4DecodeBatch` is the shape this type should take.
+2. **Stage 4's output.** Nothing carries "the shape is settled".
+   `dispatch_decode_rows` computes the batched/gate decision and matches on it
+   immediately; the capturable test inside `try_graph_decode_paged` is inline.
+   Kernel selection has no result type, which is why kernel choice and kernel
+   launch cannot be tested apart.
 
 The audit also found that the Metal backend never calls
 `KvBatchDescriptor::from_plan` at all; it reads the pool directly
