@@ -202,7 +202,7 @@ case "$cmd" in
     remote="$NODE_TREE.build-$op.argv"
     push_or_die "$tmp" "$remote"
     pod_remote="$(pod_path "$remote")"
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-build.sh' build '$label' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' ${ARLE_BUNDLE_DONOR:+ARLE_BUNDLE_DONOR='$ARLE_BUNDLE_DONOR' }setsid bash '$TREE/scripts/pod-remote-build.sh' build '$label' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
     echo "build '$label' launched; receipt: build:$label"
     ;;
   run)
