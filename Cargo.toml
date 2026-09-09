@@ -19,6 +19,7 @@ members = [
     "crates/infer-metal",
     "crates/infer-moe",
     "crates/infer-plan",
+    "crates/infer-quant",
     "crates/infer-seam",
     "crates/infer-server",
     "crates/infer-topo",

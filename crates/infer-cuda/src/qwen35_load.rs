@@ -2,7 +2,7 @@ use anyhow::{Context as _, bail};
 use safetensors::SafeTensors;
 
 use crate::loader::{float_elem_size, tensor_bytes_to_f32};
-use crate::quant_format::{QuantFormat, ScaleApply};
+use infer_quant::{QuantFormat, ScaleApply};
 
 use super::*;
 

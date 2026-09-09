@@ -18,6 +18,7 @@ deepseek-spec = { path = "../deepseek-spec", optional = true }
 half = { version = "2.4", features = ["num-traits"], optional = true }
 infer-moe = { path = "../infer-moe" }
 infer-plan = { path = "../infer-plan" }
+infer-quant = { path = "../infer-quant" }
 infer-seam = { path = "../infer-seam" }
 infer-topo = { path = "../infer-topo" }
 kv-native-sys = { path = "../kv-native-sys" }

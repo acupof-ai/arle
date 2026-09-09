@@ -5,13 +5,13 @@ use safetensors::tensor::Dtype;
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScaleApply {
+pub enum ScaleApply {
     Multiply,
     Divide,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum QuantFormat {
+pub enum QuantFormat {
     DenseBf16,
     DenseF32,
     Fp8BlockScaled {
@@ -44,13 +44,13 @@ pub(crate) enum QuantFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TensorHeader {
+pub struct TensorHeader {
     pub dtype: Dtype,
     pub shape: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct QuantTensorView {
+pub struct QuantTensorView {
     pub name: String,
     pub logical_shape: Vec<usize>,
     pub storage_dtype: Dtype,
@@ -59,7 +59,7 @@ pub(crate) struct QuantTensorView {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-pub(crate) struct QuantManifest {
+pub struct QuantManifest {
     pub quant_method: Option<String>,
     pub fmt: Option<String>,
     pub format: Option<String>,
@@ -71,7 +71,7 @@ pub(crate) struct QuantManifest {
 }
 
 impl QuantManifest {
-    pub(crate) fn ignored(&self, tensor_name: &str) -> bool {
+    pub fn ignored(&self, tensor_name: &str) -> bool {
         self.modules_to_not_convert
             .iter()
             .chain(self.ignore.iter())
@@ -79,7 +79,7 @@ impl QuantManifest {
     }
 }
 
-pub(crate) fn read_quant_manifest(model_path: &Path) -> Result<Option<QuantManifest>> {
+pub fn read_quant_manifest(model_path: &Path) -> Result<Option<QuantManifest>> {
     let config_path = model_path.join("config.json");
     let content = fs::read_to_string(&config_path)
         .with_context(|| format!("read quant manifest config {}", config_path.display()))?;
@@ -96,7 +96,7 @@ pub(crate) fn read_quant_manifest(model_path: &Path) -> Result<Option<QuantManif
     ))
 }
 
-pub(crate) fn detect_quant_format(
+pub fn detect_quant_format(
     name: &str,
     tensors: &BTreeMap<String, TensorHeader>,
     manifest: Option<&QuantManifest>,
@@ -348,7 +348,7 @@ pub(crate) fn detect_quant_format(
     Ok(Some(view))
 }
 
-pub(crate) fn validate_scale_shapes(
+pub fn validate_scale_shapes(
     view: &QuantTensorView,
     tensors: &BTreeMap<String, TensorHeader>,
 ) -> Result<()> {
@@ -575,7 +575,7 @@ pub(crate) fn validate_scale_shapes(
     }
 }
 
-pub(crate) fn decode_f8_e4m3fn(byte: u8) -> f32 {
+pub fn decode_f8_e4m3fn(byte: u8) -> f32 {
     let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
     let exp = (byte >> 3) & 0x0f;
     let mant = byte & 0x07;
@@ -611,7 +611,7 @@ fn fp4_logical_shape(name: &str, storage_shape: &[usize]) -> Result<Vec<usize>> 
     Ok(vec![storage_shape[0], storage_shape[1] * 2])
 }
 
-pub(crate) fn reject_dsv4_e8m0_scale_abi(
+pub fn reject_dsv4_e8m0_scale_abi(
     name: &str,
     tensors: &BTreeMap<String, TensorHeader>,
 ) -> Result<()> {

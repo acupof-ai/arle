@@ -1588,6 +1588,7 @@ dependencies = [
  "half",
  "infer-moe",
  "infer-plan",
+ "infer-quant",
  "infer-seam",
  "infer-topo",
  "kv-native-sys",
@@ -1650,6 +1651,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "infer-quant"
+version = "0.5.8"
+dependencies = [
+ "anyhow",
+ "safetensors",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

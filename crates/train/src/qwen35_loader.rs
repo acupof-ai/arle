@@ -1107,7 +1107,7 @@ fn plan_fp8_cuda_frozen_base(
     let per_channel_name = format!("{base}.weight_scale");
 
     // compressed-tensors per-channel FP8 is block-scaled with block [1, K] --
-    // the same reuse the serving path makes in infer-cuda/src/quant_format.rs,
+    // the same reuse the serving path makes in infer-quant/src/lib.rs,
     // so no new format is involved here either.
     let (scale_name, block_m, block_k) = if hf_name_to_shard.contains_key(&block_scaled_name) {
         (block_scaled_name, QWEN36_FP8_BLOCK_M, QWEN36_FP8_BLOCK_K)
