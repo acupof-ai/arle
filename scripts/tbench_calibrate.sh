@@ -34,6 +34,7 @@ OPENAI_API_BASE=http://127.0.0.1:$PORT/v1 OPENAI_API_KEY=dummy NO_PROXY=127.0.0.
 R=$(ls -td $WORK/run/*/ 2>/dev/null | head -1)
 $PY $ROOT/scripts/filter_inband.py "$R/results.json" $POOL $WORK/calib > $WORK/band.txt 2>&1
 # -x matches the comm exactly: pkill -f on the serve cmdline also kills
-# profiler wrappers (nsys) whose own cmdline embeds it.
-for p in $(pgrep -x arle 2>/dev/null); do tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -qE -- "--port $PORT([[:space:]]|$)" && kill "$p" 2>/dev/null; done
+# profiler wrappers (nsys) whose own cmdline embeds it. SIGKILL — serve
+# ignores SIGTERM.
+for p in $(pgrep -x arle 2>/dev/null); do tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -qE -- "--port $PORT([[:space:]]|$)" && kill -9 "$p" 2>/dev/null; done
 echo "CALIB_DONE $(date -u)"; cat $WORK/band.txt
