@@ -325,9 +325,21 @@ struct RawDraftConfig {
     num_key_value_heads: usize,
     head_dim: usize,
     rms_norm_eps: f64,
-    rope_theta: f64,
+    // transformers 5.x exports nest this under `rope_parameters`; older drafts
+    // keep it top-level. Fallback default matches every shipped Qwen3 config.
+    #[serde(default)]
+    rope_theta: Option<f64>,
+    #[serde(default)]
+    rope_parameters: Option<RawMtpRopeParams>,
     block_size: Option<usize>,
-    dflash_config: RawDflashConfig,
+    // z-lab DFlash exports nest these under `dflash_config`; the r3lax DSpark
+    // export flattens them to the top level. Accept either.
+    #[serde(default)]
+    dflash_config: Option<RawDflashConfig>,
+    #[serde(default)]
+    mask_token_id: Option<u32>,
+    #[serde(default)]
+    target_layer_ids: Option<Vec<usize>>,
     quantization: Option<RawDraftQuantConfig>,
     quantization_config: Option<RawDraftQuantConfig>,
 }
@@ -434,6 +446,23 @@ impl DFlashDraftConfig {
         let raw: RawDraftConfig = serde_json::from_str(config_text)
             .with_context(|| format!("cannot parse {}", config_path.display()))?;
         let quantization = raw_quant(raw.quantization, raw.quantization_config);
+        let rope_theta = raw
+            .rope_theta
+            .or_else(|| raw.rope_parameters.as_ref().map(|r| r.rope_theta))
+            .unwrap_or(1_000_000.0); // every shipped Qwen3 config uses 1e6
+        let (mask_token_id, target_layer_ids) = raw
+            .dflash_config
+            .map(|c| (c.mask_token_id, c.target_layer_ids))
+            .or_else(|| {
+                raw.mask_token_id
+                    .zip(raw.target_layer_ids.clone())
+            })
+            .with_context(|| {
+                format!(
+                    "{}: draft config has neither dflash_config nor top-level mask_token_id/target_layer_ids",
+                    config_path.display()
+                )
+            })?;
         Ok(Self {
             draft_kind: DraftKind::DFlashEagle,
             hidden_size: raw.hidden_size,
@@ -444,10 +473,10 @@ impl DFlashDraftConfig {
             rotary_dim: raw.head_dim,
             attn_output_gate: false,
             rms_norm_eps: raw.rms_norm_eps as f32,
-            rope_theta: raw.rope_theta as f32,
+            rope_theta: rope_theta as f32,
             block_size: raw.block_size.unwrap_or(16),
-            mask_token_id: raw.dflash_config.mask_token_id,
-            target_layer_ids: raw.dflash_config.target_layer_ids,
+            mask_token_id,
+            target_layer_ids,
             quantization,
         })
     }
@@ -1243,9 +1272,16 @@ pub(crate) fn prepare_draft_block(
                 );
             }
             let draft_tokens = &draft_tokens[..runtime.block_size];
-            let mut block = Vec::with_capacity(runtime.block_size + 1);
+            // The verify kernel takes exactly block_size tokens — [real,
+            // d1..d_{bs-1}] — and verifies block_size-1 drafts; the Markov head
+            // produces block_size drafts, so verify the first block_size-1.
+            let mut block = Vec::with_capacity(runtime.block_size);
             block.push(current_token);
-            block.extend(draft_tokens.iter().map(|&t| t as u32));
+            block.extend(
+                draft_tokens[..runtime.block_size - 1]
+                    .iter()
+                    .map(|&t| t as u32),
+            );
             // Reset (not trim+window): stale draft KV from previous blocks
             // causes acceptance to degrade over long generations.
             draft_state.reset();
@@ -1306,10 +1342,19 @@ pub(crate) fn prepare_draft_block(
             runtime.block_size
         };
         let draft_tokens = &draft_tokens[..actual_bs];
-        // The verify block is [real, d1..d_actual_bs] — actual_bs+1 tokens.
-        let mut block = Vec::with_capacity(actual_bs + 1);
+        // The verify kernel takes exactly block_size tokens — [real,
+        // d1..d_{bs-1}] — and verifies block_size-1 drafts. The Markov head
+        // produces block_size drafts; verify the first block_size-1 and pad
+        // any confidence-truncated tail with the last draft token (padding
+        // cannot extend the matched prefix past the real drafts). The full
+        // block_size+1 verify needs a variable-length kernel — follow-up.
+        let verified = draft_tokens.len().min(runtime.block_size - 1);
+        let mut block = Vec::with_capacity(runtime.block_size);
         block.push(current_token);
-        block.extend(draft_tokens.iter().map(|&t| t as u32));
+        block.extend(draft_tokens[..verified].iter().map(|&t| t as u32));
+        while block.len() < runtime.block_size {
+            block.push(*block.last().unwrap());
+        }
         // Reset (not trim+window): stale draft KV from previous blocks
         // causes acceptance to degrade over long generations.
         draft_state.reset();
