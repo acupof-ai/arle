@@ -52,33 +52,48 @@ root = os.fsencode(os.path.abspath(sys.argv[1]))
 def git(*args):
     return subprocess.check_output([b"git", b"-C", root, *args])
 
-paths = set(git(b"ls-tree", b"-rz", b"--name-only", b"HEAD").split(b"\0"))
-if os.environ.get("CLEAN"):
-    # Clean sync: committed files + the gitignored AOT bundle, no working-tree
-    # changes. Matches the `git archive HEAD` + generated/ tarball pod.sh ships.
+clean = bool(os.environ.get("CLEAN"))
+paths = set()
+committed = {}
+if clean:
+    # The clean sync ships `git archive HEAD`; hash git's content identity
+    # (blob hash) for committed files, not the working tree, so an uncommitted
+    # change (delete, rename, edit) cannot move the digest. generated/ is
+    # gitignored, so it stays content-addressed from the working tree.
+    for entry in git(b"ls-tree", b"-rz", b"HEAD").split(b"\0"):
+        if not entry: continue
+        meta, name = entry.split(b"\t", 1)
+        mode, _typ, blob = meta.split()
+        committed[name] = (mode, blob)
+        paths.add(name)
     gen = os.path.join(root, b"crates/cuda-kernels/generated")
     if os.path.isdir(gen):
         for dirpath, _, filenames in os.walk(gen):
             for fn in filenames:
                 paths.add(os.path.relpath(os.path.join(dirpath, fn), root))
 else:
+    paths.update(git(b"ls-tree", b"-rz", b"--name-only", b"HEAD").split(b"\0"))
     paths.update(git(b"ls-files", b"-co", b"--exclude-standard", b"-z").split(b"\0"))
 paths.discard(b"")
 paths.discard(b".arle-source-receipt")
 digest = hashlib.sha256()
 for path in sorted(paths):
-    full = os.path.join(root, path)
     digest.update(len(path).to_bytes(8, "big")); digest.update(path)
+    if clean and path in committed:
+        mode, blob = committed[path]
+        digest.update(b"G"); digest.update(mode); digest.update(blob)
+        continue
+    full = os.path.join(root, path)
     try:
-        mode = os.lstat(full).st_mode
+        st = os.lstat(full).st_mode
     except FileNotFoundError:
         digest.update(b"D")
         continue
-    if stat.S_ISLNK(mode):
+    if stat.S_ISLNK(st):
         data = os.fsencode(os.readlink(full)); kind = b"L"
-    elif stat.S_ISREG(mode):
+    elif stat.S_ISREG(st):
         with open(full, "rb") as f: data = f.read()
-        kind = b"X" if mode & 0o111 else b"F"
+        kind = b"X" if st & 0o111 else b"F"
     else:
         continue
     digest.update(kind); digest.update(len(data).to_bytes(8, "big")); digest.update(data)
