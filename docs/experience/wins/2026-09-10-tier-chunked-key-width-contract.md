@@ -35,6 +35,20 @@ is what surfaced the contract.
   wrong KV pages into attention with no error. `MANIFEST_MAGIC` bumps
   V2→V3, so a store written under the old width cold-starts instead of
   serving mixed-width records.
+- **The source mask has a cost, and it is backstopped, not free.**
+  `prefix_block_content_key` feeds both the chunked prefix stores and
+  the non-chunked page store (`tier_key(NS_PAGE, key)`), so masking at
+  the source narrows the page path from 56 to 40 bits too. Birthday
+  collisions rise by 2^16: ~0.78 expected colliding pairs in a 131k-page
+  Metal store (32 GB budget) versus ~1e-7 at 56 bits; ~0.09% in a 44k-page
+  DSv4 1 TB tier. The absolute risk lands on the one path without a key
+  check, which is why the page-payload key validation is the immediate
+  follow-up: once a wrong key is a reported error instead of a wrong KV
+  page, the residual cost of 40 bits is a spurious recompute, not silent
+  corruption. (Masking only at the chunked API entry would keep the page
+  path at 56 bits, at the cost of masks in five store functions; the
+  source mask was the smaller diff and the key validation makes the
+  width choice benign.)
 
 ## Rule
 
@@ -47,6 +61,10 @@ collision probability is small enough: a silent wrong KV page is worse
 than a cold start.
 
 ## Net
+
+No baseline: the collision figures are a birthday-paradox analysis over the
+stated store sizes, not a measurement; the test counts and diff stat are
+mechanical facts.
 
 3 files, +27/-8. kv-native-sys 7/7, infer-seam 8/8, infer-kvspace 12/12
 green; Mac CUDA clippy gate exit 0.
