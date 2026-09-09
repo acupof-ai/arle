@@ -511,9 +511,9 @@ enum EngineMode {
 ///
 /// Prefix reuse is host-indexed: the engine carries token blocks and page ids,
 /// while executor/model-specific storage stays below the seam.
-pub struct Engine<E: BackendExecutor, K: KvPool> {
-    executor: E,
-    kv: K,
+pub struct Engine {
+    executor: Box<dyn BackendExecutor>,
+    kv: Box<dyn KvPool>,
     config: SchedulerConfig,
     max_tokens_per_step: usize,
     governor: Box<dyn ResourceGovernor>,
@@ -522,7 +522,7 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     active: BTreeMap<usize, RequestState>,
     waiting: VecDeque<RequestState>,
     completed: BTreeMap<RequestHandle, CompletedRequest>,
-    inflight: Option<E::Inflight>,
+    inflight: Option<Box<dyn std::any::Any + Send>>,
     /// Wall clock captured just before the in-flight forward's `submit`, consumed
     /// when its `poll` returns Ready to accrue [`ENGINE_FORWARD_BUSY_MICROS`].
     inflight_submit_at: Option<std::time::Instant>,
@@ -561,16 +561,20 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
 /// to its request. The seam a serving layer installs to stream tokens live.
 pub type TokenObserver = Box<dyn FnMut(RequestHandle, &SlotToken)>;
 
-impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
+impl Engine {
     /// Create an engine with explicit scheduler config.
-    pub fn with_config(executor: E, kv: K, config: SchedulerConfig) -> Result<Self> {
+    pub fn with_config(
+        executor: Box<dyn BackendExecutor>,
+        kv: Box<dyn KvPool>,
+        config: SchedulerConfig,
+    ) -> Result<Self> {
         Self::with_config_and_governor(executor, kv, config, Box::new(PermissiveGovernor))
     }
 
     /// Create an engine with explicit scheduler config and resource governor.
     pub fn with_config_and_governor(
-        mut executor: E,
-        kv: K,
+        mut executor: Box<dyn BackendExecutor>,
+        kv: Box<dyn KvPool>,
         mut config: SchedulerConfig,
         governor: Box<dyn ResourceGovernor>,
     ) -> Result<Self> {
@@ -581,7 +585,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 executor.kv_slot_tier().is_some(),
                 "--kv-oversubscription is set, but backend {} has no whole-slot \
                  KV tier, so the flag would do nothing",
-                std::any::type_name::<E>()
+                executor.name()
             );
         }
         let limits = executor.step_limits();
@@ -651,8 +655,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// forward, weight offload/reload, LoRA re-merge) against the executor
     /// between scheduler steps. Not for the request hot path — the scheduler
     /// drives the executor through [`Engine::step`].
-    pub fn executor_mut(&mut self) -> &mut E {
-        &mut self.executor
+    pub fn executor_mut(&mut self) -> &mut dyn BackendExecutor {
+        &mut *self.executor
     }
 
     /// Frontend live-request capacity requested by the backend executor.
@@ -888,7 +892,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             eprintln!("[STEP-DIAG] SUBMIT plan mode={:?}", plan.mode);
         }
         let submit_at = std::time::Instant::now();
-        self.inflight = Some(self.executor.submit(&plan, &mut self.kv)?);
+        self.inflight = Some(self.executor.submit(&plan, &mut *self.kv)?);
         self.inflight_submit_at = Some(submit_at);
         phase!(5);
         let decode_only = plan.prefill_rows.is_empty() && applied_decode_only;
@@ -1547,7 +1551,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 let committed = candidate.committed_cow();
                 let matched = self.radix.peek_longest_prefix_match(&committed);
                 Self::clamp_prefix_to_backend(
-                    &mut self.executor,
+                    &mut *self.executor,
                     self.radix.block_size(),
                     matched,
                     &committed,

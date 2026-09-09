@@ -18,7 +18,6 @@ use infer_core::{
     RequestOptions, ThroughputStats,
 };
 use infer_plan::SamplingParams;
-use infer_seam::{BackendExecutor, KvPool};
 
 use crate::ServeShutdown;
 
@@ -66,10 +65,7 @@ pub struct CounterSnapshot {
 
 type CounterHandle = Arc<Mutex<CounterSnapshot>>;
 
-fn publish_counters<E: BackendExecutor, K: KvPool>(
-    engine: &Engine<E, K>,
-    counters: &CounterHandle,
-) {
+fn publish_counters(engine: &Engine, counters: &CounterHandle) {
     if let Ok(mut snap) = counters.lock() {
         let stats = engine.backend_stats();
         snap.active_requests = engine.active_count();
@@ -89,12 +85,12 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
 ///
 /// The OPD control surface (raw-logits forward, weight offload/reload, student
 /// LoRA re-merge + prefix-cache invalidation) reaches the thread-owned
-/// `&mut Engine<E, K>` through these between steps, off the request hot path. The
+/// `&mut Engine` through these between steps, off the request hot path. The
 /// closure gets the whole engine (scheduler + RadixCache + executor), so a
 /// resident-weight re-merge can drop the now-stale prefix cache atomically in one
 /// message. The closure carries its own response channel, so the loop body only
 /// has to invoke it.
-pub(crate) type ControlMessage<E, K> = Box<dyn FnOnce(&mut Engine<E, K>) + Send>;
+pub(crate) type ControlMessage = Box<dyn FnOnce(&mut Engine) + Send>;
 
 pub(crate) struct Submission {
     pub(crate) prompt: Vec<u32>,
@@ -109,16 +105,13 @@ pub(crate) struct Submission {
     pub(crate) grammar: Option<infer_core::GrammarHook>,
 }
 
-pub(crate) fn engine_loop<E, K>(
-    mut engine: Engine<E, K>,
+pub(crate) fn engine_loop(
+    mut engine: Engine,
     submit_rx: Receiver<Submission>,
-    control_rx: Receiver<ControlMessage<E, K>>,
+    control_rx: Receiver<ControlMessage>,
     counters: CounterHandle,
     shutdown: ServeShutdown,
-) where
-    E: BackendExecutor,
-    K: KvPool,
-{
+) {
     // Per-request completion back-channels, keyed by the engine-assigned handle.
     // Entries are removed as their completion is delivered.
     let mut pending: PendingCompletions = std::collections::HashMap::new();
@@ -296,14 +289,7 @@ pub(crate) fn engine_loop<E, K>(
 /// blocking, returning how many ran. Each closure carries its own response
 /// channel, so the loop only invokes it. A disconnected channel is benign (the
 /// frontend dropped its `ServeHandle`); the loop's normal shutdown path still runs.
-fn drain_control<E, K>(
-    engine: &mut Engine<E, K>,
-    control_rx: &Receiver<ControlMessage<E, K>>,
-) -> usize
-where
-    E: BackendExecutor,
-    K: KvPool,
-{
+fn drain_control(engine: &mut Engine, control_rx: &Receiver<ControlMessage>) -> usize {
     let mut ran = 0;
     while let Ok(closure) = control_rx.try_recv() {
         closure(engine);
@@ -317,15 +303,12 @@ fn abort_pending(pending: &mut PendingCompletions, streamers: &Streamers) {
     streamers.borrow_mut().clear();
 }
 
-fn admit_submission<E, K>(
-    engine: &mut Engine<E, K>,
+fn admit_submission(
+    engine: &mut Engine,
     pending: &mut PendingCompletions,
     streamers: &Streamers,
     submission: Submission,
-) where
-    E: BackendExecutor,
-    K: KvPool,
-{
+) {
     let handle = engine.submit_request_with_options(
         submission.prompt,
         submission.max_tokens,
@@ -349,14 +332,7 @@ fn admit_submission<E, K>(
     }
 }
 
-fn deliver_completions<E, K>(
-    engine: &Engine<E, K>,
-    pending: &mut PendingCompletions,
-    streamers: &Streamers,
-) where
-    E: BackendExecutor,
-    K: KvPool,
-{
+fn deliver_completions(engine: &Engine, pending: &mut PendingCompletions, streamers: &Streamers) {
     if pending.is_empty() {
         return;
     }

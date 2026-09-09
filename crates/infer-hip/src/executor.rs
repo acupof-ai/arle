@@ -72,8 +72,6 @@ impl HipDsv4Executor {
 }
 
 impl BackendExecutor for HipDsv4Executor {
-    type Inflight = HipInflight;
-
     fn prefix_reuse(&mut self) -> Option<&mut dyn infer_seam::PrefixReuse> {
         // Written opt-out: HIP DSv4 stores the real restore state in per-slot
         // arenas (`slot.sw_window_ring`, compressor/indexer buffers, and
@@ -83,9 +81,15 @@ impl BackendExecutor for HipDsv4Executor {
         None
     }
 
-    fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<HipInflight> {
+    fn submit(
+        &mut self,
+        plan: &ForwardPlan,
+        kv: &mut dyn KvPool,
+    ) -> Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
-            return Ok(HipInflight::Ready(StepOutput { tokens: Vec::new() }));
+            return Ok(Box::new(HipInflight::Ready(StepOutput {
+                tokens: Vec::new(),
+            })));
         }
         let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
         ensure!(
@@ -108,7 +112,7 @@ impl BackendExecutor for HipDsv4Executor {
                 &row.params,
                 position,
             )?;
-            return Ok(HipInflight::Ready(StepOutput {
+            return Ok(Box::new(HipInflight::Ready(StepOutput {
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -116,7 +120,7 @@ impl BackendExecutor for HipDsv4Executor {
                     top_logprobs: Vec::new(),
                     finish: None,
                 }],
-            }));
+            })));
         }
         if let Some(row) = plan.decode_rows.first() {
             let epoch = kv.slot_epoch(row.slot);
@@ -129,7 +133,7 @@ impl BackendExecutor for HipDsv4Executor {
                 &row.params,
                 position,
             )?;
-            return Ok(HipInflight::Ready(StepOutput {
+            return Ok(Box::new(HipInflight::Ready(StepOutput {
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -137,15 +141,29 @@ impl BackendExecutor for HipDsv4Executor {
                     top_logprobs: Vec::new(),
                     finish: None,
                 }],
-            }));
+            })));
         }
         bail!("HIP DSv4 executor received a non-idle plan with no rows")
     }
 
-    fn poll(&mut self, inflight: HipInflight) -> Result<PollResult<HipInflight>> {
-        match inflight {
+    fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> Result<PollResult> {
+        let inflight = *inflight.downcast::<HipInflight>().unwrap_or_else(|wrong| {
+            panic!(
+                "hip executor poll received foreign inflight type: {}",
+                std::any::type_name_of_val(&*wrong)
+            )
+        });
+        match *inflight {
             HipInflight::Ready(output) => Ok(PollResult::Ready(output)),
         }
+    }
+
+    fn name(&self) -> &'static str {
+        "hip"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn model_stop_token_ids(&self) -> Vec<u32> {
