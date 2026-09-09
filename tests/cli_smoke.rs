@@ -19,7 +19,7 @@ fn root_help_mentions_explicit_run_entrypoint() {
     assert!(help.contains("run"));
     assert!(help.contains("serve"));
     assert!(help.contains("Start the interactive agent REPL."));
-    assert!(help.contains("Start the OpenAI-compatible server."));
+    assert!(help.contains("Serve over the Anthropic and OpenAI APIs."));
     assert!(help.contains("Explicit alias for the interactive agent REPL."));
     assert!(help.contains("arle --doctor"));
     assert!(help.contains("arle train opd --smoke --steps 5"));
@@ -57,7 +57,7 @@ fn serve_help_exposes_unified_server_frontdoor() {
     let help = stdout(&output);
     assert!(help.contains("--backend"));
     assert!(help.contains("--model-path"));
-    assert!(help.contains("OpenAI-compatible serving"));
+    assert!(help.contains("Anthropic Messages and OpenAI APIs"));
     assert!(help.contains("arle serve --backend metal"));
 }
 
