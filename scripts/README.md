@@ -167,7 +167,8 @@ GPU gate manually per target and hand `qualify-publish` the aggregated fragments
 | `ci-fmt-check-changed.sh` | CI rustfmt check on changed files. |
 | `ci-patch-tvm-ffi.sh` | CI TVM FFI patch. |
 | `pre_push_checks.sh` | Pre-push validation checks. |
-| `check_repo_hygiene.py` | Repo hygiene checker (wins cap, frozen archive seal, etc.). |
+| `check_repo_hygiene.py` | Repo hygiene checker (wins cap, frozen archive seal, etc.). `--selftest` runs every git-backed check against a broken copy of its real artifact and fails if the check passes there. |
+| `prereg.py` | Pre-registration ledger: `start` writes the hypothesis before the run, `done` closes it with result / finding / decision. A row left running past 24h fails hygiene. |
 | `clean_repo.py` | Sweep untracked build/run residue; dry-run by default, `--apply` to delete. |
 | `archive_experience.py` | Seal wins/errors entries into the frozen archive with link repair and manifest update. |
 | `pick-gpu.sh` | GPU selection helper. |

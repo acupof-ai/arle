@@ -76,6 +76,12 @@ toolkit probe):
 Run it before pushing any `infer-cuda` / `cuda-kernels` / cuda-gated `cli`
 edit; `metal,no-cuda` and plain `cargo check` never see those lints.
 
+**Every bench run is pre-registered.** `scripts/prereg.py start --name … --cmd … --hypothesis …`
+before the run; `done --result --finding --decision` after. `result` is the number,
+`finding` is what it means, `decision` is what changes. A row left running past 24h
+fails hygiene. The wins/errors entry is written after the fact and cannot constrain
+what the run was for; the prereg row can.
+
 **Every runtime change produces a bench entry.** A dated entry under
 `docs/experience/wins/` (or `errors/` on regression) — no entry, not shipped. In
 scope: `crates/infer-*/src/`, `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/`,
@@ -119,7 +125,8 @@ refactors (collapse duplicates, converge on one flow) over layering adapters.
 **Phases** (non-trivial tasks): Explore until you can name every file you will
 touch → Plan (accepted in writing; >5 files or irreversible → stop and flag) →
 Implement (compiles, simplify pass on the diff) → Verify (`cargo test
---workspace`, `cargo clippy -- -D warnings`, bench entry) → Reflect (bug that
+--workspace`, `cargo clippy -- -D warnings`, `python3 scripts/check_repo_hygiene.py
+--selftest`, bench entry) → Reflect (bug that
 took >1 attempt → `docs/experience/errors/`; user correction → feedback memory).
 Trivial → Implement + Verify.
 

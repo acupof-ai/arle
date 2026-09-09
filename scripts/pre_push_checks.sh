@@ -79,6 +79,7 @@ done
 # --- Fast checks (parallel with cargo) ------------------------------------
 run_fast_checks() {
     run python3 scripts/check_repo_hygiene.py
+    run python3 scripts/check_repo_hygiene.py --selftest
     run cargo fmt --all -- --check
     for test in \
         test_cuda_prebuilt_export.sh \
