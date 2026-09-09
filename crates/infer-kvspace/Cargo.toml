@@ -1,0 +1,13 @@
+[package]
+name = "infer-kvspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+half = "2.4"
+
+[lints]
+workspace = true

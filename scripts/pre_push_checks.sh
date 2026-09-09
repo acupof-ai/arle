@@ -140,7 +140,7 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     run cargo clippy -p train --features no-cuda --lib -- -D warnings
     run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys -p infer-quant
     run cargo test \
-        -p infer-core -p infer-server -p infer-plan -p infer-seam \
+        -p infer-core -p infer-server -p infer-plan -p infer-kvspace -p infer-seam \
         -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
     run cargo clippy -p kv-native-sys --all-targets -- -D warnings
 

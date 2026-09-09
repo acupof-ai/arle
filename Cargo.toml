@@ -16,6 +16,7 @@ members = [
     "crates/infer-cuda",
     "crates/infer-gguf",
     "crates/infer-hip",
+    "crates/infer-kvspace",
     "crates/infer-metal",
     "crates/infer-moe",
     "crates/infer-plan",

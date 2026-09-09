@@ -33,7 +33,7 @@ Current workspace members (ownership and boundaries are listed in
 [architecture.md §Package Boundaries](architecture.md#package-boundaries)):
 
 - workspace root package `arle` (produces the `arle` binary)
-- **runtime crate graph:** `crates/infer-plan`, `crates/infer-quant`, `crates/infer-seam`,
+- **runtime crate graph:** `crates/infer-plan`, `crates/infer-kvspace`, `crates/infer-quant`, `crates/infer-seam`,
  `crates/infer-core`, `crates/infer-cuda`, `crates/infer-metal`,
  `crates/infer-hip`, `crates/infer-vulkan`,
  `crates/infer-server`, `crates/infer-api`, `crates/infer-topo`,
