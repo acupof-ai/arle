@@ -1126,7 +1126,7 @@ mod cuda {
             // by the multiproc coordinator/launcher before this runs. On a
             // single GPU (world_size==1) it loads as one rank. DSv4 owns its
             // MLA KV state inside the forward, so the host `CudaKvPool` is
-            // only present to satisfy the `submit(.., &mut dyn KvPool)`
+            // only present to satisfy the `submit(.., &KvBatchDescriptor, &mut dyn KvSlotAccounting)`
             // signature; `max_seq_len` is `config.max_total_tokens` — the same
             // global cap `--max-total-tokens` sets for every backend (DSv4
             // multiproc auto-resolves it from the checkpoint's

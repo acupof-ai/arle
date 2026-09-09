@@ -15,8 +15,8 @@ use radix::{BlockId, PrefixMatch, RadixCache};
 use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
-    AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvPool, PermissiveGovernor, PollResult,
-    ResourceGovernor, StepBudget,
+    AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvAllocator, KvBatchDescriptor, KvPool,
+    PermissiveGovernor, PollResult, ResourceGovernor, StepBudget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -892,7 +892,8 @@ impl Engine {
             eprintln!("[STEP-DIAG] SUBMIT plan mode={:?}", plan.mode);
         }
         let submit_at = std::time::Instant::now();
-        self.inflight = Some(self.executor.submit(&plan, &mut *self.kv)?);
+        let batch = KvBatchDescriptor::from_plan(&plan, &*self.kv)?;
+        self.inflight = Some(self.executor.submit(&plan, &batch, &mut *self.kv)?);
         self.inflight_submit_at = Some(submit_at);
         phase!(5);
         let decode_only = plan.prefill_rows.is_empty() && applied_decode_only;
@@ -1273,7 +1274,7 @@ impl Engine {
                 && self.active.contains_key(&row.slot)
                 && self.kv.seq_len(row.slot) > committed_len
             {
-                self.kv.truncate_slot(row.slot, committed_len)?;
+                KvAllocator::truncate_slot(&mut *self.kv, row.slot, committed_len)?;
             }
         }
 

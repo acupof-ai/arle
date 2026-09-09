@@ -1,5 +1,5 @@
 //! [`CudaKvPool`] is the CUDA name for the backend-neutral host page manager
-//! implementing the [`KvPool`] seam. It is the SINGLE page allocator for the
+//! implementing the `KvPool` seam. It is the SINGLE page allocator for the
 //! Qwen-dense paged path: the executor lowers each scheduled row's host page
 //! table into the device pool (`TokenKVPool::mirror_slot`), which is what makes
 //! radix prefix attach serve real device KV. [`CudaExecutor`] implements
@@ -16,7 +16,8 @@ use std::path::Path;
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{
-    BackendExecutor, HostPagedKvPool, KvPool, KvTierLocation, PollResult, PrefixBlock,
+    BackendExecutor, HostPagedKvPool, KvBatchDescriptor, KvSlotAccounting, KvTierLocation,
+    PollResult, PrefixBlock,
 };
 
 #[cfg(feature = "cuda")]
@@ -540,12 +541,13 @@ impl BackendExecutor for CudaExecutor {
     fn submit(
         &mut self,
         plan: &ForwardPlan,
-        _kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
+        kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         let output = match &mut self.inner {
             CudaExecutorInner::Placeholder => Self::placeholder_forward(plan),
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.submit(plan, _kv)?,
+            CudaExecutorInner::Real(real) => real.submit(plan, batch, kv)?,
         };
         Ok(Box::new(CudaInflight { output }))
     }

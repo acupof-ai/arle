@@ -12,7 +12,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult, PrefixBlock};
+use infer_seam::{
+    BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult, PrefixBlock,
+};
 
 #[cfg(feature = "metal")]
 use crate::{config, dflash, lfm2, mlx, model_source, qwen35};
@@ -387,16 +389,17 @@ impl BackendExecutor for MetalExecutor {
     fn submit(
         &mut self,
         plan: &ForwardPlan,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
+        kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {
             return real
-                .submit(plan, kv)
+                .submit(plan, batch, kv)
                 .map(|i| Box::new(i) as Box<dyn std::any::Any + Send>);
         }
         #[cfg(not(feature = "metal"))]
-        let _ = kv;
+        let _ = (batch, kv);
 
         Ok(Box::new(MetalInflight::Ready(Self::placeholder_forward(
             plan,
@@ -709,20 +712,25 @@ impl RealMetalExecutor {
         Ok(())
     }
 
-    fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> anyhow::Result<MetalInflight> {
+    fn submit(
+        &mut self,
+        plan: &ForwardPlan,
+        batch: &KvBatchDescriptor,
+        _kv: &mut dyn KvSlotAccounting,
+    ) -> anyhow::Result<MetalInflight> {
         let _guard = mlx_sys::mlx_guard();
         let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
         anyhow::ensure!(row_count > 0, "R3a MetalExecutor received an idle plan");
         if !plan.prefill_rows.is_empty() && !plan.decode_rows.is_empty() {
             if self.dflash.is_some() {
-                return self.submit_dflash_mixed_rows(&plan.prefill_rows, &plan.decode_rows, kv);
+                return self.submit_dflash_mixed_rows(&plan.prefill_rows, &plan.decode_rows, batch);
             }
             anyhow::bail!("R3a MetalExecutor does not support mixed prefill/decode plans");
         }
 
         if !plan.prefill_rows.is_empty() {
             if self.dflash.is_some() && plan.prefill_rows.len() > 1 {
-                return self.submit_dflash_prefill_rows(&plan.prefill_rows, kv);
+                return self.submit_dflash_prefill_rows(&plan.prefill_rows, batch);
             }
             anyhow::ensure!(
                 plan.prefill_rows.len() == 1,
@@ -730,12 +738,12 @@ impl RealMetalExecutor {
                 plan.prefill_rows.len()
             );
             let row = &plan.prefill_rows[0];
-            return self.submit_prefill(row, kv);
+            return self.submit_prefill(row, batch);
         }
 
         if !plan.decode_rows.is_empty() {
             if self.dflash.is_some() {
-                return self.submit_dflash_decode_rows(&plan.decode_rows, kv);
+                return self.submit_dflash_decode_rows(&plan.decode_rows, batch);
             }
             anyhow::ensure!(
                 plan.decode_rows.len() == 1,
@@ -743,7 +751,7 @@ impl RealMetalExecutor {
                 plan.decode_rows.len()
             );
             let row = &plan.decode_rows[0];
-            return self.submit_decode(row, kv);
+            return self.submit_decode(row, batch);
         }
 
         anyhow::bail!("R3a MetalExecutor received a non-idle plan with no rows")
@@ -752,11 +760,11 @@ impl RealMetalExecutor {
     fn submit_dflash_prefill_rows(
         &mut self,
         rows: &[infer_plan::PrefillRow],
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<MetalInflight> {
         self.preflight_dflash_prefill_rows(rows)?;
         Ok(MetalInflight::Ready(
-            self.run_dflash_prefill_rows(rows, kv)?,
+            self.run_dflash_prefill_rows(rows, batch)?,
         ))
     }
 
@@ -764,7 +772,7 @@ impl RealMetalExecutor {
         &mut self,
         prefill_rows: &[infer_plan::PrefillRow],
         decode_rows: &[infer_plan::DecodeRow],
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<MetalInflight> {
         let runtime = self
             .dflash
@@ -777,7 +785,7 @@ impl RealMetalExecutor {
             runtime.max_rows()
         );
         self.preflight_dflash_prefill_rows(prefill_rows)?;
-        self.preflight_dflash_decode_rows(decode_rows, kv)?;
+        self.preflight_dflash_decode_rows(decode_rows, batch)?;
 
         log::info!(
             "Metal DFlash scheduler-mixed lane live: prefill_rows={}, decode_rows={}",
@@ -787,7 +795,7 @@ impl RealMetalExecutor {
         // Decode first: minimise TTFT/ITL for active decode requests before
         // running the more expensive prefill sub-steps.
         let mut tokens = self.run_dflash_decode_rows(decode_rows)?.tokens;
-        tokens.extend(self.run_dflash_prefill_rows(prefill_rows, kv)?.tokens);
+        tokens.extend(self.run_dflash_prefill_rows(prefill_rows, batch)?.tokens);
         Ok(MetalInflight::Ready(StepOutput { tokens }))
     }
 
@@ -830,7 +838,7 @@ impl RealMetalExecutor {
     fn run_dflash_prefill_rows(
         &mut self,
         rows: &[infer_plan::PrefillRow],
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<StepOutput> {
         log::info!(
             "Metal DFlash scheduler-prefill lane live: rows={} (serial prefill)",
@@ -838,7 +846,7 @@ impl RealMetalExecutor {
         );
         let mut tokens = Vec::new();
         for row in rows {
-            let output = materialize_inflight_now(self.submit_prefill(row, kv)?)?;
+            let output = materialize_inflight_now(self.submit_prefill(row, batch)?)?;
             tokens.extend(output.tokens);
         }
         Ok(StepOutput { tokens })
@@ -847,33 +855,39 @@ impl RealMetalExecutor {
     fn submit_prefill(
         &mut self,
         row: &infer_plan::PrefillRow,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<MetalInflight> {
         anyhow::ensure!(
             !row.tokens.is_empty(),
             "MetalExecutor prefill row must contain at least one token"
         );
         self.ensure_no_other_active_session(row.slot)?;
+        let brow = batch
+            .row_for_slot(row.slot)
+            .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?;
+        let epoch = brow.slot_epoch;
 
-        self.reset_slot_if_epoch_changed(row.slot, kv)?;
+        self.reset_slot_if_epoch_changed(row.slot, epoch)?;
         if !self.slots.contains_key(&row.slot) {
-            let reservation = kv
-                .seq_len(row.slot)
+            let reservation = brow
+                .seq_len
                 .max(row.total_tokens.saturating_add(512))
                 .max(row.tokens.len().saturating_add(1));
             let state = if row.start_pos == 0 {
                 MetalSlotState::new(
                     row.slot,
-                    kv.slot_epoch(row.slot),
+                    epoch,
                     &self.config,
                     self.kv_cache_dtype,
                     reservation,
                 )
             } else {
+                let slot_pages = &batch.flat_slot_page_ids[brow.slot_page_range.clone()];
                 self.page_store.materialize_slot_from_prefix(
                     row.slot,
-                    kv.slot_epoch(row.slot),
-                    kv,
+                    epoch,
+                    batch.page_size,
+                    slot_pages,
                     row.start_pos,
                     reservation,
                 )?
@@ -966,7 +980,12 @@ impl RealMetalExecutor {
         // so pages/snapshots covering generated tokens are unreachable. The old
         // decode-time publishes were a per-token O(full_pages) re-slice plus an
         // unbounded restore-snapshot leak (`prefixes` is never evicted).
-        self.page_store.publish_slot(slot, kv)?;
+        let brow = batch
+            .row_for_slot(slot.slot)
+            .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", slot.slot))?;
+        let slot_pages = &batch.flat_slot_page_ids[brow.slot_page_range.clone()];
+        self.page_store
+            .publish_slot(slot, batch.page_size, slot_pages)?;
         // A new prefill restarts this slot's token stream; any decode prequeue
         // from a prior turn is stale.
         self.pending = None;
@@ -990,10 +1009,10 @@ impl RealMetalExecutor {
     fn submit_dflash_decode_rows(
         &mut self,
         rows: &[infer_plan::DecodeRow],
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<MetalInflight> {
         self.pending = None;
-        self.preflight_dflash_decode_rows(rows, kv)?;
+        self.preflight_dflash_decode_rows(rows, batch)?;
         Ok(MetalInflight::Ready(self.run_dflash_decode_rows(rows)?))
     }
 
@@ -1036,7 +1055,7 @@ impl RealMetalExecutor {
     fn preflight_dflash_decode_rows(
         &mut self,
         rows: &[infer_plan::DecodeRow],
-        kv: &dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<()> {
         let runtime = self
             .dflash
@@ -1068,7 +1087,11 @@ impl RealMetalExecutor {
                 "Metal DFlash currently supports greedy sampling only; refusing slot {}",
                 row.slot
             );
-            self.reset_slot_if_epoch_changed(row.slot, kv)?;
+            let epoch = batch
+                .row_for_slot(row.slot)
+                .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?
+                .slot_epoch;
+            self.reset_slot_if_epoch_changed(row.slot, epoch)?;
         }
         for row in rows {
             let slot = self.slots.get(&row.slot).ok_or_else(|| {
@@ -1409,8 +1432,12 @@ impl RealMetalExecutor {
     fn submit_decode(
         &mut self,
         row: &infer_plan::DecodeRow,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<MetalInflight> {
+        let brow = batch
+            .row_for_slot(row.slot)
+            .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?;
+        let epoch = brow.slot_epoch;
         // Pipeline fast path: this step's `step_session` was already issued
         // (async) inside the previous submit, with the session left open one step
         // ahead. Drain that now-committed step, prequeue the next one, and
@@ -1424,10 +1451,10 @@ impl RealMetalExecutor {
         // into `Decoding` on a recycled slot index, which would otherwise return
         // the prior request's stale token; these checks send that case to the
         // cold path (which resets the slot and drops the stale pending).
-        if row.params.is_raw_argmax() && self.pending_matches_live_slot(row, kv) {
+        if row.params.is_raw_argmax() && self.pending_matches_live_slot(row, epoch) {
             probe_pipeline_fast_path();
             let ready = self.pending.take().expect("pending checked above");
-            self.commit_pending_then_prequeue(row, kv)?;
+            self.commit_pending_then_prequeue(row)?;
             return Ok(MetalInflight::Sampled {
                 slot: ready.slot,
                 sampled: ready.sampled,
@@ -1440,7 +1467,7 @@ impl RealMetalExecutor {
         }
 
         self.ensure_no_other_active_session(row.slot)?;
-        self.reset_slot_if_epoch_changed(row.slot, kv)?;
+        self.reset_slot_if_epoch_changed(row.slot, epoch)?;
         let model = self.weights.compiled()?;
         if !self.slots.contains_key(&row.slot) {
             anyhow::ensure!(
@@ -1448,11 +1475,13 @@ impl RealMetalExecutor {
                 "decode for slot {} before prefill with empty host prefix",
                 row.slot
             );
-            let reservation = kv.seq_len(row.slot).max(row.kv_seq_len.saturating_add(512));
+            let reservation = brow.seq_len.max(row.kv_seq_len.saturating_add(512));
+            let slot_pages = &batch.flat_slot_page_ids[brow.slot_page_range.clone()];
             let state = self.page_store.materialize_slot_from_prefix(
                 row.slot,
-                kv.slot_epoch(row.slot),
-                kv,
+                epoch,
+                batch.page_size,
+                slot_pages,
                 row.kv_seq_len,
                 reservation,
             )?;
@@ -1503,7 +1532,7 @@ impl RealMetalExecutor {
             if let Some(slot) = self.slots.get_mut(&row.slot) {
                 slot.last_sampled = Some(sampled.clone());
             }
-            self.prequeue_decode(row.slot, kv)?;
+            self.prequeue_decode(row.slot)?;
         }
 
         Ok(inflight)
@@ -1515,7 +1544,7 @@ impl RealMetalExecutor {
     /// the same slot number a finished request left a `pending` on. We require
     /// the same slot, an unchanged epoch (the host has not freed/reallocated the
     /// slot), a still-open one-ahead session, and a matching committed length.
-    fn pending_matches_live_slot(&self, row: &infer_plan::DecodeRow, kv: &dyn KvPool) -> bool {
+    fn pending_matches_live_slot(&self, row: &infer_plan::DecodeRow, epoch: u64) -> bool {
         let Some(pending) = self.pending.as_ref() else {
             return false;
         };
@@ -1526,7 +1555,7 @@ impl RealMetalExecutor {
             return false;
         };
         slot.session_active
-            && slot.slot_epoch == kv.slot_epoch(row.slot)
+            && slot.slot_epoch == epoch
             && row.kv_seq_len == slot.committed_len
             && slot.cache_len == slot.committed_len + 1
     }
@@ -1538,7 +1567,6 @@ impl RealMetalExecutor {
     fn commit_pending_then_prequeue(
         &mut self,
         row: &infer_plan::DecodeRow,
-        kv: &mut dyn KvPool,
     ) -> anyhow::Result<()> {
         let model = self.weights.compiled()?;
         {
@@ -1557,7 +1585,7 @@ impl RealMetalExecutor {
             slot.drain_session(model)?;
             self.active_session_slot = None;
         }
-        self.prequeue_decode(row.slot, kv)
+        self.prequeue_decode(row.slot)
     }
 
     /// Issue (async) the next greedy step on `slot`'s session, feeding the slot's
@@ -1566,8 +1594,7 @@ impl RealMetalExecutor {
     /// session is left OPEN one step ahead so the following submit can drain +
     /// publish it. Capacity-bounded: if the slot's reserved K/V is full, the
     /// prequeue is skipped and the next submit falls back to the cold path.
-    fn prequeue_decode(&mut self, slot_idx: usize, kv: &mut dyn KvPool) -> anyhow::Result<()> {
-        let _ = kv;
+    fn prequeue_decode(&mut self, slot_idx: usize) -> anyhow::Result<()> {
         let seed = self
             .slots
             .get(&slot_idx)
@@ -1618,8 +1645,7 @@ impl RealMetalExecutor {
         Ok(())
     }
 
-    fn reset_slot_if_epoch_changed(&mut self, slot: usize, kv: &dyn KvPool) -> anyhow::Result<()> {
-        let epoch = kv.slot_epoch(slot);
+    fn reset_slot_if_epoch_changed(&mut self, slot: usize, epoch: u64) -> anyhow::Result<()> {
         let stale = self
             .slots
             .get(&slot)
@@ -2109,7 +2135,7 @@ mod tests {
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(2, 8, 4);
 
-        pool.alloc(0, 8).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
         let first_pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state_a = MetalSlotState::from_arrays(
             0,
@@ -2119,7 +2145,7 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state_a, &pool).unwrap();
+        store.publish_slot(&state_a, pool.page_size(), pool.page_indices(state_a.slot)).unwrap();
         let first_key = store
             .logical_key_for_pages(&first_pages)
             .expect("first occupant logical key");
@@ -2131,7 +2157,7 @@ mod tests {
         // Free slot 0 and allocate slot 1: the LIFO free list recycles the SAME
         // physical page ids (in reversed order) to the new occupant.
         pool.free_slot(0);
-        pool.alloc(1, 8).unwrap();
+        KvAllocator::alloc(&mut pool, 1, 8).unwrap();
         let second_pages: Vec<u32> = pool.page_indices(1).to_vec();
         let sorted = |mut v: Vec<u32>| {
             v.sort_unstable();
@@ -2156,7 +2182,7 @@ mod tests {
             vec![kv_array(8, 20)],
             vec![gdr_array(2)],
         );
-        store.publish_slot(&state_b, &pool).unwrap();
+        store.publish_slot(&state_b, pool.page_size(), pool.page_indices(state_b.slot)).unwrap();
 
         assert!(
             !store.prefixes.contains_key(&first_key),
@@ -2194,7 +2220,7 @@ mod tests {
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        pool.alloc(0, 4).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
         let one_page: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2204,7 +2230,7 @@ mod tests {
             vec![kv_array(4, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
         let one_key = store
             .logical_key_for_pages(&one_page)
             .expect("one-page logical key");
@@ -2216,7 +2242,7 @@ mod tests {
         // Second chunk: 8 tokens = 2 pages. Page p0's block is overwritten
         // (insert returns Some) but [p0] is an exact prefix of the live
         // occupant's page list, so its snapshot survives.
-        pool.alloc(0, 4).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
         let two_pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2226,7 +2252,7 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
         let two_key = store
             .logical_key_for_pages(&two_pages)
             .expect("two-page logical key");
@@ -2255,7 +2281,7 @@ mod tests {
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        pool.alloc(0, 4).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
         let first: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2265,13 +2291,13 @@ mod tests {
             vec![kv_array(4, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
         let first_key = store.logical_key_for_pages(&first).unwrap();
 
         // Next turn: the slot is recycled, restores the shared page, and
         // re-prefills one more page.
         pool.free_slot(0);
-        pool.alloc(0, 8).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
         let pages: Vec<u32> = pool.page_indices(0).to_vec();
         assert_eq!(
             pages[0], first[0],
@@ -2285,7 +2311,7 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
 
         assert!(
             store.prefixes.contains_key(&first_key),
@@ -2312,7 +2338,7 @@ mod tests {
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(2, 16, 4);
 
-        pool.alloc(0, 4).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
         let a = pool.page_indices(0)[0];
         let state = MetalSlotState::from_arrays(
             0,
@@ -2322,10 +2348,10 @@ mod tests {
             vec![kv_array(4, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
 
         // Slot 1 recomputed block 0 (dedup keeps `a`) and added block 1 (`d`).
-        pool.alloc(1, 8).unwrap();
+        KvAllocator::alloc(&mut pool, 1, 8).unwrap();
         let slot_chain: Vec<u32> = pool.page_indices(1).to_vec();
         let d = slot_chain[1];
         let state = MetalSlotState::from_arrays(
@@ -2336,7 +2362,7 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
         let canonical = [a, d];
         assert_eq!(
             store.reusable_prefix_blocks(&resident_prefix_blocks(&canonical)),
@@ -2359,7 +2385,7 @@ mod tests {
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        pool.alloc(0, 8).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
         let pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2369,7 +2395,7 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
         let key = store
             .logical_key_for_pages(&pages)
             .expect("published logical key");
@@ -2405,7 +2431,7 @@ mod tests {
         assert!(store.set_ssd(root.clone(), 8 * 1024 * 1024, 1024, 4, "test-epoch"));
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        pool.alloc(0, 8).unwrap();
+        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
         let pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2415,7 +2441,7 @@ mod tests {
             vec![kv_bf16_array(8, 10)],
             vec![gdr_array(7)],
         );
-        store.publish_slot(&state, &pool).unwrap();
+        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
         // Two 4-token pages; the sidecar binds their content keys and persists
         // the restore snapshot under the key of the last one.
         let tokens: Vec<u32> = (0..8u32).collect();
@@ -2460,7 +2486,7 @@ mod tests {
             2
         );
         let restored = store
-            .materialize_slot_from_prefix(0, pool.slot_epoch(0), &pool, 8, 8)
+            .materialize_slot_from_prefix(0, pool.slot_epoch(0), pool.page_size(), pool.page_indices(0), 8, 8)
             .unwrap();
         assert_eq!(restored.cache_len, 8);
         let kv = mlx::as_dtype(&restored.kv_flat[0], mlx::Dtype::Float32);
@@ -2478,8 +2504,11 @@ mod tests {
 
     #[test]
     fn executor_decode_plumbing_returns_one_token_per_row() {
+        use infer_seam::KvAllocator;
         let mut exec = MetalExecutor::new();
         let mut pool = MetalKvPool::new(2, 8, 16);
+        KvAllocator::alloc(&mut pool, 0, 5).unwrap();
+        KvAllocator::alloc(&mut pool, 1, 8).unwrap();
         let plan = ForwardPlan {
             mode: ForwardMode::Decode,
             decode_rows: vec![
@@ -2502,7 +2531,8 @@ mod tests {
             ],
             prefill_rows: Vec::new(),
         };
-        let inflight = exec.submit(&plan, &mut pool).unwrap();
+        let batch = KvBatchDescriptor::from_plan(&plan, &pool).unwrap();
+        let inflight = exec.submit(&plan, &batch, &mut pool).unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => {
                 assert_eq!(out.tokens.len(), 2);
@@ -2515,8 +2545,10 @@ mod tests {
 
     #[test]
     fn executor_prefill_plumbing_returns_completion_token() {
+        use infer_seam::KvAllocator;
         let mut exec = MetalExecutor::new();
         let mut pool = MetalKvPool::new(1, 8, 16);
+        KvAllocator::alloc(&mut pool, 0, 3).unwrap();
         let plan = ForwardPlan {
             mode: ForwardMode::Prefill,
             decode_rows: Vec::new(),
@@ -2530,7 +2562,8 @@ mod tests {
                 penalty_prompt_len: 0,
             }],
         };
-        let inflight = exec.submit(&plan, &mut pool).unwrap();
+        let batch = KvBatchDescriptor::from_plan(&plan, &pool).unwrap();
+        let inflight = exec.submit(&plan, &batch, &mut pool).unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => {
                 assert_eq!(out.tokens.len(), 1);

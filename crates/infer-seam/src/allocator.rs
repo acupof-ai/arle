@@ -41,3 +41,20 @@ pub trait KvAllocator {
 
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
 }
+
+/// The narrow write surface a backend needs during `submit`: grow or shrink a
+/// slot's accounted length. Everything else the backend used to read from
+/// `&dyn KvPool` is resolved above the seam into `KvBatchDescriptor`.
+pub trait KvSlotAccounting {
+    fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()>;
+    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
+}
+
+impl<T: KvAllocator> KvSlotAccounting for T {
+    fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
+        KvAllocator::alloc(self, slot, tokens)
+    }
+    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
+        KvAllocator::truncate_slot(self, slot, new_len)
+    }
+}

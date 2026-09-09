@@ -1,5 +1,6 @@
 use super::*;
 use crate::qwen35::alloc_recurrent_block;
+use anyhow::anyhow;
 use std::cmp::Ordering;
 
 /// A sidecar blob whose `to_bytes()` + chunking completed on the serialization thread.
@@ -21,11 +22,20 @@ struct SidecarWork {
 /// the full spec chain (#197), so this normally no-ops; a warm row or a chain
 /// shorter than the budget truncates the over-allocation instead of leaving
 /// the host pool ahead of the device truth.
-fn set_host_slot_to(host_kv: &mut dyn KvPool, slot: usize, target: usize) -> Result<()> {
-    match target.cmp(&host_kv.seq_len(slot)) {
-        Ordering::Less => host_kv.truncate_slot(slot, target),
+fn set_host_slot_to(
+    kv_batch: &KvBatchDescriptor,
+    kv: &mut dyn KvSlotAccounting,
+    slot: usize,
+    target: usize,
+) -> Result<()> {
+    let current = kv_batch
+        .row_for_slot(slot)
+        .ok_or_else(|| anyhow!("set_host_slot_to: no batch row for slot {slot}"))?
+        .seq_len;
+    match target.cmp(&current) {
+        Ordering::Less => kv.truncate_slot(slot, target),
         Ordering::Equal => Ok(()),
-        Ordering::Greater => host_kv.alloc(slot, target - host_kv.seq_len(slot)),
+        Ordering::Greater => kv.alloc(slot, target - current),
     }
 }
 
@@ -250,23 +260,26 @@ impl Qwen35CudaExecutor {
     /// straight out of HBM.
     fn mirror_host_slot(
         &mut self,
-        host_kv: &dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
         slot: usize,
         seq_len: usize,
     ) -> Result<()> {
-        let host_pages = host_kv.page_indices(slot);
+        let brow = kv_batch
+            .row_for_slot(slot)
+            .ok_or_else(|| anyhow!("mirror_host_slot: no batch row for slot {slot}"))?;
+        let local_pages = &kv_batch.flat_local_page_ids[brow.local_page_range.clone()];
         let pool = self
             .full_attn_kv
             .as_mut()
             .expect("full_attn_kv present (full_attn_paged)");
         let global_pages = seq_len.div_ceil(pool.page_size);
-        let need = host_kv.shard_local_page_count(global_pages);
+        let need = kv_batch.shard.local_page_count(global_pages);
         ensure!(
-            host_pages.len() >= need,
-            "host pool holds {} pages for slot {slot}, {need} needed to cover {seq_len} tokens",
-            host_pages.len()
+            local_pages.len() >= need,
+            "batch holds {} local pages for slot {slot}, {need} needed to cover {seq_len} tokens",
+            local_pages.len()
         );
-        pool.mirror_slot(slot, &host_pages[..need], seq_len)
+        pool.mirror_slot(slot, &local_pages[..need], seq_len)
     }
 
     /// Store the slot's recurrent state into `slot_tier`, keyed by the token hash of
@@ -1218,7 +1231,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &infer_plan::PrefillRow,
         position: u64,
-        host_kv: &dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         {
@@ -1235,7 +1248,7 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
-        self.mirror_host_slot(host_kv, slot, row.end_pos())?;
+        self.mirror_host_slot(kv_batch, slot, row.end_pos())?;
         let (meta, cp) = self.build_prefill_geometry(row)?;
         let Self {
             model,
@@ -1311,7 +1324,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         position: u64,
-        host_kv: &dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         {
@@ -1330,7 +1343,7 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
-        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
+        self.mirror_host_slot(kv_batch, slot, row.kv_seq_len + 1)?;
         // 2D decode never captures (the graph lane is single-GPU), so it uses a
         // persistent per-slot meta refreshed in place; non-2D builds a fresh meta.
         let two_d = self.two_d_engaged();
@@ -1437,7 +1450,7 @@ impl Qwen35CudaExecutor {
     fn mtp_decode_row(
         &mut self,
         row: &DecodeRow,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
         ensure!(
             row.slot < self.num_slots,
@@ -1456,7 +1469,7 @@ impl Qwen35CudaExecutor {
                 Some(s) if s.pending == row.last_token
             );
         if !seeded {
-            let (token, logprob) = self.mtp_warm_decode_row(row, host_kv)?;
+            let (token, logprob) = self.mtp_warm_decode_row(row, kv_batch, kv)?;
             return Ok(vec![SlotToken {
                 slot: row.slot,
                 token,
@@ -1465,7 +1478,7 @@ impl Qwen35CudaExecutor {
                 finish: None,
             }]);
         }
-        self.mtp_spec_row(row, depth, host_kv)
+        self.mtp_spec_row(row, depth, kv_batch, kv)
     }
 
     /// Warm step: one forward that also captures the seed (pending token + hidden) for
@@ -1473,7 +1486,7 @@ impl Qwen35CudaExecutor {
     fn mtp_warm_decode_row(
         &mut self,
         row: &DecodeRow,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         let start = row.kv_seq_len;
@@ -1486,8 +1499,8 @@ impl Qwen35CudaExecutor {
                     pool.seq_len(slot),
                 );
             }
-            set_host_slot_to(host_kv, slot, start + 1)?;
-            self.mirror_host_slot(host_kv, slot, start + 1)?;
+            set_host_slot_to(kv_batch, kv, slot, start + 1)?;
+            self.mirror_host_slot(kv_batch, slot, start + 1)?;
             let meta = {
                 let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
                 crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, start, 1)?
@@ -1597,7 +1610,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         depth: usize,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
         let slot = row.slot;
         let start = row.kv_seq_len;
@@ -1613,8 +1626,8 @@ impl Qwen35CudaExecutor {
                     pool.seq_len(slot),
                 );
             }
-            set_host_slot_to(host_kv, slot, start + depth + 1)?;
-            self.mirror_host_slot(host_kv, slot, start + depth + 1)?;
+            set_host_slot_to(kv_batch, kv, slot, start + depth + 1)?;
+            self.mirror_host_slot(kv_batch, slot, start + depth + 1)?;
         }
         let meta = if self.full_attn_paged() {
             let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
@@ -1672,9 +1685,13 @@ impl Qwen35CudaExecutor {
         if let Some(len) = truncate_to
             && let Some(pool) = full_attn_kv.as_mut()
         {
-            host_kv.truncate_slot(slot, len)?;
+            kv.truncate_slot(slot, len)?;
             let need = len.div_ceil(pool.page_size);
-            pool.mirror_slot(slot, &host_kv.page_indices(slot)[..need], len)?;
+            let brow = kv_batch
+                .row_for_slot(slot)
+                .ok_or_else(|| anyhow!("no batch row for slot {slot}"))?;
+            let slot_pages = &kv_batch.flat_slot_page_ids[brow.slot_page_range.clone()];
+            pool.mirror_slot(slot, &slot_pages[..need], len)?;
         }
         Ok(emitted
             .into_iter()
@@ -1696,7 +1713,7 @@ impl Qwen35CudaExecutor {
     fn mtp_decode_batch(
         &mut self,
         decode_rows: &[DecodeRow],
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
         let depth = self.model.spec_draft_tokens().max(1);
         let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
@@ -1733,7 +1750,7 @@ impl Qwen35CudaExecutor {
         // the per-row path, which warms or specs them one at a time.
         for (i, row) in decode_rows.iter().enumerate() {
             if !seeded[i] || !row.params.is_greedy() {
-                out[i] = self.mtp_decode_row(row, host_kv)?;
+                out[i] = self.mtp_decode_row(row, kv_batch, kv)?;
             }
         }
 
@@ -1853,7 +1870,8 @@ impl Qwen35CudaExecutor {
             full_attn_kv,
             &batch,
             &chains_flat,
-            host_kv,
+            kv_batch,
+            kv,
             &mut free_caps,
             None,
             true,
@@ -1861,20 +1879,23 @@ impl Qwen35CudaExecutor {
             Ok(logits) => logits,
             Err(e) => {
                 for c in &batch {
-                    if host_kv.seq_len(c.slot) > c.start {
-                        host_kv.truncate_slot(c.slot, c.start)?;
+                    let brow = kv_batch.row_for_slot(c.slot);
+                    if brow.is_some_and(|b| b.seq_len > c.start) {
+                        kv.truncate_slot(c.slot, c.start)?;
                     }
                     let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-                    let host_pages = host_kv.page_indices(c.slot);
+                    let local_pages = brow.map(|b| &kv_batch.flat_local_page_ids[b.local_page_range.clone()]);
                     let need = c.start.div_ceil(pool.page_size);
-                    ensure!(
-                        host_pages.len() >= need,
-                        "host pool holds {} pages for slot {}, {need} needed to cover {} tokens",
-                        host_pages.len(),
-                        c.slot,
-                        c.start
-                    );
-                    pool.mirror_slot(c.slot, &host_pages[..need], c.start)?;
+                    if let Some(pages) = local_pages {
+                        ensure!(
+                            pages.len() >= need,
+                            "batch holds {} local pages for slot {}, {need} needed to cover {} tokens",
+                            pages.len(),
+                            c.slot,
+                            c.start
+                        );
+                        pool.mirror_slot(c.slot, &pages[..need], c.start)?;
+                    }
                 }
                 return Err(e);
             }
@@ -1911,9 +1932,13 @@ impl Qwen35CudaExecutor {
             if k + 1 < c.chain.len() {
                 let len = c.start + k + 1;
                 let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-                host_kv.truncate_slot(c.slot, len)?;
+                kv.truncate_slot(c.slot, len)?;
                 let need = len.div_ceil(pool.page_size);
-                pool.mirror_slot(c.slot, &host_kv.page_indices(c.slot)[..need], len)?;
+                let brow = kv_batch
+                    .row_for_slot(c.slot)
+                    .ok_or_else(|| anyhow!("no batch row for slot {}", c.slot))?;
+                let slot_pages = &kv_batch.flat_slot_page_ids[brow.slot_page_range.clone()];
+                pool.mirror_slot(c.slot, &slot_pages[..need], len)?;
             }
             out[c.out] = tokens
                 .into_iter()
@@ -1970,14 +1995,14 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         position: u64,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         if !self.full_attn_paged() {
             if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
                 df.pending = None;
             }
-            return self.submit_decode_row(row, false, host_kv);
+            return self.submit_decode_row(row, false, kv_batch, kv);
         }
         {
             let pool = self.full_attn_kv.as_ref().expect("paged (checked)");
@@ -1989,8 +2014,8 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
-        set_host_slot_to(host_kv, slot, row.kv_seq_len + 1)?;
-        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
+        set_host_slot_to(kv_batch, kv, slot, row.kv_seq_len + 1)?;
+        self.mirror_host_slot(kv_batch, slot, row.kv_seq_len + 1)?;
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("paged (checked)");
             crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
@@ -2052,7 +2077,7 @@ impl Qwen35CudaExecutor {
     fn dspark_decode_batch(
         &mut self,
         decode_rows: &[DecodeRow],
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
         let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
         let mut batch: Vec<SpecChain> = Vec::with_capacity(decode_rows.len());
@@ -2176,7 +2201,7 @@ impl Qwen35CudaExecutor {
             .filter(|(chain, _)| chain.len() >= 2 || row.params.is_greedy());
             let Some((chain, partial_ctx)) = drafted else {
                 let (token, logprob) =
-                    self.dspark_warm_decode_row(row, start.saturating_add(1) as u64, host_kv)?;
+                    self.dspark_warm_decode_row(row, start.saturating_add(1) as u64, kv_batch, kv)?;
                 out[i] = vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -2268,7 +2293,8 @@ impl Qwen35CudaExecutor {
             full_attn_kv,
             &batch,
             &chains,
-            host_kv,
+            kv_batch,
+            kv,
             &mut free_caps,
             Some(&mut ds.taps),
             false,
@@ -2276,20 +2302,24 @@ impl Qwen35CudaExecutor {
             Ok(logits) => logits,
             Err(e) => {
                 for c in &batch {
-                    if host_kv.seq_len(c.slot) > c.start {
-                        host_kv.truncate_slot(c.slot, c.start)?;
+                    let brow = kv_batch.row_for_slot(c.slot);
+                    if brow.is_some_and(|b| b.seq_len > c.start) {
+                        kv.truncate_slot(c.slot, c.start)?;
                     }
                     let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-                    let host_pages = host_kv.page_indices(c.slot);
                     let need = c.start.div_ceil(pool.page_size);
-                    ensure!(
-                        host_pages.len() >= need,
-                        "host pool holds {} pages for slot {}, {need} needed to cover {} tokens",
-                        host_pages.len(),
-                        c.slot,
-                        c.start
-                    );
-                    pool.mirror_slot(c.slot, &host_pages[..need], c.start)?;
+                    if let Some(pages) =
+                        brow.map(|b| &kv_batch.flat_local_page_ids[b.local_page_range.clone()])
+                    {
+                        ensure!(
+                            pages.len() >= need,
+                            "batch holds {} local pages for slot {}, {need} needed to cover {} tokens",
+                            pages.len(),
+                            c.slot,
+                            c.start
+                        );
+                        pool.mirror_slot(c.slot, &pages[..need], c.start)?;
+                    }
                 }
                 return Err(e);
             }
@@ -2342,9 +2372,13 @@ impl Qwen35CudaExecutor {
             if k + 1 < c.chain.len() {
                 let len = c.start + k + 1;
                 let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-                host_kv.truncate_slot(c.slot, len)?;
+                kv.truncate_slot(c.slot, len)?;
                 let need = len.div_ceil(pool.page_size);
-                pool.mirror_slot(c.slot, &host_kv.page_indices(c.slot)[..need], len)?;
+                let brow = kv_batch
+                    .row_for_slot(c.slot)
+                    .ok_or_else(|| anyhow!("no batch row for slot {}", c.slot))?;
+                let slot_pages = &kv_batch.flat_slot_page_ids[brow.slot_page_range.clone()];
+                pool.mirror_slot(c.slot, &slot_pages[..need], len)?;
             }
             // Plain decode steps don't update the draft KV cache; rebase if
             // the context is behind so append stays contiguous.
@@ -2413,7 +2447,7 @@ impl Qwen35CudaExecutor {
         full_attn_kv: &mut Option<PagedKVPool>,
         batch: &[SpecChain],
         chains: &[u32],
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
         free_caps: &mut [Option<&mut crate::qwen35::Qwen35LinearCapture>],
         taps: Option<&mut crate::qwen35::dspark::Qwen35DsparkTaps>,
         norm_offset: bool,
@@ -2430,17 +2464,20 @@ impl Qwen35CudaExecutor {
                 );
             }
             let len = c.start + c.chain.len();
-            set_host_slot_to(host_kv, c.slot, len)?;
+            set_host_slot_to(kv_batch, kv, c.slot, len)?;
             let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-            let host_pages = host_kv.page_indices(c.slot);
+            let brow = kv_batch
+                .row_for_slot(c.slot)
+                .ok_or_else(|| anyhow!("no batch row for slot {}", c.slot))?;
+            let slot_pages = &kv_batch.flat_slot_page_ids[brow.slot_page_range.clone()];
             let need = len.div_ceil(pool.page_size);
             ensure!(
-                host_pages.len() >= need,
-                "host pool holds {} pages for slot {}, {need} needed to cover {len} tokens",
-                host_pages.len(),
+                slot_pages.len() >= need,
+                "batch holds {} pages for slot {}, {need} needed to cover {len} tokens",
+                slot_pages.len(),
                 c.slot
             );
-            pool.mirror_slot(c.slot, &host_pages[..need], len)?;
+            pool.mirror_slot(c.slot, &slot_pages[..need], len)?;
         }
         let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
         let rows: Vec<_> = batch
@@ -2556,7 +2593,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         position: u64,
-        host_kv: &dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
     ) -> Result<Option<(u32, Option<f32>)>> {
         // BF16 captures the FA3 lane, whose scheduling ceiling `seqlen_k_capture`
         // pins. FP8/INT8 capture the split-KV lane instead: its grid is
@@ -2607,7 +2644,7 @@ impl Qwen35CudaExecutor {
             );
         }
         // Idempotent, so the eager fallback may re-run it.
-        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
+        self.mirror_host_slot(kv_batch, slot, row.kv_seq_len + 1)?;
         if self.decode_graph.is_none() {
             self.decode_graph = Some(Qwen35DecodeGraph::new(
                 self.num_slots,
@@ -2749,12 +2786,12 @@ impl Qwen35CudaExecutor {
     pub(crate) fn submit(
         &mut self,
         plan: &ForwardPlan,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<StepOutput> {
         ensure!(
-            host_kv.page_size() == SUPPORTED_PAGE_SIZE,
+            kv_batch.page_size == SUPPORTED_PAGE_SIZE,
             "host CudaKvPool page_size={} does not match Qwen3.5 device page_size={SUPPORTED_PAGE_SIZE}",
-            host_kv.page_size()
+            kv_batch.page_size
         );
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
         if rows == 0 {
@@ -2781,7 +2818,7 @@ impl Qwen35CudaExecutor {
 
         let mut tokens = Vec::with_capacity(rows);
         for row in &plan.prefill_rows {
-            let (token, logprob) = self.submit_prefill_row(row, host_kv)?;
+            let (token, logprob) = self.submit_prefill_row(row, kv_batch, kv)?;
             tokens.push(SlotToken {
                 slot: row.slot,
                 token,
@@ -2790,7 +2827,7 @@ impl Qwen35CudaExecutor {
                 finish: None,
             });
         }
-        tokens.extend(self.dispatch_decode_rows(&plan.decode_rows, allow_graph, host_kv)?);
+        tokens.extend(self.dispatch_decode_rows(&plan.decode_rows, allow_graph, kv_batch, kv)?);
         Ok(StepOutput { tokens })
     }
 
@@ -2819,7 +2856,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         decode_rows: &[DecodeRow],
         allow_graph: bool,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
@@ -2846,12 +2883,12 @@ impl Qwen35CudaExecutor {
             false => 1,
         };
         match super::spec_decode::route_decode(kind, decode_rows.len(), gate, !spec_compatible) {
-            DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, host_kv),
-            DecodeRoute::Mtp => self.mtp_decode_batch(decode_rows, host_kv),
+            DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, kv_batch, kv),
+            DecodeRoute::Mtp => self.mtp_decode_batch(decode_rows, kv_batch, kv),
             DecodeRoute::Plain => match decode_rows {
                 [] => Ok(Vec::new()),
                 [row] => {
-                    let (token, logprob) = self.submit_decode_row(row, allow_graph, host_kv)?;
+                    let (token, logprob) = self.submit_decode_row(row, allow_graph, kv_batch, kv)?;
                     Ok(vec![SlotToken {
                         slot: row.slot,
                         token,
@@ -2860,7 +2897,7 @@ impl Qwen35CudaExecutor {
                         finish: None,
                     }])
                 }
-                rows => self.submit_decode_batch(rows, host_kv),
+                rows => self.submit_decode_batch(rows, kv_batch, kv),
             },
         }
     }
@@ -2878,7 +2915,7 @@ impl Qwen35CudaExecutor {
     fn submit_prefill_row(
         &mut self,
         row: &infer_plan::PrefillRow,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, _kv: &mut dyn KvSlotAccounting,
     ) -> Result<(u32, Option<f32>)> {
         ensure!(
             row.slot < self.num_slots,
@@ -2946,9 +2983,9 @@ impl Qwen35CudaExecutor {
         // L*, leaving the tail segment blind to the prefix — fall through to
         // the single-pass default under 2D.
         if self.slots[row.slot].has_recurrent() && !self.two_d_engaged() {
-            return self.prefill_row_snapshotted(row, position, host_kv);
+            return self.prefill_row_snapshotted(row, position, kv_batch);
         }
-        self.prefill_row_paged_default(row, position, host_kv)
+        self.prefill_row_paged_default(row, position, kv_batch)
     }
 
     /// Prefill a hybrid row, splitting the forward at recurrent-snapshot boundaries so
@@ -2967,7 +3004,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &infer_plan::PrefillRow,
         position: u64,
-        host_kv: &dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
     ) -> Result<(u32, Option<f32>)> {
         let start = row.start_pos;
         let end = row.end_pos();
@@ -3011,7 +3048,7 @@ impl Qwen35CudaExecutor {
                     penalty_history: row.penalty_history.clone(),
                     penalty_prompt_len: row.penalty_prompt_len,
                 };
-                self.prefill_row_paged_default(&seg, cut as u64, host_kv)?; // token discarded
+                self.prefill_row_paged_default(&seg, cut as u64, kv_batch)?; // token discarded
                 cursor = cut;
             }
             // State is now materialized at exactly `cut`.
@@ -3024,7 +3061,7 @@ impl Qwen35CudaExecutor {
             did_cut = true;
         }
         if !did_cut {
-            return self.prefill_row_paged_default(row, position, host_kv);
+            return self.prefill_row_paged_default(row, position, kv_batch);
         }
         // Cuts are all `< end`, so this tail is non-empty.
         let tail = infer_plan::PrefillRow {
@@ -3036,7 +3073,7 @@ impl Qwen35CudaExecutor {
             penalty_history: row.penalty_history.clone(),
             penalty_prompt_len: row.penalty_prompt_len,
         };
-        self.prefill_row_paged_default(&tail, position, host_kv)
+        self.prefill_row_paged_default(&tail, position, kv_batch)
     }
 
     /// `allow_graph` admits the whole-step B=1 decode-graph lane — true only for
@@ -3045,7 +3082,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         allow_graph: bool,
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, _kv: &mut dyn KvSlotAccounting,
     ) -> Result<(u32, Option<f32>)> {
         ensure!(
             row.slot < self.num_slots,
@@ -3065,10 +3102,10 @@ impl Qwen35CudaExecutor {
         // invariant above holds because the recall forward advances it in lockstep.
         // The graph lane runs first when armed; the eager paged forward is the
         // correctness floor and the fallback for every gate miss.
-        if allow_graph && let Some(token) = self.try_graph_decode_paged(row, position, host_kv)? {
+        if allow_graph && let Some(token) = self.try_graph_decode_paged(row, position, kv_batch)? {
             return Ok(token);
         }
-        self.decode_row_paged_default(row, position, host_kv)
+        self.decode_row_paged_default(row, position, kv_batch)
     }
 
     /// A rows>1 pure-decode sub-batch: ONE batched forward over all rows.
@@ -3082,7 +3119,7 @@ impl Qwen35CudaExecutor {
     fn submit_decode_batch(
         &mut self,
         rows: &[DecodeRow],
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor, kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
         debug_assert!(rows.len() > 1);
         // Validate BEFORE any device mutation (the dup-slot ensure ran in `submit`).
@@ -3102,7 +3139,7 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        self.submit_decode_batch_paged(rows, host_kv)
+        self.submit_decode_batch_paged(rows, kv_batch, kv)
     }
 
     /// A rows>1 decode sub-batch over the shared-paged lane: ONE B-row page table and a
@@ -3113,7 +3150,8 @@ impl Qwen35CudaExecutor {
     fn submit_decode_batch_paged(
         &mut self,
         rows: &[DecodeRow],
-        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
+        _kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
         debug_assert!(rows.len() > 1);
         // Append before building the page table: the meta encodes POST-append lengths,
@@ -3132,7 +3170,7 @@ impl Qwen35CudaExecutor {
                     row.slot
                 );
             }
-            self.mirror_host_slot(host_kv, row.slot, row.kv_seq_len + 1)?;
+            self.mirror_host_slot(kv_batch, row.slot, row.kv_seq_len + 1)?;
         }
 
         let slot_indices: Vec<usize> = rows.iter().map(|r| r.slot).collect();

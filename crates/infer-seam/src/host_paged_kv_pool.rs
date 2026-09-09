@@ -290,6 +290,10 @@ impl KvQuery for HostPagedKvPool {
     fn shard_local_page_count(&self, global_pages: usize) -> usize {
         self.shard.local_page_count(global_pages)
     }
+
+    fn shard_spec(&self) -> ShardSpec {
+        self.shard
+    }
 }
 
 impl KvAllocator for HostPagedKvPool {

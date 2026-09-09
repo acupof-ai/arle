@@ -9,7 +9,7 @@ use infer_plan::{
     SamplingParams, SlotToken, StepOutput, generate_diffusion_with_cancel,
 };
 
-use crate::{BackendExecutor, KvPool, PollResult};
+use crate::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult};
 
 #[derive(Debug, Clone)]
 struct BufferedToken {
@@ -112,12 +112,15 @@ impl<M> BufferedDiffusionExecutor<M> {
     fn submit_prefill(
         &mut self,
         row: &infer_plan::PrefillRow,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
     ) -> anyhow::Result<StepOutput>
     where
         M: DiffusionBlockModel,
     {
-        let epoch = kv.slot_epoch(row.slot);
+        let epoch = batch
+            .row_for_slot(row.slot)
+            .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?
+            .slot_epoch;
         let reset_prompt = row.start_pos == 0;
         let prompt = {
             let state = self.slot_mut(row.slot, epoch, reset_prompt);
@@ -189,7 +192,8 @@ where
     fn submit(
         &mut self,
         plan: &ForwardPlan,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
+        _kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
             return Ok(Box::new(StepOutput { tokens: Vec::new() }));
@@ -207,12 +211,14 @@ where
             "diffusion buffered executor supports exactly one prefill or decode row, got {row_count}"
         );
         if let Some(row) = plan.prefill_rows.first() {
-            return Ok(Box::new(self.submit_prefill(row, kv)?));
+            return Ok(Box::new(self.submit_prefill(row, batch)?));
         }
         if let Some(row) = plan.decode_rows.first() {
-            return Ok(Box::new(
-                self.next_buffered_token(row.slot, kv.slot_epoch(row.slot))?,
-            ));
+            let epoch = batch
+                .row_for_slot(row.slot)
+                .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?
+                .slot_epoch;
+            return Ok(Box::new(self.next_buffered_token(row.slot, epoch)?));
         }
         anyhow::bail!("diffusion buffered executor received a non-idle plan with no rows")
     }

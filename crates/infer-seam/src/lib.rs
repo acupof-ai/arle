@@ -41,7 +41,7 @@ mod resource;
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
 
-pub use allocator::KvAllocator;
+pub use allocator::{KvAllocator, KvSlotAccounting};
 pub use diffusion_executor::BufferedDiffusionExecutor;
 pub use host_paged_kv_pool::{EVICTED_PAGE, HostPagedKvPool, ShardSpec};
 pub use kv::KvPool;
@@ -336,10 +336,15 @@ pub struct BackendStats {
 /// A capability accessor returning `None` (the default) is a written opt-out:
 /// the engine substitutes the documented inert behavior at each call site.
 pub trait BackendExecutor: 'static {
+    /// Submit one forward step. `batch` carries every host KV read the backend
+    /// needs (page tables, epochs, lengths, page size), resolved above the seam.
+    /// `kv` is the narrow write surface (grow/shrink a slot's accounted length)
+    /// — the only mutable pool access left below the seam.
     fn submit(
         &mut self,
         plan: &ForwardPlan,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
+        kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>>;
 
     fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult>;
