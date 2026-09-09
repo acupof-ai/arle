@@ -102,6 +102,10 @@ PY
     exec 9>"$CLAIMS/.lock"; flock 9
     compute="$(load_compute_uuids)" || { echo NONE; exit 1; }
     now="$(date +%s)"
+    # Here-string, not `< <(...)`: the pod container has no /dev/fd, so process
+    # substitution fails there and the loop silently reads nothing — every GPU
+    # looked busy while five cards were free.
+    gpu_rows="$(load_gpus)" || { echo NONE; exit 1; }
     while IFS=',' read -r idx uuid used _; do
       idx="${idx//[[:space:]]/}"; uuid="${uuid//[[:space:]]/}"; used="${used//[!0-9]/}"
       [ -n "$idx" ] || continue
@@ -111,7 +115,7 @@ PY
       c="$CLAIMS/$idx"; tmp="$c.tmp.$$"
       printf 'schema=arle-gpu-claim-v1\nop=%s\nowner=%s\npid=%s\nstart=%s\ncreated=%s\n' "$OP" "$OWNER" "$CLAIM_PID" "$CLAIM_START" "$now" > "$tmp" && mv "$tmp" "$c"
       echo "$idx"; exit 0
-    done < <(load_gpus)
+    done <<< "$gpu_rows"
     echo NONE; exit 1
     ;;
   *) echo "usage: pick-gpu.sh [check-free-set|reserve-set <csv>]" >&2; exit 2;;

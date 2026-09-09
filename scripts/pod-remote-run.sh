@@ -109,6 +109,8 @@ PY
 case "${1:-}" in
   status|log|kill)
     action="$1"; label="${2:?missing label}"; found=0; failed=0
+    # Here-string, not `< <(...)`: the pod container has no /dev/fd.
+    op_rows="$(find_op "$label")" || op_rows=""
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue; found=1
       if [ "$action" = log ]; then cat "$dir/log" 2>/dev/null; continue; fi
@@ -126,7 +128,7 @@ case "${1:-}" in
         failed=1
       fi
       [ "$action" = status ] && tail -20 "$dir/log" 2>/dev/null || true
-    done < <(find_op "$label")
+    done <<< "$op_rows"
     [ "$found" -eq 1 ] || { echo "no operation: $label" >&2; exit 1; }
     exit "$failed"
     ;;
