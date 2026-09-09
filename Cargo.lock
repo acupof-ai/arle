@@ -1639,6 +1639,7 @@ version = "0.5.8"
 dependencies = [
  "anyhow",
  "half",
+ "infer-seam",
 ]
 
 [[package]]

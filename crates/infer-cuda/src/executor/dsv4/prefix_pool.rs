@@ -1,7 +1,26 @@
 use super::*;
 use infer_kvspace::{
-    MAX_PENDING_PREFIX_CAPTURES, PendingPrefixPage, capture_epoch_matches, rekey_target_conflicts,
+    MAX_PENDING_PREFIX_CAPTURES, PendingPrefixPage, PrefixPoolIndex, capture_epoch_matches,
+    rekey_target_conflicts, reusable_prefix_blocks, reusable_prefix_blocks_for_prompt,
 };
+
+/// Real [`PrefixPoolIndex`] over the executor's host pool.
+struct PrefixStateIndex<'a> {
+    page_block_size: usize,
+    state: &'a crate::attention::Dsv4PrefixStatePool,
+}
+
+impl PrefixPoolIndex for PrefixStateIndex<'_> {
+    fn page_block_size(&self) -> usize {
+        self.page_block_size
+    }
+    fn page_boundary(&self, page: u32) -> Option<bool> {
+        self.state.page_meta(page).map(|meta| meta.boundary)
+    }
+    fn frontier_tail_tokens(&self, page: u32) -> Option<&[u32]> {
+        self.state.frontier_tail_tokens(page)
+    }
+}
 
 pub(super) struct PendingPrefixCapture {
     slot: usize,
@@ -330,25 +349,11 @@ impl Dsv4CudaExecutor {
     /// page to carry the boundary sections. Pool presence covers host DRAM and
     /// disk alike — licensing never does capacity math.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
-        let page_tokens = self.model.kv_arena.page_block_size;
-        if page_tokens == 0 {
-            return 0;
-        }
-        let mut committed = 0usize;
-        for (idx, block) in blocks.iter().enumerate() {
-            // Fail closed on demoted keys: DSv4 pages never demote through the
-            // radix tier.
-            let PrefixBlock::ResidentPage(page_id) = *block else {
-                break;
-            };
-            let Some(meta) = self.prefix_state.page_meta(page_id) else {
-                break;
-            };
-            if meta.boundary {
-                committed = idx + 1;
-            }
-        }
-        committed
+        let index = PrefixStateIndex {
+            page_block_size: self.model.kv_arena.page_block_size,
+            state: &self.prefix_state,
+        };
+        reusable_prefix_blocks(&index, blocks)
     }
 
     /// Like [`Self::reusable_prefix_blocks`], but a frontier page carrying a
@@ -361,34 +366,11 @@ impl Dsv4CudaExecutor {
         blocks: &[PrefixBlock],
         tokens: &[u32],
     ) -> usize {
-        let page_tokens = self.model.kv_arena.page_block_size;
-        if page_tokens == 0 {
-            return 0;
-        }
-        let mut committed = 0usize;
-        for (idx, block) in blocks.iter().enumerate() {
-            let PrefixBlock::ResidentPage(page_id) = *block else {
-                break;
-            };
-            let Some(meta) = self.prefix_state.page_meta(page_id) else {
-                break;
-            };
-            if !meta.boundary {
-                continue;
-            }
-            let page_end = (idx + 1) * page_tokens;
-            let commit = match self.prefix_state.frontier_tail_tokens(page_id) {
-                None => true,
-                Some(tail) => {
-                    let finish = page_end + tail.len();
-                    tokens.len() >= finish && tokens[page_end..finish] == *tail
-                }
-            };
-            if commit {
-                committed = idx + 1;
-            }
-        }
-        committed
+        let index = PrefixStateIndex {
+            page_block_size: self.model.kv_arena.page_block_size,
+            state: &self.prefix_state,
+        };
+        reusable_prefix_blocks_for_prompt(&index, blocks, tokens)
     }
 
     /// Boundary sections exist only at a forward's own end position, so without
@@ -470,5 +452,51 @@ impl Dsv4CudaExecutor {
             page_tokens,
         )?;
         Ok(tail_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(page: u32, boundary: bool) -> infer_kvspace::Dsv4PrefixPageEntry {
+        infer_kvspace::Dsv4PrefixPageEntry {
+            page_index: page,
+            boundary,
+            layers: vec![],
+        }
+    }
+
+    /// Contract test against the REAL adapter: the policy reads the host
+    /// pool's meta and frontier tails exactly as the executor does. Runs on a
+    /// CUDA host only — the executor module is cuda-gated, so the test binary
+    /// links CUDA FFI; the fake-side contract tests in infer-kvspace cover the
+    /// same policy branches on Mac.
+    #[test]
+    fn real_adapter_reads_pool_meta_and_frontier_tails() {
+        let mut pool = crate::attention::Dsv4PrefixStatePool::new(1 << 20, 4096);
+        assert!(pool.publish(10, &entry(10, true), &[]));
+        assert!(pool.publish(11, &entry(11, true), &[]));
+        pool.set_frontier_tail(11, vec![1, 2, 3]);
+        let index = PrefixStateIndex {
+            page_block_size: 16,
+            state: &pool,
+        };
+        let blocks = [PrefixBlock::ResidentPage(10), PrefixBlock::ResidentPage(11)];
+        assert_eq!(reusable_prefix_blocks(&index, &blocks), 2);
+        // Matching continuation through the real pool's tail (page 11 ends
+        // at token 32; the tail occupies [32, 35)).
+        let mut tokens = vec![0u32; 35];
+        tokens[32..35].copy_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            reusable_prefix_blocks_for_prompt(&index, &blocks, &tokens),
+            2
+        );
+        // Divergent prompt: the tail page must not commit.
+        tokens[34] ^= 0xFFFF;
+        assert_eq!(
+            reusable_prefix_blocks_for_prompt(&index, &blocks, &tokens),
+            1
+        );
     }
 }
