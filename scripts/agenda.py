@@ -161,6 +161,26 @@ def defects() -> list[str]:
     return out
 
 
+# The ledger is a repo artifact and stays English; the board is read in Chinese.
+# A missing key falls back to the ledger's own text, so a new task is never
+# invisible on the board — only untranslated.
+ZH = ROOT / "docs/agenda-zh.json"
+
+
+def localize(rows: list[dict]) -> list[dict]:
+    if not ZH.exists():
+        return rows
+    table = json.loads(ZH.read_text())
+    out = []
+    for row in rows:
+        row = dict(row)
+        for field, text in table.get(row["id"], {}).items():
+            if row.get(field):
+                row[field] = text
+        out.append(row)
+    return out
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     rows = read_rows()
     prereg = read_rows(PREREG)
@@ -195,6 +215,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     text = "\n".join(lines)
     if args.html:
         board = (ROOT / "scripts/agenda_board.html").read_text()
+        rows = localize(rows)
         for token, value in (
             ("__AGENDA_JSON__", rows), ("__PREREG_JSON__", prereg), ("__DEFECTS_JSON__", bad),
             ("__CARDS_JSON__", json.loads((ROOT / "docs/agenda-cards.json").read_text())),

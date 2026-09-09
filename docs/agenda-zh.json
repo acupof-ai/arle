@@ -1,0 +1,78 @@
+{
+  "27b-sota": {
+    "statement": "27B 推理达到全球 SOTA,且每个特性都对模型通用",
+    "north_star": "TTFT 与 ITL 分开报,对标 H20+SGLang 上的 Qwen3-32B FP8;绝不报 out tok/s"
+  },
+  "kv-capacity": {
+    "statement": "L2/L3 分层提供无损的 KV 容量",
+    "north_star": "冷页读取延迟相对一个 decode step 的预算"
+  },
+  "opd": {
+    "statement": "On-policy distillation 是差异化点:SOPD 以 DSv4-Flash 为教师、35B 为学生",
+    "north_star": "27B/35B 学生模型上有一个下游能力指标发生移动"
+  },
+  "distribution": {
+    "statement": "coding-agent server 在标准模型上有一个干净的公开数字",
+    "north_star": "Qwen3.6-35B-A3B 的每轮 TTFT 对比 mlx-lm,在一台无 swap 压力的 Mac 上"
+  },
+  "harness": {
+    "statement": "门是机器,不是文字",
+    "north_star": "每个 check 都能证明自己会失败;每次 run 都带一个事前写下的假设"
+  },
+  "lanes": {
+    "statement": "每个 lane 在自己的 worktree 里工作,通过 PR 合入",
+    "north_star": "任何 lane 都无法 stash、checkout 或提交另一个 lane 的文件;磁盘代价维持在跟踪文件大小"
+  },
+  "ergonomics": {
+    "statement": "改一次 kernel 到看见信号,是一条本地命令,不是一趟 pod 往返",
+    "north_star": "一次 kernel 修改能在一分钟内于本地产出它自己的数"
+  },
+  "w1-build-profile": {
+    "exit": "从 release-fast 构建发起的、带 bench 标签的 run 失败并点名 profile;同一个 run 从 release 构建发起时放行"
+  },
+  "w2-dyn-seam": {
+    "exit": "同一 profile 下 infer-seam / infer-core / infer-server 每个 target 恰好一条 fingerprint,cuda-kernels ≤ 4 条;needle ladder ×3 不变"
+  },
+  "w3-kernel-harness": {
+    "exit": "arle kernel fp4-gemv 与 marlin-fp4-gemm 各自在 M=1 打出耗时和最大相对误差,并有一篇 wins 条目带上 matched A/B"
+  },
+  "w4-pod-tree-identity": {
+    "exit": "两个 lane 并发 sync + build,各自的二进制报出自己的 sha;脏 sync 在 status 里被标成 dirty"
+  },
+  "mtp-batch": {
+    "exit": "c=16 上的 ms/committed-token 在同一二进制上胜过无投机对照臂,needle ×3 在包络内;或一篇 errors 条目点名阻止 SpecKind 合并的那一个执行差异"
+  },
+  "splitkv-occupancy": {
+    "exit": "FP8/INT8 paged decode 的 num_splits 选择器被定位,并且要么按 SM 占用率定尺寸,要么被证明本来就是;无论哪种,qwen35.rs:2249 那条过时注释都要消失"
+  },
+  "dsv4-prefill-i32": {
+    "exit": "DSv4 在 4K 与 16K token 上的 prefill 要么复现 i32 溢出,要么把 architecture.md 和 roadmap 里的 in-repair 说法删掉并写明原因"
+  },
+  "kvtier-coldpage": {
+    "exit": "L2 与 L3 单页冷读的 p50/p99 测出,以相对一个 decode step 的比值陈述;条目说明是否允许对活跃序列做按页换出"
+  },
+  "notes-2-4": {
+    "exit": "设计笔记 2 和 4 落地,spec_parity.py 零 token 不匹配,arle --doctor 打印出 solve"
+  },
+  "notes-3-5": {
+    "exit": "设计笔记 3 和 5 加上 what-breaks.md 落地,各带一行 CHANGELOG"
+  },
+  "ttft-35b": {
+    "exit": "Qwen3.6-35B-A3B 的每轮 TTFT 表替换 README 里的 0.8B 行,在一台无 swap 压力的 Mac 上测得"
+  },
+  "bench-control-arm": {
+    "exit": "选定的 bench 脚本在同一会话内跑它的对照臂,并拒绝从单臂打印比值"
+  },
+  "selftest-prereg": {
+    "exit": "每个 git 支撑的 hygiene check 都证明自己会失败;每次 run 都带一个预注册的假设"
+  },
+  "marlin-m1-gemv": {
+    "exit": "厘清那条被 kill 的 W4AFP8 GEMV 是否覆盖 dense NVFP4 Marlin 路径;若不覆盖,则在 matched A/B 上把 M=1 fp4 GEMV 对 Marlin 测出来,或写明为何测不了"
+  },
+  "lane-worktrees": {
+    "exit": "四个 lane worktree 各在自己的分支上,共享一个 cargo target 目录,且 AGENTS.md 载有这条取代旧规则的条文"
+  },
+  "speckind-unify": {
+    "exit": "DSpark 与 MTP 通过一张参数名映射从同一个 draft head 加载,或一篇条目说明是哪个执行差异禁止了它"
+  }
+}
