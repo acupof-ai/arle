@@ -6,6 +6,13 @@
 
 mod diffusion;
 mod sample;
+mod spec;
+
+pub use spec::{
+    DEFAULT_SPEC_DRAFT_DEPTH, DEFAULT_SPEC_DRAFT_TOPK, DecodeRoute, DraftChain,
+    MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, MtpDraftRow, SpecKind, SpecVerifySchedule,
+    route_decode,
+};
 
 pub use diffusion::{
     DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateError,

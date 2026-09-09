@@ -1647,6 +1647,7 @@ version = "0.5.8"
 name = "infer-plan"
 version = "0.5.8"
 dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

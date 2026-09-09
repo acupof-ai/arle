@@ -1,10 +1,6 @@
 use super::layer_block::HcHalf;
 use super::*;
 
-pub(crate) struct MtpDraftRow {
-    pub token: u32,
-}
-
 impl Dsv4Model {
     /// Returns per row: top-k candidate tokens (highest first) + the wide MTP
     /// stream the next draft row branches from. Candidates come from k rounds
