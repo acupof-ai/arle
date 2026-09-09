@@ -57,7 +57,16 @@ pr)
     [ -n "$(git -C "$path" status --porcelain)" ] && {
         echo "lane: $name has uncommitted changes; commit them by explicit path first" >&2
         git -C "$path" status --short >&2; exit 2; }
-    git -C "$path" push -u origin "lane/$name"
+    # Rebase first: a lane branched before main moved would otherwise open a PR
+    # that reverts every file main gained in the meantime.
+    git -C "$ROOT" fetch --quiet origin main 2>/dev/null || true
+    behind=$(git -C "$path" rev-list --count "HEAD..main")
+    if [ "$behind" -gt 0 ]; then
+        echo "lane: $name is $behind commit(s) behind main; rebasing"
+        git -C "$path" rebase main || {
+            echo "lane: rebase stopped with conflicts in $path — resolve, then rerun" >&2; exit 2; }
+    fi
+    git -C "$path" push -u --force-with-lease origin "lane/$name"
     title="${3:-$(git -C "$path" log -1 --pretty=%s)}"
     gh pr create --repo "$(git -C "$ROOT" remote get-url origin | sed 's#.*[:/]\([^/]*/[^/]*\)\.git#\1#')" \
         --base main --head "lane/$name" --title "$title" \
