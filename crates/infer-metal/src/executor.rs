@@ -384,24 +384,34 @@ impl MetalExecutor {
 }
 
 impl BackendExecutor for MetalExecutor {
-    type Inflight = MetalInflight;
-
     fn submit(
         &mut self,
         plan: &ForwardPlan,
         kv: &mut dyn KvPool,
-    ) -> anyhow::Result<Self::Inflight> {
+    ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {
-            return real.submit(plan, kv);
+            return real
+                .submit(plan, kv)
+                .map(|i| Box::new(i) as Box<dyn std::any::Any + Send>);
         }
         #[cfg(not(feature = "metal"))]
         let _ = kv;
 
-        Ok(MetalInflight::Ready(Self::placeholder_forward(plan)))
+        Ok(Box::new(MetalInflight::Ready(Self::placeholder_forward(
+            plan,
+        ))))
     }
 
-    fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>> {
+    fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult> {
+        let inflight = *inflight
+            .downcast::<MetalInflight>()
+            .unwrap_or_else(|wrong| {
+                panic!(
+                    "metal executor poll received foreign inflight type: {}",
+                    std::any::type_name_of_val(&*wrong)
+                )
+            });
         match inflight {
             MetalInflight::Ready(output) => Ok(PollResult::Ready(output)),
             #[cfg(feature = "metal")]
@@ -420,6 +430,14 @@ impl BackendExecutor for MetalExecutor {
                 }))
             }
         }
+    }
+
+    fn name(&self) -> &'static str {
+        "metal"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn model_stop_token_ids(&self) -> Vec<u32> {

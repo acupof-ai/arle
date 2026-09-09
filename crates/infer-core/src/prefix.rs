@@ -8,12 +8,12 @@
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use infer_seam::{BackendExecutor, KvPool, KvTierLocation, PrefixBlock};
+use infer_seam::{BackendExecutor, KvTierLocation, PrefixBlock};
 
 use crate::radix::{BlockId, PrefixMatch};
 use crate::{Engine, RequestPhase, RequestState};
 
-impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
+impl Engine {
     pub(crate) fn request_pages_needed_after_prefix(
         &self,
         request: &RequestState,
@@ -57,7 +57,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Associated fn over `executor` + `block_size` so callers can keep other
     /// `self` borrows (e.g. the waiting queue's committed stream) alive.
     pub(crate) fn clamp_prefix_to_backend(
-        executor: &mut E,
+        executor: &mut dyn BackendExecutor,
         block_size: usize,
         mut prefix_match: PrefixMatch,
         tokens: &[u32],
@@ -79,7 +79,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Backend-licensed reusable leading blocks, clamped to the match length.
     /// `_for_prompt`: a finish-write-through frontier is reusable only when
     /// `tokens` continues through the cached tail (the tail has no radix key).
-    fn licensed_prefix_blocks(executor: &mut E, blocks: &[PrefixBlock], tokens: &[u32]) -> usize {
+    fn licensed_prefix_blocks(
+        executor: &mut dyn BackendExecutor,
+        blocks: &[PrefixBlock],
+        tokens: &[u32],
+    ) -> usize {
         match executor.prefix_reuse() {
             Some(reuse) => reuse.reusable_prefix_blocks_for_prompt(blocks, tokens),
             None => 0,
@@ -123,7 +127,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prefix_match.matched_len = prefix_match.block_ids.len() * self.radix.block_size();
         }
         let prefix_match = Self::clamp_prefix_to_backend(
-            &mut self.executor,
+            &mut *self.executor,
             self.radix.block_size(),
             prefix_match,
             tokens,
@@ -753,7 +757,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let matched = self.radix.longest_prefix_match(tokens);
             let raw = matched.block_ids.len();
             let clamped = Self::clamp_prefix_to_backend(
-                &mut self.executor,
+                &mut *self.executor,
                 self.radix.block_size(),
                 matched,
                 tokens,
@@ -773,7 +777,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .take_while(|b| matches!(b, PrefixBlock::ResidentPage(_)))
             .count();
         let mut blocks = blocks_all;
-        let reusable = Self::licensed_prefix_blocks(&mut self.executor, &blocks, tokens);
+        let reusable = Self::licensed_prefix_blocks(&mut *self.executor, &blocks, tokens);
         self.record_prefix_match_metrics(blocks.len(), reusable);
         log::info!(
             "prefix-lookup(tier): prompt={} raw_blocks={} resident_run={resident} licensed_blocks={reusable}",

@@ -56,10 +56,9 @@ pub use resource::{
 };
 pub use runtime_flags::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
 
-#[derive(Debug, Clone)]
-pub enum PollResult<I> {
+pub enum PollResult {
     Ready(StepOutput),
-    NotReady(I),
+    NotReady(Box<dyn std::any::Any + Send>),
 }
 
 /// Bits of a tier key below the backend store's namespace byte; content keys
@@ -336,14 +335,24 @@ pub struct BackendStats {
 ///
 /// A capability accessor returning `None` (the default) is a written opt-out:
 /// the engine substitutes the documented inert behavior at each call site.
-pub trait BackendExecutor {
-    /// Opaque backend-owned in-flight handle.
-    type Inflight;
+pub trait BackendExecutor: 'static {
+    fn submit(
+        &mut self,
+        plan: &ForwardPlan,
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<Box<dyn std::any::Any + Send>>;
 
-    fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool)
-    -> anyhow::Result<Self::Inflight>;
+    fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult>;
 
-    fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>>;
+    /// Backend name for diagnostics (slot-oversubscription mismatch, logs).
+    fn name(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// Downcast to the concrete executor for out-of-band control closures
+    /// (OPD raw-logits forward, LoRA re-merge) that run between scheduler
+    /// steps. Not for the request hot path.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
     /// Advance completed backend work that is independent of the active
     /// forward. Engine-core calls this before request admission.
