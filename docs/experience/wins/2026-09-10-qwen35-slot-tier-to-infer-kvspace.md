@@ -30,12 +30,18 @@ executor. The cross-rank two-phase commit already converged in the seam
   infer-kvspace` still contains zero `cuda-kernels`.
 - **The debug build caught a latent key-space bug.** `tier_key` packs the
   namespace into the top 8 bits and `chunk_sub` the chunk index into the
-  low 16, so a key must fit 40 bits — but the sidecar key was a full
-  64-bit FNV hash. In release the overflow is silent and save/probe
-  rendezvous by symmetry (both sides mangle the same way); in debug
-  `tier_key`'s `debug_assert!` panics. The old path ran release-only on
-  GPU, so it never fired; the new host tests run debug and tripped it on
-  the first run. `hash_prefix_tokens` now folds to 40 bits.
+  low 16, so a chunked key must fit 40 bits — but the sidecar key was a
+  full 64-bit FNV hash. In release the overflow is silent: bits 40-55 of
+  the key land in the namespace field, so for a uniform 56-bit key the
+  namespace isolation is contaminated with probability 1 − 2⁻¹⁶ ≈ 99.998%
+  — the guarantee was effectively never in effect. Save/probe still
+  rendezvous because both sides apply the same mangling, at the cost of
+  effective key entropy dropping from 56 to 40 bits. In debug
+  `tier_key`'s `debug_assert!` panics; the old path ran release-only on
+  GPU, so it never fired, and the new host tests run debug and tripped
+  it on the first run. `hash_prefix_tokens` now folds to 40 bits. The
+  contract itself (an unguarded `chunk_sub` and a `TIER_KEY_BITS`
+  constant that promises 56) is fixed separately in kv-native-sys.
 - **DSv4 shares the pure mapping.** Its `kv_tier_io_stats` aggregation
   maps the store's stats through the same `infer_kvspace::tier_io_stats`
   as the qwen35 arm; its inline 2PC demote/promote stays untouched
@@ -43,11 +49,16 @@ executor. The cross-rank two-phase commit already converged in the seam
 
 ## Rule
 
-A full-width hash handed to a packed key space works only by release-mode
-symmetry — debug assertions exist to make that kind of contract visible,
-and code that only ever runs release-only on GPU keeps the contract
+A full-width hash handed to a packed key space does not merely "work by
+release-mode symmetry": the namespace field is contaminated on nearly
+every key (1 − 2⁻¹⁶ for uniform 56-bit keys), so the isolation guarantee
+is dead in practice and the effective entropy silently drops to the
+packed width. Debug assertions exist to make that contract visible, and
+code that only ever runs release-only on GPU keeps the contract
 invisible. Moving the logic to a host-tested crate is what surfaced it:
-the test lane that matters is the one that runs debug.
+the test lane that matters is the one that runs debug. The fix belongs
+at the contract's definition (the packer's assert and the constant that
+promises the key width), not at the call site.
 
 ## Net
 
