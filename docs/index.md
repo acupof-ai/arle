@@ -31,7 +31,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | Rolling baselines | [baselines.md](baselines.md) |
 | Agent task harness (goals, gates, execution, report) | [plans/2026-09-09-agent-task-harness.md](plans/2026-09-09-agent-task-harness.md) |
 | Design theses (depth track) | [plans/2026-09-02-design-theses.md](plans/2026-09-02-design-theses.md) |
-| Design notes | [design/hybrid-prefix-cache.md](design/hybrid-prefix-cache.md) |
+| Design notes | [1 prefix cache](design/hybrid-prefix-cache.md) · [2 speculative decoding](design/speculative-decoding.md) · [3 backend seam](design/seam-cost-contract.md) · [4 memory](design/memory-is-the-product.md) · [5 matched measurement](design/matched-measurement.md) · [what-breaks](design/what-breaks.md) |
 | Env / flags | [environment.md](environment.md) |
 | Capability evals | [eval.md](eval.md) |
 | OPD capability curve | [opd-capability-curve.md](opd-capability-curve.md) |
