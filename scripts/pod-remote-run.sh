@@ -261,5 +261,62 @@ PY
     printf 'RUN_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;
-  *) echo "usage: pod-remote-run.sh run|ready|status|log|kill ..." >&2; exit 2;;
+  kernel-ab)
+    # fp4-gemv vs marlin-fp4-gemm at M=1, both against the CPU f32 reference
+    # (infer_quant::cpu_ref_fp4). The keep/remove call for fp4-gemv: it has no
+    # production caller since dispatch convergence, so this A/B decides whether
+    # the GEMV beats the tensor-core GEMM at M=1.
+    BUILD="${2:?missing build label}"; LABEL="${3:?missing run label}"; GPU="${4:?missing GPU}"
+    SHAPE="${5:-1,34816,5120}"; ITERS="${6:-100}"
+    DIR="$STATE/runs/$LABEL"; BUILD_RECEIPT="$STATE/builds/$BUILD/receipt"
+    [ ! -e "$DIR" ] || { echo "run label exists: $LABEL" >&2; exit 1; }
+    mkdir "$DIR" || exit 1
+    LOG="$DIR/log"; RECEIPT="$DIR/receipt"; MARKER="$DIR/terminal"
+    binary="$(field "$BUILD_RECEIPT" binary)"
+    source_head="$(field "$BUILD_RECEIPT" source_head)"; source_digest_value="$(field "$BUILD_RECEIPT" source_digest)"
+    process_pgid="$(ps -o pgid= -p $$ | tr -d ' ')"; process_start="$(proc_start $$)"
+    claim_op="kernel-ab-$LABEL"
+    printf '%s\n' "schema=arle-process-v1" "kind=run" "expected_helper=$TREE/scripts/pod-remote-run.sh" "operation=kernel-ab" "pid=$$" "pgid=$process_pgid" "start=$process_start" "expected_binary=$binary" > "$DIR/process"
+    exec >"$LOG" 2>&1
+    rc=1; selected_gpu=""
+    if [ ! -f "$BUILD_RECEIPT" ] || [ "$(field "$BUILD_RECEIPT" schema)" != arle-build-v1 ] || [ "$(field "$BUILD_RECEIPT" exit)" != 0 ]; then
+      echo "successful build receipt required: build:$BUILD"
+    elif [ "$(sha256 "$binary" 2>/dev/null)" != "$(field "$BUILD_RECEIPT" binary_sha)" ]; then
+      echo "binary SHA mismatch"
+    elif [ ! -f "$TREE/.arle-source-receipt" ] || [ "$(field "$TREE/.arle-source-receipt" head)" != "$source_head" ] || [ "$(field "$TREE/.arle-source-receipt" digest)" != "$source_digest_value" ] || [ "$(git -C "$TREE" rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then
+      echo "source changed since build"
+    elif [ "${LABEL#bench}" != "$LABEL" ] && [ "$(field "$BUILD_RECEIPT" profile)" != release ]; then
+      echo "bench run requires a release build: build=$BUILD profile=$(field "$BUILD_RECEIPT" profile)"
+    else
+      claim_env=(ARLE_OP_ID="$claim_op" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$process_start")
+      if [ "$GPU" = auto ]; then
+        selected_gpu="$(env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh")" || selected_gpu=""
+      else
+        if ARLE_GPU="$GPU" env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh" >/dev/null; then selected_gpu="$GPU"; fi
+      fi
+      if [ -z "$selected_gpu" ]; then echo "no free GPU"
+      else
+        if write_receipt "$RECEIPT" "schema=arle-run-v1" "state=running-unobserved" "operation=kernel-ab" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$(field "$BUILD_RECEIPT" binary_sha)" "kernel_id=$(field "$BUILD_RECEIPT" kernel_id)" "shape=$SHAPE" "iters=$ITERS" "gpu=$selected_gpu" "pid=$$" "pgid=$process_pgid" "start=$process_start" "launched_at=$(date -u +%FT%TZ)"; then
+          rc=0
+          for kernel in fp4-gemv marlin-fp4-gemm; do
+            echo "=== $kernel shape=$SHAPE iters=$ITERS ==="
+            CUDA_VISIBLE_DEVICES="$selected_gpu" "$binary" kernel "$kernel" --shape "$SHAPE" --ref cpu --iters "$ITERS" || rc=1
+          done
+        else
+          echo "failed to persist launch receipt"
+        fi
+        claim="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$selected_gpu"
+        [ "$(field "$claim" op)" = "$claim_op" ] && rm -f "$claim"
+      fi
+    fi
+    if [ -f "$RECEIPT" ]; then
+      update_receipt "$RECEIPT" "state=exited" "exit=$rc" "finished_at=$(date -u +%FT%TZ)"
+    else
+      write_receipt "$RECEIPT" "schema=arle-run-v1" "state=exited" "operation=kernel-ab" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$(field "$BUILD_RECEIPT" binary_sha)" "shape=$SHAPE" "iters=$ITERS" "gpu=$selected_gpu" "exit=$rc" "finished_at=$(date -u +%FT%TZ)"
+    fi
+    write_receipt "$MARKER" "KERNEL_AB_EXIT=$rc"
+    printf 'KERNEL_AB_EXIT=%s\n' "$rc"
+    exit "$rc"
+    ;;
+  *) echo "usage: pod-remote-run.sh run|ready|status|log|kill|kernel-ab ..." >&2; exit 2;;
 esac
