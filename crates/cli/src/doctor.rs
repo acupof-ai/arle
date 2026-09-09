@@ -10,7 +10,7 @@ use crate::hardware::{self, GpuInfo};
 use crate::hub_discovery;
 use crate::model_catalog;
 
-const INSPECTION_SCHEMA_VERSION: u32 = 3;
+const INSPECTION_SCHEMA_VERSION: u32 = 4;
 const PRIMARY_MODEL_ENV: &str = "ARLE_MODEL";
 const LEGACY_MODEL_ENV: &str = "AGENT_INFER_MODEL";
 
@@ -24,6 +24,12 @@ struct DoctorSnapshot {
     snapshots: Vec<hub_discovery::HubSnapshot>,
     recommendations: Vec<&'static model_catalog::CatalogEntry>,
     selected: Result<SelectedModelSource>,
+    /// Metal resource-guard solve for the resolved model, when the backend can
+    /// plan it (Metal build, local model present).
+    #[cfg(feature = "metal")]
+    resource_solve: Option<infer_api::MetalResourcePlan>,
+    #[cfg(feature = "metal")]
+    resource_solve_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -46,6 +52,138 @@ fn print_resolution(selected: &Result<SelectedModelSource>) {
         }
         Err(err) => println!("{} {err:#}", style("resolution error").red().bold()),
     }
+}
+
+#[cfg(feature = "metal")]
+fn print_resource_solve_section(snapshot: &DoctorSnapshot) {
+    if !snapshot.info.compiled_backend.supports_inference() {
+        return;
+    }
+    println!("{}", style("Resource solve (Metal)").bold());
+    if let Some(err) = &snapshot.resource_solve_error {
+        println!("{} {err}", style("solve error").yellow().bold());
+        println!();
+        return;
+    }
+    let Some(plan) = &snapshot.resource_solve else {
+        println!("{} <no model resolved>", style("solve").dim());
+        println!();
+        return;
+    };
+    println!(
+        "{} {}",
+        style("weights").dim(),
+        format_gib(plan.weight_bytes)
+    );
+    println!(
+        "{} {}",
+        style("runtime headroom").dim(),
+        format_gib(plan.runtime_headroom_bytes)
+    );
+    println!(
+        "{} {}",
+        style("static state").dim(),
+        format_mib(plan.static_state_bytes)
+    );
+    println!(
+        "{} {}",
+        style("anti-swap reserve").dim(),
+        format_gib(plan.anti_swap_reserve_bytes)
+    );
+    match plan.system_reserve_bytes {
+        Some(reserve) => println!("{} {}", style("system reserve").dim(), format_gib(reserve)),
+        None => println!("{} <unknown>", style("system reserve").dim()),
+    }
+    println!(
+        "{} {}",
+        style("memory limit").dim(),
+        format_gib(plan.memory_limit_bytes)
+    );
+    println!(
+        "{} {}",
+        style("wired limit").dim(),
+        format_gib(plan.wired_limit_bytes)
+    );
+    println!(
+        "{} {}",
+        style("cache limit").dim(),
+        format_mib(plan.cache_limit_bytes)
+    );
+    println!(
+        "{} {} ({} tokens, {} pages{})",
+        style("KV budget").dim(),
+        format_gib(plan.kv_budget_bytes),
+        plan.capacity_tokens,
+        plan.planned_total_pages,
+        if plan.clamped {
+            format!(", requested {} clamped", plan.requested_total_pages)
+        } else {
+            String::new()
+        }
+    );
+    println!();
+}
+
+#[cfg(not(feature = "metal"))]
+fn print_resource_solve_section(_snapshot: &DoctorSnapshot) {}
+
+#[cfg(feature = "metal")]
+fn resource_solve_report(snapshot: &DoctorSnapshot) -> Option<ResourceSolveReport> {
+    if !snapshot.info.compiled_backend.supports_inference() {
+        return None;
+    }
+    if let Some(err) = &snapshot.resource_solve_error {
+        return Some(ResourceSolveReport {
+            error: Some(err.clone()),
+            weights_bytes: None,
+            runtime_headroom_bytes: None,
+            static_state_bytes: None,
+            anti_swap_reserve_bytes: None,
+            system_reserve_bytes: None,
+            memory_limit_bytes: None,
+            wired_limit_bytes: None,
+            cache_limit_bytes: None,
+            kv_budget_bytes: None,
+            kv_capacity_tokens: None,
+            planned_total_pages: None,
+            requested_total_pages: None,
+            clamped: None,
+        });
+    }
+    snapshot
+        .resource_solve
+        .as_ref()
+        .map(|plan| ResourceSolveReport {
+            error: None,
+            weights_bytes: Some(plan.weight_bytes),
+            runtime_headroom_bytes: Some(plan.runtime_headroom_bytes),
+            static_state_bytes: Some(plan.static_state_bytes),
+            anti_swap_reserve_bytes: Some(plan.anti_swap_reserve_bytes),
+            system_reserve_bytes: plan.system_reserve_bytes,
+            memory_limit_bytes: Some(plan.memory_limit_bytes),
+            wired_limit_bytes: Some(plan.wired_limit_bytes),
+            cache_limit_bytes: Some(plan.cache_limit_bytes),
+            kv_budget_bytes: Some(plan.kv_budget_bytes),
+            kv_capacity_tokens: Some(plan.capacity_tokens),
+            planned_total_pages: Some(plan.planned_total_pages),
+            requested_total_pages: Some(plan.requested_total_pages),
+            clamped: Some(plan.clamped),
+        })
+}
+
+#[cfg(not(feature = "metal"))]
+fn resource_solve_report(_snapshot: &DoctorSnapshot) -> Option<ResourceSolveReport> {
+    None
+}
+
+#[cfg(feature = "metal")]
+fn format_gib(bytes: usize) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1 << 30) as f64)
+}
+
+#[cfg(feature = "metal")]
+fn format_mib(bytes: usize) -> String {
+    format!("{} MiB", bytes >> 20)
 }
 
 pub(crate) fn run(args: &Args) -> Result<()> {
@@ -123,6 +261,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     print_resolution(&snapshot.selected);
     println!();
 
+    print_resource_solve_section(&snapshot);
     print_discovery_section(&snapshot);
     print_recommendations_section(&snapshot);
     print_tools_section();
@@ -192,6 +331,8 @@ fn collect_snapshot(args: &Args) -> DoctorSnapshot {
         env_model.as_deref(),
         discovered.clone(),
     );
+    #[cfg(feature = "metal")]
+    let (resource_solve, resource_solve_error) = metal_resource_solve(&selected);
     DoctorSnapshot {
         info,
         tty,
@@ -202,6 +343,62 @@ fn collect_snapshot(args: &Args) -> DoctorSnapshot {
         snapshots,
         recommendations,
         selected,
+        #[cfg(feature = "metal")]
+        resource_solve,
+        #[cfg(feature = "metal")]
+        resource_solve_error,
+    }
+}
+
+/// Plan the Metal resource guard for the resolved model, using the same
+/// defaults `arle serve` applies with no budget flags. Returns the plan, or
+/// the planning error when the guard rejects the load (that rejection is the
+/// diagnostic the doctor exists to surface).
+#[cfg(feature = "metal")]
+fn metal_resource_solve(
+    selected: &Result<SelectedModelSource>,
+) -> (Option<infer_api::MetalResourcePlan>, Option<String>) {
+    let Some(path) = selected
+        .as_ref()
+        .ok()
+        .and_then(SelectedModelSource::local_path)
+    else {
+        return (None, None);
+    };
+    if !path.exists() {
+        return (
+            None,
+            Some(format!("model path {} not present locally", path.display())),
+        );
+    }
+    let config = infer_api::EngineLoadConfig::default();
+    // Mirror `EngineLoadConfig::hot_workspace_slots` (private): a set
+    // `--max-running-requests` is the slot budget; unset, the num_slots
+    // auto-ceiling applies.
+    let num_slots = config
+        .max_running_requests
+        .unwrap_or(config.num_slots)
+        .max(1);
+    let kv_cache_dtype = match infer_api::MetalKvCacheDtype::resolve(config.kv_cache_dtype) {
+        Ok(dtype) => dtype,
+        Err(err) => return (None, Some(format!("{err:#}"))),
+    };
+    match infer_api::plan_resource_budget(
+        &path,
+        infer_api::MetalResourceRequest {
+            kv_cache_dtype,
+            num_slots,
+            total_pages: config.total_pages,
+            page_size: config.page_size,
+            low_impact: config.low_impact,
+            memory_budget_bytes: config.memory_budget_bytes,
+            system_reserve_bytes: config.system_reserve_bytes,
+            allow_swap: config.allow_swap,
+            mem_fraction_static: config.mem_fraction_static,
+        },
+    ) {
+        Ok(plan) => (Some(plan), None),
+        Err(err) => (None, Some(format!("{err:#}"))),
     }
 }
 
@@ -223,6 +420,27 @@ struct DoctorJsonReport {
     recommendations: Vec<ModelRecommendationReport>,
     tools: tools::ToolRuntimeReport,
     checks: Vec<CheckReport>,
+    /// Metal resource-guard solve for the resolved model. `None` on non-Metal
+    /// builds or with no resolved model; `error` is set when the guard rejects.
+    resource: Option<ResourceSolveReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceSolveReport {
+    error: Option<String>,
+    weights_bytes: Option<usize>,
+    runtime_headroom_bytes: Option<usize>,
+    static_state_bytes: Option<usize>,
+    anti_swap_reserve_bytes: Option<usize>,
+    system_reserve_bytes: Option<usize>,
+    memory_limit_bytes: Option<usize>,
+    wired_limit_bytes: Option<usize>,
+    cache_limit_bytes: Option<usize>,
+    kv_budget_bytes: Option<usize>,
+    kv_capacity_tokens: Option<usize>,
+    planned_total_pages: Option<usize>,
+    requested_total_pages: Option<usize>,
+    clamped: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -364,6 +582,7 @@ fn doctor_report(snapshot: &DoctorSnapshot) -> DoctorJsonReport {
         recommendations: recommendation_reports(snapshot),
         tools: tools::tool_runtime_report(),
         checks,
+        resource: resource_solve_report(snapshot),
     }
 }
 
