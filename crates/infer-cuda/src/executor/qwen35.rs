@@ -1772,7 +1772,7 @@ impl Qwen35CudaExecutor {
         host_kv: &mut dyn KvPool,
     ) -> Result<Vec<SlotToken>> {
         let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
-        let mut batch: Vec<DsparkChain> = Vec::with_capacity(decode_rows.len());
+        let mut batch: Vec<SpecChain> = Vec::with_capacity(decode_rows.len());
         let mut seeded = Vec::with_capacity(decode_rows.len());
         for row in decode_rows {
             ensure!(
@@ -1903,7 +1903,7 @@ impl Qwen35CudaExecutor {
                 }];
                 continue;
             };
-            batch.push(DsparkChain {
+            batch.push(SpecChain {
                 out: i,
                 slot: row.slot,
                 start,
@@ -2091,7 +2091,7 @@ impl Qwen35CudaExecutor {
     /// any error.
     fn dspark_verify_forward(
         &mut self,
-        batch: &[DsparkChain],
+        batch: &[SpecChain],
         chains: &[u32],
         total_rows: usize,
         host_kv: &mut dyn KvPool,
