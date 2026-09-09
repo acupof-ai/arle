@@ -87,7 +87,7 @@ fn write_page(tier: &mut KvTierStore, content_key: u64, block: &MetalPageBlock) 
     if tier.contains(key) {
         return true;
     }
-    match encode_page_payload(&block.kv_flat) {
+    match encode_page_payload(content_key, &block.kv_flat) {
         Ok(bytes) => tier.insert(key, bytes),
         Err(err) => {
             log::warn!("Metal KV T2 page encode failed for content key {content_key}: {err:#}");
@@ -392,7 +392,7 @@ impl MetalPageStore {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Metal KV T2 store is not configured"))?;
         let bytes = tier.read(tier_key(NS_PAGE, key))?;
-        let kv_flat = decode_page_payload(&bytes)?;
+        let kv_flat = decode_page_payload(&bytes, key)?;
         Ok(MetalPageBlock {
             logical_id: self.next_logical_id(),
             owner: None,
@@ -638,18 +638,25 @@ impl MetalPageStore {
     }
 }
 
-// All-u64 LE framing. Page payload: `[n_arrays][arrays…]`. Prefix payload:
-// `[content_key][cache_len][n_arrays][arrays…]` — the key echo catches a
-// namespace collision at decode. Array: `[dtype][ndim][dims…][len][bytes]`.
+// All-u64 LE framing. Page payload: `[content_key][n_arrays][arrays…]` — the
+// key echo catches a namespace collision at decode. Prefix payload:
+// `[content_key][cache_len][n_arrays][arrays…]`. Array:
+// `[dtype][ndim][dims…][len][bytes]`.
 
-fn encode_page_payload(arrays: &[mlx::MlxArray]) -> anyhow::Result<Vec<u8>> {
+fn encode_page_payload(content_key: u64, arrays: &[mlx::MlxArray]) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
+    out.extend_from_slice(&content_key.to_le_bytes());
     encode_arrays(&mut out, arrays)?;
     Ok(out)
 }
 
-fn decode_page_payload(bytes: &[u8]) -> anyhow::Result<Vec<mlx::MlxArray>> {
+fn decode_page_payload(bytes: &[u8], content_key: u64) -> anyhow::Result<Vec<mlx::MlxArray>> {
     let mut reader = PayloadReader { bytes, offset: 0 };
+    let recorded = reader.u64()?;
+    anyhow::ensure!(
+        recorded == content_key,
+        "Metal KV T2 page key mismatch: requested={content_key}, record={recorded}"
+    );
     let arrays = decode_arrays(&mut reader)?;
     reader.finish()?;
     Ok(arrays)
@@ -797,5 +804,41 @@ pub fn dtype_size(dtype: mlx::Dtype) -> usize {
         mlx::Dtype::Uint16 | mlx::Dtype::Int16 | mlx::Dtype::Float16 | mlx::Dtype::Bfloat16 => 2,
         mlx::Dtype::Uint32 | mlx::Dtype::Int32 | mlx::Dtype::Float32 => 4,
         mlx::Dtype::Uint64 | mlx::Dtype::Int64 | mlx::Dtype::Float64 | mlx::Dtype::Complex64 => 8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_array() -> mlx::MlxArray {
+        mlx::MlxArray::from_bytes(vec![0u8; 8], &[2], mlx::Dtype::float32)
+    }
+
+    #[test]
+    fn page_payload_round_trips_and_rejects_a_wrong_key() {
+        let array = tiny_array();
+        let bytes = encode_page_payload(0x1234, std::slice::from_ref(&array)).unwrap();
+        assert!(decode_page_payload(&bytes, 0x1234).is_ok());
+        let err = decode_page_payload(&bytes, 0x5678).unwrap_err();
+        assert!(
+            err.to_string().contains("page key mismatch"),
+            "wrong key must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn write_page_persists_under_the_content_key() {
+        // Positive control: an oversized insert fails silently (warn + false),
+        // so assert the write path itself, not just the decode.
+        let mut tier = KvTierStore::with_budget(1 << 20, 1 << 18);
+        let block = MetalPageBlock {
+            logical_id: 0,
+            owner: None,
+            content_key: Some(0x1234),
+            kv_flat: vec![tiny_array()],
+        };
+        assert!(write_page(&mut tier, 0x1234, &block));
+        assert!(tier.contains(tier_key(NS_PAGE, 0x1234)));
     }
 }
