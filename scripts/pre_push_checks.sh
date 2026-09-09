@@ -96,6 +96,10 @@ FAST_PID=$!
 # --- Cargo steps (serial — cargo locks the target dir) ---------------------
 if [[ "${SKIP_CARGO}" == "0" ]]; then
     run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
+    # CI's test-backend lane runs `-p arle`; the hook did not, so a CLI help
+    # rewrite landed on main with cli_smoke red. Same feature set as the check
+    # above, so the binary is already built.
+    run cargo test -p arle --no-default-features --features cpu,no-cuda,cli --test cli_smoke
     # Clippy (not check) on the cuda lane: catches clippy lints (missing_safety_doc,
     # needless_borrow) that plain check misses — the gap that let quant_linear.rs
     # clippy errors pass the hook and fail CI. Debug profile shares the cache with
