@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use infer_core::CompletedRequest;
-use infer_seam::{BackendExecutor, KvPool};
+#[cfg(feature = "cuda")]
+use infer_seam::BackendExecutor;
 use infer_server::{OpenAiTokenizer, ServeHandle, StreamItem};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -18,19 +19,15 @@ use crate::types::{
 /// Adapter over one running [`ServeHandle`] + its tokenizer, generic over the
 /// executor / KV pool so the same wiring serves every backend. The shared body
 /// behind each [`crate::LoadedInferenceEngine`] variant's impl.
-pub struct ServeInferenceEngine<E: BackendExecutor, K: KvPool> {
+pub struct ServeInferenceEngine {
     model_id: String,
     tokenizer: OpenAiTokenizer,
-    serve: Arc<ServeHandle<E, K>>,
+    serve: Arc<ServeHandle>,
 }
 
-impl<E, K> ServeInferenceEngine<E, K>
-where
-    E: BackendExecutor + 'static,
-    K: KvPool + 'static,
-{
+impl ServeInferenceEngine {
     #[must_use]
-    pub fn new(model_id: String, tokenizer: OpenAiTokenizer, serve: ServeHandle<E, K>) -> Self {
+    pub fn new(model_id: String, tokenizer: OpenAiTokenizer, serve: ServeHandle) -> Self {
         Self {
             model_id,
             tokenizer,
@@ -41,7 +38,7 @@ where
     /// Shared handle to the running engine, for wiring an HTTP router over an
     /// already-loaded engine ([`crate::LoadedInferenceEngine::local_router`]).
     #[cfg(feature = "cuda")]
-    pub(crate) fn serve_arc(&self) -> Arc<ServeHandle<E, K>> {
+    pub(crate) fn serve_arc(&self) -> Arc<ServeHandle> {
         Arc::clone(&self.serve)
     }
 
@@ -295,16 +292,16 @@ where
         let exec_images = images;
         let sampling = req.sampling.clone();
         let max_tokens = req.max_tokens;
+        let output = self
+            .serve
+            .run_on_executor(move |executor| match executor.multimodal() {
+                Some(mm) => {
+                    mm.generate_multimodal(&exec_prompt, &exec_images, max_tokens, &sampling)
+                }
+                None => Ok(None),
+            })?;
         let output =
-            self.serve
-                .run_on_executor(move |executor| match executor.multimodal() {
-                    Some(mm) => {
-                        mm.generate_multimodal(&exec_prompt, &exec_images, max_tokens, &sampling)
-                    }
-                    None => Ok(None),
-                })??;
-        let output =
-            output.ok_or_else(|| anyhow!("backend does not expose multimodal chat completion"))?;
+            output?.ok_or_else(|| anyhow!("backend does not expose multimodal chat completion"))?;
         let response_token_ids = output.generated_tokens;
         let text = self
             .tokenizer
@@ -328,7 +325,26 @@ where
 /// The closure builds `RawLogits` on the engine thread so the device buffer +
 /// context cross back to the caller as a single `Send` value.
 #[cfg(feature = "cuda")]
-impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
+impl ServeInferenceEngine {
+    /// Downcast the engine-thread executor to the CUDA concrete type for
+    /// OPD control-surface methods. Runs on the engine thread, so the
+    /// downcast cannot race a backend swap.
+    fn with_cuda_executor<R>(
+        &self,
+        f: impl FnOnce(&mut infer_cuda::CudaExecutor) -> Result<R> + Send + 'static,
+    ) -> Result<R>
+    where
+        R: Send + 'static,
+    {
+        self.serve.run_on_executor(move |executor| {
+            let executor = executor
+                .as_any_mut()
+                .downcast_mut::<infer_cuda::CudaExecutor>()
+                .ok_or_else(|| anyhow::anyhow!("engine backend is not cuda"))?;
+            f(executor)
+        })?
+    }
+
     pub fn forward_token_logits(
         &self,
         input_ids: &[u32],
@@ -336,14 +352,14 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
     ) -> Result<crate::types::RawLogits> {
         let input_ids = input_ids.to_vec();
         let positions = positions.to_vec();
-        self.serve.run_on_executor(move |executor| {
+        self.with_cuda_executor(move |executor| {
             let (logits, shape, device) = executor.forward_token_logits(&input_ids, &positions)?;
             Ok(crate::types::RawLogits {
                 logits,
                 shape,
                 device,
             })
-        })?
+        })
     }
 
     /// Trunk taps + final hidden states for offline DSpark draft training.
@@ -356,9 +372,9 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let input_ids = input_ids.to_vec();
         let target_layer_ids = target_layer_ids.to_vec();
-        self.serve.run_on_executor(move |executor| {
+        self.with_cuda_executor(move |executor| {
             executor.forward_training_taps(&input_ids, &target_layer_ids)
-        })?
+        })
     }
 
     /// Fold a fresh student LoRA update into the resident projection weights
@@ -374,19 +390,25 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
     /// drop.
     pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
         self.serve.run_on_engine(move |engine| {
-            engine.executor_mut().remerge_student_lora(update)?;
+            {
+                let executor = engine
+                    .executor_mut()
+                    .as_any_mut()
+                    .downcast_mut::<infer_cuda::CudaExecutor>()
+                    .ok_or_else(|| anyhow::anyhow!("engine backend is not cuda"))?;
+                executor.remerge_student_lora(update)?;
+                // The captured decode graph baked the old weight pointers; drop it
+                // so the next step re-captures against the merged weights (#97 C1).
+                executor.invalidate_decode_graph();
+            }
             engine.invalidate_prefix_cache();
-            // The captured decode graph baked the old weight pointers; drop it
-            // so the next step re-captures against the merged weights (#97 C1).
-            engine.executor_mut().invalidate_decode_graph();
             Ok(())
         })?
     }
 
     /// The NVFP4 twin of [`Self::frozen_base_fp8_pointers`].
     pub fn frozen_base_fp4_pointers(&self) -> Result<Vec<infer_cuda::SharedFp4BaseProjection>> {
-        self.serve
-            .run_on_executor(|executor| executor.frozen_base_fp4_pointers())?
+        self.with_cuda_executor(|executor| executor.frozen_base_fp4_pointers())
     }
 
     /// Read-only borrow of resident FP8 block-scaled base projection pointers
@@ -395,16 +417,14 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
     /// pointer table — raw `u64` device pointers + dims, all `Send`. The borrow
     /// is read-only; resident weights are not mutated, so no prefix-cache drop.
     pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
-        self.serve
-            .run_on_executor(|executor| executor.frozen_base_fp8_pointers())?
+        self.with_cuda_executor(|executor| executor.frozen_base_fp8_pointers())
     }
 
     /// Non-owning views of every resident dense-BF16 base projection's device
     /// pointer, for refreshing the train student's frozen base AFTER a LoRA
     /// re-merge.
     pub fn frozen_base_bf16_pointers(&self) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
-        self.serve
-            .run_on_executor(|executor| executor.frozen_base_bf16_pointers())?
+        self.with_cuda_executor(|executor| executor.frozen_base_bf16_pointers())
     }
 
     /// Hot-swap the DSpark Markov head weights from a host f32 snapshot, then
@@ -413,9 +433,14 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
     /// forward step.
     pub fn update_dspark_markov_weights(&self, w1: Vec<f32>, w2: Vec<f32>) -> Result<()> {
         self.serve.run_on_engine(move |engine| {
-            engine
-                .executor_mut()
-                .update_dspark_markov_weights(&w1, &w2)?;
+            {
+                let executor = engine
+                    .executor_mut()
+                    .as_any_mut()
+                    .downcast_mut::<infer_cuda::CudaExecutor>()
+                    .ok_or_else(|| anyhow::anyhow!("engine backend is not cuda"))?;
+                executor.update_dspark_markov_weights(&w1, &w2)?;
+            }
             engine.invalidate_prefix_cache();
             Ok(())
         })?
@@ -423,14 +448,10 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
 }
 
 // `Send` holds via the auto-trait: `ServeInferenceEngine` stores only a
-// `ServeHandle<E, K>` (Send channel + JoinHandle + PhantomData), never an `E`/`K`
+// `ServeHandle` (Send channel + JoinHandle), never an executor value
 // value, so a `!Send` executor (e.g. MLX `MetalExecutor`, which lives on the
 // engine thread) is fine.
-impl<E, K> InferenceEngine for ServeInferenceEngine<E, K>
-where
-    E: BackendExecutor + 'static,
-    K: KvPool + 'static,
-{
+impl InferenceEngine for ServeInferenceEngine {
     fn model_id(&self) -> &str {
         &self.model_id
     }

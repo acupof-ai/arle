@@ -8,7 +8,7 @@
 //!
 //! The API is intentionally `std`-only (threads + `mpsc`), no async runtime:
 //!
-//! - [`ServeHandle::spawn`] starts the engine thread owning an `Engine<E, K>`.
+//! - [`ServeHandle::spawn`] starts the engine thread owning an `Engine`.
 //! - [`ServeHandle::submit`] hands a prompt to the engine and returns a
 //!   [`RequestTicket`] carrying the engine-assigned [`RequestHandle`] plus a
 //!   private back-channel for that request's completion.
@@ -196,14 +196,14 @@ impl LiveRequestGate {
 /// request a process-level abort instead, used by HTTP Ctrl-C shutdown. The
 /// generic parameters mirror [`Engine`]; both must be `Send + 'static` because
 /// the engine lives on a separate thread.
-pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
+pub struct ServeHandle {
     submit_tx: Option<Sender<Submission>>,
-    /// Out-of-band control channel: runs a `FnOnce(&mut Engine<E, K>)` on the
+    /// Out-of-band control channel: runs a `FnOnce(&mut Engine)` on the
     /// engine thread between steps. The OPD control surface (raw-logits forward,
     /// weight offload/reload, student-LoRA re-merge + prefix-cache invalidation)
     /// reaches the thread-owned engine through here without crossing the request
     /// hot path.
-    control_tx: Option<Sender<ControlMessage<E, K>>>,
+    control_tx: Option<Sender<ControlMessage>>,
     join: Option<JoinHandle<()>>,
     /// Latest scheduler counters, republished by the engine loop each tick.
     counters: Arc<Mutex<CounterSnapshot>>,
@@ -211,7 +211,6 @@ pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     max_live_requests: usize,
     /// Request tickets currently handed out and not yet dropped.
     live_gate: Arc<LiveRequestGate>,
-    _backend: std::marker::PhantomData<fn() -> (E, K)>,
 }
 
 /// Shared server shutdown token observed by the HTTP signal handler and the
@@ -288,23 +287,23 @@ fn submit_trace_enabled() -> bool {
     std::env::var_os("ARLE_SERVE_SUBMIT_TRACE").is_some()
 }
 
-impl<E, K> ServeHandle<E, K>
-where
-    E: BackendExecutor + Send + 'static,
-    K: KvPool + Send + 'static,
-{
-    pub fn spawn(executor: E, kv: K, config: SchedulerConfig) -> Self {
+impl ServeHandle {
+    pub fn spawn(
+        executor: Box<dyn BackendExecutor + Send>,
+        kv: Box<dyn KvPool + Send>,
+        config: SchedulerConfig,
+    ) -> Self {
         Self::spawn_with_shutdown(executor, kv, config, ServeShutdown::new())
     }
 
     pub fn spawn_with_shutdown(
-        executor: E,
-        kv: K,
+        executor: Box<dyn BackendExecutor + Send>,
+        kv: Box<dyn KvPool + Send>,
         config: SchedulerConfig,
         shutdown: ServeShutdown,
     ) -> Self {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
-        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E, K>>();
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
         let observe_counters = Arc::clone(&counters);
@@ -329,12 +328,11 @@ where
             counters,
             max_live_requests,
             live_gate: Arc::new(LiveRequestGate::new(max_live_requests)),
-            _backend: std::marker::PhantomData,
         }
     }
 }
 
-fn quiesce_engine<E: BackendExecutor, K: KvPool>(engine: &mut Engine<E, K>) -> Result<usize> {
+fn quiesce_engine(engine: &mut Engine) -> Result<usize> {
     let handles = engine.quiesce();
     engine.run_to_idle()?;
     for handle in &handles {
@@ -343,20 +341,16 @@ fn quiesce_engine<E: BackendExecutor, K: KvPool>(engine: &mut Engine<E, K>) -> R
     Ok(handles.len())
 }
 
-impl<E, K> ServeHandle<E, K>
-where
-    E: BackendExecutor + 'static,
-    K: KvPool + 'static,
-{
+impl ServeHandle {
     pub fn spawn_with_engine_builder_and_shutdown<B>(
         builder: B,
         shutdown: ServeShutdown,
     ) -> Result<Self>
     where
-        B: FnOnce() -> Result<Engine<E, K>> + Send + 'static,
+        B: FnOnce() -> Result<Engine> + Send + 'static,
     {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
-        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E, K>>();
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
@@ -394,7 +388,6 @@ where
                     counters,
                     live_gate: Arc::new(LiveRequestGate::new(max_live_requests)),
                     max_live_requests,
-                    _backend: std::marker::PhantomData,
                 })
             }
             Err(err) => {
@@ -535,7 +528,7 @@ where
     /// Run `f` against the engine-thread-owned [`Engine`] and return its result.
     ///
     /// The closure executes on the engine thread (between scheduler steps), so it
-    /// has exclusive `&mut Engine<E, K>` access — scheduler, RadixCache, *and*
+    /// has exclusive `&mut Engine` access — scheduler, RadixCache, *and*
     /// executor — without racing the request hot path. This is the engine-level
     /// out-of-band control seam: the OPD surface uses it when a control op must
     /// touch engine state the executor cannot reach, e.g. dropping the now-stale
@@ -543,7 +536,7 @@ where
     /// the engine thread runs the closure and returns its value.
     pub fn run_on_engine<R, F>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&mut Engine<E, K>) -> R + Send + 'static,
+        F: FnOnce(&mut Engine) -> R + Send + 'static,
         R: Send + 'static,
     {
         let control_tx = self
@@ -552,7 +545,7 @@ where
             .ok_or_else(|| anyhow!("ServeHandle already shut down"))?;
         let (response_tx, response_rx) = mpsc::channel::<R>();
         control_tx
-            .send(Box::new(move |engine: &mut Engine<E, K>| {
+            .send(Box::new(move |engine: &mut Engine| {
                 // If the caller dropped the receiver, discard the result.
                 let _ = response_tx.send(f(engine));
             }))
@@ -570,7 +563,7 @@ where
     /// express. Blocks until the engine thread runs the closure and returns it.
     pub fn run_on_executor<R, F>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&mut E) -> R + Send + 'static,
+        F: FnOnce(&mut dyn BackendExecutor) -> R + Send + 'static,
         R: Send + 'static,
     {
         self.run_on_engine(move |engine| f(engine.executor_mut()))
@@ -631,7 +624,7 @@ where
     }
 }
 
-impl<E: BackendExecutor, K: KvPool> Drop for ServeHandle<E, K> {
+impl Drop for ServeHandle {
     fn drop(&mut self) {
         // Wake every queued submit so it errors instead of blocking forever.
         self.live_gate.shutdown();
@@ -645,12 +638,12 @@ impl<E: BackendExecutor, K: KvPool> Drop for ServeHandle<E, K> {
     }
 }
 
-// ServeHandle<E, K> is Send regardless of whether E or K are Send: every field
+// ServeHandle is Send regardless of whether E or K are Send: every field
 // is independently Send (channels, Arc, AtomicUsize, PhantomData<fn()->(E,K)>).
 // SAFETY: Field-by-field Send proof: Sender<Submission>, Sender<ControlMessage<E,K>>
 // (ControlMessage is Box<dyn FnOnce+Send>, always Send), Arc<Mutex<_>>, etc.
 // E/K values live exclusively on the engine thread, never moved through the public API.
-unsafe impl<E: BackendExecutor, K: KvPool> Send for ServeHandle<E, K> {}
+unsafe impl Send for ServeHandle {}
 
 /// Single-process coordinator HTTP router using a local in-process relay.
 ///
@@ -658,17 +651,13 @@ unsafe impl<E: BackendExecutor, K: KvPool> Send for ServeHandle<E, K> {}
 /// request handling goes through the relay protocol over an in-process channel
 /// rather than TCP. Pass `multimodal_kind` for VLM backends (DeepseekOcr,
 ///; text-only backends pass `None`.
-pub fn coordinator_local_router<E, K>(
-    serve: Arc<ServeHandle<E, K>>,
+pub fn coordinator_local_router(
+    serve: Arc<ServeHandle>,
     tokenizer: tokenizer::OpenAiTokenizer,
     model: impl Into<String>,
     max_thinking_tokens: usize,
     multimodal_kind: Option<infer_plan::MultimodalKind>,
-) -> axum::Router
-where
-    E: infer_seam::BackendExecutor + 'static,
-    K: infer_seam::KvPool + 'static,
-{
+) -> axum::Router {
     use multiproc_relay::RelayCoordinator;
 
     let (relay, engine_recv, engine_tx) = RelayCoordinator::new_local();
@@ -740,16 +729,13 @@ fn relay_stream(
     }
 }
 
-fn serve_handle_relay_driver<E, K>(
-    serve: std::sync::Arc<ServeHandle<E, K>>,
+fn serve_handle_relay_driver(
+    serve: std::sync::Arc<ServeHandle>,
     mut engine_recv: multiproc_relay::LocalChannelRecv,
     engine_tx: std::sync::mpsc::SyncSender<multiproc_relay::RelayEnvelope>,
     multimodal_rx: Option<LocalMultimodalRx>,
     grammars: Option<std::sync::Arc<grammar::GrammarCache>>,
-) where
-    E: infer_seam::BackendExecutor + 'static,
-    K: infer_seam::KvPool + 'static,
-{
+) {
     use multiproc_relay::{RelayChannel, RelayEnvelope, WireStats};
 
     if let Some(rx) = multimodal_rx {

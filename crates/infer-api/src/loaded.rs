@@ -446,7 +446,7 @@ mod backend {
     #[cfg(feature = "hip")]
     use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
-    use infer_metal::{MetalDeepseekOcrModel, MetalExecutor, MetalKvPool};
+    use infer_metal::{MetalExecutor, MetalKvPool};
     #[cfg(feature = "cuda")]
     use infer_seam::BackendExecutor;
     #[cfg(feature = "metal")]
@@ -498,30 +498,28 @@ mod backend {
     pub enum LoadedInferenceEngine {
         /// Metal backend (Apple Silicon, MLX). Fully wired and runnable.
         #[cfg(feature = "metal")]
-        Metal(ServeInferenceEngine<MetalExecutor, MetalKvPool>),
+        Metal(ServeInferenceEngine),
         /// Metal DeepSeek-OCR VLM backend. The DeepEncoder + DeepSeek-MoE MLX
         /// bridge owns generation and is adapted to the shared autoregressive
         /// engine by a buffered executor (single image, 1024x1024 base view).
         #[cfg(feature = "metal")]
-        MetalDeepseekOcr(
-            ServeInferenceEngine<BufferedDiffusionExecutor<MetalDeepseekOcrModel>, HostPagedKvPool>,
-        ),
+        MetalDeepseekOcr(ServeInferenceEngine),
         /// CUDA backend (Linux + NVIDIA). Structurally wired (typechecks); the
         /// real forward is lead-owned and not yet runnable.
         #[cfg(feature = "cuda")]
-        Cuda(ServeInferenceEngine<CudaExecutor, CudaKvPool>),
+        Cuda(ServeInferenceEngine),
         /// HIP backend (AMD ROCm, DSv4 GGUF). Host-side wiring typechecks
         /// everywhere; the device forward runs on a ROCm box (pending-remote).
         #[cfg(feature = "hip")]
-        Hip(ServeInferenceEngine<HipDsv4Executor, HipKvPool>),
+        Hip(ServeInferenceEngine),
         /// Vulkan backend (cross-vendor, GGUF). Host-side wiring typechecks
         /// everywhere; numeric device forward is pending AIPC on-box bring-up.
         #[cfg(feature = "vulkan")]
-        Vulkan(ServeInferenceEngine<VulkanExecutor, VulkanKvPool>),
+        Vulkan(ServeInferenceEngine),
         /// Portable CPU backend: the placeholder `MetalExecutor` over the
         /// backend-neutral host paged KV pool (no MLX, no CUDA). Smoke / CI.
         #[cfg(all(feature = "cpu", not(feature = "metal")))]
-        Cpu(ServeInferenceEngine<MetalExecutor, HostPagedKvPool>),
+        Cpu(ServeInferenceEngine),
     }
 
     impl LoadedInferenceEngine {
@@ -1123,7 +1121,8 @@ mod backend {
                 config.total_pages,
                 config.page_size,
             );
-            let serve = ServeHandle::spawn(executor, kv, config.scheduler_config());
+            let serve =
+                ServeHandle::spawn(Box::new(executor), Box::new(kv), config.scheduler_config());
             Ok(Self::Cpu(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -1209,11 +1208,7 @@ mod backend {
         model_path: &str,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
-    ) -> Result<(
-        ServeHandle<MetalExecutor, MetalKvPool>,
-        infer_server::OpenAiTokenizer,
-        String,
-    )> {
+    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
         use infer_server::OpenAiTokenizer;
 
         if config.mtp_enabled() {
@@ -1309,13 +1304,13 @@ mod backend {
                     })
                     .with_yield_every_ticks(8);
                     infer_core::Engine::with_config_and_governor(
-                        executor,
-                        kv,
+                        Box::new(executor),
+                        Box::new(kv),
                         scheduler,
                         Box::new(governor),
                     )
                 } else {
-                    infer_core::Engine::with_config(executor, kv, scheduler)
+                    infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
                 }
             },
             shutdown,
@@ -1363,11 +1358,7 @@ mod backend {
         resolved: &std::path::Path,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
-    ) -> Result<(
-        ServeHandle<BufferedDiffusionExecutor<MetalDeepseekOcrModel>, HostPagedKvPool>,
-        infer_server::OpenAiTokenizer,
-        String,
-    )> {
+    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
         use infer_server::OpenAiTokenizer;
 
         if config.mtp_enabled() {
@@ -1427,13 +1418,13 @@ mod backend {
                     })
                     .with_yield_every_ticks(8);
                     infer_core::Engine::with_config_and_governor(
-                        executor,
-                        kv,
+                        Box::new(executor),
+                        Box::new(kv),
                         scheduler,
                         Box::new(governor),
                     )
                 } else {
-                    infer_core::Engine::with_config(executor, kv, scheduler)
+                    infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
                 }
             },
             shutdown,
@@ -1535,11 +1526,7 @@ mod backend {
         model_path: &str,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
-    ) -> Result<(
-        ServeHandle<CudaExecutor, CudaKvPool>,
-        infer_server::OpenAiTokenizer,
-        String,
-    )> {
+    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
         use infer_server::OpenAiTokenizer;
 
         // Resolve HF id → local cache dir, downloading if absent. Mirrors the
@@ -1642,7 +1629,7 @@ mod backend {
     pub(super) fn build_cuda_engine(
         model_path: &str,
         config: &EngineLoadConfig,
-    ) -> Result<infer_core::Engine<CudaExecutor, CudaKvPool>> {
+    ) -> Result<infer_core::Engine> {
         // Single funnel for single-proc serve AND multiproc workers — flags
         // land in the statics before any CUDA context/executor exists.
         infer_cuda::apply_runtime_flags(&config.cuda);
@@ -1916,7 +1903,7 @@ mod backend {
         if let Some((rank, size)) = executor.kv_shard_spec() {
             kv.set_shard(rank, size);
         }
-        infer_core::Engine::with_config(executor, kv, scheduler)
+        infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
     }
 
     #[cfg(feature = "cuda")]
@@ -1935,7 +1922,7 @@ mod backend {
     /// discard their TP-replicated tokens.
     #[cfg(feature = "cuda")]
     pub struct CudaWorkerEngine {
-        engine: infer_core::Engine<CudaExecutor, CudaKvPool>,
+        engine: infer_core::Engine,
         /// Rank 0 owns the visible output; followers skip all output bookkeeping.
         owns_output: bool,
         /// engine handle -> coordinator request_id (output owner only); removed
@@ -2209,11 +2196,7 @@ mod backend {
         model_path: &str,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
-    ) -> Result<(
-        ServeHandle<HipDsv4Executor, HipKvPool>,
-        infer_server::OpenAiTokenizer,
-        String,
-    )> {
+    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
         use infer_server::OpenAiTokenizer;
 
         if config.mtp_enabled() {
@@ -2241,7 +2224,7 @@ mod backend {
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
                 let (executor, kv) = infer_hip::load_dsv4_gguf(&gguf_path, num_slots, max_seq_len)?;
-                infer_core::Engine::with_config(executor, kv, scheduler)
+                infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
             },
             shutdown,
         )?;
@@ -2259,11 +2242,7 @@ mod backend {
         model_path: &str,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
-    ) -> Result<(
-        ServeHandle<VulkanExecutor, VulkanKvPool>,
-        infer_server::OpenAiTokenizer,
-        String,
-    )> {
+    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
         use infer_server::OpenAiTokenizer;
 
         if config.mtp_enabled() {
@@ -2295,7 +2274,7 @@ mod backend {
             move || {
                 let (executor, kv) =
                     infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
-                infer_core::Engine::with_config(executor, kv, scheduler)
+                infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
             },
             shutdown,
         )?;
@@ -2369,8 +2348,12 @@ mod backend {
             config.total_pages,
             config.page_size,
         );
-        let serve =
-            ServeHandle::spawn_with_shutdown(executor, kv, config.scheduler_config(), shutdown);
+        let serve = ServeHandle::spawn_with_shutdown(
+            Box::new(executor),
+            Box::new(kv),
+            config.scheduler_config(),
+            shutdown,
+        );
         Ok(infer_server::coordinator_local_router(
             Arc::new(serve),
             tokenizer,
