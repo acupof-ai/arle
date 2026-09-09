@@ -4,7 +4,7 @@
 
 ## Context
 
-After [`1da4e0422`](../wins/2026-08-19-nvfp4-marlin-remaining-load-sites.md) put
+After [](../wins/2026-08-19-nvfp4-marlin-remaining-load-sites.md) put
 every quantised GEMM of Qwen3.8-27B-NVFP4 on Marlin, c=16 sat at +13.3% over
 Qwen3.6-27B-FP8 while c=1..8 were all above +30%. A per-op profile put the whole
 residue in `dense_ffn`, and an in-tree comment recorded the kernel as
@@ -34,7 +34,7 @@ path skips entirely. It is intrinsic to the format, not a defect.
 ## What was tried, and what each measured
 
 `crates/infer-cuda/examples/marlin_fp4_probe.rs` (kept), 1xH20, 50 iters/point.
-Baseline is `1da4e0422`. ncu metrics from the gate_up FP4 kernel.
+Baseline is. ncu metrics from the gate_up FP4 kernel.
 
 | | regs/thread | warps active | issue | gate_up M=16 | down M=16 | gate_up M=32 |
 |---|---:|---:|---:|---:|---:|---:|

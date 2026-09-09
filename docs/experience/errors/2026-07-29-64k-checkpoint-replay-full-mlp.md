@@ -2,7 +2,7 @@
 
 ## Context
 
-Candidate `a9bb1e49` plus autograd diff `ac9fd401` passed 192 CUDA autograd
+Candidate plus autograd diff `ac9fd401` passed 192 CUDA autograd
 tests. A single-H20 `agent-opd --synthetic-writeback-seq 65536` run completed
 all 64 forward groups in 734.963 seconds and fused CE in 2.936 seconds.
 

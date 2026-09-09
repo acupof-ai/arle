@@ -57,12 +57,12 @@ consistency=0.7372`; step 1 skipped by the confidence gate at max_prob=0.9726.
 
 A second, independent gap surfaced once the aux forward was reached: flashqla had
 no AOT instantiation for the 0.8B GDN geometry H=16/Hg=16. Added as five
-`kernels.toml` rows (`f77ca2eb5`); the FFI dispatch table is generated from that
+`kernels.toml` rows; the FFI dispatch table is generated from that
 file, so no Rust change was needed.
 
-Commits: `62017ec8a` (deletion), `bc96d29ec` (collapse duplicated aux loading),
-`f77ca2eb5` (AOT geometry). Earlier in the same chain: `2dfb12140` (RoPE cache
-host mirror), `b56274770` (bf16 operands in add/mul/matmul).
+Commits: (deletion) (collapse duplicated aux loading),
+ (AOT geometry). Earlier in the same chain: (RoPE cache
+host mirror) (bf16 operands in add/mul/matmul).
 
 ## Rule
 

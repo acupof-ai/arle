@@ -3,7 +3,7 @@
 > Status: Shipped
 
 Measured on `ThinkingCap-Qwen3.6-27B-FP8`, H20 (97,508 MiB), `--synthetic-writeback-seq`,
-binaries `sp12` … `sp17` (`b3fef817d` … `11ef1f089`).
+binaries `sp12` … `sp17` (…).
 
 ## Context
 

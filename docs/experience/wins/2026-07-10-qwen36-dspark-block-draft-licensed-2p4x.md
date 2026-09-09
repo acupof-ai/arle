@@ -15,10 +15,10 @@ checkpoints). H20, Qwen3.6-27B-FP8, GPU-idle, greedy 500-tok probes.
 
 | round | draft | verify | total step | tok/s | change |
 |---|---|---|---|---|---|
-| baseline | 63.2 | 177.2 | 248.7 ms | 17.0 | as-landed dd79c713e |
+| baseline | 63.2 | 177.2 | 248.7 ms | 17.0 | as-landed |
 | TILE==B gemv tweak | 63.3 | 201.8 | 273.3 | 15.5 | **regression, reverted** |
 | fix A | 63.5 | 72.3 | 144.1 | 29.1 | `QWEN_FP8_DEEPGEMM_DENSE_MIN_M` 64→16 |
-| fix B | **7.7** | **24.9** | **36.2** | **104–108** | bf16 gemm small-N GEMV loop 16→4 + full lane routing (7f84a3371) |
+| fix B | **7.7** | **24.9** | **36.2** | **104–108** | bf16 gemm small-N GEMV loop 16→4 + full lane routing |
 
 Plain decode: 43.6 tok/s (control unregressed). **Net 2.4×** at accept
 3.3–3.4/16 (think-block); acceptance 2.8–5.4 across prompts.

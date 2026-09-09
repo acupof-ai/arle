@@ -32,7 +32,7 @@ select skips a dead group; streaming_submit rejects a dead group.
 # - assert group 1 step wall within 5% of solo baseline
 ```
 
-- Baseline: `663235636` (teardown co-kills all groups via serve shutdown)
+- Baseline: (teardown co-kills all groups via serve shutdown)
 - Treatment: this commit (dead flag isolates the group)
 - Trials: pending-remote
 

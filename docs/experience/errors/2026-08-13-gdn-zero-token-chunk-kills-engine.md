@@ -134,6 +134,6 @@ request down. That containment gap is independent and still open.
   also deletes the build's cwd (`sh: 0: getcwd() failed`). Gate work from a
   private copy.
 - The node tree carried `csrc/attention/decode_attention_varlen_int8.cu`,
-  deleted from the repo in `64be73980`, with corrupted content
+ deleted from the repo in with corrupted content
   (`__nv_fp8_e4m32float`). Every CUDA build there failed at `build.rs:2490`
   regardless of the change under test.

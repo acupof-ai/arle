@@ -1,12 +1,12 @@
 # Zigzag ring device kernel: per-row positions ride the ring — 2026-07-31
 
 > Status: Kernel + backend + ops landed; Mac CUDA typecheck + host ring tests
-> green. Pod 2026-08-01 (HEAD 3d9bc3717): the ring FIRES and is CORRECT — seq=16
+> green. Pod 2026-08-01 (HEAD): the ring FIRES and is CORRECT — seq=16
 > f32-anchored PASS (cp_vs_f32 2.4e-4) and 256K liveness+gross-error PASS
 > (rel_err 2.958e-5). The earlier "5.2% FAIL" was a real split-brain bug (now
 > fixed), not a gate artifact — see the correction below.
 >
-> **Pod liveness (2026-08-01, HEAD e739a1105, GPUs 1,3):** `nd_parallel_parity`
+> **Pod liveness (2026-08-01, HEAD GPUs 1,3):** `nd_parallel_parity`
 > `ARLE_ND_SEQ=131072` cp=2 (local shard 65536) **completed a full optimizer
 > step** — single-card ref (`DONE loss=3.232068` over 131068 targets) then BOTH
 > CP ranks forward+CE+backward+optimizer. Peak host RSS **4.37 GB**, min
@@ -18,7 +18,7 @@
 > **liveness only** (a step completes without OOM). Liveness is NOT correctness:
 > the shipping CP forward ran plain attention on each shard (below).
 >
-> **CORRECTION (2026-08-01, HEAD 3d9bc3717): the "5.2% parity FAIL" WAS a real
+> **CORRECTION (2026-08-01, HEAD): the "5.2% parity FAIL" WAS a real
 > bug — a cp split-brain, now fixed.** `masked_writeback_step` sharded the
 > sequence by its `cp` ARGUMENT, but the forward decided whether to ring by
 > reading a DIFFERENT source, the model field `self.cp` — set only by `set_cp`,
@@ -30,7 +30,7 @@
 > stage explicitly wired cp (the diagnostic calls `set_cp`) — it verified the
 > ring MATH, never the shipping FORWARD, which bypassed it. Fix: thread `cp`
 > through `forward_hidden_states`/`forward_batch_hidden_indices`, delete the
-> `self.cp` field + `set_cp` (`3d9bc3717`). **Pod-verified (HEAD 3d9bc3717, GPUs
+> `self.cp` field + `set_cp`. **Pod-verified (HEAD GPUs
 > 1,3): seq=16 `cp_vs_f32` 5.5e-2 → 2.4e-4 (~bf16 floor); 256K rung
 > (ARLE_ND_SEQ=131072, cp=2, local shard 65536 = the >65535 ring path) completes
 > a full fwd+bwd+optimizer step, loss_single=3.232068 vs loss_cp_sum=3.232163
@@ -90,7 +90,7 @@ Touch points (all one mechanism):
   tests (`ring_matches_full_softmax`, ragged/nonaligned/future,
   `cp_causal_sdpa_world1`) stay green — the CPU reference already masked per-row,
   so this aligns the device path to it.
-- **Pod (the gate) — PASS (2026-08-01, HEAD 3d9bc3717, GPUs 1,3):** built
+- **Pod (the gate) — PASS (2026-08-01, HEAD GPUs 1,3):** built
   `cuda,nccl`; `nd_parallel_parity` `ARLE_ND_SEQ=131072` (cp=2, local 65536,
   zigzag, the >65535 ring path) completes a full forward+backward+optimizer step
   (no `slice_bwd` OOM — the ring never materializes full_seq) with the CP loss-sum
@@ -98,7 +98,7 @@ Touch points (all one mechanism):
   1.629638 + 1.602526), `rel_err=2.958e-5` ≪ `bf16_tol=1e-1`. RUN_EXIT=0. The
   seq=16 rung additionally passes the f32 anchor (`cp_vs_f32=2.4e-4`, 83× under
   the 2e-2 margin). This only became a real test once the `self.cp` split-brain
-  was fixed (`3d9bc3717`) — before that the shipping forward bypassed the ring.
+ was fixed — before that the shipping forward bypassed the ring.
 
 ## Rule
 

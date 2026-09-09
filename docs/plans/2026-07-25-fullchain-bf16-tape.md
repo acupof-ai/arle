@@ -1,7 +1,7 @@
 # Full-chain bf16 mixed-precision training — design + implementation spec
 
 > **STATUS 2026-08-03 — SUPERSEDED by the shipped `--tape-dtype` design**
-> (commits 23e03e590 / 42dcd537f / f2f6e5aea / 8f6deb43f): kernel templating via
+> (commits / / /): kernel templating via
 > dtype-keyed NVRTC injection, flag surface on agent-opd + opd + self-opd. The pod
 > A/B ladder is pending and MUST include the checkpoint-path no-op probe from
 > `docs/experience/errors/2026-07-27-tape-bf16-noop-on-checkpoint-path.md`.

@@ -37,7 +37,7 @@ python3 scripts/bench_throughput.py \
 ```
 
 - Baseline: CUTLASS grouped GEMM for decode (pre-GEMV), 18.3 tok/s at c=1
-- Treatment: `521db0bed` — xor_mask GEMV (final, zero-VRAM)
+- Treatment: — xor_mask GEMV (final, zero-VRAM)
 - Prompt tokens: 8 (synthetic)
 - Completion tokens: 128
 - Trials: 16 requests per concurrency level

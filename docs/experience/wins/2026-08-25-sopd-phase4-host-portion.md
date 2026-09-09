@@ -29,7 +29,7 @@ buffer). C5 (batch drain) was already implemented (`drain_control` +
 # - trajectory channel feeds live agent rollouts into the OPD step (4b gate)
 ```
 
-- Baseline: `ba1d464c3` (no graph invalidation, no trajectory channel)
+- Baseline: (no graph invalidation, no trajectory channel)
 - Treatment: this commit
 - Trials: pending-remote
 

@@ -83,7 +83,7 @@ path changed, so no perf delta is possible.
   caller is `flashqla_gdr_generated.rs`, a build.rs-generated lookup table
   compiled under `#[cfg(feature = "cuda")]`, invisible in Mac no-cuda builds.
   V100 CUDA build failed with 27× E0425. Restored all 27 declarations
-  (`62349f463`). Lesson: generated-code callers behind cfg gates don't show up
+. Lesson: generated-code callers behind cfg gates don't show up
   in `rg` on the host platform.
 - Plan estimated 78 dead FFI declarations in cuda-kernels; actual count was 25
   (the plan's scan included functions with C++ internal callers). Verified each

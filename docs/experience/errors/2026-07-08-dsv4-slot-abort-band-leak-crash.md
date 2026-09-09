@@ -11,7 +11,7 @@
 ## Context
 
 Discovered 2026-07-08 while verifying the FlashMLA per-layer KV budget fix
-(`3ebc763f9`) on the H20 pod via `needle_gate.py` at a deliberately tight
+ on the H20 pod via `needle_gate.py` at a deliberately tight
 admission boundary (see
 `docs/experience/wins/2026-07-08-dsv4-flashmla-budget-needle-gate-pass.md`).
 Initially misdiagnosed as an admission-reject-path reservation leak (plausible
@@ -21,7 +21,7 @@ with an actual pod repro + trace, which found the real cause below.
 ## Root Cause (confirmed via repro, FIXED)
 
 Two bugs in `crates/infer-cuda/src/attention/kv_layout.rs`, both stemming from
-the same fact: since the 2026-07-05 per-layer KV-budget fix (`3ebc763f9`),
+the same fact: since the 2026-07-05 per-layer KV-budget fix,
 each DSv4 layer's `flashmla_kv_pool` is sized to **that layer's own**
 `flashmla_slot_pages` — layers are NOT uniform (in the production DeepSeek-V4-
 Flash-FP8 checkpoint: 3 SlidingWindow layers at 2 pages/slot vs.
@@ -79,7 +79,7 @@ correct fix). Same lesson as `2026-07-06-dsv4-concurrent-decode-digit-corruption
 case-as-fact rule, now confirmed a second time on the same feature area.
 
 **Secondary rule, still valid**: a per-layer-heterogeneous budget/sizing fix
-(like `3ebc763f9`) can expose OTHER code that assumed uniform per-layer sizes
+(like) can expose OTHER code that assumed uniform per-layer sizes
 and never got updated — `flashmla_total_pages`/`mirror_slot_pages` both
 silently assumed "layer 0's pool = every layer's pool," which was true only
 under the OLD uniform-divide budgeting. Any future change that makes

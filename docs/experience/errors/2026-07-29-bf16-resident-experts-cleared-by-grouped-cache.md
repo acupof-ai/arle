@@ -27,7 +27,7 @@ Gate the BF16 grouped path on the flag too:
 `deepgemm_ready = !routed_quant && deepgemm_native_ready && !sm120 &&
 !experts_bf16_resident`. The eager per-expert MoE forward keeps the Vecs mutable
 — the same path the sm120 self-disable already uses in production
-(commit 227790953).
+(commit).
 
 ## Rule
 

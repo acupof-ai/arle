@@ -1,7 +1,7 @@
 # DSv4/MTP guidellm canonical bench — SSE usage fix VERIFIED, sweep still capacity-blocked at TP=4 — 2026-07-06
 
 > Status: **partial PASS.** The commissioned SSE `stream_options.include_usage`
-> fix (`e16c89968`) is confirmed working end-to-end on the real CUDA multiproc
+> fix is confirmed working end-to-end on the real CUDA multiproc
 > coordinator path — this is the exact bug that blocked every prior canonical
 > guidellm attempt. Two more environment-layer blockers were found and fixed en
 > route (guidellm CLI version drift; a transformers/checkpoint config-load
@@ -25,7 +25,7 @@ serving-pipeline verification task, not a kernel-level optimization.
 
 ## Goal
 
-1. Verify the `e16c89968` SSE usage fix holds on the real CUDA multiproc
+1. Verify the SSE usage fix holds on the real CUDA multiproc
    coordinator (not just the Metal in-process path already verified locally).
 2. Get the canonical `scripts/bench_guidellm.sh` sweep to complete for
    DeepSeek-V4-Flash-FP8 + MTP, now that the usage-blocker is gone.
@@ -48,10 +48,10 @@ canonical production topology) was not available this session.
 
 ## Pod state
 
-- `scripts/pod.sh sync` → pod tree `e56adab0 docs(train): plan OPD Metal
-  backend, ...` (descendant of the commissioned `e16c89968`; confirmed via
-  `git -C /host/arle-build log --oneline -1` showing both `e56adab0` HEAD and
-  `e16c8996` in history).
+- `scripts/pod.sh sync` → pod tree ` docs(train): plan OPD Metal
+ backend,...` (descendant of the commissioned confirmed via
+ `git -C /host/arle-build log --oneline -1` showing both HEAD and
+ in history).
 - Build: `cargo build --release --features cuda,nccl,deepep --bin arle` →
   `BUILD_EXIT=0` (compiled 6 crates, 49.67s).
 
@@ -84,7 +84,7 @@ scripts/bench_guidellm.sh dsv4-mtp-tp4-c1 --target http://localhost:18198 \
 
 - **Backend:** CUDA, H20 ×4 of 8 (GPUs 4-7, 97871 MiB/card), CUDA 12.9.
 - **Model:** DeepSeek-V4-Flash-FP8, `/host/DeepSeek-V4-Flash-FP8`.
-- **Commit:** pod HEAD `e56adab0` (descendant of commissioned `e16c89968`).
+- **Commit:** pod HEAD (descendant of commissioned).
 - **Feature set:** `cargo build --release --features cuda,nccl,deepep --bin arle`.
 - **Non-default flags:** `--spec-type mtp` (`mtp_draft_tokens=2`,
   `mtp_draft_topk=1`); `INFER_TP_SIZE=4`; `INFER_CUDA_DEVICES=4,5,6,7`;
@@ -294,7 +294,7 @@ Additional columns from the raw table:
 
 ## Learnings
 
-- **The exact SSE usage-populate fix commissioned today (`e16c89968`) is
+- **The exact SSE usage-populate fix commissioned today is
   confirmed correct on the CUDA multiproc coordinator relay path, not just
   the previously-verified Metal in-process path.** Round 2's diagnosed root
   cause (`coordinator.rs` never passing `Some(usage)`, `stream_options` never
@@ -347,7 +347,7 @@ Additional columns from the raw table:
 ## Notes
 
 - What changed in code since the commissioning push: nothing this session
-  (devops/bench execution task); the SSE usage fix (`e16c89968`) and the
+ (devops/bench execution task); the SSE usage fix and the
   FlashMLA budget-reconciliation fix (separately verified,
   `2026-07-06-dsv4-flashmla-budget-reconciliation-verified.md`) were already
   landed and pulled in via `scripts/pod.sh sync`.

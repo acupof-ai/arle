@@ -19,7 +19,7 @@ were rejected as deliberate design (below).
   `KvPageTier` trait has no data source for it; the field and all plumbing are
   deleted.
 - `evict_slot_page` / `reinstate_slot_page` are KEPT (deliberately retained by
-  3f826c204 for the remote-L3 hole-tolerance path), but 6 doc sites referencing
+ for the remote-L3 hole-tolerance path), but 6 doc sites referencing
   the deleted `--kv-recall` flag are corrected — including a README feature
   bullet and a support-matrix row.
 
@@ -30,7 +30,7 @@ were rejected as deliberate design (below).
 - 8 per-layer `std::getenv` readers in `mlx_qwen35_model.cpp` (32+ lookups per
   decode step) now use function-local `static const` caching, matching the
   file's own existing op-profile pattern. A follow-up simplify pass
-  (`993c3e49b`) collapsed the bool sites into a `parse_env_bool` helper and
+ collapsed the bool sites into a `parse_env_bool` helper and
   cached the 8th reader, `qwen35_cpp_gdr_threadgroup_y`.
 
 **Gate loudness.**

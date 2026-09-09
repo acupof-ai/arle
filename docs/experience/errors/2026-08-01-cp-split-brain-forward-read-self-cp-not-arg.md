@@ -49,14 +49,14 @@ alone was proof of a defect.
 ## Fix
 
 Thread `cp` as a **forward argument** (beside `positions`) and delete the
-`self.cp` field + `set_cp` setter (`3d9bc3717`): `forward_hidden_states` and
+`self.cp` field + `set_cp` setter: `forward_hidden_states` and
 `forward_batch_hidden_indices` take `cp`; the non-CP internal callers pass
 `single()`; the CP writeback branch passes the real `cp`. First-principles
 placement — `tp` is model state (shards weights at load), `cp` is a forward-time
 routing choice (weights are replicated across the cp group), so it belongs with
 the call, not in the struct. `layer.forward` already took `cp` as a param; the
 field was the anomaly. Production reaches the fix for free — it already supplies
-`cp` as the step argument. Pod-verified (HEAD `3d9bc3717`, GPUs 1,3): seq=16
+`cp` as the step argument. Pod-verified (HEAD GPUs 1,3): seq=16
 `cp_vs_f32` 5.5e-2 → **2.4e-4** (~bf16 floor, 83× under the 2e-2 margin); and the
 256K rung (`ARLE_ND_SEQ=131072`, cp=2, local shard 65536 = the >65535 ring path)
 completes a full forward+backward+optimizer step with `loss_single=3.232068`,

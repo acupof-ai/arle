@@ -5,7 +5,7 @@
 ## Goal
 
 Verify that the B2 (replicated-KV, flash-decoding) CP decode path
-(807e6c0b4) produces correct output and does not regress decode at long
+ produces correct output and does not regress decode at long
 context. The gate covers needle correctness ×3 same-config and decode-rate
 probes at 4K / 128K / 224K context, CP=1 vs CP=2, TP=2 on 2×H20.
 

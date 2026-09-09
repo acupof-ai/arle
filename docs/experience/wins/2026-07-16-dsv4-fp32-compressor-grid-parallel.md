@@ -10,7 +10,7 @@ probe kernel launched `<<<1, 256>>>` — one thread block serially sweeping ever
 compressed block of the chunk, replacing the grid-parallel bf16 path
 (`dsv4_compressor_block_kernel<<<completed, 256>>>` + finalize).
 
-## Change (`2e635eda3`, one file, net −24 lines)
+## Change (one file, net −24 lines)
 
 `dsv4_compressor.cu`: templated `dsv4_compressor_block_kernel` +
 `dsv4_compressor_finalize_kernel` on input/carry type `T` (uint16_t | float);
@@ -30,7 +30,7 @@ behavior, same pattern as the all-boundaries entry). Logs:
 ## A/B — same shell, same GPUs (0–3), same eager config, TP=4/EP=4
 
 Arm A = serial probe (HEAD~, backup binary `arle-armA-serialprobe`); arm B =
-grid-parallel (`2e635eda3`). Rates: 20-prompt `bench-prompts.jsonl` (~3352 tok,
+grid-parallel. Rates: 20-prompt `bench-prompts.jsonl` (~3352 tok,
 60 s); var-c1/c32: 64-doc varied `bench-prompts-64.jsonl` (~3350 tok, 120 s,
 unique prefixes). guidellm concurrent profile, seed 20260416.
 
@@ -71,7 +71,7 @@ absent.
   20840MB)` — c32 saturates at 2 concurrent decodes. The slot-state is
   dominated by the per-(layer,slot) FP32 probe scratch
   (2 × width × max_seq_len × 4 B per compressor state); hoisted to a
-  model-wide shared scratch in `672b8ac08` (pending its own A/B, expect
+ model-wide shared scratch in (pending its own A/B, expect
   slots 2 → ~4).
 - Arm B var-c32 ITL p50 160 ms vs arm A 70 ms while completing +7 requests:
   faster prefills admit more chunked-prefill interleave per decode tick.

@@ -31,7 +31,7 @@ INFER_TP_SIZE=4 arle train rubric-opd \
 ```
 
 - Baseline: N/A (did not run — rank-0 deadlocked / OOM)
-- Treatment: commit ed3864466, `--features cuda,nccl`
+- Treatment: commit `--features cuda,nccl`
 
 ## Environment
 

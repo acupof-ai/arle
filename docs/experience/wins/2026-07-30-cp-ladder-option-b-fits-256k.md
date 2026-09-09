@@ -1,7 +1,7 @@
 # CP seq-ceiling ladder: option B fits 256K on 4×H20 — no ring needed
 
 Date: 2026-07-30
-Scope: measurement only (no code change). Binary HEAD `562fc87ab`, `cuda,nccl`.
+Scope: measurement only (no code change). Binary HEAD `cuda,nccl`.
 Driver: `scripts/run_cp_ceiling.sh` (untracked helper).
 
 ## Context

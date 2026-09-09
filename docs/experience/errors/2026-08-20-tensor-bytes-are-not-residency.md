@@ -1,7 +1,7 @@
 # A lever sized by tensor bytes bought 0 MiB — tensor bytes are not residency — 2026-08-20
 
-Reverted: `bdf19e8a3` + `bf7c8f032` (`perf(train): rebuild the gated-delta conv
-pair in the backward`), reverted by `edcc653b7` + `9466ffdff`.
+Reverted: + (`perf(train): rebuild the gated-delta conv
+pair in the backward`), reverted by +.
 
 ## Context
 

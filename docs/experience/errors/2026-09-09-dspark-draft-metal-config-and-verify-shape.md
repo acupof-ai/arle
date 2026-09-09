@@ -45,7 +45,7 @@ layout the code comments cite. The compiled verify kernel
 (`qwen35_compiled_verify_block_summary`) takes exactly `block_size` tokens
 and verifies `block_size - 1` drafts: that is the non-Markov DFlash layout,
 and the kernel's matched-prefix loop is hard-wired to it
-(`drafted_len = block_size - 1`). The Markov path shipped (b788bc137,
+(`drafted_len = block_size - 1`). The Markov path shipped (
 2026-08-24) against a compiled forward baked for S=5; a later refactor
 collapsed the verify path onto the fixed-shape summary kernel and the
 Markov path was never re-validated on Metal — the 2026-08-26 prefix-reuse

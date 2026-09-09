@@ -8,7 +8,7 @@
 > Scope: Qwen dense quantized linear dispatch in `infer-cuda`. This plan does
 > not change kernel math, serving APIs, model formats, or the backend seam.
 >
-> Amended 2026-08-20: storage rules updated for 30171f8be (DeepGEMM prefill
+> Amended 2026-08-20: storage rules updated for (DeepGEMM prefill
 > operand derived from the Marlin layout; repacks free source inline) and the
 > launcher-home decision (typed launchers live in `cuda-kernels`, not
 > `infer-cuda`).
@@ -73,7 +73,7 @@ that contract from field presence.
 | NVFP4 probe | `crates/infer-cuda/examples/marlin_fp4_probe.rs` | Reuse for FP4 route checks |
 | Load-time Marlin preparation | `crates/infer-cuda/src/loader.rs:5741` | Add post-preparation validation here |
 | Source-release marker | `DeviceMatrix::quant_source_freed()` | Preserve LoRA and offload behavior |
-| Marlin-sourced DeepGEMM arms | 30171f8be; `quant_linear.rs:671,1138`, `tensor.rs` repacks | Retained layout is the only resident copy; source arms serve repack-declined shapes only |
+| Marlin-sourced DeepGEMM arms | `quant_linear.rs:671,1138`, `tensor.rs` repacks | Retained layout is the only resident copy; source arms serve repack-declined shapes only |
 | Typed-launcher reference layer | `crates/cuda-kernels/src/moe.rs` (wrappers), `crates/infer-cuda/src/moe.rs` (consumer, zero raw FFI) | Copy this pattern into `crates/cuda-kernels/src/quant_linear.rs` |
 
 ## Goals
@@ -156,7 +156,7 @@ problem. The phased route-owner design is the minimum complete solution.
 The validator reports a load error. It does not repair state, synthesize a
 fallback, or retain extra VRAM defensively.
 
-After 30171f8be both FP4 and FP8 repacks free their source inline, so source
+After both FP4 and FP8 repacks free their source inline, so source
 retention means repack-declined or never-repacked only. A retained layout
 without source is the normal post-repack state, not an invalid one. FP4 is
 stricter: its repack never declines — a shape it cannot take is a load failure
@@ -268,7 +268,7 @@ Fp4E2M1Group
 ```
 
 sfb post-dates the source: it is built after repack from the `marlin_packed`
-scale tail (30171f8be), so "sfb present, source freed" is the normal state.
+scale tail, so "sfb present, source freed" is the normal state.
 Do not reintroduce a source/sfb coupling. The widen arm inherits the repack's
 one lossy step (group-scale flush to zero), which is why it is gated on the
 needle ladder rather than on the scale algebra. The repack bails on shapes the
@@ -288,7 +288,7 @@ creates a route that does not exist. Keep W8A16 dequant only if the current
 implementation can still engage for an unrepacked source; otherwise prove it
 dead and delete it in the same tranche. The same reachability proof applies to
 the FP8 source arms (dequant-BF16 and scalar/batched GEMV): after
-30171f8be they serve only repack-declined shapes. Enumerate the shapes that
+ they serve only repack-declined shapes. Enumerate the shapes that
 decline repack (SM, alignment, scale overflow, group size); if no production
 shape reaches a source arm, prove it dead and delete it in the same tranche.
 FP4 has no source arms to prove — the repack bails where FP8 declines, so an
@@ -322,7 +322,7 @@ Validation order:
 checkpoint load
   -> format/shape validation
   -> optional fuse
-  -> optional Marlin repack            (frees source inline, 30171f8be)
+ -> optional Marlin repack (frees source inline)
   -> optional sfb build                (from the marlin_packed scale tail)
   -> validate final consumable representations
   -> publish DeviceMatrix to model weights
@@ -351,7 +351,7 @@ same state machine.
 | Pre-sm80 device chooses Marlin | SM gate remains part of route and repack | Pure SM route cases | Source fallback |
 | TP shard becomes unaligned (FP8/W8A16) | Repack declines without releasing source | Misaligned N/K cases | Source fallback with warning |
 | TP shard becomes unaligned (FP4) | Repack bails at load | `marlin_fp4_probe` n%64 bail assertion | Tensor-named load error |
-| FP4 `sfb` present with source freed | Normal post-repack state (30171f8be) | Validator accepts; rejects `sfb` without `marlin_packed` | Valid load |
+| FP4 `sfb` present with source freed | Normal post-repack state | Validator accepts; rejects `sfb` without `marlin_packed` | Valid load |
 | LoRA updates a source beside an active Marlin copy | Preserve current hard error for source-freed or dual-layout base | Existing LoRA merge tests plus runtime smoke | Clear merge error; no stale layout |
 | Reload restores source but not retained layout | Audit snapshot rebuild and validate after restore | Offload/reload round-trip | Restored route matches pre-offload route |
 | Counter moves before failed CUDA submission | Increment after `.result()?` | Injected/invalid launch harness where available | Failed launch does not count |
@@ -525,9 +525,9 @@ No code changes.
    request.
 3. Archive the binary and raw outputs used by the later A/B.
 
-HEAD includes 30171f8be (Marlin-sourced DeepGEMM). Its re-measure is still
+HEAD includes (Marlin-sourced DeepGEMM). Its re-measure is still
 pending; record the baseline after that verdict lands. If the verdict
-regresses and 30171f8be is reverted, re-record the baseline on the new HEAD.
+regresses and is reverted, re-record the baseline on the new HEAD.
 
 Exit: baseline can be reproduced and its binary is still available.
 

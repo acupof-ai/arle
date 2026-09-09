@@ -1,6 +1,6 @@
 # DSv4 band exhaustion parks instead of fatal — per-row per-layer device-fit gate (#160)
 
-> Status: Code landed (1b80dc724 + 389464585). Runtime park-verify attempted
+> Status: Code landed (+). Runtime park-verify attempted
 > 2026-07-25 on 4×H20 and **the gate never fires — it is unreachable by
 > config**, for a structural reason worth keeping (see §Runtime verify).
 
@@ -13,7 +13,7 @@ benefit regime was exactly its unsafe regime (#160).
 
 ## What Worked
 
-Generalized a9d0c5412's park-not-fatal gate instead of a DSv4 special case.
+Generalized 's park-not-fatal gate instead of a DSv4 special case.
 Three codex-review rounds shaped the seam:
 
 - **Seam**: `kv_device_fit(rows: &[DeviceRowDemand], unfit: &mut Vec<usize>)`
@@ -36,7 +36,7 @@ Gates: `device_fit_pairs_need_with_pool_not_extrema`,
 `device_fit_unfit_row_does_not_starve_later_fitting_rows`, 113 infer-core
 tests green, clippy -D clean, both Mac cuda-lane checks clean.
 
-## Runtime verify (2026-07-25, `d0525cb06`, 4×H20 GPUs 0-3 TP=4/EP=4)
+## Runtime verify (2026-07-25, 4×H20 GPUs 0-3 TP=4/EP=4)
 
 **Negative, and structurally so.** `device KV pool exhausted` count = 0 (both
 variants) across four escalating pressure configs, all with

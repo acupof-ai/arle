@@ -7,7 +7,7 @@ independent — no shared growing prefix, reuse never fires). The multi-turn
 concurrent harness (`eval_harness multiturn_concurrent`, token-preserving
 history feed-back) A/B's `--dsv4-decode-reuse` OFF vs ON on a real high-
 concurrency multi-turn agent shape. H20 TP=4 GPUs 4-7, DSv4-Flash-FP8, HEAD
-`d9cc1bfbf`, binary `873101640824…`, CONCURRENCY=1/4/8/16, TURNS=4,
+binary `873101640824…`, CONCURRENCY=1/4/8/16, TURNS=4,
 PROMPT=500, GEN=128.
 
 ## Result — the reuse win scales monotonically with concurrency

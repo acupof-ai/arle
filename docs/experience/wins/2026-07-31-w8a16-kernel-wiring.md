@@ -86,7 +86,7 @@ inference. Two real load-time errors surfaced first — both signal, not noise:
    gates, not GEMMs), which `qwen35.rs:3296-3297` loads BF16-only by design.
    Serve read I8 through the BF16 path and bailed. Fix: the quantizer's
    `ALL_LINEAR_SKIP` now carries `in_proj_a`/`in_proj_b`/`conv1d` — the complete
-   BF16-only `.weight` set in the builder (`195ba2e5d`).
+ BF16-only `.weight` set in the builder.
 
 This is why the pod gate exists: local numerics were all green (self-check, logit
 probe), but the quantizer↔loader scope contract can only fail on a real serve.
@@ -95,7 +95,7 @@ probe), but the quantizer↔loader scope contract can only fail on a real serve.
 
 The 0.8B proved the path; the 27B is what it was for. `iso-tc-huihui` (the ISO
 merge output — BF16 dense Qwen3.6-27B, 55.5 GB) → W8A16 with the final
-`e739a1105` script (520-tensor all-linear scope, **492 quantized**, group 128) →
+ script (520-tensor all-linear scope, **492 quantized**, group 128) →
 29 GB. Served on one H20 (68 GB free → 337K max KV tokens), loaded clean, W8A16
 kernel dispatched. All three greedy probes coherent (Paris / a correct recursive
 fibonacci / "40 mph"), and **byte-identical to the BF16 source** on every prompt.

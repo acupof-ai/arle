@@ -2,9 +2,9 @@
 
 ## Context
 
-`8ba5e45b7` closed both checkpoint gates (capability default on + ×4 estimate)
+ closed both checkpoint gates (capability default on + ×4 estimate)
 to fix the B=4 long-completion writeback OOM (97.5 GB, full-tape). Pod round
-on snapshot `8ba5e45b7` (GPU 0, sha-verified, zero contention): the OOM is
+on snapshot (GPU 0, sha-verified, zero contention): the OOM is
 gone — and both newly-engaged branches are broken.
 
 ## Findings (measured)

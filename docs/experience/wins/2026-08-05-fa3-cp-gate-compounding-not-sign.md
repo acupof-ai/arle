@@ -1,6 +1,6 @@
 # FA3 as the unconditional CP ring: the gate that worked was "does it compound", not "which arm is closer"
 
-**Date:** 2026-08-05 · **Commit:** `15caff0d0` (flip), gate run at `4846f8046` · **Pod:** 8×H20, `qwen35-08b-clean`, seq 2048, LoRA attention-qv · **Verdict: flip stands**
+**Date:** 2026-08-05 · **Commit:** (flip), gate run at · **Pod:** 8×H20, `qwen35-08b-clean`, seq 2048, LoRA attention-qv · **Verdict: flip stands**
 
 ## Context
 
@@ -43,7 +43,7 @@ have repeated the earlier error of attributing #85 to FA3.
 
 ## The gate that discriminated
 
-A 2×2×3 on ONE binary at `4846f8046`, which still carries the env var, so the only
+A 2×2×3 on ONE binary at which still carries the env var, so the only
 variable is the flag. Then a third world size.
 
 **Control:** at cp=1, FA3 is provably inert — identical loss (8.963640) and

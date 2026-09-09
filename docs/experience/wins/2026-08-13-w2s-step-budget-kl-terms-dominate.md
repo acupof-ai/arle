@@ -8,7 +8,7 @@ First per-stage timing of `arle train w2s` after the FP8 offload round-trip was
 deleted ([errors](../errors/2026-08-13-w2s-fp8-base-offload-roundtrip-was-lossy.md)).
 Six steps, `--confidence-threshold 0.99` so the confidence gate skips nothing;
 ThinkingCap-Qwen3.6-27B-FP8 base/student, four 0.8B aux, GSM8K prompts, one free
-H20 (95.2 GB). Build `w2s-refactor1` at `18096ec7f`, `RUN_EXIT=0`.
+H20 (95.2 GB). Build `w2s-refactor1` at `RUN_EXIT=0`.
 
 `StageTimer` (`crates/train/src/w2s.rs`) fences the device before stopping each
 stage, so these are GPU times. Stage sum 4.418 s vs measured total 4.415 s — the

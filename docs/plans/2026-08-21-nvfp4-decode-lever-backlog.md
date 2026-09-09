@@ -1,7 +1,7 @@
 # NVFP4 optimisation backlog — ranked by measured attack surface, 2026-08-21
 
 > Status: Open. Worked top-down; every row is closed with a measurement, not an
-> argument. Runtime `c19b26511` (v0.5.7), Qwen3.8-27B-NVFP4, 1xH20.
+> argument. Runtime (v0.5.7), Qwen3.8-27B-NVFP4, 1xH20.
 
 ## Where the time is
 

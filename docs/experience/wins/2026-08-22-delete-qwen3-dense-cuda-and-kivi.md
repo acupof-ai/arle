@@ -28,7 +28,7 @@ checkpoint". 57 files, +223 / −7340.
 Every quantized KV pool on CUDA now stores per-(token, head) scales for K and
 V and decodes through `paged_attention_quantized_fa3.cu`.
 
-Gate on the resulting binary (`0d46ac4a8`), Qwen3.8-27B-NVFP4, fp8 KV: needle
+Gate on the resulting binary, Qwen3.8-27B-NVFP4, fp8 KV: needle
 ladder ×3 at 512/4096/16384/32768 12/12 exact, DET; 200-item GSM8K-train greedy
 eval 177/200 (177 on the previous binary; same-base FP8 176).
 

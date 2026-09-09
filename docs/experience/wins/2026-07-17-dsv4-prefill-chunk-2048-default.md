@@ -34,7 +34,7 @@ ITL-kill precedent inverts at long-prompt shapes.
 ## Notes
 
 - SW ring same-slot write race at chunk>window fixed host-side
-  (`sw_ring_tail_slice`, 0e9f687f8) — plausible co-conspirator in historical
+ (`sw_ring_tail_slice`) — plausible co-conspirator in historical
   >2048 needle failures.
 - c16 TTFT p50 varied 2.4× between same-code runs (2403 vs 5855ms) —
   arrival/cache-state sensitivity, flagged unattributed.

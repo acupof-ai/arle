@@ -1,6 +1,6 @@
 # FA3 fp8 prefill attention over the quantized pool — 2026-08-22
 
-> Status: Closed 2026-08-22 — landed `8f48ff6b4` + `7d58850dc`, routed at
+> Status: Closed 2026-08-22 — landed + routed at
 > seqlen_k ≥ 64K and seqlen_q ≥ 256; 220K TTFT −17 %
 > ([entry](../experience/wins/2026-08-22-fa3-fp8-prefill-attention-long-context.md)).
 

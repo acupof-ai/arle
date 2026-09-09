@@ -15,7 +15,7 @@ of the round wall (round-0 `cc_rollout` 4576 s on subset16).
 
 ## Change
 
-`7aef20557` + simplify pass: every cp rank loads the rollout engine + cc serve
+ + simplify pass: every cp rank loads the rollout engine + cc serve
 (`load_agent_opd_serve_student`, follower port = base + rank) and rank 0's
 harness spreads each group's samples round-robin across the fleet endpoints
 (`CcHarness.base_urls`). Scheduling, filtering, GRESO, replay, and saves stay
@@ -38,7 +38,7 @@ Same binary, same subset16 manifest, cp=2 GPUs 4/5, one config change per arm:
   (paired writeback losses identical across ranks, follower end-of-stream,
   `RUN_EXIT=0`, loss values in family with fulltrain4/5 round trajectories).
 
-## Results — measured 2026-08-07/08, pod GPUs 4+5, tree `af9e48246`, `fulltrain6`
+## Results — measured 2026-08-07/08, pod GPUs 4+5, tree `fulltrain6`
 
 Correctness: 3 rounds, `RUN_EXIT=0`, both serve pids present in the shared dump
 dir, rank-0 and follower writeback losses identical to all printed decimals
@@ -70,7 +70,7 @@ slots (4 per engine × 2 ranks). Two independent causes, both structural:
   never used;
 - the group barrier idles the fast samples' slots until the straggler ends.
 
-## Follow-up — `--prompts-per-update` (`f996e6826`)
+## Follow-up — `--prompts-per-update`
 
 The lever is rollout concurrency, not per-sample throughput. The round loop now
 windows the verl way: G groups roll concurrently under one policy version, then
@@ -79,7 +79,7 @@ its launch version), and `rejection-ce` steps per trajectory inside `update_ce`,
 so the merged batch does not raise writeback VRAM — only the engine's extra
 slots do.
 
-Measured 2026-08-08, `fulltrain7` at `5b1cd473d`, G=4 vs `fulltrain6` G=1
+Measured 2026-08-08, `fulltrain7` at G=4 vs `fulltrain6` G=1
 (same subset16, cp=2, GPUs 4+5):
 
 | round 0 | G=1 | G=4 | Δ |

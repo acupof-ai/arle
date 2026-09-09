@@ -36,7 +36,7 @@ arle train opd --steps 1 \
 ```
 
 - GPU: 1×H20 (sm_90, 96 GB), TP=1, nothing else resident
-- Runtime `d3ea2f267`
+- Runtime
 
 ## Results
 
@@ -84,7 +84,7 @@ Three defects surfaced, none of them in the new 4-bit code:
 
 - The checkpoint's attention and linear-attn projections are **per-channel** FP8
   (`.weight_scale`, `[N, 1]`), not block-scaled (`.weight_scale_inv`). Serving
-  has treated that as block-scaled with block `[1, K]` since `33f4863c7`; the
+ has treated that as block-scaled with block `[1, K]` since the
   trainer had never needed to.
 - A missing sidecar raised `LoaderError::MissingTensor`, which the candidate
   loop reads as "this HF name does not exist, try the next one". The real cause

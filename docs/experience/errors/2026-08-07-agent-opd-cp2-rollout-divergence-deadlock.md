@@ -39,7 +39,7 @@ identical call sequences by construction. The coordinator no longer tears the
 group down on a clean follower exit (only rank 0's exit, or any nonzero exit,
 ends the run). dp>1 in this lane now fails fast with an explicit error.
 Pod cp=2 validation (2026-08-07, subset16 × 4 samples × 3 rounds, GPUs 4+5,
-tree `9da8ff777`): **confirmed.** The former wedge point — first passing-group
+tree): **confirmed.** The former wedge point — first passing-group
 writeback — completed in ~30 s; 46 writebacks, 22 mirrored updates, rank-0 and
 follower losses identical to all printed decimals (e.g. 0.085379/0.085379,
 0.118810/0.118810); follower reached `end of stream`, run exited 0, mesh dir

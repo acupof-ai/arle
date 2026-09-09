@@ -1,10 +1,10 @@
 # Tokenizer refactor crashed every DSv4 serve at startup — CUDA, 2026-08-20
 
-> Status: Fix committed (`a1b5dffe2`), verified on pod.
+> Status: Fix committed, verified on pod.
 
 ## Context
 
-Commit `a9f0bab97` (2026-08-20) refactored the tokenizer cache to use upstream
+Commit (2026-08-20) refactored the tokenizer cache to use upstream
 `Vocab`/`Merges` types and switched `extract_cache_parts` from manual field
 extraction to `serde_json::from_value`. The refactor passed local typecheck
 but crashed every DSv4 serve at startup with "BPE model missing vocab/merges".

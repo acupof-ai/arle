@@ -5,7 +5,7 @@
 Auditing the offline DSpark draft trainer, I filed a P0: "training's visible
 context is one token behind the serve's." It was wrong in the one direction
 that matters, and it survived a seven-agent audit, an adversarial refute pass,
-and my own source read. `c4e7a2286` shipped it; `1fdf2817c` reverted it.
+and my own source read. shipped it reverted it.
 
 The fix I shipped moved the training context's upper bound from `anchor` to
 `anchor + 1`, putting `taps[anchor]` in reach.

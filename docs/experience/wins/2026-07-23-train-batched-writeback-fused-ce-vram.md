@@ -1,6 +1,6 @@
 # Batched rubric writeback: fused indexed CE kills the dense logits tile — parity GREEN, phase-C +0.13 GB
 
-> Status: Shipped (10389a340 code, this entry closes its `pending-remote` VRAM
+> Status: Shipped (code, this entry closes its `pending-remote` VRAM
 > measurement). Pod: 8×H20, GPU 0 only, sm_90, pod binary sha-identical to HEAD
 > for the two changed files (`opd.rs`, `qwen35.rs`; remaining tree delta
 > functionally no-op for round-0 rubric-opd).
@@ -8,7 +8,7 @@
 ## Context
 
 `rubric_writeback_ce_step_batched` materialized `[B, max_len, vocab]` f32 logits
-via `forward_batch_tokens` then sliced per row. 10389a340 routes it through
+via `forward_batch_tokens` then sliced per row. routes it through
 `forward_batch_hidden` + per-row `fused_linear_ce_loss_indexed` (chunked, only
 masked completion positions projected through `lm_head`) and enables
 grad-checkpoint host offload past `writeback_offload_for_seq(b*max_len)`.

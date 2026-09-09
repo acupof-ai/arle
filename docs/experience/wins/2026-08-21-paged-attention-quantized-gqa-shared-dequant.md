@@ -1,6 +1,6 @@
 # Quantized paged attention: one CTA dequantizes K/V for the whole GQA group — 1.4–1.6× at the kernel from B=4
 
-> Status: Landed (`04e3b4e3e` + `e3b9b0f81`; the first commit lost the `.cu`
+> Status: Landed (+ the first commit lost the `.cu`
 > to the fmt hook and shipped shifted FFI args — the second lands it).
 
 ## Context

@@ -1,6 +1,6 @@
 # Spec-decode concurrency gate — c=1 win kept, high-c loss gated out
 
-> Phase exit (2026-07-26, `69560ae55` gate + env-deletion follow-up). Pod A/B
+> Phase exit (2026-07-26 gate + env-deletion follow-up). Pod A/B
 > PASS on both campaigns; `--spec-max-batch` default 1 is the shipped default.
 
 ## Context

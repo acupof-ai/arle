@@ -31,7 +31,7 @@ quantized `lm_head`.
 
 ## Result
 
-`834a87aed` on 1xH20, CUDA release, TP=1, FP8 KV, `--spec-type mtp
+ on 1xH20, CUDA release, TP=1, FP8 KV, `--spec-type mtp
 --mtp-draft-tokens 3 --max-running-requests 4`, greedy, 600 output-token cap.
 
 **1. Thinking budget — confirmed, with a control.** Two servers on the same
@@ -84,7 +84,7 @@ There is no Mac typecheck lane for this: the local `cuda,no-cuda` test binary
 cannot link because the CUDA C symbols are intentionally absent, so the pod
 build is the typecheck.
 
-- Commit `834a87aed`, on top of `a5df06c7c`. Binary sha256 (first 16)
+- Commit on top of. Binary sha256 (first 16)
   `bcea08abfe9a87c2`; an earlier run of the same HEAD hashed
   `2e99884cdba05a60` — Rust release links are not bit-reproducible here, so the
   hash identifies a build, not a source.

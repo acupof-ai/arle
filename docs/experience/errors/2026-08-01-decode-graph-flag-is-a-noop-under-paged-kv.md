@@ -61,7 +61,7 @@ consistent with a flag that changes nothing.
 
 ## Fix
 
-**Fixed 2026-08-03 by `cb6b3389d`** ("whole-step decode CUDA graph under paged
+**Fixed 2026-08-03 by ** ("whole-step decode CUDA graph under paged
 KV — capture the serving default"): the unconditional paged-KV early return was
 removed and `try_graph_decode_paged` now captures the serving default. The flag
 went default-on the same day. 35B c=1 TPOT 16.22 → 6.70 ms (−58.7%); see the

@@ -1,7 +1,7 @@
 # The anchor window, partitioned exactly — prefill arithmetic is at the floor, the data-prep tail is not, CUDA, 2026-08-09
 
 > Status: **measurement, no runtime change.** Same `nsys` capture as 08-08
-> (`70760bc09`, `/host/c16decomp/c16.sqlite`); no new GPU time. It closes the two
+> (`/host/c16decomp/c16.sqlite`); no new GPU time. It closes the two
 > largest open items and replaces the performance model's fitted coefficients
 > with an exact partition.
 

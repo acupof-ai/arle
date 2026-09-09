@@ -1,6 +1,6 @@
 # Agent-OPD multi-rank rollout merge
 
-**Status: shipped as the serve-fleet variant** (`7aef20557`, 2026-08-07); pod
+**Status: shipped as the serve-fleet variant** (2026-08-07); pod
 cp=2 A/B pending-remote. The trigger fired the same day it was written: the
 cp=2 fix validation showed cp=2 is the preferred operating point (update wall
 7.1× vs single-GPU), which makes follower idle during the rollout phase (75%
@@ -10,7 +10,7 @@ of the round wall) the dominant waste.
 −5%: it cut per-sample latency (−23% on throughput-bound groups, +43% tok/s) but
 left rollout *concurrency* unchanged, so the fleet's 8 slots ran at 29%
 utilization ([wins](../experience/wins/2026-08-07-agent-opd-rollout-fleet.md)).
-`f996e6826` adds `--prompts-per-update G`: G groups roll concurrently under one
+ adds `--prompts-per-update G`: G groups roll concurrently under one
 policy version, then a single update trains their merged batch — strictly
 on-policy, and the straggler tail is amortized across the window instead of
 idling its siblings' slots.
@@ -30,7 +30,7 @@ sessions can no longer all originate on rank 0's host.
 
 ## Current state (shipped)
 
-`9da8ff777` fixed the cp>1 deadlock (see
+ fixed the cp>1 deadlock (see
 [errors/2026-08-07](../experience/errors/2026-08-07-agent-opd-cp2-rollout-divergence-deadlock.md)):
 cp rank 0 owns the whole lane (serve, rollouts, filtering, saves) and streams
 every update's batch to follower ranks via `MeshUpdateChannel`
@@ -91,7 +91,7 @@ and the interim structure creates path dependence. Here neither holds.
   count, message volume, fault-tolerance semantics) decide the transport. A
   design built now would target an unmeasured workload and likely be rebuilt.
 - **Path dependence is near zero.** The one-time structural cost was paid in
-  `9da8ff777`: the transport is confined to `MeshUpdateChannel` with two call
+ : the transport is confined to `MeshUpdateChannel` with two call
   sites (leader publish in `run_update`, follower recv loop). Replacing files
   with an NCCL host broadcast or a distributed queue is a localized swap; the
   training loop does not change. The same seam is where the reverse group

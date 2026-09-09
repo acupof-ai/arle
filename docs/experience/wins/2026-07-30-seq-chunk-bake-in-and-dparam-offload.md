@@ -12,7 +12,7 @@ Two things at once, both on the single-GPU 256K writeback path
 (`--synthetic-writeback-seq`, ThinkingCap-Qwen3.6-27B-FP8, 1×H20 97871 MiB):
 
 1. MLP seq-chunking (`2026-07-28-mlp-seq-chunked-recompute-256k.md`) and
-   full-attention chunking (`95b305c9e`, no entry of its own) each shipped behind
+ full-attention chunking (no entry of its own) each shipped behind
    a `total_rows ≥ 40961` threshold plus an env override. Two knobs, two code
    paths, and the un-chunked path is the one never taken past 40960.
 2. 65536 was the next wall. Forward completed (743.1 s), fused_ce 2.95 s, then
@@ -166,7 +166,7 @@ stays on the fused fast path regardless of total seq. That branch remains
 untested, and CP is still the first thing that would reach it
 (`reference_sdpa_65535_grid_boundary_untested_under_cp`).
 
-## The structural fix (`2b4509f05`, `fba949e24`)
+## The structural fix
 
 Four bugs in one day, all the same shape: something that should have been a type
 or an invariant was a convention — *remember* to mark the gradient, *remember* to

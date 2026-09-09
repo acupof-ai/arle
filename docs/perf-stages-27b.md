@@ -1,7 +1,7 @@
 # 27B-FP8 DSpark per-stage timing reference
 
 > Reference for debugging throughput regressions. All numbers from
-> `ARLE_CUDA_PROFILE=1` on the A/B binary (abb3461ef + pre-budget/truncate
+> `ARLE_CUDA_PROFILE=1` on the A/B binary (+ pre-budget/truncate
 > disabled), c=4, 8 requests, 32K prompts, 214 max-tokens, greedy.
 > Linked from `docs/baselines.md` — the SOTA row carries the throughput
 > numbers; this carries the per-stage breakdown that explains them.
@@ -41,7 +41,7 @@ forward_hidden total: 84,983,687 μs / 153 calls = 555,449 μs avg.
 
 ## Bench-level metrics (128 requests/concurrency, 32K prompts)
 
-### Baseline (fad8f4d5b, 2026-08-14)
+### Baseline (2026-08-14)
 
 | c | ITL mean ms | TTFT p50 ms | accept |
 | ---: | ---: | ---: | ---: |
@@ -51,7 +51,7 @@ forward_hidden total: 84,983,687 μs / 153 calls = 555,449 μs avg.
 | 8 | 48.86 | 625.1 | 27.63% |
 | 16 | 89.34 | 878.6 | 27.28% |
 
-### arle-gate (a8150bc6b, 2026-08-18)
+### arle-gate (2026-08-18)
 
 | c | ITL mean ms | TTFT p50 ms |
 | ---: | ---: | ---: |
@@ -61,7 +61,7 @@ forward_hidden total: 84,983,687 μs / 153 calls = 555,449 μs avg.
 | 8 | 47.61 | 598.5 |
 | 16 | 84.55 | 1223.5 |
 
-### pre-CP (abb3461ef, 2026-08-17)
+### pre-CP (2026-08-17)
 
 | c | ITL mean ms | TTFT p50 ms |
 | ---: | ---: | ---: |

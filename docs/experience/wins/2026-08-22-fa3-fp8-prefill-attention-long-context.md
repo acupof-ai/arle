@@ -1,6 +1,6 @@
 # FA3 fp8 prefill attention from 64K tokens — 220K TTFT −17 %, short context unchanged
 
-> Status: Landed (`8f48ff6b4` + `7d58850dc`). Closes
+> Status: Landed (+). Closes
 > [the FA3 fp8 prefill plan](../../plans/2026-08-22-fa3-fp8-prefill-attention.md).
 
 ## Context
@@ -25,7 +25,7 @@ form vs bf16: 33K +10 %, 66K −1 %, 132K −11 %, 220K −16 %. At 32K the fp8
 form's attention was 1564 → 2644 ms (profile), and on the few-row spec-verify
 step at 220K it cost −21 % decode tok/s — hence both floors.
 
-Gate on the routed binary (`7d58850dc`), base `1df0acf68`, same GPU:
+Gate on the routed binary, base same GPU:
 
 | | base | new |
 |---|---:|---:|

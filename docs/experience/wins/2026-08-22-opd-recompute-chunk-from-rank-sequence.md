@@ -3,7 +3,7 @@
 > Status: Shipped
 
 `ThinkingCap-Qwen3.6-27B-FP8`, H20 (97,508 MiB), `--synthetic-writeback-seq`,
-binary `sp21` (`fb5795599`).
+binary `sp21`.
 
 ## Context
 

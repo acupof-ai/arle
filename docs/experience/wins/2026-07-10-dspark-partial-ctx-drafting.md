@@ -6,7 +6,7 @@ P2.5: prefix-cache-hit
 requests degraded to plain decode forever — the draft-ctx append gate required
 `ctx_len == start_pos` (fresh slot 0 vs restored start_pos>0) and `pending`
 required coverage from 0. At OPD's ~91% hit rate DSpark was near-inert.
-Implementation `8edde59c7`; pod round 8×H20 GPU 1, Qwen3.6-27B-FP8 + z-lab
+Implementation pod round 8×H20 GPU 1, Qwen3.6-27B-FP8 + z-lab
 DFlash draft, greedy, prefix cache ON, plain anchor 42.6–43.6 tok/s.
 
 ## What Worked
@@ -39,7 +39,7 @@ Pod verdict — **LICENSED on the production multi-turn shape**:
   run 2's prefix-hit changes drafter ctx → different proposal chains → a
   different (equally valid) sampled realization. Cache-ON same-seed still
   diverges by design.
-- Env-sweep smoke (4d8c8c827..f7b2467cb): plain decode 42.7 tok/s decode-only
+- Env-sweep smoke (..): plain decode 42.7 tok/s decode-only
   vs 42.6–43.6 baseline band → **Δ≈0%**, flag-plumbing-only claim holds.
 
 ## Rule

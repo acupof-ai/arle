@@ -7,8 +7,8 @@ Under TP=2 CP=2 every whole-slot park was refused (9,970/9,970 in one 65 s
 pressure run) and L2/L3 received nothing. `swap_out_image` rejected any slot
 that had run a B2 CP decode step.
 
-Commits: `b2cc9b783` (park the shard), `8e325e8dc` (capture before release),
-`cb9a53373` (comment trim).
+Commits: (park the shard) (capture before release),
+ (comment trim).
 
 ## What Worked
 

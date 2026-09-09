@@ -2,7 +2,7 @@
 
 ## Context
 
-Exact `b5f078ae0` completed 64K forward and CE, then OOMed in the first
+Exact completed 64K forward and CE, then OOMed in the first
 full-attention replay. Driver memory peaked at 97,483/97,508 MiB.
 
 ## Root Cause

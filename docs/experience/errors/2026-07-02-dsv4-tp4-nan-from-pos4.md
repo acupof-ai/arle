@@ -12,7 +12,7 @@ zero content deltas.
 
 Not yet attributed to a commit — but the case is fully decoded and bounded:
 
-- `--probe-out` (a25922b9) per-position records: prefill entropy/nll sane
+- `--probe-out` per-position records: prefill entropy/nll sane
   for pos 0, 1, 2, 3 (7.40 / 7.13 / 3.06 / 5.80), **NaN from pos 4 onward**;
   every decode step then records `token: 0` (bos, special) with NaN
   entropy — argmax over all-NaN logits → special token → skip-special detok
@@ -22,12 +22,12 @@ Not yet attributed to a commit — but the case is fully decoded and bounded:
   absolute position 4 exactly, matching the first compress-ratio-4 chunk
   (`compress_ratios` layer arm = 4: chunk covers pos 0-3, first consumed at
   pos 4). Mechanistic suspect: the DSv4 compressed-attention chunk path.
-- Bisect (worktree boots, same box/model/shape): reproduces on `958536e9`,
-  `16a95fe0`, and the round-6 build `5cafb308` — probe commit `a25922b9`,
-  LoRA-FP8 promotion `16a95fe0`, and the whole round-7 window exonerated.
+- Bisect (worktree boots, same box/model/shape): reproduces on
+ and the round-6 build — probe commit
+ LoRA-FP8 promotion and the whole round-7 window exonerated.
   Tier flags exonerated (control without `--kv-disk` reproduces).
 - Contradiction to resolve: round-6 recorded "DSv4 regression completion
-  clean" on `5cafb308`; measured on `5cafb308` this shape NaNs. That check
+ clean" on measured on this shape NaNs. That check
   must have used a different shape/criterion (or never looked at text).
 
 ## Fix

@@ -19,7 +19,7 @@ Deleted the constant, its doc comment, the `cuda_model_is_dsv4` helper
 checkpoint's `max_position_embeddings` through unmodified for every model
 — one rule, no DSv4 special case.
 
-Commit: `32670210d`.
+Commit:.
 
 ## Result
 
@@ -47,7 +47,7 @@ DeepSeek-V4-Flash-0731, 4×H20, TP=4, W4AFP8, build `ctx-cap-v2`:
 
 The needle gate's `TEMPLATE=dsv4` shim forced non-thinking mode
 (`</think>` after the assistant tag), causing the reasoning-trained
-model to loop ("code code code..."). Deleted in commit `ad2c92034`.
+model to loop ("code code code..."). Deleted in commit.
 The server's builtin DeepSeek-V4 template defaults to thinking-ON
 (`tokenizer.rs:170`); its own comment documents the failure mode.
 

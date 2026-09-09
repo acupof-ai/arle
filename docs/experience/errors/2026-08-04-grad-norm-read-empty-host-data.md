@@ -1,6 +1,6 @@
 # The grad-norm reader routed on backend identity, not on where the grad lives — and reported 0.0
 
-**Date:** 2026-08-04 · **Commits:** e3ff7c368 (gate guard) + this fix · **Found by:** the CP grad-parity gate's f32 anchor
+**Date:** 2026-08-04 · **Commits:** (gate guard) + this fix · **Found by:** the CP grad-parity gate's f32 anchor
 
 ## Context
 

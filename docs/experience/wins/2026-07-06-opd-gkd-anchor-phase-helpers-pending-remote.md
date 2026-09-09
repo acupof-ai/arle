@@ -26,7 +26,7 @@ an overload chain with live callers without a path to behavior verification.
 
 ## Renamed 2026-08-13
 
-The helpers this entry names were renamed in `18096ec7f`..HEAD; `route` was
+The helpers this entry names were renamed in..HEAD; `route` was
 dropped because the word already means MoE expert routing in this crate, and
 both functions run a complete step body (zero_grad → backward →
 finite_optimizer_step → `OpdStepOutcome`) rather than a segment of one.

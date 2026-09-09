@@ -74,7 +74,7 @@ reproducing the wrong answer by omitting the `+1` is what named the defect.
 
 ## Fix
 
-`694245eec` — 14 call sites swapped to `rms_norm_offset` / `rms_norm_offset_vec`
+ — 14 call sites swapped to `rms_norm_offset` / `rms_norm_offset_vec`
 (`qwen35.rs:9219`, `:9246`; byte-identical signatures, and the latter's doc
 comment already read "the final norm before lm_head").
 
@@ -87,7 +87,7 @@ had no remaining legitimate caller on this model. The DSpark instance bears on
 spec-decode rather than on this repro and a trunk-only investigation would never
 have surfaced it.
 
-**Verified, gate 1** (`694245eec`, same 130 ids, `IDENTICAL=True`, single prefill,
+**Verified, gate 1** (same 130 ids, `IDENTICAL=True`, single prefill,
 greedy): top-1 **328**, top-3 **328 > 348 > 5289** — the exact ordering both
 external runtimes give, with `5289` moved from our rank 1 to rank 3. Logits
 27.875 / 26.25 against HF's 28.0 / 26.0, bf16 granularity at that magnitude.
@@ -103,7 +103,7 @@ this one position.
 
 | Excluded | Evidence |
 |---|---|
-| Streaming detokenizer | Separate real bug, fixed (`ee6339fd7`, [entry](2026-08-08-streaming-detokenizer-splits-multibyte-codepoints.md)); the U+FFFD runs here are literal replacement chars and the raw body decodes as strict UTF-8. Verified fixed: streamed text 0 U+FFFD and byte-identical to non-streaming. |
+| Streaming detokenizer | Separate real bug, fixed ([entry](2026-08-08-streaming-detokenizer-splits-multibyte-codepoints.md)); the U+FFFD runs here are literal replacement chars and the raw body decodes as strict UTF-8. Verified fixed: streamed text 0 U+FFFD and byte-identical to non-streaming. |
 | NaN / Inf in logits | `finite=248320 nan=0 pos_inf=0 neg_inf=0` on 4 runs, prefill and decode. |
 | Decode path (paged KV, KV reuse, decode attention, per-step state) | A **single prefill forward** over the 130 ids reproduces it: top-1 `5289`, p1 0.363, entropy 7.147 — against decode's 0.350 / 7.308. Two paths agree to **0.06 logits**. |
 | fq-chunked versus recurrent GDN | `ARLE_FQ_PARITY=1`, 48/48 GDN layers: `state_rel` median 1.3e-2, `o_rel` median 7.0e-3. Sampled token, logits, p1 and entropy **byte-identical** with parity on. |
@@ -261,6 +261,6 @@ a key.
   `ARLE_PROBE_LENS_LAYERS` and `ARLE_PROBE_STAGES` both had call sites only in
   `dsv4.rs` while their `meta` line printed as if armed — a silent empty result
   reads as "no divergence found". Fixed for both
-  (`7b34f7fff`, `982175818`, `d708f216e`).
+.
 - Scripts named after stdlib modules (`bisect.py`) on the CWD shadow the stdlib
   and execute on import; this corrupted one measurement before it was caught.

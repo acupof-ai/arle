@@ -81,7 +81,7 @@ raises the log-prob of the rejected tail on any above-baseline chain. That is a
 property of the update rule, readable in the source. Its *empirical* support was
 the 07-28 accept_ema fall, and that support is withdrawn here.
 
-The objective now matching the paper (`2c55fce10`) also stands on its own terms.
+The objective now matching the paper also stands on its own terms.
 Neither is measured.
 
 ## Rule

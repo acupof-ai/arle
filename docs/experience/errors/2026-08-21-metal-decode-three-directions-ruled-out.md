@@ -41,7 +41,7 @@ seconds. Fusing them saves a fraction of that 1%.
 
 ### Direction 3 — faster 2-bit matmul: headroom is <17% and mostly non-kernel
 
-Re-verified decode speed on a clean release binary (main @ec839b0fa,
+Re-verified decode speed on a clean release binary (main @
 Metal, `--max-running-requests 1`, 60-token streaming decode, 3-run
 median): **22.4 tok/s = 44.6 ms/step**.
 
@@ -78,7 +78,7 @@ macOS 26.2+, unavailable on this box.
 - Model: majentik/Qwen3.8-27B-MLX-2bit (64 layers, 48 GDR + 16 full attn,
   hv=48, dv=128)
 - Binary: `arle` release, `--no-default-features --features metal,no-cuda`,
-  main @ec839b0fa
+ main @
 - Files: `crates/mlx-sys/src/mlx_qwen35_model.cpp` (fused postprocessing
   variant on branch `metal-fused-gdr-postprocess`),
   `crates/mlx-sys/vendor/mlx/mlx/backend/metal/quantized.cpp` (bn=16

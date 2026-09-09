@@ -9,7 +9,7 @@
 
 `writeback_offload_for_seq` engaged host-offload at seq≥4096, anchored on a
 pre-fused-CE "resident checkpoints OOM at seq≈9600" measurement. Fused-CE
-(no [seq,vocab] tile) and the batched-LA device path (ecc058b20) changed the
+(no [seq,vocab] tile) and the batched-LA device path changed the
 headroom; #172 asked for a measured re-sweep.
 
 ## What Worked

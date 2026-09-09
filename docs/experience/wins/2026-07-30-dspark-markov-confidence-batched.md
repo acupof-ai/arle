@@ -36,7 +36,7 @@ calls; `batchable_draft()` is deleted.
 
 1×H20 GPU 0, ThinkingCap-Qwen3.6-27B-FP8 + 27B-DFlash block 6,
 `bench-agent-32k-16x8`, 128 req/point, max_tokens 214, greedy, seed 20260416,
-`prompt_tokens` p50 34963. Against the `d05d0aee6` champion row:
+`prompt_tokens` p50 34963. Against the champion row:
 
 | c | TPOT before | TPOT after | Δ |
 |---|---:|---:|---:|
@@ -104,7 +104,7 @@ worth.
 ragged-penalized were the arms that truncated chains to the bare anchor, and
 those fell out of the batched verify into a serial per-slot decode
 (`dspark_warm_decode_row`) — one forward per dropped slot, which is the only
-mechanism in this path with a 56 ms/step magnitude. `7358cb06c` keeps
+mechanism in this path with a 56 ms/step magnitude. keeps
 budget-zeroed greedy chains in the batch, and the penalty does not reproduce.
 
 ## DEFAULT FLIP — `--dspark-conf-threshold` 0.5 → 0 (flag since deleted)
@@ -297,7 +297,7 @@ That penalty does not exist. Three hypotheses, killed in order:
   `dspark_warm_decode_row`, one per-slot trunk forward each. Every "ragged"
   arm in the earlier table is a *thresholded* arm — thresholding is what
   produces bare-anchor chains — so the two variables were never separated.
-  `7358cb06c` keeps those chains in the batch as one decode row.
+ keeps those chains in the batch as one decode row.
 
 The isolating A/B (zero code — `--dspark-sps-row-ms 0` makes rows free, so the
 budget always admits the full block; same binary, weights, prompts, GPU):

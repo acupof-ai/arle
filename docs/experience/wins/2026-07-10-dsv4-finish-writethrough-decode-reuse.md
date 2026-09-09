@@ -1,6 +1,6 @@
 # DSv4 finish-write-through decode-region reuse — `--dsv4-decode-reuse`
 
-> Status: pod-verified opt-in (crash-fix gate PASS, `28b8cd7bb`, binary
+> Status: pod-verified opt-in (crash-fix gate PASS, binary
 > `b1d9f968…`, TP=8 H20). OFF byte-identical; ON no-crash + reuse engages.
 > Default flip still pending a token-id-preserving perf harness (below).
 
@@ -34,12 +34,12 @@ entry) and prefills only the new suffix.
 
 ## Pod verification (TP=8 H20, DSv4-Flash-FP8, `--dsv4-decode-reuse true`)
 
-Two rounds. v1 (`79b5dbb17`): mechanism engaged (multi-turn match 640→704, +1
+Two rounds. v1: mechanism engaged (multi-turn match 640→704, +1
 page into the decode region) but the ON path CRASHED the TP serve — `pool
 seq_len 494 != append_pos 485`: a shorter request restored a prior turn's
 sub-page tail (the tail has no radix content identity;
 [errors](../errors/2026-07-10-dsv4-finish-writethrough-tail-content-identity.md)).
-v2 (`28b8cd7bb`) added the continuation guard and re-verified:
+v2 added the continuation guard and re-verified:
 
 | Lane | Result |
 |---|---|
@@ -51,7 +51,7 @@ v2 (`28b8cd7bb`) added the continuation guard and re-verified:
 ## Still pending (default flip)
 
 - **Perf Δ%**: the token-id-preserving multi-turn driver is now BUILT
-  (`3461a37c8`: server accepts a token-id `prompt` array + returns
+ (: server accepts a token-id `prompt` array + returns
   `prompt_token_ids`; `scripts/eval_harness/token_reuse.py` replays turn-1's
   exact `prompt_ids + generated_ids` into turn-2). The clean OFF-vs-ON delta run
   is **blocked on infra, not the feature**: the pod's GPU 1 is pinned by foreign

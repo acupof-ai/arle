@@ -9,7 +9,7 @@ remaining host syncs.
 
 Two OPD hot-path syncs replaced with stream-ordered equivalents:
 
-1. **bf16 teacher-logits bridge** (`196eb2bb1`): the D2D copy now runs on the
+1. **bf16 teacher-logits bridge**: the D2D copy now runs on the
    source stream (after the lm_head GEMM), gated by a completion event that
    the student stream waits on. The source's `cuMemFreeAsync` is ordered after
    the copy on the same stream. A/B on H20: 2.005 → 0.897 ms/call (2.24x).

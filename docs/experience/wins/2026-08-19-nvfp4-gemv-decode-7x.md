@@ -16,8 +16,8 @@ c=1 decode, 1xH20, `--kv-cache-dtype fp8`, no spec, profiling OFF:
 | | dense_ffn | forward_hidden | decode |
 |---|---:|---:|---:|
 | NVFP4 start | 86.19 ms/step | 106.70 ms/step | — |
-| NVFP4 bit-manipulation decode (`cb109750e`) | 23.30 | 42.26 | — |
-| NVFP4 PRMT decode (`5185ce517`) | 11.46 | 31.21 | **52.3 tok/s** |
+| NVFP4 bit-manipulation decode | 23.30 | 42.26 | — |
+| NVFP4 PRMT decode | 11.46 | 31.21 | **52.3 tok/s** |
 | Qwen3.6-27B-FP8 | 9.84 | 29.22 | **57.6 tok/s** |
 
 7.5x on the kernel. NVFP4 remains 9% behind FP8 on decode.
@@ -37,14 +37,14 @@ measured with profiling off.
 
 ## What each step did
 
-**Constant-memory table -> bit manipulation** (`cb109750e`). The decode was
+**Constant-memory table -> bit manipulation**. The decode was
 `__constant__ float LUT[16]` indexed by the nibble: one memory read per weight
 at a data-dependent address, serialising across a warp when nibbles differ.
 Replaced by assembling the bf16 pattern with shifts and masks. Also removed a
 runtime integer division per scale index (group_size is a power of two) and a
 redundant scale reload (a 32-weight chunk spans two groups, not four).
 
-**Bit manipulation -> PRMT byte lookups** (`5185ce517`). ncu showed the shift/mask
+**Bit manipulation -> PRMT byte lookups**. ncu showed the shift/mask
 form pinning the sm_90 ALU pipe at 92.4% against FP8's 59.4%, costing 59.8% of
 the kernel. Both bytes of the target bf16 turn out to be 8-entry functions of
 `n & 7`, which is exactly PRMT's table size:

@@ -12,7 +12,7 @@ FLA Triton reference, and its forward was already ported and AOT-built here —
 but only reachable from `infer-cuda`. Training had a second, separate chunkwise
 implementation: the six `gdr_{cumsum,a,solve,recompute,state,o}` stages in
 `backend_cuda.rs`, themselves unreachable until the stale `seq<=32` clamp came
-off (`e084cc8b0`).
+off.
 
 ## What landed
 

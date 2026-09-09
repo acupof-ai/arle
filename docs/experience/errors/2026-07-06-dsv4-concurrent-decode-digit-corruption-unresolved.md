@@ -5,7 +5,7 @@
 > TP=4, `DeepSeek-V4-Flash-0731`) produced 0 failures — at the documented
 > ~17-28% failure rate, P(0 in 40) ≈ 0.06%. The model experts are NVFP4
 > (`expert_dtype: "fp4"`); the FP8 MoE kernel suspected below was replaced by
-> the W4AFP8/NVFP4 path (`b87584fa6`, `1065bc4c3`, `60c1a7f65`). Issue #229
+> the W4AFP8/NVFP4 path. Issue #229
 > closed. The full investigation record below is retained for reference.
 
 ## Context
@@ -65,7 +65,7 @@ None yet. `ARLE_DSV4_FLASHMLA_DECODE=0` (the existing lever to route around
 this lane entirely) could not be used for a clean A/B at first: that
 fallback path's KV-pool sizing was keyed to the FlashMLA banded layout and
 admission-rejected almost every request at typical `--max-total-tokens`
-ceilings — fixed same day in `4e44b0209` (decoupled
+ceilings — fixed same day in (decoupled
 `dsv4_flashmla_decode_alloc_enabled`, a compile-time `HAS_FLASHMLA` question,
 from the runtime `ARLE_DSV4_FLASHMLA_DECODE` kernel-choice flag). Pod-verified
 the unblock: booting at the exact previously-rejecting config (TP=4,
@@ -2130,7 +2130,7 @@ this mechanism would need re-testing — out of scope: no established repro at
 that length exists in this doc.)
 
 **Aside — an unrelated, broken commit blocked GPU access mid-round.**
-`36835179f` ("persistent device page table for CUDA graph safety (#8)",
+ ("persistent device page table for CUDA graph safety (#8)",
 authored by a concurrent session working the SAME pod tree — see
 `docs/experience/wins/2026-07-07-prefix-cache-graph-page-table-fix.md`)
 landed on `main` mid-investigation and unconditionally fails
@@ -2203,11 +2203,11 @@ own A/B.
 
 ## Note (2026-07-07): DSv4 boot was broken for part of today
 
-`36835179f` (#8 persistent-page-table fix) introduced a construction-time
+ (#8 persistent-page-table fix) introduced a construction-time
 regression that broke **all** DSv4 FlashMLA boots (100% `ensure!` panic at
 startup) — fixed same day, see the "Follow-up" section of
 [wins/2026-07-07-prefix-cache-graph-page-table-fix.md](../wins/2026-07-07-prefix-cache-graph-page-table-fix.md).
-Window: `36835179f..<fix commit>`. No DSv4 commits touching
+Window: `..<fix commit>`. No DSv4 commits touching
 `attention/flashmla.rs`, `attention/dsa.rs`, `dsv4.rs`, or `executor.rs` land
 in that range besides the fix itself — this investigation's own rounds each
 built their own binary at various points and are unaffected, but noting the
@@ -2215,7 +2215,7 @@ window honestly per the case-as-fact discipline.
 
 ## Part A — Case-level attribution of the residual corruption (post-#8): onset is BEFORE `proj_batched`, implicating the sibling MLA FP8 gate (2026-07-08)
 
-Rebuilt at `main` HEAD (`b0d266838`, which includes `a207a11cc` — #8 fully
+Rebuilt at `main` HEAD (which includes — #8 fully
 fixed, construction-time regression and all) with the same one-line
 `proj_batched` bf16-force as "Experiment B" (`attention.rs:7704`, `if false &&
 input.seq_len > 1`, reverted after this round). TP=4, GPUs 2/3/4/5, same
@@ -2240,7 +2240,7 @@ substitution instances are uniformly simpler: `738292` (×4, single last-digit
 flip) and `738391` (×1, single mid-string-digit flip), plus one with trailing
 hedging text. **The residual signature changed character once #8 (the
 CUDA-graph device-page-table UAF) was fixed** — direct evidence that
-Experiment B's own residual-corruption sample, run before `a207a11cc` landed,
+Experiment B's own residual-corruption sample, run before landed,
 was at least partly characterizing #8's own artifact rather than a pure
 picture of whatever remains after `proj_batched`'s fix. This is exactly the
 contamination risk this task was commissioned to check.
@@ -2842,7 +2842,7 @@ neither attempted this round (scope: diagnosis only):
 All instrumentation reverted after use (`diff_summary` methods on the four
 `*Image` types + the `ARLE_DSV4_ROUNDTRIP_TRACE` hook in
 `capture_cached_prefix`) — `git diff` clean on both local and pod trees
-(confirmed `git diff --stat` empty on both, both at `20871e531`).
+(confirmed `git diff --stat` empty on both, both at).
 
 ## Post-idempotency follow-up — both pre-registered targets checked out clean, source-proven (2026-07-08)
 

@@ -43,4 +43,4 @@ Cannot reach 32 tok/s — the theoretical ceiling is 27.1 tok/s at 273 GB/s.
 - Host: M4 Pro 48GB, macOS
 - Model: majentik/Qwen3.8-27B-MLX-2bit (64 layers, 48 GDR + 16 full attn)
 - Flags: `--backend metal --max-running-requests 1`
-- Commit: `455ad36c0`
+- Commit:

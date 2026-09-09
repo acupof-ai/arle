@@ -2,7 +2,7 @@
 
 > Status: Confirmed (local M4 Pro 48 GB)
 >
-> Baseline: `0f1fef63c`, `arle serve --backend metal --model-path
+> Baseline: `arle serve --backend metal --model-path
 > LiquidAI/LFM2.5-8B-A1B-MLX-4bit --no-speculative --kv-cache-dtype bf16`,
 > M4 Pro 48 GB. Three loop-prone prompts, `max_tokens=2500`, greedy.
 

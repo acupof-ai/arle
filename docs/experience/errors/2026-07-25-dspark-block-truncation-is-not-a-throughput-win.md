@@ -2,7 +2,7 @@
 
 ## Context
 
-`--dspark-block-size` (49b02be24) landed on the premise that block 16 at
+`--dspark-block-size` landed on the premise that block 16 at
 accept_rate ~0.21 keeps only ~3.3 tokens per chain, so **79.5% of drafted work is
 discarded** — and that shrinking the block would recover it. It was also pitched
 as the fixed-length stand-in for a confidence head, and as the baseline that head

@@ -49,7 +49,7 @@ The stalls were bracketed by 3145728-byte transfers, D2H 1488 and H2D 816,
 each paired 1:1 with a 61440-byte copy. 3145728 = 48 × 3 MiB is the gated-delta
 recurrent state per linear layer and 61440 the conv ring, so the payload was
 certain. I then named the producer as `Qwen35SlotImage` / `swap_out_image` —
-the whole-slot park — wrote it up, and committed a fix for it (`a546ba80a`).
+the whole-slot park — wrote it up, and committed a fix for it.
 
 Both park routes are unreachable in the measured serve:
 
@@ -62,7 +62,7 @@ The serve log also carried none of the `log::warn!` lines every KV-overflow
 preempt path emits. The actual producer is `Qwen35RecurrentSnapshot`, written
 at every stride boundary of every prefill so a later conversation can restore
 the hybrid prefix — a second struct with a copy-pasted serializer of the same
-shape (`d626a1b03`).
+shape.
 
 **The payload identified the data, not the code path.** Two call sites can move
 byte-identical payloads; the transfer signature cannot distinguish them. Before

@@ -1,6 +1,6 @@
 # Marlin for per-channel FP8 — the only lever left on the NVFP4 concurrency gap
 
-> Status: **Done and superseded.** The repack shipped (`6f4b413fe`), and per-channel
+> Status: **Done and superseded.** The repack shipped, and per-channel
 > FP8 prefill then moved off Marlin to DeepGEMM entirely
 > ([wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md](../experience/wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md)).
 > `Fp4Route` named below no longer exists — NVFP4 has one serving path.
@@ -54,7 +54,7 @@ recompiles. This is a smaller change than the `kFE2M1f` one that preceded it.
 
 ## What is missing
 
-**1. `marlin_fp8_gemm_cuda` entry (written, parked out of `675d7f32a`).**
+**1. `marlin_fp8_gemm_cuda` entry (written, parked out of).**
 Mirrors `marlin_fp4_gemm_cuda` with `host::kFE4M3fn`, `num_groups = 1`,
 `group_size = -1`, `s2 = nullptr`. Plus the `ARLE_DISABLE_MARLIN_SM70` stub and
 the `ffi/gemm.rs` declaration.

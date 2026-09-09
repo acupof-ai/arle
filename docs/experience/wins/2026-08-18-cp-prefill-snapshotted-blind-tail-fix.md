@@ -31,7 +31,7 @@ TEMPLATE=qwen3_nonthink RAW=1 PORT=18189 \
 ```
 
 - Baseline: `cpfix3` build (pre-fix), TP=2 CP=2
-- Treatment: `e767bd5ac` (fix), TP=2 CP=2
+- Treatment: (fix), TP=2 CP=2
 - Needle: `738291`, depth=0.0 (position 0)
 - Trials: 3 per length, 7 lengths = 21 requests
 
@@ -45,7 +45,7 @@ TEMPLATE=qwen3_nonthink RAW=1 PORT=18189 \
 
 ## Results
 
-| len | baseline (cpfix3) | treatment (e767bd5ac) |
+| len | baseline (cpfix3) | treatment |
 |---:|---|---|
 | 115 | 3/3 exact | 3/3 exact |
 | 300 | 3/3 exact | 3/3 exact |

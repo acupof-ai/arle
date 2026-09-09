@@ -1,12 +1,12 @@
 # The cp=2 wall at global 163,840 is one checkpoint group's replay, and the peak model undercounts it — 2026-08-20
 
-Instrumented on `c7c9ec4c4` (`fix(train): surface the driver error when a zeros
+Instrumented on (`fix(train): surface the driver error when a zeros
 allocation fails`).
 
 ## Context
 
 Target is global sequence 262,144 on 2 GPUs. The ceiling has sat at 131,072
-since `28a1a79ef`. Global 163,840 (local 81,920) fails in the backward on
+since. Global 163,840 (local 81,920) fails in the backward on
 `zeros [1, 81920, 5120]`, 1.6 GB, and the peak model reads
 `actual=77,026 MiB` of 97,508 — apparently 20 GB of headroom.
 

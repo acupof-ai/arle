@@ -22,7 +22,7 @@ so the conv-boundary `grad_weight` is real, not zero.
 
 ## Measured (H20 pod, sm_90)
 
-**Live device-carry gradcheck — PASSED** (`5fbf38e4e`, GPU 1): build 0, clippy 0,
+**Live device-carry gradcheck — PASSED** (GPU 1): build 0, clippy 0,
 `cuda_linear_attention_carry_grad_matches_cpu` exit 0, non-carry regression exit 0.
 This is the coverage tranche 1 could not have (dead path). dq 1.74e-3, dconv
 6.29e-3 — both **bf16-rounding artifacts**, not logic bugs (see below).
@@ -41,7 +41,7 @@ Flipping ONLY the read precision drops both under floor → pure bf16 rounding.
 Concentrated on carry-fed boundary tokens (dq worst tok 0-1) and conv boundary
 taps (dconv worst tap 0-1), decaying to ~0 mid-sequence — the boundary signature.
 The bf16 gradient is the **correct adjoint of the bf16 forward**; f32 would be
-finer-but-wrong. Fix was test-side: carry variant `abs_tol` 1e-3→1e-2 (`c4709d348`),
+finer-but-wrong. Fix was test-side: carry variant `abs_tol` 1e-3→1e-2,
 kernel untouched.
 
 **VRAM wall (masked writeback, `--writeback-offload true`, 27B-FP8):**
@@ -61,7 +61,7 @@ this reroute lifts the wall one notch and gives the carry path a chunked backwar
 
 Cross-commit A/B (the tranche-2 flip is in the forward — the device path records
 `initial_state` as `None`, so a runtime host-vs-device toggle can't exist). Arm A =
-HEAD `5fbf38e4e` (device chunked backward); arm B = `a03bf04f2` (= `d6ae52dc1^`,
+HEAD (device chunked backward); arm B = (= `^`,
 clean host recompute). Both arms: same records, same seed, GPU 1, two full builds
 in isolated trees. 27B-FP8, `--writeback-offload true`.
 

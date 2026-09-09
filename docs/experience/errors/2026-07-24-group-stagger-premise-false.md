@@ -6,8 +6,8 @@ Cross-sample LCP measurement showed a CC group's 8 samples share 18,176 of
 ~21.1K first-turn prompt tokens (86%). Since the radix cache publishes only at
 request finish, the inference was: 8 concurrent cold starts each pay the full
 21K prefill — ~127K wasted tokens/group. Built `--group-stagger` (hold K−1
-samples until sample 0's first request publishes), landed as 1566bb175 +
-93bb17726 + 294cfd90b, ran the pod A/B (H20, ThinkingCap-27B-FP8, SMOKE
+samples until sample 0's first request publishes), landed as +
+ + ran the pod A/B (H20, ThinkingCap-27B-FP8, SMOKE
 SAMPLES=8, 4 groups, same GPU/port/binary, sequential arms).
 
 ## Root Cause
@@ -23,7 +23,7 @@ inert (k=1), moved −14% in the same direction.
 
 ## Fix
 
-Reverted all three commits (2ab7883f1). The LCP measurement itself stands
+Reverted all three commits. The LCP measurement itself stands
 (86% shared preamble) — only the "waste exists" inference was wrong.
 
 ## Rule

@@ -24,7 +24,7 @@ production models. Two mechanisms are in scope:
 
 Serve config: `--kv-dram 256MiB --kv-disk /data00/kv-ssd-dsv4
 --kv-oversubscription --max-running-requests 8 --max-total-tokens 4096`,
-TP=4 on H20 (sm_90), binary `l2l3-fix` (source 72d3afccb).
+TP=4 on H20 (sm_90), binary `l2l3-fix` (source).
 
 14 concurrent requests (3.5K-token prefill each, 128 max-tokens), 59.9 s wall:
 

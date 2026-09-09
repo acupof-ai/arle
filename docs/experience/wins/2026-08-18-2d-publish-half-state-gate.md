@@ -4,7 +4,7 @@
 
 ## Context
 
-c8c8b5d71 skipped the prefix **attach** path under 2D (attn_tp × attn_cp, world ≥ 4)
+ skipped the prefix **attach** path under 2D (attn_tp × attn_cp, world ≥ 4)
 to break a cross-communicator deadlock, but left the **publish** path running.
 Under 2D the radix is write-only — attach is skipped, so no rank ever reads the
 cached prefix. `publish_prefix_blocks` still burned one `tp_sync_min` collective
@@ -13,7 +13,7 @@ rank ever re-attaches.
 
 ## What Worked
 
-- **Early return on `kv_shard_spec().is_some()`.** The same predicate c8c8b5d71
+- **Early return on `kv_shard_spec().is_some()`.** The same predicate
   used for attach, applied at the top of `publish_prefix_blocks`. Symmetric on
   every rank (config property, not runtime state), so the collective count
   stays rank-invariant — no deadlock.

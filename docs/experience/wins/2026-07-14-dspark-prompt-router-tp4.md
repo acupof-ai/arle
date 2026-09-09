@@ -32,7 +32,7 @@ can preserve short-prompt gains and route longer prompts to the target decoder.
 - Concurrency 1, 128 output tokens, `ignore_eos=true`, 5 s warmup
 - 20 distinct natural document slices per shape; 12 requests at 8K
 - GuideLLM 0.6.0, concurrent profile, seed 20260416
-- Baseline binary: `fee5832ce`, SHA-256 `63925252...f02c6c`
+- Baseline binary: SHA-256 `63925252...f02c6c`
 - Router binary: SHA-256 `6b60a206...36e9d6`
 - Router flag: `--dspark-max-prompt-tokens 64`
 - Profiling off

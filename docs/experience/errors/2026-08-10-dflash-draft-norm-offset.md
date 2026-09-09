@@ -10,7 +10,7 @@ target final norm was wrong and therefore cannot be an accuracy reference.
 
 ## Root Cause
 
-Commit `694245eec` correctly changed the Qwen3Next target final norm to its
+Commit correctly changed the Qwen3Next target final norm to its
 `(1+w)` convention and also changed seven DFlash draft norms. The DFlash model
 is Qwen3 and uses plain-weight RMSNorm. SGLang's DFlash implementation uses its
 plain RMSNorm, and the checkpoint norm weights are centered below one; adding

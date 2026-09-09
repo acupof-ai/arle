@@ -10,7 +10,7 @@ The saturation client would find a stable throughput point within the 16-slot se
 
 ## Environment
 
-- Binary commit: `91d105f3f618`; 4× NVIDIA H20, TP=4
+- Binary commit: 4× NVIDIA H20, TP=4
 - Server: 16 slots, 400 KV pages, 25,600 compressed-context tokens
 - Workload: 4096 input tokens, 256 output tokens, 60-second saturation points
 

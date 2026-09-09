@@ -1,6 +1,6 @@
 # T1 gate+up row-fusion: −2.1% decode ITL, and the Marlin fixed-grid correction — CUDA, 2026-08-03
 
-> Status: **Shipped, default path** (`3e383c082`, #196 T1). c=1 W8A16 decode
+> Status: **Shipped, default path** (#196 T1). c=1 W8A16 decode
 > ITL p50 **26.88 → 26.31 ms (−0.6 ms)**. Smaller than predicted — and the
 > reason re-ranks the whole program: Marlin launches a FIXED `sms × 1` grid
 > and iterates tiles internally, so wider N does NOT lift occupancy. Fusion
@@ -22,7 +22,7 @@ per fused buffer, window-scoped merge/restore) — OPD bf16 students unaffected.
 
 | arm | ITL p50 | ITL p99 |
 |---|---:|---:|
-| unfused (same day, `f2c07d0cf`-era binary) | 26.88 ms | 27.46 ms |
+| unfused (same day-era binary) | 26.88 ms | 27.46 ms |
 | **T1 fused** | **26.31 ms** | 26.99 ms |
 
 TTFT p50 30.5→24.5 s is NOT T1's — this binary also carries the ctx-bind +

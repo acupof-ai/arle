@@ -1,6 +1,6 @@
 # FP8 operator-evidence convergence — guidellm, CUDA H20 Qwen3.6-27B-FP8, 2026-07-11
 
-> After-run for commits `6cb2c0054`/`fb1e1896f`/`a7fd6ff37`/`4b80a4e3d`
+> After-run for commits ///
 > (content-addressed bundle id, request-boundary stats, probe-truth, multiproc
 > fix). Host-path-only change — no kernel or scheduler bytes changed — so this is
 > a serving no-regression + engagement-proof run, not a matched kernel Δ%.

@@ -26,7 +26,7 @@ B=2..8 shapes decode actually uses.
 
 ## Env
 8×H20, TP=4/EP=4 GPUs 0-3, DSv4-Flash-FP8 (274G FP8-native dir), greedy T=0,
-HEAD 6d238b7e (`/host/arle-kern141-bin`) vs base 5bbeeaac (`/host/arle-base-bin`),
+HEAD (`/host/arle-kern141-bin`) vs base (`/host/arle-base-bin`),
 same quad/env/scripts, back-to-back serve cycles, stats-trace method.
 
 ## Results (aggregate with the #143 mhc levers — same campaign, same binaries)

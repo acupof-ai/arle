@@ -1,6 +1,6 @@
 # TP decode graph capture: industry path exists — CUDA, 2026-08-22
 
-> Status: Verified (9b346ea1a) — TP2 decode graph armed + replaying; +10% ITL at
+> Status: Verified — TP2 decode graph armed + replaying; +10% ITL at
 > c=1, wash at c≥2 (GPU-bound ceiling); needle envelope identical to eager
 
 ## Context
@@ -44,7 +44,7 @@ check both premises.
 ## Verification
 
 ThinkingCap-Qwen3.6-27B-NVFP4, 8×H20 pod, TP2, FP8 KV, spec off. Graph arm =
-9b346ea1a (gate removed); eager arm = pre-change binary, same model/config.
+ (gate removed); eager arm = pre-change binary, same model/config.
 Serve log under TP2: `whole-step decode graph ARMED` on both ranks,
 `replay_total=5100 captures_total=16` — graph captured and replayed, no eager
 fallback.

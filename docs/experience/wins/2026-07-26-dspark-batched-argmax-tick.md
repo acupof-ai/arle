@@ -2,7 +2,7 @@
 
 ## Context
 
-After the ragged B×T batched verify landed (`f4f419629`), 45% of the c=8 plateau
+After the ragged B×T batched verify landed, 45% of the c=8 plateau
 was still strictly O(B). A phase probe attributed it, and the accept scan looked
 like the culprit: `dspark_accept_commit` called `argmax_hs_row` per chain row per
 slot, and that helper is launch + `ctx.sync()` + D2H. At `block=16`, c=8, a tick

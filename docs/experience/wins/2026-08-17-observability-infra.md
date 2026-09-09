@@ -41,7 +41,7 @@ process exit.
   auto-refresh 10 s, 9 charts: GPU util, VRAM, CPU, RAM, disk, token throughput,
   cache hit rate, TTFT, TPOT)
 
-**Multiproc coordinator** (`0d5f58970`): the coordinator process is engine-less
+**Multiproc coordinator**: the coordinator process is engine-less
 in TP mode — workers use `CudaWorkerEngine` directly, so `spawn_observe_task`
 was never called and the JSONL store stayed empty. Fixed by adding
 `CoordinatorHandle::query_stats()` (shared with the `metrics()` handler) and
@@ -51,7 +51,7 @@ spawn exactly one. The task is a single closure-parameterized
 `spawn_observe_task<F: FnMut() -> Option<CounterSnapshot>>` — one loop, one
 implementation. The flock singleton handles cross-process dedup.
 
-An earlier version (`cf028de9d`) minted a private stats-request ID counter in
+An earlier version minted a private stats-request ID counter in
 the observe thread, colliding with the HTTP handlers' counter over the shared
 `stats_sinks` map — collisions silently evicted awaiters, producing zeroed
 samples. Fixed by routing all stats queries through `query_stats()` which

@@ -1,13 +1,13 @@
 # Relay hello-read timeout leaked into the steady-state reader → TP=4 c8+ serve teardown
 
-> Status: Fixed (837b89d39), pod-confirmed 2026-07-24
+> Status: Fixed, pod-confirmed 2026-07-24
 
 ## Context
 
 A review-fix (LOW#18) added a read timeout to `accept_n` in
 `infer-server/src/multiproc_relay.rs` to stop a silent peer from wedging the
 single-threaded coordinator accept loop at boot. It shipped in commit
-`104cef160`. Local `cargo test` + Mac CUDA typecheck + CI were all green; the H20
+. Local `cargo test` + Mac CUDA typecheck + CI were all green; the H20
 DSv4-Flash TP=4/EP=4 needle gate passed 15/15 and c1/c4 throughput was
 perf-neutral. Then at **c8** the serve tore itself down:
 
@@ -35,7 +35,7 @@ prefix → the 1.77 GB garbage length → teardown. The champion binary had no r
 timeout on the worker stream → steady-state reads blocked → no desync, which is
 why c8 passed there.
 
-The pod agent's first hypothesis was the sibling `104cef160` change (H2,
+The pod agent's first hypothesis was the sibling change (H2,
 "un-serialize relay streaming" in the *local* relay pool). That was **wrong** —
 H2 is `infer-server/src/lib.rs` `coordinator_local_router`, not on the multiproc
 TP=4 path. Reading the actual failing code (`multiproc_relay.rs:726` timeout →
@@ -52,7 +52,7 @@ enters the steady-state relay (`multiproc_relay.rs`, after the hello validation)
 stream.set_read_timeout(None).context("worker stream clear read timeout after hello")?;
 ```
 
-Pod-confirmed on `837b89d39` (DSv4-Flash TP=4): c8 48/48, c16 64/64 completions,
+Pod-confirmed on (DSv4-Flash TP=4): c8 48/48, c16 64/64 completions,
 `TEARDOWN_RECURRED=no`, reproducible on a quiet box.
 
 ## Rule

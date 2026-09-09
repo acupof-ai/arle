@@ -14,13 +14,13 @@ Guard the probe to prefill only so MTP draft runs on the BF16 path.
 
 ## Changes
 
-1. `attention.rs` (`2e5ef6503`, `60be54d9a`): `compressor_forward` FP32 probe
+1. `attention.rs`: `compressor_forward` FP32 probe
    guard limited to `start_pos_device.is_none()` (prefill). Decode (batched,
    full-flatten, graph, MTP draft) always has `start_pos_device = Some` → BF16
    path. Guard simplified from 5 conditions to 3: `precomputed.is_none()` and
    `defer_update.is_none()` are redundant — every prefill call site has all
    three `None`, every decode call site has `start_pos_device = Some`.
-2. `scripts/bench_throughput.py` (`fc7fdd34e`): removed the strict
+2. `scripts/bench_throughput.py`: removed the strict
    `output_events == completion_tokens` check that failed under MTP
    (multiple accepted tokens per SSE event); usage-based token count is the
    ground truth.

@@ -6,10 +6,10 @@
 > accurate as a decomposition; the up-to-date single-GPU ladder and terminal
 > ceiling live in that plan's T5.
 
-## Correction (2026-07-28, post-Move-1 `e736c485a`, backward per-op probe)
+## Correction (2026-07-28, post-Move-1 backward per-op probe)
 
 Move 1 (free dead MLP+LoRA transients in the tape-disabled forward, commit
-`e736c485a`) cleared the **forward** wall: seq=40960 all-linear now completes
+) cleared the **forward** wall: seq=40960 all-linear now completes
 64/64 forward groups, flat at free≈20 GB (was OOM at group 3). The wall **moved
 to backward** and is now measured, not modeled:
 
@@ -51,7 +51,7 @@ target non-binding blocks — deferred. Everything below is history.
 
 ---
 
-## Correction (2026-07-27, clean HEAD `585e49337`, 4-arm re-measure)
+## Correction (2026-07-27, clean HEAD 4-arm re-measure)
 
 The earlier "40960 passes on main" below is RETRACTED. It rested on a pod probe
 binary `6da8e866` that does not exist in the repo — an unrebuildable mystery

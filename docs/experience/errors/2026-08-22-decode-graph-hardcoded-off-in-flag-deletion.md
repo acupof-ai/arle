@@ -1,12 +1,12 @@
 # Flag deletion hardcoded decode-graph OFF — the winning literal was `false`
 
-> Status: Fixed `cfcc5d4d9`-era follow-up. Introduced in `1864ddac5` (flag
+> Status: Fixed -era follow-up. Introduced in (flag
 > deletion wave), caught by the SOTA-defaults audit the same day.
 
 ## Context
 
 Wave 1 deleted `--qwen35-decode-graph` (off-arm measured −58.7 % TPOT,
-`cb6b3389d`). The seam field was kept for the OPD rollout engine, whose own
+). The seam field was kept for the OPD rollout engine, whose own
 flag defaults off.
 
 ## Root Cause

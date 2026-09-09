@@ -5,9 +5,9 @@
 The plan's Phase 5 ISO license gate needs an ISO-off `prob_match_alpha = 0/0.5/1`
 spectrum-drift sweep on a real DSpark head — the premise being "an unconstrained
 pure-PG acceptance update leaves the head near-isospectral." H20 verification
-(HEAD `b922bde52`) cleared the build and every unit gate, and two output-path
-gaps I'd missed were fixed along the way (`--dspark-prob-match-alpha` `327d172e4`,
-the ISO-off `SpectrumProbe` `3e883e127`). The sweep still could not run.
+(HEAD) cleared the build and every unit gate, and two output-path
+gaps I'd missed were fixed along the way (`--dspark-prob-match-alpha`
+the ISO-off `SpectrumProbe`). The sweep still could not run.
 
 ## Root cause
 
@@ -31,7 +31,7 @@ flags were silently inert.
 
 ## Fix (this tranche)
 
-`b922bde52`: `run_config` fails fast when `--dspark-train` / `--dspark-markov-init`
+: `run_config` fails fast when `--dspark-train` / `--dspark-markov-init`
 meet a multiproc model, instead of serving with the sidecar silently dead —
 Phase 3's rule that a no-op flag must reject, not no-op. This does NOT unblock the
 sweep; it makes the blocker loud.

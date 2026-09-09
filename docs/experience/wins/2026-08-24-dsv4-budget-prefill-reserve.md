@@ -1,6 +1,6 @@
 # DSv4 slot budget: prefill-transient reserve — CUDA, 2026-08-24
 
-> Status: Shipped (`94a15d415`), validated on the new 8xH20 box (`budget-v2`).
+> Status: Shipped, validated on the new 8xH20 box (`budget-v2`).
 
 ## Context
 
@@ -51,4 +51,4 @@ idle engine. Reserve terms are itemized from allocation sites, never a factor.
 ## Artifacts
 
 - `/root/arle-ops/runs/budgetval/serve.log` (reject), `budgetval-nvfp4/`
-  (bench-c8, serve.log), `budgetval-fp8clean/` (exact-config run), build `budget-v2` (head `0c31d5cde`)
+ (bench-c8, serve.log), `budgetval-fp8clean/` (exact-config run), build `budget-v2` (head)

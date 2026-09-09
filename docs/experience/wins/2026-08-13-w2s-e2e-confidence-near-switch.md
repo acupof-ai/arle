@@ -7,7 +7,7 @@
 First full-length `arle train w2s` run after the step-budget measurement
 ([wins](2026-08-13-w2s-step-budget-kl-terms-dominate.md)). 60 steps,
 `--confidence-threshold 0.9`, `--save-every 20`; ThinkingCap-Qwen3.6-27B-FP8
-base/student, four 0.8B aux, GSM8K prompts. Binary `1c5847839`, GPU 4,
+base/student, four 0.8B aux, GSM8K prompts. Binary GPU 4,
 `RUN_EXIT=0`, adapters saved at steps 20/40/60.
 
 ## What Worked

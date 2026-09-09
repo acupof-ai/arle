@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-16
 **Scope:** `crates/train/src/opd/`, `crates/train/src/qwen35/`, `crates/train/src/teacher_infer.rs`, `crates/cli/src/train_cli/`
-**Commits:** `cd9784f6c`, `a52761816`, `e96ee6a43`
+**Commits:**
 
 ## Context
 
@@ -60,7 +60,7 @@ step 1/1 loss 4.334862 rollout_len 65544
 ```
 Peak VRAM ~26 GB. ~21 min on H20 GPU 5.
 
-131072 (after O(n) student forward refactor, `e96ee6a43`):
+131072 (after O(n) student forward refactor):
 ```
 step 1/1 loss 0.151320 rollout_len 131080
 ```

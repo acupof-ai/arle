@@ -24,7 +24,7 @@ TEMPLATE=qwen3_nonthink RAW=1 PORT=18189 \
 ```
 
 - Baseline: `cpkv5` build (pre-`kv_lens` fix), TP=2 CP=2 — CUTLASS crash
-- Treatment: `a29d24f5b` (fix), TP=2 CP=2
+- Treatment: (fix), TP=2 CP=2
 - Needle: `738291`, depth=0.0 (position 0)
 - Trials: 3 per length, 7 lengths = 21 requests
 
@@ -38,7 +38,7 @@ TEMPLATE=qwen3_nonthink RAW=1 PORT=18189 \
 
 ## Results
 
-| len | baseline (cpkv5) | treatment (a29d24f5b) |
+| len | baseline (cpkv5) | treatment |
 |---:|---|---|
 | 115 | server crash | 3/3 exact |
 | 300 | — | 3/3 exact |

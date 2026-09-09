@@ -20,7 +20,7 @@ Replace the host zero-masking on the World comm with a real DP subgroup axis
   zero-masking (every rank contributes; the DP subgroup holds one CP rank per
   replica). Loss reduce stays on `CommAxis::World` (the world sum of partials
   is the global mean).
-- Drive-by: remove a pre-existing `mut` lint in math_opd.rs (39c43d5d2).
+- Drive-by: remove a pre-existing `mut` lint in math_opd.rs.
 
 world==1 identity preserved (cpu-lane `all_reduce_sum_device` is identity):
 `cargo test -p autograd -p train` green. Mac CUDA clippy lint green
@@ -34,7 +34,7 @@ world==1 identity preserved (cpu-lane `all_reduce_sum_device` is identity):
 # - no divergence across the step
 ```
 
-- Baseline: `50f8183f3` (zero-masking on World)
+- Baseline: (zero-masking on World)
 - Treatment: this commit (CommAxis::Dp subgroup)
 - Trials: pending-remote
 

@@ -74,7 +74,7 @@ again").
 
 ## First fix attempt was incomplete — retested, found the real blocking site
 
-`b595b0e95` added `ACK_STALL_TIMEOUT` (120s) to `wait_for_ack_window`,
+ added `ACK_STALL_TIMEOUT` (120s) to `wait_for_ack_window`,
 bounding the "poll `min_acked`, sleep, repeat" loop. Pod retest (same
 TP=4/EP=4, `prompt_tokens=8106`) showed **the request still hung forever** —
 two independent repro attempts, one waited out a 600s client timeout with
@@ -105,7 +105,7 @@ write now surfaces as an `Err` through the existing `write_all`/`?` chain,
 which `lockstep_loop`'s pre-existing broadcast-error branch already tears
 down on — no new plumbing needed for that half.
 
-## Second fix (`57606c63c`) is sound but doesn't fix the reported hang — the freeze is one layer deeper
+## Second fix is sound but doesn't fix the reported hang — the freeze is one layer deeper
 
 Retest 2 (same repro, `prompt_tokens=8106`, fresh build with both fixes):
 **still hangs forever** — 590s+ client timeout, zero bytes, zero HTTP
@@ -186,7 +186,7 @@ Two separate open questions this surfaces, not one:
   retry loop unless something explicitly distinguishes them — the loop
   cannot tell the difference on its own, so it must be told.
 
-## Round 4 — SPMD admission livelock, fixed (`5fd6a8984`)
+## Round 4 — SPMD admission livelock, fixed
 
 Design doc: plans/2026-07-05-spmd-admission-page-sync.md.
 Live simultaneous 5-process gdb snapshots (coordinator + all 4 workers, 3
@@ -209,7 +209,7 @@ per `admit_waiting()` call via the same min-reduce pattern
 through the collective, never diverging. This closes the SPMD-livelock CLASS
 of bug.
 
-## Round 5 — the SAME repro still hung, different mechanism, fixed (`eeac3d2b9`)
+## Round 5 — the SAME repro still hung, different mechanism, fixed
 
 With round 4's fix confirmed working, the identical `prompt_tokens=8106`
 repro **still hung** — this time with all 4 ranks staying symmetric (no
@@ -249,7 +249,7 @@ on both servers — no false-positive rejection. Server health after
 rejection: control → repro → repro → repro → control, all correct, no
 degradation, no zombie state.
 
-## Round 6 — `InFlightGuard` cancellation propagation, landed (`d9222a29a`, `b7ec09160`)
+## Round 6 — `InFlightGuard` cancellation propagation, landed
 
 The one gap rounds 1-5 left open, deliberately deferred pending a scope
 check-in: `InFlightGuard::drop` only decremented coordinator-side `in_flight`
@@ -258,14 +258,14 @@ request a permanent zombie in every rank's engine (`waiting` or an active
 slot), never told to stop.
 
 Fix, two commits:
-- `d9222a29a` (`infer-core`, self-contained, unit-tested): new
+- (`infer-core`, self-contained, unit-tested): new
   `Engine::cancel_request(handle)` — drops a queued request from `waiting`
   (same `complete_immediately(Abort)` path as the `max_prompt_tokens`
   rejection), or frees an active request's slot through the exact same
   `finish_slot` release path a natural completion uses. Safe no-op for an
   already-finished or unknown handle. Same MULTIPROC INVARIANT as admission:
   must be called identically, same tick, on every SPMD rank.
-- `b7ec09160` (multiproc wiring): new `RelayEnvelope::CancelRequest`,
+- (multiproc wiring): new `RelayEnvelope::CancelRequest`,
   broadcast BEFORE the tick's `TickAdmissions` (same locked `coord` scope) so
   every rank applies it at the identical point relative to that tick's step.
   `CoordSubmission::Cancel(u64)` carries it from `InFlightGuard::drop`

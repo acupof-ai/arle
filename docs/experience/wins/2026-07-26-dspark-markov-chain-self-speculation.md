@@ -43,7 +43,7 @@ pass, so the speculation settles on the first round essentially always — as th
 (`block` rounds) costs exactly what the per-row path did, so the win *is* the
 round count, and 0.14 ms is what bounds it.
 
-A simplify pass (`0ade41244`) followed: greedy became a slice copy out of
+A simplify pass followed: greedy became a slice copy out of
 `dspark_block_greedy` rather than a per-row scan, the round loop stopped
 allocating a device buffer per argmax (`argmax_rows_into`), and the four markov
 scratch slots gained block-shaped twins so the row-shaped path (sampling, and

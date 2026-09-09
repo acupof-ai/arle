@@ -25,7 +25,7 @@ python3 scripts/bench_throughput.py \
   --max-tokens 256 --seed 20260416 --output bench-output/baseline/bench
 ```
 
-- Baseline: origin/main `9dbcb54`, binary sha256 `6c588981…`, kernel bundle `058202352a…`, features `cuda` (no nccl, world=1). **No treatment** — single-arm baseline.
+- Baseline: origin/main binary sha256 `6c588981…`, kernel bundle `058202352a…`, features `cuda` (no nccl, world=1). **No treatment** — single-arm baseline.
 - Prompt tokens: p50 **3013** / ~13.4 k chars, 64 unique docs.
 - Completion tokens: 256 target (c1 256 / c4 248 / c8 219 avg).
 - Trials: n = 3 / 6 / 8 / 0 (small — TTFT 85–175 s vs a 120 s window; inherent to the fallback's slowness, not a harness fault. TTFT/prefill is the load-bearing metric and is unambiguous).

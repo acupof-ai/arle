@@ -2,8 +2,8 @@
 
 ## Context
 
-`77635e8c5` vectorized `split_qkv`, `split2`, and `silu_mul_fused` and changed
-shared activation functions to CUDA fast intrinsics. `a70cf5f7e` cached GEMV
+ vectorized `split_qkv`, `split2`, and `silu_mul_fused` and changed
+shared activation functions to CUDA fast intrinsics. cached GEMV
 activations in shared memory and hoisted scale-row addressing. Neither change
 had an operator reference comparison or a measured serving win. A later
 correctness run reported a precision regression, but its raw outputs and error
@@ -19,12 +19,12 @@ failed after these changes were combined.
 
 ## Fix
 
-`17c60435e` restored `expf` and `logf`. `9a6ca91ac9` restored the scalar split
+ restored `expf` and `logf`. restored the scalar split
 kernels and the direct GEMV input loads. The restored split file matches the
-parent of `77635e8c5`, the eight fast-math files match the same parent, and the
-GEMV file matches the parent of `a70cf5f7e`.
+parent of the eight fast-math files match the same parent, and the
+GEMV file matches the parent of.
 
-Remote verification used an isolated clean tree at exact commit `9a6ca91ac9`
+Remote verification used an isolated clean tree at exact commit
 on one H20:
 
 - CUDA release build completed with exit 0;
@@ -37,7 +37,7 @@ on one H20:
 - sampled coherence: 200/200 tokens, zero glued repetition.
 
 Artifacts are under
-`/host/fq-fwd-9a6ca91ac9-g0/artifacts/{build.log,serve-baseline.log,needle-baseline.log,temp-baseline.log}`
+`/host/fq-fwd--g0/artifacts/{build.log,serve-baseline.log,needle-baseline.log,temp-baseline.log}`
 on the validation host.
 
 ## Rule

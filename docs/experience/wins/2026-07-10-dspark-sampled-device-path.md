@@ -5,13 +5,13 @@
 Pod-measured: DSpark sampling mode inflated draft 16.6→71.7 ms (host per-row
 filtered softmax over ~150K vocab × 16 markov steps) and accept_commit
 2.0→18.7 ms (host p/q + residual sampling) → sampled spec 34.8 tok/s <
-plain-sampling 37.6–37.8. Commits `e22a41637` (kernels+FFI) + `9f2dd5b3b`
+plain-sampling 37.6–37.8. Commits (kernels+FFI) +
 (wiring) move both loops onto the device: per-markov-step
 `dspark_draft_sample_cuda` (filter + q-row store + draw, 4-byte D2H) and one
 `dspark_filter_probs_cuda` + `dspark_chain_accept_cuda` per verify (8-byte
 D2H). Uniforms stay host salted splitmix64 `(seed, position)` streams.
 License round: 8×H20 (GPUs 1/2/3), Qwen3.6-27B-FP8 + z-lab DFlash, binary =
-tree at `0b5bd3d55` (see caveat below), temp 0.7 / top_p 0.95 / seed 42.
+tree at (see caveat below), temp 0.7 / top_p 0.95 / seed 42.
 
 ## Pod gates — all PASS
 
@@ -33,10 +33,10 @@ Phase means (sampled): draft 36.0 / verify 25.7 / accept_commit 4.3 ms.
   hit): partial-ctx accept cost is real on both lanes; the full-attention
   draft layer's blind span is the suspect.
 
-**Provenance caveat:** committed HEAD `ce8c5dac1` did not compile for cuda —
-`9f2dd5b3b` swept ckl's in-flight executor.rs/lib.rs call-site hunks (their
-definition side landed in `0b5bd3d55` shortly after). The licensed binary
-equals the `0b5bd3d55` tree. Hunk-split rule updated: pathspec limits files,
+**Provenance caveat:** committed HEAD did not compile for cuda —
+ swept ckl's in-flight executor.rs/lib.rs call-site hunks (their
+definition side landed in shortly after). The licensed binary
+equals the tree. Hunk-split rule updated: pathspec limits files,
 not hunks (memory `feedback_commit_only_own_files`).
 
 ## Rule

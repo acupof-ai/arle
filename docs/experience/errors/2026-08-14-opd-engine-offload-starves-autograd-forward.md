@@ -34,12 +34,12 @@ pressure the forward's cuBLAS matmul reads freed/unmapped memory — garbage
 
 Ruled out along the way, with evidence:
 
-- Not the 08-13 refactors: NaN reproduces on `1c5847839`; the v0.5.5 binary
+- Not the 08-13 refactors: NaN reproduces on the v0.5.5 binary
   cannot run this model at all (H=16/Hg=16 AOT geometry only added 08-13), so
   this path had never executed anywhere.
 - Not the flashqla `fq_bwd` kernel: `--gdr-chunkwise-prefill false` still NaNs.
-- Not the bf16 teacher-logits bridge: reproduces before and after `196eb2bb1`
-  + `4f37b60ff`.
+- Not the bf16 teacher-logits bridge: reproduces before and after
+ +.
 - Not FP8 teacher numerics: bf16 0.8B teacher reproduces.
 - Not zero-copy base sharing: plain `train opd` uploads an owned bf16 base
   (`upload_bf16_bits`); the FP8 `--share-frozen-base` table is agent/rubric-OPD

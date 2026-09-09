@@ -22,7 +22,7 @@ python3 scripts/bench_throughput.py \
   --max-tokens 256 --temperature 0 --timeout-seconds 900
 ```
 
-- Binary: `1a48d179f`, build `c1-graph-v24b`
+- Binary: build `c1-graph-v24b`
 - Baseline: `ARLE_DSV4_DECODE_GRAPH=0` (eager); Treatment: same binary, default (graph armed)
 - Prompt tokens: p50 28568; completion tokens 256 exact (ignore_eos)
 - Trials: 1 per arm, sequential, same GPUs (0,1,2,4)
@@ -106,46 +106,46 @@ correct", each found by the next probe after the previous fix:
 
 1. `record_pipeline_fence` probed the event pool with `cuEventQuery` during
    capture → `STREAM_CAPTURE_UNSUPPORTED`, which also invalidated the capture.
-   Fix: skip the pool probe when `cuStreamIsCapturing` (`cac2729d4`).
+ Fix: skip the pool probe when `cuStreamIsCapturing`.
 2. The 3 hash-routed MoE layers `clone_htod` the token ids per step → 3 host
    memcpy nodes, rejected by the audit. Fix: read the persistent pre-replay
-   buffer in graph mode (`82391a0fd`).
+ buffer in graph mode.
 3. Replay advanced `slot.seq_len` only; `compressed.seq_len` and
-   `fp8_kv_comp_packed_rows` drifted. Fix: `advance_after_replay` (`ca602dfc8`).
+ `fp8_kv_comp_packed_rows` drifted. Fix: `advance_after_replay`.
 4. `graph_stream_clone` returned buffer 0 (the embedding), so the LM head
-   sampled from the input. Fix: last layer's `ffn_stream` index (`f11e2cf0f`).
+ sampled from the input. Fix: last layer's `ffn_stream` index.
 5. `CudaSlice::clone()` in cudarc is a D2D copy into a fresh allocation, so
    every "persistent" graph buffer handed to a kernel was a throwaway copy;
    replay wrote freed memory and the LM head read a frozen buffer. Fix:
-   `StepBuf::Alias` over `upgrade_device_ptr` in `ManuallyDrop` (`c72c6c1a6`).
+ `StepBuf::Alias` over `upgrade_device_ptr` in `ManuallyDrop`.
 6. A new request's `slot.reset()` re-arms the SW-ring bootstrap, but the slot's
    graph kept replaying the post-bootstrap body. Fix: drop the slot's graph on
-   reset (`8484ad783`).
+ reset.
 7. 1296 alloc / 1295 free nodes in the captured body (every per-step
    `uninit`/`alloc_zeros` in the layer loop, MoE scratch, mHC params). Under
    `AUTO_FREE_ON_LAUNCH` each replay re-allocated them through the async pool
    and the p99 stalled at 156 ms. Fix: keyed persistent scratch
    (`GraphBufKey = (layer, GraphSlot)`) plus `StepBuf`/`StepSlice`, so graph
    mode aliases a model-owned buffer and eager mode still allocates
-   (`c63517aaa`, then the tail down to zero).
+ (then the tail down to zero).
 8. The CSA key-cache pack baked its `newly_packed > 0` branch and row range
    into the graph, so replay either skipped the write or repeated the captured
    row. Fix: a device-gated one-row pack kernel keyed on `start_pos_device`,
-   plus advancing `dsa_official.packed_rows` on replay (`c8ac2542a`).
+ plus advancing `dsa_official.packed_rows` on replay.
 9. Capture rollback called `slot.truncate`, which rewinds the FlashMLA pool
    cursor that `prepare_kv_batch` had already advanced; eager fallback in the
    same tick then broke the `pool seq_len == append_pos` invariant. Fix:
-   `rewind_host_counters` touches host counters only (`5cf706dae`).
+ `rewind_host_counters` touches host counters only.
 10. The batched (n>1) decode lane replaced and freed the same per-layer O-LoRA
     staging that a c=1 graph had captured, so returning to c=1 replayed freed
-    addresses. Fix: fixed n=1 staging inside the fused scratch (`5cf706dae`).
+ addresses. Fix: fixed n=1 staging inside the fused scratch.
 11. **The one that survived four versions.** Six MMLU items were graph-wrong /
     eager-right, reproducibly. Root cause: a prefix-cache restore (and a KV-tier
     promote) hands a slot to a new occupant with a new page band and fresh
     ring/compressor state, while the previous occupant's captured graph stayed
     armed and replayed over it. `ARLE_DISABLE_PREFIX_CACHE=1` collapsing the
     diff to 1 item was the probe that located it. Fix: drop the slot's graph on
-    restore and on promote (`450a7d208`).
+ restore and on promote.
 
 Defects 1, 2 and 5 were located with an `LD_PRELOAD` shim on
 `cuMemcpyHtoDAsync_v2` (hooked through `dlsym`, since cudarc loads libcuda
@@ -157,7 +157,7 @@ Defect 7's fix regressed once: the constructor sized the n=1 O-LoRA staging
 from `dsv4_oproj_group_dims(config)` while the runtime used the TP-local
 `shape.cols_per_group`, so the mismatch re-introduced 86 alloc nodes. The
 staging now resizes on the eager warm step when the loaded table dims differ
-(`7b761258b`).
+.
 
 ## Learnings
 
@@ -266,7 +266,7 @@ matched by the same grep run that reported the zeros).
 **The +21.3% headline above is stale, and the eager baseline is why.** The
 v24b eager arm ran at 35.6 tok/s; the v26 eager arm runs at 40.8, a 14.6%
 baseline improvement contributed by two commits from concurrent work
-(`0777aa346`, Marlin `blocks_per_sm` config search; `c5a3a11d1`, Markov head
+(Marlin `blocks_per_sm` config search, Markov head
 resident on GPU). The graph arm barely moved (43.2 → 44.2). The current,
 licensed number for this lever is **+8.3% decode / −7.9% ITL p50**.
 
@@ -340,7 +340,7 @@ accumulates is real work.
 ## Instrumentation note
 
 Two profilers `docs/environment.md` documented for this exact job were dead
-(removed in `b159c6bef`): `ARLE_DSV4_OPERATOR_TRACE` does not exist in the
+(removed in): `ARLE_DSV4_OPERATOR_TRACE` does not exist in the
 crates at all, and `ARLE_DSV4_STAGE_PROFILE`'s serve auto-flush keyed on a
 stage label with no call site, so a serve accumulated stats and printed
 nothing. The live tools are `ARLE_CUDA_PROFILE` (per-op, via `op_timing` in

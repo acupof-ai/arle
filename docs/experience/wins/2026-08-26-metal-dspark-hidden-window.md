@@ -2,7 +2,7 @@
 
 > Status: Confirmed (local M4 Pro 48 GB)
 >
-> Baseline: `59d91a2f6`, `arle serve --backend metal --model-path
+> Baseline: `arle serve --backend metal --model-path
 > LiquidAI/LFM2.5-8B-A1B-MLX-4bit --draft-model LiquidAI/LFM2.5-8B-A1B-DSpark
 > --kv-cache-dtype bf16 --kv-disk=<dir> --chunked-prefill-size 1024`,
 > M4 Pro 48 GB. 15 030-token prompt, 126 generated tokens.
@@ -10,7 +10,7 @@
 ## Context
 
 `DSpark disabled after 3 consecutive rejections (slot 0)` on every request. The
-obvious suspect was the prefix cache landed in `59d91a2f6` — a restored prefix
+obvious suspect was the prefix cache landed in — a restored prefix
 leaving the draft out of sync with the target. It is not that:
 
 - the warning fires once per request in the **pre-change** baseline log, where

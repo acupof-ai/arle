@@ -19,7 +19,7 @@ GPU-verified). Goal: quantify FP8 quantization quality on the 27B lane.
 
 - **FP8 verdict: no measurable quant loss** at ctx 2048 (FP8 marginally *lower*
   — within scoring noise, both shared-scale FP8).
-- **Blocking bug found + fixed first** (`067849cf3`): `forward_token_logits`
+- **Blocking bug found + fixed first**: `forward_token_logits`
   built a `new_linear_only()` transient slot, but the paged-KV migration never
   allocates contiguous `k_caches` — any full-attn layer panicked (index 0, len
   0, `qwen35.rs:5725`). Fix routes the transient forward through a free

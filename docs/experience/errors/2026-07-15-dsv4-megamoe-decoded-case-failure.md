@@ -13,7 +13,7 @@ wall-clock throughput.
 
 ## Parameters
 
-- Binary: `91d105f3f618`, SHA256 `16a2dd6a30d64e333a082991e938c18e5c6558573239ed7eb963e0e38e5f98e1`
+- Binary: SHA256 `16a2dd6a30d64e333a082991e938c18e5c6558573239ed7eb963e0e38e5f98e1`
 - Baseline: `ARLE_DSV4_MOE_TRANSPORT=allreduce`
 - Treatment: `ARLE_DSV4_MOE_TRANSPORT=mega_moe`
 - Workload: 20 natural 32-token prompts, 128 output tokens, greedy decode

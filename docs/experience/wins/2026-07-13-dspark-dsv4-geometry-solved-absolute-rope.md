@@ -14,7 +14,7 @@ DSpark speculative decode for DeepSeek-V4-Flash ran correct + lockstep under TP=
 rejected — **accept_rate 0.0**, drafts semantically UNRELATED to the target argmax
 (`[dspark-dbg]` dump: `anchor=603 drafts=[68745]` vs `target=[671]`). Two cheap
 hypotheses were disproven by pod A/B, both no-ops on the drafts:
-1. output post-attention inverse-RoPE (`f36675d85`, reverted `88360c888`) — no
+1. output post-attention inverse-RoPE (reverted) — no
    counterpart in the SGLang DFlash reference.
 2. absolute-position shift alone — pure relative RoPE, a constant base shift
    doesn't change scores.
@@ -33,7 +33,7 @@ the absolute target-position frame.
 ## What Worked
 
 Decouple the RoPE position frame from the `latent_kv` write offset (commit
-`b350b0f90`). Thread `block_abs` (= executor `verify_pos = start_pos + 1`) through
+). Thread `block_abs` (= executor `verify_pos = start_pos + 1`) through
 `dspark_forward_block → dspark_stage_forward / dspark_append_latent`:
 - noise block Q/K RoPE at absolute `block_abs + [0..block)`;
 - each step's committed-token context at absolute `block_abs - 1` (all `hc_mult`

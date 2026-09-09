@@ -25,7 +25,7 @@ dense copy:
 round 1 trained 6 (loss 0.0653), merge + requant over all 48 layers each round,
 exit 0. Store residency 23 200 MiB FP8 + 4 895 MiB BF16 per round.
 
-**Re-verified after the simplification pass** (`89508bf84`: launcher derives the
+**Re-verified after the simplification pass** (: launcher derives the
 scale grid, dead barrier/bound check removed, row-outer loops replace per-element
 div/mod): same config, round 0 loss 0.0542 — identical to the pre-simplification
 run — round 1 loss 0.0411 (vs 0.0653), within MoE rollout non-determinism since

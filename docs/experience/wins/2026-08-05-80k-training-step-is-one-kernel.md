@@ -1,6 +1,6 @@
 # Where an 80K training step goes: one kernel is 71%, and FA3 is worth 3.54× not 2.17×
 
-**Date:** 2026-08-05 · **Pod:** 8×H20, commit `e675f031b`, ThinkingCap-Qwen3.6-27B-FP8, LoRA attention-qv
+**Date:** 2026-08-05 · **Pod:** 8×H20, commit ThinkingCap-Qwen3.6-27B-FP8, LoRA attention-qv
 
 > Status: Characterization. No runtime change in this entry; it is the map the
 > 80K campaign is ranked against, and it re-ranks the campaign.

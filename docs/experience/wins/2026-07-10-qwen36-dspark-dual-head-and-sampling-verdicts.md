@@ -5,7 +5,7 @@
 Follow-up to [2026-07-10 block-draft license](2026-07-10-qwen36-dspark-block-draft-licensed-2p4x.md)
 (z-lab DFlash backbone, greedy, 36ms/step, 2.4×). This round gates the trained
 DSpark heads (Markov + confidence) and the P2 rejection-sampling verify
-(a5d738953) on the pod. 8×H20, GPU 1, Qwen3.6-27B-FP8, HEAD 90c51bda8,
+ on the pod. 8×H20, GPU 1, Qwen3.6-27B-FP8, HEAD
 500-tok csv/rust prompts, plain-decode anchor 42.6–43.6 tok/s. Checkpoints:
 `Hikari07jp/DSpark-Qwen3.6-27B-{AEON-draft,FR}` (AEON config.json recovered
 from the remote — the weight pull had skipped it), FR converted via

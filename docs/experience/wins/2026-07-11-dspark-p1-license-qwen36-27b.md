@@ -16,7 +16,7 @@ this is the P1 throughput license.
 - H20 GPU 1, TP=1, base `Qwen3.6-27B-FP8`, `--spec-type dspark --mtp-draft-model
   <dflash>`. B=1, greedy (argmax verify), thinking-mode on, no shared prefix
   (radix/decode-reuse never fires — raw draft acceptance), `max_tokens=384`,
-  decode-graph OFF uniformly. One-flag delta. Binary pod HEAD `93dcf4be`.
+ decode-graph OFF uniformly. One-flag delta. Binary pod HEAD.
 
 ## Result — LICENSED (clears 1.15× by a wide margin)
 

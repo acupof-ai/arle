@@ -42,7 +42,7 @@ The dense NVFP4 production path at M=1 is a tensor-core GEMM:
   (`crates/cuda-kernels/src/ffi/gemm.rs:422`) and a kernel test
   (`gemm_tests.rs:343`). It has no production caller: a grep across `crates/`
   finds only the binding and the test. The dense dispatch has been
-  Marlin-only since the 2026-08-20 quant-linear consolidation (`b7432e52a`).
+ Marlin-only since the 2026-08-20 quant-linear consolidation.
 - No wins/errors entry A/Bs Marlin against this GEMV at M=1 for dense NVFP4.
   The 2026-08-19 issue-bound finding
   (`errors/2026-08-19-marlin-decode-is-not-occupancy-limited.md`) varied
@@ -51,7 +51,7 @@ The dense NVFP4 production path at M=1 is a tensor-core GEMM:
 One doc sentence amplified the overbroad reading: `docs/baselines.md:317`
 states in the present tense that FP8 and NVFP4 "run the same hand-written
 warp-per-row scalar GEMV at M=1". That passage originates from 2026-08-19
-(`ea301015a`) and predates the Marlin-only consolidation; the same section's
+ and predates the Marlin-only consolidation; the same section's
 2026-08-23 Marlin tiebreaker win reflects the current path.
 
 ## Fix

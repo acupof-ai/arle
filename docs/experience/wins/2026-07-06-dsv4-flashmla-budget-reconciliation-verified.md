@@ -1,4 +1,4 @@
-# DSv4 FlashMLA/`affordable`-gate reconciliation (`ba36fbd39`) — pod-verified: clean reject, no crash
+# DSv4 FlashMLA/`affordable`-gate reconciliation — pod-verified: clean reject, no crash
 
 ## Context
 
@@ -10,12 +10,12 @@ Round 3 of a verification chain on real CUDA hardware (8×H20):
    (`kv_layout.rs`'s FlashMLA pool `ensure!`, pages=3344 need>=4098) on all 4
    worker ranks.
 2. round 2 —
-   `29fdda704` capped the auto-resolve ceiling at 32768, but the same failure
+ capped the auto-resolve ceiling at 32768, but the same failure
    still reproduced at the smaller value (pages=74 need>=130) — proving the
    real defect is a reconciliation gap between two independent budget checks
    (`dsv4.rs`'s `affordable` gate vs. `kv_layout.rs`'s FlashMLA pool
    constructor), not "wrong default value."
-3. **This round** — pod-verifies `ba36fbd39`, which adds a
+3. **This round** — pod-verifies which adds a
    `dsv4_flashmla_slot_pages` pre-check directly inside `dsv4_kv_budget_plan`
    (`crates/infer-cuda/src/dsv4.rs`), so the reconciliation gap is caught
    *before* reaching `kv_layout.rs`'s pool constructor, with the same
@@ -31,7 +31,7 @@ Round 3 of a verification chain on real CUDA hardware (8×H20):
   free (0 MiB) at session start. Used **GPUs 4,5,6,7 (TP=4,
   `INFER_CUDA_DEVICES=4,5,6,7 INFER_TP_SIZE=4`)** — same topology as rounds 1-2,
   for direct comparability (GPU1's occupancy still precludes TP=8).
-- `scripts/pod.sh sync` → pod tree confirmed `pod tree @ ba36fbd3 fix(cuda):
+- `scripts/pod.sh sync` → pod tree confirmed `pod tree @ fix(cuda):
   reconcile DSv4's affordable gate with the FlashMLA pool's own page floor`.
 - Build: `cargo build --release --features cuda,nccl,deepep --bin arle` →
   `BUILD_EXIT=0 (compiled 6 crates)` in 54.00s (warm `target/` cache; the
@@ -50,7 +50,7 @@ return, **not a Rust `panic!`/unwind**. Neither the pre-fix nor post-fix
 failure path is a literal panic with a backtrace; both rounds 1-2's quoted
 logs and this round's log show `[arle-worker rank=N] failed: worker rank N
 engine build: <message>` with no `thread '...' panicked at`/`RUST_BACKTRACE`
-text, in both the old and new cases. **The actual improvement `ba36fbd39`
+text, in both the old and new cases. **The actual improvement
 delivers is not "eliminating a panic"** (there wasn't a literal panic to
 eliminate) — it is:
 1. **Firing earlier**: the new `ensure!` in `dsv4_kv_budget_plan`
@@ -71,7 +71,7 @@ eliminate) — it is:
 
 Both before and after, the top-level behavior (worker exits `Some(1)`,
 coordinator aborts cleanly, `RUN_EXIT=1`, no zombie GPU memory) was already
-correct — `ba36fbd39` improves *where* and *how clearly* the rejection fires,
+correct — improves *where* and *how clearly* the rejection fires,
 not whether the process exits cleanly.
 
 ## No-flags boot (the exact round-2 crash scenario)
@@ -161,7 +161,7 @@ gate.
 
 ## Ruled out / not confounded
 
-- Not a build miss: `BUILD_EXIT=0` on the exact `ba36fbd39` pod HEAD
+- Not a build miss: `BUILD_EXIT=0` on the exact pod HEAD
   (`scripts/pod.sh sync` confirmed before build), `cuda,nccl,deepep` features
   (the default `pod.sh build` with no args only builds plain `cuda` — caught
   and corrected before the key test).

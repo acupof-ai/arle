@@ -1,8 +1,8 @@
 # FlashQLA chunked GDR at H=48: 33K prefill −27% — 2026-08-02
 
-> Status: **DEFAULT-ON** (`778fef873` parameterization, `5b851d193` compile
-> fixes, `2e2ab667c` first flip, `715c37a0c` revert on the raw-8-shot GSM
-> collapse, `c2eb5de9e` re-flip after full adjudication). Final license:
+> Status: **DEFAULT-ON** (parameterization compile
+> fixes first flip revert on the raw-8-shot GSM
+> collapse re-flip after full adjudication). Final license:
 > chat GSM8K 100 = **95/100 both arms, zero per-item disagreements**; chat
 > MMLU 80 vs 81; needle 9/9 ×2; stub-probe fallback. The collapse was bf16
 > drift on a knife-edge harness, not a kernel bug — mechanism and rules in

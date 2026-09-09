@@ -1,10 +1,10 @@
 # DSv4 on-demand FlashMLA band paging (Phase 3b) — 16K slot cliff 1→117, pod gate passed with one documented perf miss
 
-> Status: **Shipped** — commits `91ab1c5d1` (demand paging) + `429e87a70`
-> (budget-solve fixes) + `806b7ba4` (memset claim-zero) + `977325ca` (codex R3
+> Status: **Shipped** — commits (demand paging) +
+> (budget-solve fixes) + (memset claim-zero) + (codex R3
 > batched-gap fix) + reserve-at-first-chunk. 4×H20 (GPUs 4-7), TP4,
 > DeepSeek-V4-Flash-FP8, logs `job3b_*.log` / controls `job3c_*.log`
-> (pre-3b `fc850c7c` rebuilt same-day in the needlegate tree).
+> (pre-3b rebuilt same-day in the needlegate tree).
 
 ## What changed
 
@@ -28,7 +28,7 @@ full band.
 
 ## Capacity (gate ② — the headline)
 
-| Config | pre-3b (same day, fc850c7c) | 3b |
+| Config | pre-3b (same day) | 3b |
 |---|---|---|
 | `--max-total-tokens 2048` | 209 slots (pool-band clamp) | **256 slots**, shared comp 524,288 tokens (8192 engine pages) |
 | `--max-total-tokens 16384` | **3 slots** (pool residual 172MB; the 2026-07-09 cliff) | **117 slots**, shared comp 60,672 tokens (948 engine pages) |
@@ -53,7 +53,7 @@ E6 shape (n=4, len 2000, ×15, same salts, same day):
 
 | Arm | mean wall |
 |---|---|
-| pre-3b fc850c7c (209 slots, identity bands) | **9.137 s** |
+| pre-3b (209 slots, identity bands) | **9.137 s** |
 | 3b, 256 slots | 9.473-9.498 s (**+3.8%**) |
 | 3b forced to 209 slots (diag) | 9.417 s → slot count ≈ 0.9pp |
 | 3b + memset claim-zero (removed ~10MB blocking H2D/request) | 9.498 s — no change |

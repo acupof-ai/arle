@@ -1,11 +1,11 @@
 # CP training gradients regressed 6.4× against single-card, and the gate that would catch it cannot run — 2026-08-19
 
-> **RESOLVED 2026-08-19** (`ad1192864`) — one dropped `* 2` in the FA3 pair
+> **RESOLVED 2026-08-19** — one dropped `* 2` in the FA3 pair
 > route's byte offsets. Item 2 below (the dead 0.8B CP gate arm) is still open.
 
 ## Context
 
-Refreshing the stale timing rows in `docs/baselines.md` on `9c2c84675`. The
+Refreshing the stale timing rows in `docs/baselines.md` on. The
 workload is deterministic (`--synthetic-writeback-seq` builds the trajectory
 from `(i % 30000) + 1`, the base is frozen, LoRA `B` is zero-init), so the
 loss at step 1 is reproducible. The refresh compared against the 2026-08-05
@@ -17,7 +17,7 @@ rows and the numbers did not match.
 
 | arm | loss | grad_norm |
 |---|---:|---:|
-| 2026-08-05 baseline row, cp=2 (`15caff0d0`) | 10.871086 | 2.263385 |
+| 2026-08-05 baseline row, cp=2 | 10.871086 | 2.263385 |
 | 2026-08-19 **cp=1** | **10.870087** | **2.197122** |
 | 2026-08-19 cp=2, FlashQLA on | 11.664682 | 1.401418e1 |
 | 2026-08-19 cp=2, FlashQLA off | 11.665197 | 1.403425e1 |
@@ -50,11 +50,11 @@ supposed to agree — the 2026-08-05 correctness rows assert exactly that
 
 ## Cause
 
-**`652f87cb8` (2026-08-17) dropped `* 2` from the five run-offset expressions in
+** (2026-08-17) dropped `* 2` from the five run-offset expressions in
 the FA3 pair route.** They offset raw `CUdeviceptr` byte addresses into bf16
 buffers, so every offset was halved — exact for a shard's first run (row 0 at
 batch 1 makes the whole expression 0) and wrong for every later run of a
-non-contiguous zigzag shard. Fixed in `ad1192864`; see
+non-contiguous zigzag shard. Fixed in see
 [wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md](../wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md).
 
 Ruled out on the way, by measurement:
@@ -68,15 +68,15 @@ Ruled out on the way, by measurement:
 - **Not the single-card path.** cp=1 reproduces the old numbers on both models.
 
 **The baseline's stated commits are not on main.** `docs/baselines.md` cites
-`15caff0d0` and `fa742a038`; neither is an ancestor of HEAD — both live only on
+ and neither is an ancestor of HEAD — both live only on
 `fix/qwen35-final-norm-*` branches. The rebased main-side equivalent is
-`ab0f21007` (same subject, same date, and `git diff 15caff0d0 ab0f21007 --
+ (same subject, same date, and `git diff --
 crates/{train,autograd,cuda-kernels}/src crates/cuda-kernels/csrc` is empty), so
 the anchor holds and the doc's SHAs are wrong.
 
 The 2026-08-16 T1 entry recorded `cp_hidden_parity` PASS, which cut the window
 from 166 commits to the four code commits after it that touch the ring surface.
-Only `652f87cb8` edited `ring_attention.rs`, and only those five pointer lines.
+Only edited `ring_attention.rs`, and only those five pointer lines.
 No bisect build was needed.
 
 ## Why it went unnoticed
@@ -90,7 +90,7 @@ flashqla GDN head geometry H=8/Hg=8 not built
 (have 32/16, 48/16, 24/8, 12/4, 16/8, 16/16)
 ```
 
-FlashQLA went default-on at `15caff0d0`/`fa742a038` (2026-08-05) and has no
+FlashQLA went default-on at / (2026-08-05) and has no
 kernel for the 0.8B's per-rank geometry under CP, so the gate model cannot run
 the very configuration it exists to check. The 27B's CP geometry is 24/8, which
 IS in the built list — so the 27B runs, and produces wrong gradients quietly.
@@ -115,7 +115,7 @@ be loud where the gate's results are read, not only in the run log.
 
 ## Follow-up
 
-1. ~~Bisect~~ **Done** — `ad1192864`. cp=2 now gives loss 10.870859 /
+1. ~~Bisect~~ **Done** —. cp=2 now gives loss 10.870859 /
    grad_norm 2.152082 against cp=1's 10.870087 / 2.197122.
 2. Build the FlashQLA H=8/Hg=8 geometry, or make the 0.8B CP correctness arm
    run on the recurrent path, so the gate produces a number again.

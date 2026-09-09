@@ -17,7 +17,7 @@ The first candidate build exposed a generator bug. The device kernel read
 tiles uncomputed. Those numerical results are invalid for judging the complete
 candidate.
 
-`e2a837ff6` derives the wrapper grid from the loaded kernel module's `FQ_DV`
+ derives the wrapper grid from the loaded kernel module's `FQ_DV`
 and `FQ_BLOCK_DV`. Nsight Compute then confirmed the complete candidate at
 grid `(192, 1, 1)`, block `(512, 1, 1)`.
 
@@ -42,7 +42,7 @@ Keep `FQ_BLOCK_DV=64`. The 32-wide candidate is rejected before timing or
 model-level acceptance. Keep the wrapper-grid derivation fix so future tile
 changes cannot silently launch an incomplete output domain.
 
-`3582c881a` also makes the two numerical paths explicit: the ignored CPU
+ also makes the two numerical paths explicit: the ignored CPU
 reference test is named and pinned to the recurrent kernel, while
 `ARLE_FQ_PARITY=1` reports `max_abs`, `p99_abs`, RMSE, floored max-relative
 error, relative L2, cosine, and non-finite mismatches from FlashQLA and the
@@ -51,13 +51,13 @@ recurrent reference inside the same forward.
 Artifacts on the validation host:
 
 - baseline NCU:
-  `/host/fq-fwd-9a6ca91ac9-g0/artifacts/fq64-q2048-h48-full.ncu-rep`;
+ `/host/fq-fwd--g0/artifacts/fq64-q2048-h48-full.ncu-rep`;
 - corrected candidate grid:
-  `/host/fq-fwd-9a6ca91ac9-g0/artifacts/fq32-grid192-smoke.ncu-rep`;
+ `/host/fq-fwd--g0/artifacts/fq32-grid192-smoke.ncu-rep`;
 - corrected candidate parity:
-  `/host/fq-fwd-9a6ca91ac9-g0/artifacts/fq32-grid192-parity-1-serve.log`;
+ `/host/fq-fwd--g0/artifacts/fq32-grid192-parity-1-serve.log`;
 - comparison report:
-  `/host/fq-fwd-9a6ca91ac9-g0/artifacts/fq32-grid192-vs-fq64-parity-run1.txt`.
+ `/host/fq-fwd--g0/artifacts/fq32-grid192-vs-fq64-parity-run1.txt`.
 
 ## Rule
 

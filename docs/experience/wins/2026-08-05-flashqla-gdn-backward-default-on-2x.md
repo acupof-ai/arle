@@ -1,6 +1,6 @@
 # FlashQLA GDN backward default-on: 80K training step 1.99×, backward 2.14×
 
-**Date:** 2026-08-05 · **Pod:** 8×H20, `fa742a038`, ThinkingCap-Qwen3.6-27B-FP8, LoRA attention-qv
+**Date:** 2026-08-05 · **Pod:** 8×H20, ThinkingCap-Qwen3.6-27B-FP8, LoRA attention-qv
 
 > Status: Default flip. `--gdr-chunkwise-prefill` now defaults true; the
 > recurrent arm stays reachable via `--la-backward-mono`.
@@ -10,8 +10,8 @@
 The 71% `linear_attention_chunked_scan_backward_f32` row (see
 `2026-08-05-80k-training-step-is-one-kernel.md`) is the whole 80K step. FlashQLA
 (QwenLM, MIT, TileLang SM90+) is the official SOTA GDN chunkwise kernel; the port
-landed `4846f8046` and built cold once the sm_90a fix (`4b85750e4`) and the CP
-geometry table (`1b913e31e`) cleared. This entry flips the default and records the
+landed and built cold once the sm_90a fix and the CP
+geometry table cleared. This entry flips the default and records the
 matched A/B that licenses it.
 
 ## Result — matched A/B, seq=81920 cp=2

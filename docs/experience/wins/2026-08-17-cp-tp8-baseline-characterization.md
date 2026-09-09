@@ -7,14 +7,14 @@
 Characterize CP=1 vs CP=2 end-to-end on ThinkingCap-Qwen3.6-27B-FP8 at TP=8
 across all production axes: throughput, decode rate, TTFT, needle correctness,
 and GSM8K accuracy. This is the clean-baseline re-run after the L2 tier budget
-fix (0088e37e5); the prior 1.67x TTFT "speedup" was an artifact of that bug.
+fix; the prior 1.67x TTFT "speedup" was an artifact of that bug.
 
 ## Parameters
 
 - Model: ThinkingCap-Qwen3.6-27B-FP8 (dense, 64 layers = 16 full-attn + 48 GDN,
   hidden=5120, intermediate=17408, FP8 e4m3)
 - TP=8, CP=1 vs CP=2, world=8, 8×H20 pod (sm_90)
-- Binary: `/host/arle-build/target/release/arle` (build 4bcefcb57)
+- Binary: `/host/arle-build/target/release/arle` (build)
 - Throughput: `bench_throughput.py`, 64 synthetic prompts (535 tok), 128 decode
   tokens, concurrency 1/4/8/16/32, 64 requests per concurrency
 - Decode: `decode_rate_probe.py --target-tokens 128000 --max-tokens 128`
@@ -109,7 +109,7 @@ attn_tp from 2 to 1, eliminating the attention all-reduce entirely and halving
 attention FLOPs per rank. That benefit does not generalize to TP=8 where
 attn_tp only halves 8→4.
 
-**Why the old 1.67x existed:** the L2 tier budget bug (0088e37e5) allocated
+**Why the old 1.67x existed:** the L2 tier budget bug allocated
 50% DRAM per rank without dividing by TP world, causing 8x over-allocation at
 TP=8. This inflated CP=1 TTFT (70.8s vs 43.0s clean). CP=2 was less affected
 (attn_tp=4, 4x over-allocation), creating a false speedup.

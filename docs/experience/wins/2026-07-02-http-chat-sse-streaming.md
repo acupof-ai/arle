@@ -1,6 +1,6 @@
 # Chat SSE streaming shipped — /v1/chat/completions stream=true (closes #79)
 
-> Status: Shipped — `30ad158f`, 2026-07-02.
+> Status: Shipped — 2026-07-02.
 
 ## Context
 

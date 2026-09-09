@@ -5,7 +5,7 @@
 Loading `DeepSeek-V4-Flash-FP8` on CUDA failed with an E8M0 scale rejection
 error. The model's FP8 experts use block-scaled E8M0 scales (`.scale` suffix),
 which are native to DSv4's quantization scheme. The W4A16 detection probe
-(`ec9997cfd`) calls `quant_view_for()` to check whether the first expert is
+ calls `quant_view_for()` to check whether the first expert is
 W4A16, and that call triggered the Qwen safety rejection.
 
 ## Root Cause
@@ -23,7 +23,7 @@ be subject to the Qwen guard.
 
 ## Fix
 
-`5cc681759` — added `quant_view_for_dsv4()` in `loader.rs` that skips the E8M0
+ — added `quant_view_for_dsv4()` in `loader.rs` that skips the E8M0
 rejection. `quant_view_for()` delegates to a shared inner function with a
 `reject_e8m0` flag; the DSv4 W4A16 detection probe calls the `_dsv4` variant.
 21 insertions, 5 deletions.

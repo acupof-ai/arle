@@ -45,7 +45,7 @@ python3 scripts/bench_throughput.py \
 ```
 
 - Baseline: model fails to load (no FP8 per-channel detection)
-- Treatment: `33f4863c7` — per-channel FP8 detection arm + dequant GEMM gate
+- Treatment: — per-channel FP8 detection arm + dequant GEMM gate
   relaxation + lm_head quant-aware + Fp4E2M1Group row-fusion
 - Prompt tokens: 7-9 (synthetic)
 - Completion tokens: 128 per request
@@ -161,7 +161,7 @@ address directly.
 
 ## FP4 GEMV vectorization + dequant prefill path — measured
 
-Runtime `2a3a2164f` (kernel `d6873c5e6`, dequant path `a23539905`), same pod,
+Runtime (kernel dequant path), same pod,
 same H20, `--kv-cache-dtype fp8`.
 
 The three FP4 group GEMV kernels read one packed byte per thread per iteration,

@@ -63,7 +63,7 @@ qwen35.rs:826  FlashQLA chunked GDR unavailable (stub build or non-sm90);
 ```
 
 `--qwen35-gdr-chunked` defaults true and FlashQLA has been default-on since
-`c2eb5de9e`, but `scripts/pod-build-env.sh` set only `ARLE_CUDA_ENABLE_FA3=1`.
+but `scripts/pod-build-env.sh` set only `ARLE_CUDA_ENABLE_FA3=1`.
 Without `ARLE_CUDA_ENABLE_FLASHQLA_GDR`, `build.rs:1637` skips every
 flashqla-gated TileLang row, the runtime probe finds no kernel, and the path
 falls back silently. **Every W8A16 prefill number measured 2026-08-02 through
@@ -73,14 +73,14 @@ optimization.**
 Two more failures hid behind it, both invisible while the rows were never
 generated:
 
-1. `/host/arle-build` was a mixed tree — git at `b7fecaa5d`, individual files
-   overwritten by single-file `tn push`. It lacked `4b85750e4`, which targets
+1. `/host/arle-build` was a mixed tree — git at individual files
+ overwritten by single-file `tn push`. It lacked which targets
    the flashqla rows at `sm_90a`; without it ptxas rejects `setmaxnreg`.
    Replaced wholesale from `git archive HEAD`, with a
    `.arle-source-receipt` since `.git` still reports the old commit.
 2. tilelang 0.1.12 renames a kernel parameter that collides with a C++ keyword
    (`do` → `do_1`), which failed `gdr_fq_bwd` codegen. The scalar path already
-   stripped that suffix; tensors now do too (`6e3f68fac`).
+ stripped that suffix; tensors now do too.
 
 ## Results
 
@@ -123,7 +123,7 @@ needle 9/9; raw-completion knife-edge flips the named trade) was adjudicated
 ## The flag is gone
 
 Setting the env in `pod-build-env.sh` fixed this box and left the defect. Both
-build-time opt-ins were deleted (`0ac780495`) rather than inverted to
+build-time opt-ins were deleted rather than inverted to
 `DISABLE`: the gates already carried the real conditions — vendored tree
 present, sm_90 among the targets — and an opt-out is still a switch someone has
 to know exists. DeepGEMM-native and FlashMLA already auto-detected; its comment
@@ -140,7 +140,7 @@ Both fallback logs moved `info!` → `warn!`.
 
 **Rule: a feature flag that defaults true proves nothing about the binary.**
 The CLI said on, the code path said on, the docs said default-on since
-`c2eb5de9e` — and the kernel was not in the build. Only the serve log knew.
+ — and the kernel was not in the build. Only the serve log knew.
 Before attributing a gap to design, grep the boot log for the fallback line of
 every optimization the number depends on.
 

@@ -142,7 +142,7 @@ comparison checkpoint. Its 128x128 blocks fail `quant_block_m == 1` as intended.
 
 `cuda.qwen.fp8_gemv` still takes 80507 of 238235 FP8 calls. Four load sites never
 call any repack — `lm_head`, `linear_attn.out_proj` x48, the TP=1 qkv, and the MTP
-fc — the same four flagged in `5499e20a7` when `down_proj`/`o_proj` were fixed for
+fc — the same four flagged in when `down_proj`/`o_proj` were fixed for
 FP4. 48 linear-attn layers is the right order of magnitude for the residue.
 Wiring those is the next step and should land where it is still needed most, at
 c>=8.

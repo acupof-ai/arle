@@ -20,7 +20,7 @@ on-device cast kernel eliminates a second per-layer host roundtrip.
 ## Parameters
 
 ```bash
-# A/B: baseline = parent of 142b959d4, treatment = 142b959d4
+# A/B: baseline = parent of treatment =
 # DSv4 MoE model, ARLE_DSV4_MOE_TRANSPORT=deepep, TP>=2
 python3 scripts/bench_throughput.py \
   --url <url> \
@@ -34,8 +34,8 @@ python3 scripts/bench_throughput.py \
   --output bench-output/deepep-event-order/bench
 ```
 
-- Baseline: `142b959d4^` (compute_stream=0, host sync, D2H/host/H2D roundtrip)
-- Treatment: `142b959d4` (event ordering, device cast kernel)
+- Baseline: `^` (compute_stream=0, host sync, D2H/host/H2D roundtrip)
+- Treatment: (event ordering, device cast kernel)
 - Trials: 3 (matched A/B, simultaneous)
 
 ## Environment

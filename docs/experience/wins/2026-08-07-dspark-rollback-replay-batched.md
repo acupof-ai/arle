@@ -25,7 +25,7 @@ if super::qwen35_gdr_chunked_enabled() {
 ```
 
 `--qwen35-gdr-chunked` was opt-in when that was written, so the per-slot loop
-was the minority branch. The flag defaulted on in `c2eb5de9e` (08-02, 33K
+was the minority branch. The flag defaulted on in (08-02, 33K
 prefill −27%) and from that day it was the **only** branch:
 `replay_linear_only_batched` has been dead code in every shipped configuration
 since, and its own doc comment states the cost it was written to avoid — "one
@@ -40,7 +40,7 @@ for the batched path.
 
 Delete the branch. The condition was never a correctness requirement: the
 replay restores a pre-verify snapshot and recomputes the accepted prefix, so it
-never had to match the trunk's discarded state. And since `4933e1bf4` the
+never had to match the trunk's discarded state. And since the
 trunk's uniform short rows take this same recurrent varlen kernel, so matching
 it is now the more consistent choice as well.
 
@@ -60,7 +60,7 @@ python3 scripts/bench_throughput.py --url http://127.0.0.1:8321 \
 ```
 
 - 1× H20 GPU 6, TP=1, eager, 16 slots.
-- Arm B `4933e1bf4`, arm C `70760bc09`. Only `qwen35/dspark.rs` differs.
+- Arm B arm C. Only `qwen35/dspark.rs` differs.
 - **Four sweeps in the order B, C, C, B** so each arm runs once in each half.
   Position was worth +3.4% to +6.3% within an arm here, consistent with the
   earlier finding that the arm loading second measures slower.
@@ -87,9 +87,9 @@ Cumulative for the day at c=16 TPOT:
 
 | commit | TPOT ms | vs morning |
 |---|---:|---:|
-| `010af0ede` (this morning's baseline) | 124.99 | — |
-| `4933e1bf4` (verify core batched) | 117.68 | −5.8% |
-| `70760bc09` (rollback replay batched) | **110.52** | **−11.6%** |
+| (this morning's baseline) | 124.99 | — |
+| (verify core batched) | 117.68 | −5.8% |
+| (rollback replay batched) | **110.52** | **−11.6%** |
 
 The 07-30 champion is 111.53 ms.
 
@@ -110,8 +110,8 @@ The phase mistake is written up in
 
 **A default flip is a routing change.** Both of today's wins are the same bug:
 a flag defaulting on turned an `if flag { per-row }` minority branch into the
-only path. The morning's was `LinearCore::Rows` after `0ac780495` made FlashQLA
-real in the pod binary; this one is the rollback replay after `c2eb5de9e`.
+only path. The morning's was `LinearCore::Rows` after made FlashQLA
+real in the pod binary; this one is the rollback replay after.
 Neither failed, neither had a test that could notice, and both survived until a
 kernel-instance ledger made the per-row shape visible. When a flag defaults on,
 grep its call sites — not just the feature it names.

@@ -1,7 +1,7 @@
 # cp=4 training seq ceiling is 229376, and the 131072 step got 17.5× faster — 2026-08-19
 
 > **Measured on a path with a since-fixed gradient bug**
-> ([`ad1192864`](2026-08-19-cp-ring-fa3-byte-offset-fix.md)). Re-run on the fixed
+> ([](2026-08-19-cp-ring-fa3-byte-offset-fix.md)). Re-run on the fixed
 > binary: the ceiling is unchanged at 229376, walls held to within 1% and peaks
 > to 2%, and the loss column moved a lot — 131072/196608/229376 now read
 > 3.034899 / 2.072005 / 1.780185 against 7.631271 / 6.924870 / 6.742337 here.
@@ -19,7 +19,7 @@ Nothing above 131072 had ever run on this substrate: the only rung that ever
 reached 262144 was the 2026-07-30 option-B ladder, and that path was deleted and
 replaced by the ring.
 
-Binary `ctxlad` at HEAD `9c2c84675`, `--release --features cuda,nccl`, 4×H20
+Binary `ctxlad` at HEAD `--release --features cuda,nccl`, 4×H20
 (97,508 MiB), GPUs 4-7. Model `/data00/ThinkingCap-Qwen3.6-27B-FP8` (64 layers =
 16 full-attn + 48 gated-delta), LoRA r16 α32 `attention-qv`, workload
 `--synthetic-writeback-seq N` (one masked-CE writeback, no rollout). FA3 engaged

@@ -6,7 +6,7 @@ The GO-measurement run found every CC request carried ~31K prompt tokens
 because sandboxes staged under the ARLE checkout and `claude -p` ingested the
 repo `CLAUDE.md`
 ([wins](2026-07-24-agent-opd-gpu-busy-frac-measured-go.md)). Fix landed
-`6bd40d663`+`b0a29443e` (WORK_ROOT default `/tmp/agent-opd`, warn-once guard)
++ (WORK_ROOT default `/tmp/agent-opd`, warn-once guard)
 with acceptance deferred to this pod run.
 
 Run: `sandboxfix-s4`, 1×H20 GPU 0, ThinkingCap-Qwen3.6-27B-FP8,
@@ -38,7 +38,7 @@ base-eval fail, one cc-timeout, both session-level).
   is skewed (the timeout group read 0.0 busy despite 366 completion tokens);
   within-run comparison only.
 - Rewards: 19/20 train samples pass; evals base 7/8, round-0 8/8, round-1
-  8/8. Plot-guard (`031c8c3f8`) engaged: exit 0 with the plot script absent.
+ 8/8. Plot-guard engaged: exit 0 with the plot script absent.
 
 ## Rule
 

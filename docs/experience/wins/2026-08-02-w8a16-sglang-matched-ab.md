@@ -23,7 +23,7 @@ Both arms: same H20 GPU 6, same day, serial, `bench_throughput.py`
 `--prompts-jsonl bench-agent-32k-64.jsonl --concurrency-grid 1
 --requests-per-concurrency 16 --max-tokens 256 --seed 20260416`; 16/16
 complete × 256 tokens each. SGLang: tp=1, mem-fraction 0.85, CUDA graph
-captured (bs 1…56), chunked prefill 8192. ARLE: `arle @ f2c07d0cf` serve
+captured (bs 1…56), chunked prefill 8192. ARLE: `arle @ ` serve
 defaults (decode graph flag is a documented no-op under paged KV — eager
 launches is the shipped state).
 
@@ -41,7 +41,7 @@ stable; the gap is real.
 Caveats stated: (1) weight *values* cannot affect GEMM timing (same shapes,
 dtypes, bytes), so output-quality equivalence of the repack was not re-eval'd
 — the SGLang quantized path is confirmed by its load log + 29 GB resident.
-(2) The ARLE binary predates the ctx-bind fix (`b0368426a`), so its TTFT may
+(2) The ARLE binary predates the ctx-bind fix, so its TTFT may
 have run the recurrent GDR fallback — the TTFT row is directional only; the
 decode rows are unaffected (prefill-path changes).
 

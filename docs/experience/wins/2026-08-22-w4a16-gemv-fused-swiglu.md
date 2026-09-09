@@ -26,8 +26,8 @@ python3 scripts/bench_throughput.py \
   --synthetic-prompts 8
 ```
 
-- Baseline: `993c3e49b` (pre-fusion: paired GEMV + separate SwiGLU)
-- Treatment: `8804072ef` (fused GEMV+SwiGLU)
+- Baseline: (pre-fusion: paired GEMV + separate SwiGLU)
+- Treatment: (fused GEMV+SwiGLU)
 - Prompt tokens: 8 (synthetic)
 - Completion tokens: 128
 - Trials: 16
@@ -61,7 +61,7 @@ BF16 round-trip on the intermediates) but not bit-identical.
 | concurrency | arm | decode tok/s | delta |
 |---:|---|---:|---:|
 | 1 | baseline (2026-08-21) | 41.1 | — |
-| 1 | treatment (`8804072ef`) | 41.2 | +0.2% (wash) |
+| 1 | treatment | 41.2 | +0.2% (wash) |
 
 Coherence: PASS (17x23=391, correct reasoning). Lever gate: PASS
 (`correctness PASS: summaries=5`, exit 0). Needle scores all-miss on the

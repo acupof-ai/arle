@@ -61,7 +61,7 @@ confounded design produces, not a result.
 The knob that isolates step latency is the per-tick token budget
 (`max_num_batched_tokens`, Sarathi-Serve's "token budget"), which had no CLI
 path at all: a hardcoded 16384 in `SchedulerConfig::default()` that nobody
-chose and nobody could test. Exposed in `ed92c6d8c`.
+chose and nobody could test. Exposed in.
 
 ## Fix
 
@@ -126,7 +126,7 @@ if super::qwen35_gdr_chunked_enabled() {
 ```
 
 `--qwen35-gdr-chunked` was opt-in when that branch was written. It defaulted on
-in `c2eb5de9e` (08-02, 33K prefill −27%), and from that day the per-slot loop
+in (08-02, 33K prefill −27%), and from that day the per-slot loop
 was the only route: `replay_linear_only_batched` became dead code in every
 shipped configuration. Partial accept fires on most ticks at `accept_rate`
 0.30, so the cost is rows × 48 layers × ~6 launches — about 4608 a tick at 16
@@ -134,7 +134,7 @@ rows, against 144 for the batched path.
 
 **This is the second instance of the same shape today.** The morning's fix was
 `LinearCore::Rows` running a per-row loop that only started being paid when
-`0ac780495` made FlashQLA real in the pod binary. Both are: a flag flip
+ made FlashQLA real in the pod binary. Both are: a flag flip
 silently re-routes a batched path to a per-row one, and nothing fails.
 
 Rule: **a default flip is a routing change.** When a flag defaults on, every

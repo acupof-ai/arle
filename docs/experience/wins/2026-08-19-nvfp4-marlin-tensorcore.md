@@ -13,7 +13,7 @@ comparison isolates the quantization format.
 
 The hand-written FP4 GEMV had been taken from 86.19 to 11.46 ms/step dense_ffn
 across two decode rewrites (constant table -> bit manipulation -> PRMT byte
-lookups, `cb109750e` and `5185ce517`). At that point it was within 12% of its
+lookups and). At that point it was within 12% of its
 own instruction floor at ~7.8 integer instructions per 4-bit weight, and ncu
 showed it against two walls at once: instruction issue 84.6%, L1 wavefront
 87.1%. Unroll x2/x4, prefetch, and cp.async double-buffering all measured
@@ -45,8 +45,8 @@ c=1 decode, 1xH20, `--kv-cache-dtype fp8`, no spec, **profiling OFF**:
 
 | | decode | dense-MLP bytes/layer |
 |---|---:|---:|
-| NVFP4 scalar GEMV (`5185ce517`) | 52.3 tok/s | 150.4 MB |
-| NVFP4 Marlin (`25a87ad2a`) | **57.9 tok/s** | 150.4 MB |
+| NVFP4 scalar GEMV | 52.3 tok/s | 150.4 MB |
+| NVFP4 Marlin | **57.9 tok/s** | 150.4 MB |
 | Qwen3.6-27B-FP8 | 57.6 tok/s | 267.5 MB |
 
 NVFP4 matches FP8 while reading 56% of the weight bytes. +11% over the scalar

@@ -16,7 +16,7 @@ the ecosystem looked alive from the PR list alone.
 ## Root Cause
 
 `.cargo/config.toml` carried a repo-level wrapper pin, added 2026-06-30 in
-`358335265` to speed up local rebuilds (infer-util re-check 14.6s -> 0.35s):
+ to speed up local rebuilds (infer-util re-check 14.6s -> 0.35s):
 
     [build]
     rustc-wrapper = "sccache"

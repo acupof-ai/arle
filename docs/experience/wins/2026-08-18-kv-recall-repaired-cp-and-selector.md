@@ -38,32 +38,32 @@ rank into per-rank stores
 
 Five fixes, each gated before the next was written.
 
-**1. FA3 sized from the full context** (`1bf969aa9`). `for_recall_decode` passed
+**1. FA3 sized from the full context**. `for_recall_decode` passed
 `total_len` as `seqlen_k` without CP while handing FA3 a page table holding only
 the working set — the combine kernel indexed splits with no pages behind them
 and aborted in `flash_fwd_combine_launch_template.h:52`. The CP branch already
 derived the length from the table, so both branches collapse to one.
 
-**2. The recall cycle ran on every prefill chunk** (`26014ff0e`). Evicting at an
+**2. The recall cycle ran on every prefill chunk**. Evicting at an
 earlier chunk's tail left `EVICTED_PAGE` sentinels in a page table the next
 chunk's prefill must still attend through. Any prompt above the chunk size
 (clamped to 4096) returned token 0. Non-final chunks now do a plain paged
 prefill.
 
-**3. The block representation carried no ranking signal** (`099d764cd`). K is
+**3. The block representation carried no ranking signal**. K is
 cached post-RoPE, so a mean over `l_bs` consecutive positions rotates each key by
 a different angle and the high-frequency channels cancel. Replaced with a
 per-channel `[min | max]` envelope scored as `Σ_d max(q_d·lo_d, q_d·hi_d)` — an
 upper bound on the block's true max `q·k`, which is what makes a top-k selection
 admissible. 11/48 → 34/48 at TP=1.
 
-**4. Recall state survived a prefix-hit slot reuse** (`588bac752`). The
+**4. Recall state survived a prefix-hit slot reuse**. The
 new-occupant reset lives under `row.start_pos == 0`, which a prefix hit never
 reaches. The prior session's envelopes stayed at the same block indices and
 `update_block_reps` only grows past `len()`, so they were never recomputed.
 34/48 → 48/48 at TP=1.
 
-**5. The scoring query was never captured under CP** (`8e98f5cfe`). Recall with
+**5. The scoring query was never captured under CP**. Recall with
 `attn_cp>1` is forced onto the ring prefill branch, which had no `layer0_query`
 parameter, so the scorer received an empty vec, every block scored `0.0`, and
 `plan_recall`'s index tie-break kept middle blocks `0..top_k` for every request.
@@ -98,7 +98,7 @@ residency 18 pages). Net −66 lines. The load-bearing parts:
   That count sizes a cross-rank collective, so a drift between the two copies
   would hang the group.
 
-## Deferred cleanups (2026-08-19, `e5c20c13c`)
+## Deferred cleanups (2026-08-19)
 
 Re-gated on pod at every arm above, all unchanged — including residency at 19
 local pages, so none of it turned recall into a no-op.

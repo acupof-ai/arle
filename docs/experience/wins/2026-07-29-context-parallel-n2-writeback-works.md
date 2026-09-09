@@ -14,7 +14,7 @@ not just lockstep collectives.
 Two changes closed the last gap after the launcher/seq-shard/ring-attention
 bricks were already in place:
 
-1. **Deterministic LoRA param order** (b8e2ad96b). `adapter_name_map()` was a
+1. **Deterministic LoRA param order**. `adapter_name_map()` was a
    2-entry `HashMap{lora_a, lora_b}`; Rust randomizes hash iteration per
    process, and each CP rank is a separate re-exec, so the two ranks fed
    `all_reduce_cp_grads` the same 64 params in **different order** — pairing
@@ -22,7 +22,7 @@ bricks were already in place:
    NCCL has no size rendezvous → GPU spins forever (CPU races to DONE via async
    enqueue, so the host looks finished while the device wedges). Fix:
    `adapter_ordered()` returns fixed A-then-B; register + collect paths use it.
-2. **Fail-fast layout guard** (f55c883a3). Before the reduce, each rank gathers
+2. **Fail-fast layout guard**. Before the reduce, each rank gathers
    a fixed-length per-param element-count vector and rejects the step if two
    ranks differ — turns the whole class of order-mismatch bugs from a silent
    24-min spin into a clear error in seconds. world==1 is a no-op.
@@ -37,7 +37,7 @@ arle train agent-opd \
   --lora-rank 16 --lora-alpha 32 --lora-target-set attention-qv
 ```
 
-- Backend: H20 (sm_90), cuda,nccl release, commit b8e2ad96b + f55c883a3
+- Backend: H20 (sm_90), cuda,nccl release, commit +
 - Baseline (N=1): `--cp-size 1`, single GPU
 
 ## Result

@@ -1,13 +1,13 @@
 # A checkpoint boundary around the CP full-attention core: −7,942 MiB resident, −1,280 MiB at the peak — 2026-08-20
 
-Commit: `0206208a5` (`perf(train): give the CP full-attention core its own
+Commit: (`perf(train): give the CP full-attention core its own
 checkpoint boundary`).
 
 ## Context
 
 Target is global sequence 262,144 on 2 GPUs. `--synthetic-writeback-seq N
 --cp-size 2`, ThinkingCap-Qwen3.6-27B-FP8, LoRA r16 α32 attention-qv, 2×H20
-(97,508 MiB). The ceiling has been 131,072 since `28a1a79ef`.
+(97,508 MiB). The ceiling has been 131,072 since.
 
 `ARLE_OPD_OP_MEM_CHECKPOINT_FN=60` measures one layer's checkpoint replay from
 inside. At local 65,536, layer 63 (a full-attention layer) replays 45 ops:
@@ -45,7 +45,7 @@ A checkpoint group frees once at its boundary, so a layer's peak is the SUM
 over its stages; a nested boundary makes it the MAX. The ring, its gate, the
 head merge and out_proj now replay under their own boundary and free when their
 own backward completes, rather than staying resident through the projection
-backwards. Same shape as `28a1a79ef` used for the linear-attention core, and
+backwards. Same shape as used for the linear-attention core, and
 inert in the forward — `checkpoint` passes straight through while the outer
 group has the tape disabled.
 

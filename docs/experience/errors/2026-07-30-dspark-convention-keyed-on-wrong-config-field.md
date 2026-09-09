@@ -8,7 +8,7 @@ i.e. block drafts `block_size` tokens (rows are next-token heads) vs
 read the `dflash_config` nesting. While aligning our implementation with the
 DeepSpec reference I re-keyed it on `architectures[0].contains("DSpark")`,
 because that is what DeepSpec's `eval.py` and sglang dispatch on
-(`92afc4a17`).
+.
 
 ## Root Cause
 

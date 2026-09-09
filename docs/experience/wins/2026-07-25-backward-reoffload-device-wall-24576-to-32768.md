@@ -2,7 +2,7 @@
 
 ## Context
 
-`e4be96108` closed the backward half of grad-checkpoint offload: `checkpoint_backward`
+ closed the backward half of grad-checkpoint offload: `checkpoint_backward`
 re-fetched every offloaded hidden per-layer on replay but never put it back, so device
 residency climbed monotonically and all N ended co-resident — offload netted almost
 nothing. The fix re-offloads the replayed hidden after `free_new_except`, mirroring the
@@ -41,7 +41,7 @@ CUDA-OOMs with 409 MiB free (`concat_axis2`): one GDN layer's saved backward con
 *retained* buffers can't touch this; it's the recompute's own working set. Same lesson as
 S1a and bf16: retained-buffer levers (offload, store-bf16) act on the wrong term. The 256K
 lever is chunking the LA backward recompute (bound single-layer device peak — like
-head-chunked SDPA `d2477c720`) or sequence parallelism (TP8 splits seq → transient/8).
+head-chunked SDPA) or sequence parallelism (TP8 splits seq → transient/8).
 
 **Attribution discipline (self-correction):** an earlier probe of this same sweep mis-read
 two `rc=137` SIGKILLs at 28672/32768 as "our offloaded hidden overran host memcg" and

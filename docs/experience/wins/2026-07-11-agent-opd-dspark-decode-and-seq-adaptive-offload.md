@@ -56,7 +56,7 @@ forward 3.0→2.4, ce/opt negligible. Writeback +5.7% B-vs-A is run-to-run noise
   `writeback_offload() && seq_len >= 4096`. Short (common) trajectories get the
   fast on-device path by default; long ones self-protect; `--writeback-offload
   false` still forces off. Threshold 4096 conservative (2.3× margin below the OOM
-  anchor; nested-SDPA checkpointing `0b7a1d89` bounds inner O(seq²)). Applied at
+ anchor; nested-SDPA checkpointing bounds inner O(seq²)). Applied at
   all three writeback variants (`opd.rs` masked / frozen-prompt-kv / GKD).
 
 **Stacked: C = −30.1% round wall** (dspark decode + seq-adaptive offload),

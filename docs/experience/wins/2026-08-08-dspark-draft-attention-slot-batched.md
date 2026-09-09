@@ -47,7 +47,7 @@ base pointers and promotes `blockIdx.z` to a slot axis; the new
 existing per-slot loop and runs attention once after it. Grid becomes
 (32, 6, 16) = 3072 blocks, one launch per layer instead of 16.
 
-Commit `3a8f99b1f`.
+Commit.
 
 ## Measured — pinned shape
 
@@ -71,8 +71,8 @@ serve duration histogram is bimodal — 47% of launches in the 550–600 µs bin
 
 ## Results — serve A/B
 
-Matched A/B, two binaries built serially from the same tree — NEW `3a8f99b1f`
-(sha `9906b136…`) and BASE `d42c7afc2` = its parent (sha `44a4b874…`). Decode-
+Matched A/B, two binaries built serially from the same tree — NEW
+(sha `9906b136…`) and BASE = its parent (sha `44a4b874…`). Decode-
 shaped c=16, 32 requests, `max_tokens` 4096, temp 0, arms swapped across GPU 0
 and GPU 1. Artifacts `/host/draftattn/ab/`.
 

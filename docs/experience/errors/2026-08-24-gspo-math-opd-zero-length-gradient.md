@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-24
 **Scope:** `crates/cli/src/train_cli/math_opd.rs`, `crates/cli/src/args.rs`
-**Commit:** `39c43d5d2` (fix)
+**Commit:** (fix)
 
 ## Context
 

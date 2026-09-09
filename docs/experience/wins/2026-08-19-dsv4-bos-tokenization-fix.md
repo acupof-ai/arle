@@ -59,7 +59,7 @@ DeepSeek-V4-Flash-0731, 2×H20, TP=2, W4AFP8, build `bos-fix`:
 - Needle gate (RAW=1, no template): unchanged — the BOS fix only affects
   the chat template path.
 
-Commit: `d4477f925`.
+Commit:.
 
 ## Remaining: thinking-mode repetition on completion CUE
 

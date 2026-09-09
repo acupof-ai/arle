@@ -1,6 +1,6 @@
 # Metal prefix restore survives past the first turn
 
-Date: 2026-09-02 · Runtime: `8540af887` + this fix · Metal, M4 Pro 48 GB
+Date: 2026-09-02 · Runtime: + this fix · Metal, M4 Pro 48 GB
 
 ## Context
 

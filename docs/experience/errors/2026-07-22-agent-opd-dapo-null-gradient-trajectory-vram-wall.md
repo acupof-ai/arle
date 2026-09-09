@@ -1,6 +1,6 @@
 # agent-opd dapo null gradient — long agentic trajectories exceed the writeback VRAM cap
 
-> Status: Root-caused + code fix landed (3e2388f77); H20 validation pending.
+> Status: Root-caused + code fix landed; H20 validation pending.
 
 ## Context
 
@@ -41,7 +41,7 @@ Confounder: Colab G4 reclaims the GPU at ~1h while actively polled (two sessions
 `session_terminated` mid-rollout). A single H20 is also 96 GB — same writeback
 wall — so H20 only removes the reclaim, not the VRAM wall.
 
-## Fix — attempted (`3e2388f77`), then REVERTED (`5240a79c5`, `64013549c`)
+## Fix — attempted, then REVERTED
 
 Plumbed `--kv-cache-dtype` into the agent-opd/rubric-opd rollout engine to free
 KV-pool headroom via quantized KV. **Reverted** — adversarial review (codex) +

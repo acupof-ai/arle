@@ -60,7 +60,7 @@ Three methods formed a dead call chain:
 
 ## Pre-existing build break fixed
 
-`CudaFp4E2M1GroupStorage` (W4AFP8, commit `2a3a2164f`) had
+`CudaFp4E2M1GroupStorage` (W4AFP8, commit) had
 `#[cfg_attr(feature = "no-cuda", allow(dead_code))]` but no
 `#[cfg(feature = "cuda")]` gate. In the `cpu,no-cuda` lane the struct compiled
 without the `Arc` import (gated on `any(metal, cuda)`), breaking the build.

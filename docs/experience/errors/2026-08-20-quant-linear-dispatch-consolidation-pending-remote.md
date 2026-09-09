@@ -20,14 +20,14 @@ ordered route owner per family. CUDA equivalence gates require the remote box.
 
 ## Fix
 
-Landed in `b7432e52a`. Local gates green: fmt, diff --check, cuda typecheck
+Landed in. Local gates green: fmt, diff --check, cuda typecheck
 zero warnings, table-driven host route test. Deviations from the brief, both
 behavior-neutral: `#[path]` without `ops/` prefix (resolves relative to the
 declaring file); catch-all error strings unified to one
 `"quant_linear unsupported resident quant weight format {f}"`, FP4 no-route
 bails `"fp4_e2m1_group has no consumable representation"`.
 
-Remote gates (H20, baseline `10df1d079` vs `b7432e52a`, Qwen3.8-27B-NVFP4):
+Remote gates (H20, baseline vs Qwen3.8-27B-NVFP4):
 
 - Numerical — PASS. `marlin_fp8_parity` / `marlin_w8a16_parity` ALL PASS
   (relL2 1.65e-3 / 2.85e-3, ratio 1.00), `marlin_fp4_probe` exit 0.
@@ -53,7 +53,7 @@ Remote gates (H20, baseline `10df1d079` vs `b7432e52a`, Qwen3.8-27B-NVFP4):
   TTFT deltas +4.1% / +4.8% / -9.2% — all inside the ≤10% noise band. No
   regression. c=1: the first baseline arm hit `CUDA_ERROR_OUT_OF_MEMORY` on a
   GPU carrying a ~22 GB foreign resident; the clean-GPU re-run (rebuilt
-  `10df1d079`, 3 trials) completed 32/32 each with zero OOM at 41.5/41.6 tok/s
+ 3 trials) completed 32/32 each with zero OOM at 41.5/41.6 tok/s
   warm, decode 48.3 tok/s (≈20.7 ms ITL) vs the tranche-1 arm's 42.0 tok/s /
   20.45 ms ITL — within noise. The OOM was environmental.
 - Eval harness — PASS. `python -m eval_harness` on the tranche-1 binary:

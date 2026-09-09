@@ -29,7 +29,7 @@ capacity, over-capacity blocks until release, shutdown wakes waiters.
 # - needle x3 per group
 ```
 
-- Baseline: `959f50a92` (queue absent, "server is busy" 429)
+- Baseline: (queue absent, "server is busy" 429)
 - Treatment: this commit (queue at entry)
 - Trials: pending-remote
 

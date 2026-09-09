@@ -1,6 +1,6 @@
 # CP×DP verified end-to-end; the training step is finally attributed — and the attribution re-ranks the campaign
 
-**Date:** 2026-08-03 · **Commits:** 4aa6e5e02 (mesh) + 00e482f50 (CommAxis) + a644adab8 (GEMM f32 out) + e57c59793 (port fix) + 3cae75304 (count fix) · **Pod:** 8×H20, real 27B
+**Date:** 2026-08-03 · **Commits:** (mesh) + (CommAxis) + (GEMM f32 out) + (port fix) + (count fix) · **Pod:** 8×H20, real 27B
 
 ## Context
 
@@ -21,7 +21,7 @@ step).
 **G3 (cp=2×dp=2): port fix verified** — distinct world-rank ports, dp replica 1
 completed, walls match G2. Caught a real normalization bug: losses came back
 exactly ÷4 (world size) because every cp rank contributed the same
-replica-global count to the world-comm count reduce → fixed (3cae75304, only cp
+replica-global count to the world-comm count reduce → fixed (only cp
 rank 0 contributes). Re-gate pending.
 
 **G4 (cp=4, seq=131072): PASS, clean exit** — full fwd+bwd+step in ~3100 s

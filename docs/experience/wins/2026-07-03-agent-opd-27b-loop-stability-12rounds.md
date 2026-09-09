@@ -20,7 +20,7 @@ tape-margin fix), and interleaved eval passes run without OOM or drift.
 27B Qwen3.6-FP8 student, `--share-frozen-base` (zero-copy FP8 base), LoRA
 attention-qv r16/α32, lr 1e-5, rollout temp 1.0 seed 0, max-turns 10,
 max-tokens 768, writeback-cap 8, window 2048. Single H20 (GPU 4), binary @
-`ab2ec1a8`+`ffebfbd3`. Corpus: synthetic hard-v2, 12 train / 24 held-out
++. Corpus: synthetic hard-v2, 12 train / 24 held-out
 (`scripts/gen_agent_opd_tasks.py`, self-check 36/36). Run: `scripts/
 agent_opd_curve.sh full0703`; stopped by ckl after round 12 of 16 (remaining
 rounds carried no information — corpus saturated, stability already

@@ -27,9 +27,9 @@ python3 scripts/bench_throughput.py \
   --output /tmp/sidecar-prechunk-bench
 ```
 
-- Baseline: `16857e541` (previous session, synchronous `to_bytes` + `insert_chunked`)
-- Treatment 1: `e00580c83` (spawn-per-call background `to_bytes` + chunking, main-thread `insert_many`)
-- Treatment 2: `6856f164b` (dedicated serialization thread, same pre-chunked pipeline)
+- Baseline: (previous session, synchronous `to_bytes` + `insert_chunked`)
+- Treatment 1: (spawn-per-call background `to_bytes` + chunking, main-thread `insert_many`)
+- Treatment 2: (dedicated serialization thread, same pre-chunked pipeline)
 - Prompt tokens: ~32k per prompt (128 lines, 16×8 grid)
 - Completion tokens: ≤214 per request
 - Trials: 1 run per arm, 32 requests per concurrency level

@@ -1,6 +1,6 @@
 # `pack_quantize` — 16 B loads, 5.13× on the kernel, −2.98% anchor wall, CUDA, 2026-08-09
 
-> Status: **accept.** `554173b36` (4 bf16/lane) then `HEAD` (8 bf16/lane +
+> Status: **accept.** (4 bf16/lane) then `HEAD` (8 bf16/lane +
 > packed conversion). Correctness gate clean on both arms, anchor A/B
 > counterbalanced with non-overlapping ranges on four metrics.
 > **The SOTA row does not move** — see Scope.
@@ -84,9 +84,9 @@ both arms:
 
 | rung (prompt tok) | 115 (149) | 300 (314) | 446 (453) | 2000 (1989) | 8000 (8129) |
 |---|---|---|---|---|---|
-| BASE `a37d9cca5` | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
-| 4/lane `554173b36` | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
-| **8/lane `5cfe8494f`** | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+| BASE | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+| 4/lane | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
+| **8/lane ** | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET | 3/0/0 DET |
 
 `GATE_EXIT=0` on all three, every run emitting the identical `738291`. The short
 rungs that straddle the 241-token boundary are included, and they are the ones
@@ -96,7 +96,7 @@ FP8 dense DeepGEMM warmed 5 projection shape(s) at M=2048`.
 
 ## Result — anchor A/B, 32K long-agent, c=16
 
-**Measured on the 4/lane form (`554173b36`).** The 8/lane upgrade adds 1.39× on
+**Measured on the 4/lane form.** The 8/lane upgrade adds 1.39× on
 top, which moves `pack_quantize` from ~601 ms to ~430 ms: **~171 ms of a 409 s
 wall, 0.42%, below this bench's own 0.5% BASE spread.** No A/B is claimed for it
 and none was run — it rests on the microbench, the `ncu` instruction count, and
@@ -158,7 +158,7 @@ prediction better; a win reported without its prediction teaches nothing.
 ## Resolved 2026-08-09 — `nsys` on the new binary
 
 **The kernel is fully engaged and the microbench transfers exactly.** Same 30 s
-steady-state window, same analyzer, `70760bc09` against `5cfe8494f`; wall
+steady-state window, same analyzer against wall
 29,642 / 29,693 ms, GPU busy 96.5% / 96.4%, kernel 28,601 / 28,611 ms.
 
 | | before | after |

@@ -1,6 +1,6 @@
 # FA3 replaces the scalar ring-attention kernels: 2.17x per training step — and the gate that was missing all along
 
-**Date:** 2026-08-04 · **Commits:** 2fe12a2fe (FA3 bwd substrate) + df75a1da2 (pair dispatch) + a15d3ec75 (test callsite) · **Pod:** 8xH20, real 27B · **Verdict: perf ACCEPT, default OFF pending the correctness gate**
+**Date:** 2026-08-04 · **Commits:** (FA3 bwd substrate) + (pair dispatch) + (test callsite) · **Pod:** 8xH20, real 27B · **Verdict: perf ACCEPT, default OFF pending the correctness gate**
 
 ## Context
 
@@ -34,7 +34,7 @@ vs 375 s), so the A/B is matched. Losses agree at the bf16 floor across all
 three configurations — cp=1 anchor 10.870796, FA3 cp=2 10.871086, scalar cp=2
 10.870268 (spread 8.2e-4, 7.5e-5 relative), and the FA3 arm sits *closer* to the
 single-card anchor than the scalar ring does. Uniform loss reporting
-(`fe6cc2346`) also passed its first gate: every rank prints the identical
+ also passed its first gate: every rank prints the identical
 world-sum in both arms.
 
 ## Why the default stays OFF

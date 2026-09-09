@@ -1,6 +1,6 @@
 # Flag deletion wave 2 — three more proven flags deleted, Metal warmup default fixed
 
-> Status: Accepted. `5b880f2f8`, 9-agent workflow (6 investigators → edit → verify).
+> Status: Accepted. 9-agent workflow (6 investigators → edit → verify).
 > Serve flags 56 → 53.
 
 ## Context

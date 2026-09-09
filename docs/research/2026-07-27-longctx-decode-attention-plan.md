@@ -92,8 +92,8 @@ own docstring cites.
 ### Three wrong turns, recorded because each was cheap to avoid
 
 - **Hand-wrote a GQA + warp-per-key + scaled-splits rewrite of
-  `fused_gqa_attention_decode_batched_kernel`** (`c00efdb9c`): measured −20.5%,
-  reverted (`fcf709e0f`). That kernel is in the **non-paged** lane, which this
+ `fused_gqa_attention_decode_batched_kernel`**: measured −20.5%,
+ reverted. That kernel is in the **non-paged** lane, which this
   configuration never enters.
 - **Turned on `--qwen35-fa3-decode`** (since deleted): ITL p50 72.4 ms vs 72.1
   off. Its call site was in the same unused non-paged lane. Four configurations —
@@ -127,7 +127,7 @@ Floor at 4.0 TB/s: **7.3 ms**. Real stacks land at 35–65% of peak → 11–21 
 
 The constant term is measured, not extrapolated: a 66-token prompt, no spec,
 c=1, on today's binary gives **37.60 tok/s = 26.6 ms/token** (6 trials, spread
-0.6%) — against `baselines.md`'s `6aa4ca6d1` row of 38.62 tok/s at 128 tokens,
+0.6%) — against `baselines.md`'s row of 38.62 tok/s at 128 tokens,
 i.e. inside the ±3% drift band. **Short-context decode has not regressed.**
 Splitting the 32k measurement against that anchor:
 
@@ -165,7 +165,7 @@ the step.
 
 Closed out 2026-07-27/28:
 
-- `fused_gqa_attention_single_token_kernel` — deleted (`5dc0d28e7`, 185 lines,
+- `fused_gqa_attention_single_token_kernel` — deleted (185 lines,
   zero Rust callers).
 - `--qwen35-fa3-decode` — deleted. FA3 went into the paged lane unconditionally
   instead, for every query length; a second differently-gated FA3 entry that

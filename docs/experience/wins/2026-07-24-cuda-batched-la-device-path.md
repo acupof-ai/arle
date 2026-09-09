@@ -1,7 +1,7 @@
 # Batched linear-attention device path — B>1 crash fixed, 337 s CPU fallback gone
 
-Commits `ecc058b20` (per-row dispatch + i64 state_history index) +
-`5f68d1f6e` (gate models exact LA ctx bytes) + `f05642b68`/`bb17f5332`
+Commits (per-row dispatch + i64 state_history index) +
+ (gate models exact LA ctx bytes) + /
 (simplify passes). Pod-verified 2026-07-24 on H20 (GPU 0/3, snapshot binary
 sha `d6fca3a2…`, Qwen3.5-0.8B rubric batched writeback).
 
@@ -23,7 +23,7 @@ row, concat per-token results, sum weight grads. The chunked kernels stay
 batch==1-only (chunk_state has no batch stride); `la_state_time_base`
 widened to `long long` for the remaining non-128-dim fallback lane.
 
-Measured (pod, snapshot binary at `5f68d1f6e`):
+Measured (pod, snapshot binary at):
 
 | Gate | Result |
 |------|--------|
@@ -32,7 +32,7 @@ Measured (pod, snapshot binary at `5f68d1f6e`):
 | Short B=4 seq=1040 checkpointed | **6–9 s/mb** (337 s CPU-fallback pathology gone); loss 0.1321/0.1329 vs pre-change 0.1317–0.1323 (parity) |
 | `[ckpt-gate]` probe | engage=true at B=4 seq≈3150, modeled 41.26 GB ≈ the commit's 41.2 GB sanity |
 
-Gate boundary resolved same day (#170, `b2a5d6180`): `[vram-ramp]`
+Gate boundary resolved same day (#170): `[vram-ramp]`
 attribution showed full-tape at B=4 seq=1040 is 39.1 GB forward (uniform
 ~1.71 GB/layer) + 4.4 CE + 1.4 backward = **45 GB live = 3.3× the modeled
 floor** — the earlier "79 GB / 5.8×" read was pool retention across

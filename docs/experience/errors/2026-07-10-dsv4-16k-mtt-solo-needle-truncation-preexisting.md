@@ -13,7 +13,7 @@ no needle checks). Multi-shape sweep found deterministic solo misses:
 
 ## Attribution (same-day, same-salt, pre-3b control)
 
-fc850c7c6 (pre-3b, whole-band identity allocation, 3 slots at 16384) on the
+ (pre-3b, whole-band identity allocation, 3 slots at 16384) on the
 same box/GPUs/salts: `s1-2000` **0/3 exact**, `s1-8000` **1/3 exact** —
 same signature, same determinism. n=4 arms at 16384 mostly pass (3/4-4/4).
 

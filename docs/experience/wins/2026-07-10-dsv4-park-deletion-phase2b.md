@@ -1,8 +1,8 @@
 # DSv4 whole-slot park deleted (Phase 2b) — preemption rides the prefix-state pool, pod gate PASSED
 
-> Status: **Shipped** — commits `61c06b187` (deletion, −869 LOC) + `fc850c7c6`
+> Status: **Shipped** — commits (deletion, −869 LOC) +
 > (preempt-requeue counter). 4×H20 (GPUs 4-7), TP4, DeepSeek-V4-Flash-FP8,
-> `--max-total-tokens 2048`, binary sha256 `971dacd6602a…` @ tree `fc850c7c`,
+> `--max-total-tokens 2048`, binary sha256 `971dacd6602a…` @ tree
 > logs `job2c_*.log` on the pod build tree.
 
 ## Context
@@ -36,7 +36,7 @@ prefix-state pool. Deleted: `Dsv4LayerImage`/`Dsv4CompressorImage`/
   fixed bands (`fixed_pages_per_slot`) make `append_pages_needed()` = 0 for
   occupied slots, so `retract_decode_to_fit` never fires. Measured: 0
   preempt-requeue events across every lane (`fallback_recompute` counter +
-  log line added in `fc850c7c6` for 3b's gate, where demand paging makes
+ log line added in for 3b's gate, where demand paging makes
   the path reachable).
 
 ## Evidence lanes (one serve each, ports 18220-18224 after a foreign-serve

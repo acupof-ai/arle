@@ -46,11 +46,11 @@ with all output trapped in `reasoning_content`).
 - `reasoning_effort` parameter maps: low=2048, medium=8192, high=32768
 - Default `max_tokens` for thinking: budget + 4096 (content headroom)
 
-Commit: `c8c344051`
+Commit:
 
 ## Verified on pod (H20 ×4, TP=4, 2026-08-19)
 
-Build: `think-budget-v6` (head `ad8189dc2`), serve `--max-thinking-tokens 128`.
+Build: `think-budget-v6` (head), serve `--max-thinking-tokens 128`.
 
 ### Forced think-end fires at exact budget
 
@@ -72,7 +72,7 @@ confirming `eos_token_id` is not the think-end token. If it were, the
 forced token would terminate the request instead of transitioning to
 content.
 
-### reasoning_tokens usage reporting (fixed in `b3a1f675a`)
+### reasoning_tokens usage reporting (fixed in)
 
 `usage.completion_tokens_details.reasoning_tokens` was hardcoded to 0
 in three places (`from_parts`, streaming chat, n>1 path). The n>1 path

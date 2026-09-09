@@ -15,7 +15,7 @@ resting on the wrong measurement.
 
 ## Method
 
-The `nsys` c=16 anchor capture (`70760bc09`, `/host/c16decomp/c16.sqlite`). The
+The `nsys` c=16 anchor capture (`/host/c16decomp/c16.sqlite`). The
 launch sequence is exactly periodic, so each GEMM is identified without NVTX by
 the kernel it sits between and the dimension of the `pack_quantize` that feeds
 it. 14,094 launches, one grid shape — (78, 1, 1), one persistent block per SM,

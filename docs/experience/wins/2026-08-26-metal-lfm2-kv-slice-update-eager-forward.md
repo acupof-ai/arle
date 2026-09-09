@@ -2,7 +2,7 @@
 
 > Status: Confirmed (local M4 Pro 48 GB)
 >
-> Baseline: `c858c0485`, `arle serve --backend metal --model-path
+> Baseline: `arle serve --backend metal --model-path
 > LiquidAI/LFM2.5-8B-A1B-MLX-4bit --kv-cache-dtype bf16`, both arms built from
 > the same tree (`git apply -R` for the baseline binary), M4 Pro 48 GB.
 

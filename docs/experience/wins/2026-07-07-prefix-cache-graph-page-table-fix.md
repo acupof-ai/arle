@@ -75,7 +75,7 @@ verification.
 
 ## Follow-up: construction-time regression + missing first-draw sync (2026-07-07)
 
-This commit (`36835179f`) broke **all** DSv4 FlashMLA boots. Root cause and fix
+This commit broke **all** DSv4 FlashMLA boots. Root cause and fix
 below; this is what finally closed the "DSv4 test blocked" gap above.
 
 ### The regression

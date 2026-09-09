@@ -1,8 +1,8 @@
 # NVFP4 prefill on the FP8 tensor cores: widen the nibbles to E4M3 — CUDA, 2026-08-20
 
-> Status: Shipped. `a5df06c7c` prefill arms · `30171f8be` derive from Marlin
-> (the VRAM fix) · `9f1987f25` delete the arms that were not the serving path ·
-> `905fc4fc2` + `ec5edf987` the two kernels.
+> Status: Shipped. prefill arms · derive from Marlin
+> (the VRAM fix) · delete the arms that were not the serving path ·
+> + the two kernels.
 
 ## Context
 
@@ -49,7 +49,7 @@ the floor.
 
 ## Result
 
-1xH20, TP=1, FP8 KV, `--max-running-requests 16`, no spec, runtime `ec5edf987`.
+1xH20, TP=1, FP8 KV, `--max-running-requests 16`, no spec, runtime.
 Both arms on the same binary, NVFP4 on GPU 0 and FP8 on GPU 1, points back to
 back. `bench-agent-32k-16x8.jsonl` (sha 8867f63e), 32 req/point, `--max-tokens
 214`. 32/32 complete, `SERVER_ERRORS=0` everywhere.

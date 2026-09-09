@@ -15,7 +15,7 @@ Logit-bias threshold measurement — zero code change. The DSv4 sampling path
 has no logprobs capture (501 by design), so the margin was measured through
 the existing `logit_bias` parameter: bias the losing first token upward until
 the continuation flips; the threshold estimates the top-2 margin. Serve:
-DSv4-Flash-FP8 + DSpark draft, TP=4 on 4×H20 (build lp202n, a8150bc6b),
+DSv4-Flash-FP8 + DSpark draft, TP=4 on 4×H20 (build lp202n),
 GPUs 4–7.
 
 - Positive control: `logit_bias +100` on token 334 (` A`) and 16 (`.`) each

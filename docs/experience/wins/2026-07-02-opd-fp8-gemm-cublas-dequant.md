@@ -3,7 +3,7 @@
 ## Context
 
 Agent-OPD masked-writeback forward on 27B Qwen3.6-FP8 (`--share-frozen-base`,
-8×H20) took 122s; per-layer profile (`ARLE_OPD_PROFILE=1`, 137ffb28) showed
+8×H20) took 122s; per-layer profile (`ARLE_OPD_PROFILE=1`) showed
 every layer uniformly slow — linear-attn ~1732ms, full-attn ~2423ms — pointing
 at a shared per-op cost, not one hot op. MoE was a false lead (27B is dense).
 Code reading alone found it: `CudaBackend::matmul_bt` routed any
@@ -19,12 +19,12 @@ Dequantize the FP8 block-scaled weight to bf16 on device (one memory-bound
 elementwise kernel, ~0.1ms per 27B weight) and delegate to the existing
 `matmul[_bt]_device_f32_bf16` cuBLAS tensor-core path. Both naive GEMM kernels
 and the orphaned `launch_2d` helper deleted (net −181 LOC); no shape/model
-guards — any FP8 block-scaled weight on any model qualifies. Commit `270a509e`.
+guards — any FP8 block-scaled weight on any model qualifies. Commit.
 
 Same toy config A/B (run-fp8dq-toy1r vs run-profile3-toy1r, same pod, same
 task, GPU 1, RUN_EXIT=0, zero NVRTC/runtime errors):
 
-| metric | 137ffb28 baseline | 270a509e | Δ |
+| metric | baseline | | Δ |
 |---|---|---|---|
 | forward_hidden_states | 122.119s | **14.416s** | **8.5×** |
 | forward layers sum | 121.807s | 13.496s | 9.0× |

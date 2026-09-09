@@ -7,7 +7,7 @@
 > stream) recovered to 63 tok/s; remaining −19% gap under investigation.
 > Single-GPU (no NCCL) is unaffected.
 >
-> **Root-cause fix: event pool** (`9a82dbe4d`, 2026-08-17). The regression
+> **Root-cause fix: event pool** (2026-08-17). The regression
 > was per-fence `cuEventCreate`/`cuEventDestroy` — 80 all-reduces × 2 fences
 > = 160 event allocations per decode step at TP=8. The pool reuses events
 > (`Arc<Mutex<Vec<CudaEvent>>>` in `DeviceContext`), eliminating steady-state
@@ -37,7 +37,7 @@ has no slack to hide it.
 ## Parameters
 
 ```bash
-# A/B: baseline = a59c6c661^, treatment = a59c6c661
+# A/B: baseline = ^, treatment =
 # ThinkingCap-27B-FP8, TP>=2 (NCCL arm, not one-shot)
 python3 scripts/bench_throughput.py \
   --url <url> \
@@ -51,8 +51,8 @@ python3 scripts/bench_throughput.py \
   --output bench-output/comm-stream/bench
 ```
 
-- Baseline: `a59c6c661^` (NCCL on compute stream, no fences)
-- Treatment: `a59c6c661` (NCCL on comm_stream, fenced)
+- Baseline: `^` (NCCL on compute stream, no fences)
+- Treatment: (NCCL on comm_stream, fenced)
 - Trials: 3 (matched A/B, simultaneous)
 
 ## Environment
@@ -82,8 +82,8 @@ without measurement. The decode regression was found by a separate
 
 | build | decode tok/s @ 128K | Δ vs baseline |
 |---|---:|---:|
-| pre-comm-stream (4bcefcb57) | 78.7 | — |
-| comm-stream (a59c6c661) | 55–59 | −25–30% |
+| pre-comm-stream | 78.7 | — |
+| comm-stream | 55–59 | −25–30% |
 | + all-reduce → compute stream fix | 63 | −20% |
 
 The remaining −19% gap (63 vs 78.7) is under investigation. Single-GPU

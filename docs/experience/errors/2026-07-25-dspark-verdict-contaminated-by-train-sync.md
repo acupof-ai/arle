@@ -1,6 +1,6 @@
 # DSpark's −50% at c=16 was a default-off training sidecar's stream sync (#183)
 
-> Status: gate landed; clean re-measure DONE on `6aa4ca6d1` (#183+#184). The
+> Status: gate landed; clean re-measure DONE on (#183+#184). The
 > per-step-sync collapse is GONE, but DSpark c=1 came back at **+5.0%**, not the
 > predicted ~+63% — so a second effect remains and the #128 verdict is still
 > open (see §Re-measure).
@@ -30,7 +30,7 @@ chain drafts full width). The draft head works. The step does not.
 
 ## Root Cause
 
-`aec71ef16` (2026-07-21 16:13, "wire DSv4-Flash into train sidecar") added the
+ (2026-07-21 16:13, "wire DSv4-Flash into train sidecar") added the
 `capture_dspark_experience{,_hidden}` call sites to both DSpark verify lanes
 (`executor/dsv4.rs:1843`, `:2140`) — **unconditionally**. Each does two
 vocab-wide bf16 D2H copies, two host bf16→f32 conversions of ~1.4M elements, and
@@ -38,10 +38,10 @@ two full `ctx.sync()`, per verify step, before any shape guard runs. The only
 consumer is the `--dspark-train` sidecar, which is default-off.
 
 **This is a regression against a measured win, not a first-measurement
-disappointment.** `591772a43` (2026-07-20 18:55) measured DSpark **c=1 +63.8%**
+disappointment.** (2026-07-20 18:55) measured DSpark **c=1 +63.8%**
 (63.7 vs 38.9 tok/s,
 [win](../wins/2026-07-20-dspark-sliding-window-c1-win-c8-regress.md)).
-`aec71ef16` lands 21 h later — after that measurement and after the 07-21
+ lands 21 h later — after that measurement and after the 07-21
 batched-verify work — and `git log -S"capture_dspark_experience"` confirms it is
 the commit that introduced the call sites. Today's c=1 is **+1.4%**.
 
@@ -68,7 +68,7 @@ The clean re-measure must use `bench-prompts-64.jsonl` + `max_tokens 256` — th
 07-20 dataset — so the prediction is falsifiable: c=1 should return to ~63 tok/s.
 Anything materially short of that means a second cause is still in the path.
 
-## Re-measure (2026-07-25, `6aa4ca6d1`, #183 gate + #184 scratch)
+## Re-measure (2026-07-25, #183 gate + #184 scratch)
 
 Clean 6-arm run, DSv4-Flash-FP8 4×H20 TP=4 GPUs 4-7, dataset
 `dspark_natural_128in_128out.jsonl`, **max_tokens 128**, 60 s/point, 0 errors.
@@ -111,7 +111,7 @@ accept-or-kill still needs the same-dataset 256-out rerun to close reason (1).
 ## Rule (open items above)
 
 - **A feature-wiring commit is a perf change to every path it touches.** No bench
-  entry was cut for `aec71ef16` because it read as plumbing for a default-off
+ entry was cut for because it read as plumbing for a default-off
   flag; it silently added a stream sync to the hot loop. The gate is "does this
   execute on the default path", not "is the feature on by default".
 - **A hot-path producer for a default-off consumer must be gated on the consumer,

@@ -21,7 +21,7 @@ the supported 8,448-token prompt window.
 
 ## Environment
 
-- Commit `5d53f40e7`; binary SHA256
+- Commit binary SHA256
   `07aba935be745c52d95b51d5c3235ba200061af07a03c9d37943488869af24c8`.
 - DeepSeek-V4-Flash-FP8, 4x H20, TP=4 on GPUs 2/3/4/5, driver 535.161.08.
 - NCCL allreduce; `max_prompt_tokens=8448`, `max_total_tokens=9216`.

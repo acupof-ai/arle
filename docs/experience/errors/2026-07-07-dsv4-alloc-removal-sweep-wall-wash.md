@@ -3,10 +3,10 @@
 > Status: measured — 2026-07-07. Code landed; sweep halted.
 
 ## Changes landed
-- commit `de6fc4fd`: `forward_decode_batch_stream_impl` shared-expert switched from
+- commit : `forward_decode_batch_stream_impl` shared-expert switched from
   per-layer `dsv4_shared_expert_forward` (`HiddenStates::uninit` + 6 allocs + 4 H2D)
   to `dsv4_shared_expert_forward_decode_scratch` reusing `kv_adapter.shared_expert_scratch`.
-- commit `4f589cfb`: `dsv4_moe_forward_decode_fp8` 8 per-layer buffers replaced by
+- commit : `dsv4_moe_forward_decode_fp8` 8 per-layer buffers replaced by
   `Dsv4MoeTailScratch` (band ceiling 128 rows) on the kv_adapter; per step re-init
   counts=0, cursors=0, route_out=0, packed_route_slot=-1.
 - Both compiled BUILD_EXIT=0 (cuda,nccl,deepep), clippy-clean.
@@ -19,7 +19,7 @@
 ## A/B (same prompt, max_tokens=256, temperature=0, TP=4, MTP-on, 3 runs each)
 | | runs (s) | mean (s) | tok/s |
 |---|---|---|---|
-| baseline `c59aab9c` | 5.573 / 5.602 / 5.631 | 5.602 | 45.70 |
+| baseline | 5.573 / 5.602 / 5.631 | 5.602 | 45.70 |
 | c1+c2 | 5.557 / 5.632 / 5.573 | 5.587 | 45.82 |
 
 Δ mean wall −0.27%. Per-group run-to-run spread ±0.7%.

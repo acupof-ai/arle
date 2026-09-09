@@ -85,5 +85,5 @@ in layers 56-63) puts Marlin's NVFP4 arm at ~1.04 TB/s against its FP8 arm's
 
 A format-gated repack helper is only as wired as its call sites. After adding
 one, grep every `load_*_quant_aware` caller rather than the ones the current
-model exercises — `5499e20a7` fixed two sites for FP4 and named these four,
+model exercises — fixed two sites for FP4 and named these four,
 and they still shipped one release later carrying 34% of the FP8 calls.

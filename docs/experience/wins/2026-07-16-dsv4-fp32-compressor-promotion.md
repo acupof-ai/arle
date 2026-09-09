@@ -26,8 +26,8 @@ bash scripts/run_dsv4_bench.sh <fp32on|fp32off>
 #   --backend openai_http --request-format /v1/completions --random-seed 20260416
 ```
 
-- Baseline: `c7982e4ee` with `fp32_probe = None` (loader.rs), `--features cuda,nccl`
-- Treatment: `c7982e4ee` with `fp32_probe = Some(...)` (default), `--features cuda,nccl`
+- Baseline: with `fp32_probe = None` (loader.rs), `--features cuda,nccl`
+- Treatment: with `fp32_probe = Some(...)` (default), `--features cuda,nccl`
 - Prompt tokens: 4096 (fixed, synthetic English text)
 - Completion tokens: 256 (fixed)
 - Trials: 20 completed requests per rate (60s duration)

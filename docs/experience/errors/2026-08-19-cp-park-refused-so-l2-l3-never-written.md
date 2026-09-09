@@ -2,7 +2,7 @@
 
 ## Context
 
-`--kv-recall` was deleted (`3f826c204`); L2/L3 are wanted as a **lossless**
+`--kv-recall` was deleted; L2/L3 are wanted as a **lossless**
 capacity extension instead, with tier I/O only at prefill/scheduler boundaries
 and never in decode. Verifying that the surviving path actually moves KV into
 L2/L3 under pressure.
@@ -77,6 +77,6 @@ metric surface where capacity decisions are actually read.
 
 Fixed 2026-08-19 — see
 [`wins/2026-08-19-cp-slot-park-works-l2-l3-nonzero.md`](../wins/2026-08-19-cp-slot-park-works-l2-l3-nonzero.md).
-Each rank round-trips its own 1/cp shard (`b2cc9b783`); capture no longer
-destroys the slot before the tier accepts it (`8e325e8dc`); refusals are
+Each rank round-trips its own 1/cp shard; capture no longer
+destroys the slot before the tier accepts it; refusals are
 counted as `kv_tier_slot_demote_failures_total`.

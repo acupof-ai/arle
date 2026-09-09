@@ -1,6 +1,6 @@
 # TP batched decode: rows>1 goes through the batched paged forward — CUDA, 2026-08-23
 
-> Status: Verified (ce190fc20) — c≥2 ITL 1.55×–17.89×, aggregate 87 → 1,300 tok/s at c=32
+> Status: Verified — c≥2 ITL 1.55×–17.89×, aggregate 87 → 1,300 tok/s at c=32
 
 ## Context
 
@@ -13,7 +13,7 @@ never-validated single-GPU assumption.
 
 ## Change
 
-`ce190fc20` — deleted the `is_single` branch and the per-row fallback loop in
+ — deleted the `is_single` branch and the per-row fallback loop in
 `submit_decode_batch`; rows>1 always routes to `submit_decode_batch_paged`.
 c=1 is untouched (single-row graph path).
 

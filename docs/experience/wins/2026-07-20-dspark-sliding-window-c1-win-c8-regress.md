@@ -18,7 +18,7 @@ prompt lengths).
 
 - 4×H20 TP=4, GPUs 2,3,4,5; DSv4-Flash FP8 + DSpark FP8 draft, block 5, greedy
 - `bench-prompts-64.jsonl` (~3.4k tok), 60s/point, max_tokens 256
-- No `--dspark-max-prompt-tokens` (router deleted in `591772a43`)
+- No `--dspark-max-prompt-tokens` (router deleted in)
 
 ## Results
 

@@ -2,7 +2,7 @@
 
 ## Context
 
-Commit `834d6d54e4d1584ee5e153546ac04100800e43bc` needed a cold `sm_89` source
+Commit needed a cold `sm_89` source
 build, Qwen3.5-4B inference, needle gate, CUDA MoE test, and matched throughput
 A/B.
 
@@ -34,8 +34,8 @@ exact treatment commit, not the current HEAD:
 
 ```bash
 cd /content/arle
-git fetch --depth 1 origin 834d6d54e4d1584ee5e153546ac04100800e43bc
-git checkout --detach 834d6d54e4d1584ee5e153546ac04100800e43bc
+git fetch --depth 1 origin
+git checkout --detach
 ```
 
 Then create the repo-local TileLang venv and run the canonical bootstrap:

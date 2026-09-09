@@ -13,8 +13,8 @@ Verifying that the L2 (host DRAM) and L3 (SSD) KV tiers work under TP=2 CP=2 wit
 `--kv-recall`, on ThinkingCap-Qwen3.6-27B-FP8. The tier plumbing works. Selection,
 the non-CP decode page table, and multi-row prefill do not.
 
-Builds: `cpkv7` (`2ae47a16`) for the survey, then a build of `5d2ccc2eb` (which
-carries the fix in `1bf969aa9`) for the follow-up. Every arm below was run against
+Builds: `cpkv7` for the survey, then a build of (which
+carries the fix in) for the follow-up. Every arm below was run against
 a same-binary control.
 
 ## Phenomenon
@@ -84,7 +84,7 @@ pages behind them: `CUTLASS error
 deterministic at concurrency 2. The CP branch already derived the length from the
 table — which is why CP=2 survived and TP=1 aborted.
 
-Fixed in `1bf969aa9`: a 1-wide shard owns every page, so both branches collapse
+Fixed in : a 1-wide shard owns every page, so both branches collapse
 to the CP arithmetic. Byte-identical whenever `num_pages == global_pages`, i.e.
 every non-recall decode. **Verified**: the abort is gone, the server survives the
 same workload.
@@ -149,7 +149,7 @@ A front-of-prompt needle cannot gate `--kv-recall`. Position 0 lands inside the
 pinned sink window, so the gate passes without the recall cycle ever retrieving
 anything — `needle_concurrent.py` gave 48/48 on a configuration that loses 100%
 of mid-context content. Gate recall with the needle in the middle:
-`needle_concurrent.py <port> <conc> <tokens> <rounds> 50` (added in `bb4e362ea`).
+`needle_concurrent.py <port> <conc> <tokens> <rounds> 50` (added in).
 
 Second: a tier whose read counters sit at exactly 0 while its write counters
 climb is a one-way evict path, and that is visible without any correctness test.

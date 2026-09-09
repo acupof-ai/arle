@@ -1,6 +1,6 @@
 # GDR chunk-prepare goes native CUDA — 289× per launch, −19 s/step, losses bit-identical
 
-**Date:** 2026-08-03 · **Commit:** 3d80dd473 · **Pod:** 8×H20, real 27B · **Verdict: ACCEPT**
+**Date:** 2026-08-03 · **Commit:** · **Pod:** 8×H20, real 27B · **Verdict: ACCEPT**
 
 ## Context
 

@@ -40,18 +40,18 @@ invalidated it. **Check this table before ranking anything off a number.**
 | §1.2 | W8A16 prefill vs SGLang | 08-05 | 1 | 33K cold | current |
 | §2.1 | plain decode step budget | 08-01 | 1 | short | **stale** — its #2 kernel was deleted 08-03; only the 8.9 ms weight-read floor survives |
 | §2.2 | W8A16 decode ledger vs SGLang | 08-03 | 1 | short | **before-state only** — the program it motivated shipped the same day, 26.88 → 21.37 ms |
-| §2.3 | decode throughput vs batch | 08-07 `70760bc09` | 1–16 | 32K | current; the column is `B / TPOT`, decode-only |
-| §2.4 | sampling penalty | 08-07 `7b8a66603` | 1, 8, 16 | 32K | current |
-| §3 | DSpark tick phase split | 08-07 `7b8a66603` | 11.0 rows at nominal 16 | short | split current; the `22 ms + 2.48/row` fit is superseded by a per-row fit |
+| §2.3 | decode throughput vs batch | 08-07 | 1–16 | 32K | current; the column is `B / TPOT`, decode-only |
+| §2.4 | sampling penalty | 08-07 | 1, 8, 16 | 32K | current |
+| §3 | DSpark tick phase split | 08-07 | 11.0 rows at nominal 16 | short | split current; the `22 ms + 2.48/row` fit is superseded by a per-row fit |
 | §4.1 | launch-gap histogram | 08-07 | c=16 window | short | current, and it is a **window** not a step |
 | §4.2 | prefix sidecar | 08-07 | 1–16 | short | current |
 | §4.4 | memory ledger | 08-07 | 16 slots | — | current |
-| §5.0 | anchor row | 08-07 `70760bc09` | 1, 8, 16 | 32K | current |
+| §5.0 | anchor row | 08-07 | 1, 8, 16 | 32K | current |
 | §5.2 | vs SGLang, W8A16 | 08-06 | — | 33K | current |
-| ceiling | c=16 window, anchor workload | 08-08 `70760bc09` | 9 rows/tick at nominal 16 | 32.5K | current, but the window undersamples decode 2–6× — see the note there |
-| §2.0 | c=16 window, **decode-shaped** workload | 08-08 `70760bc09` | **16.0 rows/tick**, four counts | 2.5K | **current — the decode baseline**, window reconciled to +6.8% |
-| §1.3 | FP8 GEMM decomposed, per layer | 08-08 `70760bc09` | c=16 | 32.5K anchor | **current — the prefill baseline.** Read off the anchor trace, no new GPU time |
-| model | exact prefill/decode ledger, floors, tail bandwidth | 08-09 `70760bc09` | c=16 | 32.5K anchor | **current — supersedes the 251.9 µs/token estimate.** A partition of the window, not a fit; same trace, no new GPU time |
+| ceiling | c=16 window, anchor workload | 08-08 | 9 rows/tick at nominal 16 | 32.5K | current, but the window undersamples decode 2–6× — see the note there |
+| §2.0 | c=16 window, **decode-shaped** workload | 08-08 | **16.0 rows/tick**, four counts | 2.5K | **current — the decode baseline**, window reconciled to +6.8% |
+| §1.3 | FP8 GEMM decomposed, per layer | 08-08 | c=16 | 32.5K anchor | **current — the prefill baseline.** Read off the anchor trace, no new GPU time |
+| model | exact prefill/decode ledger, floors, tail bandwidth | 08-09 | c=16 | 32.5K anchor | **current — supersedes the 251.9 µs/token estimate.** A partition of the window, not a fit; same trace, no new GPU time |
 
 The stale and before-state rows remain as history. Current prefill decisions use
 the anchor partition and §1.3; current decode decisions use §2.0 and the c-sweep
@@ -103,7 +103,7 @@ matched-run prediction is `delta_wall = s_run x (1 - 1/f)`. `s_run` is specific
 to that treatment and workload. A narrow-window share is diagnostic evidence
 until a full-run trace or matched A/B establishes its run-level value.
 
-### The anchor window, resolved exactly — 2026-08-09, `70760bc09`
+### The anchor window, resolved exactly — 2026-08-09
 
 Every kernel in the `nsys` c=16 capture is assigned to prefill or decode by
 whether its start falls inside one of the seven decode windows, so the ledger
@@ -270,7 +270,7 @@ it establishes neither the binding resource nor reclaimable headroom.
 
 | kernel | ms | GB moved | effective TB/s | of HBM | traffic lower bound ms |
 |---|---:|---:|---:|---:|---:|
-| ~~`pack_quantize`~~ **fixed `5cfe8494f`** | 2216 → **441** | 593 | 0.27 → **1.35** | 7.6% → **38.5%** | 170 |
+| ~~`pack_quantize`~~ **fixed ** | 2216 → **441** | 593 | 0.27 → **1.35** | 7.6% → **38.5%** | 170 |
 | `silu_mul` | 589 | 605 | 1.03 | 29.4% | 173 |
 | `conv1d` | 590 | 222 | 0.38 | 10.7% | 63 |
 | `split2` | 360 | 289 | 0.80 | 23.0% | 83 |
@@ -336,8 +336,8 @@ anyone learning which bucket paid — which is indistinguishable from guessing.
 
 ### The buckets, measured on the anchor window
 
-Two captures, same 30 s steady-state window, same analyzer: `70760bc09` (before)
-and `5cfe8494f` (after the `pack_quantize` fix). Wall 29,642 / 29,693 ms, GPU
+Two captures, same 30 s steady-state window, same analyzer: (before)
+and (after the `pack_quantize` fix). Wall 29,642 / 29,693 ms, GPU
 busy 96.5% / 96.4%, kernel 28,601 / 28,611 ms — like for like.
 
 | bucket | selected-window amount | of kernel time | run-level status | how it was obtained |
@@ -477,7 +477,7 @@ this was written — all of which were batch 1.
 
 ### Measured: the mechanism is confirmed and the size is not
 
-`nsys`, 2026-08-08, `70760bc09`, GPU 6, c=16 on the 32K anchor dataset, a 30 s
+`nsys`, 2026-08-08, GPU 6, c=16 on the 32K anchor dataset, a 30 s
 window at bench elapsed 118–148 s. **This is the document's first decode
 capture above batch 1.** Full entry:
 [`errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md`](experience/errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md).
@@ -581,7 +581,7 @@ norms + elementwise   3.37 ms   7.2%   n=689  ████
 
 ### Corrections to the previous version of this section
 
-`b3198fb22` framed performance as a product of three factors — time occupancy,
+ framed performance as a product of three factors — time occupancy,
 roofline efficiency, arithmetic intensity — and ranked levers by factor. Ten
 things in it were wrong, found by four adversarial reviews of that commit:
 
@@ -654,7 +654,7 @@ flowchart TB
 
     subgraph DECODE["Decode — 2.1-6.1% of GPU time on the anchor, 100% of a decode-shaped one"]
         direction TB
-        C1["draft — DFlash backbone, block 6<br/>attention 30.5% of a decode-shaped tick<br/>slot-batched 3a8f99b1f"] --> C2["snapshot recurrent"]
+ C1["draft — DFlash backbone, block 6<br/>attention 30.5% of a decode-shaped tick<br/>slot-batched "] --> C2["snapshot recurrent"]
         C2 --> C3["verify — trunk forward<br/>FP8 GEMM 28.8% · GDN 21.0%<br/>full-attn 1.8% at 2.5K ctx, 42.5% at 32.5K"]
         C3 --> C4["accept + commit"]
         C4 --> C5["rollback replay<br/>batched varlen"]
@@ -771,14 +771,14 @@ until it is re-run with equal completion counts and reported prefix hits.
 `nsys`, 2026-08-01, 28.6 s wall / 24.0 s GPU-busy (**83.9%**).
 
 > **STALE — do not rank prefill work off this table.** Measured before chunked
-> GDR went default-on (`c2eb5de9e`, 08-02). Its #1 row is a kernel that no
+> GDR went default-on (08-02). Its #1 row is a kernel that no
 > longer runs **on the prefill path** at the shipped defaults: FlashQLA chunked
 > replaced `gated_delta_rule_prefill_recurrent` there and measured **1.06 s
 > against its 9.37 s**, which moves 33% of the budget and reorders everything
 > below it. The kernel itself is still live — the 08-08 capture measures it at
 > **7.75 ms per decode tick, 16.6%**, 48 launches, despite the name.
-> Two more prefill changes landed after (`0ac780495`, `301d0c074`), and
-> `b0368426a` routed batch==1 prefill to FA3, which also moves the TileLang
+> Two more prefill changes landed after, and
+> routed batch==1 prefill to FA3, which also moves the TileLang
 > row. Same flag as [`baselines.md`](baselines.md) carries. A re-measure needs
 > one `nsys` capture. **§1.2 is the current prefill decomposition** — it is
 > dated 08-05 and has the FlashQLA column.
@@ -814,7 +814,7 @@ Per-part ceilings decide where work is worth doing:
 
 The recurrence was the largest single line and the only one with headroom.
 FlashQLA chunked GDR, parameterized over (H, Hg), took 33K cold prefill
-**28.95 → 21.63 s (−26%)** and is default-on since `c2eb5de9e`; `b0368426a`
+**28.95 → 21.63 s (−26%)** and is default-on since
 then routed batch==1 prefill to FA3 for a further −4%.
 
 ### 1.2 W8A16 weights — 33K cold, versus SGLang
@@ -853,7 +853,7 @@ Roofline: ~1.68 PFLOP for a 33K prefill (22.3 B GEMM params × 2 × 33e3, plus
 
 ### 1.3 The anchor's biggest line, decomposed — it is at ~90% of FP8 peak
 
-The `nsys` c=16 anchor capture, `70760bc09`, same window as §"Measured". Read
+The `nsys` c=16 anchor capture, same window as §"Measured". Read
 off the trace with no new GPU time; the launch sequence is exactly periodic, so
 each GEMM is identified by the kernel it sits between and by the dimension of
 the `pack_quantize` that feeds it.
@@ -948,7 +948,7 @@ a lever by 7×; here it overstated one.
 
 ### 2.0 Decode-shaped workload, c=16 — the current decode baseline
 
-`nsys`, 2026-08-08, `70760bc09`, GPU 6, 16 sessions × 1 turn, ~1.1K prompt /
+`nsys`, 2026-08-08, GPU 6, 16 sessions × 1 turn, ~1.1K prompt /
 1.8K generated (**1 : 1.62** prompt:output), 32 requests, 60 s window at bench
 elapsed 40–100 s. **Window reconciled against run totals: 484 ticks in the
 window at 8.07/s against a run-level 7.56/s, +6.8%** — representative, unlike
@@ -1097,7 +1097,7 @@ measured mean of 11.0 rows per tick (§3).
 
 ### 2.4 Sampling's cost is not yet isolated (envelope mismatch)
 
-Counterbalanced greedy/sampled sweep, 2026-08-07, `7b8a66603`, long-agent 32K,
+Counterbalanced greedy/sampled sweep, 2026-08-07, long-agent 32K,
 128 requests per point, order greedy, sampled, sampled, greedy. The sweep
 reported no decode-only metric.
 
@@ -1133,7 +1133,7 @@ hypothesis that "accept halves at concurrency" is already withdrawn
 
 ## 3. Speculative decode — the DSpark tick
 
-`ARLE_DSPARK_PHASE=1`, 2026-08-07, `7b8a66603`, c=16, short prompts, 293 ticks,
+`ARLE_DSPARK_PHASE=1`, 2026-08-07, c=16, short prompts, 293 ticks,
 mean 11.0 rows/tick.
 
 The tick is sequential, so position and length are both to scale:
@@ -1217,8 +1217,8 @@ independent of how much prefix is cached.
 |---|---:|---:|
 | count | — | 578 |
 | payload | 146.8 MiB | **83 GB** |
-| serialize, per element (`d626a1b03^`) | 84.45 ms | 48.25 s = **9.4% of wall** |
-| serialize, bulk copy (`d626a1b03`) | 76.40 ms | 43.65 s |
+| serialize, per element (`^`) | 84.45 ms | 48.25 s = **9.4% of wall** |
+| serialize, bulk copy | 76.40 ms | 43.65 s |
 
 Bulk copy is **−9.5% on the operation and 0.9% of wall** — an end-to-end null,
 kept because it is strictly less work
@@ -1236,7 +1236,7 @@ bench is earned is unknown. This is the largest unpriced item in the chain.
 whenever a waiter exists. Both park routes are **unreachable in a default
 serve** — `--kv-oversubscription` defaults off, and the other route requires
 `kv_tier_capacity() == 0` while the L2 host tier is on. The same per-element
-serialization was fixed there in `a546ba80a` and remains **unmeasured** for
+serialization was fixed there in and remains **unmeasured** for
 that reason. Park and promote now log elapsed ms and a running count.
 
 ---
@@ -1273,7 +1273,7 @@ Two consequences the chain depends on:
 
 ### 5.0 Current row
 
-Long-agent 32K × 8 turns, DSpark, `70760bc09`, 2026-08-07 — the row
+Long-agent 32K × 8 turns, DSpark, 2026-08-07 — the row
 [`baselines.md`](baselines.md) tracks:
 
 | c | TTFT cold | TTFT warm | TPOT |
@@ -1284,7 +1284,7 @@ Long-agent 32K × 8 turns, DSpark, `70760bc09`, 2026-08-07 — the row
 
 ### 5.1 Day delta — what the 08-07 decode work moved
 
-Counterbalanced A/D/D/A, `010af0ede` (morning) against `7b8a66603` (evening),
+Counterbalanced A/D/D/A (morning) against (evening),
 same anchor workload, 128/128 complete at every point in all four sweeps. Each
 cell is the mean of that arm's two sweeps.
 
@@ -1321,7 +1321,7 @@ Ceilings belong to levers, not to categories.
 | lever | phase | measured at | size | status |
 |---|---|---|---|---|
 | **FP8 GEMM, prefill shapes** | prefill | **c=16 anchor** | **57.7% of ALL kernel time** | **CLOSED (§1.3)** — `gate_up` 93.2% of FP8 peak, `down` 87.5%. At the floor; only less math helps |
-| **DSpark draft attention** | decode | **c=16, 2.5K ctx** | **30.5% of a decode tick** | **FIXED** `3a8f99b1f` — per-slot 192-block launch; −69% pinned, ITL −10.4% decode-shaped, **null on the anchor** |
+| **DSpark draft attention** | decode | **c=16, 2.5K ctx** | **30.5% of a decode tick** | **FIXED** — per-slot 192-block launch; −69% pinned, ITL −10.4% decode-shaped, **null on the anchor** |
 | FP8 GEMM on the verify shape | decode | c=16, 2.5K ctx | 28.8% of a decode tick | open — but the prefill shapes are at 90% of peak (§1.3), so expect little |
 | GDN / gated-delta at c=16 | decode | c=16, 2.5K ctx | 21.0% of a decode tick | open — a same-binary A/B nulled it at 33K, untested here |
 | >1 ms gaps inside decode ticks | decode | c=16, 2.5K ctx | 13.8% of tick span, 53 gaps | open, cause unknown |
@@ -1392,7 +1392,7 @@ Execute one tranche at a time. A tranche advances only after its stated gate.
 
 | tranche | exact work | required artifact | advance gate |
 |---:|---|---|---|
-| **0. Re-anchor — completed** | runtime `9b38ba6c0`, runner `c98c4e0b2`, 1×H20 GPU2, shipped DSpark defaults, canonical 32K × 8-turn dataset | [accepted baseline](experience/wins/2026-08-10-qwen36-27b-corrected-baseline.md) with runner JSON/CSV, serve log, stats, identities, and concurrent needle output | **passed:** 128/128 at every `c=1,2,4,8,16`, zero errors/empty outputs, prompt p50 +8.84%, needle 78/78 exact |
+| **0. Re-anchor — completed** | runtime runner 1×H20 GPU2, shipped DSpark defaults, canonical 32K × 8-turn dataset | [accepted baseline](experience/wins/2026-08-10-qwen36-27b-corrected-baseline.md) with runner JSON/CSV, serve log, stats, identities, and concurrent needle output | **passed:** 128/128 at every `c=1,2,4,8,16`, zero errors/empty outputs, prompt p50 +8.84%, needle 78/78 exact |
 | **1. Close the run model** | run the same sweep with `ARLE_STEP_PHASE=1`; reconcile wall, forward-busy time, prefill tokens, generated tokens, steps, rows, accepted tokens, prefix hits, and queue depth | one full-run ledger whose terms and overlap rules are explicit | ≥95% of measured GPU-busy time assigned; request and token counts equal the runner artifact |
 | **2. Price the prefix sidecar** | derive writes/read bytes from tier I/O counters and restores from prefix hits; add a temporary same-binary write-policy toggle only if current counters cannot isolate the sidecar | restore hits, restored tokens, useful read/write bytes, serialization time, matched on/off wall A/B | retain only when saved prefill wall exceeds write + restore wall; otherwise reduce periodic writes or delete them |
 | **3. Close `fq_fwd` tile size — completed** | `ncu` at `Q=2048`, H=48; correct the wrapper grid; validate 64/32 with in-forward recurrent reference | raw 96/192-CTA `ncu` reports and numerical comparison | **closed:** dependency stall confirmed; `block_DV=32` fails correctness |
@@ -1421,7 +1421,7 @@ TTFT ratios are hypotheses pending a complete matched run.
 
 **Decode** — priced on §2.0, the decode-shaped c=16 capture.
 
-1. **DSpark draft attention, 30.5% of a decode tick — fixed at `3a8f99b1f`.
+1. **DSpark draft attention, 30.5% of a decode tick — fixed at.
    ITL mean 31.05 → 27.81 ms, −10.4% on the decode-shaped workload, and a null
    on the anchor** (TPOT +0.8%, inside the trial spread, 3 trials per arm).
    Correctness clean: 11/11 needle rungs, MMLU 0/50 disagreements. It was the
@@ -1497,7 +1497,7 @@ TTFT ratios are hypotheses pending a complete matched run.
    in it.**
 
 7. **The data-prep tail — `pack_quantize` DONE, eight kernels remain.**
-   `pack_quantize` shipped at `5cfe8494f`: 2216 → 441 ms, **5.12× in situ**,
+ `pack_quantize` shipped at : 2216 → 441 ms, **5.12× in situ**,
    bit-identical, wall −2.98%. The remaining rows total **2248 ms, 7.9% of the
    selected window's kernel time**. Their implementations differ: `silu_mul`
    and `add_native` already use `uint2`, `split2` and `split_qkv` use `uint4`,
@@ -1530,7 +1530,7 @@ Facts this chain rests on that have not been measured:
 | **full-run phase accounting** | the selected window over-represents `pack_quantize` by 2.02x; the run-level shares of every other term and the critical-path split remain unknown |
 | prefix sidecar restore hit rate | decides whether 9.4% of wall is earned |
 | acceptance rate under temperature | the sampled arm has no matching `accept_rate`; its cost is still unattributed |
-| whole-slot park cost | `a546ba80a` shipped unmeasured; both routes default-off |
+| whole-slot park cost | shipped unmeasured; both routes default-off |
 | tokenize / detokenize share | folded into "GPU idle" in every prefill capture |
 | TP > 1 | every number here is single-GPU |
 | the 8/128 incomplete requests under sampling | 120/128 complete at every concurrency, cause unknown |

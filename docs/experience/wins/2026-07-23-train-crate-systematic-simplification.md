@@ -1,6 +1,6 @@
 # train crate systematic simplification — −4,134 LOC of pivot-orphaned dead code + single-impl traits
 
-> Status: Shipped (4c26f1ad0, 0958e1c9f, fe342f640, c42af5fa1). Bench-exempt:
+> Status: Shipped. Bench-exempt:
 > host-side OPD-training refactor, zero serving/runtime perf surface. Verified by
 > test parity (238 green) + clippy + end-to-end `--smoke` on the arle binary.
 
@@ -45,7 +45,7 @@ delete the over-abstraction and dead paths, behavior-preserving, no serving impa
 - `cargo test -p train --no-default-features --features no-cuda`: 286 → 238 green
   (delta = deleted dead-code tests), 0 failures throughout.
 - `cargo clippy -p train --all-targets -- -D warnings`: clean (also cleared 2
-  pre-existing test-code nits, c42af5fa1).
+ pre-existing test-code nits).
 - End-to-end binary smoke (CPU): `arle train opd --smoke` (3 steps, ok) +
   `arle train self-opd --smoke` (loss 2.6682→2.6677, finite decreasing, EMA
   self-teacher + LoRA writeback). Colab CPU re-run byte-identical (fresh Linux).

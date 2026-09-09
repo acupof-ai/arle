@@ -1,7 +1,7 @@
 # The agentic writeback drops most turn records, and its mitigation is inert under CP
 
 **Date:** 2026-08-08 · **Pod:** 8×H20 GPUs 4–7, ThinkingCap-Qwen3.6-27B-FP8,
-cp=4 × G=2, `fulltrain11` (449-task production run, tree `5b1cd473d`)
+cp=4 × G=2, `fulltrain11` (449-task production run, tree)
 
 ## Context
 

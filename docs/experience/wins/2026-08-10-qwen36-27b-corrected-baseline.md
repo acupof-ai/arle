@@ -24,8 +24,8 @@ python3 scripts/bench_throughput.py \
   --timeout-seconds 900 --output artifacts/c98-baseline/bench
 ```
 
-- Runtime: `9b38ba6c0`, binary SHA-256 `5df97e8711ecda7787106a503b7dea432adbab5e865587c9f8a85725d0f078ca`
-- Runner: `c98c4e0b2`, `ignore_eos=true`, disjoint warmup prefix
+- Runtime: binary SHA-256 `5df97e8711ecda7787106a503b7dea432adbab5e865587c9f8a85725d0f078ca`
+- Runner: `ignore_eos=true`, disjoint warmup prefix
 - Dataset SHA-256: `8867f63eaac2f0537bb2b17847a7d0d3c1bb8d504c1ad191e97d673e9ecc4f34`
 - Prompt tokens: 32425 / 34827.5 / 37248 min/p50/max
 - Completion tokens: 214 / 214 / 214

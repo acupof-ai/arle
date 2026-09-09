@@ -23,7 +23,7 @@ Standalone kernel probe (no engine, no checkpoint):
 INFER_CUDA_DEVICE=6 target/release/examples/marlin_fp4_probe
 ```
 
-- Baseline: `gptq_marlin.cuh` at f681c8156 (tiebreaker: larger thread_k)
+- Baseline: `gptq_marlin.cuh` at (tiebreaker: larger thread_k)
 - Treatment: tiebreaker prefers higher bps for `m_block_size_8 && q_type == host::kFE2M1f`
 - Shapes: Qwen3.8-27B dense-MLP (gate_up N=34816 K=5120, down N=5120 K=34816)
 - M sweep: 1, 16, 512, 2048

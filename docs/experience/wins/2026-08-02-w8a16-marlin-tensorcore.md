@@ -41,7 +41,7 @@ python3 scripts/bench_throughput.py \
   --output bench-output/<arm>/bench
 ```
 
-- Binary: `arle @ 435c399f` (matched across all arms), `--qwen35-decode-graph` ON.
+- Binary: `arle @ ` (matched across all arms), `--qwen35-decode-graph` ON.
 - Arms: W8A16-marlin, W8A16-scalar (`ARLE_W8A16_DISABLE_MARLIN=1`, bench-only
   toggle since removed), bf16 (`/host/nvme0/models/Qwen3.6-27B`).
 - Deviation (stated per §3.3): 32k×256 slots doesn't fit one H20 (Qwen3.6 hybrid

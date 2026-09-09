@@ -1,6 +1,6 @@
 # OPD writeback forward peak — as-you-go free — CUDA, 2026-07-28
 
-> Status: Shipped (commit `e736c485a`). Forward wall cleared. The full step
+> Status: Shipped (commit). Forward wall cleared. The full step
 > still OOMs in backward; that lever (seq-chunked attention forward-recompute in
 > the checkpoint replay) is a standalone autograd/kernel project, **deferred —
 > Phase 7a closed 2026-07-28**. See the Learnings note and the research doc's
@@ -25,8 +25,8 @@ ARLE_OPD_VRAM_TRACE=1 arle train agent-opd \
   --lora-target-set all-linear
 ```
 
-- Baseline: clean HEAD `585e49337` — forward OOM at group 3/64, 15.9 MiB free.
-- Treatment: `e736c485a` — `qwen35.rs` Dense-MLP + `lora.rs` forward free dead transients when `!tape.enabled`.
+- Baseline: clean HEAD — forward OOM at group 3/64, 15.9 MiB free.
+- Treatment: — `qwen35.rs` Dense-MLP + `lora.rs` forward free dead transients when `!tape.enabled`.
 
 ## Environment
 
@@ -36,7 +36,7 @@ ARLE_OPD_VRAM_TRACE=1 arle train agent-opd \
 
 ## Results
 
-| metric | baseline `585e49337` | treatment `e736c485a` |
+| metric | baseline | treatment |
 |---|---|---|
 | forward groups completed | 3 / 64 (OOM) | **64 / 64** |
 | per-group used (layers 1-63) | — | flat 77492 MiB, +8 MiB/group (retained ckpt inputs) |

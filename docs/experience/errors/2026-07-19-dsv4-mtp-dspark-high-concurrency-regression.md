@@ -1,13 +1,13 @@
 # DSv4 MTP/DSpark high-concurrency regression: serial draft + B>1 disable
 
-> Status: Fixed 2026-07-19 (`13426a8de` + `7a8c0bdd4`). MTP c16 recovered +31%; DSpark B>1 dispatch + budget fixed.
+> Status: Fixed 2026-07-19 (+). MTP c16 recovered +31%; DSpark B>1 dispatch + budget fixed.
 
 ## Context
 
-Production-all-on benchmark (`45dd64bd2`, 4×H20 TP=4/EP=4, `bench-prompts-64.jsonl`
+Production-all-on benchmark (4×H20 TP=4/EP=4, `bench-prompts-64.jsonl`
 ~2.8k tok, 120 s/point, max_tokens 256):
 
-| c | Base | MTP (before fix) | MTP Δ | MTP (after fix `7a8c0bdd4`) | MTP Δ |
+| c | Base | MTP (before fix) | MTP Δ | MTP (after fix) | MTP Δ |
 |---|-----:|----:|------:|----:|------:|
 | 1  | 38.0 | **46.2** | **+21.6%** | **47.0** | **+23.7%** |
 | 4  | 74.6 | 70.2 | -5.9% | 71.3 | -4.4% |
@@ -67,7 +67,7 @@ instead of N×depth sequential m=1 calls.
 (b) implement batched DSpark verify for B>1; (c) include per-slot DSpark
 runtime in `kv_budget_plan`.
 
-## Fix Applied (`13426a8de` + `7a8c0bdd4`)
+## Fix Applied (+)
 
 ### MTP: batched draft phase
 `spec_decode.rs:442-478` — `spec_step_batched` now runs `depth` batched
@@ -101,6 +101,6 @@ throughput and MTP adds overhead. Not a default-flip candidate.
 ## Rule
 
 - Speculative decode gains are c1-only until draft generation is batched.
-- Before `13426a8de`, DSpark was effectively disabled at B>1. That dispatch defect is fixed; later `13fe251cb` also batches anchor + target verify. Concurrency wins still require measured A/B because draft work remains costly and c=8 was later −7.6% vs valid no-spec.
+- Before DSpark was effectively disabled at B>1. That dispatch defect is fixed; later also batches anchor + target verify. Concurrency wins still require measured A/B because draft work remains costly and c=8 was later −7.6% vs valid no-spec.
 - Benchmark speculative configs with the production workload (long
   prompts), not synthetic short-prompt sets.

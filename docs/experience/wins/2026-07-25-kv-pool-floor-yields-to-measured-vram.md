@@ -1,6 +1,6 @@
 # Qwen KV pool sizing follows measured VRAM, not a constant floor (#178)
 
-> Status: Code landed (`5c2931cd3`) and **runtime-VERIFIED 2026-07-25** on the
+> Status: Code landed and **runtime-VERIFIED 2026-07-25** on the
 > 32 GB V100 at default flags — the box that surfaced the defect.
 
 ## Context
@@ -36,7 +36,7 @@ free VRAM with no constant floor and fails **closed** at startup ("Lower
 Gates: cuda-lane clippy clean. A box-local 8192→1024-page patch had already
 served fine on the V100, which is the same direction as this fix.
 
-## Runtime verify (2026-07-25, `eacd62ce7`, 1×V100-32GB sm_70)
+## Runtime verify (2026-07-25, 1×V100-32GB sm_70)
 
 Qwen3.6-27B-W4A16, default flags (no `--max-total-tokens`, no
 `--mem-fraction-static`), binary symbol-checked (`pages (advisory)` ×2):

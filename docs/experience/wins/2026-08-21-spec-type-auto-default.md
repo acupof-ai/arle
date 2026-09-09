@@ -1,6 +1,6 @@
 # `--spec-type auto` as the default — CUDA, 2026-08-21
 
-> Status: Shipped, `4863971eb`. Qwen3.8-27B-NVFP4, 1xH20, FP8 KV.
+> Status: Shipped. Qwen3.8-27B-NVFP4, 1xH20, FP8 KV.
 
 ## Context
 

@@ -1,7 +1,7 @@
 # Accumulating slice gradients into the input's existing buffer took 6,210 MiB off the cp=2 backward — 2026-08-20
 
-Commit: `530cbb2c7` (`perf(train): accumulate slice gradients into the input's
-existing buffer`), on top of `62b4927b8` (transport chain residency drops).
+Commit: (`perf(train): accumulate slice gradients into the input's
+existing buffer`), on top of (transport chain residency drops).
 
 ## Context
 
@@ -27,7 +27,7 @@ against the same weight and optimizer residency:
 
 **−6,210 MiB.** Loss is `3.036179` in both arms, bit-identical.
 
-The same run also serves as the numerics gate for `62b4927b8` (transport chain
+The same run also serves as the numerics gate for (transport chain
 residency drops), which until now had no completed run to read a loss from — its
 only run had died in the backward at 163,840.
 

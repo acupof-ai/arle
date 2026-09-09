@@ -1,7 +1,7 @@
 # CP ideal state: one mesh, one attention-CP core, engine + training
 
 > Status: accepted 2026-08-16 (ckl: "把 cp 重构成理想态,引擎和训练都得支持").
-> T1 accepted 2026-08-16 (083e2e89a; gates in
+> T1 accepted 2026-08-16 (gates in
 > `docs/experience/wins/2026-08-16-cp-t1-ring-core-extraction.md`). T2 accepted
 > 2026-08-16 (gates in
 > `docs/experience/wins/2026-08-16-cp-t2b-replicated-kv-prefill.md`; GDR smem
@@ -11,7 +11,7 @@
 > T3 revised 2026-08-16 after the engine architecture audit: KV ownership
 > sharding priced as the one seam-level change in the 5D program; CP×quant-KV
 > and CP×spec combination debts made explicit; position vs DP routing stated.
-> T3.1 (B2) implemented 2026-08-17 (807e6c0b4): load-time weight subset
+> T3.1 (B2) implemented 2026-08-17: load-time weight subset
 > (W8A16/Marlin preserved), full-head pool at natural head offset, two-buffer
 > GDN, global all-reduce, eager (decode graph off at world>1). Pod gate pending.
 
@@ -39,7 +39,7 @@
 
 ### 1. One attention-CP core, engine- and train-callable (T1)
 
-Done 2026-08-16 (083e2e89a). The ring merge math ((m, l, out) forward +
+Done 2026-08-16. The ring merge math ((m, l, out) forward +
 backward adjoint), the FA3 pair route, and the per-block FA3 launches moved
 into `cuda-kernels/src/ring_attention.rs`, tape-free, on `&Arc<CudaStream>`.
 autograd keeps DeviceHandle adapters, f32↔bf16 staging, scalar fallback
@@ -99,7 +99,7 @@ not depend on T3.2 and lands first.
 
 #### T3.1 — B2: CP decode = head-sharding across the cp group (ships 256K gate)
 
-> As built 2026-08-17 (807e6c0b4). Decode is **weight-bandwidth-bound**, not
+> As built 2026-08-17. Decode is **weight-bandwidth-bound**, not
 > compute-bound (marlin W8A16 GEMMs ≈52% of the 27B decode step; FA3 chain
 > <4%), so the win is sharding the attention *weights*, not the compute. The
 > v1 "per-step slice" design was rejected: `slice_rows` dequantizes W8A16 to
@@ -319,7 +319,7 @@ T3.2+ gates are set with their own designs.
 |---|---|---|
 | T1 | Extract shared ring core into `cuda-kernels`; autograd calls it | CP gate battery byte-stable; `cargo test --workspace`; no new public surface beyond the core fns |
 | T2 | Engine prefill CP (replicated KV) + GDN state relay | needle ×3 cp=2 vs cp=1; 128K prefill ≥1.6× — **accepted 2026-08-16** (1.75×) |
-| T3.1 | B2: CP decode head-sharding across cp group (load-time weight subset, full-head pool at natural offset) | needle ×3 cp=2 vs cp=1 (wash + B2-engaged); 4K decode wash; 128K decode recover 43→~60 at world=2; 256K decode win — **implemented 2026-08-17 (807e6c0b4), pod gate pending** |
+| T3.1 | B2: CP decode head-sharding across cp group (load-time weight subset, full-head pool at natural offset) | needle ×3 cp=2 vs cp=1 (wash + B2-engaged); 4K decode wash; 128K decode recover 43→~60 at world=2; 256K decode win — **implemented 2026-08-17, pod gate pending** |
 | T3.2 | KV ownership sharding (3 seam-level assumptions, §3.2) + decode merge on comm_stream (§3.3) | capacity past 512K; 256K quant-KV; dated wins entry |
 | T3.4 | Settle CP×quant-KV, CP×spec (§3.4) | per-debt gates |
-| T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve; GDR smem-race fix (1f7948070) re-gated on-pod at world=4 (775f7c7b6, needle 12/12 + 128K 1.75×) | dated wins/errors entries |
+| T4 | Cleanup (scalar kernel), GDN a2a scaling decision, cp=4 256K curve; GDR smem-race fix re-gated on-pod at world=4 (needle 12/12 + 128K 1.75×) | dated wins/errors entries |

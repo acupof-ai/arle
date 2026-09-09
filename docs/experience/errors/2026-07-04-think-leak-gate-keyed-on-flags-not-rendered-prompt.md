@@ -2,7 +2,7 @@
 
 ## Context
 
-9fdc4e57 rebuilt reasoning-before-tool-parsing on all four paths
+ rebuilt reasoning-before-tool-parsing on all four paths
 (`split_reasoning` pre-split + `StreamPipeline`), with a five-think-forms ×
 two-APIs unit matrix, all green — and declared the bare-`</think>` leak fixed.
 Same-day pod e2e (Qwen3.6-27B-FP8, GPU 1, `/host/cc_leak_smoke/`) reproduced
@@ -28,7 +28,7 @@ clean; default → leak.
 
 ## Fix
 
-0f463f15 — key the parse-side gate off the rendered prompt: after every
+ — key the parse-side gate off the rendered prompt: after every
 render, `thinking |= prompt_prefills_think(&prompt)` (rendered prompt
 `trim_end`-ends with an open `<think>`). Self-consistent with the template:
 explicit `enable_thinking=false` renders a closed block (or none) and keeps

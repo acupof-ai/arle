@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-05. **Backend:** CUDA, DeepSeek-V4-Flash-FP8, TP=4/EP=4,
 4×H20 (GPUs 3,4,6,7; GPU 1 excluded — foreign process holding VRAM). Commit
-under test: `7b89fe32` (includes P1 `611d18cd`, P2+P4 `2dd9d07c`). Harness
+under test: (includes P1 P2+P4). Harness
 `scripts/needle_gate.py`, `RAW=1`, greedy, needle `738291`, 3 same-config
 repeats. `INFER_DSV4_MAX_SEQ_LEN=16384` (TP=4 halves rank count vs the
 TP=8 baseline this repo has previously validated at 32K — see
@@ -11,8 +11,8 @@ TP=8 baseline this repo has previously validated at 32K — see
 
 ## Goal
 
-Close the "pod needle gate 2K/8K/32K" verification the P1 (`611d18cd`) and
-P2+P4 (`2dd9d07c`) commit messages deferred: prove the `Dsv4BlockMap`
+Close the "pod needle gate 2K/8K/32K" verification the P1 and
+P2+P4 commit messages deferred: prove the `Dsv4BlockMap`
 comp-row single-sourcing (P1/P2) and the CSA select-boundary shape guard (P4)
 preserve correct inference on the >2048 comp-row-addressing path this
 refactor targets, per
@@ -43,7 +43,7 @@ only 1 of 3 live call sites that compute `indexer_rows_after` for
 
 | call site | role | had guard before this fix? |
 |---|---|---|
-| `mla_attention_prepare` | eager single-row decode + chunked-prefill | yes (2dd9d07c) |
+| `mla_attention_prepare` | eager single-row decode + chunked-prefill | yes |
 | `mla_attention_prepare_compressed_only` | **batched-decode lane (#60), default-on** (`dsv4_flashmla_decode_batched_enabled()` → `dsv4_flashmla_decode_enabled()` defaults true when FlashMLA compiled) | **no** |
 | `mla_attention_decode_graph` | CUDA-graph decode (opt-in, `ARLE_DSV4_DECODE_GRAPH_CSA`) | **no** |
 
@@ -66,7 +66,7 @@ Prompts with `prompt_tokens` ≳8106 froze the entire multiproc engine
 indefinitely (`/v1/stats` `steps` frozen, zero progress, reproducible on the
 very first request — not a leak). Bisected: 7661 pt OK, 8106 pt hangs.
 **Controlled A/B**: reproduced the identical hang at the identical length on
-a second pod tree built at `c89c26ae` (immediately before P1), same
+a second pod tree built at (immediately before P1), same
 TP=4/EP=4/`INFER_DSV4_MAX_SEQ_LEN=16384` config — confirms this is
 **pre-existing, not a regression from this refactor**.
 
@@ -82,7 +82,7 @@ session, independent of the DSv4 KV-storage refactor either way.
 
 ## Verdict
 
-- **P1 (`611d18cd`) + P2 (`2dd9d07c` P2) comp-row single-sourcing: PASS.**
+- **P1 + P2 (P2) comp-row single-sourcing: PASS.**
   Correct, coherent, exact-match inference at every reachable length crossing
   2048 (2000/4000/8000/8500 tokens).
 - **P4 guard: coverage gap found and fixed this session** (see above) — now

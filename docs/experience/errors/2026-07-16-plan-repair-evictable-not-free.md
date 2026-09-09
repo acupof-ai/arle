@@ -2,7 +2,7 @@
 
 ## Context
 
-The first #164 fix (`74b6aafd3`) made `fit_plan_to_kv_pages` shed prefill rows
+The first #164 fix made `fit_plan_to_kv_pages` shed prefill rows
 and preempt decodes whenever `plan_new_pages_needed > kv.free_pages()`. A
 high-effort adversarial review (before any pod deployment) confirmed four
 defects in it.
@@ -26,7 +26,7 @@ defects in it.
 
 ## Fix
 
-`459ed5000`: capacity = `tp_sync_min(free + resident_evictable)` (accessor
+: capacity = `tp_sync_min(free + resident_evictable)` (accessor
 already existed), re-synced after each preemption; shed only demand-reducing
 rows (`rposition(append_pages_needed > 0)`); spec extra-token alloc failure
 degrades to the #162 park path. 6 GPU-free regression tests cover

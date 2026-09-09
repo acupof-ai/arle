@@ -1,6 +1,6 @@
 # CP T1: ring-attention core extracted into cuda-kernels, gates green
 
-**Date:** 2026-08-16 · **Commit:** 083e2e89a · **Plan:** docs/plans/2026-08-16-cp-ideal-state.md (T1)
+**Date:** 2026-08-16 · **Commit:** · **Plan:** docs/plans/2026-08-16-cp-ideal-state.md (T1)
 
 ## Context
 

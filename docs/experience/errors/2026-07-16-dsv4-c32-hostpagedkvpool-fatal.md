@@ -2,7 +2,7 @@
 
 ## Context
 
-Arm C (`672b8ac08` slot hoist, slots 2→59) var-c32 bench: 59/64 requests
+Arm C (slot hoist, slots 2→59) var-c32 bench: 59/64 requests
 completed, then at ~101 s (tick #3073) all 4 ranks died together:
 
 ```
@@ -91,7 +91,7 @@ and zero teardowns.
 
 ## Residual (2026-07-17)
 
-The 459ed5000 repair (`fit_plan_to_kv_pages` budgets `tp_sync_min(free +
+The repair (`fit_plan_to_kv_pages` budgets `tp_sync_min(free +
 resident_evictable_pages)`, sheds/preempts on shortfall) did NOT survive the
 pod acceptance run: 4×H20 TP=4 eager c=32, prefix hit_rate 0.925, tick #8340,
 all ranks identical — `KV alloc retry failed after reclaiming 2 pages ...

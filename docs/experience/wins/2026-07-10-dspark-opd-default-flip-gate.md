@@ -3,8 +3,8 @@
 ## Context
 
 Final gate before defaulting DSpark on for OPD rollouts. Binary at HEAD
-`095dcca6` (spec_decode /v1/stats export dfbf33ee, trainer dspark flags
-6b71f637, MIN_M=2 crossover e5d0899). 8×H20, Qwen3.6-27B-FP8 + z-lab DFlash
+ (spec_decode /v1/stats export trainer dspark flags
+MIN_M=2 crossover e5d0899). 8×H20, Qwen3.6-27B-FP8 + z-lab DFlash
 draft, CC-as-harness (`scripts/cc_swe_baseline.py`), temp 0.7. Build+symbol
 gates green; `/v1/stats.spec_decode` live.
 

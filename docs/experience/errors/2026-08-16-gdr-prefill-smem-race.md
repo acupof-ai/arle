@@ -45,7 +45,7 @@ the race fire frequently.
 ## Fix
 
 One `__syncthreads()` after the smem_q/smem_k writes, before the cross-thread
-reads (1f7948070). The decode siblings (`gdr_decode_batch.cu`, the decode path
+reads. The decode siblings (`gdr_decode_batch.cu`, the decode path
 in `gated_delta_rule.cu`) already sync after their smem writes — audited, no
 sibling bug.
 

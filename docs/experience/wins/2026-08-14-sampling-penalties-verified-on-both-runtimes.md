@@ -4,7 +4,7 @@
 
 `repetition_penalty` / `frequency_penalty` / `presence_penalty` were accepted at
 the HTTP layer and dropped before sampling; `logit_bias` was accepted and also
-kept the device-argmax fast path. Both landed for `fad8f4d5b`, verified on the
+kept the device-argmax fast path. Both landed for verified on the
 H20 pod against the shipping serve, not a unit harness.
 
 ## What worked

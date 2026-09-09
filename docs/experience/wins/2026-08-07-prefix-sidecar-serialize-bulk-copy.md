@@ -14,7 +14,7 @@ recurrent state — 48 linear layers × (3 MiB gdr f32 + 60 KiB conv bf16) =
 
 `to_bytes` walked it one element at a time (`extend_from_slice(&x.to_le_bytes())`
 per f32, 37M calls per snapshot) and `from_bytes` rebuilt it with
-`chunks_exact(4).map().collect()`. Both are bulk byte copies in `d626a1b03`, the
+`chunks_exact(4).map().collect()`. Both are bulk byte copies in the
 idiom `attention/prefix_state.rs::push_bf16` already used.
 
 ## Parameters
@@ -31,7 +31,7 @@ python3 scripts/bench_throughput.py --url http://127.0.0.1:18701 \
 ```
 
 - 1× H20 GPU 1, TP=1, eager, 16 slots, `RUST_LOG=info`.
-- Arm D = `d626a1b03^` serializer (per element), arm E = `d626a1b03` (bulk).
+- Arm D = `^` serializer (per element), arm E = (bulk).
   Both arms carry the same `to_bytes` timing log, so the mechanism is read
   directly off the two serve logs rather than inferred from throughput.
 - **Four sweeps in the order D, E, E, D** so each arm runs once in each half.

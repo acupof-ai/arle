@@ -7,7 +7,7 @@ the attention kernel — 15× the neighbouring MLP GEMM that moves 10× more dat
 Reading `nonpaged_prefill_attention_kernel` showed the QK loop gives every key
 its own block-wide reduction: thread `dim` holds one head dimension, so a
 2048-key window serializes 2048 dependent `warp_reduce_sum`es plus 128
-`__syncthreads`. That looked like the whole story, so `2f7cdc145` swapped the
+`__syncthreads`. That looked like the whole story, so swapped the
 axis — one warp owns one key, lane strides `head_dim` in registers, `num_warps`
 keys in flight, one reduction per key — and hoisted `expf` out of the per-thread
 AV loop.
@@ -50,7 +50,7 @@ still lost 2.7% in the serve — see
 
 ## Fix
 
-Reverted (`aa4d2a6ec`). The change is a wash on the workload and a regression on
+Reverted. The change is a wash on the workload and a regression on
 part of it, so it does not earn its diff.
 
 

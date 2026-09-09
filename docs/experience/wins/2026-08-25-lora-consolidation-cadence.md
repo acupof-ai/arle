@@ -28,7 +28,7 @@ The weight-requant primitive itself is cuda-kernels (TurboQuant/Marlin/Q4_K)
 # - failed gate reverts to pre-upgrade base + adapter
 ```
 
-- Baseline: `27ab564e2` (no consolidation)
+- Baseline: (no consolidation)
 - Treatment: this commit (cadence + snapshot)
 - Trials: pending-remote
 

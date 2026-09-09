@@ -1,6 +1,6 @@
 # Flag deletion wave — 10 proven A/B flags deleted, comm-backend default reverted
 
-> Status: Accepted. `1864ddac5`, audit + edits + verify via a 6-agent workflow.
+> Status: Accepted. audit + edits + verify via a 6-agent workflow.
 > Serve flags 66 → 56; `ARLE_*` env names 38 → 33.
 
 ## Context
@@ -18,7 +18,7 @@ Deleted (hardcoded winner, flag + runtime-flags field + all reads):
 
 | flag | hardcoded | verdict |
 |---|---|---|
-| `--qwen35-decode-graph` | on | `cb6b3389d`, −58.7 % TPOT off |
+| `--qwen35-decode-graph` | on | −58.7 % TPOT off |
 | `--qwen35-batched-decode` | on | sequential off-arm killed 2026-06-29 |
 | `--qwen35-gpu-router` | on | off = host routing, not graph-capturable |
 | `--qwen35-fa3-decode-splits` | derive | derive = every explicit arm, 2026-08-04 |
@@ -34,7 +34,7 @@ own off-by-default `--qwen35-decode-graph` in `OpdRuntimeArgs`.
 `dsv4_decode_reuse_enabled()` stays as a `true` shim until the peer's
 `executor/dsv4.rs` call site lands.
 
-**comm-backend default reverted Auto → Nccl.** `84c60dee5` (a dead-code
+**comm-backend default reverted Auto → Nccl.** (a dead-code
 commit) flipped it with no bench entry, contradicting two verdicts
 (2026-06-10 wall-neutral; 2026-08-17 one-shot 51–53 vs NCCL 70–80 tok/s).
 Auto also activates one-shot's different FP summation order in every TP≥2
@@ -49,7 +49,7 @@ folded into `ARLE_QWEN35_PROFILE`; `ARLE_DSV4_MOE_BACKEND` alias deleted
 **Consistency fixes:** runtime-flags statics now equal
 `CudaRuntimeFlags::default()` (decode-graph, gdr-chunked were `false`,
 spec-max-batch was 1 vs shipped 16). DSv4's `spec_max_batch.min(1)` confirmed
-intentional (`c0d302f52`, per-slot draft) — help text now says the flag is
+intentional (per-slot draft) — help text now says the flag is
 pinned to 1 on DSv4.
 
 Verified: cuda-lane clippy `-D warnings`, metal `cargo check`, cpu smoke

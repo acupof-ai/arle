@@ -10,7 +10,7 @@ max_seq_len × 4 B`) was allocated per (layer, slot) inside
 `Dsv4CompressorState`, inflating per_slot to 9618 MB → `256 slots clamped
 to 2`.
 
-## Change (`672b8ac08`)
+## Change
 
 `Dsv4CompressorFp32Scratch` — one model-wide shared pair per rank (pattern:
 #85 P3 FlashMLA hoist), threaded `Option<&mut>` through every prefill lane;
@@ -19,7 +19,7 @@ Per-slot ledger and budget fixed-term stay bit-exact.
 
 ## Ledger (serve log, verbatim deltas)
 
-| | arm B (2e635eda3) | arm C (672b8ac08) |
+| | arm B | arm C |
 |---|---|---|
 | per_slot | 9618 MB (slot-state 9596) | **338 MB** (slot-state 316) |
 | shared compressor FP32 | — | 256 MB per rank (once) |
@@ -57,7 +57,7 @@ unreachable at clamp 2, now the top blocker for the high-concurrency regime.
 8×H20, driver 535.161.08, CUDA 12.9, DSv4-Flash-FP8, TP=4/EP=4 GPUs 0–3,
 eager serve port 8000, build `--release --features cuda,nccl` (plain `cuda`
 cannot serve TP=4). HEAD carried unrelated train/docs commits; infer-cuda
-delta vs arm B is 672b8ac08 only. Raw:
+delta vs arm B is only. Raw:
 `bench-output/2026-07-16-fp32slots-*` (pod).
 
 ## Learnings

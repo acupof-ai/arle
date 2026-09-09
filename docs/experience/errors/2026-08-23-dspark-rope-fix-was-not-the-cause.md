@@ -1,6 +1,6 @@
 # Fixed a real config bug that was not the cause
 
-> Status: fix shipped (`7130f0b8b`); the symptom it was credited with is unexplained
+> Status: fix shipped; the symptom it was credited with is unexplained
 
 ## Context
 

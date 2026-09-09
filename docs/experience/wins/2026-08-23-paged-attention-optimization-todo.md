@@ -1,6 +1,6 @@
 # Paged Attention Optimization TODO
 
-Baseline: kernel at ab8c96200 (pre-fp8-MMA); ncu data below is that baseline.
+Baseline: kernel at (pre-fp8-MMA); ncu data below is that baseline.
 
 Kernel: `crates/cuda-kernels/csrc/attention/paged_attention_quantized_fa3.cu`
 Hardware: H20 (sm_90, 78 SM, 4.0 TB/s HBM3, 228 KB smem/SM, 65536 regs/SM)
@@ -83,4 +83,4 @@ Manual load cost: ~128 LDS.U8/lane/tile for A + ~64 for B = 192 load instruction
 
 - 2026-08-23: ncu baseline. Three approaches ruled out (o_acc→smem, launch bounds, K+V parallel). Kernel is instruction-issue bound. fp8 tensor core Q·Kᵀ is the correct direction.
 - 2026-08-23: fp8 MMA blocked on sm_90 — ldmatrix.b8 is sm_100 only. Manual fragment load cost offsets dequant savings. Direction viable only on Blackwell. Next: Marlin GEMV M-split (item 5).
-- 2026-08-23: Marlin bps tiebreaker shipped (0777aa346). +2-6% at M=1, not the expected 2×. Kernel is compute-bound, not occupancy-limited. M-split grid direction ruled out.
+- 2026-08-23: Marlin bps tiebreaker shipped. +2-6% at M=1, not the expected 2×. Kernel is compute-bound, not occupancy-limited. M-split grid direction ruled out.

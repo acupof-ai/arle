@@ -1,6 +1,6 @@
 # Chat requests with thinking off defaulted to max_tokens=16 — CUDA, 2026-08-22
 
-> Status: Fixed (2907785d5), verified
+> Status: Fixed, verified
 
 ## Context
 
@@ -23,7 +23,7 @@ detected and the think-budget branch never engaged.
 
 ## Fix
 
-`2907785d5` — collapsed the three sites to one rule:
+ — collapsed the three sites to one rule:
 `max_tokens = sampling.max_new_tokens.unwrap_or_else(|| think_budget +
 THINK_CONTENT_HEADROOM)` (4096 when no budget). The `else { 16 }` fallback is
 gone.

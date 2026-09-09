@@ -3,7 +3,7 @@
 ## Context
 
 #228 (2026-06-14): batched FlashMLA decode (`sparse_decode_fwd(b=N)`) produced
-garbled output at c≥4. Root-caused and fixed in `b4fec44b` (2026-06-15): the
+garbled output at c≥4. Root-caused and fixed in (2026-06-15): the
 batched indices reader used `max_topk_unified` (640) as stride while the writer
 used per-layer `topk_unified` (128/256/640), so rows ≥1 read wrong offsets on
 non-max layers. The fix shipped but never had a bench entry, and the issue
@@ -36,7 +36,7 @@ Pod: 4×H20, TP=4, `DeepSeek-V4-Flash-0731`, 250-token prompt, max_new=8.
 ## Rule
 
 A fix commit without a bench entry leaves the issue unverifiable — the
-`b4fec44b` fix sat unproven for 2 months because the bench entry was deferred
+ fix sat unproven for 2 months because the bench entry was deferred
 and never written. The `dsv4_parity` batch-validation harness
 (`INFER_DSV4_BATCH_DECODE_VALIDATE`) is the reusable gate: c=1 reference +
 batched byte-parity, no HTTP/tokenizer/scheduler in the loop.

@@ -6,7 +6,7 @@ Full-chain bf16 tape plan (`docs/plans/2026-07-25-fullchain-bf16-tape.md`)
 targets moving the agent-OPD writeback OOM wall 30K→60K by storing retained
 buffers bf16. §7 chose **Stage 1a = frozen prompt-prefix K/V** (`PrefixKv.k/v`,
 qwen35.rs:1665) as the minimum first A/B, on the premise it is "the largest
-single retained buffer." Shipped S1a (commit `2738a5b90`): `quantize_frozen_to_bf16`
+single retained buffer." Shipped S1a (commit): `quantize_frozen_to_bf16`
 (Backend) + `quantize_frozen_bf16` (TensorStore), gated on `--tape-precision bf16`.
 Verified on the H20 pod against ThinkingCap-Qwen3.6-27B-FP8 (r16 α32 attention-qv,
 `--writeback-frozen-prompt-kv true`, deterministic ob172 fixed-length replay so

@@ -1,6 +1,6 @@
 # Quantized-KV attention: one tensor-core kernel for every Qwen — 2026-08-22
 
-> Status: Closed 2026-08-22. Runtime `5759a2caa` → `1df0acf68`, Qwen3.8-27B-NVFP4, 1×H20. Each phase
+> Status: Closed 2026-08-22. Runtime → Qwen3.8-27B-NVFP4, 1×H20. Each phase
 > closes on a measurement and a CHANGELOG line.
 
 ## Where we stand
@@ -24,7 +24,7 @@ Four code paths serve quantized-KV decode today:
 
 ## Phase 1 — tensor-core partial kernel, the only decode path — CLOSED
 
-Landed `97d28ba2c`; c=16 +33 %, c=32 +34 %, kernel 2.7–3.9×, B=32 now 4× off
+Landed c=16 +33 %, c=32 +34 %, kernel 2.7–3.9×, B=32 now 4× off
 the floor ([entry](../experience/wins/2026-08-22-paged-attention-quantized-tensor-core.md)).
 
 - Rewrite the partial kernel: one CTA per (batch row, kv-head, split); the
@@ -44,7 +44,7 @@ the floor ([entry](../experience/wins/2026-08-22-paged-attention-quantized-tenso
 ## Phase 2 — Qwen3 dense joins the same path — CLOSED (family deleted)
 
 No Qwen3 dense checkpoint is served on CUDA; the family and KIVI per-channel K
-were deleted instead of ported (`1df0acf68`, −7,340 lines,
+were deleted instead of ported (−7,340 lines,
 [entry](../experience/wins/2026-08-22-delete-qwen3-dense-cuda-and-kivi.md)).
 Every CUDA quantized pool is per-(token, head) K+V on the Phase 1 kernel.
 
@@ -64,7 +64,7 @@ with per-token KV scales; low certainty).
 
 ## Phase 4 — fill the free GEMM rows — CLOSED (measured; no default to flip)
 
-One binary (`1df0acf68`), Qwen3.8-27B-NVFP4, fp8 KV, 32 K chain, c=1/4/8/16,
+One binary, Qwen3.8-27B-NVFP4, fp8 KV, 32 K chain, c=1/4/8/16,
 per-request decode tok/s: no-spec 73.0 / 42.1 / 25.9 / 14.8; MTP d=2 **84.3**
 / 42.0 / 24.8 / 14.0; MTP d=4 83.0 / 42.1 / 26.3 / 15.1. TTFT identical.
 MTP pays +15 % at c=1 only — the default `--spec-type auto` already selects

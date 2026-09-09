@@ -1,6 +1,6 @@
 # Quantized paged attention on tensor cores — c=16 +33 %, c=32 +34 %, the only quantized decode path
 
-> Status: Landed (`97d28ba2c`). Phase 1 of
+> Status: Landed. Phase 1 of
 > [the unification plan](../../plans/2026-08-22-quantized-kv-attention-unification.md);
 > follows [the GQA-group kernel](2026-08-21-paged-attention-quantized-gqa-shared-dequant.md).
 
@@ -36,7 +36,7 @@ Diffs are 1–2 bf16 ulp from P rounding to bf16 before P·V. B=32 is 4× off
 the bandwidth floor (was 11×).
 
 End-to-end, Qwen3.8-27B-NVFP4, 1×H20, fp8 KV, MTP on, 32 K agent prompts
-×32, 214 output tokens, two interleaved trials per arm, base = `e3b9b0f81`:
+×32, 214 output tokens, two interleaved trials per arm, base = :
 
 | arm | c=1 decode tok/s | c=16 decode tok/s | c=32 decode tok/s |
 | --- | ---: | ---: | ---: |

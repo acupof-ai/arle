@@ -29,7 +29,7 @@ device argmax fast path never produced alternatives.
 
 ## Bench
 
-H20 pod, build `lp202` (a8150bc6b), ThinkingCap-27B-FP8, DSpark serve
+H20 pod, build `lp202`, ThinkingCap-27B-FP8, DSpark serve
 (`--spec-type dspark`), 2026-08-14. 13/13 e2e checks PASS:
 
 - Shape: `tokens` / `token_logprobs` / `top_logprobs` / `text_offset` equal

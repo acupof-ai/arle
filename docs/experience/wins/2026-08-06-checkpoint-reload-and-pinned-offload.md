@@ -26,7 +26,7 @@ rejected. Copy-engine traffic in-window: HtoD 327.8 GB / 38.16 s, DtoH 101.5 GB 
 ## Arm 1 — `--checkpoint-reload-device` (reload the offloaded hidden to device)
 
 `ensure_checkpoint_device` (tensor.rs) restored **only** `CheckpointResidency::L3`.
-It was added by the L3 commit `ac348032c` for the case where the payload is not in
+It was added by the L3 commit for the case where the payload is not in
 `tensor.data` at all; the `Host` case was left to lazy per-op `ensure_device`. But
 the replay's forward ops gate on device residency (`reshape` at ops/layout.rs:22,
 `slice`, `silu`, … each fall to a host `Vec` path when `dirty == Host`), so a
@@ -75,19 +75,19 @@ would have added ~100 GB of write-combined host reads and could have come out
 slower than the pageable path it replaced.
 
 Slot capacities round to 64 MiB with best-fit reuse and an exact-fit fallback
-(`aa5b1f820`, `d1870526f`): exact-length reuse plus varying OPD trajectory
+: exact-length reuse plus varying OPD trajectory
 lengths exhausted the budget on the first size classes and silently disabled the
 pinned path. Every copy names its own length, since cudarc's typed memcpy copies
 the whole destination.
 
-`d1870526f` also removes a full-source clone in `slice_host_eager` (it cloned
+ also removes a full-source clone in `slice_host_eager` (it cloned
 the whole tensor to read one chunk), which cuts the baseline arm's replay memcpy
 too — all arms must be measured on the same tree.
 
 Precedent for DtoH into cudarc write-combined pinned memory:
 `infer-cuda/src/qwen35.rs:1396` (recurrent-state snapshot), in production.
 
-## Results — measured 2026-08-06, pod GPUs 4+5, tree `d7ecbbcee`, one rep/arm
+## Results — measured 2026-08-06, pod GPUs 4+5, tree one rep/arm
 
 | arm | backward | step | loss | grad_norm | peak VRAM (cp0/cp1) | host RSS |
 |---|---:|---:|---:|---:|---:|---:|

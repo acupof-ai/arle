@@ -1,7 +1,7 @@
 # CP ring FA3 pair offsets were halved for two days — one `* 2`, 6.4× wrong gradients — 2026-08-19
 
 Fixes [`2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md`](../errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md).
-Commit `ad1192864`.
+Commit.
 
 ## Context
 
@@ -11,7 +11,7 @@ grad_norm 14.014 at cp=2 against 10.870087 / 2.197122 at cp=1.
 
 ## Root cause
 
-`652f87cb8` (2026-08-17, "2D KV ownership sharding") dropped `* 2` from the five
+ (2026-08-17, "2D KV ownership sharding") dropped `* 2` from the five
 run-offset expressions in the FA3 pair route — three in
 `ring_block_fwd_merge_fa3`, two in `ring_block_bwd_fa3`:
 
@@ -32,7 +32,7 @@ rank that happens to hold one contiguous range is unaffected.
 ## Verification
 
 `cp_hidden_parity`, 2×H20, cp=2, seq=16 — the same gate that last passed at
-`083e2e89a` (2026-08-16):
+ (2026-08-16):
 
 | | 2026-08-16 (last pass) | before fix | after fix |
 |---|---:|---:|---:|
@@ -90,7 +90,7 @@ No bisect build was needed.
 
 ## Why three layers of gating missed it
 
-- `652f87cb8`'s own gate was "needle ladder ×3 at world=4 — **pending-remote**".
+- 's own gate was "needle ladder ×3 at world=4 — **pending-remote**".
   That is an *inference* gate; the commit also changed the *training* ring.
 - The training CP gate (`cp_hidden_parity`) was never re-run after 2026-08-16.
 - The 0.8B CP correctness arm, which compares cp=1/2/4 grad_norm, cannot run at
@@ -100,7 +100,7 @@ No bisect build was needed.
 ## Rule
 
 A commit that edits a shared kernel must run the gates of **every** consumer, not
-the gate of the feature it was written for. `652f87cb8` was an inference feature
+the gate of the feature it was written for. was an inference feature
 whose diff reached into the training ring; its stated gate could not have caught
 this even if it had run.
 

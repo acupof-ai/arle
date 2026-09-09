@@ -38,7 +38,7 @@ half-state).
 ## Note
 
 `BufferedDiffusionExecutor::into_inner` was listed as deleted in the wave 4
-entry but was still in the tree (commit `aa10fccca` removed `new`, missed
+entry but was still in the tree (commit removed `new`, missed
 `into_inner`). Wave 5 completed it.
 
 The first pass also over-deleted `linear_profile::reset()`: the finder's

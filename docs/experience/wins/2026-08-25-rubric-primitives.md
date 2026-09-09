@@ -32,7 +32,7 @@ adds the missing Rubricator and the test gate.
 # - reward-hack tripwire (in-loop score rises while held-out falls → revert)
 ```
 
-- Baseline: `8b7e8754e` (no Rubricator, no rubric tests)
+- Baseline: (no Rubricator, no rubric tests)
 - Treatment: this commit
 - Trials: pending-remote
 

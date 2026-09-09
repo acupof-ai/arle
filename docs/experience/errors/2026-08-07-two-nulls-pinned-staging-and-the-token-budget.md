@@ -15,7 +15,7 @@ with 3487 D2H readbacks. `clone_dtoh` lands in a pageable `Vec`, so the driver
 page-locks a staging buffer, copies, and frees it — ~615 µs to allocate, ~298 µs
 to free, to move a handful of i32 tokens.
 
-**Fixed in `7b8a66603`:** added `PinnedSlot<T>` (the pinned twin of `SliceSlot`'s
+**Fixed in :** added `PinnedSlot<T>` (the pinned twin of `SliceSlot`'s
 exact-length reuse) and routed the three readbacks that run every tick through
 it — the batched draft draw, the single-token autoregressive draft step, and
 `argmax_rows`.
@@ -69,7 +69,7 @@ profile's `dense_ffn` curve gives a 0.173 ms/layer memory floor and a
 110.52 ms mean — so the tail looked like a decode row waiting behind a prefill
 step, and shrinking the budget looked like it would cut it.
 
-**Exposed in `ed92c6d8c`** as `--max-num-batched-tokens`, then swept on one
+**Exposed in ** as `--max-num-batched-tokens`, then swept on one
 binary with 16384 run twice as its own noise control:
 
 | budget | TPOT | p90 | p99 |

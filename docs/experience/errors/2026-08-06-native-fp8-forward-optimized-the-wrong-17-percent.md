@@ -1,7 +1,7 @@
 # Native FP8 forward halved the GEMM cluster and moved the step wall 1%
 
 **Date:** 2026-08-06 · **Verdict:** REJECT `--fp8-native-gemm` · **Commits:**
-`cafda607c` (feature, on main), stream-guard fix on main (`3c021aead`)
+ (feature, on main), stream-guard fix on main
 
 ## Context
 
@@ -44,7 +44,7 @@ net wall moved 1%. The predicted ~300 s was unreachable by a forward-only flag.
 ## Fix
 
 `--fp8-native-gemm` stays **off** (opt-in, no default flip). The feature and the
-stream-guard fix (`3c021aead`: the dense DeepGEMM entry now accepts CUDA's legal
+stream-guard fix (: the dense DeepGEMM entry now accepts CUDA's legal
 null default stream, which autograd runs on) remain in the tree — the stream fix
 is a genuine correctness bug repair, and the fp8 forward is correct and available
 for any future backward-bound-elsewhere regime. No revert.

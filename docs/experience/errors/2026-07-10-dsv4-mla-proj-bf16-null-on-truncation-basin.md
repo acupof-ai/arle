@@ -11,12 +11,12 @@ experiment (no bf16 weights exist on disk) was unblocked by shipping
 `ARLE_DSV4_MLA_PROJ_BF16` (opt-in, default OFF): loader-side host FP8→bf16
 block dequant copies of the three weights, and BOTH decode lanes (n=1 fused
 AND n≥2 batched) routed through bf16 cublasLt so all decode batch sizes share
-one arithmetic; prefill keeps FP8 DeepGEMM. Commits: `f261c6b03` (lever),
-`047056fb4` (F32 power-of-two scale sidecar fix — the checkpoint's `.scale`
+one arithmetic; prefill keeps FP8 DeepGEMM. Commits: (lever),
+ (F32 power-of-two scale sidecar fix — the checkpoint's `.scale`
 is F32, not E8M0; boot failed until normalized via `dsv4_block_scale_e8m0`
 like the main FP8 load path).
 
-## Experiment (pod, 8×H20, TP=4 GPUs 4-7, isolated tree `/host/arle-build-150` @ `095dcca6` = main+`047056fb4`)
+## Experiment (pod, 8×H20, TP=4 GPUs 4-7, isolated tree `/host/arle-build-150` @ = main+)
 
 Same binary all arms (`sha256 bac21cab…`, sccache-reproduced byte-identical),
 same boot env (`ARLE_DSV4_MOE_BACKEND=allreduce ARLE_DSV4_INCREMENTAL_KV=1

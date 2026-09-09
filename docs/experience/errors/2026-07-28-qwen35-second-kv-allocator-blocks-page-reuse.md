@@ -48,7 +48,7 @@ not dead weight.
 
 ## Fix
 
-Reverted (`247461a90`). The 8.7 s stands as measured and remains the largest
+Reverted. The 8.7 s stands as measured and remains the largest
 single term in warm TTFT — c=1 on the long-agent dataset spends 974 s of its
 3161 s wall there — but removing it means converging qwen35 onto the
 host-allocator + `mirror_slot` model that `qwen.rs` already uses, not deleting

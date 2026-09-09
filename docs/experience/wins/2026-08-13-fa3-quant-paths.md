@@ -25,7 +25,7 @@ Path B should match or beat the varlen kernel; Path A trades temp VRAM for FA3's
 ## Environment
 
 - H20 pod, single GPU, CUDA 12.8
-- Binary: commit a3a769db1
+- Binary: commit
 - Server flags: `--kv-cache-dtype fp8|int8`
 
 ## Results

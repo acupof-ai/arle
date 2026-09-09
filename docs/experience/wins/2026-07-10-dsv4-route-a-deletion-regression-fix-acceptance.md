@@ -3,14 +3,14 @@
 ## Context
 
 #154's warm-cache needle regression (solo miss up to 98.3% at the pre-fix
-HEAD, bisected: origin `0198c3ba7` + amplifier Route A page-sharing series /
-`e05a467e6` padding) was fixed by the two-commit series `bbaaea93b` (delete
+HEAD, bisected: origin + amplifier Route A page-sharing series /
+ padding) was fixed by the two-commit series (delete
 the entire Route A prefix-reuse machinery, +67/−1553 — pools, tiers,
 restore path, `host_to_flashmla` translation, all of it; whole-slot park
 kept) + the dirty-bit coherence contract (host tables carry only real
 pages; per-(slot,layer) device page tables refresh whenever the host band
 changes, prefill AND decode — decode never resynced before). Simplification
-sweep `b6d5bd887` (behavior-neutral) followed. Acceptance ran at
+sweep (behavior-neutral) followed. Acceptance ran at
 `91981b737` (the byte-identical pre-rewrite stack; later commits are the
 verified-equal rewrite + a Qwen-lane kv-tier pin fix + the neutral sweep).
 

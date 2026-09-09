@@ -23,7 +23,7 @@ Cost grows linearly with the row count and is absent at one row. That is the
 shape of the measured regression: TPOT +9.7% at c=8, +21.5% at c=16, −12.7%
 (faster) at c=1.
 
-`0ac780495` (08-05) is where FlashQLA first compiled into the pod binary, so
+ (08-05) is where FlashQLA first compiled into the pod binary, so
 the per-row call pattern only started being paid then — the same commit that
 delivered the c=1 TTFT win. Fix forward, not revert.
 
@@ -64,7 +64,7 @@ python3 scripts/bench_throughput.py --url http://127.0.0.1:8321 \
 ```
 
 - 1× H20 GPU 6, TP=1, eager, 16 slots. Co-tenants on GPUs 0/4/5.
-- Arm A `010af0ede` (parent), arm B `4933e1bf4` (this change). The only
+- Arm A (parent), arm B (this change). The only
   source delta between them is `crates/infer-cuda/src/qwen35.rs`.
 - Dataset regenerated on the pod; `gen_bench_prompts.py` has no RNG, so it
   reproduces byte for byte (md5 `0f0d67222baa50c884ee3468a66d0df6`).
@@ -143,8 +143,8 @@ both arms:
 
 | arm | c=2 | c=8 | c=16 | cross-row |
 |---|---|---|---|---|
-| A `010af0ede` | 6/6 exact | 24/24 exact | 48/48 exact | none |
-| B `4933e1bf4` | 6/6 exact | 24/24 exact | 48/48 exact | none |
+| A | 6/6 exact | 24/24 exact | 48/48 exact | none |
+| B | 6/6 exact | 24/24 exact | 48/48 exact | none |
 
 ## Problems
 
@@ -199,6 +199,6 @@ change. Building the parent commit as arm A cost about 40 minutes and made the
 delta single-commit.
 
 **Archives expire.** `/host/spec-phase/arle-mk` and
-`/host/gdr-gates/arle-gdr2-3d80dd4`, both cited yesterday as the arms that made
+`/host/gdr-gates/arle-gdr2-`, both cited yesterday as the arms that made
 the champion row falsifiable, are gone from the pod. The A/B above had to
 rebuild its own control. An archived binary is only a control while it exists.

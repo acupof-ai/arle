@@ -8,7 +8,7 @@ a same-binary A/B has excluded the GDN lane, the KV traffic is 34.6 GB whose
 floor is 9.9 ms, so the read looked ~9× off roofline. The derivation was never
 measured, because **no capture in that document was taken above batch 1**.
 
-One `nsys` capture at the served shape settled it. GPU 6, `70760bc09`, c=16 on
+One `nsys` capture at the served shape settled it. GPU 6, c=16 on
 the 32K anchor dataset, a 30 s window at bench elapsed 118–148 s.
 
 ## What was confirmed

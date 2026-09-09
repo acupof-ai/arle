@@ -1,6 +1,6 @@
 # One vector load for the paged-attention KV row — CUDA, 2026-08-21
 
-> Status: Shipped, `185319d40`. Qwen3.8-27B-NVFP4, 1xH20, FP8 KV.
+> Status: Shipped. Qwen3.8-27B-NVFP4, 1xH20, FP8 KV.
 
 ## Context
 

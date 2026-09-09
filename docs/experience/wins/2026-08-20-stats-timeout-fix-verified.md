@@ -12,7 +12,7 @@ timeout and discarded the entire snapshot if any rank missed it. Under load
 
 ## What Worked
 
-Two-part fix in `coordinator.rs` (`c7eb23420`):
+Two-part fix in `coordinator.rs`:
 
 1. Return partial ranks on timeout instead of discarding the entire snapshot.
    Counters are monotonic — a partial snapshot underestimates but never
@@ -40,7 +40,7 @@ produces coherent output.
 - Model: DeepSeek-V4-Flash-0731 (NVFP4, 43 layers, 256 experts)
 - Draft: DeepSeek-V4-Flash-DSpark-draft-fp8 (3 stages, block=5, target=[40,41,42])
 - TP: 2, slots: 6, max_seq_len: 131072
-- Binary: `stats-fix2` (commits `c7eb23420` + `a1b5dffe2`)
+- Binary: `stats-fix2` (commits +)
 
 ## Rule
 

@@ -4,7 +4,7 @@
 
 ## Context
 
-The FlashQLA GDN backward port (`4846f8046`) went to the pod for its first real
+The FlashQLA GDN backward port went to the pod for its first real
 compile. TileLang AOT hard-failed:
 
 ```
@@ -31,7 +31,7 @@ build after the first hit that cache. The port changed `flashqla_gdr.py` **and**
 the three forward kernels that had been "fine" — and forced the first cold compile
 this family has ever had on this box.
 
-Confirmed by bisect, not inferred: `e675f031b`, the commit before any of this
+Confirmed by bisect, not inferred: the commit before any of this
 session's work, built with `ARLE_CUDA_ENABLE_FLASHQLA_GDR=1` in a separate private
 tree, fails **byte-identically** — same kernel, same two instructions, same target.
 Same shared preserved venv, tilelang 0.1.12, matching the `requirements-build.txt`

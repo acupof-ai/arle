@@ -12,10 +12,10 @@ Local (Mac, no nvcc) work is committed; every CUDA-path fix is `pending-remote`
 until a pod rebuild re-runs the ladder — the 2026-07-29 ladder ran the *pre-fix*
 binary.
 
-- T1: slice offsets widened (`e01aa6606`); GDN/elementwise widened (`b5f078ae0`).
+- T1: slice offsets widened; GDN/elementwise widened.
   **Two further i32 walls found by the remote ladder and fixed this session:**
-  conv1d inner offset `src_t*channels` (`d676cbb14`) and the bf16<->f32 bridge
-  length (`15527d80c`). All three `pending-remote`.
+ conv1d inner offset `src_t*channels` and the bf16<->f32 bridge
+ length. All three `pending-remote`.
 - T2.1: long-query fused forward implemented; CUDA 65,536 gate passed.
 - T2.2: CP-only attention deleted; both paths use rectangular recompute.
 - T2.3: 512 GiB host capture removed; CUDA boundary capture streams state only.
@@ -23,12 +23,12 @@ binary.
 - T3.1: persistent gradient accumulation — the shared `merge_grad` fusion still
   used the allocating `add_into_device` (the 65,536 backward-OOM site); fixed
   this session with a `strong_count==1` guarded in-place accumulate
-  (`84ac53fd6`, `pending-remote`).
+ (`pending-remote`).
 - T3.2: indexed CE implemented; CPU parity and exact 64K CE passed.
 - T3.3: MLP already seq-chunked on device (`checkpoint_seq_chunked`); NOT the
   forward wall.
 - T4: programmatic checkpoint default aligned; remaining items pending.
-- T5: `e01aa6606` completed a 64K update. This session's ladder (below) is the
+- T5: completed a 64K update. This session's ladder (below) is the
   latest measured evidence.
 
 ### 2026-07-29 single-GPU ladder (measured, pre-fix binary)
@@ -40,9 +40,9 @@ lora attention-qv:
 |-----|----------|------|
 | 49,152 | **completed optimizer step**, loss 7.233413 | re-anchor holds; fwd 439.8s / CE 2.2s / bwd 1855s |
 | 57,344 | killed mid-backward (coordinator stop) | past the pre-fix death point |
-| 65,536 | backward OOM | `add_into_device` 3.0 GB, card at 26.8 MB free — the T3.1 site, now fixed (`84ac53fd6`) |
-| 131,072 | forward OOM | `import_local_bf16_as_f32` f32 alloc — the bf16 bridge, now widened (`15527d80c`) |
-| 262,144 | index-wall | bf16 bridge i32 guard — now widened (`15527d80c`) |
+| 65,536 | backward OOM | `add_into_device` 3.0 GB, card at 26.8 MB free — the T3.1 site, now fixed |
+| 131,072 | forward OOM | `import_local_bf16_as_f32` f32 alloc — the bf16 bridge, now widened |
+| 262,144 | index-wall | bf16 bridge i32 guard — now widened |
 
 Two remaining walls, both need design (not one-liners), both `pending-remote`:
 1. **backward (~57-65K):** the `merge_grad` third-buffer OOM — fix committed,
@@ -75,8 +75,8 @@ set, and optimizer. Passing a synthetic sub-path is diagnosis, not acceptance.
   this session) — a real optimizer step. The prior 65,536 evidence was
   superseded: on a clean card the pre-fix binary OOMs at 65,536 in the backward.
 - Three CUDA-path i32/memory walls above 49,152 are fixed in local commits but
-  **not yet re-run on a GPU**: conv1d offset (`d676cbb14`), bf16 bridge length
-  (`15527d80c`), and the `merge_grad` third-buffer accumulate (`84ac53fd6`).
+ **not yet re-run on a GPU**: conv1d offset, bf16 bridge length
+, and the `merge_grad` third-buffer accumulate.
 - One forward wall (full-seq f32 GEMM output, ~131K+) is diagnosed but its exact
   binding tensor is unpinned and no fix is written.
 - No existing run proves a complete 128K or 256K update.

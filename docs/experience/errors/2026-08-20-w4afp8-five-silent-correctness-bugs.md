@@ -1,6 +1,6 @@
 # W4AFP8 MoE path: five silent-correctness bugs shipped, caught by review — CUDA, 2026-08-20
 
-> Status: Fix committed (`7cde1ce84`), partially lost when replaced by `6f1b416e4` (kept 3 of 5 fixes), re-applied in `ee8640904`. Math gate 4/4 PASS on the re-applied binary. Long-prefill + concurrent verification pending-remote.
+> Status: Fix committed, partially lost when replaced by (kept 3 of 5 fixes), re-applied in. Math gate 4/4 PASS on the re-applied binary. Long-prefill + concurrent verification pending-remote.
 
 ## Context
 
@@ -54,7 +54,7 @@ The math gate didn't catch bugs 1–3 because it uses short prompts (few tokens,
 
 ## Fix
 
-All in `7cde1ce84` (+ shape validation in loader.rs):
+All in (+ shape validation in loader.rs):
 
 1. `atomicMax(reinterpret_cast<int*>(amax_out), __float_as_int(local_max))` — global cross-block reduction.
 2. Added `w4a8_amax_finalize_kernel` (single thread, converts raw amax → amax/448) between amax and quantize kernels.

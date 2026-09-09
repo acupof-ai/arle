@@ -4,8 +4,8 @@
 
 #166 escalated twice past its filed surface. Layer 1: the `prefix_reuse` gate
 read a nonexistent stats key (`prefix_hit_tokens`; real key
-`prefix_cache_hit_tokens`) and `stat_delta` silently returned 0 (f6cd2ca3a +
-fail-loud d9765b7cf). Layer 2 (the real engine bug, instrumented round-2 pod
+`prefix_cache_hit_tokens`) and `stat_delta` silently returned 0 (+
+fail-loud). Layer 2 (the real engine bug, instrumented round-2 pod
 probes, `dsv4.rs:1191`): with `--dsv4-decode-reuse` ON, the finish
 write-through ALWAYS recaptured the frontier page, replacing the prefill
 chunk-end's tail-less boundary entry (carry at the aligned page end, licenses
@@ -18,10 +18,10 @@ destroyed previously-hitting shapes (republish clears the frontier tail).
 
 ## What Worked
 
-Fix b6f34a564: `capture_finish_frontier` skips the frontier recapture when the
+Fix : `capture_finish_frontier` skips the frontier recapture when the
 page already holds a tail-less boundary entry — the finish forfeits only the
 < page_tokens sub-page tail (exact repeats floor at the aligned boundary).
-Round-3 pod battery (8×H20, DSv4-Flash-FP8 TP=4, b6f34a564):
+Round-3 pod battery (8×H20, DSv4-Flash-FP8 TP=4):
 
 - Probes: EXT + EXT-REPEAT license 26 blocks (was 0), REPEAT2 keeps licensing
   (no retroactive destruction), zero boundary-downgrade republishes logged.

@@ -99,7 +99,7 @@ with no entry is reported as unreferenced.
 First two entries, chosen because they answer an open question:
 
 - `fp4-gemv` — the dense NVFP4 M=1 GEMV at `quantized_gemv.cu:1193`, zero
-  production callers since dispatch convergence `b7432e52a`, never A/B'd
+ production callers since dispatch convergence never A/B'd
   against the Marlin tensor-core GEMM it was replaced by. This is the leading
   candidate explanation for the 84.5 -> 92.4 decode gap
   (`errors/2026-09-09-w4afp8-gemv-killed-item-dsv4-moe-only.md`).

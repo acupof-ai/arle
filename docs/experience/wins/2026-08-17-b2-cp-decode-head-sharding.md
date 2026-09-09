@@ -19,7 +19,7 @@ regression by halving the attention weight read, not the compute.
 
 ## Parameters
 
-- Build: `bash scripts/pod.sh build b2decode --release --features cuda,nccl --bin arle` (jobs=32, 6m37s, BUILD_EXIT=0). Source head `039618336` (B2 commit `807e6c0b4`).
+- Build: `bash scripts/pod.sh build b2decode --release --features cuda,nccl --bin arle` (jobs=32, 6m37s, BUILD_EXIT=0). Source head (B2 commit).
 - Model: `/data00/ThinkingCap-Qwen3.6-27B-FP8`, bf16 KV pool.
 - world=2: `INFER_TP_SIZE=2`. Baseline `INFER_ATTN_CP_SIZE=1` (attn_tp=2); B2 `INFER_ATTN_CP_SIZE=2` (attn_tp=1, attn_cp=2).
 - Correctness: `scripts/lever_gate.sh` needle ladder, `TEMPLATE=qwen3_nonthick RAW=1`, RUNS=3.

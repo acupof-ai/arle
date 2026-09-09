@@ -10,9 +10,9 @@ The `gpu_busy_frac` timer (engine-forward wall via `ENGINE_FORWARD_BUSY_MICROS`,
 emitted per kind=group metrics row) landed 2026-07-23; two serve bugs then
 blocked every measurement attempt (relay-ack teardown + fatal device-pool
 exhaustion — [errors entry](../errors/2026-07-23-agent-opd-mtp-lockstep-single-gpu-teardown.md),
-fixed in `e4ac039dc` + `a9d0c5412`).
+fixed in +).
 
-Valid run: `busytimer-s4`, HEAD `0a42841ad`, 1×H20, ThinkingCap-Qwen3.6-27B-FP8,
+Valid run: `busytimer-s4`, HEAD 1×H20, ThinkingCap-Qwen3.6-27B-FP8,
 `SMOKE=1 SPEC=off SAMPLES=4`. Hard gate passed: completion_tokens > 0 every
 group, 0 teardowns, 0 `#164 backstop` engagements, 16/16 sessions exit 0 inside
 the 600 s CC wall.

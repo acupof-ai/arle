@@ -6,7 +6,7 @@
 greedy-64 identity, defaulted on, then scored **GSM8K 11/100 vs recurrent
 46/100** (raw 8-shot completion, greedy) — 35 one-directional failures, most
 as an immediate-EOS first token after "Answer:". Default reverted
-(`715c37a0c`), then a full adjudication.
+, then a full adjudication.
 
 ## Root Cause
 

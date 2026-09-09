@@ -10,7 +10,7 @@ hypothesis (from a prior run, `run_fkv5`) was a **staging/sandbox bug**: sample 
 had `cd`'d into a SIBLING task's repo (`/host/aopd_work_fkv5/ansible__ansible-0ea40e0`)
 from turn 0 and wasted all 30 turns there, leaving its own diff empty.
 
-Latest HEAD (`017a495c`, binary built on pod with the
+Latest HEAD (binary built on pod with the
 `ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV` symbols verified present), generous budget:
 `--max-turns 30 --max-tokens 4096 --samples-per-prompt 4 --rollout-temperature 1.0`,
 GPU 4, KV BF16 (not FP8). Decoded the full per-sample trajectory (case-as-fact).

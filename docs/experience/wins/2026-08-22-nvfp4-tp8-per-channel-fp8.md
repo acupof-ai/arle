@@ -44,7 +44,7 @@ python3 scripts/bench_throughput.py \
 
 - Baseline: TP>1 fails at load (assertion above); TP1 c=1 = 66.6 tok/s
   (2026-08-18 entry, kernel-ladder figure)
-- Treatment: local working tree (loader fix + `26790bd4d`), TP8
+- Treatment: local working tree (loader fix +), TP8
 - Prompt tokens: 8 (synthetic)
 - Completion tokens: 128 per request
 - Trials: 1

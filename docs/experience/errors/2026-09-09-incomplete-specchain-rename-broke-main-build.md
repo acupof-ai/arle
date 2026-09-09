@@ -2,7 +2,7 @@
 
 ## Context
 
-Commit `f0b71e351` (quantized decode split ceiling 16 -> 64) also executed a
+Commit (quantized decode split ceiling 16 -> 64) also executed a
 planned rename from the batched-mtp-verify plan: struct `DsparkChain` ->
 `SpecChain` in `crates/infer-cuda/src/executor/qwen35.rs`. The definition was
 renamed; three use sites (lines 1775, 1906, 2094) kept the old name. The
@@ -26,7 +26,7 @@ Two stacked faults:
 
 ## Fix
 
-`420e00c10` renames the three use sites. Both lint lanes were re-run without
+ renames the three use sites. Both lint lanes were re-run without
 a pipe and exit 0:
 
 - `clippy -p infer-api --no-default-features --features cuda,no-cuda --lib

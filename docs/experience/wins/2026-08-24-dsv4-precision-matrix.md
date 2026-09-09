@@ -4,6 +4,10 @@
 > NVFP4 44.4 tok/s, MMLU wash); the four quantized-KV arms cannot load by
 > design. The matrix's FP8 26.5 was a census-contaminated measurement.
 
+Baseline: the arms of this sweep are the baseline for one another — every
+number below comes from the same box, binary, and prompt set, measured in
+one session. There is no external reference configuration.
+
 ## Goal
 
 Bench and eval DSv4-Flash across every precision configuration the runtime
@@ -36,7 +40,7 @@ arle_capability_eval_local.py --tasks mmlu --n-samples 200 --concurrency 1 --see
 | FP8 | fp8 | LOAD_FAILED | — | — | — | — | — |
 | FP8 | int8 | LOAD_FAILED | — | — | — | — | — |
 
-FP8 c=1 re-measured on `fp8recheck-v1` (includes `ebb1dd89b`), same GPUs,
+FP8 c=1 re-measured on `fp8recheck-v1` (includes), same GPUs,
 workload and flags, `ARLE_GRAPH_NODE_CENSUS` unset, 16 requests per arm:
 
 | experts | arm | captures | c=1 decode tok/s | TTFT p50 ms |
@@ -92,12 +96,12 @@ only surfaced error is `RelayCoordinator write envelope to worker rank 0:
 relay write payload: Broken pipe`. The real message is in the worker stdout,
 interleaved four ways because all four ranks write it concurrently.
 
-**The FP8 arm's 26.5 tok/s was a measurement artifact.** `16857e541` made an
+**The FP8 arm's 26.5 tok/s was a measurement artifact.** made an
 allocating capture fatal; the FP8 checkpoint recorded 86 alloc nodes per
 capture, so every capture was rejected, and the matrix ran with
 `ARLE_GRAPH_NODE_CENSUS=1`, so every decode step re-attempted the capture and
 walked the node census. That is 2x slower than plain eager (26.5 vs 51.9).
-`ebb1dd89b` restores the warn; the re-measure above is the truth. DeepEP and
+ restores the warn; the re-measure above is the truth. DeepEP and
 DeepGEMM were not a factor: both checkpoints ran the default `allreduce`
 transport and the M=1 GEMV lanes.
 
@@ -112,12 +116,12 @@ re-serialization forces (its low-rank `wo_a` is left unquantized, so there is
 no DeepGEMM cache) and which at TP=4 < `o_groups`=8 allocated its `[4096,1]`
 gather and `[1024,1]` scatter scratch on every call. NVFP4's block-scaled
 `wo_a` takes the DeepGEMM lane, which already staged through the fixed
-buffers. `7fa06218a` shares that staging with the cuBLAS lane:
+buffers. shares that staging with the cuBLAS lane:
 
 | build | FP8 captures | FP8 alloc nodes | FP8 c=1 tok/s | NVFP4 alloc nodes | NVFP4 c=1 tok/s |
 |---|---:|---:|---:|---:|---:|
-| `a4bd9a8a2` | 72 | 86 | 60.3 | 0 | 45.2 |
-| `7fa06218a` | 72 | **0** | 60.4 | 0 | 45.1 |
+| | 72 | 86 | 60.3 | 0 | 45.2 |
+| | 72 | **0** | 60.4 | 0 | 45.1 |
 
 Decode is unchanged, as expected: the allocations were legal under
 `AUTO_FREE_ON_LAUNCH`; the fix is what lets the strict alloc audit hold across
@@ -135,7 +139,7 @@ runs on every capture attempt; with rejected captures that is every step.
 
 **The census is the only evidence for an alloc node's origin.** Two
 same-sized buffers (`normed` [4096,1] and the O-LoRA `latent` [1024,1]) were
-first "identified" from sizes alone and moved to graph buffers (`6469d1668`,
+first "identified" from sizes alone and moved to graph buffers (
 reverted): node count and alloc count did not move, because the captured c=1
 lane is the slot lane, whose activations were already persistent. Read the
 kernel neighbours in the census before touching code.
@@ -159,7 +163,7 @@ Open: the compressor's BF16 full-history retention (5.5 GB/slot at 1M): decode
 already attends the FP8-packed rows in the paged pool, but
 `flashmla_prefill_attention` reads the BF16 history, so a ring there is a
 prefill numerics change behind the needle gate, not host bookkeeping. The
-prefill-transient reserve landed as `94a15d415` — see
+prefill-transient reserve landed as — see
 `2026-08-24-dsv4-budget-prefill-reserve.md`.
 
 ## Artifacts
@@ -167,4 +171,4 @@ prefill-transient reserve landed as `94a15d415` — see
 - `/host/arle-ops/runs/c1g/matrix/matrix.tsv`, `bench-*.json`, `mmlu-*/`
 - `/host/arle-ops/runs/c1g/kvprobe/serve-{fp8,int8}.log`
 - `/host/arle-ops/runs/c1g/recheck/bench-fp8-nocensus-{graph,eager}*`, `serve-{graph,eager}.log`
-- `/host/arle-ops/runs/c1g/c8/bench-fp8-mtt131072-mrr8*` (c=1,8), `eval8/mmlu/` (MMLU 200), `census2/rank0.txt` (node census), `fix/bench-{fp8,nvfp4}*` + `serve-{fp8,nvfp4}.log` (`7fa06218a`)
+- `/host/arle-ops/runs/c1g/c8/bench-fp8-mtt131072-mrr8*` (c=1,8), `eval8/mmlu/` (MMLU 200), `census2/rank0.txt` (node census), `fix/bench-{fp8,nvfp4}*` + `serve-{fp8,nvfp4}.log`

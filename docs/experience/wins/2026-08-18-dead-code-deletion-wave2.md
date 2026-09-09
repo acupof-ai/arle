@@ -27,7 +27,7 @@ including cfg-gated and build.rs-generated callers).
 | plan/core/util | infer-plan, infer-core, infer-util | SpecPlan, ForwardPlan.spec/.microbatch fields (+8 external initializers), ForwardMode::TargetVerify/DraftExtend, merge_vocab_shard_argmax, diffusion_prediction_from_logits, generate_diffusion wrapper, predict_row/sample_gumbel orphans, RecallPlan::recalled_blocks, Engine::cancel_all_requests (pub→private), resolve_weighted_model_path, download_runtime_assets_from_hub | ~330 |
 | autograd | autograd | module.rs whole file, ConstantLr/LinearWarmup/parse_lr_schedule (CosineWithWarmup + LrSchedule live), fused_linear_distill sparse leftovers, comm_world_rank, checkpoint_sequential group_size param collapsed to inline `li + 1` | ~520 |
 | cli / train | cli, train | --teacher-topk ×2 (parsed-but-rejected stub; engine-side top-k never landed), reject_unimplemented_gkd_objectives, GkdLossConfig.teacher_topk field + validation/step rejection arms, checkpoint_policy group_size arg, unused KlDirection import | ~120 |
-| infer-cuda | infer-cuda | tp.rs with_comm/oneshot_comm_active, dsv4_resident_ab.rs 3 dead env-var sets + env_flag helper (decode-graph lane deleted 9b12060fc), paged_kv_table.rs dsv4_pack_token_byte_base + dsv4_decode_route_index host mirrors | ~110 |
+| infer-cuda | infer-cuda | tp.rs with_comm/oneshot_comm_active, dsv4_resident_ab.rs 3 dead env-var sets + env_flag helper (decode-graph lane deleted), paged_kv_table.rs dsv4_pack_token_byte_base + dsv4_decode_route_index host mirrors | ~110 |
 | Marlin kernel arg | cuda-kernels | unused `int max_shared_mem` arg from MARLIN_KERNEL_PARAMS macro + template + launch site (max_shared_mem_new stays as LaunchKernel dynamic-shm-size arg) | ~15 |
 | stale docs/scripts | docs, scripts | eval_humaneval.py, eval_mbpp.py, scripts/README.md 6 stale rows, environment.md INFER_MARLIN_W4_FP8_PREFILL row, architecture/codebase-map/AGENTS kv_turboquant drift | ~120 |
 
@@ -42,7 +42,7 @@ including cfg-gated and build.rs-generated callers).
 - KVCacheDtype — live internally (paged_kv.rs legacy mapping); only the re-export was removed in wave 1
 - agent-bench whole crate — deleted 2026-08-18 (user confirmed); 743-line harness crate, zero external dependents
 - mlx-sys C++ dead wrappers, infer-metal pipeline_fast_path_hits — deleted 2026-08-18 (user confirmed); 75 C++ symbols + 4 Rust symbols, −2,724 lines, Metal test lane pass
-- mlx-sys transitively-dead state (QWeight GGUF/reorder fields, embed_packed, gdr_metal_kernel_enabled, attn-mask/cache-pos/rope-offset ctx fields, capture_final_hidden, bridge GGUF kernel stack) — deleted 2026-08-18 (6dcd3931d); −755 lines, zero runtime change, 0.8B inference smoke test pass
+- mlx-sys transitively-dead state (QWeight GGUF/reorder fields, embed_packed, gdr_metal_kernel_enabled, attn-mask/cache-pos/rope-offset ctx fields, capture_final_hidden, bridge GGUF kernel stack) — deleted 2026-08-18; −755 lines, zero runtime change, 0.8B inference smoke test pass
 - arle_monitor.py / arle_watchdog.sh / cp2_ttft_oneshot.sh cluster — deleted 2026-08-18 (user confirmed); zero external callers
 - dsv4_route.cu 14 dead exports — blocked on user's in-flight ffi/moe.rs W4AFP8 work; delete after merge
 
@@ -51,15 +51,15 @@ including cfg-gated and build.rs-generated callers).
 ### Local (Mac)
 
 ```
-cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib  → clean (after c9a01d538)
+cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib → clean (after)
 cargo check -p cuda-kernels -p infer-cuda --no-default-features --features cuda,no-cuda → clean
-cargo check -p cli --no-default-features --features cuda,no-cuda                       → clean (after 477541e04)
+cargo check -p cli --no-default-features --features cuda,no-cuda → clean (after)
 cargo clippy -p <all changed crates> -- -D warnings                                     → zero warnings (changed crates)
 cargo test -p cli --release --no-default-features --features metal,no-cuda              → pass
 cargo test -p arle --profile release-fast --no-default-features --features cpu,no-cuda,cli → pass
 ```
 
-Wave-3 follow-up (6dcd3931d, transitively-dead state):
+Wave-3 follow-up (transitively-dead state):
 ```
 cargo check -p infer-metal --no-default-features --features metal  → clean
 cargo clippy -p infer-metal --features metal -- -D warnings        → zero warnings
@@ -71,12 +71,12 @@ Metal bench 0.8B (512 prompt, 128 decode, K=3)                    → TTFT 174.8
 
 Pre-existing warnings on HEAD (not from this wave): infer-cuda/src/gpu_sample.rs
 spawn/parse_nvidia_smi/query_nvidia_smi never used — the sampler was disabled
-in bbd422973. Left for the owner of that change.
+in. Left for the owner of that change.
 
 ### Remote (CUDA build + parity gate) — verified
 
 - `cargo build --release --features cuda,nccl --bin arle` on pod (H20, sm_90)
-  at 477541e04: clean (BUILD_EXIT=0). First attempt at 01e9c4822 failed on
+ at : clean (BUILD_EXIT=0). First attempt at failed on
   the CUDA-gated `agent_opd.rs` stale import — see Problems.
 - `scripts/lever_gate.sh` with Qwen3.5-9B on GPU 1 (NEEDLE_MAX_TOKENS=2000,
   full ladder ×3):
@@ -115,15 +115,15 @@ consumed all 2000 tokens on reasoning_content, empty output).
 
 ## Problems
 
-- **User's committed code broke the cuda,no-cuda lane (fixed in c9a01d538)**:
-  64a922bbf added `if rc != 0 { bail!("... {rc}") }` on the FFI's `CUresult`
+- **User's committed code broke the cuda,no-cuda lane (fixed in)**:
+ added `if rc != 0 { bail!("... {rc}") }` on the FFI's `CUresult`
   enum in moe.rs:2318 — CUresult is neither comparable to 0 nor Display.
   Fixed to `rc != CUresult::CUDA_SUCCESS` + `{rc:?}`, matching the pattern in
   infer-cuda/src/tp.rs. Flagged to the user since they may be mid-edit on the
   W4AFP8 path.
 - **External restore wiped tranche B mid-wave**: the user's W4AFP8 workflow
   restored all of csrc/ + ffi/{attention,misc}.rs to HEAD, deleting
-  uncommitted wave-2 work. Re-applied and committed immediately (63e52f55d).
+ uncommitted wave-2 work. Re-applied and committed immediately.
   Lesson reinforced: work is durable only once committed.
 - **Brace-matching orphans (×2)**: TpLinearConfig and LinearWarmup cuts
   matched the struct's column-0 `}` instead of the impl's, leaving orphaned
@@ -136,7 +136,7 @@ consumed all 2000 tokens on reasoning_content, empty output).
   crates/cuda-kernels with repo-root-relative paths and silently searched only
   cuda-kernels/src/. Re-ran from the repo root; found 5 symbols still had Rust
   FFI decls. Lesson: zero-ref verification is only as wide as the cwd.
-- **CUDA-gated caller invisible on Mac (fixed by user in 477541e04)**: the
+- **CUDA-gated caller invisible on Mac (fixed by user in)**: the
   `reject_unimplemented_gkd_objectives` deletion left a stale import in
   `cli/train_cli/agent_opd.rs`, which is `#[cfg(feature = "cuda")]`-gated —
   invisible to the Mac `metal,no-cuda` test lane and to the

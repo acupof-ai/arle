@@ -1,6 +1,6 @@
 # The DSpark online head does move drafting — my threshold for it was wrong twice
 
-Date: 2026-08-04 · `/host/arle-runs/warm-ce-tv-v2/` · build `bf16floor` (`ea4798cc5`)
+Date: 2026-08-04 · `/host/arle-runs/warm-ce-tv-v2/` · build `bf16floor`
 
 ## Context
 
@@ -8,7 +8,7 @@ The 2026-08-03 run froze serve `accept_rate` at `0.15574302401038287` across 61
 training steps ([entry](2026-08-03-dspark-online-sidecar-degrades-regardless-of-loss.md)).
 Diagnosis: the trained bias (~1e-3) was under half a bf16 ulp of the base draft
 logit (~0.03), so `base + bias` returned `base` bit-for-bit. Fixes shipped in
-`ea4798cc5`: hashed `w1` cold start, `lr` default 1e-4 → 1e-3, and a permanent
+: hashed `w1` cold start, `lr` default 1e-4 → 1e-3, and a permanent
 `rms|w1| rms|w2| est|bias|` line at every publish.
 
 This run re-ran the same recipe at a 260-step budget, 281 steps and 35 publishes.

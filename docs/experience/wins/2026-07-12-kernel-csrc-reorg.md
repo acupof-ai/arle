@@ -1,15 +1,15 @@
 # CUDA kernel `csrc/` reorg — `misc/` junk drawer exploded, dead code deleted
 
 **Date:** 2026-07-12. **Backend:** CUDA (`crates/cuda-kernels/csrc/`).
-**Commits:** `a07a48d90` (delete dead kv+marlin GEMM), `9fc53e7e4` (explode
-`misc/`), `051edb29b` (relocate last file + delete `misc/` dir). **Bench-exempt:**
+**Commits:** (delete dead kv+marlin GEMM) (explode
+`misc/`) (relocate last file + delete `misc/` dir). **Bench-exempt:**
 pure directory reorg + dead-code deletion — no runtime code path changed
 (byte-identical kernels, `build.rs` walks `csrc/` recursively so nvcc picks up
 the new dirs automatically). No FFI symbol with a live caller was touched.
 
 ## Context
 
-The `kernel-registry.md` audit (`5ea39b464`, 2026-07-12) flagged `misc/` as a
+The `kernel-registry.md` audit (2026-07-12) flagged `misc/` as a
 19-file **MISPLACED dumping ground**: it held core live ops (`norm.cu`,
 `sampling.cu` incl. DSpark chain-rejection, `elementwise_basic.cu`, the entire
 live DSv4 attention family, Qwen3.5 linear-attn, the FlashMLA/FA3 shims) with no
@@ -19,7 +19,7 @@ with **0 callers**.
 
 ## What Worked
 
-**Deleted dead code (`a07a48d90`, 15 files, −6545 LOC):** Marlin GEMM
+**Deleted dead code (15 files, −6545 LOC):** Marlin GEMM
 (`marlin_kernel.cu` 869, `marlin_w4a8_kernel.cu` 1086, `marlin_w4_fp8_kernel.cu`
 308, `marlin_dequant.cuh` 651, `marlin_pf8/` 7 headers ~3393) — the repack path
 (`gptq_marlin_repack`, `marlin_int4_fp8_preprocess`) stays live, only the
@@ -27,7 +27,7 @@ never-called GEMM kernels went; `kv/paged_kv_append.cu` (89), `kv/scatter_kv.cu`
 (63) — superseded by the TileLang kv8 path; plus their 5 `extern "C"` decls in
 `src/ffi/{gemm,kv}.rs`.
 
-**Exploded `misc/` 19→0 (`9fc53e7e4` + `051edb29b`):** new `sampling/`·`norm/`·
+**Exploded `misc/` 19→0 (+):** new `sampling/`·`norm/`·
 `recurrent/`·`elementwise/` dirs; DSv4 MLA/DSA/MHC + TP-repack + FlashMLA/FA3
 shims → `attention/`; `fused_mlp.cu` → `gemm/`, `split_qkv.cu` → `attention/`;
 `kvcacheio/transfer.cu` merged into `kv/`. `misc/` directory removed. Every

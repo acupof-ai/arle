@@ -1,6 +1,6 @@
 # T3 in_proj_b+a row-fusion: −4.7% decode ITL — CUDA, 2026-08-03
 
-> Status: **Shipped, default path** (`4952f0df5`, #196 T3). c=1 W8A16 decode
+> Status: **Shipped, default path** (#196 T3). c=1 W8A16 decode
 > ITL p50 **26.31 → 25.08 ms**; with T1, **26.88 → 25.08 ms (−6.7%)** against
 > the pre-#196 baseline. Greedy byte-identical to the unfused binary.
 

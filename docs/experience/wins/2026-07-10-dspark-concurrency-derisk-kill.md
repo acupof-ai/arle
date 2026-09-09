@@ -2,7 +2,7 @@
 
 ## Context
 
-The "DSpark doesn't batch" claim (`5bc1b3e8f`) was corrected against the paper:
+The "DSpark doesn't batch" claim was corrected against the paper:
 DSpark's Hardware-Aware Prefix Scheduler (Algorithm 1) is *designed* to hold
 throughput at concurrency. Before building it (decompose: ≥1-week batched
 ragged-verify substrate, terminates in frozen attention files), one spike

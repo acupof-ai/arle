@@ -53,9 +53,9 @@ step to get achieved GB/s vs H20 HBM peak (~4.0 TB/s).
 - **Binary provenance (caveat):** running serve = `/host/arle-dsv4-snap/arle`,
   built 2026-07-03 13:29 UTC, embeds git sha `59807616` which is **untraceable**
   in both local and pod git (a #138-campaign WIP; the pod build tree
-  `/host/arle-build` has since been reset to HEAD `954d9905`, the #138 root-cause
+ `/host/arle-build` has since been reset to HEAD the #138 root-cause
   fix — the task's floor). Commit-exact provenance is therefore NOT proven.
-  What IS proven: the binary was built 3 h *after* `954d9905` committed
+ What IS proven: the binary was built 3 h *after* committed
   (10:24 UTC), and it passes the #138 correctness gate directly — a ~2014-token
   prompt returns **coherent, on-topic text** (189 tok, EOS'd early), no
   token-0/NaN collapse. The commit floor is a proxy for that gate; the gate
@@ -159,4 +159,4 @@ slots ≈ 1.8–2.0/req, matching c=1).
 - Follow-ups: (1) SLO-shape run at ≥4096 prefill / ≥8K prompt; (2) raise
   `num_slots` (>4) and re-measure the decode ceiling under real batching;
   (3) `ncu` decode-GEMV roofline for an optimization pass; (4) a
-  provenance-clean rebuild from `954d9905` if a commit-exact number is needed.
+ provenance-clean rebuild from if a commit-exact number is needed.

@@ -12,14 +12,14 @@
 
 ## Goal
 
-`docs/baselines.md`'s DSpark long-agent row is `51985031d` (2026-07-30) and is
+`docs/baselines.md`'s DSpark long-agent row is (2026-07-30) and is
 three accepted prefill changes stale:
 
 | change | commit | measured effect |
 |---|---|---|
-| chunked GDR default-on | `c2eb5de9e` (08-02) | 33K prefill −27% |
-| FlashQLA actually compiled into the pod binary | `0ac780495` (08-05) | TTFT 31.08 → 25.01 s |
-| snapshot stride 2048 → 8192 | `301d0c074` (08-06) | TTFT 25.3 → 23.0 s |
+| chunked GDR default-on | (08-02) | 33K prefill −27% |
+| FlashQLA actually compiled into the pod binary | (08-05) | TTFT 31.08 → 25.01 s |
+| snapshot stride 2048 → 8192 | (08-06) | TTFT 25.3 → 23.0 s |
 
 Rule 1 of that file replaces a row on any effect over ~10%. Three landed and
 the row did not move.
@@ -62,7 +62,7 @@ stated ±3%.
 
 Against the recorded row, median of the two sweeps:
 
-| c | recorded (`51985031d`) | measured | Δ | vs ±2.7% band |
+| c | recorded | measured | Δ | vs ±2.7% band |
 |---:|---:|---:|---:|---|
 | 1 | 7440.7 | **10425** | **+40.1%** | far outside |
 | 2 | 8292.3 | 20619 | — | `pt` differs, not comparable |
@@ -97,13 +97,13 @@ workloads.
 ## Anchor audit
 
 Rule 4 of `docs/baselines.md`: one A/B against the archived binary bounds
-accumulated drift. `51985031d`'s binary is archived at
+accumulated drift. 's binary is archived at
 `/host/spec-phase/arle-mk`, so this needs no rebuild and no bisect across the
 ~800 commits between the two shas. Same box, same dataset file, same serve
 flags, same grid, back to back.
 
 **The champion reproduces its own row.** Back to back, same shell, HEAD
-`b8d390bf3` against champion `51985031d`: `accept_rate` 0.3121 vs 0.3091 —
+`b8d390bf3` against champion : `accept_rate` 0.3121 vs 0.3091 —
 spec decode acceptance is not the difference.
 
 `TPOT` (= `itl_mean`, the only honest per-token figure on a spec row, since `itl_p50` samples the within-chain
@@ -135,9 +135,9 @@ batch and is absent at batch 1.
 
 | candidate | test | result |
 |---|---|---|
-| `SIDECAR_SNAPSHOT_STRIDE_PAGES` 128 → 512 (`301d0c074`) | same-source A/B, that constant alone | **dead** — 128 is worse everywhere: c=1 −7.0%, c=4 −5.2%, c=8 −6.6% |
-| DSpark goodput cost model mis-fit (`c3f38fdd7`) | same-binary flag A/B, 211/0.53 vs a refit 17.9/1.50 | **dead** — drafted 85570 vs 85735, accept 0.3245 vs 0.3246 |
-| `grammar_bitmask` per-step cost (`7c3946a2e`) | read the guard | **dead** — `is_greedy() && grammar_bitmask.is_none()` keeps the argmax fast path, and the bench is `--temperature 0` |
+| `SIDECAR_SNAPSHOT_STRIDE_PAGES` 128 → 512 | same-source A/B, that constant alone | **dead** — 128 is worse everywhere: c=1 −7.0%, c=4 −5.2%, c=8 −6.6% |
+| DSpark goodput cost model mis-fit | same-binary flag A/B, 211/0.53 vs a refit 17.9/1.50 | **dead** — drafted 85570 vs 85735, accept 0.3245 vs 0.3246 |
+| `grammar_bitmask` per-step cost | read the guard | **dead** — `is_greedy() && grammar_bitmask.is_none()` keeps the argmax fast path, and the bench is `--temperature 0` |
 
 The cost model **is** mis-fit — the model predicts 261.9 ms for a tick measured
 at 162.0 — but `--dspark-block-size 6` caps each row's admitted extra at 5, and
@@ -147,17 +147,17 @@ the argmax saturates over that range. A wrong parameter that nothing reads.
 
 TPOT (ms), same box, same dataset, same flags:
 
-| c | `51985031d` 07-30 | `3d80dd473` 07-31 | `b8d390bf3` 08-06 |
+| c | 07-30 | 07-31 | `b8d390bf3` 08-06 |
 |---:|---:|---:|---:|
 | 1 | 9.690 | 9.669 | **8.462** |
 | 8 | 63.685 | **59.635** | **69.894** |
 | 16 | 111.529 | **113.174** | **135.509** |
 
 The midpoint is clean — faster than the champion at c=8, within 1.5% at c=16 —
-so **the regression is entirely in `3d80dd473..b8d390bf3`**: 145 commits, all
+so **the regression is entirely in `..b8d390bf3`**: 145 commits, all
 dated 08-03 through 08-06.
 
-**Archived binaries make a step free.** `/host/gdr-gates/arle-gdr2-3d80dd4` is
+**Archived binaries make a step free.** `/host/gdr-gates/arle-gdr2-` is
 the midpoint prebuilt, so that step cost one sweep and no build. Building it
 instead failed: a `cp -a` bisect tree carries the newer commit's `target/` and
 generated TileLang artifacts, `git checkout --force` only resets tracked files,

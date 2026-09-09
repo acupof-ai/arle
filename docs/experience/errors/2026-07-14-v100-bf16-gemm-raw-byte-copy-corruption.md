@@ -51,7 +51,7 @@ hot path is untouched — gated on `device_compute_major() <= 7`.
   never relied on the broken cast).
 - BF16 end-to-end serve on V100: "2+2?"→"Four",
   "capital of France"→"Paris" — correct greedy output, not garbage.
-- Commit `b94e2fc44`, pushed to `origin/main`.
+- Commit pushed to `origin/main`.
 
 ## Rule
 

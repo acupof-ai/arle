@@ -4,7 +4,7 @@
 
 ## Context
 
-`cfec5827e` let `determine_exec_config` search `blocks_per_sm` instead of
+ let `determine_exec_config` search `blocks_per_sm` instead of
 pinning it to 1. Measured +4.5% decode, needle 6/6, shipped. It also made
 `blocks_per_sm > 1` reachable for the first time, and two pieces of surrounding
 code had only ever been correct because it was always 1.
@@ -127,9 +127,9 @@ is the first complete 32K run this checkpoint has produced.
 | 4 | 96.4 | 163.5 | **-41.0%** |
 | 16 | 138.1 | 236.1 | **-41.5%** |
 
-`cfec5827e` was licensed at +4.5%. The true value is 29-42%, and the reason the
+ was licensed at +4.5%. The true value is 29-42%, and the reason the
 original number was so low is that it was measured when only `gate_up` was on
-Marlin — `down_proj` and `o_proj` joined at `5499e20a7`, roughly doubling the
+Marlin — `down_proj` and `o_proj` joined at roughly doubling the
 surface the search acts on.
 
 **An optimisation's licensing number only holds for the surface it was measured

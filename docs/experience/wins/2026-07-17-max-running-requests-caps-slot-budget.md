@@ -14,7 +14,7 @@ construction (`min(max_running_requests, num_slots)`, infer-core/src/lib.rs).
 
 ## What Worked
 
-Commit 77e0d1d5d: a set cap IS the requested executor slot budget
+Commit : a set cap IS the requested executor slot budget
 (`max_running_requests.unwrap_or(num_slots).max(1)`); unset keeps the
 `num_slots` auto-ceiling. Predicted at cap=32: ~9.1GB freed -> pool ~1.28M
 tokens (~15x). Bench numbers pending the pod A/B.
@@ -24,7 +24,7 @@ tokens (~15x). Bench numbers pending the pod A/B.
 Post-#154-3b DSv4 slots TRADE against comp-pool tokens — "the VRAM budget
 always binds first" no longer licenses over-provisioning the slot request.
 
-## Results (pod A/B, 4xH20 TP=4/EP=4 eager, ce5d0b833 build, native runner 256-out)
+## Results (pod A/B, 4xH20 TP=4/EP=4 eager build, native runner 256-out)
 
 Slot lines: default = `num_slots 59, shared comp capacity 83968 tokens`;
 `--max-running-requests 32` = `num_slots 32, shared comp capacity 1048576

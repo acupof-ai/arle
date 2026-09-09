@@ -1,7 +1,7 @@
 # DSv4 FlashMLA per-layer budget fix — needle_gate PASS, exact-fit admission-boundary proof (#85 Route A step 2)
 
 **Date:** 2026-07-08. **Backend:** CUDA, DeepSeek-V4-Flash-FP8, TP=4 (GPUs 4-7,
-GPU1 held by a concurrent legitimate job). **Commit:** `3ebc763f9`.
+GPU1 held by a concurrent legitimate job). **Commit:**.
 **Scope:** `crates/infer-cuda/src/dsv4.rs` (`kv_budget_plan`),
 `crates/infer-cuda/src/attention/kv_layout.rs` (`Dsv4LayerKvLayout::new`).
 
@@ -57,7 +57,7 @@ full build+boot at the parent commit; time-boxed out). The admission-boundary
 exactness proof is the load-bearing correctness evidence, not the pre/post
 delta.
 
-## Problems — orthogonal finding, NOT a `3ebc763f9` defect, newly *reachable* because of it, now FIXED
+## Problems — orthogonal finding, NOT a defect, newly *reachable* because of it, now FIXED
 
 At the tight `num_slots ∈ {1,2}` boundary this fix makes reachable for the
 first time, the server crashed on the very first request. **Corrected same
@@ -68,7 +68,7 @@ sizing/addressing bugs in `Dsv4KvAdapter` (`flashmla_total_pages()` reading
 `.first()` instead of the max-by-`flashmla_slot_pages` layer;
 `mirror_slot_pages`/`prepare_kv_batch` slicing the host's shared page-id
 list instead of deriving each layer's own local range) — both exposed by
-`3ebc763f9`'s per-layer heterogeneity, neither in its arithmetic. Fixed and
+'s per-layer heterogeneity, neither in its arithmetic. Fixed and
 re-verified (3 reject→retry cycles PASS, `needle_gate.py` PASS at
 500/2000 tokens). Full writeup:
 `docs/experience/errors/2026-07-08-dsv4-slot-abort-band-leak-crash.md`.

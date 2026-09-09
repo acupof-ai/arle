@@ -1,9 +1,9 @@
 # DSv4 content-keyed prefix-state pool (Phase 2a) — pod evidence gate PASSED
 
-> Status: **Shipped** — fix commit `0b5bd3d55` on top of the code series
-> (`5dc5ef79b`, `754648421`, `14b264ea7`). 4×H20 (GPUs 4-7), TP4,
+> Status: **Shipped** — fix commit on top of the code series
+>. 4×H20 (GPUs 4-7), TP4,
 > DeepSeek-V4-Flash-FP8, `--max-total-tokens 2048`, binary sha256
-> `7b76c44d1c20…` @ tree `0b5bd3d5`.
+> `7b76c44d1c20…` @ tree.
 
 ## Context
 
@@ -26,7 +26,7 @@ disabling the decode-lane bulk self-heal — every warm decode ran CSA sparse
 attention over 96 zeroed FP8 keys. A constant perturbation that flips
 near-tied tokens: `'738'`+EOS, `291→292`.
 
-Fix (`0b5bd3d55`): never capture/restore the band (derived state = staging
+Fix: never capture/restore the band (derived state = staging
 quantized); restore leaves `fp8_kv_comp_packed_rows=0` and the first
 post-restore decode's existing bulk pack rebuilds it from the restored bf16
 staging. Paired same-binary A/B on the failing trial (`job2a-e2fx`, resend ×10,

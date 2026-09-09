@@ -204,7 +204,7 @@ interface rather than scattered through operator implementations.
 TP leaks upward in exactly three places: weight sharding into the loader, rank
 into the KV budget (`tier budget ÷ world`, still pending on the roadmap), and
 vocabulary into sampling (`lm_head` vocab-parallel, implemented and deleted at
-`9b12060fc`). Three leaks means TP cannot be sealed inside a backend. It is a
+). Three leaks means TP cannot be sealed inside a backend. It is a
 global configuration dimension like dtype: **world and rank are
 construction-time parameters, never runtime queries.**
 

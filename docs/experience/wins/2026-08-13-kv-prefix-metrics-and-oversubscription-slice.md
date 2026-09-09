@@ -40,7 +40,7 @@ python3 scripts/bench_throughput.py \
 
 - Host / GPU: DevOps H20 pod / one isolated NVIDIA H20 96 GB
 - Model / dtype: ThinkingCap-Qwen3.6-27B-FP8 / BF16 KV
-- Source parent: `448104810`; the six changed files match current main
+- Source parent: the six changed files match current main
 - Candidate binary SHA256: `da2fb8224edf0bb5c8fa5628f4914d7aa2f67e8621444964ab3d37ce994c4fd6`
 - Kernel bundle SHA256: `4cd9da81dfa624cd1becaa1416c56458b6edc36994b1f30cac836b52feb167b4`
 
@@ -75,7 +75,7 @@ SIGKILLed after launch. Helper signal tracing saw no signal to the helper; the
 ARLE logs had no graceful-shutdown line; there was no OOM, Xid, or host-memory
 pressure. The sender is unknown. No formal performance result is reported.
 
-Raw evidence is under `/host/arle-kvfix-ops-448104810/evidence/` on the pod.
+Raw evidence is under `/host/arle-kvfix-ops-/evidence/` on the pod.
 
 ## Problems
 

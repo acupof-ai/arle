@@ -2,8 +2,8 @@
 
 ## Context
 
-Series `17aeebcc` (DSv4 prefix cache rides THE tier store, env knob deleted,
-2-collective lockstep contract) + `8b72083a`/`1564a342` (unified flags:
+Series (DSv4 prefix cache rides THE tier store, env knob deleted,
+2-collective lockstep contract) + / (unified flags:
 `--kv-dram` / `--kv-disk` / `--kv-disk-limit` / `--kv-oversubscription`,
 deployment-total ÷ world budgets, fail-loud gates, resolved-tier log line).
 Verified on the 8×H20 pod (DSv4-Flash-FP8, TP=4, GPUs 1/3/4/6) and locally on

@@ -1,7 +1,7 @@
 # Unified kernel set — one full-build binary serves Qwen AND DSv4
 
-> Verification for `89ea8e7c4` (delete model-family kernel partition) +
-> `93dcf4bef` (prebuilt-manifest TARGET fix). Build-shape change: runtime kernel
+> Verification for (delete model-family kernel partition) +
+> (prebuilt-manifest TARGET fix). Build-shape change: runtime kernel
 > dispatch is unchanged per model, so the gate is correctness (both families
 > serve, no NOT_SUPPORTED) + the prebuilt round-trip, not a new SLO number.
 
@@ -32,7 +32,7 @@ Pod (H20 sm_90, nvcc 12.9, `INFER_TILELANG_PYTHON=/host/tilelang-preserve/.venv`
    France is` → ` Paris.` Re-verified Qwen on the same nccl binary (` Tokyo.`).
 4. **Reproducible prebuilt bundle** — export produced `libkernels_cuda.a`
    (10.77 MB) + `libtilelang_kernels_aot.a` (2.95 MB) + `arle-cuda-kernels.manifest`
-   + `manifest.json`, 14 MB total. After the TARGET fix (`93dcf4bef`) a fresh
+ + `manifest.json`, 14 MB total. After the TARGET fix a fresh
    consumer build with NO TARGET override consumes it cleanly ("skipping nvcc and
    TileLang AOT"), no manifest panic.
 5. **Consumer binary serves Qwen** — `Two plus two equals` → ` four.` The
@@ -40,8 +40,8 @@ Pod (H20 sm_90, nvcc 12.9, `INFER_TILELANG_PYTHON=/host/tilelang-preserve/.venv`
 
 ## Problems
 
-- **Ship-blocker found + fixed (`93dcf4bef`):** the content-addressed manifest
-  byte-match (`6cb2c0054`) rejected every exported bundle. `cuda_prebuilt_manifest.sh`
+- **Ship-blocker found + fixed:** the content-addressed manifest
+ byte-match rejected every exported bundle. `cuda_prebuilt_manifest.sh`
   keyed on `target=$TARGET`; cargo injects `TARGET` into build.rs subprocesses
   but the standalone export script has it unset → producer `target=` vs consumer
   `target=x86_64-unknown-linux-gnu` → 100% byte-mismatch panic. Dropped `TARGET`

@@ -1,6 +1,6 @@
 # Linear-attn CP a2a + zigzag reorder: real 27B 256K runs end-to-end — 2026-08-02
 
-> Status: Shipped. Pod-verified (HEAD 1734c69cc, GPUs 2/3): f32-anchored
+> Status: Shipped. Pod-verified (HEAD GPUs 2/3): f32-anchored
 > reorder gate PASS (ce_cp_vs_cpu 8.5e-5, bf16 floor); real 27B cp=2 seq=131072
 > completes a full fwd+bwd+optimizer step, no OOM.
 
@@ -22,23 +22,23 @@ linear-attn layers):
 
 ## What worked
 
-**a2a device transport (`fd8e38e5c` + `b41b130e5`):** NCCL send/recv group +
+**a2a device transport (+):** NCCL send/recv group +
 transpose-sandwich assembly, reusing `ring_send_recv_kv` / `cuda_slice_device` /
 `cuda_concat_parts` — no new kernel. Self-send excluded from the group.
 
-**Zigzag reorder (`b41b130e5`):** a 2N-block permutation in
+**Zigzag reorder:** a 2N-block permutation in
 `linear_attention_core_cp` un-interleaves to global order before the scan and
 re-interleaves before the output shuffle. Derived from `cp_size` alone (CP always
 uses 2N-way zigzag); pure `slice`+`cat` so backward reassembles for free.
 
-**The gate that actually proved it (`1734c69cc`):** `cp_hidden_parity` ran
+**The gate that actually proved it:** `cp_hidden_parity` ran
 `layer_types=[FullAttention, FullAttention]` — it never touched the reorder.
 Switching layer 0 to `LinearAttention` (mixed, mirroring the 27B) put the reorder
 under the f32 anchor. Since reorder + scan are f32 and the CP path is f32, the
 CPU-f32 ground truth separates a reorder bug from bf16 noise — the 27B liveness
 run can't (no single-card anchor fits at seq=131072).
 
-## Verification (pod, HEAD 1734c69cc, GPUs 2/3)
+## Verification (pod, HEAD GPUs 2/3)
 
 - **f32-anchored reorder gate (seq=16, layer 0 LinearAttention):**
   `cp_vs_cpu_f32=3.84e-2 ≤ single_vs_cpu_f32=4.38e-2`; `ce_cp_vs_cpu=8.5e-5`

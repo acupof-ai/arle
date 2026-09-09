@@ -26,6 +26,12 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# This script importlib-loads prereg.py and agenda.py to validate their ledgers.
+# Writing their .pyc would create the junk that check_git_tracked_junk then
+# reports, because the pre-push snapshot is not a git repo and that check falls
+# back to walking the filesystem.
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 
 PUBLIC_DOCS = [
@@ -448,7 +454,10 @@ def check_archived_experience() -> list[str]:
 
 
 # Entries before this date are grandfathered; perf-claim entries on/after it
-# must cite a baseline (a git hash) or carry an explicit waiver line.
+# must say in words what the baseline was, or carry an explicit waiver line.
+# A bare commit hash satisfied this until 2026-09-09 and no longer does:
+# commit references were removed from the docs corpus, and a hash never said
+# what the number was compared against.
 WINS_BASELINE_CUTOFF = "2026-08-23"
 _PERF_RE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:tok/s|tokens/s|req/s|ms|us|ns|GB|GiB|MiB|KiB|MB|KB|TB|TFLOPS|GFLOPS|GB/s|TB/s|%)"
@@ -466,13 +475,12 @@ def check_wins_baseline_citations() -> list[str]:
         text = (ROOT / rel).read_text(errors="ignore")
         if (
             len(_PERF_RE.findall(text)) >= 3
-            and not _HASH_RE.search(text)
             and not _BASELINE_RE.search(text)
             and not _WAIVER_RE.search(text)
         ):
             errors.append(
-                f"{rel}: perf-claim wins entry needs a baseline citation (git hash) "
-                f"or a 'no baseline' waiver; see docs/experience/wins/TEMPLATE-bench.md"
+                f"{rel}: perf-claim wins entry must name its baseline in words "
+                f"or carry a 'no baseline' waiver; see docs/experience/wins/TEMPLATE-bench.md"
             )
     return errors
 

@@ -38,7 +38,7 @@ Multi-GPU TP≥2 DSpark results (H20) are unaffected.
 
 ## Resolution — 2026-07-25
 
-Re-bench at HEAD 59b86ee4c (fresh on-box build, symbol-verified): **zero
+Re-bench at HEAD (fresh on-box build, symbol-verified): **zero
 lockstep-stall WARNs / zero errors over ~2 h of DSpark load** — the
 world_size≤1 self-ack bypass is measured effective; stall root cause closed
 (#168). DSpark-on-V100 stays KILLED on new grounds: the non-user-facing

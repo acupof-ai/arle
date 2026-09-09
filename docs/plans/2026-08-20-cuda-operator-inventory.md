@@ -1,7 +1,7 @@
 # T0 — CUDA operator inventory
 
 > Parent: [CUDA operator organization](2026-08-20-cuda-operator-organization.md).
-> Census date 2026-08-20, checkout `80d8ded87`. Families 1–10 per the parent
+> Census date 2026-08-20, checkout. Families 1–10 per the parent
 > plan's "Operator families" section.
 
 ## Raw-FFI consumption outside cuda-kernels

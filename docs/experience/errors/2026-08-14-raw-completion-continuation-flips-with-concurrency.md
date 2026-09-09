@@ -2,7 +2,7 @@
 
 ## Context
 
-Re-anchoring the DSv4-Flash-FP8 8×H20 DSpark baseline at `fad8f4d5b`
+Re-anchoring the DSv4-Flash-FP8 8×H20 DSpark baseline at
 (120 s/point, greedy, seed 42, 64 synthetic prompts over raw
 `/v1/completions`). The c=16 point reported 7/241 `correctness_failed`; c=1 and
 c=8 reported none.

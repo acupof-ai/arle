@@ -28,8 +28,8 @@ the recv latency hides under the local FA3/scatter compute.
 # concurrency 1 on a long-prompt workload (e.g. 131072-token prefill).
 ```
 
-- Baseline: `f53107d3b^` (synchronous rotate, 8 fences/hop)
-- Treatment: `f53107d3b` (ping-pong overlap, 2 fences/hop)
+- Baseline: `^` (synchronous rotate, 8 fences/hop)
+- Treatment: (ping-pong overlap, 2 fences/hop)
 - Trials: 3
 
 ## Environment

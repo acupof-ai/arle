@@ -3,10 +3,10 @@
 ## Context
 
 Rounds 3–4 on the 8×H20 pod (DSv4-Flash TP=4, GPUs re-picked at boot) closing
-the series: tick-ack lockstep window (`27162919`), Qwen3.6 TP consensus
-(`0fdbf711`), disk-before-recall (`5009dc24`), chunked-blob API + capture
-logging + counter truth (`365796d2`), oversize fail-closed (`326fab5d`),
-rank-prefix init-order fix (`e855141c`, from a round-4 finding).
+the series: tick-ack lockstep window, Qwen3.6 TP consensus
+, disk-before-recall, chunked-blob API + capture
+logging + counter truth, oversize fail-closed,
+rank-prefix init-order fix (from a round-4 finding).
 
 ## What Worked
 
@@ -52,7 +52,7 @@ rank-prefix init-order fix (`e855141c`, from a round-4 finding).
   the per-event sequence before naming something a leak.
 - Worker `[rankN]` log prefixes were silently dropped: the generic logger
   init ran before `worker_entry` and `init` is call_once — fixed by
-  short-circuiting workers first (`e855141c`); re-verify prefixes next pod
+ short-circuiting workers first; re-verify prefixes next pod
   session.
 - Hygiene for next rounds: `cargo test --features cuda` clobbers
   `target/release/arle` (feature unification) — build the serve bin after

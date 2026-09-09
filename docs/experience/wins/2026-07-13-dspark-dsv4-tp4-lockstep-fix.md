@@ -45,7 +45,7 @@ separate lever (noted inline).
   accept_rate:0.0` → the draft path executed and stayed lockstep across all 4
   ranks through verify.
 
-Commit `d4c25f1c2`. Files: `crates/infer-cuda/src/tp.rs`,
+Commit. Files: `crates/infer-cuda/src/tp.rs`,
 `crates/infer-cuda/src/executor/dsv4.rs`.
 
 ## Open — draft acceptance is 0%

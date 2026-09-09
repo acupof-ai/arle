@@ -15,7 +15,7 @@ masked grouped GEMM at all decode shapes — no floor — motivating a measureme
 ## Setup
 
 - Model: Qwen3.6-35B-A3B-FP8 (256 experts, top_k=8, 40 layers), 1×H20, fp8 KV.
-- Same binary (`47e80f06f`), same GPU, sequential A/B, only the flag differs.
+- Same binary, same GPU, sequential A/B, only the flag differs.
 - Prompts: 128 agent prompts, ~33k tokens each. `--spec-type none`, decode graph on.
 - Cells: c=16 (boundary control, R=128=MASKED_BAND, both arms forced to hand
   kernels), c=32 (R=256, treatment arm switches to DeepGEMM), c=64 (R=512).

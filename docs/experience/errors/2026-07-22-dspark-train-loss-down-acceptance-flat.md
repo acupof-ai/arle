@@ -46,13 +46,13 @@ fall while serve acceptance stayed flat. Four defects, all static-verified:
 ## Prior hypothesis — alpha weighting
 
 The first-pass hypothesis blamed `prob_match_alpha = 0.9` (L2 drowns PG).
-The 0.9 → 0.5 flip (`b719eb252`) is predicted no-op pending re-benchmark —
+The 0.9 → 0.5 flip is predicted no-op pending re-benchmark —
 with D1-D3, both loss terms back-propagated through the wrong frame and rows,
 so no weighting could have fixed acceptance.
 
 ## Accept gate — resolved 2026-07-24
 
-Post-fix re-benchmark (721a553bc, same protocol): **still flat** — windowed
+Post-fix re-benchmark (same protocol): **still flat** — windowed
 accept 0.4694 → 0.4583, slope −0.0118/5 min; trainer healthy (loss 0.0020 →
 −0.0867, 0 failed hot-swaps). Decoded case dump (N=2048, `ARLE_DSPARK_DUMP`):
 P(drafted == target_argmax) 0.580 vs base-head argmax agreement 0.479 — the

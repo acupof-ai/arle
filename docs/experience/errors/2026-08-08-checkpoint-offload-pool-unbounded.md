@@ -28,7 +28,7 @@ rank equal shard bytes, so shard size does not explain it.
 ## Root Cause
 
 `CheckpointOffloadPool` (`crates/autograd/src/tensor.rs`, added by the L3 commit
-`ac348032c`) held idle host buffers for reuse with **no bound at all**:
+) held idle host buffers for reuse with **no bound at all**:
 `recycle` pushed every non-empty buffer onto a free list that nothing ever
 drained, and `take` was **first-fit** over that list.
 

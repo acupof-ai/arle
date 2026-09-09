@@ -15,7 +15,7 @@ the machine.
 ```bash
 python3 scripts/gen_bench_prompts.py bench-decode-16x1.jsonl 16 1024 4096 1
 
-/host/fqbatch/arle-C-70760bc09 serve --backend cuda \
+/host/fqbatch/arle-C- serve --backend cuda \
   --model-path ThinkingCap-Qwen3.6-27B-FP8 \
   --spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash \
   --dspark-block-size 6 --port 8178 --max-running-requests 16

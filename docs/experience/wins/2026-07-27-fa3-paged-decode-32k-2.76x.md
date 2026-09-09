@@ -78,7 +78,7 @@ assumed:
   ([entry](2026-07-28-fa3-covers-every-query-length.md)).
 - **Three wrong turns preceded the profile**, all avoidable by running it first:
   a hand-written GQA/warp-per-key/scaled-splits rewrite of
-  `fused_gqa_attention_decode_batched_kernel` (−20.5%, reverted `fcf709e0f`);
+ `fused_gqa_attention_decode_batched_kernel` (−20.5%, reverted);
   `--qwen35-fa3-decode`, which moved nothing (72.4 vs 72.1 ms); and a four-way
   batched/per-row × FA3 sweep that landed within 0.4% because **none of the four
   paths executes** — they are all in the non-paged lane.

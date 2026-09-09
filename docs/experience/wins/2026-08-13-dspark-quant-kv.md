@@ -23,7 +23,7 @@ The `paged_kv_bf16()` gate on batched DSpark draft was conservative ("unvalidate
 ## Environment
 
 - H20 pod, single GPU, CUDA 12.8
-- Binary: commit c04c700a7 (gate removal)
+- Binary: commit (gate removal)
 - Server flags: `--spec-type dspark --mtp-draft-model <DFlash> --mtp-draft-tokens 16 --kv-cache-dtype fp8|int8`
 
 ## Results

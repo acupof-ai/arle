@@ -10,7 +10,7 @@ per-committed-token **context window** as the next lever to reach DeepSeek's
 
 ## Root cause (measured, token-level)
 
-Two clean pod probes on the b350b0f90 baseline (`INFER_DSPARK_DEBUG=1`):
+Two clean pod probes on the baseline (`INFER_DSPARK_DEBUG=1`):
 
 1. **Window is not the lever.** A 200-token generation grows the committed
    context window from ~1 to ~200 tokens. `accept_rate` stayed **flat at 0.0** —

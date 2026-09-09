@@ -4,7 +4,7 @@
 
 ## Context
 
-The stats timeout fix (`c7eb23420`) raised the `/metrics` query timeout from 2s
+The stats timeout fix raised the `/metrics` query timeout from 2s
 to 30s as a bandaid: workers under load (long prefill, busy decode) routinely
 missed the 2s window, and the old code discarded the entire snapshot on any
 rank timeout. The 30s timeout made `/metrics` correct but could block a

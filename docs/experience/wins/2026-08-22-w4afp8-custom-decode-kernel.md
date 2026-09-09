@@ -38,7 +38,7 @@ python3 scripts/bench_throughput.py \
   --synthetic-prompts 8
 ```
 
-- Baseline: `994163a98` (fused-SwiGLU W4A16 paired GEMV, 2026-08-22)
+- Baseline: (fused-SwiGLU W4A16 paired GEMV, 2026-08-22)
 - Treatment: `w4afp8-decode8` (custom W4AFP8 decode kernel)
 - Prompt tokens: 8 (synthetic)
 - Completion tokens: 128

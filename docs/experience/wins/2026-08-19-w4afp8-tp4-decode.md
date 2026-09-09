@@ -10,7 +10,7 @@ TP=4 closes the gap.
 
 ## Result
 
-Same binary (`w4afp8-tp4`, built from `8c1a54948`), same bench script
+Same binary (`w4afp8-tp4`, built from), same bench script
 (`bench_dsv4_trace_http.py`), same model, same pod:
 
 | Config | GPUs | decode64 tok/s | write_zh tok/s |

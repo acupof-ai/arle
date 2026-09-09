@@ -1,6 +1,6 @@
 # merge_base_fp8 matched FP4 matrices; FP4 decoders clamped the group index — 2026-08-18
 
-> Status: Fixed in `11227da43`. Latent — never reachable in production
+> Status: Fixed in. Latent — never reachable in production
 > (`promote_lora_target_to_bf16` rejects a non-FP8 format first), found by an
 > adversarial review of the 4-bit training design.
 

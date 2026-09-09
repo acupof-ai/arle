@@ -1,7 +1,7 @@
 # Batched DSpark over quantized KV loses from c=8 — cause unknown, verify kernel ruled out
 
-> Status: Rejected twice on measurement; gate restored (`1f36fea61`). Runtime `2aa569adc` (gate
-> lifted) vs `7d58850dc`, Qwen3.6-27B-FP8 + `Qwen3.6-27B-DFlash`, fp8 KV,
+> Status: Rejected twice on measurement; gate restored. Runtime (gate
+> lifted) vs Qwen3.6-27B-FP8 + `Qwen3.6-27B-DFlash`, fp8 KV,
 > 1×H20, 32K agent chain, 32 req/point, greedy, `--dspark-block-size 6`.
 
 ## Context
@@ -37,8 +37,8 @@ Gate restored (`paged_kv_bf16()`), with the numbers in the comment.
 ## Follow-up: verify-shape MMA kernel does not close the gap
 
 `paged_attention_quantized_fa3.cu` now takes up to 8 query tokens per row
-(`c177cda5b`, 16-row tile of (token, head) pairs, in-block causal mask), so
-verify rows and plain rows share one kernel. Gate lifted again (`6f8d7da6c`),
+(16-row tile of (token, head) pairs, in-block causal mask), so
+verify rows and plain rows share one kernel. Gate lifted again,
 same setup, needle ladder ×3 12/12 DET:
 
 | c | no-spec | DSpark, per-row | DSpark, batched + MMA verify |
@@ -50,7 +50,7 @@ same setup, needle ladder ×3 12/12 DET:
 
 The c≥8 loss is unchanged, so it does not sit in verify attention. The
 kernel extension stays (one attention path for every decode shape; c=1 is a
-wash); the gate lift is reverted (`1f36fea61`).
+wash); the gate lift is reverted.
 
 ## Follow-up 2: the loss is scheduler stalls, and smaller prefill chunks do not fix it
 

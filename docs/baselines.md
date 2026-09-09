@@ -34,7 +34,7 @@ python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 
 ## Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### SOTA — DSpark, runtime `fad8f4d5b`, runner `c98c4e0b2` (2026-08-14)
+### SOTA — DSpark, runtime runner (2026-08-14)
 
 The Qwen3Next target final norm uses `(1+w)`; the Qwen3 DFlash draft uses
 plain-weight RMSNorm. The fixed-output runner sends `ignore_eos=true`, and its
@@ -47,8 +47,8 @@ slots, 195 MiB per slot.
 
 Identity:
 
-- Runtime commit `fad8f4d5b715698fcada7d2ce382682f18788e03`
-- Runner commit `c98c4e0b2`
+- Runtime commit
+- Runner commit
 - Binary SHA-256 `7ba56981695cbdd759b5d6b96e74a0b9b851549c3c55469c0b62d8701c94e9de`
 - Kernel bundle `79d522d1bc4f2d4fd6d706c8d7a5ea2040d44b4aeaeac5fcc96472d3040bdd72`
 - GPU `GPU-1769a5e7-852b-74f9-e109-f52dbb2c4859` (H20)
@@ -84,13 +84,13 @@ concurrency-scaling experiment.
 Correctness: needle ladder 512/4096/16384/32768 ×3 passed 12/12 exact,
 deterministic at every length.
 
-This row replaces `9b38ba6c0` (2026-08-10) under rule 1 taken as
+This row replaces (2026-08-10) under rule 1 taken as
 latest-is-reference, not because a delta was demonstrated. Acceptance moves
 under 1 pp at every point, so the two runtimes are indistinguishable on this
 fingerprint. The GPU differs from the prior row
 (`GPU-77551814`), which rule 3 counts as part of the fingerprint.
 
-**Re-run 2026-08-17, runtime `5ea12daaa`, same GPU (`GPU-1769a5e7`):**
+**Re-run 2026-08-17, runtime same GPU (`GPU-1769a5e7`):**
 c=1 matches, c≥2 regresses. Acceptance is within 2 pp
 of the SOTA row at every point, so the regression is in chain rate, not
 speculation quality. Root cause not yet isolated; 78 commits landed between
@@ -101,12 +101,12 @@ pool, observability). The SOTA row stands. Needle 12/12 PASS.
 The SOTA table says how fast; this says what to fix.
 
 > **STALE — do not rank prefill work off this table.** Measured before chunked
-> GDR went default-on (`c2eb5de9e`, 08-02). Its #1 row is a kernel that no
+> GDR went default-on (08-02). Its #1 row is a kernel that no
 > longer runs at the shipped defaults: the FlashQLA chunked path replaced
 > `gated_delta_rule_prefill_recurrent` and measured **1.06 s against its 9.37 s**
 > ([`wins/2026-08-02-flashqla-chunked-gdr-h48.md`](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md)),
 > which moves 33% of the prefill budget and reorders everything below it. Two
-> more prefill changes landed after (`0ac780495`, `301d0c074`). A re-measure
+> more prefill changes landed after. A re-measure
 > needs one `nsys` capture; the two attempts that failed and the delay to use
 > are recorded in
 > [`errors/2026-08-06-decode-lever-board-rebuilt-gemm-is-not-the-top-lever.md`](experience/errors/2026-08-06-decode-lever-board-rebuilt-gemm-is-not-the-top-lever.md).
@@ -148,15 +148,15 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
 
 ## Qwen3.6-35B-A3B-FP8 (MoE) · 1×H20 · single-GPU · eager
 
-### SOTA — decode graph, runtime `02867728d` (2026-08-17)
+### SOTA — decode graph, runtime (2026-08-17)
 
-No spec. Features on: whole-step decode graph (default-on, `cb6b3389d`) ·
+No spec. Features on: whole-step decode graph (default-on) ·
 batched FA3 (one launch per layer) · host-authoritative KV mirror · GDR
-chunked (default-on, `c2eb5de9e`).
+chunked (default-on).
 
 Identity:
 
-- Runtime commit `02867728d`
+- Runtime commit
 - Binary SHA-256 `9567bbccaacdbac585dabb55de10b0931575c17fb83c1a205b31df9c92093de7`
 - Kernel bundle `ee06c0c3aea4429ac51d5c32d784e9948fd6c0e85842bf0a87d66fb6186c3c15`
 - Dataset SHA-256 `8867f63eaac2f0537bb2b17847a7d0d3c1bb8d504c1ad191e97d673e9ecc4f34`
@@ -171,7 +171,7 @@ measured; TTFT warm is the p50 across all 128 requests.
 | 8 | 0.60 s | 36.12 ms | 29.34 ms | 27.7 |
 | 16 | 0.75 s | 66.41 ms | 47.71 ms | 15.1 |
 
-vs the prior row (`a956f69b1`, 2026-07-28, pre-decode-graph): TPOT −58.7% /
+vs the prior row (2026-07-28, pre-decode-graph): TPOT −58.7% /
 −18.1% / −9.9% at c=1/8/16. The c=1 effect is
 the decode graph; c≥8 gains are smaller because the GPU is already saturated.
 1–3/128 responses per point tripped the repetition checker (greedy, long
@@ -199,13 +199,13 @@ deterministic at every length.
   carries ~4.7 s teardown, inflating TPOT ~1.85×). Cold = session turn 0,
   warm = turns 1–7.
 
-**The whole-step decode graph is DEFAULT-ON and working** (2026-08-03, `cb6b3389d`):
+**The whole-step decode graph is DEFAULT-ON and working** (2026-08-03):
 the paged-KV early return that made it a no-op was removed, and the graph now
 captures the serving default. 35B c=1 TPOT 16.22 → 6.70 ms (−58.7%); see the
 35B SOTA row below. The earlier no-op diagnosis is at
 [errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md](experience/errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md).
 
-**`--qwen35-gdr-chunked` is DEFAULT-ON** (2026-08-02, `c2eb5de9e`): 33K cold
+**`--qwen35-gdr-chunked` is DEFAULT-ON** (2026-08-02): 33K cold
 prefill −26%; license = chat GSM8K 100 **95/100 both arms, zero
 disagreements** + chat MMLU 80 vs 81 + needle 9/9 ×2 + stub-probe fallback.
 Named trade: raw-completion few-shot can flip knife-edge boundary tokens
@@ -267,7 +267,7 @@ build: TTFT 24.94/24.95 s vs 24.97/25.05, zero fallback lines in the serve log.
 
 ## Qwen3.6-27B-FP8 vs Qwen3.8-27B-NVFP4 · 1×H20 · c=1 no-spec decode
 
-### Snapshot — runtime `b159c6bef` (2026-08-23)
+### Snapshot — runtime (2026-08-23)
 
 The 27B FP8 SOTA row above runs DSpark and a long-agent workload, so it is not
 comparable to a short-prompt no-spec decode. This row establishes that
@@ -309,8 +309,8 @@ vocab 248320.
 | | dense_ffn | forward_hidden | decode | dense_ffn GB/s |
 |---|---:|---:|---:|---:|
 | Qwen3.6-27B-FP8 | 9.84 ms/step | 29.22 ms/step | 33.2 tok/s | 1740 |
-| Qwen3.8-27B-NVFP4 (`cb109750e`) | 23.30 ms/step | 42.26 ms/step | 23.5 tok/s | 413 |
-| Qwen3.8-27B-NVFP4 (`5185ce517`) | 11.46 ms/step | 31.21 ms/step | 31.5 tok/s | 840 |
+| Qwen3.8-27B-NVFP4 | 23.30 ms/step | 42.26 ms/step | 23.5 tok/s | 413 |
+| Qwen3.8-27B-NVFP4 | 11.46 ms/step | 31.21 ms/step | 31.5 tok/s | 840 |
 
 NVFP4 moves 150.4 MB of dense-MLP weights per layer against FP8's 267.5 MB —
 56% of the bytes — so it should be faster, not 2.4x slower. Both formats run
@@ -321,8 +321,8 @@ structurally identical inner loops.
 
 Progress on the NVFP4 side, all at this fingerprint: the kernel started at
 86.19 ms/step dense_ffn and 9.3 tok/s. Replacing the constant-memory decode
-table with bit manipulation (`cb109750e`) took it to 23.30 / 23.5, and
-replacing that with PRMT byte lookups (`5185ce517`) to 11.46 / 31.5 — 7.5x on
+table with bit manipulation took it to 23.30 / 23.5, and
+replacing that with PRMT byte lookups to 11.46 / 31.5 — 7.5x on
 the kernel and 3.39x on decode. NVFP4 is now within 5% of FP8 on decode and
 16% behind on dense_ffn alone.
 
@@ -337,7 +337,7 @@ makes the dense_ffn column a clean single-variable comparison.
 
 ## Qwen3.8-27B-NVFP4 · 1×H20 · single-GPU · eager — NVFP4 ANCHOR
 
-### SOTA — runtime `97d28ba2c` (2026-08-22)
+### SOTA — runtime (2026-08-22)
 
 Mixed-precision: NVFP4 MLP (group_size=16, E2M1 + E4M3 group scales) on 56 of 64
 layers + FP8 per-channel attention (F8_E4M3 + BF16 `[N,1]` weight_scale)
@@ -364,7 +364,7 @@ Both arms on the same binary. 32/32 complete and `SERVER_ERRORS=0` at every cell
 
 Same-base control: `Qwen3.8-27B-FP8` (the Qwen3.6 control of the 2026-08-20
 row compared two different models). Both arms on GPU 0 back to back, no spec,
-decode graph on, p50 of 32 requests. Runtime `97d28ba2c` — the tensor-core
+decode graph on, p50 of 32 requests. Runtime — the tensor-core
 quantized paged attention ([entry](experience/wins/2026-08-22-paged-attention-quantized-tensor-core.md)).
 
 | c | NVFP4 ITL ms | FP8 ITL ms | ITL | NVFP4 TTFT s | FP8 TTFT s |
@@ -374,7 +374,7 @@ quantized paged attention ([entry](experience/wins/2026-08-22-paged-attention-qu
 | 8 | **24.40** | 29.82 | **+22.2%** | 1.46 | 1.50 |
 | 16 | **37.80** | 39.79 | **+5.3%** | 1.52 | 1.56 |
 
-Against the 2026-08-20 row (`ec5edf987`, NVFP4 ITL 20.46 / 39.40 / 69.81 /
+Against the 2026-08-20 row (NVFP4 ITL 20.46 / 39.40 / 69.81 /
 130.11 ms) ITL is −33 / −52 / −65 / −71 %; TTFT is unchanged (prefill still
 dequantises the quantized prefix into a bf16 temp for FA3). The ITL lead over
 FP8 still decays with concurrency — 29.0 → 28.9 → 22.2 → 5.3 — the
@@ -382,7 +382,7 @@ FP8 still decays with concurrency — 29.0 → 28.9 → 22.2 → 5.3 — the
 measured. TTFT at c≥4 is below c=1 because the 16×8 prompt set shares
 prefixes and the radix cache serves them after the first sweep.
 
-Previous row (`ec5edf987`, 2026-08-20, control Qwen3.6-27B-FP8 on GPU 1):
+Previous row (2026-08-20, control Qwen3.6-27B-FP8 on GPU 1):
 
 | c | NVFP4 ITL ms | FP8 ITL ms | ITL |
 | ---: | ---: | ---: | ---: |
@@ -405,7 +405,7 @@ invalidates the run it is in; the sign of the NVFP4 delta flipped with it.
 
 `--max-prompt-tokens 262144 --max-total-tokens 262144 --max-running-requests 2`;
 the engine caps prompts at `max_total − max_total/8` = 229,376 and keeps the
-rest for decode. Runtime `1df0acf68`, GPU 0, one request.
+rest for decode. Runtime GPU 0, one request.
 
 | prompt tok | TTFT s | decode tok/s | generated | needle |
 |---:|---:|---:|---:|---|
@@ -419,7 +419,7 @@ full-attention term dominates prefill at this length, where it was 22 % at
 #### 8-token decode grid
 
 `--seconds-per-concurrency 30 --max-tokens 128`, synthetic prompt (mean 8
-tokens). Measured at `1da4e0422`; the prefill work since does not reach these
+tokens). Measured at the prefill work since does not reach these
 shapes (the DeepGEMM arms sit above an M floor no decode batch reaches).
 `decode tok/s (agg)` = `c × 1000 / ITL mean`.
 
@@ -514,8 +514,8 @@ no gain" note is withdrawn.** It compared INT8 against FP8 activations and misse
 the real gap, which was the BF16 *weight* widening Marlin does — worth 3.15x at
 prefill and fixed without a new GEMM kernel.
 
-Superseded rows (9.3 tok/s initial support `33f4863c7`, FP4 GEMV vectorization
-`2a3a2164f`) live in
+Superseded rows (9.3 tok/s initial support FP4 GEMV vectorization
+) live in
 [wins/2026-08-18-qwen38-27b-nvfp4-inference.md](experience/wins/2026-08-18-qwen38-27b-nvfp4-inference.md);
 the kernel ladder is in
 [wins/2026-08-19-nvfp4-marlin-tensorcore.md](experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md).
@@ -524,7 +524,7 @@ the kernel ladder is in
 
 ## DSv4-Flash-FP8 · 8×H20 · TP=8/EP=8 · eager
 
-### SOTA — DSpark, runtime `fad8f4d5b`, runner `c98c4e0b2` (2026-08-14)
+### SOTA — DSpark, runtime runner (2026-08-14)
 
 Serve `--spec-type dspark --mtp-draft-model
 /host/nvme0/DeepSeek-V4-Flash-DSpark-draft-fp8 --comm-backend nccl`, no other
@@ -553,7 +553,7 @@ those acceptance figures are a few-dozen-chain sample, not an indicator. The
 c=8/16 points are plain decode.
 
 Rule 3 re-anchor, not a regression against `868043f5f` (2026-08-10). That row
-predates `ef8bcd61e`, which added `ignore_eos=true`: its points average
+predates which added `ignore_eos=true`: its points average
 120.7 / 110.1 / 113.5 completion tokens per request, so its requests stopped at
 EOS, while every request here emits exactly 128. Forcing generation past EOS is
 where the drafter agrees least, which moves acceptance 58.7% → 50.4% at an
@@ -568,9 +568,9 @@ The `logit_bias` relay gate passes at TP=8: a biased request returns 200 with
 the biased token dominating, two ordinary requests then answer correctly, and
 the serve log carries zero `relay deserialize` lines.
 
-**Re-run 2026-08-17, runtime `5cc681759`** (E8M0 loading fix + event pool +
+**Re-run 2026-08-17, runtime ** (E8M0 loading fix + event pool +
 comm-stream fix): net neutral against the SOTA row at c=1/8/16. Needle 512/4096/16384 ×3 = 9/9 exact.
-The E8M0 fix (`5cc681759`) unblocks DSv4 FP8 loading: the W4A16 detection
+The E8M0 fix unblocks DSv4 FP8 loading: the W4A16 detection
 probe called `quant_view_for()` which rejected DSv4's native E8M0 scales;
 the DSv4 path now skips that rejection. See
 [`errors/2026-08-17-dsv4-e8m0-scale-rejection-blocks-fp8-loading.md`](experience/errors/2026-08-17-dsv4-e8m0-scale-rejection-blocks-fp8-loading.md).
@@ -579,7 +579,7 @@ the DSv4 path now skips that rejection. See
 
 ## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager
 
-### SOTA — Base, `d0525cb06` (re-anchored 2026-07-25, #180)
+### SOTA — Base (re-anchored 2026-07-25, #180)
 
 > Short-prompt fingerprint, retired 2026-07-26 under rule 5 — the dataset is no
 > longer reproducible from the repo. Evidence for what it licensed, not a
@@ -608,7 +608,7 @@ idle compute.
 
 ## DSv4-Flash · 4×H20 · TP=4/EP=4 · c=1 decode graph (default)
 
-### Default flip — runtime `1a48d179f` (2026-08-23)
+### Default flip — runtime (2026-08-23)
 
 The c=1 decode body is captured into one CUDA graph per slot and replayed.
 Armed by default; `ARLE_DSV4_DECODE_GRAPH=0` selects the eager arm. The gate is
@@ -617,7 +617,7 @@ c=1-only and disarms under DSpark/MTP, so c>=2 and spec-decode are untouched.
 Identity:
 
 - Runtime commit `1c56ca0dd`, build `c1-graph-v26` (headline A/B); the
-  c=8/16 and FP8 rows below are from `1a48d179f` / `c1-graph-v24b`
+ c=8/16 and FP8 rows below are from / `c1-graph-v24b`
 - Models `/data00/DeepSeek-V4-Flash-0731` (NVFP4 experts) and `-FP8`
 - GPU: 4×H20 (sm_90), TP=4, 4 slots/rank, BF16 KV, `--comm-backend nccl`
 - Workload `bench-agent-32k-16x8.jsonl`, prompt p50 28568 tok, max_tokens 256
@@ -658,7 +658,7 @@ per-item diffs. DSpark control (`--spec-type dspark`): ITL p50 65.8 (off) vs
 
 ## DSv4-Flash-W4AFP8 · 2×H20 · TP=2 · eager
 
-### Initial support — runtime `fb0b877d2` (2026-08-19)
+### Initial support — runtime (2026-08-19)
 
 NVFP4 checkpoint (E2M1 float4 + E8M0 block scales) converted to W4AFP8
 (signed INT4 + BF16 interleaved scales) at load time on GPU. 4-bit weights
@@ -667,7 +667,7 @@ mixed-input grouped GEMM for routed experts; shared expert stays FP8.
 
 Identity:
 
-- Runtime commit `fb0b877d2` (32MB workspace right-size)
+- Runtime commit (32MB workspace right-size)
 - Model `/data00/DeepSeek-V4-Flash-0731` (166.9 GB NVFP4)
 - GPU: 2×H20 (sm_90, 96 GB), TP=2
 - Server flags: `--tensor-parallel-size 2 --port 30000`
@@ -692,7 +692,7 @@ Prefill throughput: 2109 tok/s (1K), 3647 tok/s (4K).
 
 ## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager
 
-**`aec71ef16` (2026-07-21)** — V100 kernel opts + KV pool floor fix. Synthetic
+** (2026-07-21)** — V100 kernel opts + KV pool floor fix. Synthetic
 prompts 64, 60 s/point, max_tokens 256, seed 20260416. KV pool 16384 tok BF16
 (1.1 GB), 86 slots. Serve `--max-total-tokens 16384`.
 
@@ -737,7 +737,7 @@ hopper tree and an sm_90 target at build time — without them
 `ring_fa3_route`'s real-kernel marker returns 0 and the ring falls back to the
 scalar kernels.
 
-## SOTA — 27B, cp=2, seq=32768 · `15caff0d0` (2026-08-05)
+## SOTA — 27B, cp=2, seq=32768 · (2026-08-05)
 
 | | |
 |---|---:|
@@ -754,7 +754,7 @@ Both ranks print identical loss and grad_norm (post-all-reduce). Reproduces the
 2026-08-04 FA3 reference (10.871086 / 2.264733 / ~212 s) to 6-decimal loss and
 0.06% grad-norm; the +6% on step is shared-box variance.
 
-## SOTA — 27B, cp=2, seq=81920 · FlashQLA default-on `fa742a038` (2026-08-05)
+## SOTA — 27B, cp=2, seq=81920 · FlashQLA default-on (2026-08-05)
 
 FlashQLA GDN chunkwise backward is the default (`--gdr-chunkwise-prefill=true`).
 Same harness (`/host/fqgate.sh perf_on`), same seq, only variable is the flag.
@@ -769,7 +769,7 @@ Same harness (`/host/fqgate.sh perf_on`), same seq, only variable is the flag.
 Peak host RSS 55.4 GB, loss 4.537510, grad_norm 7.976866, RUN_EXIT=0. The 71%
 `linear_attention_chunked_scan_backward_f32` row is gone.
 
-The recurrent column is `--la-backward-mono` on `e675f031b`: device peak
+The recurrent column is `--la-backward-mono` on : device peak
 91,547 MiB/rank (93.5% of the card), loss 4.536131, grad_norm 7.202155.
 
 ### Step budget — where the time goes
@@ -788,9 +788,9 @@ The recurrent column is `--la-backward-mono` on `e675f031b`: device peak
 | 1.4% | 13.553 s | 25,196 | `slice_f32` |
 
 The two gated-delta rows are 77.7% of the step. Both ride the route the
-FlashQLA port (`4846f8046`) replaces.
+FlashQLA port replaces.
 
-## Correctness rows — 0.8B dense, seq=2048 · `15caff0d0` (2026-08-05)
+## Correctness rows — 0.8B dense, seq=2048 · (2026-08-05)
 
 > **STALE AND UNRUNNABLE.** The cp=2/cp=4 arms error today —
 > `flashqla GDN head geometry H=8/Hg=8 not built` — because FlashQLA went
@@ -815,10 +815,10 @@ ring-step count — it collapses into the noise floor at cp=4, while the pre-fli
 scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
 [the gate entry](experience/wins/2026-08-05-fa3-cp-gate-compounding-not-sign.md).
 
-## SOTA — 27B, cp=4 seq ladder · `9c2c84675` (2026-08-19)
+## SOTA — 27B, cp=4 seq ladder · (2026-08-19)
 
 4×H20 (97,508 MiB), GPUs 4-7, FA3 engaged, `--synthetic-writeback-seq N`. All
-four ranks bit-identical loss at every passing rung. Re-measured on `ad1192864`
+four ranks bit-identical loss at every passing rung. Re-measured on
 after the CP ring byte-offset fix
 ([wins](experience/wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md)); the broken
 path's walls held to within 1% and its peaks to 2%, its loss column did not.
@@ -837,7 +837,7 @@ magnitude. Loss falls monotonically with sequence length, as it should; the
 pre-fix column (7.63 / 6.92 / 6.74) was inflated by corrupted hidden states.
 163840 was measured pre-fix only (230.7 s, 78,959 MiB).
 
-## SOTA — 27B, cp=2 seq ceiling · `62b4927b8` (2026-08-20)
+## SOTA — 27B, cp=2 seq ceiling · (2026-08-20)
 
 2×H20, `--synthetic-writeback-seq N`, LoRA r16 α32 attention-qv. cp=2 means
 local seq = N/2 and the ceiling is per-rank.
@@ -858,8 +858,8 @@ pool high-water is 84,789 → 77,026 MiB and the peak model's drift +17,420 →
 | shape | outcome |
 |---|---|
 | 27B cp=1 seq=81920 | forward completes (3972.216 s), **backward OOMs** on `cuda alloc_zeros failed`. Host RSS 104.5 GB. The failing tensor is not named by the log. |
-| 27B cp=4 seq=245760 | forward + CE complete, **backward OOMs** on `cuda alloc_zeros failed (la dqkv)` (2026-08-19, `9c2c84675`). Still fails on `ad1192864` with the same deadlock signature; that re-run was killed before the error string flushed, so the allocation is not re-confirmed post-fix |
-| 27B cp=4 seq=262144 | forward 126.5 s + CE 3.14 s complete, **backward OOMs** on `cuda alloc_zeros failed (slice_bwd)` — the linear-attn zigzag reorder's `slice` backward allocates a full-input zero buffer (2026-08-19, `9c2c84675`) |
+| 27B cp=4 seq=245760 | forward + CE complete, **backward OOMs** on `cuda alloc_zeros failed (la dqkv)` (2026-08-19). Still fails on with the same deadlock signature; that re-run was killed before the error string flushed, so the allocation is not re-confirmed post-fix |
+| 27B cp=4 seq=262144 | forward 126.5 s + CE 3.14 s complete, **backward OOMs** on `cuda alloc_zeros failed (slice_bwd)` — the linear-attn zigzag reorder's `slice` backward allocates a full-input zero buffer (2026-08-19) |
 | any cp, rank-local error | the erroring rank unwinds into `ncclCommDestroy` and blocks behind the peers' in-flight collective, so **the error text never prints**. Presents as N−1 GPUs at 100% util and one at 0%, indefinitely. Kill the spinners to release the unwind and read the real line. |
 | 27B cp=2 seq=131072 | fits — backward peak 94,175 MiB (96.6%), ~3.3 GB headroom (2026-08-02, older commit) |
 | 27B cp=4 seq=131072 | full step ~3100 s, host RSS 170.4 GiB total / ~44.6 GB per rank (2026-08-03, scalar ring, older commit) |

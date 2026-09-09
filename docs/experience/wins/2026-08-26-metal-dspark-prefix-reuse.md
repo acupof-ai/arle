@@ -2,7 +2,7 @@
 
 > Status: Confirmed (local M4 Pro 48 GB)
 >
-> Baseline: `4c1ff355d`, `arle serve --backend metal --model-path
+> Baseline: `arle serve --backend metal --model-path
 > LiquidAI/LFM2.5-8B-A1B-MLX-4bit --draft-model LiquidAI/LFM2.5-8B-A1B-DSpark
 > --kv-cache-dtype bf16 --kv-disk=<dir> --chunked-prefill-size 1024`,
 > M4 Pro 48 GB. One 15 030-token prompt, three questions over a shared prefix,

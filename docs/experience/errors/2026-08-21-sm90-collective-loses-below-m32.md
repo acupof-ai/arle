@@ -83,7 +83,7 @@ and spec decode is that something.**
 ## Two alignment bugs found on the way
 
 Driving the grouped kernel with one group exposed a latent crash for any odd
-expert count, fixed in `8778391f5` and `7806c01ec`:
+expert count, fixed in and :
 
 - CUTLASS builds the prototype TMA descriptor from the **pointer array's own
   address**, not from a pointer read out of it, and `make_tma_copy_desc` asserts

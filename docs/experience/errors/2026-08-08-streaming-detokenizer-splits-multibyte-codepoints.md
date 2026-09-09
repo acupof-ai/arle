@@ -10,7 +10,7 @@ the answer text was U+FFFD replacement characters. The first hypothesis —
 sampling temperature (#48) — is refuted by the harness source: both runners pass
 `temperature=0.0` literally (`scripts/arle_capability_eval.py:442`, `:632`) and
 `--seeds` only shuffles which items are drawn (`:602`), never the generation RNG.
-`args.rs:2069` records that `b4b293f0c` already fixed greedy. So this is a
+`args.rs:2069` records that already fixed greedy. So this is a
 different defect on the greedy path.
 
 ## Phenomenon
@@ -62,7 +62,7 @@ still emitted, so a stream cannot stall holding them.
 by construction (one extra decode of ≤4 tokens only while a codepoint is
 incomplete).
 
-Verified on the pod at `ee6339fd7` (isolated build tree, serve on an idle GPU so
+Verified on the pod at (isolated build tree, serve on an idle GPU so
 production's binary and endpoints were untouched): the assembled streamed text
 carries **zero U+FFFD and is byte-identical to the non-streaming decode of the
 same greedy generation**. The old binary on the same class of prompt put the

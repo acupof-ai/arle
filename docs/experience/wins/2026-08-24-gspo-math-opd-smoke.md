@@ -5,6 +5,10 @@ Scope: `crates/train/src/math_harness.rs`, `crates/cli/src/train_cli/math_opd.rs
 `crates/infer-cuda/src/qwen35_lora.rs`, `crates/cuda-kernels/src/quant_linear.rs`,
 `crates/cli/src/train_cli/opd_engine.rs`, `crates/cli/src/args.rs`
 
+No baseline: this is an end-to-end smoke that records what it took to make
+the lane run. The quantities below are configuration sizes and reward
+parameters, not a measured comparison.
+
 ## Context
 
 The GSPO length-compression experiment trains `unsloth/Qwen3.8-27B-NVFP4`
@@ -31,7 +35,7 @@ Three blockers, each fixed at its root:
    per-channel `scale_f32`. No new CUDA code. The helper
    `dequantize_fp8_marlin_to_bf16` is the FP8 analog of
    `dequantize_fp4_marlin_to_bf16`. The Linux build needed a follow-up
-   (`f96b946a3`): `RawDevicePtr` has no `len()`, and the E4M3 scratch passes via
+: `RawDevicePtr` has no `len()`, and the E4M3 scratch passes via
    `cache_ptr` — neither visible to Mac clippy (CUDA-type signatures compile
    Linux-only).
 
@@ -44,7 +48,7 @@ Three blockers, each fixed at its root:
    layer 40. The default is now `attention-qv` — the GSPO-standard set, with a
    promotion footprint of ~5 GB.
 
-## Result (smoke #5, `6bcc7bd92`)
+## Result (smoke #5)
 
 Build PASS (2m49s). Run EXIT=0, 420s, two rounds complete, both LoRA syncs
 passed with no OOM. Command: `--task-limit 4 --eval-n 8 --rounds 2

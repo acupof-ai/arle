@@ -1,6 +1,6 @@
 # FA3 for batch==1 prefill (−4%) and the driver-context thread lottery — 2026-08-02
 
-> Status: Shipped, default path (`b0368426a`). 33K cold prefill now
+> Status: Shipped, default path. 33K cold prefill now
 > **19.5 s vs the 28.9 s 2026-08-01 baseline (−32%)** combined with the
 > chunked GDR.
 
