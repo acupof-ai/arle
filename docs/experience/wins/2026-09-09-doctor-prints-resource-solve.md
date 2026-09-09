@@ -55,6 +55,10 @@ against a 13 GiB budget. The printed fixed-plus-KV sum matches measured
 resident bytes after load within the tolerance stated in
 [design note 4](../../design/memory-is-the-product.md).
 
+No baseline: this is a CLI/diagnostics change; the GiB/MiB figures are the
+printed solve output, not a performance measurement, so there is no baseline
+to compare against.
+
 ## Rule
 
 A resource guard that only prints its verdict makes the operator re-derive
