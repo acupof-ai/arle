@@ -44,3 +44,9 @@ signature — suspect the shared `target/` before the code. Clean and rebuild
 once. The same shape as the other 2026-09-09 shared-state bugs (`.git/config`,
 pre-push snapshot, pod build tree): one mutable copy, multiple writers, no
 identity; the symptom always lands on the writer whose turn it is to read.
+
+Sibling failure of the same shared target:
+`docs/experience/errors/2026-09-09-pre-push-target-dir-per-worktree.md` — the
+pre-push hook's `CARGO_TARGET_DIR` overrode the shared `target-dir` config,
+so each lane grew its own full target tree (18.6 GB leaked). That one is an
+env-var bypass (disk); this one is fingerprint invalidation (compile errors).
