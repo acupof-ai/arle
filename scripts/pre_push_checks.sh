@@ -61,7 +61,14 @@ cd "${SNAPSHOT_ROOT}"
 
 export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-D warnings"
-export CARGO_TARGET_DIR="${REPO_ROOT}/target/pre-push-quick"
+# REPO_ROOT is the *worktree* root, so this used to give every lane its own
+# pre-push target tree — 4.8 GB each, 18.6 GB across four lanes, and the env var
+# beat the shared `target-dir` in ../arle-lanes/.cargo/config.toml. Anchor it to
+# the main checkout (the parent of the common git dir) so all worktrees share
+# one, the way ordinary builds already do.
+MAIN_ROOT="$(dirname "$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" 2>/dev/null)"
+[[ -d "${MAIN_ROOT}" ]] || MAIN_ROOT="${REPO_ROOT}"
+export CARGO_TARGET_DIR="${MAIN_ROOT}/target/pre-push-quick"
 # cudarc probes the CUDA version at build time; pin it so the cuda,no-cuda
 # typecheck works on hosts without nvcc.
 export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
