@@ -1929,13 +1929,20 @@ impl Qwen35Model {
     /// Trunk verify of every chain in one forward over the paged pool, with
     /// per-slot linear capture + a batch-wide tap: logits `[total_q, vocab]`
     /// where chain `i` owns rows `[Σ_{j<i} len_j, ..)`.
-    pub(crate) fn dspark_verify_logits(
+    /// Batched spec verify over ragged per-slot chains: one trunk forward over
+    /// the packed rows, each slot's KV read once via the page table. `taps` is
+    /// DSpark-only (the draft seeds from trunk taps); the MTP head seeds from
+    /// the raw hidden and passes `None`. `norm_offset` selects the trunk final
+    /// norm convention: DSpark checkpoints store it centered near 1, MTP
+    /// checkpoints store `weight - 1` (matching `forward_tokens_verify`).
+    pub(crate) fn verify_logits(
         &self,
         rows: &mut [super::LinearRow<'_>],
         ws: &mut Qwen35Workspace,
         chains: &[u32],
         recall: &mut Qwen35PagedForward<'_>,
-        taps: &mut Qwen35DsparkTaps,
+        taps: Option<&mut Qwen35DsparkTaps>,
+        norm_offset: bool,
     ) -> Result<HiddenStates> {
         let seq_len: usize = rows.iter().map(|r| r.len).sum();
         ensure!(
@@ -1945,21 +1952,31 @@ impl Qwen35Model {
         );
         let start_pos = rows[0].slot.seq_len();
         self.stage_step_inputs(ws, chains, start_pos)?;
-        self.forward_hidden_staged(rows, ws, start_pos, Some(recall), Some(taps))?;
+        self.forward_hidden_staged(rows, ws, start_pos, Some(recall), taps)?;
         let hidden_size = self.config.hidden_size;
         let Qwen35Workspace { hidden, normed, .. } = ws;
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
         crate::profile::profile_op(&self.ctx, "final_norm", None, seq_len, || {
-            // DFlash draft norms use the standard w convention (weights centered
-            // near 1, not 0) — do NOT apply the trunk's (1+w) offset here.
-            rms_norm_batch(
-                &self.ctx,
-                hidden,
-                &self.norm,
-                self.config.rms_norm_eps,
-                normed,
-            )
+            if norm_offset {
+                rms_norm_offset(
+                    &self.ctx,
+                    hidden,
+                    &self.norm,
+                    self.config.rms_norm_eps,
+                    normed,
+                )
+            } else {
+                // DFlash draft norms use the standard w convention (weights centered
+                // near 1, not 0) — do NOT apply the trunk's (1+w) offset here.
+                rms_norm_batch(
+                    &self.ctx,
+                    hidden,
+                    &self.norm,
+                    self.config.rms_norm_eps,
+                    normed,
+                )
+            }
         })?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
