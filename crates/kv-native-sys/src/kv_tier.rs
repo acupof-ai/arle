@@ -75,7 +75,9 @@ const MANIFEST_FILE: &str = "manifest.kvm";
 /// [`KvTierStore::load`] start cold rather than trust a foreign layout.
 /// V3: chunked blob keys narrowed from 56 to 40 bits, so on-disk records
 /// written under V2 keys can collide with V3 lookups.
-const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V3";
+/// V4: Metal page payloads embed their content key for read-time validation,
+/// so a V3 page record decodes to a wrong-key error instead of arrays.
+const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V4";
 
 static DISK_TIER_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
