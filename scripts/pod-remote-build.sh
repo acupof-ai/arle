@@ -43,12 +43,25 @@ validate_build_args() {
   python3 - "$1" <<'PY'
 import os, sys
 args = [os.fsdecode(x) for x in open(sys.argv[1], "rb").read().split(b"\0") if x]
-release = False
+profile = None
 binary = None
 i = 0
 while i < len(args):
     arg = args[i]
-    if arg == "--release": release = True; i += 1
+    if arg == "--release":
+        if profile is not None: raise SystemExit("profile specified more than once")
+        profile = "release"; i += 1
+    elif arg == "--profile" or arg.startswith("--profile="):
+        if profile is not None: raise SystemExit("profile specified more than once")
+        if arg == "--profile":
+            if i + 1 == len(args) or args[i + 1].startswith("-"):
+                raise SystemExit("missing value for --profile")
+            value = args[i + 1]; i += 2
+        else:
+            value = arg.removeprefix("--profile="); i += 1
+        if value not in ("release", "release-fast"):
+            raise SystemExit(f"unsupported cargo profile: {value}")
+        profile = value
     elif arg == "--no-default-features": i += 1
     elif arg in ("--features", "--bin"):
         if i + 1 == len(args) or args[i + 1].startswith("-"):
@@ -60,14 +73,15 @@ while i < len(args):
     elif arg.startswith("--features="):
         if not arg.removeprefix("--features="): raise SystemExit("missing value for --features")
         i += 1
-    elif arg.startswith(("--profile", "--target-dir", "--target", "--message-format")):
+    elif arg.startswith(("--target-dir", "--target", "--message-format")):
         raise SystemExit(f"unsupported cargo build argument: {arg}")
     else:
         raise SystemExit(f"unsupported cargo build argument: {arg}")
-if not release: raise SystemExit("cargo build arguments require --release")
+if profile is None: raise SystemExit("cargo build arguments require --release or --profile")
 if binary is None: raise SystemExit("cargo build arguments require --bin")
 if "/" in binary or binary in ("", ".", ".."): raise SystemExit("invalid --bin value")
 print(binary)
+print(profile)
 PY
 }
 write_receipt() {
@@ -223,7 +237,9 @@ case "${1:-}" in
     ;;
   build)
     LABEL="${2:?missing label}"; OP="${3:?missing operation}"; ARGV_FILE="${4:?missing argv file}"
-    binary_name="$(validate_build_args "$ARGV_FILE")" || exit 2
+    parsed="$(validate_build_args "$ARGV_FILE")" || exit 2
+    binary_name="${parsed%%$'\n'*}"
+    build_profile="${parsed#*$'\n'}"
     # Only `build` writes under STATE. Creating it at file scope also fired for
     # `source-digest`, which pod.sh runs LOCALLY, so every sync from a Mac
     # printed two "mkdir: /host: Read-only file system" lines.
@@ -310,7 +326,7 @@ PY
       embedded_id="$($binary --kernel-build-id | head -n1)" || rc=1
       [ "$embedded_id" != unreported ] && [ "$embedded_id" = "$producer_id" ] || rc=1
     fi
-    write_receipt "$RECEIPT" "schema=arle-build-v1" "operation=$OP" "label=$LABEL" "tree=$TREE" "source_head=${source_head:-}" "source_digest=${source_digest_value:-}" "argv_file=$DIR/argv.nul" "argv_sha=$(argv_sha256 "$DIR/argv.nul")" "binary=$binary" "binary_sha=$binary_sha" "cargo_out_dir=${cargo_out_dir:-}" "producer_manifest=$manifest" "producer_manifest_sha=$manifest_sha" "producer_id=$producer_id" "embedded_id=$embedded_id" "kernel_id=$producer_id" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
+    write_receipt "$RECEIPT" "schema=arle-build-v1" "operation=$OP" "profile=$build_profile" "label=$LABEL" "tree=$TREE" "source_head=${source_head:-}" "source_digest=${source_digest_value:-}" "argv_file=$DIR/argv.nul" "argv_sha=$(argv_sha256 "$DIR/argv.nul")" "binary=$binary" "binary_sha=$binary_sha" "cargo_out_dir=${cargo_out_dir:-}" "producer_manifest=$manifest" "producer_manifest_sha=$manifest_sha" "producer_id=$producer_id" "embedded_id=$embedded_id" "kernel_id=$producer_id" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
     printf 'BUILD_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;

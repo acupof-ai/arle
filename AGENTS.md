@@ -208,7 +208,11 @@ specific bug. If the code already reads clearly, leave it bare — no comment.
 
 ## Build & run
 
-Always `--release` — debug GPU builds are unusably slow.
+Iteration builds use `--profile release-fast` (cu=16, no LTO); perf numbers and
+shipped artifacts use `--release` (cu=1, thin LTO). A `release-fast` binary is
+not a valid bench source: `pod.sh build` defaults to `release-fast`, and
+`pod-remote-run.sh` refuses a bench-labelled run (label prefix `bench`) whose
+build receipt profile is not `release`. Debug GPU builds are unusably slow.
 
 ```bash
 CUDA_HOME=/usr/local/cuda cargo build --release --features cuda        # CUDA (Linux+NVIDIA)
