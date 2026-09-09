@@ -193,6 +193,15 @@ def cmd_report(args: argparse.Namespace) -> int:
     if bad:
         lines += ["## Ledger defects", ""] + [f"- {item}" for item in bad] + [""]
     text = "\n".join(lines)
+    if args.html:
+        board = (ROOT / "scripts/agenda_board.html").read_text()
+        for token, value in (
+            ("__AGENDA_JSON__", rows), ("__PREREG_JSON__", prereg), ("__DEFECTS_JSON__", bad),
+            ("__CARDS_JSON__", json.loads((ROOT / "docs/agenda-cards.json").read_text())),
+        ):
+            board = board.replace(token, json.dumps(value, ensure_ascii=False))
+        Path(args.html).write_text(board.replace("__STAMP__", now()))
+        print(f"agenda: wrote {args.html}")
     if args.out:
         Path(args.out).write_text(text)
         print(f"agenda: wrote {args.out}")
@@ -243,6 +252,7 @@ def main() -> int:
 
     report = sub.add_parser("report")
     report.add_argument("--out", default="", help="write the rendered page here instead of stdout")
+    report.add_argument("--html", default="", help="also render the board page from scripts/agenda_board.html")
     report.set_defaults(func=cmd_report)
 
     args = parser.parse_args()
