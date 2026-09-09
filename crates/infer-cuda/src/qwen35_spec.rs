@@ -193,6 +193,210 @@ impl Qwen35Model {
         Ok((next, h_out))
     }
 
+    /// Batched twin of [`Self::mtp_forward_level`]: one head forward over `m`
+    /// rows. Each row owns its draft KV (`specs[r].head_k/head_v`), so the
+    /// attention runs per row at draft row `level`; every GEMM is one call over
+    /// the batch. Greedy only (the batched route is greedy-gated): returns the
+    /// per-row next token and the per-row output hidden that seeds the next
+    /// level.
+    pub(crate) fn mtp_forward_level_batch(
+        &self,
+        specs: &mut [&mut Qwen35SpecSlotState],
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        h_prevs: &[DeviceVec],
+        level: usize,
+        scratch: &mut dspark::DsparkScratch,
+    ) -> Result<(Vec<u32>, Vec<DeviceVec>)> {
+        let m = specs.len();
+        ensure!(m >= 1, "mtp_forward_level_batch empty batch");
+        ensure!(
+            tokens.len() == m && h_prevs.len() == m,
+            "mtp_forward_level_batch row count mismatch: {} specs, {} tokens, {} h_prevs",
+            m,
+            tokens.len(),
+            h_prevs.len()
+        );
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| anyhow!("mtp_forward_level_batch called without a loaded MTP head"))?;
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+        let hidden = c.hidden_size;
+
+        let token_ids = upload_i32(
+            &self.ctx,
+            &tokens.iter().map(|&t| t as i32).collect::<Vec<i32>>(),
+        )?;
+        let mut emb = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        crate::profile::profile_op(&self.ctx, "embedding", None, m, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut emb)
+        })?;
+
+        let mut emb_n = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        crate::profile::profile_op(&self.ctx, "mtp_emb_norm", None, m, || {
+            rms_norm_offset(&self.ctx, &emb, &mtp.pre_fc_norm_embedding, eps, &mut emb_n)
+        })?;
+
+        // Pack the per-row seed hiddens into one [hidden, m] buffer, then norm.
+        let mut h_prev_all = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        for (r, h_prev) in h_prevs.iter().enumerate() {
+            ensure!(
+                h_prev.len == hidden,
+                "mtp_forward_level_batch h_prev len {} != hidden {hidden}",
+                h_prev.len
+            );
+            let mut dst = h_prev_all.data.slice_mut(r * hidden..(r + 1) * hidden);
+            self.ctx
+                .stream
+                .memcpy_dtod(&h_prev.data, &mut dst)
+                .map_err(|e| anyhow!("mtp batch h_prev pack failed: {e}"))?;
+        }
+        let mut h_n = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        crate::profile::profile_op(&self.ctx, "mtp_hidden_norm", None, m, || {
+            rms_norm_offset(
+                &self.ctx,
+                &h_prev_all,
+                &mtp.pre_fc_norm_hidden,
+                eps,
+                &mut h_n,
+            )
+        })?;
+
+        // concat [2H, m]: emb_n row then h_n row per slot.
+        let mut concat = HiddenStates::zeros(&self.ctx, 2 * hidden, m)?;
+        for r in 0..m {
+            let src = emb_n.data.slice(r * hidden..(r + 1) * hidden);
+            let mut dst = concat
+                .data
+                .slice_mut(r * 2 * hidden..r * 2 * hidden + hidden);
+            self.ctx
+                .stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow!("mtp batch concat emb failed: {e}"))?;
+            let src = h_n.data.slice(r * hidden..(r + 1) * hidden);
+            let mut dst = concat
+                .data
+                .slice_mut(r * 2 * hidden + hidden..(r + 1) * 2 * hidden);
+            self.ctx
+                .stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow!("mtp batch concat hidden failed: {e}"))?;
+        }
+        let mut h_fc = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        crate::profile::profile_op(&self.ctx, "mtp_fc", None, m, || {
+            gemm_batch(&self.ctx, &mtp.fc, &concat, &mut h_fc)
+        })?;
+
+        // Mirrors the trunk layer body.
+        let layer = &mtp.layer;
+        let Qwen35Attn::Full(full_attn) = &layer.attn else {
+            unreachable!("MTP head layer is always full attention");
+        };
+
+        let mut normed = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        crate::profile::profile_op(&self.ctx, "input_norm", None, m, || {
+            rms_norm_offset(&self.ctx, &h_fc, &layer.input_layernorm, eps, &mut normed)
+        })?;
+
+        // Per-row attention: each slot's head KV is its own cache, appended at
+        // draft row `level`.
+        let start_pos_dev = upload_i32(&self.ctx, &[level as i32])?;
+        let mut attn_out = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        let mut normed_row = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        let mut attn_row = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        crate::profile::profile_op(&self.ctx, "full_attention", None, m, || {
+            for (r, spec) in specs.iter_mut().enumerate() {
+                let src = normed.data.slice(r * hidden..(r + 1) * hidden);
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&src, &mut normed_row.data)
+                    .map_err(|e| anyhow!("mtp batch attn copy-in failed: {e}"))?;
+                self.full_attention_into(
+                    full_attn,
+                    &normed_row,
+                    &mut spec.head_k,
+                    &mut spec.head_v,
+                    0, // profiling label
+                    level,
+                    &start_pos_dev,
+                    &mut ws.full,
+                    &mut attn_row,
+                )?;
+                let mut dst = attn_out.data.slice_mut(r * hidden..(r + 1) * hidden);
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&attn_row.data, &mut dst)
+                    .map_err(|e| anyhow!("mtp batch attn copy-out failed: {e}"))?;
+            }
+            Ok(())
+        })?;
+
+        let mut hidden_mid = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        crate::profile::profile_op(&self.ctx, "post_attn_norm", None, m, || {
+            add_batch(&self.ctx, &h_fc, &attn_out, &mut hidden_mid)?;
+            rms_norm_offset(
+                &self.ctx,
+                &hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                &mut normed,
+            )
+        })?;
+        let mut mlp_out = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        if let Some(moe) = &layer.moe {
+            let moe_cfg = self
+                .moe_config
+                .as_ref()
+                .ok_or_else(|| anyhow!("MTP MoE layer but no moe_config"))?;
+            crate::profile::profile_op(&self.ctx, "moe_ffn", None, m, || {
+                crate::moe::moe_forward_into(
+                    &self.ctx,
+                    moe,
+                    &normed,
+                    moe_cfg,
+                    &self.expert_split,
+                    &mut ws.moe,
+                    &mut mlp_out,
+                )
+            })?;
+        } else {
+            let mlp = layer
+                .mlp
+                .as_ref()
+                .ok_or_else(|| anyhow!("MTP head layer missing MLP"))?;
+            crate::profile::profile_op(&self.ctx, "dense_ffn", None, m, || {
+                self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out)
+            })?;
+        }
+        let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, m)?;
+        crate::profile::profile_op(&self.ctx, "ffn_residual", None, m, || {
+            add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)
+        })?;
+
+        // Same weights as the trunk lm_head.
+        crate::profile::profile_op(&self.ctx, "final_norm", None, m, || {
+            rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)
+        })?;
+        let vocab = self.output_projection().rows;
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, m)?;
+        crate::profile::profile_op(&self.ctx, "lm_head_gemm", None, m, || {
+            gemm_batch(&self.ctx, self.output_projection(), &normed, &mut logits)
+        })?;
+        let next = self.argmax_rows(&logits, scratch)?;
+
+        // The head's own output hidden seeds the next level (autoregressive
+        // chain, per `dflash.rs` `step_hidden = flat`).
+        let mut h_outs = Vec::with_capacity(m);
+        for r in 0..m {
+            let mut h_out = DeviceVec::zeros(&self.ctx, hidden)?;
+            copy_row_to_vec(&self.ctx, &h_layer, r, &mut h_out)?;
+            h_outs.push(h_out);
+        }
+        Ok((next, h_outs))
+    }
+
     /// NextN-MTP speculative decode step (single chain).
     ///
     /// Correctness: greedy rows accept the longest prefix whose draft equals the
