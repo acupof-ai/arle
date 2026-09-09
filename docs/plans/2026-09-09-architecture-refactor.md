@@ -1,0 +1,399 @@
+# Architecture: stage boundaries the compiler enforces
+
+Date: 2026-09-09 · Status: Plan, pending acceptance · Owner: ckl
+
+## What this document decides
+
+Three things, in this order:
+
+1. Which boundary in the runtime is wrong, stated as a measurement rather than a preference.
+2. What the boundary should be, and by what criterion it stays correct.
+3. The sequence that gets there, where each step is verifiable on its own and leaves no half-state.
+
+It does not decide model support, feature priority, or anything on
+[`2026-08-24-roadmap.md`](2026-08-24-roadmap.md). Those rank work inside the
+current structure; this changes the structure.
+
+## 1. The complaint, and the mechanism behind each part
+
+| Complaint | Mechanism |
+|---|---|
+| Rust iteration is slow | `infer-cuda` is 60,347 lines in one crate. A one-line change to host logic recompiles it and links 84,728 lines of C++ |
+| Kernels are hard to work with | `arle kernel` exists — `crates/infer-cuda/src/kernel_bench.rs`, 316 lines — with zero references in `scripts/pre_push_checks.sh` or any file under `.github/workflows/` |
+| The flow is not legible | No type names the CPU-to-GPU transition. `ForwardPlan` (`crates/infer-plan/src/lib.rs:85`) and `KvBatchDescriptor` (`crates/infer-seam/src/kv_batch.rs:16`) are both pure host; the transition happens afterwards inside `infer-cuda` with no name. 3,322 lines of host logic have drifted below the seam |
+
+The three share one cause. There is no place above the device where step
+construction is supposed to live, so it lives below it, and everything below it
+carries the compile cost and the GPU-only verification cost of the device.
+
+## 2. Where performance actually comes from
+
+319 entries under `docs/experience/wins/`, bucketed by subject from the
+filename. Counts, not magnitudes:
+
+| Bucket | Entries |
+|---|---:|
+| kernel / quant | 63 |
+| KV / cache | 44 |
+| speculative decode | 30 |
+| parallel / TP | 28 |
+| scheduler | 25 |
+| memory | 8 |
+| launch / graph | 3 |
+| unclassified | 115 |
+
+The kernel bucket is the largest and its remaining margin is the smallest.
+Three separate kernel-side items were closed as structural rather than
+fixable in `2026-08-24-roadmap.md`: W4AFP8 GEMV restructuring (memory-bound at
+M=1), M-split GEMV grid (+2–6%), and the NVFP4 c=1 gap against FP8 (structural
+to the compute mix). One kernel-side item is open and large:
+`2026-07-28-fa3-one-launch-per-layer` measured MoE expert kernels
+(`dsv4_fp8_grouped_{down,swiglu}_decode`) at **53.9% of GPU time** after FA3
+was fixed. Dense GEMV/GEMM is closing; MoE grouped kernels are not.
+
+The launch/graph bucket has three entries and carries the largest verified
+deltas in the tree, in both directions:
+
+| Entry | Change | Measured |
+|---|---|---|
+| `2026-07-28-fa3-one-launch-per-layer` | one FA3 launch per layer instead of per row | ITL p50 c=16 94.61 → 59.51 ms (1.59×); decode 9.5 → 14.0 tok/s (1.47×); launches 34,212 → 3,049 over the same 35 s; step model `12.7 + 5.12·B` → `14.9 + 2.79·B`, so the per-row marginal fell 1.83× with a flat intercept. c=1 unchanged (16.03 → 16.04 ms) |
+| `2026-08-23-dsv4-c1-decode-graph` | CUDA graph on the c=1 decode step | decode +21.3%, ITL p50 −9.0%, ITL p99 −63.7% |
+| `2026-08-17-collectives-to-comm-stream` | NCCL moved to its own stream, fenced | **78.7 → 55–59 tok/s, a 25–30% regression.** Cause: 80 all-reduces × 2 fences = 160 `cuEventCreate`/`cuEventDestroy` per step, 3–5 ms/step of host overhead. A partial revert recovered to 63 tok/s, still −19% |
+
+Three entries: two of the largest wins, and one of the largest self-inflicted
+regressions. In all three the mechanism was host-side launch bookkeeping, not
+device numerics — launch count, capture eligibility, event allocation. None of
+them required reading a `.cu` file to diagnose.
+
+**This is the layer with the most remaining margin and no boundary.** It has no
+crate, no trait, and no gate. The regression entry is the strongest single
+argument in this document: a 25–30% loss shipped through a layer that nothing
+guards, and the cost was 160 host allocations per step.
+
+## 3. Six structural findings
+
+### 3.1 "Kernel" names three things that share one crate
+
+| Layer | Size | Authored by | Source of regressions |
+|---|---|---|---|
+| Device compute — MMA loops, TileLang AOT, vendored FlashMLA / DeepGEMM / DeepEP | 84,728 lines C++ | mostly vendored | rarely |
+| Per-kernel host adaptation — repack, scale lift, launcher, dispatch | 20,503 lines Rust FFI | ours | yes |
+| Kernel selection | 17 dispatch matches | ours | yes |
+
+All 17 dispatch matches are in `qwen35_load.rs`, `quant_format.rs`,
+`loader.rs`, and `dsv4/load.rs` — the load path — and none depends on a device
+return value. Kernel selection is a pure function of (model, layer, dtype,
+quant kind, shape, SM tier). It is fully CPU-testable today and is not tested
+on the CPU today.
+
+### 3.2 Kernel-to-model binding is four stages written as one
+
+A Marlin GEMM does not know which model calls it. What is model-bound is the
+operator sequence and the weight layout requirement. The real relation is
+
+```
+model → operator sequence → weight layout requirement → kernel selection → launch
+```
+
+Only the last is device-side. The first four are collapsed into
+`crates/infer-cuda/src/executor/qwen35.rs` (3,472 lines) and
+`executor/dsv4.rs` (650 lines). This gives those files a principled split:
+by which stage a line belongs to, not by whether it happens to call a device
+function.
+
+### 3.3 Scheduling has four levels and three names
+
+| Level | Where | Named |
+|---|---|---|
+| Request — continuous batching, admission, preemption | `infer-core` | yes |
+| Step — prefill/decode/mixed, producing `ForwardPlan` | `infer-plan` | yes |
+| KV — page/slot allocation, prefix match, tiering | `infer-seam` | yes, across six traits |
+| **Device — stream assignment, graph capture, collective placement** | inside `infer-cuda` | **no** |
+
+Only three files in the tree touch graph capture. Graph capture is a
+step-scheduling constraint — this step's launch sequence must be isomorphic to
+the last — and putting it inside the executor is what allowed
+`errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv`: a flag that
+silently did nothing because the constraint it depended on lived somewhere the
+flag could not see.
+
+Scheduling and kernels have exactly one real coupling: **batch shape decides
+kernel selection** (M=1 GEMV, M≥64 GEMM, fixed shape for a captured decode).
+The scheduler does not need to know a kernel; it needs to emit a shape. The
+type that would carry "the shape is settled" does not exist, which is why host
+logic keeps being written on the far side of the seam.
+
+### 3.4 KV is four roles inside one trait group
+
+`KvPool = KvQuery + KvAllocator + KvPrefixStore` (`crates/infer-seam/src/kv.rs:16`),
+plus `KvPageTier`, `KvSlotTier`, `DeviceKvFit` as capability traits. Six traits
+for one object, because KV is simultaneously:
+
+| Role | Change rate | Needs a GPU to verify |
+|---|---|---|
+| Capacity resource — how many pages remain | near-static | no |
+| Content index — prefix match, radix | active; hybrid recurrent sidecar is current work | no |
+| Kernel operand — page table layout the attention kernel reads | tracks the kernel | yes |
+| Tiered storage — L2/L3 | new | partly |
+
+Grouping them by "all about KV" puts a near-static concern, an actively
+changing one, and a device-bound one behind the same trait. Three of the four
+never need a GPU.
+
+Hybrid models already falsified the assumption underneath the grouping —
+"KV is the attention KV". Recurrent state is currently carried as a sidecar
+bound to the radix block
+([`design-theses` note 1](2026-09-02-design-theses.md)). The general type is
+sequence state; attention KV is one implementation, recurrent state another,
+and paging is an implementation detail of the first.
+
+### 3.5 Fusion is a gate problem, not an architecture problem
+
+41 distinct `fused_*` symbols in `crates/cuda-kernels/`, no fusion mechanism —
+each is a hand-written `.cu`. A fusion framework needs an operator graph, and
+the tree has none (zero `enum Op` / `struct OpGraph` / `trait Op` definitions).
+Building one means rewriting the executors, and it would buy backend plurality
+we do not have: 2 backends, against SGLang's 28 attention backends and vLLM's
+161-method `Platform` interface.
+
+What is actually missing is the ability to A/B one fused kernel by itself. That
+is a gate, and `arle kernel` is 90% of it (see §6, step 0).
+
+Cross-operator **launch merging** is a different thing and belongs to device
+scheduling — `fa3-one-launch-per-layer` deleted 31,163 launches without
+changing any numerics.
+
+### 3.6 TP is a configuration dimension; PP does not exist
+
+32 files reference NCCL or collectives. Zero reference pipeline parallelism.
+
+No PP requirement has appeared — the measured configuration is 2×H20 TP=8 on a
+167 GB model — so PP is not built. The architecture must still not exclude it,
+and the only thing that currently would is the assumption "one step = one
+full-model forward", baked into `StepOutput`. A step is therefore defined at a
+**stage boundary**, which is identical to a model boundary when there is one
+stage and costs nothing.
+
+Collectives are scheduling objects, not kernels. The evidence is the
+regression in §2: moving NCCL to its own stream cost 25–30%, and the entire
+cost was host event allocation. Collectives contend for streams, SMs, and host
+time; they do not contend for numerics. They belong on the device-scheduling
+interface rather than scattered through operator implementations.
+
+TP leaks upward in exactly three places: weight sharding into the loader, rank
+into the KV budget (`tier budget ÷ world`, still pending on the roadmap), and
+vocabulary into sampling (`lm_head` vocab-parallel, implemented and deleted at
+`9b12060fc`). Three leaks means TP cannot be sealed inside a backend. It is a
+global configuration dimension like dtype: **world and rank are
+construction-time parameters, never runtime queries.**
+
+## 4. The criterion
+
+A boundary holds only if the compiler holds it.
+
+> **Criterion: does this crate compile and test on a machine with no CUDA
+> toolchain — with `cuda-kernels` absent from `cargo tree`, not merely behind a
+> feature gate.**
+
+The criterion used in the first pass of this work was "does this code call a
+device function", and it is too weak. It is true only of raw cudarc symbols.
+Two ways code passes it and still cannot move:
+
+- Code that holds a device type without calling a device operation.
+- A pure host state machine reachable only through an `impl` on a device-owning
+  struct. `a0` found both in `spec_decode.rs` and `prefix_pool.rs`: the state
+  machines are pure host, but they hang off `impl Dsv4CudaExecutor`.
+
+And one way code fails it that is real and must stay below:
+`set_dsv4_verify_frozen` is a host `AtomicBool` that device code reads.
+
+The dependency-graph criterion has none of this ambiguity, is checked by
+`cargo tree`, and cannot be satisfied by discipline alone.
+
+## 5. How the target was derived
+
+Five passes. Each one is recorded with what it rejected, because the rejected
+versions are the ones that will be proposed again.
+
+**Pass 1 — split by pipeline stage and add the missing `DeviceBatch` type.**
+Rejected as incomplete: it names the CPU-to-GPU transition but leaves device
+scheduling unnamed, leaves KV's four roles fused, and leaves kernel selection
+in the same crate as kernel implementation.
+
+**Pass 2 — split by change rate × verification cost.** Rejected: "change rate"
+is a judgement, not a type. It cannot be checked, so it erodes. It was the
+implicit criterion that produced the current state.
+
+**Pass 3 — split by whether it compiles without a CUDA toolchain.** Kept. It is
+binary, compiler-enforced, and cannot be argued with. It reframes the target:
+put as much as possible in crates where `cuda-kernels` does not appear in the
+dependency graph.
+
+**Pass 4 — check for over-correction.** If everything host-side moved up,
+`infer-cuda` would be roughly its 1,403 device-symbol lines plus device
+scheduling. That is not reachable in one pass and not desirable: code that
+holds device types has to stay. The target is therefore not a line count. It is
+that **new code defaults to above the line, and existing code moves up when a
+gate needs it to.**
+
+**Pass 5 — check against the stated core.** The core is kernel execution plus
+its scheduling. The target leaves kernel execution below, moves all scheduling
+above except device scheduling, and gives device scheduling a name for the
+first time — which §2 says is where the margin is. Kernel-to-model binding is
+handled by §3.2's four-stage split, which is what makes `qwen35.rs` divisible.
+
+## 6. Target structure
+
+Request axis, per step:
+
+```
+infer-protocol   protocol, tokenizer, sampling parameters          no cuda
+infer-plan       request scheduling → ForwardPlan                  no cuda    exists
+infer-kvspace    capacity + content index + layout description     no cuda    new
+infer-model      model → op sequence → kernel selection            no cuda    new
+                 → DeviceBatch                                                new type
+───────────── above this line, cargo tree contains no cuda-kernels ─────────────
+infer-cuda::device_sched   streams, graph capture, collective placement   new module
+infer-cuda                 kernel launch
+cuda-kernels               vendored and hand-written .cu
+```
+
+Weight axis, load time, disjoint from the request axis:
+
+```
+Checkpoint → quant-format → QuantSpec → weight-layout (repack plan) → ResidentWeights
+              no cuda        no cuda     no cuda                       cuda, copy only
+```
+
+The second axis explains why `quant_format.rs` (629 lines) is the cleanest
+extraction available: it was never on the request pipeline, so nothing about
+step construction constrains it.
+
+**Two new crates, not five.** Device scheduling starts as a module and a trait
+inside `infer-cuda`. It needs device types, so extracting it now would yield a
+trait and nothing else; it gets extracted when it is stable, or never.
+
+**Crate boundaries follow stages; modules inside may follow models.** A
+dsv4-specific byte codec belongs in a `dsv4` module inside `infer-kvspace`, not
+in a `dsv4-host` crate. A crate named for a model family commits the tree to a
+sibling for every other family, which is the per-model duplication that
+`feedback_unified_abstraction_not_per_model` records.
+
+The direct evidence for this rule is `SpecKind`: it is referenced by exactly
+two files, `executor/qwen35.rs` and `executor/spec_decode.rs`. One qwen-family
+model and one deepseek-family model share the type, so it is a step-scheduling
+concept and belongs in `infer-plan`, whose only dependencies are `serde` and
+`thiserror`.
+
+## 7. What is deliberately not built
+
+Recorded here so it is not reopened without new evidence:
+
+| Not built | Reason |
+|---|---|
+| Operator graph | Needed only by a fusion framework; building it means rewriting both executors |
+| Fusion framework | Buys backend plurality we do not have (2 backends, not 28). The real gap is a per-kernel A/B gate |
+| Pipeline parallelism | No requirement has appeared. Not excluded: step boundary = stage boundary |
+| Plugin / backend registry | 2 backends. `BackendExecutor` is 20 methods, 17 with default bodies; a registry adds indirection to a two-element set |
+| Splitting `kv-native-sys` | It is already at its boundary |
+| Rewrite to C or C++ | Examined and rejected. The host side of an inference engine can be pure C — `ggml-quants.c` uses zero C++ features — but GPU backends cannot, and llama.cpp upstream is 78% C++ by bytes. The proposal's value was diagnostic: it surfaced that the layering, not the language, is what makes iteration slow |
+| Type versioning across the seam | One repository, one release train |
+
+## 8. Order
+
+Every step is verifiable alone and leaves no parallel old/new path.
+
+### Step 0a — lift the CPU reference out of the cuda crate, and gate it
+
+`kernel_bench.rs` has its device boundary at `DeviceContext::new()`, line 276.
+Everything before it is CPU: argument validation (255), registry lookup (268),
+unknown-name bail (274). `cpu_ref_fp4` (line 62) is a pure host dequantize-and-
+GEMM.
+
+That function is the differential oracle — the thing a kernel is checked
+against — and it is trapped inside the crate that requires a GPU to build. Lift
+it and the registry surface to where they compile without cuda, and gate them
+in `pre_push_checks.sh`.
+
+This also connects two tracks that are currently separate: the same oracle
+checks a kernel's numerics and checks `quant_format`'s parsing of the same
+format.
+
+Gate: `cargo test` on a Mac; breaking the reference turns it red.
+
+### Step 0b — wire the device half into the pod flow
+
+`arle kernel fp4-gemv` against `marlin-fp4-gemm` at M=1, into `test_pod_flow.sh`
+and `pod-remote-run.sh`.
+
+The whole command must not go into a CPU CI lane. `crates/cli/src/lib.rs:173`
+makes `arle kernel` print "requires a cuda build" and exit non-zero under
+`not(feature = "cuda")`, so a CPU lane would either fail always or be skipped
+always — a gate arm that never runs
+(`feedback_gate_arm_that_errors_stops_gating_silently`).
+
+Gate: pod run with a matched A/B, and the wins entry that has been pending.
+
+### Step 1 — `DeviceBatch` on the seam
+
+Define it in `infer-seam`; `submit` takes it instead of `ForwardPlan` plus
+`KvBatchDescriptor`.
+
+This moves no code. Its whole value is that the next host function someone
+writes inside `infer-cuda` will visibly have its input in a type that lives on
+the seam, which makes the drift legible at review time instead of at line 3,322.
+
+Gate: existing seam tests.
+
+### Step 2 — `infer-kvspace`
+
+Capacity accounting, prefix matching, layout description — three of KV's four
+roles. The kernel-operand role stays in `infer-cuda`.
+
+Second because KV has the clearest existing boundary and because
+`prefix_pool.rs` is already under judgement.
+
+Gate: `cargo tree -p infer-kvspace` contains no `cuda-kernels`; contract tests
+run against both the fake and the real adapter.
+
+### Step 3 — `infer-model`
+
+The host half of `executor/qwen35.rs`, split by §3.2's four stages. Largest
+unit; its output type is `DeviceBatch`, so it must follow steps 1 and 2.
+
+Gate: no-cuda build; needle gate ×3 against the baseline envelope.
+
+### Step 4 — `device_sched`
+
+Stream assignment, graph capture eligibility, collective placement, as a module
+and a trait inside `infer-cuda`. Last, because its gate is on a GPU.
+
+Gate: pod window, matched A/B. The `collectives-to-comm-stream` regression is
+its regression test — the same change must be reproducible and its host event
+count observable before anything else moves.
+
+### Step 5 — weight axis
+
+`quant_format` extraction, then weight layout. Orthogonal to 1–4; runs in
+parallel. Gate: the oracle from step 0a.
+
+Step 0a is the only one that should not wait. Without it, no later step can
+demonstrate it did not break a kernel.
+
+## 9. Exit
+
+- `cargo tree` for `infer-plan`, `infer-kvspace`, and `infer-model` contains no
+  `cuda-kernels`.
+- `arle kernel`'s host half runs in pre-push; its device half runs in the pod
+  flow.
+- `DeviceBatch` is the only type crossing the seam for a step.
+- Each step lands its own CHANGELOG line and its wins or errors entry.
+
+## 10. What this document does not settle
+
+- Whether MoE grouped decode kernels (53.9% of GPU time) are a kernel problem
+  or a launch problem. Both are plausible and the measurement is not taken.
+- Where sequence state (§3.4) is defined once hybrid models are more than a
+  sidecar. `infer-kvspace` is the location; the type is not designed.
+- Whether `infer-protocol` is worth separating from `infer-server`. Listed in
+  the target for completeness; no evidence yet that it is a boundary.
