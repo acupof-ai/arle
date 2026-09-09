@@ -123,6 +123,27 @@ The scheduler does not need to know a kernel; it needs to emit a shape. The
 type that would carry "the shape is settled" does not exist, which is why host
 logic keeps being written on the far side of the seam.
 
+A seam audit of both backends' `submit` (2026-09-09) found a second coupling,
+in the opposite direction. `submit` receives `&mut dyn KvPool` — a capability,
+not data — and Qwen35 writes back through it: `alloc(slot, delta)` and
+`truncate_slot(slot, target)`, at nine call sites on the speculative decode
+path. The engine pre-budgets the full speculative chain (#197) and the backend
+truncates the over-allocation once the draft model's actual chain length is
+known.
+
+The host KV pool therefore has two writers: the engine budgets, the backend
+corrects. That is the same shape as the five shared-state failures found in
+tooling this session — one mutable resource, several writers, no identity —
+and it is the reason the seam cannot be closed by moving reads alone. The
+correct end state is one writer: the backend reports the actual length, the
+engine applies it. Chain length cannot move above the seam, because it is a
+device result.
+
+The audit also found that the Metal backend never calls
+`KvBatchDescriptor::from_plan` at all; it reads the pool directly
+(`slot_epoch`, `seq_len`, `page_size`, `page_indices`). Two independent drift
+paths, one cause.
+
 ### 3.4 KV is four roles inside one trait group
 
 `KvPool = KvQuery + KvAllocator + KvPrefixStore` (`crates/infer-seam/src/kv.rs:16`),
@@ -343,7 +364,23 @@ This moves no code. Its whole value is that the next host function someone
 writes inside `infer-cuda` will visibly have its input in a type that lives on
 the seam, which makes the drift legible at review time instead of at line 3,322.
 
-Gate: existing seam tests.
+Gate: existing seam tests, plus: `submit` no longer names `dyn KvPool`. The
+write path narrows to a two-method `KvSlotAccounting` trait rather than keeping
+the whole pool, so the residue is countable and Step 1b has a definite target.
+
+### Step 1b — one writer for the host KV pool
+
+Replace the narrowed write capability with returned data: `submit` yields the
+adjustment, or it rides on `PollResult`. `PollResult` is the better candidate
+because the final accepted chain length is only known after poll anyway, which
+merges two corrections into one.
+
+Separate from step 1 because it changes speculative-decode KV accounting, where
+an error is KV corruption or a premature free. It is the only step in this plan
+that moves logic rather than types.
+
+Gate: needle gate ×3, plus `spec_parity.py` — token-exact equality between the
+speculative and greedy arms.
 
 ### Step 2 — `infer-kvspace`
 
