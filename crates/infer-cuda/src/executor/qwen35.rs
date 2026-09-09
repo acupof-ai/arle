@@ -556,18 +556,21 @@ impl Qwen35CudaExecutor {
         self.slot_tier.location(key)
     }
 
-    fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
+    // Takes the model, not `&self`: the two-phase-commit call sites pair this
+    // with a rollback closure that borrows other fields, and a whole-self
+    // borrow would conflict with it.
+    fn tp_min_usize(model: &crate::qwen35::Qwen35Model, value: usize, what: &str) -> Result<usize> {
         let capped = i32::try_from(value.min(i32::MAX as usize)).unwrap_or(i32::MAX);
-        self.model
+        model
             .tp
-            .all_reduce_min_scalar_i32(&self.model.ctx, capped)
+            .all_reduce_min_scalar_i32(&model.ctx, capped)
             .map(|v| v.max(0) as usize)
             .map_err(|e| anyhow::anyhow!("Qwen3.6 TP min-reduce {what} failed: {e}"))
     }
 
     /// See `BackendExecutor::tp_sync_min` (2026-07-05 TP=4 admission livelock).
     pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
-        self.tp_min_usize(local, "admission free pages")
+        Self::tp_min_usize(&self.model, local, "admission free pages")
     }
 
     /// 2D (attn_tp × cp) engages only when both partitions are real (pinned
@@ -606,25 +609,28 @@ impl Qwen35CudaExecutor {
                 .expect("full_attn_kv present (whole-slot demote)");
             slots[slot].swap_out_image(&model.ctx, slot, pool)
         };
-        let capture_ok = usize::from(image.is_ok());
-        if self.tp_min_usize(capture_ok, "slot demote capture")? == 0 {
-            return Err(image.err().unwrap_or_else(|| {
-                anyhow::anyhow!("peer rank failed Qwen3.6 slot demote capture")
-            }));
-        }
+        let image = infer_seam::agree_abort(
+            image,
+            |ok| Self::tp_min_usize(&self.model, ok, "slot demote capture"),
+            "Qwen3.6 slot demote capture",
+        )?;
         // Chunked (16 MiB store pages): a whole image never fits one page. Per-rank
         // DRAM
         // headroom can diverge, so the verdict is min-reduced and locally-successful
         // ranks
         // roll their insert back on a mixed verdict.
-        let bytes = image?.to_bytes();
+        let bytes = image.to_bytes();
         let inserted = self
             .slot_tier
             .insert_chunked(NS_SLOT, NS_SLOT_CHUNK, key, &bytes);
-        if self.tp_min_usize(usize::from(inserted), "slot demote insert")? == 0 {
-            if inserted {
+        if !infer_seam::agree_rollback(
+            inserted,
+            |ok| Self::tp_min_usize(&self.model, ok, "slot demote insert"),
+            || {
                 self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
-            }
+                Ok(())
+            },
+        )? {
             return Ok(false);
         }
         let Self {
@@ -659,13 +665,11 @@ impl Qwen35CudaExecutor {
             .read_chunked(NS_SLOT, NS_SLOT_CHUNK, key)
             .map_err(|err| anyhow::anyhow!("Qwen3.6 whole-slot tier read key {key}: {err}"))
             .and_then(|bytes| crate::qwen35::Qwen35SlotImage::from_bytes(&bytes));
-        let image_ok = usize::from(image.is_ok());
-        if self.tp_min_usize(image_ok, "slot promote read")? == 0 {
-            return Err(image
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed Qwen3.6 slot promote read")));
-        }
-        let image = image?;
+        let image = infer_seam::agree_abort(
+            image,
+            |ok| Self::tp_min_usize(&self.model, ok, "slot promote read"),
+            "Qwen3.6 slot promote read",
+        )?;
         // Infallible config data — safe between the collectives.
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         let restored = {
@@ -691,13 +695,11 @@ impl Qwen35CudaExecutor {
                 slot_pages,
             )
         };
-        let restore_ok = usize::from(restored.is_ok());
-        if self.tp_min_usize(restore_ok, "slot promote restore")? == 0 {
-            return Err(restored.err().unwrap_or_else(|| {
-                anyhow::anyhow!("peer rank failed Qwen3.6 slot promote restore")
-            }));
-        }
-        restored
+        infer_seam::agree_abort(
+            restored,
+            |ok| Self::tp_min_usize(&self.model, ok, "slot promote restore"),
+            "Qwen3.6 slot promote restore",
+        )
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
