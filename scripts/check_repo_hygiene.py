@@ -12,11 +12,17 @@ This checker stays intentionally lightweight:
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
+import importlib.util
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -303,7 +309,7 @@ def git_grep(args: list[str]) -> list[str] | None:
 
 
 def check_repo_wide_disallowed_markers() -> list[str]:
-    own_path = repo_path(Path(__file__).resolve())
+    own_path = f"scripts/{Path(__file__).name}"
     command = ["-I", "-n"]
     for marker in REPO_WIDE_DISALLOWED_MARKERS:
         command.extend(["-e", marker])
@@ -470,6 +476,162 @@ def check_wins_baseline_citations() -> list[str]:
     return errors
 
 
+PREREG_WRITER = Path("scripts/prereg.py")
+
+
+def load_prereg():
+    """The ledger's own reader, so the format has exactly one definition."""
+    spec = importlib.util.spec_from_file_location("prereg", ROOT / PREREG_WRITER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_prereg_no_stale_running() -> list[str]:
+    """A row left `running` past 24h is a job that died without closing it; the
+    ledger is the only place that death is recorded."""
+    if not (ROOT / PREREG_WRITER).is_file():
+        return [f"missing required file: {PREREG_WRITER}"]
+    return [
+        f"docs/experience/prereg.jsonl: {stale} — close it with scripts/prereg.py done"
+        for stale in load_prereg().stale_running()
+    ]
+
+
+# --- selftest -------------------------------------------------------------
+#
+# A check that cannot fail is not a check. Five of the checks above reach the
+# tree through `git grep` / `git ls-files`, which report "nothing matched" and
+# "git is unusable" through the same empty result, so each of them can pass by
+# not running at all. `--selftest` runs those five against a world built by
+# COPYING the real artifact and breaking it, and asserts FAIL there; the same
+# world unbroken must PASS, and that half is what proves the scan ran. A
+# hand-written world shares the check's own assumptions and certifies nothing.
+
+LAUNCHER_FIXTURE = "crates/infer-cuda/src/ops/quant_linear.rs"
+REGISTRY_FIXTURE = "operators/registry.toml"
+MARKER_FIXTURE = "CONTRIBUTING.md"
+WINS_FIXTURE = "docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md"
+ARCHIVE_FIXTURE = "docs/experience/archived"
+
+
+def build_world(*rel_paths: str) -> Path:
+    """A git repo holding real copies of the named paths, staged so `git grep`
+    and `git ls-files` see them as tracked."""
+    root = Path(tempfile.mkdtemp(prefix="hygiene-world-"))
+    for rel in rel_paths:
+        src = ROOT / rel
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "core.excludesfile=", "add", "-Af"], cwd=root, check=True)
+    return root
+
+
+@contextlib.contextmanager
+def rooted(root: Path):
+    global ROOT
+    saved = ROOT
+    ROOT = root
+    try:
+        yield
+    finally:
+        ROOT = saved
+
+
+def break_launcher_boundary(root: Path) -> None:
+    path = root / LAUNCHER_FIXTURE
+    path.write_text(path.read_text() + "\nfn _world() { unsafe { ffi::launch_quant_linear(); } }\n")
+
+
+def break_registry_coverage(root: Path) -> None:
+    path = root / REGISTRY_FIXTURE
+    ids = re.findall(r'"(cuda\.[a-z0-9_.]+)"', (root / LAUNCHER_FIXTURE).read_text())
+    if not ids:
+        raise AssertionError(f"{LAUNCHER_FIXTURE} holds no cuda.* implementation id to unseat")
+    kept = [line for line in path.read_text().splitlines(keepends=True) if f'id = "{ids[0]}"' not in line]
+    path.write_text("".join(kept))
+
+
+def break_repo_wide_markers(root: Path) -> None:
+    path = root / MARKER_FIXTURE
+    path.write_text(path.read_text() + "\nbuilt at /Users/someone/code/agent-infer\n")
+
+
+def break_wins_baseline(root: Path) -> None:
+    path = root / WINS_FIXTURE
+    text = _HASH_RE.sub("XXXXXXX", path.read_text())
+    text = _BASELINE_RE.sub("reference", text)
+    path.write_text(_WAIVER_RE.sub("unmeasured", text))
+
+
+def break_archive_seal(root: Path) -> None:
+    entries = sorted((root / ARCHIVE_FIXTURE).rglob("*.md"))
+    if not entries:
+        raise AssertionError(f"{ARCHIVE_FIXTURE} holds no sealed entry to modify")
+    entries[0].write_text(entries[0].read_text() + "\n")
+
+
+def break_prereg_stale_running(root: Path) -> None:
+    """Written by the real writer, then back-dated: the world exercises the same
+    start/read path the ledger uses, so a format drift between them shows up here."""
+    subprocess.run(
+        [sys.executable, str(root / PREREG_WRITER), "start", "--name", "world",
+         "--cmd", "true", "--hypothesis", "a row left open is caught"],
+        cwd=root, check=True, stdout=subprocess.DEVNULL,
+    )
+    ledger = root / "docs/experience/prereg.jsonl"
+    rows = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+    stale = datetime.now(timezone.utc) - timedelta(hours=48)
+    rows[-1]["started"] = stale.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+SELFTEST_WORLDS = [
+    ("launcher_boundary", check_launcher_boundary, (LAUNCHER_FIXTURE,), break_launcher_boundary),
+    ("registry_covers_runtime_counters", check_registry_covers_runtime_counters,
+     (REGISTRY_FIXTURE, LAUNCHER_FIXTURE), break_registry_coverage),
+    ("repo_wide_disallowed_markers", check_repo_wide_disallowed_markers,
+     (MARKER_FIXTURE,), break_repo_wide_markers),
+    ("wins_baseline_citations", check_wins_baseline_citations, (WINS_FIXTURE,), break_wins_baseline),
+    ("archived_experience", check_archived_experience, (ARCHIVE_FIXTURE,), break_archive_seal),
+    ("prereg_no_stale_running", check_prereg_no_stale_running,
+     (str(PREREG_WRITER),), break_prereg_stale_running),
+]
+
+
+def selftest() -> int:
+    failures: list[str] = []
+    for name, check, fixtures, break_it in SELFTEST_WORLDS:
+        root = build_world(*fixtures)
+        try:
+            with rooted(root):
+                clean = check()
+                if clean:
+                    failures.append(f"{name}: the unbroken world already FAILs ({clean[0]}) — the world is wrong, not the check")
+                    continue
+                break_it(root)
+                broken = check()
+            if not broken:
+                failures.append(f"{name}: PASSes on its broken world — the check cannot fail")
+            else:
+                print(f"[selftest] {name}: FAILs on its broken world -> {broken[0]}")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    if failures:
+        print("[selftest] FAIL")
+        for failure in failures:
+            print(f"- {failure}")
+        return 1
+    print(f"[selftest] OK — {len(SELFTEST_WORLDS)} checks proved they can fail")
+    return 0
+
+
 def main() -> int:
     errors: list[str] = []
 
@@ -488,6 +650,7 @@ def main() -> int:
     errors.extend(check_workspace_truth_surface())
     errors.extend(check_launcher_boundary())
     errors.extend(check_registry_covers_runtime_counters())
+    errors.extend(check_prereg_no_stale_running())
 
     if errors:
         print("[repo-hygiene] FAIL")
@@ -499,10 +662,17 @@ def main() -> int:
     print(
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
         "repo-wide marker bans, experience entry caps, frozen archive seal, "
-        "workspace truth-surface, CUDA launcher-boundary, and registry-coverage checks all passed"
+        "workspace truth-surface, CUDA launcher-boundary, registry-coverage, "
+        "and prereg-ledger checks all passed"
     )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="assert every git-backed check FAILs on a broken copy of its real artifact",
+    )
+    sys.exit(selftest() if parser.parse_args().selftest else main())

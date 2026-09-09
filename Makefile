@@ -25,6 +25,7 @@ METAL_MODEL ?= mlx-community/Qwen3.6-35B-A3B-4bit
 
 hygiene:
 	python3 scripts/check_repo_hygiene.py
+	python3 scripts/check_repo_hygiene.py --selftest
 
 # ── Metal (macOS / Apple Silicon) ────────────────────────────────────────────
 build-metal:

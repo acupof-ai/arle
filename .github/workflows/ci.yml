@@ -54,6 +54,9 @@ jobs:
       - name: Run repo hygiene checks
         run: python3 scripts/check_repo_hygiene.py
 
+      - name: Prove the hygiene checks can fail
+        run: python3 scripts/check_repo_hygiene.py --selftest
+
   shell-contracts:
     name: Shell Contracts
     runs-on: ubuntu-latest
