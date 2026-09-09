@@ -127,7 +127,7 @@ case "$cmd" in
   quantize-w4afp8)
     input="${1:?usage: pod.sh quantize-w4afp8 <input-dir> <output-dir>}"
     output="${2:?usage: pod.sh quantize-w4afp8 <input-dir> <output-dir>}"
-    "$POD" "bash -lc 'cd $TREE && crates/cuda-kernels/tools/tilelang/.venv/bin/python scripts/quantize_dsv4_w4afp8.py \"$input\" \"$output\"'"
+    "$POD" "bash -lc 'cd $TREE && ${ARLE_TILELANG_VENV:-/root/arle-ops/tilelang-venv}/bin/python scripts/quantize_dsv4_w4afp8.py \"$input\" \"$output\"'"
     ;;
   sync)
     dirty=0; full=0
