@@ -90,6 +90,15 @@ push_or_die() {
   "$TN" exec "cat '$dst'.part.* > '$dst' && rm -f '$dst'.part.*" >/dev/null || {
     echo "reassembling $dst on the node failed; remote tree unchanged" >&2; exit 1; }
 }
+# Ship the local helpers to the tree. sync does this before apply-sync because
+# the remote apply runs the deployed tree's script: a digest-format change
+# (e.g. the blob-identity hash) would otherwise verify with the old format and
+# fail every sync until a human ran push-scripts by hand.
+push_scripts() {
+  for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh reap_run.py cuda_prebuilt_manifest.sh; do
+    push_or_die "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
+  done
+}
 pod_path() {
   case "$1" in
     "$NODE_TREE"*) printf '%s%s\n' "$TREE" "${1#"$NODE_TREE"}" ;;
@@ -107,9 +116,7 @@ tarball_files() {
 
 case "$cmd" in
   push-scripts)
-    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh reap_run.py cuda_prebuilt_manifest.sh; do
-      push_or_die "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
-    done
+    push_scripts
     echo "pushed pod helpers -> $NODE_TREE/scripts/"
     ;;
   setup)
@@ -187,6 +194,7 @@ case "$cmd" in
     [ "$bundle_mode" = none ] || push_or_die "$stage/source.bundle" "$remote_stage.source.bundle"
     push_or_die "$stage/source.meta" "$remote_stage.source.meta"
     pod_stage="$(pod_path "$remote_stage")"
+    push_scripts
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' apply-sync '$pod_stage'" || { echo "remote sync apply failed" >&2; exit 1; }
     ;;
   build)
