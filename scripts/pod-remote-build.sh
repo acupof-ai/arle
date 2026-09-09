@@ -16,7 +16,16 @@ def git(*args):
     return subprocess.check_output([b"git", b"-C", root, *args])
 
 paths = set(git(b"ls-tree", b"-rz", b"--name-only", b"HEAD").split(b"\0"))
-paths.update(git(b"ls-files", b"-co", b"--exclude-standard", b"-z").split(b"\0"))
+if os.environ.get("CLEAN"):
+    # Clean sync: committed files + the gitignored AOT bundle, no working-tree
+    # changes. Matches the `git archive HEAD` + generated/ tarball pod.sh ships.
+    gen = os.path.join(root, b"crates/cuda-kernels/generated")
+    if os.path.isdir(gen):
+        for dirpath, _, filenames in os.walk(gen):
+            for fn in filenames:
+                paths.add(os.path.relpath(os.path.join(dirpath, fn), root))
+else:
+    paths.update(git(b"ls-files", b"-co", b"--exclude-standard", b"-z").split(b"\0"))
 paths.discard(b"")
 paths.discard(b".arle-source-receipt")
 digest = hashlib.sha256()
@@ -153,6 +162,22 @@ case "${1:-}" in
   validate-build-args)
     validate_build_args "${2:?missing argv file}"
     ;;
+  tree-status)
+    receipt="$TREE/.arle-source-receipt"
+    if [ ! -f "$receipt" ]; then
+      echo "tree=$TREE head=unknown dirty=unknown (no source receipt; sync never completed?)"
+      exit 1
+    fi
+    head="$(awk -F= '$1=="head" {print $2}' "$receipt")"
+    dirty="$(awk -F= '$1=="dirty" {print $2}' "$receipt")"
+    dirty="${dirty:-0}"
+    echo "tree=$TREE head=$head dirty=$dirty"
+    recent_build="$(ls -t "$STATE/builds" 2>/dev/null | head -1)"
+    if [ -n "$recent_build" ] && [ -f "$STATE/builds/$recent_build/receipt" ]; then
+      build_head="$(awk -F= '$1=="source_head" {print $2}' "$STATE/builds/$recent_build/receipt")"
+      echo "latest_build=$recent_build source_head=${build_head:-unknown}"
+    fi
+    ;;
   apply-sync)
     stage="${2:?missing sync stage}"
     exec 9>"$TREE_LOCK"
@@ -167,6 +192,8 @@ case "${1:-}" in
     bundle_mode="$(awk -F= '$1=="bundle_mode" {print $2}' "$meta")"
     bundle_mode="${bundle_mode:-full}"
     head="$(awk -F= '$1=="head" {print $2}' "$meta")"
+    dirty="$(awk -F= '$1=="dirty" {print $2}' "$meta")"
+    dirty="${dirty:-0}"
     [ "$(sha256 "$archive")" = "$archive_sha" ] || { echo "sync digest mismatch" >&2; exit 1; }
     backup=""
     if [ "$bundle_mode" = none ]; then
@@ -226,7 +253,7 @@ case "${1:-}" in
       echo "sync source mismatch: head=$actual_head expected_head=$head digest=$actual_digest expected_digest=$expected_digest" >&2; exit 1
     fi
     receipt="$TREE/.arle-source-receipt"
-    write_receipt "$receipt" "schema=arle-source-v1" "head=$actual_head" "digest=$actual_digest" "archive_sha=$archive_sha" "bundle_sha=$bundle_sha" "applied_at=$(date -u +%FT%TZ)"
+    write_receipt "$receipt" "schema=arle-source-v1" "head=$actual_head" "dirty=$dirty" "digest=$actual_digest" "archive_sha=$archive_sha" "bundle_sha=$bundle_sha" "applied_at=$(date -u +%FT%TZ)"
     if [ "$bundle_mode" = full ]; then
       rm -rf "$backup" "$archive" "$deletes" "$bundle" "$meta"
     else
@@ -330,5 +357,5 @@ PY
     printf 'BUILD_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;
-  *) echo "usage: pod-remote-build.sh source-digest|validate-build-args|apply-sync|build ..." >&2; exit 2;;
+  *) echo "usage: pod-remote-build.sh source-digest|validate-build-args|apply-sync|tree-status|build ..." >&2; exit 2;;
 esac
