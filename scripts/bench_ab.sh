@@ -16,7 +16,7 @@
 #     * launch a server that listens on $PORT (env var, default 8000)
 #     * background themselves (trailing &) — the harness will read the PID
 #       from $! inside eval
-#     * be idempotent across kill (we pkill -f <cmd snippet> at cleanup)
+#     * be idempotent across kill (cleanup SIGKILLs serves by comm + args)
 #
 # Native runner flags are forwarded to bench_throughput.py. Artefacts land in
 # bench-output/<date>-<label-a>/ and bench-output/<date>-<label-b>/. No
@@ -184,13 +184,16 @@ fi
 
 die() { echo "error: $*" >&2; exit 3; }
 
+# Kill only serves: comm=arle plus ' serve' in args leaves `arle kernel`
+# and other subcommands alone. SIGKILL — serve ignores SIGTERM.
+kill_arle_serve() {
+    for p in $(pgrep -x arle 2>/dev/null); do
+        ps -p "$p" -o args= 2>/dev/null | grep -q ' serve' && kill -9 "$p" 2>/dev/null
+    done
+}
+
 cleanup() {
-    # Best-effort kill. Uses the full command string so we don't hit
-    # unrelated processes.
-    if [[ -n "${CURRENT_CMD:-}" ]]; then
-        pkill -f "$(echo "$CURRENT_CMD" | awk '{print $1}')" 2>/dev/null || true
-    fi
-    pkill -f "target/release/arle" 2>/dev/null || true
+    kill_arle_serve
     sleep 1
 }
 trap cleanup EXIT INT TERM
@@ -212,7 +215,7 @@ run_side() {
     echo
     echo "=== $label ==="
     # Ensure the port is free before launching.
-    pkill -f "target/release/arle" 2>/dev/null || true
+    kill_arle_serve
     sleep 2
     echo "launch: $cmd"
     eval "$cmd" || die "failed to launch: $cmd"
@@ -223,7 +226,7 @@ run_side() {
         --output "$out_dir/bench_throughput" "${PASSTHROUGH[@]}" \
         || die "bench run failed for $label"
 
-    pkill -f "target/release/arle" 2>/dev/null || true
+    kill_arle_serve
     sleep 2
     CURRENT_CMD=""
 }

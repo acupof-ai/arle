@@ -30,5 +30,8 @@ fm=collections.Counter(x.get("failure_mode","") for x in rows if not x.get("is_r
 print(f"FULL TB pass@1: {res}/{n} = {res/n:.1%}" if n else "no results")
 print("failure_modes:", dict(fm))
 PYEOF
-pkill -f "arle serve.*--port $PORT" 2>/dev/null
+# -x matches the comm exactly: pkill -f on the serve cmdline also kills
+# profiler wrappers (nsys) whose own cmdline embeds it. SIGKILL — serve
+# ignores SIGTERM.
+for p in $(pgrep -x arle 2>/dev/null); do tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -qE -- "--port $PORT([[:space:]]|$)" && kill -9 "$p" 2>/dev/null; done
 echo "FULLTB_DONE $(date -u)"; cat $W/score.txt
