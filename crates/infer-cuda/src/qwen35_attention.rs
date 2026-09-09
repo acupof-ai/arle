@@ -69,6 +69,17 @@ pub(crate) struct LinearDecodeGeom {
     v_off: usize,
 }
 
+/// Split count for the quantized paged decode kernel
+/// (`paged_attention_quantized_fa3`). The grid is
+/// `(kv_heads * splits, batch, q_tiles)`, so splits size the grid against the
+/// card's SM count; the ceiling matches the kernel's `kMaxSplits`.
+pub(crate) fn quant_decode_num_splits(sm_count: usize, batch: usize, kv_heads: usize) -> usize {
+    sm_count
+        .div_ceil(batch.max(1) * kv_heads.max(1))
+        .max(FA3_DECODE_SPLITS_FLOOR)
+        .clamp(2, QUANT_DECODE_MAX_SPLITS)
+}
+
 impl Qwen35Model {
     /// Gated full attention over an explicit contiguous K/V cache (`max_seq_len`
     /// = `k_cache.len / kv_dim`), into `out` (`[hidden, seq]`, beta=0 o_proj
@@ -641,14 +652,11 @@ impl Qwen35Model {
                             if meta.seq_len <= QUANT_POOL_KERNEL_MAX_QLEN
                                 && matches!(pool.format, KVFormat::FP8E4M3 | KVFormat::INT8)
                             {
-                                // Splits capped at 16: the pool's split-KV
-                                // workspace is sized for 16 splits.
-                                let splits = self
-                                    .ctx
-                                    .sm_count()
-                                    .div_ceil(meta.batch.max(1) * kv_heads.max(1))
-                                    .max(FA3_DECODE_SPLITS_FLOOR)
-                                    .clamp(2, 16);
+                                let splits = quant_decode_num_splits(
+                                    self.ctx.sm_count(),
+                                    meta.batch,
+                                    kv_heads,
+                                );
                                 let needed =
                                     kv_quant::paged_attention_quantized_fa3_workspace_bytes(
                                         meta.total_q,
@@ -2701,5 +2709,20 @@ impl Qwen35Model {
             "batched replay advanced {li} linear layers != slot count {num_linear}"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quant_decode_num_splits;
+
+    #[test]
+    fn splits_track_occupancy_not_depth() {
+        // H20 = 78 SMs, Qwen3.8 = 4 KV heads.
+        assert_eq!(quant_decode_num_splits(78, 1, 4), 20);
+        assert_eq!(quant_decode_num_splits(78, 8, 4), 8); // floor binds
+        assert_eq!(quant_decode_num_splits(78, 1, 1), 64); // ceiling binds
+        assert_eq!(quant_decode_num_splits(40, 1, 4), 10); // small card
+        assert_eq!(quant_decode_num_splits(78, 64, 4), 8); // floor binds at depth
     }
 }

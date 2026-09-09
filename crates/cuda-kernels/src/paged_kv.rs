@@ -478,14 +478,14 @@ impl TokenKVPool {
         let page_ref_count = vec![0_u32; max_total_pages];
 
         // Split-KV attention workspace for the quantized decode kernel: every
-        // slot in one batch, 16 splits, GQA ratio up to 8.
+        // slot in one batch, the kernel's kMaxSplits ceiling, GQA ratio up to 8.
         let (quantized_attn_workspace, quantized_attn_workspace_bytes) =
             if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
                 let ws_bytes = paged_attention_quantized_fa3_workspace_bytes(
                     num_slots,
                     num_kv_heads * 8,
                     head_dim,
-                    16,
+                    64,
                 );
                 let ws = ctx
                     .stream

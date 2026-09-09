@@ -31,7 +31,10 @@
 #define PAF3_BLOCK_SIZE (PAF3_NUM_WARPS * PAF3_WARP_SIZE)
 
 namespace {
-constexpr int kMaxSplits = 16;
+// Ceiling for the Rust-side occupancy selector
+// (quant_decode_num_splits, qwen35_attention.rs): the decode grid is
+// (kv_heads * splits, batch, q_tiles), and B=1 under-fills the card at 16.
+constexpr int kMaxSplits = 64;
 }
 
 // ─── Tensor-core partial kernel ─────────────────────────────────────────────

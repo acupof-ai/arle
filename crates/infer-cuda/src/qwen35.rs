@@ -77,6 +77,10 @@ const QUANT_POOL_KERNEL_MAX_QLEN: usize = 8;
 /// batch 4 up (2026-08-04: batch 8 is +0.36% at a ceiling of 20).
 const FA3_DECODE_SPLITS_FLOOR: usize = 8;
 
+/// Ceiling for the quantized paged decode split selector; matches the
+/// kernel's `kMaxSplits` (paged_attention_quantized_fa3.cu).
+const QUANT_DECODE_MAX_SPLITS: usize = 64;
+
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
 /// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
 /// kernel (42.1% of prefill GPU time at 3k).

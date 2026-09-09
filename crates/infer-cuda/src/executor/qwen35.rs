@@ -46,9 +46,10 @@ fn qwen_spec_decode_compatible(params: &SamplingParams) -> bool {
         && !params.has_penalty()
 }
 
-/// One chain in a batched DSpark verify; `row0` indexes the shared logits and tap
-/// features.
-struct DsparkChain {
+/// One chain in a batched spec verify; `row0` indexes the shared logits and tap
+/// features. `partial_ctx` is a ctx-ring flag only the DSpark draft sets; MTP
+/// leaves it false.
+struct SpecChain {
     /// Index of the originating row in the tick's `decode_rows`.
     out: usize,
     slot: usize,
@@ -2246,10 +2247,11 @@ impl Qwen35CudaExecutor {
     ) -> Result<Option<(u32, Option<f32>)>> {
         // BF16 captures the FA3 lane, whose scheduling ceiling `seqlen_k_capture`
         // pins. FP8/INT8 capture the split-KV lane instead: its grid is
-        // `(num_splits, total_q_heads)` and `choose_decode_num_splits` takes no KV
-        // length, so the grid is fixed at B=1; the true length is read on device
-        // from `kv_indptr`, and the workspace is pool-owned. Other formats
-        // have no such decode kernel and stay eager.
+        // `(kv_heads * num_splits, batch, q_tiles)` and the split count comes
+        // from `quant_decode_num_splits` (sm_count / (batch * kv_heads), no KV
+        // length), so the grid is fixed at B=1; the true per-row length is read
+        // on device from `seqused_k`, and the workspace is pool-owned. Other
+        // formats have no such decode kernel and stay eager.
         let capturable = match self.full_attn_kv.as_ref().map(|p| p.format) {
             Some(KVFormat::BF16) => self.model.paged_decode_fa3_active(),
             Some(KVFormat::FP8E4M3 | KVFormat::INT8) => true,
