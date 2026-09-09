@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Hooks export GIT_DIR; the `git init` below must create the temp repo.
+unset GIT_DIR GIT_WORK_TREE
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d -t pod-flow-XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
