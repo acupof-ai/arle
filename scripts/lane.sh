@@ -49,6 +49,14 @@ new)
     echo "lane $name ready:"
     echo "  cd $path"
     echo "  target-dir -> $ROOT/target (shared; builds serialize)"
+    echo
+    echo "  pod work from this lane needs its OWN remote tree — pod.sh refuses"
+    echo "  one of the pair, so export both:"
+    echo "    export POD_TREE=/host/arle-build-$name NODE_TREE=/root/arle-build-$name"
+    echo "  A shared tree is a silent-wrong-binary hazard: flock serializes each"
+    echo "  sync and each build, not the sync..build sequence, so another lane"
+    echo "  syncing between yours and your build leaves you compiling its source."
+    echo "  Cost is ~1.5 GB per tree; /host/sccache is shared, so rebuilds are cheap."
     ;;
 pr)
     name="${2:?lane: pr <name> [title]}"; valid_name "$name"
