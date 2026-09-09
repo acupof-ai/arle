@@ -74,6 +74,15 @@ Needle ladder ×3 under a concurrent stream on chunk 512: 12/12 DET — parity
 holds throughout. Final verdict: batched DSpark on quantized KV is rejected;
 the gate stays. DSpark ships per-row at c=1 (+51 %), which is the SLO lane.
 
+> Engagement caveat (2026-09-10): the per-row arm here engaged 11 chains /
+> 3440 tokens (0.3 %) — it is a no-spec reference, not a spec measurement. The
+> batched arm did engage (2.55 tok/step), and its mixed-step count was 3× the
+> per-row arm's (57 vs 19). A 2026-09-10 batched-MTP acceptance run on
+> Qwen3.8-27B-NVFP4 (d=2, 4217 chains at c=32, 256 max-tokens) found the
+> opposite sign on pure decode (+40 % ms/tok at c=32) with equal mixed-step
+> counts across arms (31 vs 31) — the mixed-step mechanism below is specific to
+> this short-decode (64 max-tokens) shape, not a universal spec-decode result.
+
 ## Rule
 
 A spec-decode gate on KV format is a statement about the verify kernel, not
