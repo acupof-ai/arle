@@ -132,8 +132,7 @@ footer{border-top:2px solid var(--rule-strong);padding-top:20px;
   <header>
     <div class="eyebrow">ARLE · controller agent-infer-34</div>
     <h1>Agenda</h1>
-    <p class="lede">Five standing goals, the measurable event each task exits on, and which agent
-      session is executing it. Rendered from <code>docs/agenda.jsonl</code> and
+    <p class="lede" id="lede">The measurable event each task exits on, and which agent session is executing it. Rendered from <code>docs/agenda.jsonl</code> and
       <code>docs/experience/prereg.jsonl</code>; nothing here is written by hand.</p>
     <div class="stamp" id="stamp"></div>
   </header>
@@ -177,6 +176,8 @@ const el = (t, c, x) => { const n = document.createElement(t); if (c) n.classNam
   if (x !== undefined) n.textContent = x; return n; };
 
 document.getElementById("stamp").textContent = "Rendered " + STAMP;
+document.getElementById("lede").firstChild.textContent =
+  goals.length + " standing goals, the measurable event each task exits on, and which agent session is executing it. ";
 
 const strip = document.getElementById("strip");
 for (const g of goals) {
