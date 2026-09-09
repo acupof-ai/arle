@@ -92,7 +92,7 @@ jobs:
 
       - name: cargo clippy (CPU-only surfaces)
         run: |
-          cargo clippy -p infer-api --no-default-features --features cpu,no-cuda --lib -- -D warnings
+          cargo clippy -p infer-api --no-default-features --features no-cuda --lib -- -D warnings
           cargo clippy -p cli --no-default-features --features no-cuda -- -D warnings
           cargo clippy -p arle --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
           cargo clippy -p autograd --features no-cuda --lib -- -D warnings

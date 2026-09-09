@@ -130,6 +130,14 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     # clippy errors pass the hook and fail CI. Debug profile shares the cache with
     # the arle check above; the old --release forced a second full compilation.
     run cargo clippy -p infer-api --no-default-features --features cuda,no-cuda --lib -- -D warnings
+    # CI's CPU-only clippy lane (job "cargo clippy (CPU-only surfaces)"): a push
+    # that is clean on the cuda lane above still failed CI here (#258). Same
+    # feature sets as CI, verbatim — the hook crate list drifts otherwise.
+    run cargo clippy -p infer-api --no-default-features --features no-cuda --lib -- -D warnings
+    run cargo clippy -p cli --no-default-features --features no-cuda -- -D warnings
+    run cargo clippy -p arle --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
+    run cargo clippy -p autograd --features no-cuda --lib -- -D warnings
+    run cargo clippy -p train --features no-cuda --lib -- -D warnings
     run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys -p infer-quant
     run cargo test \
         -p infer-core -p infer-server -p infer-plan -p infer-seam \
