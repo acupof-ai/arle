@@ -415,6 +415,7 @@ fn run_lockstep_driver(
                     throughput_prefill_forward_busy_micros: throughput.prefill_forward_busy_micros,
                     throughput_decode_forward_steps: throughput.decode_forward_steps,
                     throughput_decode_forward_busy_micros: throughput.decode_forward_busy_micros,
+                    throughput_decode_forward_tokens: throughput.decode_forward_tokens,
                     throughput_mixed_forward_steps: throughput.mixed_forward_steps,
                     throughput_mixed_forward_busy_micros: throughput.mixed_forward_busy_micros,
                     throughput_decode_phase_steps: throughput.decode_step_phase.steps,

@@ -755,6 +755,7 @@ impl StatsResponse {
                 prefill_forward_busy_micros: counters.throughput.prefill_forward_busy_micros,
                 decode_forward_steps: counters.throughput.decode_forward_steps,
                 decode_forward_busy_micros: counters.throughput.decode_forward_busy_micros,
+                decode_forward_tokens: counters.throughput.decode_forward_tokens,
                 mixed_forward_steps: counters.throughput.mixed_forward_steps,
                 mixed_forward_busy_micros: counters.throughput.mixed_forward_busy_micros,
                 decode_step_phase: StepPhaseStatsResponse {
@@ -871,6 +872,7 @@ pub struct ThroughputStatsResponse {
     pub prefill_forward_busy_micros: u64,
     pub decode_forward_steps: u64,
     pub decode_forward_busy_micros: u64,
+    pub decode_forward_tokens: u64,
     pub mixed_forward_steps: u64,
     pub mixed_forward_busy_micros: u64,
     pub decode_step_phase: StepPhaseStatsResponse,

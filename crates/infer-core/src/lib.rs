@@ -153,6 +153,11 @@ pub struct ThroughputStats {
     pub prefill_forward_busy_micros: u64,
     pub decode_forward_steps: u64,
     pub decode_forward_busy_micros: u64,
+    /// Tokens committed by pure-decode steps (prefill rows empty). The
+    /// denominator that matches `decode_forward_busy_micros` — the global
+    /// `generated_tokens` also counts mixed-step tokens, which inflates the
+    /// per-token ratio differently per arm and per concurrency.
+    pub decode_forward_tokens: u64,
     pub mixed_forward_steps: u64,
     pub mixed_forward_busy_micros: u64,
     /// Decode-only host phases. These overlap `forward_busy_micros` at submit.
@@ -1282,6 +1287,13 @@ impl Engine {
             .throughput_stats
             .generated_tokens
             .saturating_add(committed.len() as u64);
+
+        if plan.prefill_rows.is_empty() {
+            self.throughput_stats.decode_forward_tokens = self
+                .throughput_stats
+                .decode_forward_tokens
+                .saturating_add(committed.len() as u64);
+        }
 
         // Stream tokens before finishing — serving layer sees terminal token ahead of completion.
         if let Some(observer) = &mut self.on_token {
