@@ -4,6 +4,16 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# core.bare has been flipped to true on the shared config repeatedly, breaking
+# every worktree, and the writer is unidentified: the pre-push hook receives no
+# GIT_DIR (only GIT_EDITOR, GIT_PREFIX, GIT_EXEC_PATH), so the GIT_DIR
+# inheritance theory does not apply here. Bracket the next occurrence instead of
+# guessing — the log lives outside the repo so a checkout cannot lose it.
+BARE_LOG="${TMPDIR:-/tmp}/arle-core-bare.log"
+bare_now() { git --git-dir="${REPO_ROOT}/.git" config core.bare 2>/dev/null || echo "?"; }
+printf '%s enter pid=%s bare=%s\n' "$(date -u +%FT%TZ)" "$$" "$(bare_now)" >> "$BARE_LOG"
+trap 'printf "%s exit  pid=%s bare=%s\n" "$(date -u +%FT%TZ)" "$$" "$(bare_now)" >> "$BARE_LOG"' EXIT
+
 if [[ "${ARLE_SKIP_PRE_PUSH:-${AGENT_INFER_SKIP_PRE_PUSH:-0}}" == "1" ]]; then
     echo "[pre-push] ARLE_SKIP_PRE_PUSH=1; skipping (legacy AGENT_INFER_SKIP_PRE_PUSH also works)"
     exit 0
