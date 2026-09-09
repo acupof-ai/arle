@@ -159,8 +159,8 @@ fn consume(bytes: &[u8], sink: &mut [u8]) {
 fn evict_cpu_cache() {
     let v = vec![0u8; 512 << 20];
     let mut s = 0u64;
-    for chunk in v.chunks_exact(8) {
-        s = s.wrapping_add(u64::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in v.as_chunks::<8>().0 {
+        s = s.wrapping_add(u64::from_le_bytes(*chunk));
     }
     std::hint::black_box(s);
 }
