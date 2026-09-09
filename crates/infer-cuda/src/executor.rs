@@ -812,9 +812,7 @@ impl RealCudaExecutor {
     }
 }
 
-use kv_native_sys::{
-    BLOB_CHUNK_BYTES, KvTierStore, chunk_manifest, chunk_sub, default_t1_budget_bytes, tier_key,
-};
+use kv_native_sys::{BLOB_CHUNK_BYTES, KvTierStore, default_t1_budget_bytes};
 
 /// Placeholder, not measurement-derived — dormant until `demote` is wired.
 ///
@@ -838,17 +836,9 @@ pub(crate) fn default_t1_budget_per_rank() -> usize {
     default_t1_budget_bytes(DEFAULT_DRAM_FRACTION) / world.max(1)
 }
 
-/// `slot_tier` key namespaces (top byte, see `kv_native_sys::tier_key`), so features
-/// sharing THE store never collide and a future kind (e.g. a suffix cache) is
-/// one new constant.
-/// Parked whole-slot images (key = engine-minted swap key).
-pub(crate) const NS_SLOT: u64 = 1;
-pub(crate) const NS_SLOT_CHUNK: u64 = 2;
-/// Qwen3.5/3.6 recurrent prefix sidecars (key = token-prefix hash). Disjoint
-/// namespace from `NS_SLOT`, so the Qwen3.6 arm's ONE `slot_tier` holds both the
-/// whole-slot spill images and the page-radix sidecars without key aliasing.
-pub(crate) const NS_SIDECAR: u64 = 3;
-pub(crate) const NS_SIDECAR_CHUNK: u64 = 4;
+/// `slot_tier` key namespaces, defined in `infer_kvspace` where the tier
+/// lifecycle lives; re-exported for the DSv4 slot tier's `use super::*`.
+pub(crate) use infer_kvspace::{NS_SLOT, NS_SLOT_CHUNK};
 
 /// Borrow a plan row's penalty snapshot; empty when the request set no penalty.
 pub(crate) fn penalty_of(

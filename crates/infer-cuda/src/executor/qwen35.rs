@@ -3,21 +3,6 @@ use crate::qwen35::alloc_recurrent_block;
 use anyhow::anyhow;
 use std::cmp::Ordering;
 
-/// A sidecar blob whose `to_bytes()` + chunking completed on the serialization thread.
-struct SidecarBlob {
-    pos: usize,
-    key: u64,
-    chunks: usize,
-    entries: Vec<(u64, Vec<u8>)>,
-    prefix_pages: Vec<u32>,
-}
-
-/// A batch of snapshots to serialize on the dedicated thread.
-struct SidecarWork {
-    items: Vec<(usize, u64, crate::qwen35::Qwen35RecurrentSnapshot)>,
-    prefix_pages: Vec<u32>,
-}
-
 /// Set the host slot's accounted length to `target`. The engine pre-budgets
 /// the full spec chain (#197), so this normally no-ops; a warm row or a chain
 /// shorter than the budget truncates the over-allocation instead of leaving
@@ -69,23 +54,6 @@ struct SpecChain {
     partial_ctx: bool,
 }
 
-fn tier_io_stats(s: &kv_native_sys::TierIoStats) -> infer_seam::KvTierIoStats {
-    infer_seam::KvTierIoStats {
-        mode: match s.mode {
-            kv_native_sys::DiskIoMode::Direct => infer_seam::KvTierIoMode::Direct,
-            kv_native_sys::DiskIoMode::Mmap => infer_seam::KvTierIoMode::Mmap,
-            _ => infer_seam::KvTierIoMode::Disabled,
-        },
-        useful_read_bytes: s.useful_read_bytes,
-        useful_write_bytes: s.useful_write_bytes,
-        submitted_read_bytes: s.submitted_read_bytes,
-        submitted_write_bytes: s.submitted_write_bytes,
-        metadata_write_bytes: s.metadata_write_bytes,
-        failures: s.failures,
-        completion_wait_ns: s.completion_wait_ns,
-    }
-}
-
 static QWEN35_GRAPH_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static QWEN35_GRAPH_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -135,7 +103,7 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Whole-slot capacity spill: a parked request's snapshot, restored byte-exact on
     /// resume. Keyed by the engine session key — a namespace disjoint from
     /// the write-through `(slot, page)` keys.
-    slot_tier: KvTierStore,
+    slot_tier: infer_kvspace::KvSlotTier<crate::qwen35::Qwen35RecurrentSnapshot>,
     /// Free-list of detached recurrent blocks (~147 MiB each), so only ACTIVE slots
     /// hold a block rather than all `num_slots`.
     recurrent_pool: Vec<crate::qwen35::RecurrentBlock>,
@@ -170,16 +138,9 @@ pub(crate) struct Qwen35CudaExecutor {
     /// page to the new token. Holds (logical, physical).
     /// Per-rank L2 byte budget (`--kv-dram` ÷ world size).
 
-    /// NVMe root for durable recall spill (`--kv-disk`).
-    disk_root: Option<std::path::PathBuf>,
-    /// Budget bytes for durable NVMe recall spill (`--kv-disk-limit`).
-    disk_budget: Option<usize>,
     /// The constructed pool's own `max_total_pages`; `ensure_kv_pool` rebuilds at this
     /// size.
     kv_pool_sized_pages: usize,
-    /// Eviction coordination only: the tail host-pool page of each published prefix →
-    /// its sidecar key in `slot_tier`, so a sidecar's lifetime rides the radix blocks.
-    sidecar_page_key: std::collections::HashMap<u32, u64>,
     /// Per-slot recurrent snapshot captured at `L* = align_down16(prompt_len - 1)`, the
     /// exact-resend restore target. The device recurrent state cannot rewind, so
     /// snapshot-position must equal key-position or restore double-advances the
@@ -195,13 +156,6 @@ pub(crate) struct Qwen35CudaExecutor {
     /// MTP spec-decode state (`--spec-type mtp`): the spec state plus the seed
     /// (pending token + hidden) for the next spec step.
     pub(crate) mtp: Option<MtpExec>,
-    /// Dedicated sidecar serialization thread: snapshots go in via `sidecar_work_tx`,
-    /// serialized blobs come out via `sidecar_rx` (drained in `poll_sidecar_serializations`).
-    /// One thread (not spawn-per-call) bounds memory-bandwidth contention at c=1.
-    /// `ARLE_SIDECAR_SYNC=1` bypasses the thread and serializes inline (A/B control).
-    sidecar_sync: bool,
-    sidecar_work_tx: std::sync::mpsc::Sender<SidecarWork>,
-    sidecar_rx: std::sync::mpsc::Receiver<SidecarBlob>,
 }
 
 /// Per-slot MTP spec-decode state; created lazily by the first warm decode step.
@@ -310,25 +264,26 @@ impl Qwen35CudaExecutor {
         // occupant;
         // a leaked entry would double-save under a later publish.
         let periodic = std::mem::take(&mut self.periodic_boundary_snapshots[slot]);
-        let boundary = tokens.len().saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
+        let boundary = infer_kvspace::sidecar_lstar(tokens.len(), SUPPORTED_PAGE_SIZE);
         let pending = self.prefill_boundary_snapshot[slot].take();
-        let mat_len = matched_len
-            .min(self.slots[slot].seq_len())
-            .min(tokens.len())
-            / SUPPORTED_PAGE_SIZE
-            * SUPPORTED_PAGE_SIZE;
+        let mat_len = infer_kvspace::sidecar_mat_len(
+            matched_len,
+            self.slots[slot].seq_len(),
+            tokens.len(),
+            SUPPORTED_PAGE_SIZE,
+        );
         if mat_len == 0 {
             return Ok(());
         }
-        // Collect (pos, key, snapshot) items; `to_bytes()` runs on a background
-        // thread so the 146.8 MiB serialization doesn't stall the engine step
+        // Collect (pos, key, snapshot) items; serialization runs on the tier's
+        // background thread so the 146.8 MiB cost doesn't stall the engine step
         // when several requests finish prefill in the same step.
         let mut work: Vec<(usize, u64, crate::qwen35::Qwen35RecurrentSnapshot)> = Vec::new();
         for (pos, psnap) in periodic {
-            if pos == 0 || pos > mat_len {
+            if !infer_kvspace::sidecar_periodic_savable(pos, mat_len) {
                 continue;
             }
-            let pkey = crate::qwen35::hash_prefix_tokens(&tokens[..pos]);
+            let pkey = infer_kvspace::hash_prefix_tokens(&tokens[..pos]);
             work.push((pos, pkey, psnap));
         }
         // The L* prefill snapshot (full pair) is always restorable. A fresh
@@ -342,90 +297,22 @@ impl Qwen35CudaExecutor {
             _ => Some(self.slots[slot].snapshot_recurrent(&self.model.ctx)?),
         };
         if let Some(snap) = snap {
-            let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
+            let key = infer_kvspace::hash_prefix_tokens(&tokens[..mat_len]);
             work.push((mat_len, key, snap));
         }
-        if work.is_empty() {
-            return Ok(());
-        }
-        if self.sidecar_sync {
-            for (pos, key, snap) in work {
-                let bytes = snap.to_bytes();
-                let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
-                let manifest_key = tier_key(NS_SIDECAR, key);
-                let manifest = chunk_manifest(chunks, bytes.len());
-                let mut entries = Vec::with_capacity(chunks + 1);
-                entries.push((manifest_key, manifest));
-                entries.extend(
-                    bytes
-                        .chunks(BLOB_CHUNK_BYTES)
-                        .enumerate()
-                        .map(|(idx, chunk)| {
-                            (
-                                tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
-                                chunk.to_vec(),
-                            )
-                        }),
-                );
-                self.store_sidecar_blob(pos, key, chunks, entries, prefix_pages);
-            }
-            return Ok(());
-        }
-        let _ = self.sidecar_work_tx.send(SidecarWork {
-            items: work,
-            prefix_pages: prefix_pages.to_vec(),
-        });
+        self.slot_tier.submit_sidecar(work, prefix_pages);
         Ok(())
     }
 
-    /// Drain completed background serializations into `slot_tier` / `sidecar_page_key`.
+    /// Drain completed background serializations into the tier store.
     pub(crate) fn poll_sidecar_serializations(&mut self) {
-        while let Ok(blob) = self.sidecar_rx.try_recv() {
-            self.store_sidecar_blob(
-                blob.pos,
-                blob.key,
-                blob.chunks,
-                blob.entries,
-                &blob.prefix_pages,
-            );
-        }
-    }
-
-    /// Insert a sidecar blob and coordinate its eviction off the last radix page it
-    /// covers: leaves evict deepest-first, so the blob drops as its own prefix erodes.
-    fn store_sidecar_blob(
-        &mut self,
-        pos: usize,
-        key: u64,
-        chunks: usize,
-        entries: Vec<(u64, Vec<u8>)>,
-        prefix_pages: &[u32],
-    ) {
-        if !self
-            .slot_tier
-            .insert_prechunked(NS_SIDECAR, key, chunks, entries)
-        {
-            return;
-        }
-        let cover_idx = (pos / SUPPORTED_PAGE_SIZE).saturating_sub(1);
-        if let Some(&tail) = prefix_pages.get(cover_idx).or_else(|| prefix_pages.last())
-            && let Some(old) = self.sidecar_page_key.insert(tail, key)
-            && old != key
-        {
-            self.slot_tier
-                .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, old);
-        }
+        self.slot_tier.poll_sidecar();
     }
 
     /// Drop sidecar blobs keyed to evicted radix pages — eviction rides the radix,
     /// no independent sidecar LRU.
     pub(crate) fn release_sidecar_pages(&mut self, pages: &[u32]) {
-        for &page in pages {
-            if let Some(key) = self.sidecar_page_key.remove(&page) {
-                self.slot_tier
-                    .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key);
-            }
-        }
+        self.slot_tier.release_sidecar_pages(pages);
     }
 
     /// Return `slot`'s device pages NOW: a lazy free leaves the host admission pool
@@ -479,29 +366,11 @@ impl Qwen35CudaExecutor {
         // session's block envelopes describe different tokens at the same block
         // indices, and `update_block_reps` only grows past `len()` — a stale rep is
         // never recomputed, so scoring ranks another request's keys.
-        // Probe largest-first; each boundary is page-aligned, so `hash(tokens[..B])`
-        // rendezvous with the save keys.
-        let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
-        let mut candidates: Vec<usize> = Vec::new();
-        if matched_len > 0 {
-            candidates.push(matched_len);
-        }
-        let mut b = matched_len / stride * stride;
-        while b >= stride {
-            if b != matched_len {
-                candidates.push(b);
-            }
-            b -= stride;
-        }
-        // A corrupt/foreign payload deserializes to None and is skipped.
-        let restored = candidates.into_iter().find_map(|b| {
-            let key = crate::qwen35::hash_prefix_tokens(&tokens[..b]);
-            self.slot_tier
-                .read_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key)
-                .ok()
-                .and_then(|bytes| crate::qwen35::Qwen35RecurrentSnapshot::from_bytes(&bytes).ok())
-                .map(|snap| (b, snap))
-        });
+        // Probe largest-first; each boundary is page-aligned, so
+        // `hash(tokens[..B])` rendezvous with the save keys. A corrupt/foreign
+        // payload is skipped inside the probe.
+        let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE;
+        let restored = self.slot_tier.probe_sidecar(tokens, matched_len, stride);
 
         let Some((boundary, snap)) = restored else {
             // Clean up full_attn_kv and seq_len here — the caller's Err handler won't.
@@ -545,7 +414,7 @@ impl Qwen35CudaExecutor {
     }
 
     pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
-        tier_io_stats(&self.slot_tier.io_stats())
+        self.slot_tier.io_stats()
     }
 
     pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
@@ -620,14 +489,12 @@ impl Qwen35CudaExecutor {
         // ranks
         // roll their insert back on a mixed verdict.
         let bytes = image.to_bytes();
-        let inserted = self
-            .slot_tier
-            .insert_chunked(NS_SLOT, NS_SLOT_CHUNK, key, &bytes);
+        let inserted = self.slot_tier.store_image(key, &bytes);
         if !infer_seam::agree_rollback(
             inserted,
             |ok| Self::tp_min_usize(&self.model, ok, "slot demote insert"),
             || {
-                self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
+                self.slot_tier.remove_image(key);
                 Ok(())
             },
         )? {
@@ -662,8 +529,7 @@ impl Qwen35CudaExecutor {
         }
         let image = self
             .slot_tier
-            .read_chunked(NS_SLOT, NS_SLOT_CHUNK, key)
-            .map_err(|err| anyhow::anyhow!("Qwen3.6 whole-slot tier read key {key}: {err}"))
+            .load_image(key)
             .and_then(|bytes| crate::qwen35::Qwen35SlotImage::from_bytes(&bytes));
         let image = infer_seam::agree_abort(
             image,
@@ -703,9 +569,7 @@ impl Qwen35CudaExecutor {
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        for &key in keys {
-            self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
-        }
+        self.slot_tier.drop_images(keys);
     }
 
     pub(crate) fn from_qwen35_safetensors(
@@ -894,53 +758,17 @@ impl Qwen35CudaExecutor {
             .map(|_| alloc_recurrent_block(&model.ctx, num_linear, gdr_state_len, conv_len))
             .collect::<Result<Vec<_>>>()?;
 
-        // Whole-slot spill: snapshots stored as 16 MiB chunked blobs — a whole image
-        // never fits one fixed page, and the store's size contract is per-page.
+        // Whole-slot spill plus the recurrent sidecar, one tier per rank.
         let tier_budget_bytes = default_t1_budget_per_rank();
-        let slot_tier = KvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
+        let sidecar_sync = std::env::var("ARLE_SIDECAR_SYNC").is_ok_and(|v| v == "1");
+        let slot_tier =
+            infer_kvspace::KvSlotTier::new(tier_budget_bytes, SUPPORTED_PAGE_SIZE, sidecar_sync);
 
         // The decode forward's only collectives are stream-ordered all-reduces
         // (one-shot IPC kernel, or NCCL on the compute stream) — both
         // graph-capturable. Eager fallback disarms on any capture failure.
         let decode_graph_armed = crate::runtime_flags::qwen35_decode_graph()
             && model.decode_graph_unsupported_reason().is_none();
-        let sidecar_sync = std::env::var("ARLE_SIDECAR_SYNC").is_ok_and(|v| v == "1");
-        let (sidecar_tx, sidecar_rx) = std::sync::mpsc::channel::<SidecarBlob>();
-        let (sidecar_work_tx, sidecar_work_rx) = std::sync::mpsc::channel::<SidecarWork>();
-        if !sidecar_sync {
-            std::thread::spawn(move || {
-                while let Ok(work) = sidecar_work_rx.recv() {
-                    for (pos, key, snap) in work.items {
-                        let bytes = snap.to_bytes();
-                        let chunks = bytes.len().div_ceil(BLOB_CHUNK_BYTES);
-                        let manifest_key = tier_key(NS_SIDECAR, key);
-                        let manifest = chunk_manifest(chunks, bytes.len());
-                        let mut entries = Vec::with_capacity(chunks + 1);
-                        entries.push((manifest_key, manifest));
-                        entries.extend(bytes.chunks(BLOB_CHUNK_BYTES).enumerate().map(
-                            |(idx, chunk)| {
-                                (
-                                    tier_key(NS_SIDECAR_CHUNK, chunk_sub(key, idx)),
-                                    chunk.to_vec(),
-                                )
-                            },
-                        ));
-                        if sidecar_tx
-                            .send(SidecarBlob {
-                                pos,
-                                key,
-                                chunks,
-                                entries,
-                                prefix_pages: work.prefix_pages.clone(),
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            });
-        }
         let executor = Self {
             model,
             slots,
@@ -955,10 +783,7 @@ impl Qwen35CudaExecutor {
             batch_decode: None,
             full_attn_kv: Some(full_attn_kv),
             kv_format,
-            disk_root: None,
-            disk_budget: None,
             kv_pool_sized_pages,
-            sidecar_page_key: std::collections::HashMap::new(),
             prefill_boundary_snapshot: (0..num_slots).map(|_| None).collect(),
             periodic_boundary_snapshots: (0..num_slots).map(|_| Vec::new()).collect(),
             dspark: dspark_head.map(|h| crate::qwen35::dspark::Qwen35DsparkExec::new(h, num_slots)),
@@ -971,9 +796,6 @@ impl Qwen35CudaExecutor {
                 rejects: 0,
                 chains: 0,
             }),
-            sidecar_sync,
-            sidecar_work_tx,
-            sidecar_rx,
         };
         cuda_startup_log(
             "executor.qwen35_executor_total",
@@ -1137,7 +959,7 @@ impl Qwen35CudaExecutor {
     /// Per-rank L2 byte cap (`--kv-dram` ÷ world size). Pre-serve only (drops any
     /// existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        self.slot_tier = KvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
+        self.slot_tier.set_budget(bytes);
     }
 
     /// Attach NVMe spill (`--kv-disk`). Pre-serve only. The budget is a per-store
@@ -1148,10 +970,7 @@ impl Qwen35CudaExecutor {
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        self.disk_root = Some(root.clone());
-        self.disk_budget = Some(budget_bytes);
-        self.slot_tier
-            .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES)
+        self.slot_tier.set_disk(root, budget_bytes)
     }
 
     /// `Option` is `None` only after an OPD weight offload dropped the pool.
@@ -3450,10 +3269,7 @@ impl Qwen35CudaExecutor {
         self.decode_graph = None;
         // Weight epoch changed: drop every tracked sidecar blob so a skipped capture
         // never serves old-epoch state.
-        for (_, key) in self.sidecar_page_key.drain() {
-            self.slot_tier
-                .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key);
-        }
+        self.slot_tier.drop_all_sidecar();
         self.model.remerge_student_lora(update)
     }
 

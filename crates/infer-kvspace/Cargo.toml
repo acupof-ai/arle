@@ -9,6 +9,7 @@ publish.workspace = true
 anyhow = "1.0"
 half = "2.4"
 infer-seam = { path = "../infer-seam" }
+kv-native-sys = { path = "../kv-native-sys" }
 
 [lints]
 workspace = true

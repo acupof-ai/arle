@@ -287,19 +287,13 @@ impl Qwen35RecurrentSnapshot {
     }
 }
 
-/// FNV-1a hash of a token id slice — used to key the recurrent sidecar.
-pub(crate) fn hash_prefix_tokens(tokens: &[u32]) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    let mut h = FNV_OFFSET;
-    for &t in tokens {
-        let bytes = t.to_le_bytes();
-        for b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
+impl infer_kvspace::SidecarSnapshot for Qwen35RecurrentSnapshot {
+    fn serialize(self) -> Vec<u8> {
+        self.to_bytes()
     }
-    h
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        Qwen35RecurrentSnapshot::from_bytes(bytes).ok()
+    }
 }
 
 impl Qwen35SlotState {

@@ -50,20 +50,7 @@ impl Dsv4CudaExecutor {
             completion_wait_ns: prefix.completion_wait_ns + slot.completion_wait_ns,
             ..prefix
         };
-        infer_seam::KvTierIoStats {
-            mode: match stats.mode {
-                kv_native_sys::DiskIoMode::Disabled => infer_seam::KvTierIoMode::Disabled,
-                kv_native_sys::DiskIoMode::Mmap => infer_seam::KvTierIoMode::Mmap,
-                kv_native_sys::DiskIoMode::Direct => infer_seam::KvTierIoMode::Direct,
-            },
-            useful_read_bytes: stats.useful_read_bytes,
-            useful_write_bytes: stats.useful_write_bytes,
-            submitted_read_bytes: stats.submitted_read_bytes,
-            submitted_write_bytes: stats.submitted_write_bytes,
-            metadata_write_bytes: stats.metadata_write_bytes,
-            failures: stats.failures,
-            completion_wait_ns: stats.completion_wait_ns,
-        }
+        infer_kvspace::tier_io_stats(&stats)
     }
 
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
