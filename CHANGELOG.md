@@ -8,6 +8,8 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Hygiene checks now prove they can fail, and bench runs are pre-registered** — adopted from the aupai harness. `scripts/check_repo_hygiene.py --selftest` builds a world per git-backed check by copying the real artifact and breaking it, asserts FAIL there and PASS on the same world unbroken; six checks covered, 0.71 s, wired into CI / `make hygiene` / pre-push. `scripts/prereg.py` writes the hypothesis before a run and closes the row with result / finding / decision separated; a row left running past 24h fails hygiene (`1c676f1f7`).
+
 - docs(design): design note 1, a prefix cache for hybrid models — snapshots at page boundaries bound to the attention pages, `prompt_len - 1` cap, content keys on disk / page identity in memory, and the 2026-09-02 identity failure ([note](docs/design/hybrid-prefix-cache.md), [plan](docs/plans/2026-09-02-design-theses.md)).
 - **Metal prefix restore survives past the first turn — verdict: accepted.** Turn 3+ of a multi-turn conversation licensed 0 prefix blocks and re-prefilled the whole prompt: a restored slot's republish minted new logical ids for the shared pages and pruned every boundary snapshot, and the snapshots it did leave were keyed to a page chain the radix never hands out. Qwen3.5-0.8B, 12 agent-shaped turns: turns 2–12 median TTFT 2.01 s → 180 ms (mlx-lm 0.31.2 on the same weights: 249 ms); restored output byte-identical to cold, needle 18/18 DET. See `docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md`.
 
