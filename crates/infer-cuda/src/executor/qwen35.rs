@@ -197,6 +197,11 @@ pub(crate) struct Qwen35CudaExecutor {
 /// Per-slot MTP spec-decode state; created lazily by the first warm decode step.
 pub(crate) struct MtpExec {
     slots: Vec<Option<MtpSlotState>>,
+    /// Batched-verify scratch shared with the DSpark path (argmax buffers,
+    /// linear-state copy, replay tables) — the machinery is head-agnostic.
+    scratch: crate::qwen35::dspark::DsparkScratch,
+    copy: crate::qwen35::Qwen35CopyScratch,
+    replay_tables: crate::qwen35::Qwen35ReplayTables,
     /// Cumulative counters (host-side, no device sync) — the /v1/stats spec source.
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
@@ -939,6 +944,9 @@ impl Qwen35CudaExecutor {
             dspark: dspark_head.map(|h| crate::qwen35::dspark::Qwen35DsparkExec::new(h, num_slots)),
             mtp: mtp_draft_tokens.map(|_| MtpExec {
                 slots: (0..num_slots).map(|_| None).collect(),
+                scratch: Default::default(),
+                copy: Default::default(),
+                replay_tables: Default::default(),
                 accepts: 0,
                 rejects: 0,
                 chains: 0,
@@ -1681,6 +1689,281 @@ impl Qwen35CudaExecutor {
             .collect())
     }
 
+    /// One MTP tick: draft every seeded slot's chain in `depth` batched head
+    /// forwards, verify ALL chains in ONE trunk forward, then accept/roll back
+    /// per row. Greedy stays token-exact to no-spec decode. Unseeded rows fall
+    /// back to their warm step without stopping the rest of the tick.
+    fn mtp_decode_batch(
+        &mut self,
+        decode_rows: &[DecodeRow],
+        host_kv: &mut dyn KvPool,
+    ) -> Result<Vec<SlotToken>> {
+        let depth = self.model.spec_draft_tokens().max(1);
+        let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
+        let mut seeded = vec![false; decode_rows.len()];
+        for (i, row) in decode_rows.iter().enumerate() {
+            ensure!(
+                row.slot < self.num_slots,
+                "decode slot {} outside Qwen3.5 executor slots {}",
+                row.slot,
+                self.num_slots
+            );
+            ensure!(
+                self.slots[row.slot].seq_len() == row.kv_seq_len,
+                "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+                self.slots[row.slot].seq_len(),
+                row.kv_seq_len,
+                row.slot
+            );
+            // Same seed predicate as the per-row path, plus the paged pool the
+            // batched verify reads through. The gate already excluded
+            // logprobs/sampled rows when the batch route is on, but a gate
+            // miss (n_rows > spec_max_batch) still reaches here one row at a
+            // time, so keep the predicate complete.
+            seeded[i] = row.params.top_logprobs.is_none()
+                && self.full_attn_paged()
+                && speculative_chain_fits(row.kv_seq_len, depth, self.model.max_seq_len())
+                && matches!(
+                    self.mtp.as_ref().and_then(|m| m.slots[row.slot].as_ref()),
+                    Some(s) if s.pending == row.last_token
+                );
+        }
+
+        // Non-batchable rows (unseeded, or sampled/logprobs on a gate miss) take
+        // the per-row path, which warms or specs them one at a time.
+        for (i, row) in decode_rows.iter().enumerate() {
+            if !seeded[i] || !row.params.is_greedy() {
+                out[i] = self.mtp_decode_row(row, host_kv)?;
+            }
+        }
+
+        let mut idx: Vec<usize> = (0..decode_rows.len())
+            .filter(|&i| seeded[i] && decode_rows[i].params.is_greedy())
+            .collect();
+        if idx.is_empty() {
+            return Ok(out.into_iter().flatten().collect());
+        }
+        // Slot-ascending: the spec-state Vec below is built by slot index.
+        idx.sort_by_key(|&i| decode_rows[i].slot);
+
+        let Self {
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            mtp,
+            ..
+        } = self;
+        let mtp_exec = mtp.as_mut().expect("mtp (gated)");
+        let mut pick = vec![false; mtp_exec.slots.len()];
+        let mut tokens = Vec::with_capacity(idx.len());
+        let mut h_prevs = Vec::with_capacity(idx.len());
+        for &i in &idx {
+            let st = mtp_exec.slots[decode_rows[i].slot]
+                .as_ref()
+                .expect("seeded (gated)");
+            let mut h = DeviceVec::zeros(&model.ctx, st.hidden.len)?;
+            model
+                .ctx
+                .stream
+                .memcpy_dtod(&st.hidden.data, &mut h.data)
+                .map_err(|e| anyhow::anyhow!("mtp batch seed hidden copy failed: {e}"))?;
+            tokens.push(st.pending);
+            h_prevs.push(h);
+            pick[decode_rows[i].slot] = true;
+        }
+        let mut chains: Vec<Vec<u32>> = tokens.iter().map(|&t| vec![t]).collect();
+
+        // Draft: depth batched head forwards. Each slot owns its head KV, so
+        // attention runs per row inside the level; every GEMM is one call.
+        {
+            let mut specs: Vec<&mut crate::qwen35::Qwen35SpecSlotState> = mtp_exec
+                .slots
+                .iter_mut()
+                .enumerate()
+                .filter(|(s, _)| pick[*s])
+                .map(|(_, st)| &mut st.as_mut().expect("seeded (gated)").spec)
+                .collect();
+            for level in 0..depth {
+                let (next, h_outs) = model.mtp_forward_level_batch(
+                    &mut specs,
+                    workspace,
+                    &tokens,
+                    &h_prevs,
+                    level,
+                    &mut mtp_exec.scratch,
+                )?;
+                for (n, c) in chains.iter_mut().enumerate() {
+                    c.push(next[n]);
+                }
+                tokens = next;
+                h_prevs = h_outs;
+            }
+        }
+
+        // Snapshot every trunk's linear state as the partial-accept rollback base.
+        {
+            let bytes = model.linear_state_bytes();
+            let (mut gdr, mut conv) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
+            for ((_, slot), (_, st)) in slots.iter_mut().enumerate().filter(|(i, _)| pick[*i]).zip(
+                mtp_exec
+                    .slots
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(i, _)| pick[*i]),
+            ) {
+                st.as_mut()
+                    .expect("seeded (gated)")
+                    .spec
+                    .linear_state_addrs(&model.ctx, slot, bytes, &mut gdr, &mut conv)?;
+            }
+            model.batched_copy(&mut mtp_exec.copy, &gdr.0, &gdr.1, &[bytes.0])?;
+            model.batched_copy(&mut mtp_exec.copy, &conv.0, &conv.1, &[bytes.1])?;
+        }
+
+        let mut batch: Vec<SpecChain> = Vec::with_capacity(idx.len());
+        for (n, &i) in idx.iter().enumerate() {
+            batch.push(SpecChain {
+                out: i,
+                slot: decode_rows[i].slot,
+                start: decode_rows[i].kv_seq_len,
+                row0: 0,
+                chain: std::mem::take(&mut chains[n]),
+                partial_ctx: false,
+            });
+        }
+        let mut total_rows = 0usize;
+        for c in &mut batch {
+            c.row0 = total_rows;
+            total_rows += c.chain.len();
+        }
+        let chains_flat: Vec<u32> = batch.iter().flat_map(|c| c.chain.iter().copied()).collect();
+
+        // All-or-nothing: seq_lens advance only on success, so any failure must
+        // give every reserved row back.
+        let mut free_caps: Vec<Option<&mut crate::qwen35::Qwen35LinearCapture>> = mtp_exec
+            .slots
+            .iter_mut()
+            .map(|s| s.as_mut().map(|st| &mut st.spec.capture))
+            .collect();
+        let logits = match Self::spec_verify_forward(
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            &batch,
+            &chains_flat,
+            host_kv,
+            &mut free_caps,
+            None,
+            true,
+        ) {
+            Ok(logits) => logits,
+            Err(e) => {
+                for c in &batch {
+                    if host_kv.seq_len(c.slot) > c.start {
+                        host_kv.truncate_slot(c.slot, c.start)?;
+                    }
+                    let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
+                    let host_pages = host_kv.page_indices(c.slot);
+                    let need = c.start.div_ceil(pool.page_size);
+                    ensure!(
+                        host_pages.len() >= need,
+                        "host pool holds {} pages for slot {}, {need} needed to cover {} tokens",
+                        host_pages.len(),
+                        c.slot,
+                        c.start
+                    );
+                    pool.mirror_slot(c.slot, &host_pages[..need], c.start)?;
+                }
+                return Err(e);
+            }
+        };
+
+        // One argmax over every chain's rows: the accept scan is host arithmetic
+        // from here, so the loop below adds no device syncs.
+        let argmax = model.argmax_rows(&logits, &mut mtp_exec.scratch)?;
+        let hidden_size = model.config.hidden_size;
+        let mut rollback: Vec<(usize, usize, usize)> = Vec::with_capacity(batch.len());
+        for c in &batch {
+            let (tokens, bonus, k) = model.dspark_accept_commit(&c.chain, &argmax, c.row0)?;
+            if k + 1 < c.chain.len() {
+                rollback.push((c.slot, c.start, k));
+            }
+            // The accepted row's raw trunk hidden seeds the next block's level-0
+            // draft; the verify left every row's hidden in `workspace.hidden`.
+            {
+                let hidden = workspace.hidden.get(&model.ctx, hidden_size, total_rows)?;
+                let src = hidden
+                    .data
+                    .slice((c.row0 + k) * hidden_size..(c.row0 + k + 1) * hidden_size);
+                let st = mtp_exec.slots[c.slot].as_mut().expect("seeded (gated)");
+                model
+                    .ctx
+                    .stream
+                    .memcpy_dtod(&src, &mut st.hidden.data)
+                    .map_err(|e| anyhow::anyhow!("mtp batch next-hidden copy failed: {e}"))?;
+                st.pending = bonus;
+            }
+            mtp_exec.accepts += k;
+            mtp_exec.rejects += c.chain.len() - 1 - k;
+            mtp_exec.chains += 1;
+            if k + 1 < c.chain.len() {
+                let len = c.start + k + 1;
+                let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
+                host_kv.truncate_slot(c.slot, len)?;
+                let need = len.div_ceil(pool.page_size);
+                pool.mirror_slot(c.slot, &host_kv.page_indices(c.slot)[..need], len)?;
+            }
+            out[c.out] = tokens
+                .into_iter()
+                .map(|token| SlotToken {
+                    slot: c.slot,
+                    token,
+                    logprob: None,
+                    // Spec is vetoed for logprobs requests, so no capture here.
+                    top_logprobs: Vec::new(),
+                    finish: None,
+                })
+                .collect();
+        }
+        if !rollback.is_empty() {
+            rollback.sort_by_key(|r| r.0);
+            let mut pick = vec![false; slots.len()];
+            for r in &rollback {
+                pick[r.0] = true;
+            }
+            let mut rolls: Vec<crate::qwen35::dspark::DsparkRollback<'_>> = slots
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| pick[*i])
+                .zip(
+                    mtp_exec
+                        .slots
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(i, _)| pick[*i]),
+                )
+                .zip(rollback.iter())
+                .map(
+                    |(((_, slot), (_, st)), r)| crate::qwen35::dspark::DsparkRollback {
+                        slot,
+                        spec: &mut st.as_mut().expect("seeded (gated)").spec,
+                        start_pos: r.1,
+                        k: r.2,
+                    },
+                )
+                .collect();
+            model.dspark_rollback_batch(
+                &mut rolls,
+                &mut mtp_exec.replay_tables,
+                &mut mtp_exec.copy,
+                workspace,
+            )?;
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
+
     /// Warm-decode one DSpark row with tap capture. Non-paged rows run plain and clear
     /// the draft state, so speculation re-seeds at the next paged step.
     fn dspark_warm_decode_row(
@@ -1959,19 +2242,6 @@ impl Qwen35CudaExecutor {
 
         // All-or-nothing: seq_lens advance only on success, so any failure must give
         // every reserved row back.
-        let logits = match self.dspark_verify_forward(&batch, &chains, total_rows, host_kv) {
-            Ok(logits) => logits,
-            Err(e) => {
-                for c in &batch {
-                    if host_kv.seq_len(c.slot) > c.start {
-                        host_kv.truncate_slot(c.slot, c.start)?;
-                    }
-                    self.mirror_host_slot(host_kv, c.slot, c.start)?;
-                }
-                return Err(e);
-            }
-        };
-
         let Self {
             model,
             slots,
@@ -1981,6 +2251,49 @@ impl Qwen35CudaExecutor {
             ..
         } = self;
         let ds = dspark.as_mut().expect("dspark");
+        ds.taps.prepare(
+            ds.head.target_layer_ids(),
+            model.config.hidden_size,
+            total_rows,
+        );
+        let mut free_caps: Vec<Option<&mut crate::qwen35::Qwen35LinearCapture>> = ds
+            .spec
+            .iter_mut()
+            .map(|s| s.as_mut().map(|st| &mut st.capture))
+            .collect();
+        let logits = match Self::spec_verify_forward(
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            &batch,
+            &chains,
+            host_kv,
+            &mut free_caps,
+            Some(&mut ds.taps),
+            false,
+        ) {
+            Ok(logits) => logits,
+            Err(e) => {
+                for c in &batch {
+                    if host_kv.seq_len(c.slot) > c.start {
+                        host_kv.truncate_slot(c.slot, c.start)?;
+                    }
+                    let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
+                    let host_pages = host_kv.page_indices(c.slot);
+                    let need = c.start.div_ceil(pool.page_size);
+                    ensure!(
+                        host_pages.len() >= need,
+                        "host pool holds {} pages for slot {}, {need} needed to cover {} tokens",
+                        host_pages.len(),
+                        c.slot,
+                        c.start
+                    );
+                    pool.mirror_slot(c.slot, &host_pages[..need], c.start)?;
+                }
+                return Err(e);
+            }
+        };
         // The tap fc projection is batch-wide; only the K/V append is per slot.
         model.dspark_tap_features(&ds.head, &mut ds.taps, &mut ds.scratch)?;
         // One argmax over every chain's rows: the accept scan is host arithmetic from
@@ -2087,38 +2400,48 @@ impl Qwen35CudaExecutor {
         Ok(out.into_iter().flatten().collect())
     }
 
-    /// Chain `i` owns logits rows `[c.row0, +len)`. The caller rolls the pool back on
-    /// any error.
-    fn dspark_verify_forward(
-        &mut self,
+    /// Chain `i` owns logits rows `[c.row0, +len)`. The caller rolls the pool
+    /// back on any error. `free_caps` slots the per-slot linear captures by
+    /// slot index (DSpark or MTP spec states); `taps` is DSpark-only and
+    /// `norm_offset` selects the trunk final-norm convention of the caller's
+    /// checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    fn spec_verify_forward(
+        model: &crate::qwen35::Qwen35Model,
+        slots: &mut [crate::qwen35::Qwen35SlotState],
+        workspace: &mut crate::qwen35::Qwen35Workspace,
+        full_attn_kv: &mut Option<PagedKVPool>,
         batch: &[SpecChain],
         chains: &[u32],
-        total_rows: usize,
         host_kv: &mut dyn KvPool,
+        free_caps: &mut [Option<&mut crate::qwen35::Qwen35LinearCapture>],
+        taps: Option<&mut crate::qwen35::dspark::Qwen35DsparkTaps>,
+        norm_offset: bool,
     ) -> Result<cuda_kernels::prelude::HiddenStates> {
         for c in batch {
             {
-                let pool = self.full_attn_kv.as_ref().expect("paged (gated by seeded)");
+                let pool = full_attn_kv.as_ref().expect("paged (gated by seeded)");
                 ensure!(
                     pool.seq_len(c.slot) == c.start,
-                    "Qwen3.6 dspark verify: pool seq_len {} != start {} for slot {}",
+                    "Qwen3.6 spec verify: pool seq_len {} != start {} for slot {}",
                     pool.seq_len(c.slot),
                     c.start,
                     c.slot
                 );
             }
-            set_host_slot_to(host_kv, c.slot, c.start + c.chain.len())?;
-            self.mirror_host_slot(host_kv, c.slot, c.start + c.chain.len())?;
+            let len = c.start + c.chain.len();
+            set_host_slot_to(host_kv, c.slot, len)?;
+            let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
+            let host_pages = host_kv.page_indices(c.slot);
+            let need = len.div_ceil(pool.page_size);
+            ensure!(
+                host_pages.len() >= need,
+                "host pool holds {} pages for slot {}, {need} needed to cover {len} tokens",
+                host_pages.len(),
+                c.slot
+            );
+            pool.mirror_slot(c.slot, &host_pages[..need], len)?;
         }
-        let Self {
-            model,
-            slots,
-            workspace,
-            full_attn_kv,
-            dspark,
-            ..
-        } = self;
-        let ds = dspark.as_mut().expect("dspark");
         let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
         let rows: Vec<_> = batch
             .iter()
@@ -2131,18 +2454,8 @@ impl Qwen35CudaExecutor {
             cp: None,
             cp_decode: None,
         };
-        ds.taps.prepare(
-            ds.head.target_layer_ids(),
-            model.config.hidden_size,
-            total_rows,
-        );
         let mut free_slots: Vec<Option<&mut crate::qwen35::Qwen35SlotState>> =
             slots.iter_mut().map(Some).collect();
-        let mut free_caps: Vec<Option<&mut crate::qwen35::Qwen35LinearCapture>> = ds
-            .spec
-            .iter_mut()
-            .map(|s| s.as_mut().map(|st| &mut st.capture))
-            .collect();
         let mut fwd: Vec<crate::qwen35::LinearRow<'_>> = batch
             .iter()
             .map(|c| crate::qwen35::LinearRow {
@@ -2153,7 +2466,7 @@ impl Qwen35CudaExecutor {
                 capture: free_caps[c.slot].take(),
             })
             .collect();
-        model.dspark_verify_logits(&mut fwd, workspace, chains, &mut rc, &mut ds.taps)
+        model.verify_logits(&mut fwd, workspace, chains, &mut rc, taps, norm_offset)
     }
 
     /// Stage per-step device scalars into the graph workspace and drop the
@@ -2510,31 +2823,31 @@ impl Qwen35CudaExecutor {
     ) -> Result<Vec<SlotToken>> {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
-        // Only a batched greedy DSpark draft pays above c=1: sampling loses −15.5% at
-        // c=8 and −26.4% at c=16. Quantized KV keeps the per-row route: its verify
-        // runs through the FA3 dequant shim while plain decode has the tensor-core
-        // pool kernel, and on 32K prompts that verify costs −10 % at c=8 and −16 %
-        // at c=16 (errors/2026-08-22-batched-dspark-quant-kv-verify-loses).
+        // Only a batched greedy draft pays above c=1: sampling loses −15.5% at
+        // c=8 and −26.4% at c=16. DSpark on quantized KV keeps the per-row
+        // route: its verify runs through the FA3 dequant shim while plain
+        // decode has the tensor-core pool kernel, and on 32K prompts that
+        // verify costs −10 % at c=8 and −16 % at c=16
+        // (errors/2026-08-22-batched-dspark-quant-kv-verify-loses). MTP's
+        // target config is quantized KV, so it has no BF16 gate; the op_timing
+        // mixed-step share is the batched route's license instead.
         let spec_compatible = decode_rows
             .iter()
             .all(|r| qwen_spec_decode_compatible(&r.params));
-        let batched = kind == SpecKind::Dspark
-            && self.paged_kv_bf16()
-            && spec_compatible
-            && decode_rows.iter().all(|r| r.params.is_greedy());
+        let batched = spec_compatible
+            && decode_rows.iter().all(|r| r.params.is_greedy())
+            && match kind {
+                SpecKind::Dspark => self.paged_kv_bf16(),
+                SpecKind::Mtp => self.full_attn_paged(),
+                SpecKind::None => false,
+            };
         let gate = match batched {
             true => crate::runtime_flags::spec_max_batch(),
             false => 1,
         };
         match super::spec_decode::route_decode(kind, decode_rows.len(), gate, !spec_compatible) {
             DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, host_kv),
-            DecodeRoute::Mtp => {
-                let mut tokens = Vec::with_capacity(decode_rows.len());
-                for row in decode_rows {
-                    tokens.extend(self.mtp_decode_row(row, host_kv)?);
-                }
-                Ok(tokens)
-            }
+            DecodeRoute::Mtp => self.mtp_decode_batch(decode_rows, host_kv),
             DecodeRoute::Plain => match decode_rows {
                 [] => Ok(Vec::new()),
                 [row] => {
