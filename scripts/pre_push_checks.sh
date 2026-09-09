@@ -152,6 +152,9 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     # no longer resolves.
     if [[ "$(uname -s)" == "Darwin" ]]; then
         run cargo check -p infer-metal --no-default-features --features metal
+        # Examples have no other compile gate; only the Metal lane carries the
+        # feature this one needs.
+        run cargo build -p cli --example metal_kv_memory_probe --no-default-features --features metal,no-cuda
     fi
 else
     info "skipping cargo steps (docs/config-only push)"
