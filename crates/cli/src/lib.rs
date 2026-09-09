@@ -154,6 +154,26 @@ pub fn run() -> ExitCode {
             eprintln!("[ARLE] error: `arle ocr` requires a metal/cuda/cpu backend build");
             return ExitCode::FAILURE;
         }
+        #[cfg(feature = "cuda")]
+        Some(CliCommand::Kernel(command)) => {
+            match infer_api::run_kernel_bench(
+                &command.name,
+                &command.shape,
+                &command.reference,
+                command.iters,
+            ) {
+                Ok(()) => return ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("[ARLE] error: {err:#}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        Some(CliCommand::Kernel(_)) => {
+            eprintln!("[ARLE] error: `arle kernel` requires a cuda build");
+            return ExitCode::FAILURE;
+        }
         Some(CliCommand::Run(run_args)) => match run_impl(args, Some(*run_args)) {
             Ok(()) => return ExitCode::SUCCESS,
             Err(err) => {

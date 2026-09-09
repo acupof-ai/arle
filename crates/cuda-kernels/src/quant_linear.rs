@@ -517,6 +517,58 @@ pub fn dequantize_fp4_marlin_to_bf16(
     }
 }
 
+/// Dense NVFP4 M=1 GEMV (`quantized_gemv.cu:1193`) on the plain packed
+/// layout: `weight` is `n * k / 2` nibble-paired bytes, `scales` the E4M3
+/// per-group bytes, `global` one f32. No production caller since dispatch
+/// convergence; kept for the `arle kernel fp4-gemv` A/B against Marlin.
+pub fn gemv_fp4_e2m1_group(
+    ctx: &DeviceContext,
+    weight: &impl DevicePtr<u8>,
+    scales: &impl DevicePtr<u8>,
+    global: &impl DevicePtr<f32>,
+    input: &impl DevicePtr<bf16>,
+    output: &mut impl DevicePtrMut<bf16>,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    ensure!(
+        group_size > 0
+            && weight.len() >= extent(n, k, "gemv_fp4_e2m1_group weight")? / 2
+            && scales.len() >= extent(n, k / group_size, "gemv_fp4_e2m1_group scales")?
+            && global.len() >= 1
+            && input.len() >= k
+            && output.len() >= n,
+        "gemv_fp4_e2m1_group buffers do not cover [n,k,gs]=[{n},{k},{group_size}]: weight={} scales={} input={} output={}",
+        weight.len(),
+        scales.len(),
+        input.len(),
+        output.len()
+    );
+    let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = global.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths checked above; all buffers belong to `ctx.stream`.
+    unsafe {
+        ffi::gemv_fp4_e2m1_group_cuda(
+            w_ptr as *const u8,
+            s_ptr as *const u8,
+            g_ptr as *const f32,
+            x_ptr as *const Half,
+            out_ptr as *mut Half,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            i32::try_from(k / group_size)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("gemv_fp4_e2m1_group_cuda failed at [n,k]=[{n},{k}]: {e}"))
+    }
+}
+
 /// W8A16 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). Scratch/// W8A16 Marlin GEMM: C[m,n] = X[m,k] @ dequant(Marlin-packed W). Scratch
 /// contract matches `marlin_fp8_gemm`.
 #[allow(clippy::too_many_arguments)]

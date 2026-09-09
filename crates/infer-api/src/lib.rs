@@ -101,7 +101,7 @@ pub use infer_server::{
 #[cfg(feature = "cuda")]
 pub use infer_cuda::{
     SharedFp4BaseProjection, SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices,
-    StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
+    StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate, run_kernel_bench,
     set_qwen35_moe_experts_bf16_resident,
 };
 /// Rank-0 NCCL `unique_id` mint for the multiproc-serve coordinator.
