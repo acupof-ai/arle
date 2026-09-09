@@ -399,6 +399,29 @@ def check_launcher_boundary() -> list[str]:
     return [f"raw CUDA FFI call outside cuda-kernels (use a typed launcher): {hit}" for hit in hits]
 
 
+# The qwen35 decode graph bakes device addresses. Whole-graph invalidation is
+# compiler-enforced: the field is the DecodeGraphSlot newtype in
+# executor/device_sched.rs with a private inner Option, so `= None` / `.take()`
+# / `&mut` handoffs elsewhere do not compile. This grep is the backstop for
+# what the newtype cannot cover: per-slot `graphs[..]` / `baked[..]` resets,
+# which must go through `rebuild_slot_graph`. dsv4's `decode_graphs` (plural)
+# is a different field and does not match these patterns.
+DECODE_GRAPH_PATHS = ("crates/infer-cuda/src",)
+
+
+def check_decode_graph_invalidation() -> list[str]:
+    lines = git_grep(
+        ["-I", "-n", "-E",
+         r"decode_graph *= *None|decode_graph *\. *take\(|\.graphs\[[^]]+\] *=|\.baked\[[^]]+\] *=",
+         "--", *DECODE_GRAPH_PATHS],
+    ) or []
+    hits = [line for line in lines if "executor/device_sched.rs:" not in line]
+    return [
+        f"decode-graph invalidation bypasses the policy (whole-graph drops go through DecodeGraphSlot::invalidate; per-slot resets through rebuild_slot_graph, both in executor/device_sched.rs): {hit}"
+        for hit in hits
+    ]
+
+
 # Every implementation id the runtime can report through /v1/stats
 # (`implementation_hits`) must be a registry row, so a counter name and the
 # registry never drift apart: the registry is what the receipts are read against.
@@ -619,6 +642,11 @@ def break_launcher_boundary(root: Path) -> None:
     path.write_text(path.read_text() + "\nfn _world() { unsafe { ffi::launch_quant_linear(); } }\n")
 
 
+def break_decode_graph_invalidation(root: Path) -> None:
+    path = root / LAUNCHER_FIXTURE
+    path.write_text(path.read_text() + "\nfn _world() { self.decode_graph = None; }\n")
+
+
 def break_registry_coverage(root: Path) -> None:
     path = root / REGISTRY_FIXTURE
     ids = re.findall(r'"(cuda\.[a-z0-9_.]+)"', (root / LAUNCHER_FIXTURE).read_text())
@@ -685,6 +713,8 @@ def break_agenda_stale_task(root: Path) -> None:
 
 SELFTEST_WORLDS = [
     ("launcher_boundary", check_launcher_boundary, (LAUNCHER_FIXTURE,), break_launcher_boundary),
+    ("decode_graph_invalidation", check_decode_graph_invalidation,
+     (LAUNCHER_FIXTURE,), break_decode_graph_invalidation),
     ("registry_covers_runtime_counters", check_registry_covers_runtime_counters,
      (REGISTRY_FIXTURE, LAUNCHER_FIXTURE), break_registry_coverage),
     ("repo_wide_disallowed_markers", check_repo_wide_disallowed_markers,
@@ -745,6 +775,7 @@ def main() -> int:
     errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
     errors.extend(check_launcher_boundary())
+    errors.extend(check_decode_graph_invalidation())
     errors.extend(check_registry_covers_runtime_counters())
     errors.extend(check_prereg_no_stale_running())
     errors.extend(check_agenda_ledger())
@@ -759,7 +790,7 @@ def main() -> int:
     print(
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
         "repo-wide marker bans, experience entry caps, wins parameters, frozen archive seal, "
-        "workspace truth-surface, CUDA launcher-boundary, registry-coverage, "
+        "workspace truth-surface, CUDA launcher-boundary, decode-graph-invalidation, registry-coverage, "
         "prereg-ledger, and agenda-ledger checks all passed"
     )
     return 0
