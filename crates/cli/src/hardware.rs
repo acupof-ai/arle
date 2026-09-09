@@ -23,18 +23,10 @@ pub(crate) enum GpuInfo {
 pub(crate) enum CompiledBackend {
     Cuda,
     Metal,
-    #[cfg(feature = "hip")]
-    Hip,
-    #[cfg(feature = "vulkan")]
-    Vulkan,
+    // Catalog-listed backend class; cli has no cpu feature post-dispatch, so
+    // `detect` never returns it (the runtime registry owns cpu selection).
     Cpu,
-    #[cfg(not(any(
-        feature = "cuda",
-        feature = "metal",
-        feature = "hip",
-        feature = "vulkan",
-        feature = "cpu"
-    )))]
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
     None,
 }
 
@@ -49,36 +41,7 @@ impl CompiledBackend {
         {
             return Self::Metal;
         }
-        #[cfg(all(not(feature = "cuda"), not(feature = "metal"), feature = "hip"))]
-        {
-            return Self::Hip;
-        }
-        #[cfg(all(
-            not(feature = "cuda"),
-            not(feature = "metal"),
-            not(feature = "hip"),
-            feature = "vulkan"
-        ))]
-        {
-            return Self::Vulkan;
-        }
-        #[cfg(all(
-            not(feature = "cuda"),
-            not(feature = "metal"),
-            not(feature = "hip"),
-            not(feature = "vulkan"),
-            feature = "cpu"
-        ))]
-        {
-            return Self::Cpu;
-        }
-        #[cfg(not(any(
-            feature = "cuda",
-            feature = "metal",
-            feature = "hip",
-            feature = "vulkan",
-            feature = "cpu"
-        )))]
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         {
             Self::None
         }
@@ -88,41 +51,19 @@ impl CompiledBackend {
         match self {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
-            #[cfg(feature = "hip")]
-            Self::Hip => "hip",
-            #[cfg(feature = "vulkan")]
-            Self::Vulkan => "vulkan",
             Self::Cpu => "cpu",
-            #[cfg(not(any(
-                feature = "cuda",
-                feature = "metal",
-                feature = "hip",
-                feature = "vulkan",
-                feature = "cpu"
-            )))]
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
             Self::None => "none",
         }
     }
 
     pub(crate) fn supports_inference(self) -> bool {
         let _ = self;
-        #[cfg(any(
-            feature = "cuda",
-            feature = "metal",
-            feature = "hip",
-            feature = "vulkan",
-            feature = "cpu"
-        ))]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         {
             true
         }
-        #[cfg(not(any(
-            feature = "cuda",
-            feature = "metal",
-            feature = "hip",
-            feature = "vulkan",
-            feature = "cpu"
-        )))]
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         {
             false
         }
@@ -163,14 +104,6 @@ impl SystemInfo {
                 }
                 _ => 0.0,
             },
-            // No host AMD-GPU probe yet (the catalog has no HIP entries either);
-            // report 0 rather than a fictional VRAM figure.
-            #[cfg(feature = "hip")]
-            CompiledBackend::Hip => 0.0,
-            // No generic Vulkan VRAM probe yet; report 0 rather than a
-            // fictional figure.
-            #[cfg(feature = "vulkan")]
-            CompiledBackend::Vulkan => 0.0,
             CompiledBackend::Cpu => {
                 if self.available_ram_gb > 0.0 {
                     self.available_ram_gb
@@ -178,13 +111,7 @@ impl SystemInfo {
                     self.total_ram_gb * 0.75
                 }
             }
-            #[cfg(not(any(
-                feature = "cuda",
-                feature = "metal",
-                feature = "hip",
-                feature = "vulkan",
-                feature = "cpu"
-            )))]
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
             CompiledBackend::None => 0.0,
         }
     }
@@ -282,7 +209,7 @@ fn detect_apple_gpu(total_ram_gb: f64) -> GpuInfo {
 
 #[cfg(feature = "metal")]
 fn recommended_metal_working_set_gb() -> Option<f64> {
-    infer_api::metal_recommended_max_working_set_size_bytes()
+    infer_metal::recommended_max_working_set_size_bytes()
         .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 

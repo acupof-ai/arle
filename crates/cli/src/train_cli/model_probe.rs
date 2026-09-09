@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::process::ExitCode;
 
 use anyhow::Context;
@@ -15,17 +14,14 @@ use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::model_family::{ModelFamily, resolve_model_family};
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn run_model(model: ModelArgs) -> ExitCode {
     match model.command {
         ModelCommand::Download(args) => run_model_download(args),
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_model_download(args: ModelDownloadArgs) -> ExitCode {
     let source_label = match args.source {
         ModelSourceArg::Hf => "hf",

@@ -34,10 +34,7 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 
-infer-metal = { path = "../infer-metal", default-features = false, optional = true }
 infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }
-infer-hip = { path = "../infer-hip", default-features = false, optional = true }
-infer-vulkan = { path = "../infer-vulkan", default-features = false, optional = true }
 # CUDA-only: `RawLogits` carries a `cuda_kernels` device buffer/context and reads
 # its raw device pointer via the `cudarc` `DevicePtr` trait for the OPD-teacher
 # raw-logits surface. Both engage only under `--features cuda`.
@@ -68,16 +65,6 @@ cuda = [
 ]
 # Marker feature for builds without a CUDA toolchain (macOS, dev CI).
 no-cuda = ["infer-cuda?/no-cuda", "cuda-kernels?/no-cuda"]
-metal = ["dep:infer-metal", "infer-metal/metal"]
-# infer-server has no hip-specific code, so no infer-server feature is forwarded
-# (unlike metal).
-hip = ["dep:infer-hip", "infer-hip/hip"]
-# infer-server stays backend-neutral; device code is gated below infer-vulkan.
-vulkan = ["dep:infer-vulkan", "infer-vulkan/vulkan"]
-# Portable CPU backend: drives the engine over infer-metal's feature-free
-# host KV pool + the placeholder MetalExecutor (no MLX, no CUDA). Used for
-# smoke / CI and the adapter integration test.
-cpu = ["dep:infer-metal"]
 # Multi-rank NCCL collectives for the TP communicator. Implies `cuda`; forwards
 # to infer-cuda's `nccl` feature (declared optionally so it only engages when
 # the CUDA backend is pulled in).
@@ -89,7 +76,6 @@ grammar = ["infer-server/grammar"]
 
 [dev-dependencies]
 infer-core = { path = "../infer-core" }
-infer-metal = { path = "../infer-metal", default-features = false }
 infer-server = { path = "../infer-server" }
 tempfile = "3"
 

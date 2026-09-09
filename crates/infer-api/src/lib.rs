@@ -1,8 +1,10 @@
 //! Public `InferenceEngine` adapter over the rewrite stack.
 //!
-//! Backend selection is by compiled feature (`metal`/`cuda`/`hip`/`vulkan`/
-//! `cpu`). Every request flows `tokenize -> ServeHandle::submit -> collect ->
-//! detokenize` via [`ServeInferenceEngine`].
+//! Backend selection is a runtime decision: the leaf binary registers one
+//! builder per compiled-in backend via [`register_backend`], and
+//! [`LoadedInferenceEngine::load_with_config`] dispatches by
+//! [`EngineLoadConfig::backend`]. Every request flows `tokenize ->
+//! ServeHandle::submit -> collect -> detokenize` via [`ServeInferenceEngine`].
 //!
 //! # Gaps (follow-ups)
 //!
@@ -14,8 +16,6 @@
 //!   not incremental tokens.
 //! - **Telemetry** — [`InferenceEngine::telemetry`] returns only queue/active
 //!   counters (no latency / batch-occupancy / spec metrics).
-//! - **CUDA backend** — wired + typechecks, but [`LoadedInferenceEngine::load`]
-//!   errors: the real CUDA forward + builder are lead-owned.
 //! - **Train-only CUDA methods + LoRA types** — `forward_token_logits`,
 //!   `remerge_student_lora`, weight offload/reload, and the `StudentLora*` types
 //!   need direct model access the host-only `ServeHandle` doesn't expose.
@@ -58,19 +58,17 @@ pub const fn kernel_capabilities() -> &'static str {
 
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 pub use loaded::LoadedInferenceEngine;
 /// Multiproc-serve spawn gate: which CUDA checkpoints join the env-driven TP
 /// world (DSv4 + Qwen3.5/3.6 MoE). Consumed by `cli::serve_multiproc`.
 #[cfg(feature = "cuda")]
 pub use loaded::cuda_model_takes_multiproc_serve;
-pub use loaded::{EngineLoadConfig, KvCacheDtype, KvTierBudget};
+pub use loaded::{
+    BackendBuilderFn, EngineLoadConfig, KvCacheDtype, KvTierBudget, default_backend,
+    is_backend_registered, register_backend,
+};
+#[cfg(feature = "cuda")]
+pub use loaded::build_cuda_engine;
 #[cfg(feature = "cuda")]
 pub use serve::serve_coordinator_http_dp;
 pub use serve::{
@@ -78,15 +76,8 @@ pub use serve::{
     ServeSpecType, checkpoint_has_mtp_head, default_kv_ssd_root, serve_http,
     validate_kv_ssd_config,
 };
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 pub use serve::{ServeThread, serve_router_on_thread};
-pub use serve_engine::ServeInferenceEngine;
+pub use serve_engine::{ServeInferenceEngine, model_id_from_path};
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
 // the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
 // the `infer-api` surface without depending on `infer-server` directly (mirrors
@@ -107,11 +98,6 @@ pub use infer_cuda::{
 /// Rank-0 NCCL `unique_id` mint for the multiproc-serve coordinator.
 #[cfg(feature = "nccl")]
 pub use infer_cuda::{mint_nccl_unique_id_hex, nccl_unique_id_from_env};
-#[cfg(feature = "metal")]
-pub use infer_metal::{
-    MetalKvCacheDtype, MetalResourcePlan, MetalResourceRequest, plan_resource_budget,
-    recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes,
-};
 #[cfg(feature = "cuda")]
 pub use student_lora::{LoraHalf, load_student_lora_update, parse_student_adapter_name};
 #[cfg(feature = "cuda")]

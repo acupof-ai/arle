@@ -608,6 +608,7 @@ mod app {
         let max_seq_len = max_seq_len.max(128);
         // Single-slot OPD teacher (migrated off the legacy ServerRuntimeConfig
         // knobs to the rewrite's EngineLoadConfig).
+        train::teacher_infer::register_cuda_backend();
         let page_size = 16usize;
         LoadedInferenceEngine::load_with_config(
             model_dir

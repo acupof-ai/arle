@@ -4,53 +4,38 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 mod args;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod banner;
 mod doctor;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod download;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod eli;
 mod hardware;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod hf_search;
 mod hub_discovery;
 mod model_catalog;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod model_picker;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod modelscope;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod ocr;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod runtime_report;
 mod serve;
 #[cfg(all(unix, feature = "cuda"))]
 mod serve_multiproc;
 #[cfg(feature = "cuda")]
 mod spec_train_target;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod startup;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod tps;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod trace;
 mod train_cli;
 #[cfg(all(unix, feature = "cuda"))]
 mod train_multiproc;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod welcome;
 
 use std::process::ExitCode;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::time::Instant;
 
 use anyhow::Result;
 use args::{Args, CliCommand, RunArgs};
 use clap::Parser;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer_api::{InferenceEngine, LoadedInferenceEngine};
 
 /// Serializes unit tests that mutate process-global state (env vars, override
@@ -58,7 +43,7 @@ use infer_api::{InferenceEngine, LoadedInferenceEngine};
 /// unguarded `set_var`/`remove_var` races every other test touching the same
 /// global. Every such test takes this lock first. Poison-tolerant so one
 /// failing test doesn't cascade into every later env test.
-#[cfg(all(test, any(feature = "cuda", feature = "metal", feature = "cpu")))]
+#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -124,24 +109,16 @@ pub fn run() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let command = args.command.take();
-    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-    let _exit_report = if should_print_exit_report(&args, command.as_ref()) {
-        Some(runtime_report::ExitResourceReport::enabled())
-    } else {
-        None
-    };
+        let _exit_report = if should_print_exit_report(&args, command.as_ref()) {
+            Some(runtime_report::ExitResourceReport::enabled())
+        } else {
+            None
+        };
 
     match command {
         Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
         Some(CliCommand::Model(command)) => return train_cli::run_model(*command),
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
-        Some(CliCommand::Model(_)) => {
-            eprintln!("[ARLE] error: model download requires cuda/metal/cpu feature build");
-            return ExitCode::FAILURE;
-        }
         Some(CliCommand::Serve(command)) => return serve::run_serve(&args, *command),
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
         Some(CliCommand::Ocr(ocr_args)) => match ocr::run(&ocr_args) {
             Ok(()) => return ExitCode::SUCCESS,
             Err(err) => {
@@ -149,11 +126,6 @@ pub fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
-        Some(CliCommand::Ocr(_)) => {
-            eprintln!("[ARLE] error: `arle ocr` requires a metal/cuda/cpu backend build");
-            return ExitCode::FAILURE;
-        }
         #[cfg(feature = "cuda")]
         Some(CliCommand::Kernel(command)) => {
             match infer_api::run_kernel_bench(
@@ -193,15 +165,11 @@ pub fn run() -> ExitCode {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn should_print_exit_report(args: &Args, command: Option<&CliCommand>) -> bool {
     !args.doctor && !args.list_models && matches!(command, None | Some(CliCommand::Run(_)))
 }
 
 fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
-    #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
-    let _ = &run_args;
-
     if args.doctor {
         doctor::run(&args)?;
         return Ok(());
@@ -212,170 +180,157 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
+    use std::io::IsTerminal;
+
+    // Logger already installed at the top of `run()` (quiet "warn" default;
+    // RUST_LOG overrides). No re-init here.
+
+    let one_shot = run_args
+        .as_ref()
+        .is_some_and(|r| r.prompt.is_some() || r.stdin || !r.image.is_empty());
+    let interactive_tty = !args.non_interactive
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
+    if !one_shot
+        && interactive_tty
+        && let Some(action) = decide_eli_launch(&args)
     {
-        anyhow::bail!(
-            "ARLE requires a local inference backend. Rebuild with either \
-             the default `cuda` feature, `--no-default-features --features metal,no-cuda`, \
-             or `--no-default-features --features cpu,no-cuda`."
-        );
+        return run_eli_frontend(&args, action);
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-    {
-        use std::io::IsTerminal;
-
-        // Logger already installed at the top of `run()` (quiet "warn" default;
-        // RUST_LOG overrides). No re-init here.
-
-        let one_shot = run_args
-            .as_ref()
-            .is_some_and(|r| r.prompt.is_some() || r.stdin || !r.image.is_empty());
-        let interactive_tty = !args.non_interactive
-            && std::io::stdin().is_terminal()
-            && std::io::stderr().is_terminal();
-        if !one_shot
-            && interactive_tty
-            && let Some(action) = decide_eli_launch(&args)
-        {
-            return run_eli_frontend(&args, action);
-        }
-
-        let model_source = match startup::resolve_model_interactive(&args) {
-            Ok(src) => src,
-            Err(err) => {
-                let can_wizard = !args.non_interactive
-                    && std::io::stdin().is_terminal()
-                    && std::io::stderr().is_terminal();
-                if can_wizard {
-                    match startup::run_hub_wizard()? {
-                        Some(path) => path,
-                        None => {
-                            eprintln!(
-                                "No model selected. Pass --model-path <dir-or-hf-id> \
-                                 or rerun to use the model picker."
-                            );
-                            return Err(err);
-                        }
+    let model_source = match startup::resolve_model_interactive(&args) {
+        Ok(src) => src,
+        Err(err) => {
+            let can_wizard = !args.non_interactive
+                && std::io::stdin().is_terminal()
+                && std::io::stderr().is_terminal();
+            if can_wizard {
+                match startup::run_hub_wizard()? {
+                    Some(path) => path,
+                    None => {
+                        eprintln!(
+                            "No model selected. Pass --model-path <dir-or-hf-id> \
+                             or rerun to use the model picker."
+                        );
+                        return Err(err);
                     }
-                } else {
-                    return Err(err);
                 }
+            } else {
+                return Err(err);
             }
-        };
+        }
+    };
 
-        log::info!("Loading model from: {}", model_source);
-        let load_start = Instant::now();
-        let mut engine = match LoadedInferenceEngine::load(&model_source) {
-            Ok(e) => e,
-            Err(err) => {
-                // Detect the specific case where a user pointed at a DFlash
-                // *draft* model — these have no tokenizer and load fails with
-                // "tokenizer.json not found", which is opaque. The picker
-                // filters them out as of 0.1.5, but `--model-path` can still
-                // hit one directly.
-                if let Some(arch) = peek_model_architecture(&model_source)
-                    && arch == "DFlashDraftModel"
-                {
-                    return Err(anyhow::anyhow!(
-                        "`{model_source}` is a DFlash *draft* model (architecture `DFlashDraftModel`), \
-                         not a standalone target. Drafts ship without a tokenizer and only assist \
-                         speculative decoding for a paired target.\n\
-                         Hint: load the matching target instead — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit` \
-                         for the `z-lab/Qwen3.6-35B-A3B-DFlash` draft."
-                    ));
-                }
+    log::info!("Loading model from: {}", model_source);
+    let load_start = Instant::now();
+    let mut engine = match LoadedInferenceEngine::load(&model_source) {
+        Ok(e) => e,
+        Err(err) => {
+            // Detect the specific case where a user pointed at a DFlash
+            // *draft* model — these have no tokenizer and load fails with
+            // "tokenizer.json not found", which is opaque. The picker
+            // filters them out as of 0.1.5, but `--model-path` can still
+            // hit one directly.
+            if let Some(arch) = peek_model_architecture(&model_source)
+                && arch == "DFlashDraftModel"
+            {
                 return Err(anyhow::anyhow!(
-                    "failed to load model from `{model_source}`: {err:#}\n\
-                     Hint: verify --model-path points to a model directory with config.json.\n\
-                     Hint: direct Metal smoke: `arle serve --backend metal --model-path <path>`."
+                    "`{model_source}` is a DFlash *draft* model (architecture `DFlashDraftModel`), \
+                     not a standalone target. Drafts ship without a tokenizer and only assist \
+                     speculative decoding for a paired target.\n\
+                     Hint: load the matching target instead — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit` \
+                     for the `z-lab/Qwen3.6-35B-A3B-DFlash` draft."
                 ));
             }
-        };
-        let backend_name = engine.backend_name().to_string();
-
-        let load_secs = load_start.elapsed().as_secs_f64();
-        banner::print_model_loaded(engine.model_id(), &backend_name, load_secs);
-
-        if !args.non_interactive
-            && std::io::stdin().is_terminal()
-            && std::io::stderr().is_terminal()
-        {
-            welcome::print_welcome_banner(engine.model_id());
+            return Err(anyhow::anyhow!(
+                "failed to load model from `{model_source}`: {err:#}\n\
+                 Hint: verify --model-path points to a model directory with config.json.\n\
+                 Hint: direct Metal smoke: `arle serve --backend metal --model-path <path>`."
+            ));
         }
+    };
+    let backend_name = engine.backend_name().to_string();
 
-        let max_tokens = resolve_max_tokens(&model_source, args.max_tokens);
+    let load_secs = load_start.elapsed().as_secs_f64();
+    banner::print_model_loaded(engine.model_id(), &backend_name, load_secs);
 
-        // Failures here ARE surfaced to the user — we want them to know the
-        // path was unwritable before the agent loop quietly drops every record.
-        let trace_writer = match args.trace.as_ref() {
-            Some(path) => match trace::TraceWriter::open(path, args.trace_prompts.keep_prompts()) {
-                Ok(writer) => {
-                    log::info!(
-                        "trajectory: writing JSONL to {} (trace_prompts={})",
-                        writer.path().display(),
-                        if args.trace_prompts.keep_prompts() {
-                            "on"
-                        } else {
-                            "off"
-                        }
-                    );
-                    Some(writer)
-                }
-                Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to open --trace path `{}`: {err:#}",
-                        path.display()
-                    ));
-                }
-            },
-            None => None,
-        };
-
-        match run_args {
-            Some(run_args) if run_args.prompt.is_some() || run_args.stdin => {
-                let tools_enabled = !(args.no_tools || run_args.no_tools);
-                repl::run_one_shot(
-                    &mut engine,
-                    &backend_name,
-                    args.max_turns,
-                    max_tokens,
-                    args.temperature,
-                    &run_args,
-                    tools_enabled,
-                    trace_writer.as_ref(),
-                )?
-            }
-            Some(run_args) if !run_args.image.is_empty() => {
-                anyhow::bail!(
-                    "run --image requires --prompt or --stdin; in REPL use /image <path-or-url>"
-                )
-            }
-            Some(run_args) => repl::run_repl(
-                &mut engine,
-                &backend_name,
-                args.max_turns,
-                max_tokens,
-                args.temperature,
-                !(args.no_tools || run_args.no_tools),
-                trace_writer.as_ref(),
-            )?,
-            None => repl::run_repl(
-                &mut engine,
-                &backend_name,
-                args.max_turns,
-                max_tokens,
-                args.temperature,
-                !args.no_tools,
-                trace_writer.as_ref(),
-            )?,
-        }
-
-        Ok(())
+    if !args.non_interactive
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+    {
+        welcome::print_welcome_banner(engine.model_id());
     }
+
+    let max_tokens = resolve_max_tokens(&model_source, args.max_tokens);
+
+    // Failures here ARE surfaced to the user — we want them to know the
+    // path was unwritable before the agent loop quietly drops every record.
+    let trace_writer = match args.trace.as_ref() {
+        Some(path) => match trace::TraceWriter::open(path, args.trace_prompts.keep_prompts()) {
+            Ok(writer) => {
+                log::info!(
+                    "trajectory: writing JSONL to {} (trace_prompts={})",
+                    writer.path().display(),
+                    if args.trace_prompts.keep_prompts() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+                Some(writer)
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to open --trace path `{}`: {err:#}",
+                    path.display()
+                ));
+            }
+        },
+        None => None,
+    };
+
+    match run_args {
+        Some(run_args) if run_args.prompt.is_some() || run_args.stdin => {
+            let tools_enabled = !(args.no_tools || run_args.no_tools);
+            repl::run_one_shot(
+                &mut engine,
+                &backend_name,
+                args.max_turns,
+                max_tokens,
+                args.temperature,
+                &run_args,
+                tools_enabled,
+                trace_writer.as_ref(),
+            )?
+        }
+        Some(run_args) if !run_args.image.is_empty() => {
+            anyhow::bail!(
+                "run --image requires --prompt or --stdin; in REPL use /image <path-or-url>"
+            )
+        }
+        Some(run_args) => repl::run_repl(
+            &mut engine,
+            &backend_name,
+            args.max_turns,
+            max_tokens,
+            args.temperature,
+            !(args.no_tools || run_args.no_tools),
+            trace_writer.as_ref(),
+        )?,
+        None => repl::run_repl(
+            &mut engine,
+            &backend_name,
+            args.max_turns,
+            max_tokens,
+            args.temperature,
+            !args.no_tools,
+            trace_writer.as_ref(),
+        )?,
+    }
+
+    Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 enum EliLaunch {
     /// A saved Eli default exists: serve this model and launch Eli directly,
     /// skipping the model picker.
@@ -398,7 +353,6 @@ enum EliLaunch {
 /// Eli binary isn't installed — arle stays usable standalone (Eli is an
 /// optional runtime dependency, discovered, never a build dep).
 /// `--gateway` overrides the persisted/derived mode when present.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn decide_eli_launch(args: &Args) -> Option<EliLaunch> {
     use args::AgentFrontendArg;
 
@@ -440,7 +394,6 @@ fn decide_eli_launch(args: &Args) -> Option<EliLaunch> {
     })
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_eli_frontend(args: &Args, action: EliLaunch) -> Result<()> {
     // `auto` resolves to the single compiled backend, which matches this
     // interactive build.
@@ -486,7 +439,6 @@ fn run_eli_frontend(args: &Args, action: EliLaunch) -> Result<()> {
 /// model's config.json and use that. Falls back to 256K (262144) only
 /// when the config truly can't be read, and logs which path won so
 /// users can verify.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn resolve_max_tokens(model_path: &str, requested: usize) -> usize {
     const FALLBACK: usize = 262_144;
     if requested > 0 {
@@ -511,7 +463,6 @@ fn resolve_max_tokens(model_path: &str, requested: usize) -> usize {
 /// Accepts a local directory or an HF repo id (`org/repo`); for the latter
 /// tries every cached snapshot until one yields an answer. `None` on any
 /// failure — the caller falls back to the generic error path.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn peek_model_architecture(model_source: &str) -> Option<String> {
     if let Some(arch) = read_arch_from_dir(std::path::Path::new(model_source)) {
         return Some(arch);
@@ -529,7 +480,6 @@ fn peek_model_architecture(model_source: &str) -> Option<String> {
     None
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn read_arch_from_dir(dir: &std::path::Path) -> Option<String> {
     let cfg = read_model_config_from_dir(dir)?;
     cfg.get("architectures")
@@ -539,7 +489,6 @@ fn read_arch_from_dir(dir: &std::path::Path) -> Option<String> {
         .map(str::to_string)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn read_model_config(model_path: &str) -> Option<serde_json::Value> {
     if let Some(cfg) = read_model_config_from_dir(std::path::Path::new(model_path)) {
         return Some(cfg);
@@ -557,7 +506,6 @@ fn read_model_config(model_path: &str) -> Option<serde_json::Value> {
     None
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn read_model_config_from_dir(dir: &std::path::Path) -> Option<serde_json::Value> {
     let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
     serde_json::from_str(&raw).ok()
@@ -565,7 +513,6 @@ fn read_model_config_from_dir(dir: &std::path::Path) -> Option<serde_json::Value
 
 /// Tries `max_position_embeddings` (HF transformers convention) then
 /// `context_length` (GGUF / llama.cpp convention); `None` on any failure.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn read_model_max_context(model_path: &str) -> Option<usize> {
     let cfg = read_model_config(model_path)?;
     cfg.get("max_position_embeddings")

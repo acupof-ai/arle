@@ -609,6 +609,7 @@ pub mod app {
         max_seq_len: usize,
     ) -> anyhow::Result<LoadedInferenceEngine> {
         let max_seq_len = max_seq_len.max(128);
+        train::teacher_infer::register_cuda_backend();
         let page_size = 16usize;
         LoadedInferenceEngine::load_with_config(
             model_dir

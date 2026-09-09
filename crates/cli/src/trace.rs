@@ -2,27 +2,19 @@
 //! the trace file rotated, the disk filled, or the path went read-only — the
 //! run is the source of truth, the trace is a best-effort sidecar.
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::fs::OpenOptions;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::io::Write;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::sync::Mutex;
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
     AgentTurnResult, SubTurnRecord, TRAJECTORY_SCHEMA_VERSION, TerminalState, TokensRecord,
     TrajectoryMessage,
 };
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::repl::format_iso8601_utc_secs;
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AgentTrajectoryRecord {
     pub schema_version: i32,
@@ -39,7 +31,6 @@ pub(crate) struct AgentTrajectoryRecord {
     pub result: TrajectoryResult,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TrajectoryResult {
     pub text: String,
@@ -49,7 +40,6 @@ pub(crate) struct TrajectoryResult {
     pub wall_secs: f64,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) struct TraceWriter {
     path: PathBuf,
     keep_prompts: bool,
@@ -59,7 +49,6 @@ pub(crate) struct TraceWriter {
     file: Mutex<std::fs::File>,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl TraceWriter {
     pub(crate) fn open(path: impl AsRef<Path>, keep_prompts: bool) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -154,7 +143,7 @@ impl TraceWriter {
     }
 }
 
-#[cfg(all(test, any(feature = "cuda", feature = "metal", feature = "cpu")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use agent::{

@@ -294,6 +294,7 @@ mod app {
     ) -> Result<InferStudent> {
         let max_seq_len = 512usize;
         let page_size = 16usize;
+        train::teacher_infer::register_cuda_backend();
         let engine = LoadedInferenceEngine::load_with_config(
             model
                 .to_str()

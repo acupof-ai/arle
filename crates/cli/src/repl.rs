@@ -1,56 +1,36 @@
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::cell::RefCell;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::sync::Arc;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::sync::OnceLock;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::args::RunArgs;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
     AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, AgentTurnCallbacks,
     AgentTurnResult, ContentBlock, MessageContent, SubTurnRecord, TerminalState, TokensRecord,
     ToolExecutionMetadata, ToolExecutor, ToolPolicy, ToolUsage, TrajectoryMessage, TrajectoryRole,
 };
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::{Context, Result};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer_api::{
     ChatPromptImage, ChatPromptMessage, CompletionRequest, FinishReason, InferenceEngine,
     MultimodalChatRequest, SamplingParams,
 };
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::DefaultEditor;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::error::ReadlineError;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use serde::Serialize;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use tools::{
     BuiltinToolPolicyHooks, builtin_tools, execute_tool_call, execute_tool_call_with_metadata,
 };
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::trace::TraceWriter;
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const REPL_PROMPT: &str = "\x1b[1;35m> \x1b[0m";
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const MAX_CLI_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Serialize)]
 struct OneShotOutput {
     model_id: String,
@@ -64,7 +44,6 @@ struct OneShotOutput {
     max_turns_reached: bool,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplCommand {
     Help,
@@ -86,7 +65,6 @@ enum ReplCommand {
     Unknown(String),
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Default, Clone, Copy)]
 struct SessionStats {
     turn_count: usize,
@@ -104,7 +82,6 @@ struct SessionStats {
     tool_calls: usize,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl SessionStats {
     fn record_turn(
         &mut self,
@@ -137,13 +114,10 @@ impl SessionStats {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 struct BuiltinToolExecutor;
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 struct BuiltinToolPolicy;
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl ToolExecutor for BuiltinToolExecutor {
     fn execute(&self, tool_call: &ToolCall) -> String {
         execute_tool_call(tool_call)
@@ -154,7 +128,6 @@ impl ToolExecutor for BuiltinToolExecutor {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl ToolPolicy for BuiltinToolPolicy {
     fn recover_tool_calls_from_user_request(
         &self,
@@ -209,7 +182,6 @@ impl ToolPolicy for BuiltinToolPolicy {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn tool_definitions(enabled: bool) -> Vec<ToolDefinition> {
     if enabled {
         builtin_tools()
@@ -221,18 +193,14 @@ fn tool_definitions(enabled: bool) -> Vec<ToolDefinition> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Last Ctrl-C timestamp, for double-tap exit detection.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 static LAST_SIGINT_MS: OnceLock<Arc<AtomicU64>> = OnceLock::new();
 
 /// Set when two Ctrl-C taps land within 2 seconds — REPL drains and exits.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 static EXIT_REQUESTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn install_ctrlc_handler() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     let cancel = CANCEL_FLAG
         .get_or_init(|| Arc::new(AtomicBool::new(false)))
@@ -268,7 +236,6 @@ fn install_ctrlc_handler() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     (cancel, exit)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_repl(
     engine: &mut dyn InferenceEngine,
@@ -302,7 +269,6 @@ pub(crate) fn run_repl(
     )
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_one_shot(
     engine: &mut dyn InferenceEngine,
@@ -320,18 +286,18 @@ pub(crate) fn run_one_shot(
         "one-shot prompt is empty; pass --prompt or pipe non-empty stdin to --stdin"
     );
     anyhow::ensure!(
-        run_args.image.is_empty() || supports_cli_images(backend_name),
+        run_args.image.is_empty() || engine.supports_multimodal_chat(),
         "--image requires a VLM chat backend; current backend is {backend_name}"
     );
     let images = resolve_run_images(run_args)?;
 
     let tools = tool_definitions(tools_enabled);
-    let mut session = if is_direct_chat_backend(backend_name) {
+    let mut session = if engine.supports_multimodal_chat() {
         AgentSession::with_system_prompt("")
     } else {
         AgentSession::new()
     };
-    let result = if is_direct_chat_backend(backend_name) {
+    let result = if engine.supports_multimodal_chat() {
         run_direct_chat_completion(
             engine,
             &mut session,
@@ -390,7 +356,6 @@ pub(crate) fn run_one_shot(
 /// already covered by the loaded line and the welcome banner, so this only
 /// surfaces the runtime knobs that aren't shown elsewhere. `/help` re-prints
 /// the full reference on demand.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_banner(
     mode_name: &str,
     tools: &[ToolDefinition],
@@ -407,7 +372,6 @@ fn print_repl_banner(
     println!();
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn history_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".arle-history"))
@@ -418,7 +382,6 @@ fn history_path() -> Option<PathBuf> {
 ///
 /// Returns `Ok(Some(_))` for a complete input, `Ok(None)` for EOF, and
 /// propagates `ReadlineError::Interrupted` upward (REPL turns it into ^C).
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn read_multiline(editor: &mut DefaultEditor) -> Result<Option<String>, ReadlineError> {
     let mut accumulated: Option<String> = None;
     let cont = "\x1b[2m… \x1b[0m";
@@ -452,7 +415,6 @@ fn read_multiline(editor: &mut DefaultEditor) -> Result<Option<String>, Readline
 }
 
 /// Same `\` continuation, but for piped stdin.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn read_multiline_piped<R: BufRead>(
     reader: &mut R,
     prompt: Option<&str>,
@@ -501,7 +463,6 @@ fn read_multiline_piped<R: BufRead>(
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn run_interactive_repl(
     engine: &mut dyn InferenceEngine,
@@ -512,7 +473,7 @@ fn run_interactive_repl(
     tools_enabled: bool,
     trace: Option<&TraceWriter>,
 ) -> Result<()> {
-    let direct_chat = is_direct_chat_backend(backend_name);
+    let direct_chat = engine.supports_multimodal_chat();
     let tools = if direct_chat {
         Vec::new()
     } else {
@@ -610,7 +571,6 @@ fn run_interactive_repl(
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn run_piped_repl(
     engine: &mut dyn InferenceEngine,
@@ -621,7 +581,7 @@ fn run_piped_repl(
     tools_enabled: bool,
     trace: Option<&TraceWriter>,
 ) -> Result<()> {
-    let direct_chat = is_direct_chat_backend(backend_name);
+    let direct_chat = engine.supports_multimodal_chat();
     let tools = if direct_chat {
         Vec::new()
     } else {
@@ -680,7 +640,6 @@ fn run_piped_repl(
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn resolve_one_shot_prompt(run_args: &RunArgs) -> Result<String> {
     match (&run_args.prompt, run_args.stdin) {
         (Some(prompt), false) => Ok(prompt.clone()),
@@ -693,7 +652,6 @@ fn resolve_one_shot_prompt(run_args: &RunArgs) -> Result<String> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn resolve_run_images(run_args: &RunArgs) -> Result<Vec<ChatPromptImage>> {
     run_args
         .image
@@ -702,7 +660,6 @@ fn resolve_run_images(run_args: &RunArgs) -> Result<Vec<ChatPromptImage>> {
         .collect()
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn load_cli_image(source: &str) -> Result<ChatPromptImage> {
     let source = source.trim();
     anyhow::ensure!(!source.is_empty(), "image source must not be empty");
@@ -713,7 +670,6 @@ pub(crate) fn load_cli_image(source: &str) -> Result<ChatPromptImage> {
     load_local_cli_image(source, Path::new(path))
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn load_remote_cli_image(source: &str) -> Result<ChatPromptImage> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("arle-cli/0.1")
@@ -749,7 +705,6 @@ fn load_remote_cli_image(source: &str) -> Result<ChatPromptImage> {
     Ok(ChatPromptImage::new(source.to_string(), data).with_mime_type(mime_type))
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn load_local_cli_image(source: &str, path: &Path) -> Result<ChatPromptImage> {
     let metadata =
         std::fs::metadata(path).with_context(|| format!("stat image {} failed", path.display()))?;
@@ -770,7 +725,6 @@ fn load_local_cli_image(source: &str, path: &Path) -> Result<ChatPromptImage> {
     Ok(ChatPromptImage::new(source.to_string(), data).with_mime_type(mime_type))
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn guess_image_mime(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "jpg" | "jpeg" => Some("image/jpeg"),
@@ -782,7 +736,6 @@ fn guess_image_mime(path: &Path) -> Option<&'static str> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn handle_repl_input(
     engine: &mut dyn InferenceEngine,
@@ -816,8 +769,8 @@ fn handle_repl_input(
         ));
     }
 
-    if is_direct_chat_backend(backend_name) {
-        if !pending_images.is_empty() && !supports_cli_images(backend_name) {
+    if engine.supports_multimodal_chat() {
+        if !pending_images.is_empty() && !engine.supports_multimodal_chat() {
             eprintln!(
                 "\x1b[1;31mError: pending images require a VLM chat backend; current backend is {backend_name}\x1b[0m"
             );
@@ -863,17 +816,6 @@ fn handle_repl_input(
     Ok(true)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn is_direct_chat_backend(backend_name: &str) -> bool {
-    matches!(backend_name, "metal-deepseek-ocr")
-}
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn supports_cli_images(backend_name: &str) -> bool {
-    matches!(backend_name, "metal-deepseek-ocr")
-}
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn session_prompt_messages(
     session: &AgentSession,
     user_input: &str,
@@ -897,7 +839,6 @@ fn session_prompt_messages(
     messages
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn finish_reason_label(reason: FinishReason) -> &'static str {
     match reason {
         FinishReason::Stop => "stop",
@@ -905,7 +846,6 @@ fn finish_reason_label(reason: FinishReason) -> &'static str {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_direct_chat_completion(
     engine: &mut dyn InferenceEngine,
     session: &mut AgentSession,
@@ -999,7 +939,6 @@ fn run_direct_chat_completion(
     })
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_direct_chat_turn(
     engine: &mut dyn InferenceEngine,
     backend_name: &str,
@@ -1060,14 +999,12 @@ fn run_direct_chat_turn(
 ///
 /// indicatif draws to stderr by default, which is what we want: the actual
 /// answer tokens go to stdout, so the spinner never collides with them.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 struct ThinkingSpinner {
     bar: Option<indicatif::ProgressBar>,
     enabled: bool,
     label: &'static str,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl ThinkingSpinner {
     /// `enabled` should be `io::stderr().is_terminal()`. When false every
     /// method is inert and `bar` stays `None`.
@@ -1108,7 +1045,6 @@ impl ThinkingSpinner {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn run_agent_turn(
     engine: &mut dyn InferenceEngine,
@@ -1301,7 +1237,6 @@ fn run_agent_turn(
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn parse_repl_command(input: &str) -> Option<ReplCommand> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
@@ -1342,7 +1277,6 @@ fn parse_repl_command(input: &str) -> Option<ReplCommand> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn execute_repl_command(
     command: ReplCommand,
@@ -1399,7 +1333,7 @@ fn execute_repl_command(
             true
         }
         ReplCommand::Image(arg) => {
-            handle_image_command(backend_name, pending_images, &arg);
+            handle_image_command(engine, backend_name, pending_images, &arg);
             println!();
             true
         }
@@ -1453,8 +1387,12 @@ fn execute_repl_command(
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn handle_image_command(backend_name: &str, pending_images: &mut Vec<ChatPromptImage>, arg: &str) {
+fn handle_image_command(
+    engine: &dyn InferenceEngine,
+    backend_name: &str,
+    pending_images: &mut Vec<ChatPromptImage>,
+    arg: &str,
+) {
     match arg.trim() {
         "" => {
             eprintln!("\x1b[1;31mError: usage: /image <path-or-url>|list|clear\x1b[0m");
@@ -1479,7 +1417,7 @@ fn handle_image_command(backend_name: &str, pending_images: &mut Vec<ChatPromptI
             }
         }
         source => {
-            if !supports_cli_images(backend_name) {
+            if !engine.supports_multimodal_chat() {
                 eprintln!(
                     "\x1b[1;31mError: /image requires a VLM chat backend; current backend is {backend_name}\x1b[0m"
                 );
@@ -1508,14 +1446,10 @@ fn handle_image_command(backend_name: &str, pending_images: &mut Vec<ChatPromptI
 //   `  ⏵ name(args) → result`
 // Args/result are aggressively truncated so the line stays scannable.
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const TOOL_NAME_MAX: usize = 32;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const TOOL_ARGS_MAX: usize = 60;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const TOOL_RESULT_MAX: usize = 80;
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn format_tool_call_line(name: &str, arguments: &serde_json::Value, result: &str) -> String {
     // Cap + flatten the name too — malformed model output can ship a `name`
     // with embedded newlines or pathological length that would break the
@@ -1529,7 +1463,6 @@ fn format_tool_call_line(name: &str, arguments: &serde_json::Value, result: &str
 /// Pull a one-line argument summary out of a tool call's JSON arguments.
 /// Prefers a single dominant scalar field (`command`, `code`, `path`, …)
 /// when one is present; falls back to compact JSON otherwise.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn brief_tool_args(arguments: &serde_json::Value) -> String {
     const PREFERRED: &[&str] = &[
         "command", "code", "path", "file", "query", "pattern", "url", "input",
@@ -1552,7 +1485,6 @@ fn brief_tool_args(arguments: &serde_json::Value) -> String {
     truncate_one_line(&raw, TOOL_ARGS_MAX)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn brief_tool_result(result: &str) -> String {
     let trimmed = result.trim();
     if trimmed.is_empty() {
@@ -1561,7 +1493,6 @@ fn brief_tool_result(result: &str) -> String {
     truncate_one_line(trimmed, TOOL_RESULT_MAX)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn scalar_to_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -1573,7 +1504,6 @@ fn scalar_to_string(value: &serde_json::Value) -> Option<String> {
 
 /// Collapse newlines/tabs to spaces, squeeze runs of whitespace, and cap at
 /// `max` chars (counting Unicode scalars, not bytes — emoji-safe).
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn truncate_one_line(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max + 1));
     let mut prev_space = false;
@@ -1605,7 +1535,6 @@ fn truncate_one_line(s: &str, max: usize) -> String {
 // cascade into `lib.rs`/`startup.rs`. Ship listing today; track hot-swap
 // separately.
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn handle_models_command(maybe_idx: Option<usize>) {
     let snapshots = crate::hub_discovery::discover_hub_snapshots();
     if snapshots.is_empty() {
@@ -1654,7 +1583,6 @@ fn handle_models_command(maybe_idx: Option<usize>) {
 
 /// Sum of top-level file sizes under `path`, in GB. Best-effort — returns
 /// `None` on any IO error rather than failing the listing.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn approx_dir_size_gb(path: &Path) -> Option<f64> {
     let mut total: u64 = 0;
     // HuggingFace snapshot dirs are typically flat (symlinks into blobs/),
@@ -1669,7 +1597,6 @@ fn approx_dir_size_gb(path: &Path) -> Option<f64> {
 
 /// Infer model family from id substring — mirrors `hub_discovery`'s
 /// supported-families list. Returns a short label for the /models table.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn detect_family(model_id: &str) -> &'static str {
     let lc = model_id.to_ascii_lowercase();
     // Order matters — qwen3.5 and qwen2.5 must outrank the bare qwen3 match.
@@ -1684,7 +1611,6 @@ pub(crate) fn detect_family(model_id: &str) -> &'static str {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn handle_export_command(model_id: &str, history: &[ChatMessage], path_arg: &str) {
     // Count only real turns — system prompt at index 0 is excluded.
     let turns = count_export_turns(history);
@@ -1711,7 +1637,6 @@ fn handle_export_command(model_id: &str, history: &[ChatMessage], path_arg: &str
 
 /// Count "turns" in the export-spec sense — one user message OR one
 /// assistant message. The system prompt at history[0] is excluded.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn count_export_turns(history: &[ChatMessage]) -> usize {
     history
         .iter()
@@ -1724,7 +1649,6 @@ fn count_export_turns(history: &[ChatMessage]) -> usize {
 /// - empty arg    → `./arle-<ts>.md` in CWD
 /// - dir path     → `<dir>/arle-<ts>.md`
 /// - file path    → used verbatim
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn resolve_export_path(path_arg: &str) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1742,7 +1666,6 @@ fn resolve_export_path(path_arg: &str) -> PathBuf {
     p
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
     let ts = iso8601_utc_now();
     let turns = count_export_turns(history);
@@ -1766,7 +1689,6 @@ fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
 /// Format: `YYYY-MM-DDThh:mm:ssZ`. Uses Unix epoch arithmetic. This is
 /// adequate for a conversation banner — we don't need leap-second
 /// accuracy or subsecond precision.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn iso8601_utc_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1781,12 +1703,10 @@ fn iso8601_utc_now() -> String {
 ///
 /// Re-exported as `format_iso8601_utc_secs` for the trace writer; the
 /// markdown export path keeps its private alias for now.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn format_iso8601_utc_secs(unix_secs: u64) -> String {
     format_iso8601_utc(unix_secs)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn format_iso8601_utc(unix_secs: u64) -> String {
     let days = unix_secs / 86_400;
     let rem = unix_secs % 86_400;
@@ -1809,7 +1729,6 @@ fn format_iso8601_utc(unix_secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_help() {
     println!("Commands:");
     println!("  /help            Show this help");
@@ -1831,7 +1750,6 @@ fn print_repl_help() {
     println!("  Ctrl-D or /quit exits the REPL.");
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_tools_help(tools: &[ToolDefinition]) {
     println!("Built-in tools:");
     for tool in tools {
@@ -1839,7 +1757,6 @@ fn print_tools_help(tools: &[ToolDefinition]) {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn print_session_stats(
     model_id: &str,

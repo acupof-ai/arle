@@ -143,10 +143,6 @@ pub(crate) enum TracePromptsMode {
     Off,
 }
 
-// `keep_prompts` is only consumed by the trajectory writer, which is currently
-// compiled for the interactive CUDA/Metal/CPU front door. Mirror that gate here
-// so `cargo clippy -p cli -- -D warnings` on serve-only builds stays clean.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl TracePromptsMode {
     pub(crate) fn keep_prompts(self) -> bool {
         matches!(self, Self::On)
@@ -502,9 +498,6 @@ pub(crate) struct OcrArgs {
     pub(crate) json: bool,
 }
 
-// Used only by the backend-gated `ocr` module — gate to match (the `OcrMode`
-// enum + `OcrArgs` stay ungated for CLI parsing under any feature set).
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl OcrMode {
     /// The DeepSeek-OCR instruction prompt for this mode (no `<image>` marker —
     /// the engine splices the image automatically).

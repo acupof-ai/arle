@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use infer_core::CompletedRequest;
+// CUDA-gated OPD methods call `BackendExecutor` methods on the concrete
+// `CudaExecutor` (not a trait object), so the trait must be in scope there.
 #[cfg(feature = "cuda")]
 use infer_seam::BackendExecutor;
 use infer_server::{OpenAiTokenizer, ServeHandle, StreamItem};
@@ -37,11 +39,12 @@ impl ServeInferenceEngine {
 
     /// Shared handle to the running engine, for wiring an HTTP router over an
     /// already-loaded engine ([`crate::LoadedInferenceEngine::local_router`]).
-    #[cfg(feature = "cuda")]
     pub(crate) fn serve_arc(&self) -> Arc<ServeHandle> {
         Arc::clone(&self.serve)
     }
 
+    /// Tokenizer for an already-loaded engine, for wiring an HTTP router over
+    /// it ([`crate::LoadedInferenceEngine::local_router`]).
     #[cfg(feature = "cuda")]
     pub(crate) fn tokenizer(&self) -> &OpenAiTokenizer {
         &self.tokenizer
@@ -605,6 +608,14 @@ impl InferenceEngine for ServeInferenceEngine {
             timestamp_ms,
         }
     }
+
+    fn supports_multimodal_chat(&self) -> bool {
+        self.serve
+            .run_on_executor(|executor| {
+                executor.multimodal().and_then(|mm| mm.multimodal_kind()).is_some()
+            })
+            .unwrap_or(false)
+    }
 }
 
 fn server_chat_messages(messages: &[ChatPromptMessage]) -> Vec<infer_server::ChatMessage> {
@@ -704,19 +715,8 @@ fn deliverable_delta(full: &str, emitted: &str, holdback: usize) -> Option<Strin
 }
 
 /// Derive a model id from the final path segment of a model path or HF id.
-/// Used by the backend variants; unused on a no-backend lib build.
 #[must_use]
-#[cfg_attr(
-    not(any(
-        feature = "metal",
-        feature = "cuda",
-        feature = "hip",
-        feature = "vulkan",
-        feature = "cpu"
-    )),
-    allow(dead_code)
-)]
-pub(crate) fn model_id_from_path(model_path: &str) -> String {
+pub fn model_id_from_path(model_path: &str) -> String {
     std::path::Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())

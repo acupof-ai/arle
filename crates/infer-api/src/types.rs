@@ -249,6 +249,12 @@ pub trait InferenceEngine: Send {
         ))
     }
 
+    /// Whether the loaded backend exposes a VLM chat surface. The CLI routes
+    /// image-bearing chats through `complete_multimodal_chat` only when true.
+    fn supports_multimodal_chat(&self) -> bool {
+        false
+    }
+
     fn complete_stream(
         &mut self,
         req: CompletionRequest,
