@@ -73,7 +73,9 @@ const MANIFEST_FILE: &str = "manifest.kvm";
 
 /// Manifest header magic + version. A mismatch — or a missing manifest — makes
 /// [`KvTierStore::load`] start cold rather than trust a foreign layout.
-const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V2";
+/// V3: chunked blob keys narrowed from 56 to 40 bits, so on-disk records
+/// written under V2 keys can collide with V3 lookups.
+const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V3";
 
 static DISK_TIER_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -191,7 +193,17 @@ pub fn tier_key(ns: u64, sub: u64) -> u64 {
     (ns << TIER_NS_SHIFT) | sub
 }
 
+/// Pack a blob key and its chunk index into one sub-key. The key must fit
+/// `TIER_NS_SHIFT - CHUNK_IDX_BITS` (40) bits: the shift drops its high
+/// bits and the result still has to pass [`tier_key`]'s namespace check,
+/// so a wider key silently loses entropy and contaminates the namespace
+/// field in release.
 pub fn chunk_sub(key: u64, idx: usize) -> u64 {
+    debug_assert!(
+        key >> (TIER_NS_SHIFT - CHUNK_IDX_BITS) == 0,
+        "chunked blob key must fit {} bits",
+        TIER_NS_SHIFT - CHUNK_IDX_BITS
+    );
     (key << CHUNK_IDX_BITS) | idx as u64
 }
 

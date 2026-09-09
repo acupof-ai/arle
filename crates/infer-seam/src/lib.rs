@@ -64,8 +64,14 @@ pub enum PollResult {
 }
 
 /// Bits of a tier key below the backend store's namespace byte; content keys
-/// are masked to this width so they double as tier keys.
+/// that never pass through a chunk packer may use this full width.
 pub const TIER_KEY_BITS: u32 = 56;
+
+/// Bits of a tier key that goes through the store's chunk packer
+/// (`kv_native_sys::chunk_sub`): 16 of the 56 sub-key bits carry the chunk
+/// index, so a chunked key must fit 40. Content keys are masked to this
+/// width because their consumers include chunked stores.
+pub const TIER_CHUNKED_KEY_BITS: u32 = 40;
 
 /// Content key of one prefix block: FNV-1a over the parent block's key and the
 /// block's tokens. Stable across processes, so a durable tier store can be
@@ -83,7 +89,7 @@ pub fn prefix_block_content_key(parent: u64, block: &[u32]) -> u64 {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    hash & ((1u64 << TIER_KEY_BITS) - 1)
+    hash & ((1u64 << TIER_CHUNKED_KEY_BITS) - 1)
 }
 
 /// Chained content keys for every full block of `tokens`.

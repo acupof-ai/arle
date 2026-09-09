@@ -17,10 +17,11 @@ pub const NS_SLOT_CHUNK: u64 = 2;
 pub const NS_SIDECAR: u64 = 3;
 pub const NS_SIDECAR_CHUNK: u64 = 4;
 
-/// FNV-1a hash of a token id slice, folded to the tier store's key space —
-/// keys a sidecar blob to its prefix. The store packs the chunk index into the
-/// low 16 bits and the namespace into the top 8 (`kv_native_sys::{chunk_sub,
-/// tier_key}`), so a key must fit 40 bits.
+/// FNV-1a hash of a token id slice, folded to the tier store's chunked key
+/// width — keys a sidecar blob to its prefix. The store packs the chunk
+/// index into the low 16 bits and the namespace into the top 8
+/// (`kv_native_sys::{chunk_sub, tier_key}`), so the key is masked to
+/// [`infer_seam::TIER_CHUNKED_KEY_BITS`].
 pub fn hash_prefix_tokens(tokens: &[u32]) -> u64 {
     const FNV_OFFSET: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;
@@ -31,7 +32,7 @@ pub fn hash_prefix_tokens(tokens: &[u32]) -> u64 {
             h = h.wrapping_mul(FNV_PRIME);
         }
     }
-    h & ((1 << 40) - 1)
+    h & ((1u64 << infer_seam::TIER_CHUNKED_KEY_BITS) - 1)
 }
 
 /// The L* boundary: the last page-aligned position strictly inside the
