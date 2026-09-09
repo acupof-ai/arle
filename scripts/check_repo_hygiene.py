@@ -17,6 +17,7 @@ import contextlib
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -535,6 +536,19 @@ WINS_FIXTURE = "docs/experience/wins/2026-09-02-metal-prefix-restore-survives-tu
 ARCHIVE_FIXTURE = "docs/experience/archived"
 
 
+def disown_ambient_git() -> None:
+    """Hooks run with GIT_DIR and GIT_WORK_TREE exported. A `git init` that
+    inherits them reinitializes the REAL repository instead of the world, and
+    because the world's directory is not that repository's work tree, git
+    records `core.bare = true` — which makes every checkout and every worktree
+    fail with "this operation must be run in a work tree". Measured 2026-09-09:
+    this selftest, running inside pre-push, broke the main checkout four times.
+    The world's own `git grep` / `git ls-files` would also have read the real
+    repository, so the checks would have passed against the wrong tree."""
+    for name in [k for k in os.environ if k.startswith("GIT_")]:
+        del os.environ[name]
+
+
 def build_world(*rel_paths: str) -> Path:
     """A git repo holding real copies of the named paths, staged so `git grep`
     and `git ls-files` see them as tracked."""
@@ -641,6 +655,7 @@ SELFTEST_WORLDS = [
 
 
 def selftest() -> int:
+    disown_ambient_git()
     failures: list[str] = []
     for name, check, fixtures, break_it in SELFTEST_WORLDS:
         root = build_world(*fixtures)
