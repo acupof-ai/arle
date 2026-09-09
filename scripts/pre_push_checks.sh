@@ -25,7 +25,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SNAPSHOT_ROOT="${TMPDIR:-/tmp}/arle-pre-push-snapshot"
+# Per-worktree snapshot: a shared dir lets concurrent lane hooks rsync
+# different HEADs into one tree, and an interrupted rsync leaves a mix that
+# fails content-hash tests (kernel bundle id drift, 2026-09-09).
+SNAPSHOT_HASH="$(printf '%s' "$REPO_ROOT" | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-16)"
+SNAPSHOT_ROOT="${TMPDIR:-/tmp}/arle-pre-push-snapshot-${SNAPSHOT_HASH}"
 STAGE_ROOT=""
 
 info() { echo "[pre-push] $*"; }
