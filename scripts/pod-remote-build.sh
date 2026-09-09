@@ -5,6 +5,43 @@ TREE="${POD_TREE:-/host/arle-build}"
 STATE="${POD_STATE:-/root/arle-ops}"
 TREE_LOCK="/tmp/arle-build$(printf '%s' "$TREE" | tr '/.' '__').lock"
 
+# /host is a host mount, so the tree's owner uid rarely matches the container's
+# git user and every `git -C "$TREE"` fails with "dubious ownership". Trust the
+# tree once per sync/build; idempotent, harmless on the Mac (owner matches).
+ensure_safe_directory() {
+  git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$TREE" ||
+    git config --global --add safe.directory "$TREE" 2>/dev/null || true
+}
+# Digest in the mode matching the sync that wrote the receipt: a clean sync
+# counts committed + generated/ (CLEAN=1), a dirty sync counts the working
+# tree (default). Using the wrong mode excludes/includes generated/ and
+# mismatches every clean sync once the AOT bundle is present.
+source_digest_for() {  # $1 = dirty flag from the receipt/meta
+  if [ "$1" = 1 ]; then source_digest; else CLEAN=1 source_digest; fi
+}
+
+# A fresh lane tree ships an empty generated/ (the Mac builds no CUDA), so its
+# first build would JIT 105 cubins with the system tilelang — slow and version-
+# fragile. A sibling tree at the same commit has the same bundle identity, so
+# copy its generated/ in. build.rs re-verifies the identity against the source.
+provision_bundle() {
+  local donor="${ARLE_BUNDLE_DONOR:-/host/arle-build}" gen="$TREE/crates/cuda-kernels/generated"
+  [ "$donor" != "$TREE" ] || return 0
+  [ -d "$donor/crates/cuda-kernels/generated" ] || return 0
+  [ -n "$(find "$donor/crates/cuda-kernels/generated" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
+  if [ -d "$gen" ] && [ -n "$(find "$gen" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then return 0; fi
+  local this_id donor_id
+  this_id="$(bash "$TREE/scripts/kernel_artifacts.sh" id 2>/dev/null)" || return 0
+  donor_id="$(cd "$donor" && bash scripts/kernel_artifacts.sh id 2>/dev/null)" || return 0
+  if [ "$this_id" != "$donor_id" ]; then
+    echo "bundle donor $donor identity differs ($donor_id != $this_id); skipping" >&2
+    return 0
+  fi
+  rm -rf "$gen"
+  cp -R "$donor/crates/cuda-kernels/generated" "$gen"
+  echo "bundle provisioned from donor $donor (identity $this_id)"
+}
+
 proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
 source_digest() {
@@ -15,24 +52,48 @@ root = os.fsencode(os.path.abspath(sys.argv[1]))
 def git(*args):
     return subprocess.check_output([b"git", b"-C", root, *args])
 
-paths = set(git(b"ls-tree", b"-rz", b"--name-only", b"HEAD").split(b"\0"))
-paths.update(git(b"ls-files", b"-co", b"--exclude-standard", b"-z").split(b"\0"))
+clean = bool(os.environ.get("CLEAN"))
+paths = set()
+committed = {}
+if clean:
+    # The clean sync ships `git archive HEAD`; hash git's content identity
+    # (blob hash) for committed files, not the working tree, so an uncommitted
+    # change (delete, rename, edit) cannot move the digest. generated/ is
+    # gitignored, so it stays content-addressed from the working tree.
+    for entry in git(b"ls-tree", b"-rz", b"HEAD").split(b"\0"):
+        if not entry: continue
+        meta, name = entry.split(b"\t", 1)
+        mode, _typ, blob = meta.split()
+        committed[name] = (mode, blob)
+        paths.add(name)
+    gen = os.path.join(root, b"crates/cuda-kernels/generated")
+    if os.path.isdir(gen):
+        for dirpath, _, filenames in os.walk(gen):
+            for fn in filenames:
+                paths.add(os.path.relpath(os.path.join(dirpath, fn), root))
+else:
+    paths.update(git(b"ls-tree", b"-rz", b"--name-only", b"HEAD").split(b"\0"))
+    paths.update(git(b"ls-files", b"-co", b"--exclude-standard", b"-z").split(b"\0"))
 paths.discard(b"")
 paths.discard(b".arle-source-receipt")
 digest = hashlib.sha256()
 for path in sorted(paths):
-    full = os.path.join(root, path)
     digest.update(len(path).to_bytes(8, "big")); digest.update(path)
+    if clean and path in committed:
+        mode, blob = committed[path]
+        digest.update(b"G"); digest.update(mode); digest.update(blob)
+        continue
+    full = os.path.join(root, path)
     try:
-        mode = os.lstat(full).st_mode
+        st = os.lstat(full).st_mode
     except FileNotFoundError:
         digest.update(b"D")
         continue
-    if stat.S_ISLNK(mode):
+    if stat.S_ISLNK(st):
         data = os.fsencode(os.readlink(full)); kind = b"L"
-    elif stat.S_ISREG(mode):
+    elif stat.S_ISREG(st):
         with open(full, "rb") as f: data = f.read()
-        kind = b"X" if mode & 0o111 else b"F"
+        kind = b"X" if st & 0o111 else b"F"
     else:
         continue
     digest.update(kind); digest.update(len(data).to_bytes(8, "big")); digest.update(data)
@@ -153,10 +214,35 @@ case "${1:-}" in
   validate-build-args)
     validate_build_args "${2:?missing argv file}"
     ;;
+  tree-status)
+    receipt="$TREE/.arle-source-receipt"
+    if [ ! -f "$receipt" ]; then
+      echo "tree=$TREE head=unknown dirty=unknown (no source receipt; sync never completed?)"
+      exit 1
+    fi
+    head="$(awk -F= '$1=="head" {print $2}' "$receipt")"
+    dirty="$(awk -F= '$1=="dirty" {print $2}' "$receipt")"
+    dirty="${dirty:-0}"
+    echo "tree=$TREE head=$head dirty=$dirty"
+    # Builds live in a shared STATE dir across lanes; filter to this tree so a
+    # lane's status reports its own build sha, not the newest build on the box.
+    recent_build=""
+    for d in $(ls -t "$STATE/builds" 2>/dev/null); do
+      r="$STATE/builds/$d/receipt"
+      [ -f "$r" ] || continue
+      [ "$(awk -F= '$1=="tree" {print $2}' "$r")" = "$TREE" ] || continue
+      recent_build="$d"; break
+    done
+    if [ -n "$recent_build" ]; then
+      build_head="$(awk -F= '$1=="source_head" {print $2}' "$STATE/builds/$recent_build/receipt")"
+      echo "latest_build=$recent_build source_head=${build_head:-unknown}"
+    fi
+    ;;
   apply-sync)
     stage="${2:?missing sync stage}"
     exec 9>"$TREE_LOCK"
     flock 9
+    ensure_safe_directory
     meta="$stage.source.meta"
     archive="$stage.tree.tgz"
     deletes="$stage.deletes"
@@ -167,6 +253,8 @@ case "${1:-}" in
     bundle_mode="$(awk -F= '$1=="bundle_mode" {print $2}' "$meta")"
     bundle_mode="${bundle_mode:-full}"
     head="$(awk -F= '$1=="head" {print $2}' "$meta")"
+    dirty="$(awk -F= '$1=="dirty" {print $2}' "$meta")"
+    dirty="${dirty:-0}"
     [ "$(sha256 "$archive")" = "$archive_sha" ] || { echo "sync digest mismatch" >&2; exit 1; }
     backup=""
     if [ "$bundle_mode" = none ]; then
@@ -205,7 +293,7 @@ case "${1:-}" in
     fi
     actual_head="$(git -C "$TREE" rev-parse HEAD)"
     expected_digest="$(awk -F= '$1=="dirty_digest" {print $2}' "$meta")"
-    actual_digest="$(source_digest)"
+    actual_digest="$(source_digest_for "$dirty")"
     if [ "$actual_head" != "$head" ] || [ "$actual_digest" != "$expected_digest" ]; then
       # Name the offenders before rolling back. A digest mismatch is almost
       # always a stray untracked file left in the remote tree (a probe, a dump,
@@ -226,7 +314,7 @@ case "${1:-}" in
       echo "sync source mismatch: head=$actual_head expected_head=$head digest=$actual_digest expected_digest=$expected_digest" >&2; exit 1
     fi
     receipt="$TREE/.arle-source-receipt"
-    write_receipt "$receipt" "schema=arle-source-v1" "head=$actual_head" "digest=$actual_digest" "archive_sha=$archive_sha" "bundle_sha=$bundle_sha" "applied_at=$(date -u +%FT%TZ)"
+    write_receipt "$receipt" "schema=arle-source-v1" "head=$actual_head" "dirty=$dirty" "digest=$actual_digest" "archive_sha=$archive_sha" "bundle_sha=$bundle_sha" "applied_at=$(date -u +%FT%TZ)"
     if [ "$bundle_mode" = full ]; then
       rm -rf "$backup" "$archive" "$deletes" "$bundle" "$meta"
     else
@@ -257,6 +345,7 @@ case "${1:-}" in
     # shellcheck disable=SC1091
     source "$TREE/scripts/cuda_prebuilt_manifest.sh"
     cd "$TREE" || exit 1
+    ensure_safe_directory
     source_receipt="$TREE/.arle-source-receipt"
     rc=1; binary=""
     if [ ! -f "$source_receipt" ]; then
@@ -264,11 +353,14 @@ case "${1:-}" in
     else
       source_head="$(awk -F= '$1=="head" {print $2}' "$source_receipt")"
       source_digest_value="$(awk -F= '$1=="digest" {print $2}' "$source_receipt")"
+      source_dirty="$(awk -F= '$1=="dirty" {print $2}' "$source_receipt")"
+      source_dirty="${source_dirty:-0}"
       exec 9>"$TREE_LOCK"
       flock 9
-      if [ "$(git rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then
+      if [ "$(git rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest_for "$source_dirty")" != "$source_digest_value" ]; then
         echo "source changed since receipt"
       else
+        provision_bundle
         # shellcheck disable=SC2016
         flock /tmp/arle-toolchain.lock bash -c 'toolchain_dir="${ARLE_RUST_TOOLCHAIN_DIR:-/root/.rustup/toolchains/1.98.0-x86_64-unknown-linux-gnu}"; [ -x "$toolchain_dir/bin/rustc" ] && ls "$toolchain_dir"/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1 || rustup toolchain install 1.98.0 --profile minimal -c rustfmt -c clippy'
         events="$DIR/cargo.jsonl"
@@ -330,5 +422,5 @@ PY
     printf 'BUILD_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;
-  *) echo "usage: pod-remote-build.sh source-digest|validate-build-args|apply-sync|build ..." >&2; exit 2;;
+  *) echo "usage: pod-remote-build.sh source-digest|validate-build-args|apply-sync|tree-status|build ..." >&2; exit 2;;
 esac

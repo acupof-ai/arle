@@ -7,7 +7,10 @@
 # Idempotent — if the venv already imports tilelang, nothing happens.
 set -euo pipefail
 TREE="${POD_TREE:-/host/arle-build}"
-VENV="$TREE/crates/cuda-kernels/tools/tilelang/.venv"
+# One venv shared by every tree, not one per tree: the pin is the same across
+# trees at the same commit, and four trees meant four pip installs + four
+# drift chances. Lives under STATE (persistent), not inside a tree.
+VENV="${ARLE_TILELANG_VENV:-/root/arle-ops/tilelang-venv}"
 PY="$VENV/bin/python"
 
 TILELANG_PIN="$(grep -oE 'tilelang==[0-9.]+' "$TREE/requirements-build.txt" | cut -d= -f3)"

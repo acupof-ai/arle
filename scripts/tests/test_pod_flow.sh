@@ -122,31 +122,31 @@ printf target > "$TREE/target/keep"
 printf venv > "$TREE/crates/cuda-kernels/tools/tilelang/.venv/keep"
 printf bench > "$TREE/bench-output/keep"
 cp "$LOCAL/scripts/pod-remote-build.sh" "$TREE/scripts/"
-TN_FAIL_AT=0 "$LOCAL/scripts/pod.sh" sync >/dev/null 2>&1 && exit 1 || true
+TN_FAIL_AT=0 "$LOCAL/scripts/pod.sh" sync --dirty >/dev/null 2>&1 && exit 1 || true
 [ "$(cat "$TREE/sentinel")" = sentinel ]
 grep -Fq 'COPYFILE_DISABLE=1 tar ' "$LOCAL/scripts/pod.sh"
 
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 [ -f "$TREE/new name" ] && [ -f "$TREE/untracked space" ] && [ ! -e "$TREE/delete me" ] && [ ! -e "$TREE/old name" ]
 [ "$(cat "$TREE/target/keep")" = target ] && [ "$(cat "$TREE/crates/cuda-kernels/tools/tilelang/.venv/keep")" = venv ] && [ "$(cat "$TREE/bench-output/keep")" = bench ]
 
 digest_before="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 printf second > "$LOCAL/untracked space"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 digest_second="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 [ "$digest_second" != "$digest_before" ]
 printf third > "$LOCAL/untracked space"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 digest_third="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 [ "$digest_third" != "$digest_second" ]
 git -C "$LOCAL" add "untracked space"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 [ "$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")" = "$digest_third" ]
 # shellcheck disable=SC2016
 lock_expr='TREE_LOCK="/tmp/arle-build$(printf '\''%s'\'' "$TREE" | tr '\''/.'\'' '\''__'\'').lock"'
 grep -Fq "$lock_expr" "$LOCAL/scripts/pod-remote-build.sh"
 grep -Fq 'flock 9' "$LOCAL/scripts/pod-remote-build.sh"
-"$LOCAL/scripts/pod.sh" sync >/dev/null
+"$LOCAL/scripts/pod.sh" sync --dirty >/dev/null
 digest_before="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
 
 mkdir -p "$STATE/builds/good" "$TREE/target/release"
@@ -345,5 +345,52 @@ PY
   [ "$status_rc" -ne 0 ] && [ "$kill_rc" -ne 0 ] && [ ! -e "$KILL_MARKER" ]
   mv "$TMP/process.good" "$STATE/runs/shared/process"
 done
+
+# Clean sync (default): ships committed content, ignores working-tree changes.
+git -C "$LOCAL" add -A && git -C "$LOCAL" commit -qm "clean-sync probe" 2>/dev/null || true
+printf uncommitted-edit > "$LOCAL/untracked space"
+"$LOCAL/scripts/pod.sh" sync >/dev/null
+[ "$(awk -F= '$1=="dirty" {print $2}' "$TREE/.arle-source-receipt")" = 0 ]
+# The remote holds the committed content, not the uncommitted edit.
+[ "$(cat "$TREE/untracked space")" = "$(git -C "$LOCAL" show "HEAD:untracked space")" ]
+# An uncommitted edit to a committed file does not move the clean digest.
+clean_digest="$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")"
+printf more >> "$LOCAL/untracked space"
+"$LOCAL/scripts/pod.sh" sync >/dev/null
+[ "$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")" = "$clean_digest" ]
+
+# Negative control for the push_scripts-in-sync bootstrap fix. apply-sync runs
+# the deployed tree's script, so a remote whose digest algorithm is older than
+# the pusher's verifies with the old format and fails every sync until a human
+# refreshes the script by hand. Plant a stub with a different digest, then prove
+# sync fails without push_scripts (ARLE_SKIP_PUSH_SCRIPTS) and succeeds with it.
+# The stub is inserted before the case dispatch, not appended: bash parses
+# top-to-bottom, so an appended stub is read only after apply-sync has already
+# run the real digest. --full keeps the deployed script stable across the
+# digest check: bundle_mode=none extracts the tarball over the tree and would
+# overwrite the script mid-execution, so the stub could never gate Arm B.
+python3 - "$TREE/scripts/pod-remote-build.sh" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = 'case "${1:-}" in'
+assert s.count(marker) == 1, "case dispatch marker not unique"
+stub = '''# negative-control stub: a digest algorithm different from the pusher's
+source_digest() { echo stale; }
+
+'''
+open(p, "w").write(s.replace(marker, stub + marker, 1))
+PY
+set +e
+ARLE_SKIP_PUSH_SCRIPTS=1 "$LOCAL/scripts/pod.sh" sync --full >"$TMP/nc-skip.log" 2>&1
+rc=$?; set -e
+# Hard assert: a no-op here (rc==0) would let an inert stub pass the gate.
+[ "$rc" -ne 0 ] || { echo "negative control: sync should have failed without push_scripts" >&2; cat "$TMP/nc-skip.log" >&2; exit 1; }
+grep -q 'sync source mismatch' "$TMP/nc-skip.log"
+# The full-sync rollback restores the stubbed tree, so Arm B starts skewed.
+grep -q 'negative-control stub' "$TREE/scripts/pod-remote-build.sh"
+# push_scripts overwrites the stub with the local script before apply-sync.
+"$LOCAL/scripts/pod.sh" sync --full >/dev/null
+cmp -s "$LOCAL/scripts/pod-remote-build.sh" "$TREE/scripts/pod-remote-build.sh"
 
 echo "pod flow tests: PASS"

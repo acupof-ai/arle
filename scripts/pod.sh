@@ -12,10 +12,24 @@ if { [ -n "${POD_TREE:-}" ] && [ -z "${NODE_TREE:-}" ]; } ||
   echo "POD_TREE and NODE_TREE must be set together (same tree, pod side and node side); got POD_TREE='${POD_TREE:-}' NODE_TREE='${NODE_TREE:-}'" >&2
   exit 2
 fi
-NODE_TREE="${NODE_TREE:-/root/arle-build}"
-TREE="${POD_TREE:-/host/arle-build}"
-STATE="${POD_STATE:-/root/arle-ops}"
+# Per-lane tree: running pod.sh from a lane worktree defaults to that lane's
+# remote tree, so one lane's sync cannot land between another lane's sync and
+# build. Override with POD_TREE/NODE_TREE (must be set together, checked above).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_lane_tree=""
+if [ -z "${POD_TREE:-}" ] && [ -z "${NODE_TREE:-}" ]; then
+  case "$ROOT" in
+    */arle-lanes/*) _lane_tree="$(basename "$ROOT")" ;;
+  esac
+fi
+if [ -n "$_lane_tree" ]; then
+  NODE_TREE="/root/arle-build-$_lane_tree"
+  TREE="/host/arle-build-$_lane_tree"
+else
+  NODE_TREE="${NODE_TREE:-/root/arle-build}"
+  TREE="${POD_TREE:-/host/arle-build}"
+fi
+STATE="${POD_STATE:-/root/arle-ops}"
 cmd="${1:-help}"
 shift || true
 
@@ -76,6 +90,17 @@ push_or_die() {
   "$TN" exec "cat '$dst'.part.* > '$dst' && rm -f '$dst'.part.*" >/dev/null || {
     echo "reassembling $dst on the node failed; remote tree unchanged" >&2; exit 1; }
 }
+# Ship the local helpers to the tree. sync does this before apply-sync because
+# the remote apply runs the deployed tree's script: a digest-format change
+# (e.g. the blob-identity hash) would otherwise verify with the old format and
+# fail every sync until a human ran push-scripts by hand. push_scripts itself
+# only transfers files (tn push); it never invokes the remote script, so no
+# protocol change can deadlock it — the bootstrap is one-directional.
+push_scripts() {
+  for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh reap_run.py cuda_prebuilt_manifest.sh; do
+    push_or_die "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
+  done
+}
 pod_path() {
   case "$1" in
     "$NODE_TREE"*) printf '%s%s\n' "$TREE" "${1#"$NODE_TREE"}" ;;
@@ -93,9 +118,7 @@ tarball_files() {
 
 case "$cmd" in
   push-scripts)
-    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh reap_run.py cuda_prebuilt_manifest.sh; do
-      push_or_die "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
-    done
+    push_scripts
     echo "pushed pod helpers -> $NODE_TREE/scripts/"
     ;;
   setup)
@@ -108,44 +131,74 @@ case "$cmd" in
     "$POD" "sccache --show-stats 2>/dev/null | grep -iE 'compile requests|cache hits|cache misses|cache hit rate|stored|errors' | head"
     ;;
   setup-tilelang)
-    "$POD" "bash '$TREE/scripts/pod-tilelang-env.sh'"
+    "$POD" "POD_TREE='$TREE' bash '$TREE/scripts/pod-tilelang-env.sh'"
     ;;
   quantize-w4afp8)
     input="${1:?usage: pod.sh quantize-w4afp8 <input-dir> <output-dir>}"
     output="${2:?usage: pod.sh quantize-w4afp8 <input-dir> <output-dir>}"
-    "$POD" "bash -lc 'cd $TREE && crates/cuda-kernels/tools/tilelang/.venv/bin/python scripts/quantize_dsv4_w4afp8.py \"$input\" \"$output\"'"
+    "$POD" "bash -lc 'cd $TREE && ${ARLE_TILELANG_VENV:-/root/arle-ops/tilelang-venv}/bin/python scripts/quantize_dsv4_w4afp8.py \"$input\" \"$output\"'"
     ;;
   sync)
-    [ $# -eq 0 ] || { [ "${1:-}" = --full ] || { echo "sync: unknown arg $1" >&2; exit 2; }; }
+    dirty=0; full=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --dirty) dirty=1 ;;
+        --full) full=1 ;;
+        *) echo "sync: unknown arg $1" >&2; exit 2 ;;
+      esac
+      shift
+    done
     stage="$(mktemp -d -t arle-sync-XXXXXX)"
     trap 'rm -rf "$stage"' EXIT
     head="$(git -C "$ROOT" rev-parse HEAD)"
     # The bundle lands in generated/ (inside the digest), so materialise it
     # before digesting or the remote apply-sync guard sees a different tree.
     bash "$ROOT/scripts/kernel_artifacts.sh" sync || true   # source-matched AOT bundle → generated/ (no-op offline/miss)
-    dirty_digest="$(POD_TREE="$ROOT" bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
-    tarball_files > "$stage/files"
-    git -C "$ROOT" ls-files -d -z > "$stage/deletes"
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
+    if [ "$dirty" = 1 ]; then
+      # Dirty sync: ship the working tree, including uncommitted and untracked.
+      dirty_digest="$(POD_TREE="$ROOT" bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
+      tarball_files > "$stage/files"
+      git -C "$ROOT" ls-files -d -z > "$stage/deletes"
+      COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
+    else
+      # Clean sync: ship the committed tree. The tarball is `git archive HEAD`
+      # plus the gitignored AOT bundle; no working-tree changes leave the box.
+      dirty_digest="$(POD_TREE="$ROOT" CLEAN=1 bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
+      mkdir -p "$stage/clean"
+      git -C "$ROOT" archive HEAD | tar -x -C "$stage/clean"
+      if [ -d "$ROOT/crates/cuda-kernels/generated" ]; then
+        mkdir -p "$stage/clean/crates/cuda-kernels"
+        cp -R "$ROOT/crates/cuda-kernels/generated" "$stage/clean/crates/cuda-kernels/"
+      fi
+      : > "$stage/deletes"
+      # Tar from a file list, not `.`: `tar ... .` prefixes every entry with
+      # `./`, and reconcile_untracked compares against `git ls-files` (no
+      # prefix), so every tracked file read as a stray and got deleted.
+      ( cd "$stage/clean" && find . \( -type f -o -type l \) | cut -c3- ) > "$stage/clean.files"
+      COPYFILE_DISABLE=1 tar --no-xattrs -C "$stage/clean" -T "$stage/clean.files" -czf "$stage/tree.tgz"
+    fi
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
     pod_head="$("$POD" "git -C '$TREE' rev-parse HEAD" 2>/dev/null | tr -d '[:space:]' || true)"
     bundle_mode=full
-    if [ "${1:-}" != --full ] && [ "$pod_head" = "$head" ]; then
+    if [ "$full" = 0 ] && [ "$pod_head" = "$head" ]; then
       bundle_mode=none
-    elif [ "${1:-}" != --full ] && [ -n "$pod_head" ] && git -C "$ROOT" merge-base --is-ancestor "$pod_head" HEAD 2>/dev/null; then
+    elif [ "$full" = 0 ] && [ -n "$pod_head" ] && git -C "$ROOT" merge-base --is-ancestor "$pod_head" HEAD 2>/dev/null; then
       bundle_mode=incremental
       git -C "$ROOT" bundle create "$stage/source.bundle" "$pod_head"..HEAD
     else
       git -C "$ROOT" bundle create "$stage/source.bundle" HEAD
     fi
     if [ "$bundle_mode" = none ]; then bundle_sha=none; else bundle_sha="$(shasum -a 256 "$stage/source.bundle" | cut -d' ' -f1)"; fi
-    printf 'schema=arle-source-stage-v1\nhead=%s\ndirty_digest=%s\narchive_sha=%s\nbundle_sha=%s\nbundle_mode=%s\n' "$head" "$dirty_digest" "$archive_sha" "$bundle_sha" "$bundle_mode" > "$stage/source.meta"
+    printf 'schema=arle-source-stage-v1\nhead=%s\ndirty=%s\ndirty_digest=%s\narchive_sha=%s\nbundle_sha=%s\nbundle_mode=%s\n' "$head" "$dirty" "$dirty_digest" "$archive_sha" "$bundle_sha" "$bundle_mode" > "$stage/source.meta"
     remote_stage="$NODE_TREE.sync.$$.${RANDOM}"
     push_or_die "$stage/tree.tgz" "$remote_stage.tree.tgz"
     push_or_die "$stage/deletes" "$remote_stage.deletes"
     [ "$bundle_mode" = none ] || push_or_die "$stage/source.bundle" "$remote_stage.source.bundle"
     push_or_die "$stage/source.meta" "$remote_stage.source.meta"
     pod_stage="$(pod_path "$remote_stage")"
+    # ARLE_SKIP_PUSH_SCRIPTS is the negative-control hook for the bootstrap
+    # fix (test_pod_flow.sh): a protocol-skewed remote must fail without it.
+    [ -n "${ARLE_SKIP_PUSH_SCRIPTS:-}" ] || push_scripts
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' apply-sync '$pod_stage'" || { echo "remote sync apply failed" >&2; exit 1; }
     ;;
   build)
@@ -161,7 +214,7 @@ case "$cmd" in
     remote="$NODE_TREE.build-$op.argv"
     push_or_die "$tmp" "$remote"
     pod_remote="$(pod_path "$remote")"
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-build.sh' build '$label' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' ${ARLE_BUNDLE_DONOR:+ARLE_BUNDLE_DONOR='$ARLE_BUNDLE_DONOR' }setsid bash '$TREE/scripts/pod-remote-build.sh' build '$label' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
     echo "build '$label' launched; receipt: build:$label"
     ;;
   run)
@@ -195,17 +248,27 @@ case "$cmd" in
     case "$timeout_s" in ''|*[!0-9]*) echo "usage: pod.sh ready <run-label> [timeout_s]" >&2; exit 2;; esac
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' ready '$label' '$timeout_s'"
     ;;
-  status|log|kill)
+  status)
+    # No arg: the tree + latest build sha (W4). With a run-label: run status.
+    if [ $# -eq 0 ]; then
+      "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' tree-status"
+    else
+      label="$1"; valid_label "$label"
+      "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' '$cmd' '$label'"
+    fi
+    ;;
+  log|kill)
     label="${1:-}"
     valid_label "$label"
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' '$cmd' '$label'"
     ;;
   *)
     printf '%s\n' \
-      'pod.sh sync' \
+      'pod.sh sync [--dirty] [--full]' \
       'pod.sh build [label] [cargo argv...]' \
       'pod.sh run <build-label> [run-label] [auto|GPU|GPU,...] -- [arle argv...]' \
-      'pod.sh status|ready|log|kill <run-label> [timeout]' \
+      'pod.sh status [run-label] (no arg: tree head + latest build sha)' \
+      'pod.sh ready|log|kill <run-label> [timeout]' \
       'pod.sh gpus | setup | setup-sccache | sccache-stats'
     ;;
 esac

@@ -33,6 +33,7 @@ if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
   tilelang_pin="$(grep -oE 'tilelang==[0-9.]+' "${TREE:-/host/arle-build}/requirements-build.txt" 2>/dev/null | cut -d= -f3)"
   tilelang_pin="${tilelang_pin:-0.1.13}"
   for python in \
+    "${ARLE_TILELANG_VENV:-/root/arle-ops/tilelang-venv}/bin/python" \
     "${TREE:-/host/arle-build}/crates/cuda-kernels/tools/tilelang/.venv/bin/python" \
     /host/arle-build/crates/cuda-kernels/tools/tilelang/.venv/bin/python \
     "$(command -v python3 2>/dev/null)"; do
