@@ -847,10 +847,10 @@ pub(crate) struct ServeArgs {
 
     /// Speculate (MTP/DSpark) only when the decode batch is ≤ this; above it
     /// decode routes to the plain batched path. Default 16 = the measured
-    /// DSpark envelope (+77% at c=2, +8.5% at c=16); MTP, which does not batch
-    /// its draft, still wants 1. On DSv4 the gate is pinned to 1 (the draft
-    /// runs per slot and speculation loses above c=1); this flag only governs
-    /// the qwen35 batched greedy DSpark path on BF16 paged KV.
+    /// DSpark envelope (+77% at c=2, +8.5% at c=16). On DSv4 the gate is
+    /// pinned to 1 (the draft runs per slot and speculation loses above c=1);
+    /// on qwen35 it governs the batched greedy DSpark (BF16 paged KV) and MTP
+    /// paths.
     #[arg(long, default_value_t = 16, value_name = "N")]
     pub(crate) spec_max_batch: usize,
 
