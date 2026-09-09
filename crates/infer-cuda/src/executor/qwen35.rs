@@ -270,6 +270,8 @@ impl Qwen35CudaExecutor {
         let local_pages = &kv_batch.flat_local_page_ids[brow.local_page_range.clone()];
         // world/rank is a construction-time parameter of this executor, not
         // per-step batch data — slice with the executor's own shard spec.
+        // `Some` implies size >= 2 (`two_d_engaged`, tp.rs), so the div_ceil
+        // below never divides by 0.
         let (rank, size) = self.kv_shard_spec().unwrap_or((0, 1));
         let pool = self
             .full_attn_kv

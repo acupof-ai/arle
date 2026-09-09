@@ -38,8 +38,10 @@ also wider than what backends actually do during a submit.
   `poll` (match on an already-dereferenced value) that kept both crates
   from building. Neither crate is in any gate — no CI lane and no pre-push
   hook entry compiles them — so the breakage landed and sat unnoticed.
-  Their test targets had also rotted (stale 2-arg `submit` calls after the
-  signature change); this PR repairs those call sites so
+  Second evidence face of the same gap: the test targets had also rotted
+  (three stale 2-arg `submit` calls in infer-vulkan, dead since Step 1's
+  signature change), and nobody knew, because no gate compiles the tests
+  either. This PR repairs those call sites so
   `cargo test -p infer-vulkan -p infer-hip` compiles and runs. Whether the
   two crates deserve a standing `cargo check` gate or deletion is ckl's
   decision — they are on the design-theses frozen list as experimental.
