@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p infer-api --example metal_kv_memory_probe --release --no-default-features --features metal,no-cuda -- [--model MODEL] [--kv-cache-dtype auto|bf16|int8] [--prompt-tokens N] [--max-tokens N] [--memory-budget-gib N] [--low-impact true|false] [--warmup-runs N] [--repeat N]"
+                    "usage: cargo run -p arle --example metal_kv_memory_probe --release --no-default-features --features metal,no-cuda,cli -- [--model MODEL] [--kv-cache-dtype auto|bf16|int8] [--prompt-tokens N] [--max-tokens N] [--memory-budget-gib N] [--low-impact true|false] [--warmup-runs N] [--repeat N]"
                 );
                 return Ok(());
             }
@@ -107,6 +107,7 @@ fn main() -> anyhow::Result<()> {
     }
     anyhow::ensure!(repeat >= 1, "repeat must be >= 1");
 
+    arle::register_all();
     let mut config = EngineLoadConfig {
         num_slots: 1,
         total_pages,

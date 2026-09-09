@@ -2,9 +2,16 @@
 //!
 //! Every method is expressed in host slot ids, page ids, and token counts. The
 //! trait is dyn-safe.
-pub trait KvAllocator {
-    fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()>;
 
+/// The narrow write surface a backend needs during `submit`: grow or shrink a
+/// slot's accounted length. Everything else the backend used to read from
+/// `&dyn KvPool` is resolved above the seam into `KvBatchDescriptor`.
+pub trait KvSlotAccounting {
+    fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()>;
+    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
+}
+
+pub trait KvAllocator: KvSlotAccounting {
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>>;
 
     /// Must only be called with pages that were never attached to a slot or
@@ -38,6 +45,4 @@ pub trait KvAllocator {
     fn reinstate_slot_page(&mut self, _slot: usize, _logical_page: usize) -> Option<u32> {
         None
     }
-
-    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
 }

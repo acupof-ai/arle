@@ -203,6 +203,8 @@ pub struct WireStats {
     #[serde(default)]
     pub throughput_decode_forward_busy_micros: u64,
     #[serde(default)]
+    pub throughput_decode_forward_tokens: u64,
+    #[serde(default)]
     pub throughput_mixed_forward_steps: u64,
     #[serde(default)]
     pub throughput_mixed_forward_busy_micros: u64,
@@ -312,6 +314,7 @@ impl WireStats {
                 prefill_forward_busy_micros: self.throughput_prefill_forward_busy_micros,
                 decode_forward_steps: self.throughput_decode_forward_steps,
                 decode_forward_busy_micros: self.throughput_decode_forward_busy_micros,
+                decode_forward_tokens: self.throughput_decode_forward_tokens,
                 mixed_forward_steps: self.throughput_mixed_forward_steps,
                 mixed_forward_busy_micros: self.throughput_mixed_forward_busy_micros,
                 decode_step_phase: infer_core::StepPhaseStats {
@@ -409,6 +412,7 @@ impl WireStats {
             throughput_prefill_forward_busy_micros: c.throughput.prefill_forward_busy_micros,
             throughput_decode_forward_steps: c.throughput.decode_forward_steps,
             throughput_decode_forward_busy_micros: c.throughput.decode_forward_busy_micros,
+            throughput_decode_forward_tokens: c.throughput.decode_forward_tokens,
             throughput_mixed_forward_steps: c.throughput.mixed_forward_steps,
             throughput_mixed_forward_busy_micros: c.throughput.mixed_forward_busy_micros,
             throughput_decode_phase_steps: c.throughput.decode_step_phase.steps,
@@ -545,6 +549,7 @@ fn merge_wire_stats_dp(acc: &mut WireStats, other: WireStats) {
     acc.throughput_prefill_forward_busy_micros += other.throughput_prefill_forward_busy_micros;
     acc.throughput_decode_forward_steps += other.throughput_decode_forward_steps;
     acc.throughput_decode_forward_busy_micros += other.throughput_decode_forward_busy_micros;
+    acc.throughput_decode_forward_tokens += other.throughput_decode_forward_tokens;
     acc.throughput_mixed_forward_steps += other.throughput_mixed_forward_steps;
     acc.throughput_mixed_forward_busy_micros += other.throughput_mixed_forward_busy_micros;
     acc.throughput_decode_phase_steps += other.throughput_decode_phase_steps;

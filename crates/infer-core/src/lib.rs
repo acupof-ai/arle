@@ -15,8 +15,8 @@ use radix::{BlockId, PrefixMatch, RadixCache};
 use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
-    AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvPool, PermissiveGovernor, PollResult,
-    ResourceGovernor, StepBudget,
+    AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvBatchDescriptor, KvPool,
+    PermissiveGovernor, PollResult, ResourceGovernor, StepBudget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -153,6 +153,11 @@ pub struct ThroughputStats {
     pub prefill_forward_busy_micros: u64,
     pub decode_forward_steps: u64,
     pub decode_forward_busy_micros: u64,
+    /// Tokens committed by pure-decode steps (prefill rows empty). The
+    /// denominator that matches `decode_forward_busy_micros` — the global
+    /// `generated_tokens` also counts mixed-step tokens, which inflates the
+    /// per-token ratio differently per arm and per concurrency.
+    pub decode_forward_tokens: u64,
     pub mixed_forward_steps: u64,
     pub mixed_forward_busy_micros: u64,
     /// Decode-only host phases. These overlap `forward_busy_micros` at submit.
@@ -892,7 +897,8 @@ impl Engine {
             eprintln!("[STEP-DIAG] SUBMIT plan mode={:?}", plan.mode);
         }
         let submit_at = std::time::Instant::now();
-        self.inflight = Some(self.executor.submit(&plan, &mut *self.kv)?);
+        let batch = KvBatchDescriptor::from_plan(&plan, &*self.kv)?;
+        self.inflight = Some(self.executor.submit(&plan, &batch, &mut *self.kv)?);
         self.inflight_submit_at = Some(submit_at);
         phase!(5);
         let decode_only = plan.prefill_rows.is_empty() && applied_decode_only;
@@ -1281,6 +1287,13 @@ impl Engine {
             .throughput_stats
             .generated_tokens
             .saturating_add(committed.len() as u64);
+
+        if plan.prefill_rows.is_empty() {
+            self.throughput_stats.decode_forward_tokens = self
+                .throughput_stats
+                .decode_forward_tokens
+                .saturating_add(committed.len() as u64);
+        }
 
         // Stream tokens before finishing — serving layer sees terminal token ahead of completion.
         if let Some(observer) = &mut self.on_token {

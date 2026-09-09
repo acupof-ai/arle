@@ -16,7 +16,7 @@ autobins = false
 default = []
 no-cuda = ["autograd/no-cuda", "infer-api?/no-cuda"]
 metal = ["autograd/metal"]
-cuda = ["autograd/cuda", "dep:infer-api", "infer-api/cuda"]
+cuda = ["autograd/cuda", "dep:infer-api", "infer-api/cuda", "dep:infer-util"]
 # DSv4-Flash teacher needs TP (nccl) + DeepEP MoE dispatch; forwarded to
 # infer-api -> infer-cuda. Opt-in: only the in-process DSv4-teacher OPD path
 # (Flash teacher -> dense student) pulls these; dense-only OPD ignores them.
@@ -40,6 +40,9 @@ chat = { path = "../chat" }
 # train read parallelism coordinates from.
 infer-topo = { path = "../infer-topo" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
+# HF id -> local cache dir resolution for the CUDA backend builder registered by
+# `teacher_infer::register_cuda_backend` (mirrors the `arle` binary's builder).
+infer-util = { path = "../infer-util", optional = true }
 infer-plan = { path = "../infer-plan" }
 # cc-convert reuses the REAL /v1/messages -> ChatCompletionRequest mapping
 # (host-only crate; no device code), so converted records can't drift from the

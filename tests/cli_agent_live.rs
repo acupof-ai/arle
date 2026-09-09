@@ -27,7 +27,7 @@ fn live_test_guard() -> MutexGuard<'static, ()> {
 
 fn run_cli(args: &[&str], lines: &[&str], timeout: Duration) -> Output {
     let exe = env!("CARGO_BIN_EXE_arle");
-    let reads_stdin_prompt = args.iter().any(|arg| *arg == "--stdin");
+    let reads_stdin_prompt = args.contains(&"--stdin");
     let mut child = Command::new(exe)
         .arg("--max-turns")
         .arg("4")

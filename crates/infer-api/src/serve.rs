@@ -3,32 +3,17 @@
 //! The CLI is synchronous, so this owns its tokio multi-thread runtime rather
 //! than relying on `#[tokio::main]`.
 //!
-//! Backend is selected at compile time (`metal`/`cuda`/`hip`/`vulkan`/`cpu`) and the router is
-//! built by [`LoadedInferenceEngine::router_for_backend`], which spawns the same
-//! `ServeHandle` the `load_*` constructors spawn. On a build with no backend
-//! compiled in, [`serve_http`] returns a clear error (mirrors `--doctor`).
+//! The router is built by [`LoadedInferenceEngine::router_for_backend`], which
+//! dispatches through the runtime backend registry and spawns the same
+//! `ServeHandle` the `load_*` constructors spawn. A registry with no matching
+//! backend fails at load with a clear error.
 
 use std::path::PathBuf;
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::loaded::EngineLoadConfig;
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
-use crate::loaded::LoadedInferenceEngine;
+use crate::loaded::{EngineLoadConfig, LoadedInferenceEngine};
 
 /// Options for the in-process [`serve_http`] entry.
 ///
@@ -184,15 +169,8 @@ impl ServeSpecOptions {
 /// Build the backend router, bind `bind:port`, and serve OpenAI v1 traffic until
 /// Ctrl-C. Blocks the calling (sync) thread on an owned tokio runtime.
 ///
-/// Errors before binding if no backend was compiled in, if the model / tokenizer
-/// fails to load, or if the address is already in use.
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
+/// Errors before binding if the model / tokenizer fails to load, the backend is
+/// not registered, or the address is already in use.
 #[allow(clippy::type_complexity)]
 pub fn serve_http(
     opts: ServeHttpOptions,
@@ -315,13 +293,6 @@ pub fn serve_coordinator_http_dp(
     bind_and_serve(bind, port, router, model_path, shutdown)
 }
 
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 pub fn bind_and_serve(
     bind: &str,
     port: u16,
@@ -334,13 +305,6 @@ pub fn bind_and_serve(
     serve_listener(listener, router, label, shutdown, true)
 }
 
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 fn serve_listener(
     listener: std::net::TcpListener,
     router: axum::Router,
@@ -370,25 +334,11 @@ fn serve_listener(
     })
 }
 
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 pub struct ServeThread {
     join: std::thread::JoinHandle<Result<()>>,
     shutdown: infer_server::ServeShutdown,
 }
 
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 impl ServeThread {
     pub fn shutdown(self) -> Result<()> {
         self.shutdown.request();
@@ -404,13 +354,6 @@ impl ServeThread {
 /// Never touches process signals — the caller owns process lifecycle; the ONLY
 /// stop path is the [`ServeThread`] token (so a background server can't swallow
 /// the SIGTERM that should kill the whole training process).
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 pub fn serve_router_on_thread(router: axum::Router, bind: &str, port: u16) -> Result<ServeThread> {
     let shutdown = infer_server::ServeShutdown::new();
     let listener = std::net::TcpListener::bind((bind, port))
@@ -423,28 +366,6 @@ pub fn serve_router_on_thread(router: axum::Router, bind: &str, port: u16) -> Re
     Ok(ServeThread { join, shutdown })
 }
 
-/// Backend-absent build: report the same way `--doctor` does and return an error.
-#[cfg(not(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-)))]
-pub fn serve_http(opts: ServeHttpOptions, _on_engine_loaded: Option<()>) -> Result<()> {
-    validate_kv_ssd_config(&opts.engine_config)?;
-    anyhow::bail!(
-        "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"
-    )
-}
-
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
 async fn shutdown_signal(shutdown: infer_server::ServeShutdown, process_signals: bool) {
     // SIGINT or SIGTERM (kill/pod_serve.sh/orchestrators send SIGTERM): without
     // handling SIGTERM the coordinator dies un-gracefully (drop(guard) skipped) → TP

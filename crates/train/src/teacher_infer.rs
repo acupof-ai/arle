@@ -418,6 +418,37 @@ fn into_device_logits(store: &mut TensorStore, tensor_id: TensorId) -> Result<De
     Ok(DeviceLogits { tensor_id, shape })
 }
 
+/// Register train's CUDA backend with infer-api's runtime registry. The OPD
+/// teacher loads via `LoadedInferenceEngine::load_with_config`, which
+/// dispatches by registry name; infer-api no longer compiles the CUDA builder
+/// in (it moved to the `arle` binary), so train registers its own copy.
+#[cfg(feature = "cuda")]
+pub fn register_cuda_backend() {
+    fn build(
+        model_path: &str,
+        config: &infer_api::EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
+    ) -> anyhow::Result<(
+        infer_server::ServeHandle,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        // Resolve HF id -> local cache dir, downloading if absent.
+        let resolved = infer_util::hf_hub::resolve_model_path(model_path)?;
+        let resolved_str = resolved.to_string_lossy().to_string();
+        let tokenizer = infer_server::OpenAiTokenizer::from_model_dir(&resolved)?;
+        let model_id = infer_api::model_id_from_path(&resolved_str);
+        let model_source = resolved_str;
+        let engine_config = config.clone();
+        let serve = infer_server::ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || infer_api::build_cuda_engine(&model_source, &engine_config),
+            shutdown,
+        )?;
+        Ok((serve, tokenizer, model_id))
+    }
+    infer_api::register_backend("cuda", build);
+}
+
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
 pub struct InferTeacher {

@@ -24,9 +24,6 @@ impl CatalogEntry {
 
 use CompiledBackend::{Cpu, Cuda, Metal};
 
-// Consumed only by the backend-gated `ocr` module — gate to match so a
-// no-backend build doesn't flag it dead.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) const DEEPSEEK_OCR_MODEL_ID: &str = "sahilchachra/unlimited-ocr-mxfp8-mlx";
 
 /// Display order is decided by `recommend_models` (flagship picks first), not
@@ -165,8 +162,6 @@ pub(crate) fn recommend_models(info: &SystemInfo) -> Vec<&'static CatalogEntry> 
     fits
 }
 
-/// Backend-gated to match `model_picker`, its sole non-test caller.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn find_by_hf_id(hf_id: &str) -> Option<&'static CatalogEntry> {
     CATALOG.iter().find(|e| e.hf_id == hf_id)
 }

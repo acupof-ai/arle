@@ -45,7 +45,6 @@ mod w2s;
 
 #[cfg(feature = "cuda")]
 pub(crate) use model_probe::resolve_local_tokenizer_path;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) use model_probe::run_model;
 
 #[cfg(feature = "cuda")]

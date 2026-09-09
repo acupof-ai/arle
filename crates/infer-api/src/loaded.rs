@@ -1,9 +1,23 @@
-//! `LoadedInferenceEngine` — the backend-dispatching public engine.
+//! `LoadedInferenceEngine` — the public engine handle.
 //!
-//! A feature-gated enum over the available backends (`metal`/`cuda`/`hip`/`vulkan`/`cpu`,
-//! selected at compile time) with a `load(model_path)`
-//! constructor dispatching to the active variant. [`EngineLoadConfig`] is always
-//! available; the enum + impls require a backend feature.
+//! A backend-neutral struct over a [`ServeInferenceEngine`] plus the runtime
+//! backend name. Backend selection is a runtime decision: the leaf binary
+//! registers one [`BackendBuilderFn`] per compiled-in backend via
+//! [`register_backend`], and [`LoadedInferenceEngine::load_with_config`]
+//! dispatches by [`EngineLoadConfig::backend`] (or the first registered
+//! backend when unset). [`EngineLoadConfig`] is always available; the CUDA
+//! OPD/multiproc helpers under [`cuda`] require the `cuda` feature.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::serve_engine::ServeInferenceEngine;
+use crate::types::{
+    ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry,
+    InferenceEngine, MultimodalChatRequest,
+};
 
 /// Requested KV-cache dtype — re-exported from the device-neutral seam so the
 /// service/scheduler layers stay backend-agnostic. Backends resolve it against
@@ -167,6 +181,11 @@ pub struct EngineLoadConfig {
     /// `MultiAxisConfig` via `TpEnvGuard`.
     #[serde(default)]
     pub context_parallel_size: Option<usize>,
+    /// Runtime backend selection. `None` = the first registered backend (the
+    /// leaf binary's compiled-in default). Set from `--backend`; the registry
+    /// dispatches by name at load time.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 fn default_dspark_sps_bias_ms() -> f32 {
@@ -244,20 +263,18 @@ impl Default for EngineLoadConfig {
             vulkan_submit_cap: None,
             world_size: None,
             context_parallel_size: None,
+            backend: None,
         }
     }
 }
 
 impl EngineLoadConfig {
-    // All callsites are under cfg(feature = "cuda"/"metal"/"hip"/"vulkan");
-    // the cpu-only CI surface compiles none of them.
     // A set `--max-running-requests` IS the executor slot budget: the scheduler
     // runs at most `cap` requests, and post-#154-3b DSv4 slots TRADE against
     // shared comp-pool tokens (each ~338MB), so provisioning `num_slots` slots
     // for a capped scheduler reserves VRAM no request can ever use. Unset, the
     // `num_slots` auto-ceiling applies and the VRAM budget binds.
-    #[allow(dead_code)]
-    fn hot_workspace_slots(&self) -> usize {
+    pub fn hot_workspace_slots(&self) -> usize {
         self.max_running_requests.unwrap_or(self.num_slots).max(1)
     }
 
@@ -281,15 +298,13 @@ impl EngineLoadConfig {
         }
     }
 
-    #[allow(dead_code)]
-    fn kv_ssd_requested(&self) -> bool {
+    pub fn kv_ssd_requested(&self) -> bool {
         self.kv_ssd_root.is_some() || self.kv_disk_limit.is_some()
     }
 
     /// `default_budget(root, fraction)` probes free disk; `world` divides the
     /// deployment-total cap into per-rank shares.
-    #[allow(dead_code)]
-    fn kv_ssd_spill(
+    pub fn kv_ssd_spill(
         &self,
         world: usize,
         default_budget: impl FnOnce(&std::path::Path, f64) -> usize,
@@ -333,6 +348,39 @@ impl EngineLoadConfig {
             (None, Some(_)) => anyhow::bail!("--kv-disk-limit requires --kv-disk"),
             (None, None) => Ok(None),
         }
+    }
+
+    pub fn scheduler_config(&self) -> infer_core::SchedulerConfig {
+        let mut config = infer_core::SchedulerConfig::for_slots(self.hot_workspace_slots());
+        // Prompt cap = min(requested, KV capacity − gen reserve). For shared
+        // KV pools (Qwen3.6/DSv4) the device pool is profiled
+        // from free VRAM after load, so `total_pages` here is just the
+        // advisory default (8192) — using it would cap prompts at 114k even
+        // though the profiled pool holds 770k+. Bind to `max_total_tokens`
+        // instead; the post-load profiled-capacity clamp (M2) binds it down
+        // to the real device pool if needed.
+        let per_req_cap = self
+            .max_total_tokens
+            .max(self.total_pages.saturating_mul(self.page_size));
+        let gen_reserve = per_req_cap / 8;
+        config.max_prompt_tokens = self
+            .max_prompt_tokens
+            .min(per_req_cap.saturating_sub(gen_reserve));
+        config.max_total_tokens = self.max_total_tokens;
+        // Unset → 64: the Metal-interactivity default (small ticks keep the
+        // single-threaded MLX encode loop responsive between decode steps).
+        // The CUDA load path re-resolves per model kind before use.
+        config.chunked_prefill_size = self.chunked_prefill_size.unwrap_or(64);
+        config.max_running_requests = self.max_running_requests;
+        config.slot_oversubscription = self.slot_oversubscription;
+        config.oversubscription_min_slice = self.oversubscription_min_slice.max(1);
+        // Diagnostic-only escape hatch (not a shipped feature) for the
+        // concurrent-decode digit-corruption investigation — see
+        // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md.
+        if std::env::var("ARLE_DISABLE_PREFIX_CACHE").is_ok() {
+            config.enable_prefix_cache = false;
+        }
+        config
     }
 }
 
@@ -411,1032 +459,392 @@ pub(crate) fn read_config_json(model_path: &str) -> anyhow::Result<serde_json::V
     serde_json::from_str(&raw).context("parse config.json")
 }
 
-// OPD API-teacher raw-logits HTTP surface (CUDA-only; merged into router_cuda).
+// OPD API-teacher raw-logits HTTP surface (CUDA-only; merged into the cuda router).
 #[cfg(feature = "cuda")]
 #[path = "loaded/raw_logits_route.rs"]
 mod raw_logits_route;
 
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
-mod backend {
-    use std::sync::Arc;
+/// Serve-handle builder, registered by the leaf binary for each compiled-in
+/// backend. The builder resolves the model path, constructs the backend
+/// executor + KV pool, and spawns the serve handle. Backend selection is a
+/// runtime decision: the leaf binary registers one builder per backend, and
+/// [`LoadedInferenceEngine::load_with_config`] dispatches by name.
+pub type BackendBuilderFn = fn(
+    model_path: &str,
+    config: &EngineLoadConfig,
+    shutdown: infer_server::ServeShutdown,
+) -> anyhow::Result<(
+    infer_server::ServeHandle,
+    infer_server::OpenAiTokenizer,
+    String,
+)>;
 
-    use anyhow::Result;
-    use infer_core::SchedulerConfig;
-    use infer_server::ServeHandle;
-    use tokio::sync::mpsc::UnboundedSender;
+struct BackendEntry {
+    name: &'static str,
+    build: BackendBuilderFn,
+}
 
-    #[cfg(feature = "cuda")]
-    use super::CudaModelKind;
-    use super::EngineLoadConfig;
-    use crate::serve_engine::ServeInferenceEngine;
-    use crate::types::{
-        ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
-        EngineTelemetry, InferenceEngine, MultimodalChatRequest,
-    };
+static REGISTRY: std::sync::OnceLock<std::sync::RwLock<Vec<BackendEntry>>> =
+    std::sync::OnceLock::new();
 
-    #[cfg(feature = "cuda")]
-    use infer_cuda::{CudaExecutor, CudaKvPool};
-    // For the `--kv-oversubscription` whole-slot-tier capability probe.
-    #[cfg(feature = "hip")]
-    use infer_hip::{HipDsv4Executor, HipKvPool};
-    #[cfg(feature = "metal")]
-    use infer_metal::{MetalExecutor, MetalKvPool};
-    #[cfg(feature = "cuda")]
-    use infer_seam::BackendExecutor;
-    #[cfg(feature = "metal")]
-    use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool};
-    #[cfg(feature = "vulkan")]
-    use infer_vulkan::{VulkanExecutor, VulkanKvPool};
-    // The CPU path reuses infer-metal's feature-free placeholder executor over
-    // the backend-neutral host paged KV pool.
-    #[cfg(all(feature = "cpu", not(feature = "metal")))]
-    use infer_metal::MetalExecutor;
-    #[cfg(all(feature = "cpu", not(feature = "metal")))]
-    use infer_seam::HostPagedKvPool;
+/// Register a backend builder. Called by the leaf binary at startup, before
+/// any engine load. Duplicate names are ignored (first registration wins).
+pub fn register_backend(name: &'static str, build: BackendBuilderFn) {
+    let registry = REGISTRY.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let mut guard = registry.write().unwrap();
+    if !guard.iter().any(|e| e.name == name) {
+        guard.push(BackendEntry { name, build });
+    }
+}
 
-    impl EngineLoadConfig {
-        pub(super) fn scheduler_config(&self) -> SchedulerConfig {
-            let mut config = SchedulerConfig::for_slots(self.hot_workspace_slots());
-            // Prompt cap = min(requested, KV capacity − gen reserve). For shared
-            // KV pools (Qwen3.6/DSv4) the device pool is profiled
-            // from free VRAM after load, so `total_pages` here is just the
-            // advisory default (8192) — using it would cap prompts at 114k even
-            // though the profiled pool holds 770k+. Bind to `max_total_tokens`
-            // instead; the post-load profiled-capacity clamp (M2) binds it down
-            // to the real device pool if needed.
-            let per_req_cap = self
-                .max_total_tokens
-                .max(self.total_pages.saturating_mul(self.page_size));
-            let gen_reserve = per_req_cap / 8;
-            config.max_prompt_tokens = self
-                .max_prompt_tokens
-                .min(per_req_cap.saturating_sub(gen_reserve));
-            config.max_total_tokens = self.max_total_tokens;
-            // Unset → 64: the Metal-interactivity default (small ticks keep the
-            // single-threaded MLX encode loop responsive between decode steps).
-            // The CUDA load path re-resolves per model kind before use.
-            config.chunked_prefill_size = self.chunked_prefill_size.unwrap_or(64);
-            config.max_running_requests = self.max_running_requests;
-            config.slot_oversubscription = self.slot_oversubscription;
-            config.oversubscription_min_slice = self.oversubscription_min_slice.max(1);
-            // Diagnostic-only escape hatch (not a shipped feature) for the
-            // concurrent-decode digit-corruption investigation — see
-            // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md.
-            if std::env::var("ARLE_DISABLE_PREFIX_CACHE").is_ok() {
-                config.enable_prefix_cache = false;
-            }
-            config
-        }
+pub(crate) fn lookup_backend(name: &str) -> Option<BackendBuilderFn> {
+    let registry = REGISTRY.get()?;
+    let guard = registry.read().unwrap();
+    guard.iter().find(|e| e.name == name).map(|e| e.build)
+}
+
+/// The first registered backend name, or `"cpu"` when the registry is empty.
+/// Callers resolving a `--backend auto` / unset [`EngineLoadConfig::backend`]
+/// use this so CLI-level backend gates see the effective backend.
+#[must_use]
+pub fn default_backend() -> String {
+    let registry = REGISTRY.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let guard = registry.read().unwrap();
+    guard
+        .first()
+        .map(|e| e.name.to_string())
+        .unwrap_or_else(|| "cpu".to_string())
+}
+
+/// Whether a backend with this name is registered. CLI `--backend` validation
+/// uses this to fail early before loading the model.
+#[must_use]
+pub fn is_backend_registered(name: &str) -> bool {
+    lookup_backend(name).is_some()
+}
+
+/// The public engine handle: one loaded [`ServeInferenceEngine`] plus the
+/// runtime backend name. Backend-neutral; the CUDA-only OPD methods below
+/// downcast the engine-thread executor via the serve control seam.
+pub struct LoadedInferenceEngine {
+    engine: ServeInferenceEngine,
+    backend: String,
+}
+
+impl LoadedInferenceEngine {
+    /// Single-user load (REPL, OCR): caps slots at 1 so the GDR recurrent
+    /// state doesn't reserve `num_slots`× per-slot bytes (12 GiB for a 9B
+    /// model at the default 256 slots). Multi-request serving uses
+    /// `load_with_config` with the serve-derived slot budget.
+    pub fn load(model_path: &str) -> Result<Self> {
+        let config = EngineLoadConfig {
+            max_running_requests: Some(1),
+            ..EngineLoadConfig::default()
+        };
+        Self::load_with_config(model_path, config)
     }
 
-    pub enum LoadedInferenceEngine {
-        /// Metal backend (Apple Silicon, MLX). Fully wired and runnable.
-        #[cfg(feature = "metal")]
-        Metal(ServeInferenceEngine),
-        /// Metal DeepSeek-OCR VLM backend. The DeepEncoder + DeepSeek-MoE MLX
-        /// bridge owns generation and is adapted to the shared autoregressive
-        /// engine by a buffered executor (single image, 1024x1024 base view).
-        #[cfg(feature = "metal")]
-        MetalDeepseekOcr(ServeInferenceEngine),
-        /// CUDA backend (Linux + NVIDIA). Structurally wired (typechecks); the
-        /// real forward is lead-owned and not yet runnable.
-        #[cfg(feature = "cuda")]
-        Cuda(ServeInferenceEngine),
-        /// HIP backend (AMD ROCm, DSv4 GGUF). Host-side wiring typechecks
-        /// everywhere; the device forward runs on a ROCm box (pending-remote).
-        #[cfg(feature = "hip")]
-        Hip(ServeInferenceEngine),
-        /// Vulkan backend (cross-vendor, GGUF). Host-side wiring typechecks
-        /// everywhere; numeric device forward is pending AIPC on-box bring-up.
-        #[cfg(feature = "vulkan")]
-        Vulkan(ServeInferenceEngine),
-        /// Portable CPU backend: the placeholder `MetalExecutor` over the
-        /// backend-neutral host paged KV pool (no MLX, no CUDA). Smoke / CI.
-        #[cfg(all(feature = "cpu", not(feature = "metal")))]
-        Cpu(ServeInferenceEngine),
-    }
-
-    impl LoadedInferenceEngine {
-        /// Single-user load (REPL, OCR): caps slots at 1 so the GDR recurrent
-        /// state doesn't reserve `num_slots`× per-slot bytes (12 GiB for a 9B
-        /// model at the default 256 slots). Multi-request serving uses
-        /// `load_with_config` with the serve-derived slot budget.
-        pub fn load(model_path: &str) -> Result<Self> {
-            let config = EngineLoadConfig {
-                max_running_requests: Some(1),
-                ..EngineLoadConfig::default()
-            };
-            Self::load_with_config(model_path, config)
-        }
-
-        // Each arm is a feature-gated `return` (the tail arm varies by feature
-        // set), so a bare expression would not compile in single-backend builds.
-        #[allow(clippy::needless_return)]
-        pub fn load_with_config(model_path: &str, config: EngineLoadConfig) -> Result<Self> {
-            // Model-driven serve defaults for omitted sampling fields (nucleus +
-            // temperature). The cc rollout lane overrides `.temperature` after this.
-            infer_server::set_sampling_defaults(
-                infer_server::SamplingDefaults::from_generation_config(model_path)
-                    .with_overrides(config.temperature, config.repetition_penalty),
-            );
-
-            #[cfg(feature = "metal")]
-            {
-                return Self::load_metal(model_path, &config);
-            }
-
-            #[cfg(all(not(feature = "metal"), feature = "cuda"))]
-            {
-                return Self::load_cuda(model_path, &config);
-            }
-
-            #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
-            {
-                return Self::load_hip(model_path, &config);
-            }
-
-            #[cfg(all(
-                not(feature = "metal"),
-                not(feature = "cuda"),
-                not(feature = "hip"),
-                feature = "vulkan"
-            ))]
-            {
-                return Self::load_vulkan(model_path, &config);
-            }
-
-            #[cfg(all(
-                not(feature = "metal"),
-                not(feature = "cuda"),
-                not(feature = "hip"),
-                not(feature = "vulkan"),
-                feature = "cpu"
-            ))]
-            {
-                return Self::load_cpu(model_path, &config);
-            }
-        }
-
-        #[must_use]
-        pub fn backend_name(&self) -> &'static str {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => "metal",
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => "metal-deepseek-ocr",
-                #[cfg(feature = "cuda")]
-                Self::Cuda(_) => "cuda",
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => "hip",
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => "vulkan",
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => "cpu",
-            }
-        }
-
-        /// OPD-teacher raw-logits forward: run the full `[seq_len, vocab]` teacher
-        /// forward over `(input_ids, positions)` (no sampling) and return the
-        /// device logits. CUDA-only; Metal/CPU bail. The `train` OPD path couples
-        /// to this method on the runtime-led engine.
-        #[cfg(feature = "cuda")]
-        pub fn forward_token_logits(
-            &self,
-            input_ids: &[u32],
-            positions: &[u32],
-        ) -> Result<crate::types::RawLogits> {
-            match self {
-                Self::Cuda(engine) => engine.forward_token_logits(input_ids, positions),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
-                }
-                #[cfg(feature = "metal")]
-                Self::Cpu(_) => {
-                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
-                }
-            }
-        }
-
-        /// Trunk taps at `target_layer_ids` (`[seq, taps·hidden]`) and the
-        /// final-normed hidden states (`[seq, hidden]`), host f32 — what
-        /// `spec_train::trainer::Target` needs per sample. CUDA-only.
-        #[cfg(feature = "cuda")]
-        pub fn forward_training_taps(
-            &self,
-            input_ids: &[u32],
-            target_layer_ids: &[i64],
-        ) -> Result<(Vec<f32>, Vec<f32>)> {
-            match self {
-                Self::Cuda(engine) => engine.forward_training_taps(input_ids, target_layer_ids),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) | Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("forward_training_taps is CUDA-only")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => anyhow::bail!("forward_training_taps is CUDA-only"),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => anyhow::bail!("forward_training_taps is CUDA-only"),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => anyhow::bail!("forward_training_taps is CUDA-only"),
-            }
-        }
-
-        /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
-        /// Called by the train sidecar after each acceptance-weighted step.
-        #[cfg(feature = "cuda")]
-        pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> Result<()> {
-            match self {
-                Self::Cuda(engine) => engine.update_dspark_markov_weights(w1.to_vec(), w2.to_vec()),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) | Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("update_dspark_markov_weights is CUDA-only")
-                }
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
-            }
-        }
-
-        /// Programmatic token-id generation over the serving scheduler/KV path.
-        /// OPD uses this for student rollout: one submitted request owns one KV
-        /// slot and decodes incrementally until `max_tokens` is reached.
-        #[cfg(feature = "cuda")]
-        pub fn generate_token_ids(
-            &self,
-            prompt_token_ids: &[u32],
-            max_tokens: usize,
-            sampling: infer_plan::SamplingParams,
-        ) -> Result<Vec<u32>> {
-            match self {
-                Self::Cuda(engine) => {
-                    engine.generate_token_ids(prompt_token_ids, max_tokens, sampling)
-                }
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
-                }
-                #[cfg(feature = "metal")]
-                Self::Cpu(_) => {
-                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
-                }
-            }
-        }
-
-        /// Batched [`generate_token_ids`]: submit all `(prompt, sampling)`
-        /// requests to the continuous-batching engine at once, then collect each.
-        /// Used by rubric-OPD eval (16 prompts) and rollout (N samples) to keep
-        /// the batcher busy instead of decoding one request at a time.
-        #[cfg(feature = "cuda")]
-        pub fn generate_token_ids_batch(
-            &self,
-            requests: &[(Vec<u32>, infer_plan::SamplingParams)],
-            max_tokens: usize,
-        ) -> Result<Vec<Vec<u32>>> {
-            match self {
-                Self::Cuda(engine) => engine.generate_token_ids_batch(requests, max_tokens),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "metal")]
-                Self::Cpu(_) => {
-                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
-                }
-            }
-        }
-
-        /// Batched text completion: submit all `CompletionRequest`s to the
-        /// continuous-batching engine at once, then collect each. Used by
-        /// rubric-OPD judging to decode N rollout verdicts of the same problem
-        /// concurrently instead of one verdict at a time.
-        #[cfg(feature = "cuda")]
-        pub fn complete_batch(
-            &self,
-            reqs: Vec<CompletionRequest>,
-        ) -> Result<Vec<CompletionOutput>> {
-            match self {
-                Self::Cuda(engine) => engine.complete_batch(reqs),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    anyhow::bail!("complete_batch is CUDA-only for OPD")
-                }
-                #[cfg(feature = "metal")]
-                Self::Cpu(_) => {
-                    anyhow::bail!("complete_batch is CUDA-only for OPD")
-                }
-            }
-        }
-
-        /// Offload the engine's device weights to host RAM (OPD teacher weight
-        /// time-share), returning the device bytes freed. CUDA-only: the
-        /// Qwen3.5/3.6 hybrid OPD teacher path moves its weights off-device so a
-        /// co-resident student backward reuses the VRAM. Metal/CPU have no
-        /// device-weight offload path and bail.
-        pub fn offload_engine_weights(&self) -> Result<usize> {
-            match self {
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.offload_engine_weights(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("offload_engine_weights is only available on CUDA")
-                }
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("offload_engine_weights is only available on CUDA")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
-            }
-        }
-
-        /// Quiesce engine admission (the serve loop defers new admission) and
-        /// cancel every in-flight (waiting + active) request, returning how many
-        /// were cancelled. The OPD round-loop writeback bracket; pairs with
-        /// [`Self::resume_admissions`] after the KV pool is re-acquired.
-        pub fn quiesce_admissions(&self) -> Result<usize> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.quiesce_admissions(),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.quiesce_admissions(),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.quiesce_admissions(),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.quiesce_admissions(),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.quiesce_admissions(),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.quiesce_admissions(),
-            }
-        }
-
-        /// Re-acquire the KV pool, then resume admission only after success.
-        pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.ensure_kv_pool_and_resume_admissions(),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.ensure_kv_pool_and_resume_admissions(),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.ensure_kv_pool_and_resume_admissions(),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.ensure_kv_pool_and_resume_admissions(),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.ensure_kv_pool_and_resume_admissions(),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.ensure_kv_pool_and_resume_admissions(),
-            }
-        }
-
-        /// Reload the engine's device weights from the host snapshot (OPD teacher
-        /// weight time-share). CUDA-only; Metal/CPU bail.
-        pub fn reload_engine_weights(&self) -> Result<()> {
-            match self {
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.reload_engine_weights(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => {
-                    anyhow::bail!("reload_engine_weights is only available on CUDA")
-                }
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("reload_engine_weights is only available on CUDA")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
-            }
-        }
-
-        /// Release the engine's inference forward scratch WITHOUT offloading weights
-        /// or evicting KV (OPD rollout->writeback VRAM reclaim). CUDA-only behavior;
-        /// Metal/CPU/other arms are no-ops (no `Qwen35Workspace`-style scratch to
-        /// release) so this is safe to call unconditionally on the writeback path.
-        pub fn release_inference_scratch(&self) -> Result<()> {
-            match self {
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.release_inference_scratch(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => Ok(()),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => Ok(()),
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => Ok(()),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => Ok(()),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => Ok(()),
-            }
-        }
-
-        /// Drop the engine's KV pool WITHOUT offloading weights (OPD writeback
-        /// headroom: the writeback's fresh autograd forward never reads this
-        /// engine's KV). CUDA Qwen3.5/3.6 only; other arms are no-ops, so this is
-        /// safe to call unconditionally on the agent-OPD writeback path.
-        pub fn release_kv_pool(&self) -> Result<()> {
-            match self {
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.release_kv_pool(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => Ok(()),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => Ok(()),
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => Ok(()),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => Ok(()),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => Ok(()),
-            }
-        }
-
-        /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the
-        /// next rollout. CUDA Qwen3.5/3.6 only; other arms are no-ops.
-        pub fn ensure_kv_pool(&self) -> Result<()> {
-            match self {
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.ensure_kv_pool(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => Ok(()),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => Ok(()),
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => Ok(()),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => Ok(()),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => Ok(()),
-            }
-        }
-
-        /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
-        /// projection weights (OPD per-step re-merge). CUDA-only: the Metal /
-        /// CPU arms reject it.
-        ///
-        /// The CUDA forward path implements the merge (see
-        /// [`infer_cuda::CudaExecutor::remerge_student_lora`] +
-        /// `infer_cuda::qwen35::Qwen35Model::remerge_student_lora`): resident
-        /// `DeviceMatrix` weights are re-merged in place from a pristine
-        /// base-weight cache, and the next forward picks them up. The executor
-        /// lives on the [`infer_server::ServeHandle`] engine thread; this routes
-        /// the merge through the out-of-band `run_on_executor` control seam (the
-        /// same seam the raw-logits forward + weight offload/reload use), so it
-        /// runs between scheduler steps with exclusive `&mut E` access. Takes
-        /// `&self` (interior mutability via the control channel) so the train OPD
-        /// loop can call it on a shared `MutexGuard` binding.
-        #[cfg(feature = "cuda")]
-        pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
-            match self {
-                Self::Cuda(engine) => engine.remerge_student_lora(update),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    let _ = update;
-                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is Metal")
-                }
-                #[cfg(feature = "metal")]
-                Self::Cpu(_) => {
-                    let _ = update;
-                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is CPU")
-                }
-            }
-        }
-
-        /// Read-only borrow of resident FP8 block-scaled base projection
-        /// pointers for train-infer weight sharing (`--share-frozen-base`).
-        /// CUDA-only: only the Qwen3.5/3.6 hybrid student carries shareable FP8
-        /// base weights. Returns the pointer table (raw device `u64`s + dims);
-        /// the train loader imports a NON-OWNING view over these instead of
-        /// allocating its own copy of the shared frozen base.
-        #[cfg(feature = "cuda")]
-        pub fn frozen_base_fp4_pointers(&self) -> Result<Vec<infer_cuda::SharedFp4BaseProjection>> {
-            // Every other arm is feature-gated away in a cuda-only build.
-            #[allow(unreachable_patterns)]
-            match self {
-                Self::Cuda(engine) => engine.frozen_base_fp4_pointers(),
-                other => anyhow::bail!(
-                    "frozen-base NVFP4 sharing is CUDA-only; active backend is {}",
-                    other.backend_name()
-                ),
-            }
-        }
-
-        #[cfg(feature = "cuda")]
-        pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
-            match self {
-                Self::Cuda(engine) => engine.frozen_base_fp8_pointers(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is Metal")
-                }
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => anyhow::bail!(
-                    "frozen-base FP8 sharing is CUDA-only; active backend is Metal DeepSeek-OCR"
-                ),
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is HIP")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is Vulkan")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => {
-                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is CPU")
-                }
-            }
-        }
-
-        /// Non-owning views of every resident dense-BF16 base projection's
-        /// device pointer, for refreshing the train student's frozen base AFTER
-        /// a LoRA re-merge.
-        #[cfg(feature = "cuda")]
-        pub fn frozen_base_bf16_pointers(
-            &self,
-        ) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
-            match self {
-                Self::Cuda(engine) => engine.frozen_base_bf16_pointers(),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is Metal")
-                }
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(_) => anyhow::bail!(
-                    "frozen-base BF16 sharing is CUDA-only; active backend is Metal DeepSeek-OCR"
-                ),
-                #[cfg(feature = "hip")]
-                Self::Hip(_) => {
-                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is HIP")
-                }
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(_) => {
-                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is Vulkan")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => {
-                    anyhow::bail!("frozen-base BF16 sharing is CUDA-only; active backend is CPU")
-                }
-            }
-        }
-
-        /// OpenAI-compat HTTP router over this ALREADY-loaded engine's
-        /// `ServeHandle` (same engine thread, same KV pool) — unlike
-        /// `router_for_backend`, which spawns a second engine. Serve it with
-        /// [`crate::serve_router_on_thread`].
-        #[cfg(feature = "cuda")]
-        pub fn local_router(&self, max_thinking_tokens: usize) -> Result<axum::Router> {
-            match self {
-                Self::Cuda(engine) => Ok(infer_server::coordinator_local_router(
-                    engine.serve_arc(),
-                    engine.tokenizer().clone(),
-                    engine.model_id().to_string(),
-                    max_thinking_tokens,
-                    None,
-                )),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    anyhow::bail!("local router is CUDA-only; active backend is Metal")
-                }
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::Cpu(_) => {
-                    anyhow::bail!("local router is CUDA-only; active backend is CPU")
-                }
-            }
-        }
-
-        #[cfg(feature = "metal")]
-        fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            let resolved = infer_metal::resolve_model_path(model_path)?;
-            if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
-                let (serve, tokenizer, model_id) = metal_deepseek_ocr_serve_handle(
-                    model_path,
-                    &resolved,
-                    config,
-                    infer_server::ServeShutdown::new(),
-                )?;
-                return Ok(Self::MetalDeepseekOcr(ServeInferenceEngine::new(
-                    model_id, tokenizer, serve,
-                )));
-            }
-            let (serve, tokenizer, model_id) =
-                metal_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
-            Ok(Self::Metal(ServeInferenceEngine::new(
-                model_id, tokenizer, serve,
-            )))
-        }
-
-        #[cfg(feature = "cuda")]
-        fn load_cuda(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            // Single-GPU CUDA load: dispatch by checkpoint kind (Qwen3.5/3.6
-            // MoE; DSv4 is multi-GPU only and errors). Shares the engine
-            // builder with `router_cuda` via `cuda_serve_handle`.
-            let (serve, tokenizer, model_id) =
-                cuda_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
-            Ok(Self::Cuda(ServeInferenceEngine::new(
-                model_id, tokenizer, serve,
-            )))
-        }
-
-        #[cfg(feature = "hip")]
-        fn load_hip(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            // HIP DSv4 GGUF load. Shares the engine builder with `router_hip`
-            // via `hip_serve_handle`, mirroring the CUDA `cuda_serve_handle`
-            // split (Metal instead reuses an infer-server facade; infer-server
-            // has no HIP code, so the handle is built here).
-            let (serve, tokenizer, model_id) =
-                hip_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
-            Ok(Self::Hip(ServeInferenceEngine::new(
-                model_id, tokenizer, serve,
-            )))
-        }
-
-        #[cfg(feature = "vulkan")]
-        fn load_vulkan(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            // Vulkan GGUF load. Shares the engine builder with `router_vulkan`
-            // via `vulkan_serve_handle`, mirroring the HIP path while keeping
-            // all Vulkan types below the seam.
-            let (serve, tokenizer, model_id) =
-                vulkan_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
-            Ok(Self::Vulkan(ServeInferenceEngine::new(
-                model_id, tokenizer, serve,
-            )))
-        }
-
-        #[cfg(all(
-            feature = "cpu",
-            not(feature = "metal"),
-            not(feature = "cuda"),
-            not(feature = "hip"),
-            not(feature = "vulkan")
-        ))]
-        fn load_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            use infer_server::OpenAiTokenizer;
-
-            if config.mtp_enabled() {
-                anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-            }
-            anyhow::ensure!(
-                !config.kv_ssd_requested(),
-                "--kv-disk: the CPU backend has no KV tier store"
-            );
-            // CPU smoke: placeholder executor over a real host KV pool; still
-            // needs a tokenizer dir for encode/decode.
-            let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
-            let model_id = crate::serve_engine::model_id_from_path(model_path);
-            let executor = MetalExecutor::new();
-            let kv = HostPagedKvPool::new(
-                config.hot_workspace_slots(),
-                config.total_pages,
-                config.page_size,
-            );
-            let serve =
-                ServeHandle::spawn(Box::new(executor), Box::new(kv), config.scheduler_config());
-            Ok(Self::Cpu(ServeInferenceEngine::new(
-                model_id, tokenizer, serve,
-            )))
-        }
-    }
-
-    /// Mirrors [`LoadedInferenceEngine::load_with_config`] but returns the bare
-    /// [`axum::Router`] the in-process [`crate::serve_http`] loop binds, rather
-    /// than the [`InferenceEngine`] adapter the agent/OPD callers use. Each arm
-    /// spawns the same [`ServeHandle`] the matching `load_*` method spawns, then
-    /// hands it to the backend-neutral [`infer_server::openai_router`].
-    // Each arm is a feature-gated `return` (the tail arm varies by feature set),
-    // so a bare expression would not compile in single-backend builds.
-    #[allow(clippy::needless_return)]
-    pub(crate) fn router_for_backend(
-        model_path: &str,
-        config: EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(axum::Router, Option<Arc<LoadedInferenceEngine>>)> {
+    pub fn load_with_config(model_path: &str, config: EngineLoadConfig) -> Result<Self> {
         // Model-driven serve defaults for omitted sampling fields (nucleus +
-        // temperature) — the `arle serve` router lane. CLI flags win over the
-        // checkpoint.
+        // temperature). The cc rollout lane overrides `.temperature` after this.
         infer_server::set_sampling_defaults(
             infer_server::SamplingDefaults::from_generation_config(model_path)
                 .with_overrides(config.temperature, config.repetition_penalty),
         );
-
-        // The L3 disk tier is consumed by CUDA and Metal; every other
-        // backend fails closed on an explicit request instead of silently
-        // serving without it.
-        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
-        anyhow::ensure!(
-            !config.kv_ssd_requested(),
-            "--kv-disk: the L3 KV tier is only supported by CUDA and Metal today"
-        );
-
-        #[cfg(feature = "metal")]
-        {
-            let router = router_metal(model_path, &config, shutdown)?;
-            return Ok((router, None));
-        }
-
-        #[cfg(all(not(feature = "metal"), feature = "cuda"))]
-        {
-            return router_cuda(model_path, &config, shutdown).map(|(r, e)| (r, Some(e)));
-        }
-
-        #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
-        {
-            let router = router_hip(model_path, &config, shutdown)?;
-            return Ok((router, None));
-        }
-
-        #[cfg(all(
-            not(feature = "metal"),
-            not(feature = "cuda"),
-            not(feature = "hip"),
-            feature = "vulkan"
-        ))]
-        {
-            let router = router_vulkan(model_path, &config, shutdown)?;
-            return Ok((router, None));
-        }
-
-        #[cfg(all(
-            not(feature = "metal"),
-            not(feature = "cuda"),
-            not(feature = "hip"),
-            not(feature = "vulkan"),
-            feature = "cpu"
-        ))]
-        {
-            let router = router_cpu(model_path, &config, shutdown)?;
-            return Ok((router, None));
-        }
+        let backend = config.backend.clone().unwrap_or_else(default_backend);
+        let build = lookup_backend(&backend).ok_or_else(|| {
+            anyhow::anyhow!("backend '{backend}' not registered; compiled-in backends only")
+        })?;
+        let (serve, tokenizer, model_id) =
+            build(model_path, &config, infer_server::ServeShutdown::new())?;
+        Ok(Self {
+            engine: ServeInferenceEngine::new(model_id, tokenizer, serve),
+            backend,
+        })
     }
 
-    /// Shared Metal engine builder for [`LoadedInferenceEngine::load_metal`] and
-    /// [`router_metal`]. The service layer stays backend-neutral: Metal-specific
-    /// model resolution, executor construction, and KV-pool sizing happen here.
-    #[cfg(feature = "metal")]
-    fn metal_serve_handle(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
-        use infer_server::OpenAiTokenizer;
-
-        if config.mtp_enabled() {
-            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-        }
-        // Flags land in the statics before executor construction (spec-decode
-        // resolver + pipeline/warmup/paged-read/sampling gates).
-        infer_metal::apply_runtime_flags(&config.metal);
-        let metal_kv_dtype = infer_metal::MetalKvCacheDtype::resolve(config.kv_cache_dtype)?;
-        let resolved = infer_metal::resolve_model_path(model_path)?;
-        // Tokenizer loading (~190ms) is independent of resource planning and
-        // engine startup — run it in parallel.
-        let tokenizer_path = resolved.clone();
-        let tokenizer_handle =
-            std::thread::spawn(move || OpenAiTokenizer::from_model_dir(&tokenizer_path));
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
-
-        let model_source = resolved.to_string_lossy().to_string();
-        let mut scheduler = config.scheduler_config();
-        let num_slots = config.hot_workspace_slots();
-        let page_size = config.page_size;
-        let low_impact = config.low_impact;
-        let resource_plan = infer_metal::plan_resource_budget(
-            &resolved,
-            infer_metal::MetalResourceRequest {
-                kv_cache_dtype: metal_kv_dtype,
-                num_slots,
-                total_pages: config.total_pages,
-                page_size,
-                low_impact,
-                memory_budget_bytes: config.memory_budget_bytes,
-                system_reserve_bytes: config.system_reserve_bytes,
-                allow_swap: config.allow_swap,
-                mem_fraction_static: config.mem_fraction_static,
-            },
-        )?;
-        let total_pages = resource_plan.planned_total_pages;
-        let planned_capacity_tokens = resource_plan.capacity_tokens;
-        if planned_capacity_tokens < scheduler.max_total_tokens {
-            log::warn!(
-                "Metal resource guard clamps max_total_tokens {} -> {}",
-                scheduler.max_total_tokens,
-                planned_capacity_tokens
-            );
-            scheduler.max_total_tokens = planned_capacity_tokens.max(1);
-        }
-        if scheduler.max_prompt_tokens > scheduler.max_total_tokens {
-            log::warn!(
-                "Metal resource guard clamps max_prompt_tokens {} -> {}",
-                scheduler.max_prompt_tokens,
-                scheduler.max_total_tokens
-            );
-            scheduler.max_prompt_tokens = scheduler.max_total_tokens;
-        }
-        // Opt-in L3 NVMe spill (`--kv-disk`): attached inside the builder —
-        // at construction, like every other tier knob — never post-spawn.
-        // Metal serves single-process, so the deployment-total cap is the
-        // per-rank cap (world = 1).
-        let kv_ssd = config.kv_ssd_spill(1, infer_metal::default_t2_budget_bytes)?;
-        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
-            move || {
-                let mut executor =
-                    MetalExecutor::from_model_path_with_kv_cache_dtype_and_resource_plan(
-                        &model_source,
-                        metal_kv_dtype,
-                        resource_plan,
-                    )?;
-                if let Some((root, budget)) = kv_ssd {
-                    // Namespace tag: a different model or KV dtype must not
-                    // serve this store's pages.
-                    let epoch = format!(
-                        "{:016x}",
-                        infer_seam::prefix_block_content_key(
-                            0,
-                            &format!("{model_source}|{metal_kv_dtype:?}")
-                                .bytes()
-                                .map(u32::from)
-                                .collect::<Vec<_>>(),
-                        )
-                    );
-                    anyhow::ensure!(
-                        executor.set_kv_tier_disk(root, budget, page_size, &epoch),
-                        "--kv-disk: the loaded Metal model has no usable \
-                         page-addressable KV tier store (a budget below one \
-                         page also lands here; raise --kv-disk-limit)"
-                    );
-                }
-                let kv = MetalKvPool::new(num_slots, total_pages, page_size);
-                if low_impact {
-                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
-                        max_tokens: scheduler.chunked_prefill_size.max(1),
-                        max_micros: 20_000,
-                    })
-                    .with_yield_every_ticks(8);
-                    infer_core::Engine::with_config_and_governor(
-                        Box::new(executor),
-                        Box::new(kv),
-                        scheduler,
-                        Box::new(governor),
-                    )
-                } else {
-                    infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
-                }
-            },
-            shutdown,
-        )?;
-        let tokenizer = tokenizer_handle
-            .join()
-            .expect("tokenizer thread panicked")?;
-        Ok((serve, tokenizer, model_id))
+    #[must_use]
+    pub fn backend_name(&self) -> &str {
+        &self.backend
     }
 
-    /// Metal serve router. Builds the same `ServeHandle` as
-    /// [`LoadedInferenceEngine::load_metal`] and wraps it in the unified OpenAI
-    /// facade.
-    #[cfg(feature = "metal")]
-    fn router_metal(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<axum::Router> {
-        let resolved = infer_metal::resolve_model_path(model_path)?;
-        if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
-            let (serve, tokenizer, model_id) =
-                metal_deepseek_ocr_serve_handle(model_path, &resolved, config, shutdown)?;
-            return Ok(infer_server::coordinator_local_router(
-                Arc::new(serve),
-                tokenizer,
-                model_id,
-                config.max_thinking_tokens,
-                Some(infer_plan::MultimodalKind::DeepseekOcr),
-            ));
-        }
-        let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config, shutdown)?;
-        Ok(infer_server::coordinator_local_router(
-            Arc::new(serve),
-            tokenizer,
-            model_id,
-            config.max_thinking_tokens,
-            None,
-        ))
+    /// OPD-teacher raw-logits forward: run the full `[seq_len, vocab]` teacher
+    /// forward over `(input_ids, positions)` (no sampling) and return the
+    /// device logits. CUDA-only; the downcast inside `ServeInferenceEngine`
+    /// rejects any other executor.
+    #[cfg(feature = "cuda")]
+    pub fn forward_token_logits(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<crate::types::RawLogits> {
+        self.engine.forward_token_logits(input_ids, positions)
     }
 
-    #[cfg(feature = "metal")]
-    fn metal_deepseek_ocr_serve_handle(
-        model_path: &str,
-        resolved: &std::path::Path,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
-        use infer_server::OpenAiTokenizer;
+    /// Trunk taps at `target_layer_ids` (`[seq, taps·hidden]`) and the
+    /// final-normed hidden states (`[seq, hidden]`), host f32 — what
+    /// `spec_train::trainer::Target` needs per sample. CUDA-only.
+    #[cfg(feature = "cuda")]
+    pub fn forward_training_taps(
+        &self,
+        input_ids: &[u32],
+        target_layer_ids: &[i64],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.engine
+            .forward_training_taps(input_ids, target_layer_ids)
+    }
 
-        if config.mtp_enabled() {
-            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-        }
-        anyhow::ensure!(
-            !config.kv_ssd_requested(),
-            "--kv-disk: DeepSeek-OCR Metal owns no page-addressable KV tier store"
-        );
+    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
+    /// Called by the train sidecar after each acceptance-weighted step.
+    #[cfg(feature = "cuda")]
+    pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> Result<()> {
+        self.engine
+            .update_dspark_markov_weights(w1.to_vec(), w2.to_vec())
+    }
 
-        let mut tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
-        // DeepSeek-OCR's tokenizer.json ships a byte-level BPE vocab but a
-        // mismatched decoder, leaking `Ġ`/`Ċ` glyphs into the OCR text. Force a
-        // byte-level decoder so the output is real UTF-8.
-        tokenizer.force_byte_level_decoder();
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
-        let model_source = resolved.to_string_lossy().to_string();
-        let mut scheduler = config.scheduler_config();
-        scheduler.num_slots = 1;
-        scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
-        let page_size = config.page_size.max(1);
-        let total_pages = config.total_pages.max(1);
-        let low_impact = config.low_impact;
-        let resource_plan = infer_metal::plan_weight_only_resource_budget(
-            resolved,
-            infer_metal::MetalWeightOnlyResourceRequest {
-                low_impact,
-                memory_budget_bytes: config.memory_budget_bytes,
-                system_reserve_bytes: config.system_reserve_bytes,
-                allow_swap: config.allow_swap,
-            },
-        )?;
-        let cancel = shutdown.cancel_flag();
-        let max_denoising_steps = config.diffusion_max_denoising_steps.filter(|&s| s > 0);
+    /// Programmatic token-id generation over the serving scheduler/KV path.
+    /// OPD uses this for student rollout: one submitted request owns one KV
+    /// slot and decodes incrementally until `max_tokens` is reached.
+    #[cfg(feature = "cuda")]
+    pub fn generate_token_ids(
+        &self,
+        prompt_token_ids: &[u32],
+        max_tokens: usize,
+        sampling: infer_plan::SamplingParams,
+    ) -> Result<Vec<u32>> {
+        self.engine
+            .generate_token_ids(prompt_token_ids, max_tokens, sampling)
+    }
 
-        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
-            move || {
-                let loaded = infer_metal::MetalDeepseekOcrModel::load_with_resource_plan(
-                    std::path::Path::new(&model_source),
-                    Some(resource_plan),
-                )?;
-                log::info!(
-                    "DeepSeek-OCR VLM loaded: image_token_id={}; Metal DeepEncoder soft-token bridge enabled",
-                    loaded.image_token_id
-                );
-                let mut generation = loaded.generation;
-                if let Some(steps) = max_denoising_steps {
-                    generation.max_denoising_steps = steps;
-                }
-                let executor =
-                    BufferedDiffusionExecutor::new_with_cancel(loaded.model, generation, cancel);
-                let kv = HostPagedKvPool::new(1, total_pages, page_size);
-                if low_impact {
-                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
-                        max_tokens: scheduler.chunked_prefill_size.max(1),
-                        max_micros: 20_000,
-                    })
-                    .with_yield_every_ticks(8);
-                    infer_core::Engine::with_config_and_governor(
-                        Box::new(executor),
-                        Box::new(kv),
-                        scheduler,
-                        Box::new(governor),
-                    )
-                } else {
-                    infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
-                }
-            },
-            shutdown,
-        )?;
-        Ok((serve, tokenizer, model_id))
+    /// Batched [`generate_token_ids`]: submit all `(prompt, sampling)`
+    /// requests to the continuous-batching engine at once, then collect each.
+    /// Used by rubric-OPD eval (16 prompts) and rollout (N samples) to keep
+    /// the batcher busy instead of decoding one request at a time.
+    #[cfg(feature = "cuda")]
+    pub fn generate_token_ids_batch(
+        &self,
+        requests: &[(Vec<u32>, infer_plan::SamplingParams)],
+        max_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        self.engine.generate_token_ids_batch(requests, max_tokens)
+    }
+
+    /// Batched text completion: submit all `CompletionRequest`s to the
+    /// continuous-batching engine at once, then collect each. Used by
+    /// rubric-OPD judging to decode N rollout verdicts of the same problem
+    /// concurrently instead of one verdict at a time.
+    #[cfg(feature = "cuda")]
+    pub fn complete_batch(&self, reqs: Vec<CompletionRequest>) -> Result<Vec<CompletionOutput>> {
+        self.engine.complete_batch(reqs)
+    }
+
+    /// Offload the engine's device weights to host RAM (OPD teacher weight
+    /// time-share), returning the device bytes freed. Threads to the backend
+    /// executor on the engine thread; backends without device-weight offload
+    /// reject it there.
+    pub fn offload_engine_weights(&self) -> Result<usize> {
+        self.engine.offload_engine_weights()
+    }
+
+    /// Quiesce engine admission (the serve loop defers new admission) and
+    /// cancel every in-flight (waiting + active) request, returning how many
+    /// were cancelled. The OPD round-loop writeback bracket; pairs with
+    /// [`Self::ensure_kv_pool_and_resume_admissions`] after the KV pool is re-acquired.
+    pub fn quiesce_admissions(&self) -> Result<usize> {
+        self.engine.quiesce_admissions()
+    }
+
+    /// Re-acquire the KV pool, then resume admission only after success.
+    pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
+        self.engine.ensure_kv_pool_and_resume_admissions()
+    }
+
+    /// Reload the engine's device weights from the host snapshot (OPD teacher
+    /// weight time-share).
+    pub fn reload_engine_weights(&self) -> Result<()> {
+        self.engine.reload_engine_weights()
+    }
+
+    /// Release the engine's inference forward scratch WITHOUT offloading weights
+    /// or evicting KV (OPD rollout->writeback VRAM reclaim). A no-op on
+    /// backends with no forward scratch to release.
+    pub fn release_inference_scratch(&self) -> Result<()> {
+        self.engine.release_inference_scratch()
+    }
+
+    /// Drop the engine's KV pool WITHOUT offloading weights (OPD writeback
+    /// headroom: the writeback's fresh autograd forward never reads this
+    /// engine's KV). A no-op on backends without a droppable pool.
+    pub fn release_kv_pool(&self) -> Result<()> {
+        self.engine.release_kv_pool()
+    }
+
+    /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the
+    /// next rollout. A no-op on backends without a droppable pool.
+    pub fn ensure_kv_pool(&self) -> Result<()> {
+        self.engine.ensure_kv_pool()
+    }
+
+    /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
+    /// projection weights (OPD per-step re-merge). CUDA-only: the downcast
+    /// inside `ServeInferenceEngine` rejects any other executor.
+    ///
+    /// The CUDA forward path implements the merge (see
+    /// [`infer_cuda::CudaExecutor::remerge_student_lora`] +
+    /// `infer_cuda::qwen35::Qwen35Model::remerge_student_lora`): resident
+    /// `DeviceMatrix` weights are re-merged in place from a pristine
+    /// base-weight cache, and the next forward picks them up. The executor
+    /// lives on the [`infer_server::ServeHandle`] engine thread; this routes
+    /// the merge through the out-of-band `run_on_executor` control seam (the
+    /// same seam the raw-logits forward + weight offload/reload use), so it
+    /// runs between scheduler steps with exclusive `&mut E` access. Takes
+    /// `&self` (interior mutability via the control channel) so the train OPD
+    /// loop can call it on a shared `MutexGuard` binding.
+    #[cfg(feature = "cuda")]
+    pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
+        self.engine.remerge_student_lora(update)
+    }
+
+    /// Read-only borrow of resident FP8 block-scaled base projection
+    /// pointers for train-infer weight sharing (`--share-frozen-base`).
+    /// CUDA-only: only the Qwen3.5/3.6 hybrid student carries shareable FP8
+    /// base weights. Returns the pointer table (raw device `u64`s + dims);
+    /// the train loader imports a NON-OWNING view over these instead of
+    /// allocating its own copy of the shared frozen base.
+    #[cfg(feature = "cuda")]
+    pub fn frozen_base_fp4_pointers(&self) -> Result<Vec<infer_cuda::SharedFp4BaseProjection>> {
+        self.engine.frozen_base_fp4_pointers()
     }
 
     #[cfg(feature = "cuda")]
-    fn detect_cuda_model_kind(model_path: &str) -> Result<super::CudaModelKind> {
-        Ok(super::classify_cuda_model(&super::read_config_json(
-            model_path,
-        )?))
+    pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
+        self.engine.frozen_base_fp8_pointers()
+    }
+
+    /// Non-owning views of every resident dense-BF16 base projection's
+    /// device pointer, for refreshing the train student's frozen base AFTER
+    /// a LoRA re-merge.
+    #[cfg(feature = "cuda")]
+    pub fn frozen_base_bf16_pointers(&self) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
+        self.engine.frozen_base_bf16_pointers()
+    }
+
+    /// OpenAI-compat HTTP router over this ALREADY-loaded engine's
+    /// `ServeHandle` (same engine thread, same KV pool) — unlike
+    /// `router_for_backend`, which spawns a second engine. Serve it with
+    /// [`crate::serve_router_on_thread`].
+    #[cfg(feature = "cuda")]
+    pub fn local_router(&self, max_thinking_tokens: usize) -> Result<axum::Router> {
+        Ok(infer_server::coordinator_local_router(
+            self.engine.serve_arc(),
+            self.engine.tokenizer().clone(),
+            self.engine.model_id().to_string(),
+            max_thinking_tokens,
+            None,
+        ))
+    }
+}
+
+/// Mirrors [`LoadedInferenceEngine::load_with_config`] but returns the bare
+/// [`axum::Router`] the in-process [`crate::serve_http`] loop binds, rather
+/// than the [`InferenceEngine`] adapter the agent/OPD callers use. Spawns the
+/// same [`infer_server::ServeHandle`] the matching builder spawns, then hands
+/// it to the backend-neutral [`infer_server::coordinator_local_router`].
+pub(crate) fn router_for_backend(
+    model_path: &str,
+    config: EngineLoadConfig,
+    shutdown: infer_server::ServeShutdown,
+) -> Result<(axum::Router, Option<Arc<LoadedInferenceEngine>>)> {
+    // Model-driven serve defaults for omitted sampling fields (nucleus +
+    // temperature) — the `arle serve` router lane. CLI flags win over the
+    // checkpoint.
+    infer_server::set_sampling_defaults(
+        infer_server::SamplingDefaults::from_generation_config(model_path)
+            .with_overrides(config.temperature, config.repetition_penalty),
+    );
+    let backend = config.backend.clone().unwrap_or_else(default_backend);
+    let build = lookup_backend(&backend).ok_or_else(|| {
+        anyhow::anyhow!("backend '{backend}' not registered; compiled-in backends only")
+    })?;
+    let (serve, tokenizer, model_id) = build(model_path, &config, shutdown)?;
+    let serve_engine = ServeInferenceEngine::new(model_id.clone(), tokenizer.clone(), serve);
+    let serve_arc = serve_engine.serve_arc();
+    // VLM models (DeepSeek-OCR) need the multimodal kind to wire the HTTP
+    // endpoint; probe the executor once rather than threading model-specific
+    // detection through the backend-neutral builder.
+    let multimodal_kind = serve_arc
+        .run_on_executor(|executor| executor.multimodal().and_then(|mm| mm.multimodal_kind()))
+        .unwrap_or(None);
+    let engine = Arc::new(LoadedInferenceEngine {
+        engine: serve_engine,
+        backend: backend.clone(),
+    });
+    let router = infer_server::coordinator_local_router(
+        serve_arc,
+        tokenizer,
+        model_id,
+        config.max_thinking_tokens,
+        multimodal_kind,
+    );
+    // The OPD API-teacher raw-logits route is CUDA-only; merge it only there.
+    #[cfg(feature = "cuda")]
+    let router = router.merge(raw_logits_route::raw_logits_router(engine.clone()));
+    Ok((router, Some(engine)))
+}
+
+impl InferenceEngine for LoadedInferenceEngine {
+    fn model_id(&self) -> &str {
+        self.engine.model_id()
+    }
+
+    fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
+        self.engine.complete(req)
+    }
+
+    fn complete_multimodal_chat(&mut self, req: MultimodalChatRequest) -> Result<CompletionOutput> {
+        self.engine.complete_multimodal_chat(req)
+    }
+
+    fn complete_stream(
+        &mut self,
+        req: CompletionRequest,
+        tx: UnboundedSender<CompletionStreamDelta>,
+    ) -> Result<()> {
+        self.engine.complete_stream(req, tx)
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        self.engine.tokenize(text)
+    }
+
+    fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> Result<String> {
+        self.engine.render_chat_prompt(messages)
+    }
+
+    fn telemetry(&self) -> EngineTelemetry {
+        self.engine.telemetry()
+    }
+
+    fn supports_multimodal_chat(&self) -> bool {
+        self.engine.supports_multimodal_chat()
+    }
+}
+
+/// CUDA-only engine construction: the single-GPU serve builder, the multiproc
+/// worker engine, and the model-kind classifier + TP env helpers they share.
+/// Everything above stays backend-neutral; this module is the one place
+/// infer-api names CUDA executor types.
+#[cfg(feature = "cuda")]
+mod cuda {
+    use anyhow::Result;
+
+    use super::EngineLoadConfig;
+    use super::{CudaModelKind, classify_cuda_model, read_config_json};
+    use infer_cuda::{CudaExecutor, CudaKvPool};
+    use infer_seam::BackendExecutor;
+
+    fn detect_cuda_model_kind(model_path: &str) -> Result<CudaModelKind> {
+        Ok(classify_cuda_model(&read_config_json(model_path)?))
     }
 
     /// Whether `model_path`'s checkpoint takes the multiproc TP serve path when
@@ -1446,7 +854,6 @@ mod backend {
     /// like DSv4). Dense Qwen3 stays single-process. `false` on any
     /// config-read/parse failure (the single-process path then errors with its
     /// normal message).
-    #[cfg(feature = "cuda")]
     #[must_use]
     pub fn cuda_model_takes_multiproc_serve(model_path: &str) -> bool {
         matches!(
@@ -1479,10 +886,10 @@ mod backend {
     ///     KV pool.
     ///   - DSv4: SHARED MLA latent pool — the executor profiles the pool TOTAL
     ///     from measured free VRAM (`profile_kv_pool_tokens`) and derives per-slot
-    ///     length as total/num_slots, exactly like dense. Admission MUST equal the
-    ///     device pool's ACTUAL page count (`effective_total_pages()`), not the old
-    ///     `num_slots × 32768`. The host pool ALSO mirrors the device page SIZE
-    ///     (64-tok `page_block_size`, via `effective_page_size()`), not
+    ///     length as total/num_slots, exactly like dense. Admission MUST equal
+    ///     the device pool's ACTUAL page count (`effective_total_pages()`), not
+    ///     the old `num_slots × 32768`. The host pool ALSO mirrors the device page
+    ///     SIZE (64-tok `page_block_size`, via `effective_page_size()`), not
     ///     `config.page_size` (16) — H3: page_size mismatch gated host admission
     ///     at 1/4 device token capacity → early-OOM with no tier to evict.
     ///
@@ -1494,7 +901,6 @@ mod backend {
     /// `config.total_pages`, because a profiled pool may legitimately be SMALLER
     /// (big weights / small card) and a host pool larger than the device pool
     /// hands out page ids the device pool has no HBM for. Other kinds ignore it.
-    #[cfg(feature = "cuda")]
     fn cuda_admission_total_pages(
         kind: CudaModelKind,
         config: &EngineLoadConfig,
@@ -1514,42 +920,9 @@ mod backend {
         capacity_tokens.div_ceil(ps).max(config.total_pages)
     }
 
-    /// Shared single-GPU CUDA engine builder for
-    /// [`LoadedInferenceEngine::load_cuda`] and [`router_cuda`]. Sets the
-    /// decode-graph default, resolves the tokenizer + model id, classifies the
-    /// checkpoint, and spawns the `ServeHandle` (dispatching by kind; DSv4 is
-    /// multi-GPU only and errors). Callers wrap the returned handle in either
-    /// [`ServeInferenceEngine`] (the agent/OPD adapter) or
-    /// [`infer_server::openai_router`] (the in-process serve loop).
-    #[cfg(feature = "cuda")]
-    fn cuda_serve_handle(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
-        use infer_server::OpenAiTokenizer;
-
-        // Resolve HF id → local cache dir, downloading if absent. Mirrors the
-        // Metal path's `infer_metal::resolve_model_path` so `arle serve
-        // --model-path Qwen/Qwen3.5-4B` works on CUDA without a pre-download.
-        let resolved = infer_util::hf_hub::resolve_model_path(model_path)?;
-        let resolved_str = resolved.to_string_lossy().to_string();
-        let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
-        let model_id = crate::serve_engine::model_id_from_path(&resolved_str);
-
-        let model_source = resolved_str;
-        let engine_config = config.clone();
-        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
-            move || build_cuda_engine(&model_source, &engine_config),
-            shutdown,
-        )?;
-        Ok((serve, tokenizer, model_id))
-    }
-
     /// TP world size fallback when `config.world_size` is `None`:
     /// `INFER_TP_SIZE`, else the `INFER_CUDA_DEVICES` count, else 1. Every rank
     /// sees identical env, so budget division is rank-invariant.
-    #[cfg(feature = "cuda")]
     fn tp_world_size() -> usize {
         if let Some(n) = std::env::var("INFER_TP_SIZE")
             .ok()
@@ -1569,13 +942,11 @@ mod backend {
     /// `INFER_ATTN_CP_SIZE` for the executor's `TpRuntime` / `MultiAxisConfig`
     /// resolution. Restores the previous values on drop. `None` fields leave
     /// the corresponding env var untouched.
-    #[cfg(feature = "cuda")]
     struct TpEnvGuard {
         saved_tp: Option<Option<String>>,
         saved_cp: Option<Option<String>>,
     }
 
-    #[cfg(feature = "cuda")]
     impl TpEnvGuard {
         fn new(world_size: Option<usize>, cp_size: Option<usize>) -> Self {
             let saved_tp = world_size.map(|ws| {
@@ -1594,7 +965,6 @@ mod backend {
         }
     }
 
-    #[cfg(feature = "cuda")]
     impl Drop for TpEnvGuard {
         fn drop(&mut self) {
             if let Some(saved) = self.saved_tp.take() {
@@ -1620,13 +990,12 @@ mod backend {
 
     /// Build the CUDA `Engine` (executor + admission KV pool + scheduler) for
     /// `model_path` — the ONE engine constructor every rank uses. rank 0 runs it
-    /// inside [`ServeHandle::spawn_with_engine_builder`]; multiproc worker ranks
-    /// run it directly on their driver thread ([`super::CudaWorkerEngine`]). All
-    /// ranks building through this same helper with the same
+    /// inside [`infer_server::ServeHandle::spawn_with_engine_builder`]; multiproc
+    /// worker ranks run it directly on their driver thread (`CudaWorkerEngine`).
+    /// All ranks building through this same helper with the same
     /// [`EngineLoadConfig`] is a lockstep invariant: any per-rank divergence in
     /// scheduler knobs diverges the deterministic planner and deadlocks NCCL.
-    #[cfg(feature = "cuda")]
-    pub(super) fn build_cuda_engine(
+    pub fn build_cuda_engine(
         model_path: &str,
         config: &EngineLoadConfig,
     ) -> Result<infer_core::Engine> {
@@ -1756,7 +1125,7 @@ mod backend {
             // by the multiproc coordinator/launcher before this runs. On a
             // single GPU (world_size==1) it loads as one rank. DSv4 owns its
             // MLA KV state inside the forward, so the host `CudaKvPool` is
-            // only present to satisfy the `submit(.., &mut dyn KvPool)`
+            // only present to satisfy the `submit(.., &KvBatchDescriptor, &mut dyn KvSlotAccounting)`
             // signature; `max_seq_len` is `config.max_total_tokens` — the same
             // global cap `--max-total-tokens` sets for every backend (DSv4
             // multiproc auto-resolves it from the checkpoint's
@@ -1906,7 +1275,6 @@ mod backend {
         infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
     }
 
-    #[cfg(feature = "cuda")]
     type PendingTokens = std::rc::Rc<
         std::cell::RefCell<
             std::collections::HashMap<
@@ -1920,7 +1288,6 @@ mod backend {
     /// `TickAdmissions` so every rank admits at the same step index (lockstep).
     /// Rank 0 (`owns_output`) also tracks + emits completions; followers
     /// discard their TP-replicated tokens.
-    #[cfg(feature = "cuda")]
     pub struct CudaWorkerEngine {
         engine: infer_core::Engine,
         /// Rank 0 owns the visible output; followers skip all output bookkeeping.
@@ -1933,7 +1300,6 @@ mod backend {
         pending: PendingTokens,
     }
 
-    #[cfg(feature = "cuda")]
     impl CudaWorkerEngine {
         /// Build the rank-R engine from rank 0's resolved config
         /// (`ARLE_WORKER_ENGINE_CONFIG`); NCCL rank/world come from env.
@@ -2119,410 +1485,7 @@ mod backend {
             out
         }
     }
-
-    /// Single-GPU CUDA serve router. Builds the same `ServeHandle` as
-    /// [`LoadedInferenceEngine::load_cuda`] via [`cuda_serve_handle`], then wraps
-    /// it in [`infer_server::coordinator_local_router`].
-    #[cfg(feature = "cuda")]
-    fn router_cuda(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(axum::Router, Arc<LoadedInferenceEngine>)> {
-        let (serve, tokenizer, model_id) = cuda_serve_handle(model_path, config, shutdown)?;
-        let serve_engine = ServeInferenceEngine::new(model_id.clone(), tokenizer.clone(), serve);
-        let serve_arc = serve_engine.serve_arc();
-        let engine = Arc::new(LoadedInferenceEngine::Cuda(serve_engine));
-        let router = infer_server::coordinator_local_router(
-            serve_arc,
-            tokenizer,
-            model_id,
-            config.max_thinking_tokens,
-            None,
-        )
-        .merge(super::raw_logits_route::raw_logits_router(engine.clone()));
-        Ok((router, engine))
-    }
-
-    /// Resolve `model_path` to a `.gguf` checkpoint: either the file itself or a
-    /// directory containing exactly one `*.gguf`. No HF-repo resolution (that
-    /// is the Metal facade's surface); a plain file-path check with a clear
-    /// error is the MVP contract for GGUF-only backends.
-    #[cfg(any(feature = "hip", feature = "vulkan"))]
-    fn resolve_gguf_path(model_path: &str, backend_label: &str) -> Result<std::path::PathBuf> {
-        use anyhow::{Context, bail, ensure};
-
-        let path = std::path::Path::new(model_path);
-        if path.is_file() {
-            ensure!(
-                path.extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf")),
-                "{backend_label} backend serves GGUF checkpoints only; {model_path} is not a .gguf file"
-            );
-            return Ok(path.to_path_buf());
-        }
-        if path.is_dir() {
-            let mut ggufs: Vec<std::path::PathBuf> = std::fs::read_dir(path)
-                .with_context(|| format!("read model dir {model_path}"))?
-                .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.is_file()
-                        && p.extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-                })
-                .collect();
-            return match ggufs.len() {
-                1 => Ok(ggufs.remove(0)),
-                0 => bail!(
-                    "no .gguf file in {model_path}; the {backend_label} backend serves GGUF checkpoints only"
-                ),
-                n => bail!("{n} .gguf files in {model_path}; pass the .gguf file path explicitly"),
-            };
-        }
-        bail!(
-            "{backend_label} model path {model_path} not found \
-             (expected a .gguf file or a directory containing exactly one)"
-        )
-    }
-
-    /// Shared HIP engine builder for [`LoadedInferenceEngine::load_hip`] and
-    /// [`router_hip`], mirroring [`cuda_serve_handle`]. Resolves the `.gguf`
-    /// checkpoint + sibling `tokenizer.json` (the GGUF's directory), then
-    /// spawns the `ServeHandle` over [`infer_hip::load_dsv4_gguf`], which
-    /// returns the matched executor + host KV pool pair. DSv4 is a slot-arena
-    /// model: per-slot depth is the per-request `max_total_tokens` budget.
-    #[cfg(feature = "hip")]
-    fn hip_serve_handle(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
-        use infer_server::OpenAiTokenizer;
-
-        if config.mtp_enabled() {
-            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-        }
-        anyhow::ensure!(
-            !config.kv_ssd_requested(),
-            "--kv-disk: the HIP backend has no KV tier store"
-        );
-        let gguf_path = resolve_gguf_path(model_path, "HIP")?;
-        let tokenizer_dir = gguf_path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map_or_else(
-                || std::path::PathBuf::from("."),
-                std::path::Path::to_path_buf,
-            );
-        let tokenizer = OpenAiTokenizer::from_model_dir(&tokenizer_dir)?;
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
-
-        let mut scheduler = config.scheduler_config();
-        scheduler.num_slots = 1;
-        let num_slots = 1;
-        let max_seq_len = config.max_total_tokens;
-        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
-            move || {
-                let (executor, kv) = infer_hip::load_dsv4_gguf(&gguf_path, num_slots, max_seq_len)?;
-                infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
-            },
-            shutdown,
-        )?;
-        Ok((serve, tokenizer, model_id))
-    }
-
-    /// Shared Vulkan engine builder for [`LoadedInferenceEngine::load_vulkan`]
-    /// and [`router_vulkan`]. Resolves the `.gguf` checkpoint + sibling
-    /// `tokenizer.json`, then spawns the `ServeHandle` over
-    /// [`infer_vulkan::load_qwen3_gguf`]. P7 wires the CLI endpoint; the
-    /// numeric Vulkan forward remains pending AIPC/on-box validation and fails
-    /// loud inside the backend.
-    #[cfg(feature = "vulkan")]
-    fn vulkan_serve_handle(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<(ServeHandle, infer_server::OpenAiTokenizer, String)> {
-        use infer_server::OpenAiTokenizer;
-
-        if config.mtp_enabled() {
-            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-        }
-        if let Some(cap) = config.vulkan_submit_cap {
-            infer_vulkan::forward::set_submit_cap(cap);
-        }
-        anyhow::ensure!(
-            !config.kv_ssd_requested(),
-            "--kv-disk: the Vulkan backend has no KV tier store"
-        );
-        let gguf_path = resolve_gguf_path(model_path, "Vulkan")?;
-        let tokenizer_dir = gguf_path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map_or_else(
-                || std::path::PathBuf::from("."),
-                std::path::Path::to_path_buf,
-            );
-        let tokenizer = OpenAiTokenizer::from_model_dir(&tokenizer_dir)?;
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
-
-        let mut scheduler = config.scheduler_config();
-        scheduler.num_slots = 1;
-        let num_slots = 1;
-        let max_seq_len = config.max_total_tokens;
-        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
-            move || {
-                let (executor, kv) =
-                    infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
-                infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
-            },
-            shutdown,
-        )?;
-        Ok((serve, tokenizer, model_id))
-    }
-
-    /// HIP serve router. Builds the same `ServeHandle` as
-    /// [`LoadedInferenceEngine::load_hip`] via [`hip_serve_handle`], then wraps
-    /// it in [`infer_server::coordinator_local_router`]. Mirrors [`router_cuda`].
-    #[cfg(feature = "hip")]
-    fn router_hip(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<axum::Router> {
-        let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config, shutdown)?;
-        Ok(infer_server::coordinator_local_router(
-            Arc::new(serve),
-            tokenizer,
-            model_id,
-            config.max_thinking_tokens,
-            None,
-        ))
-    }
-
-    /// Vulkan serve router. Builds the same `ServeHandle` as
-    /// [`LoadedInferenceEngine::load_vulkan`] via [`vulkan_serve_handle`], then
-    /// wraps it in [`infer_server::coordinator_local_router`]. Mirrors [`router_hip`].
-    #[cfg(feature = "vulkan")]
-    fn router_vulkan(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<axum::Router> {
-        let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config, shutdown)?;
-        Ok(infer_server::coordinator_local_router(
-            Arc::new(serve),
-            tokenizer,
-            model_id,
-            config.max_thinking_tokens,
-            None,
-        ))
-    }
-
-    /// Portable CPU serve router: the placeholder `MetalExecutor` over the real
-    /// backend-neutral host paged KV pool (no MLX, no CUDA), wrapped in
-    /// [`infer_server::coordinator_local_router`]. Mirrors
-    /// [`LoadedInferenceEngine::load_cpu`].
-    #[cfg(all(
-        feature = "cpu",
-        not(feature = "metal"),
-        not(feature = "cuda"),
-        not(feature = "hip"),
-        not(feature = "vulkan")
-    ))]
-    fn router_cpu(
-        model_path: &str,
-        config: &EngineLoadConfig,
-        shutdown: infer_server::ServeShutdown,
-    ) -> Result<axum::Router> {
-        use infer_server::OpenAiTokenizer;
-
-        if config.mtp_enabled() {
-            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-        }
-        let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
-        let model_id = crate::serve_engine::model_id_from_path(model_path);
-        let executor = MetalExecutor::new();
-        let kv = HostPagedKvPool::new(
-            config.hot_workspace_slots(),
-            config.total_pages,
-            config.page_size,
-        );
-        let serve = ServeHandle::spawn_with_shutdown(
-            Box::new(executor),
-            Box::new(kv),
-            config.scheduler_config(),
-            shutdown,
-        );
-        Ok(infer_server::coordinator_local_router(
-            Arc::new(serve),
-            tokenizer,
-            model_id,
-            config.max_thinking_tokens,
-            None,
-        ))
-    }
-
-    impl InferenceEngine for LoadedInferenceEngine {
-        fn model_id(&self) -> &str {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.model_id(),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.model_id(),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.model_id(),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.model_id(),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.model_id(),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.model_id(),
-            }
-        }
-
-        fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.complete(req),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.complete(req),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.complete(req),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.complete(req),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.complete(req),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.complete(req),
-            }
-        }
-
-        fn complete_multimodal_chat(
-            &mut self,
-            req: MultimodalChatRequest,
-        ) -> Result<CompletionOutput> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.complete_multimodal_chat(req),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.complete_multimodal_chat(req),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.complete_multimodal_chat(req),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.complete_multimodal_chat(req),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.complete_multimodal_chat(req),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.complete_multimodal_chat(req),
-            }
-        }
-
-        fn complete_stream(
-            &mut self,
-            req: CompletionRequest,
-            tx: UnboundedSender<CompletionStreamDelta>,
-        ) -> Result<()> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.complete_stream(req, tx),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.complete_stream(req, tx),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.complete_stream(req, tx),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.complete_stream(req, tx),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.complete_stream(req, tx),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.complete_stream(req, tx),
-            }
-        }
-
-        fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.tokenize(text),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.tokenize(text),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.tokenize(text),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.tokenize(text),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.tokenize(text),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.tokenize(text),
-            }
-        }
-
-        fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> Result<String> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.render_chat_prompt(messages),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.render_chat_prompt(messages),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.render_chat_prompt(messages),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.render_chat_prompt(messages),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.render_chat_prompt(messages),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.render_chat_prompt(messages),
-            }
-        }
-
-        fn telemetry(&self) -> EngineTelemetry {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.telemetry(),
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.telemetry(),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.telemetry(),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.telemetry(),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.telemetry(),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.telemetry(),
-            }
-        }
-    }
 }
 
 #[cfg(feature = "cuda")]
-pub use backend::CudaWorkerEngine;
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
-pub use backend::LoadedInferenceEngine;
-#[cfg(feature = "cuda")]
-pub use backend::cuda_model_takes_multiproc_serve;
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
-pub(crate) use backend::router_for_backend;
+pub use cuda::{CudaWorkerEngine, build_cuda_engine, cuda_model_takes_multiproc_serve};

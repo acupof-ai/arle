@@ -404,15 +404,16 @@ impl MetalPageStore {
     pub(super) fn publish_slot(
         &mut self,
         slot: &MetalSlotState,
-        kv: &dyn KvPool,
+        page_size: usize,
+        slot_pages: &[u32],
     ) -> anyhow::Result<()> {
-        let page_size = kv.page_size().max(1);
+        let page_size = page_size.max(1);
         let full_pages = slot.cache_len / page_size;
         if full_pages == 0 {
             return Ok(());
         }
 
-        let page_ids = kv.page_indices(slot.slot);
+        let page_ids = slot_pages;
         let publish_pages = full_pages.min(page_ids.len());
         let mut overwritten_logical_ids = Vec::new();
         for (page_idx, page_id) in page_ids.iter().take(publish_pages).enumerate() {
@@ -537,11 +538,12 @@ impl MetalPageStore {
         &mut self,
         slot: usize,
         slot_epoch: u64,
-        kv: &dyn KvPool,
+        page_size: usize,
+        slot_pages: &[u32],
         prefix_tokens: usize,
         capacity_tokens: usize,
     ) -> anyhow::Result<MetalSlotState> {
-        let page_size = kv.page_size().max(1);
+        let page_size = page_size.max(1);
         anyhow::ensure!(
             prefix_tokens.is_multiple_of(page_size),
             "Metal prefix attach requires page-aligned prefix: prefix_tokens={}, page_size={}",
@@ -549,7 +551,6 @@ impl MetalPageStore {
             page_size
         );
         let prefix_pages = prefix_tokens / page_size;
-        let slot_pages = kv.page_indices(slot);
         anyhow::ensure!(
             slot_pages.len() >= prefix_pages,
             "Metal prefix attach for slot {slot} needs {prefix_pages} pages, host slot has {}",

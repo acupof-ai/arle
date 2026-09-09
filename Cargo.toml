@@ -93,29 +93,41 @@ publish = false
 # `arle --doctor` reports the compiled backend when none is selected.
 default = ["cli"]
 cli = ["dep:cli"]
-cuda = ["cli/cuda"]
+cuda = ["cli/cuda", "infer-api/cuda"]
 # Marker feature for builds without CUDA toolchain (macOS, dev CI).
 no-cuda = ["cli/no-cuda"]
-# Development-oriented CPU backend. Pair with `no-cuda`.
-cpu = ["cli/cpu"]
+# Development-oriented CPU backend. Pair with `no-cuda`. Uses infer-metal's
+# feature-free placeholder executor over the host paged KV pool.
+cpu = ["dep:infer-metal"]
 # Metal backend via mlx-sys (Apple Silicon). Pair with `no-cuda`.
-metal = ["cli/metal"]
+metal = ["cli/metal", "dep:infer-metal", "infer-metal/metal"]
 # HIP backend via infer-hip (AMD ROCm, DSv4 GGUF). Pair with `no-cuda` off-box.
-hip = ["cli/hip"]
+hip = ["dep:infer-hip", "infer-hip/hip"]
 # Vulkan backend via infer-vulkan (cross-vendor / Windows lane). Pair with
 # `no-cuda` off-box.
-vulkan = ["cli/vulkan"]
+vulkan = ["dep:infer-vulkan", "infer-vulkan/vulkan"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda`.
-# Forwards through `cli` → `infer-api` → `infer-cuda` → `cuda-kernels`.
+# Forwards through `cli` -> `infer-api` -> `infer-cuda` -> `cuda-kernels`.
 nccl = ["cuda", "cli/nccl"]
 # DSv4 expert-parallel DeepEP dispatch/combine. Implies `nccl`; forwards through
-# `cli` → `infer-api` → `infer-cuda` → `deepep-sys`.
+# `cli` -> `infer-api` -> `infer-cuda` -> `deepep-sys`.
 deepep = ["nccl", "cli/deepep"]
 
 [dependencies]
+anyhow = "1.0"
+infer-api = { path = "crates/infer-api" }
+infer-core = { path = "crates/infer-core" }
+infer-seam = { path = "crates/infer-seam" }
+infer-server = { path = "crates/infer-server" }
+infer-util = { path = "crates/infer-util" }
+log = "0.4"
 cli = { path = "crates/cli", default-features = false, optional = true }
+infer-metal = { path = "crates/infer-metal", default-features = false, optional = true }
+infer-hip = { path = "crates/infer-hip", default-features = false, optional = true }
+infer-vulkan = { path = "crates/infer-vulkan", default-features = false, optional = true }
 
 [dev-dependencies]
+infer-api = { path = "crates/infer-api" }
 infer-util = { path = "crates/infer-util" }
 serde_json = { workspace = true }
 

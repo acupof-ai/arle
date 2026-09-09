@@ -27,7 +27,7 @@ struct DoctorSnapshot {
     /// Metal resource-guard solve for the resolved model, when the backend can
     /// plan it (Metal build, local model present).
     #[cfg(feature = "metal")]
-    resource_solve: Option<infer_api::MetalResourcePlan>,
+    resource_solve: Option<infer_metal::MetalResourcePlan>,
     #[cfg(feature = "metal")]
     resource_solve_error: Option<String>,
 }
@@ -357,7 +357,7 @@ fn collect_snapshot(args: &Args) -> DoctorSnapshot {
 #[cfg(feature = "metal")]
 fn metal_resource_solve(
     selected: &Result<SelectedModelSource>,
-) -> (Option<infer_api::MetalResourcePlan>, Option<String>) {
+) -> (Option<infer_metal::MetalResourcePlan>, Option<String>) {
     let Some(path) = selected
         .as_ref()
         .ok()
@@ -379,13 +379,13 @@ fn metal_resource_solve(
         .max_running_requests
         .unwrap_or(config.num_slots)
         .max(1);
-    let kv_cache_dtype = match infer_api::MetalKvCacheDtype::resolve(config.kv_cache_dtype) {
+    let kv_cache_dtype = match infer_metal::MetalKvCacheDtype::resolve(config.kv_cache_dtype) {
         Ok(dtype) => dtype,
         Err(err) => return (None, Some(format!("{err:#}"))),
     };
-    match infer_api::plan_resource_budget(
+    match infer_metal::plan_resource_budget(
         &path,
-        infer_api::MetalResourceRequest {
+        infer_metal::MetalResourceRequest {
             kv_cache_dtype,
             num_slots,
             total_pages: config.total_pages,

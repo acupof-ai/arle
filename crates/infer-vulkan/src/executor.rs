@@ -7,7 +7,7 @@
 
 use anyhow::{Result, bail, ensure};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult};
+use infer_seam::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult};
 
 use crate::kv_pool::VulkanKvPool;
 
@@ -183,7 +183,8 @@ impl BackendExecutor for VulkanExecutor {
     fn submit(
         &mut self,
         plan: &ForwardPlan,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
+        _kv: &mut dyn KvSlotAccounting,
     ) -> Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
             return Ok(Box::new(VulkanInflight::Ready(StepOutput {
@@ -197,7 +198,10 @@ impl BackendExecutor for VulkanExecutor {
         );
 
         if let Some(row) = plan.prefill_rows.first() {
-            let epoch = kv.slot_epoch(row.slot);
+            let epoch = batch
+                .row_for_slot(row.slot)
+                .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?
+                .slot_epoch;
             let position = row.end_pos() as u64;
             let token = self.forward_tokens(
                 row.slot,
@@ -219,7 +223,10 @@ impl BackendExecutor for VulkanExecutor {
         }
 
         if let Some(row) = plan.decode_rows.first() {
-            let epoch = kv.slot_epoch(row.slot);
+            let epoch = batch
+                .row_for_slot(row.slot)
+                .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?
+                .slot_epoch;
             let position = (row.kv_seq_len + 1) as u64;
             let token = self.forward_tokens(
                 row.slot,
@@ -251,7 +258,7 @@ impl BackendExecutor for VulkanExecutor {
                     std::any::type_name_of_val(&*wrong)
                 )
             });
-        match *inflight {
+        match inflight {
             VulkanInflight::Ready(output) => Ok(PollResult::Ready(output)),
         }
     }
@@ -403,7 +410,10 @@ mod tests {
     fn idle_plan_returns_empty_output() {
         let mut exec = VulkanExecutor::unloaded();
         let mut pool = pool();
-        let inflight = exec.submit(&ForwardPlan::idle(), &mut pool).unwrap();
+        let batch = KvBatchDescriptor::from_plan(&ForwardPlan::idle(), &pool).unwrap();
+        let inflight = exec
+            .submit(&ForwardPlan::idle(), &batch, &mut pool)
+            .unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => assert!(out.tokens.is_empty()),
             PollResult::NotReady(_) => panic!("P2 resolves synchronously"),
@@ -414,9 +424,15 @@ mod tests {
     fn unloaded_executor_errors_clearly() {
         let mut exec = VulkanExecutor::unloaded();
         let mut pool = pool();
-        let err = exec.submit(&one_row_plan(false), &mut pool).unwrap_err();
+        pool.alloc(0, 3).unwrap();
+        let prefill = one_row_plan(false);
+        let batch = KvBatchDescriptor::from_plan(&prefill, &pool).unwrap();
+        let err = exec.submit(&prefill, &batch, &mut pool).unwrap_err();
         assert!(err.to_string().contains("no model loaded"), "{err}");
-        let err = exec.submit(&one_row_plan(true), &mut pool).unwrap_err();
+        pool.alloc(0, 1).unwrap();
+        let decode = one_row_plan(true);
+        let batch = KvBatchDescriptor::from_plan(&decode, &pool).unwrap();
+        let err = exec.submit(&decode, &batch, &mut pool).unwrap_err();
         assert!(err.to_string().contains("no model loaded"), "{err}");
     }
 

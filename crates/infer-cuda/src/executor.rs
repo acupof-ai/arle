@@ -8,7 +8,8 @@ use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 use cuda_kernels::tensor::{CudaPipelineFence, CudaPipelineFenceStatus, CudaPipelineStreamKind};
 use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
-    KvBatchDescriptor, KvBatchRowKind, KvPool, PrefixBlock, pages_only_reusable_prefix_blocks,
+    KvBatchDescriptor, KvBatchRowKind, KvSlotAccounting, PrefixBlock,
+    pages_only_reusable_prefix_blocks,
 };
 use log::{info, warn};
 
@@ -209,18 +210,12 @@ impl RealCudaExecutor {
     pub(crate) fn submit(
         &mut self,
         plan: &ForwardPlan,
-        host_kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
+        kv: &mut dyn KvSlotAccounting,
     ) -> Result<StepOutput> {
-        // Both Qwen arms lower the host pool's page table into their device pool
-        // (host-authoritative mirror); DSv4 validates + adapts the descriptor.
-        // Qwen3.5 reads the host pool directly rather than the flattened
-        // descriptor — its spec path also GROWS the slot mid-step.
         match self {
-            Self::Qwen35(q) => q.submit(plan, host_kv),
-            Self::Dsv4(d) => {
-                let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
-                d.submit(plan, &kv_batch)
-            }
+            Self::Qwen35(q) => q.submit(plan, batch, kv),
+            Self::Dsv4(d) => d.submit(plan, batch),
         }
     }
 

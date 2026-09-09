@@ -16,10 +16,8 @@ use infer_api::{
     ServeHttpOptions, ServeSpecOptions, ServeSpecType, serve_http,
 };
 
-use crate::{
-    args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg},
-    hardware::CompiledBackend,
-};
+use crate::args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServeBackend {
     Cuda,
@@ -43,7 +41,7 @@ impl ServeBackend {
 
 #[derive(Debug)]
 struct ServeConfig {
-    backend: ServeBackend,
+    backend: String,
     options: ServeHttpOptions,
 }
 
@@ -116,7 +114,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
     // where the sidecar DOES run — rejecting that would block DSpark test-time
     // training on the one config that supports it.
     #[cfg(all(unix, feature = "cuda"))]
-    if config.backend == ServeBackend::Cuda
+    if config.backend == "cuda"
         && config.options.spec.dspark_markov_init.is_some()
         && config.options.engine_config.world_size.unwrap_or(1) > 1
         && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
@@ -135,7 +133,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
     // and runs the thin coordinator HTTP loop. Single GPU returns an empty vec and
     // falls through to the byte-identical in-process path below; dense Qwen3 skips it.
     #[cfg(all(unix, feature = "cuda"))]
-    if config.backend == ServeBackend::Cuda
+    if config.backend == "cuda"
         && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
     {
         match crate::serve_multiproc::bind_relay_and_spawn_workers(
@@ -177,9 +175,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
 
     eprintln!(
         "[ARLE serve] starting {} backend in-process on {}:{}",
-        config.backend.label(),
-        config.options.bind,
-        config.options.port,
+        config.backend, config.options.bind, config.options.port,
     );
 
     // `--dspark-markov-init` installs a saved Markov head over the draft
@@ -226,6 +222,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
 
 fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, String> {
     let backend = resolve_backend(serve_args.backend)?;
+    let backend_name = backend.map_or_else(infer_api::default_backend, |b| b.label().to_string());
 
     let model_path = serve_args
         .model_path
@@ -248,7 +245,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     if !matches!(
         serve_args.spec_type,
         ServeSpecTypeArg::None | ServeSpecTypeArg::Auto
-    ) && backend != ServeBackend::Cuda
+    ) && backend_name != "cuda"
     {
         return Err("--spec-type is currently only supported by the CUDA backend".to_string());
     }
@@ -264,20 +261,21 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
                 .to_string(),
         );
     }
-    if serve_args.mtp_draft_tokens.is_some() && backend != ServeBackend::Cuda {
+    if serve_args.mtp_draft_tokens.is_some() && backend_name != "cuda" {
         return Err(
             "--mtp-draft-tokens is currently only supported by the CUDA backend".to_string(),
         );
     }
-    if serve_args.mtp_draft_topk.is_some() && backend != ServeBackend::Cuda {
+    if serve_args.mtp_draft_topk.is_some() && backend_name != "cuda" {
         return Err("--mtp-draft-topk is currently only supported by the CUDA backend".to_string());
     }
 
-    if serve_args.lora_adapters.is_some() && backend != ServeBackend::Cuda {
+    if serve_args.lora_adapters.is_some() && backend_name != "cuda" {
         return Err("--lora-adapters is currently only supported by the CUDA backend".to_string());
     }
 
-    let mut engine_config = resolve_engine_config(backend, serve_args)?;
+    let mut engine_config = resolve_engine_config(&backend_name, serve_args)?;
+    engine_config.backend = Some(backend_name.clone());
     // The student-LoRA re-merge rides the engine config so multiproc worker
     // ranks (which see only ARLE_WORKER_ENGINE_CONFIG) apply it too.
     engine_config.student_lora_adapters = serve_args.lora_adapters.clone();
@@ -285,7 +283,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     // DSv4 multiproc auto-context: resolve max_total_tokens from the checkpoint
     // when unset. CUDA-only (the gate fns are CUDA-gated) — no non-CUDA path.
     #[cfg(feature = "cuda")]
-    if backend == ServeBackend::Cuda
+    if backend_name == "cuda"
         && serve_args.max_prompt_tokens.is_none()
         && serve_args.max_total_tokens.is_none()
         && infer_api::cuda_model_takes_multiproc_serve(&model_path)
@@ -297,7 +295,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         engine_config.max_prompt_tokens = max_ctx;
         engine_config.max_total_tokens = max_ctx;
     }
-    let mut spec = resolve_spec_options(backend, serve_args);
+    let mut spec = resolve_spec_options(&backend_name, serve_args);
     // Resolve `auto` here, not just in `serve_http`: the multiproc coordinator
     // serializes only engine_config into ARLE_WORKER_ENGINE_CONFIG and never
     // runs serve_http's lowering, so an unresolved Auto would reach worker
@@ -368,18 +366,21 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         spec,
     };
 
-    Ok(ServeConfig { backend, options })
+    Ok(ServeConfig {
+        backend: backend_name,
+        options,
+    })
 }
 
-fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeSpecOptions {
-    if !matches!(backend, ServeBackend::Metal | ServeBackend::Cuda) {
+fn resolve_spec_options(backend: &str, serve_args: &ServeArgs) -> ServeSpecOptions {
+    if !matches!(backend, "metal" | "cuda") {
         return ServeSpecOptions::default();
     }
     let mut spec_type = match serve_args.spec_type {
         ServeSpecTypeArg::None => ServeSpecType::None,
         // Checkpoint-native MTP is CUDA-only; the default must not speculate
         // its way into a backend that cannot load the head.
-        ServeSpecTypeArg::Auto if backend != ServeBackend::Cuda => ServeSpecType::None,
+        ServeSpecTypeArg::Auto if backend != "cuda" => ServeSpecType::None,
         ServeSpecTypeArg::Auto => ServeSpecType::Auto,
         ServeSpecTypeArg::Mtp => ServeSpecType::Mtp,
         ServeSpecTypeArg::Dspark => ServeSpecType::Dspark,
@@ -403,7 +404,9 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
     }
 }
 
-fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
+/// Resolve the `--backend` flag. `Auto` maps to `None` (the registry's
+/// default); an explicit backend is validated against the runtime registry.
+fn resolve_backend(arg: ServeBackendArg) -> Result<Option<ServeBackend>, String> {
     let requested = match arg {
         ServeBackendArg::Cuda => Some(ServeBackend::Cuda),
         ServeBackendArg::Metal => Some(ServeBackend::Metal),
@@ -412,44 +415,17 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
         ServeBackendArg::Cpu => Some(ServeBackend::Cpu),
         ServeBackendArg::Auto => None,
     };
-
-    let compiled = match CompiledBackend::detect() {
-        CompiledBackend::Cuda => Some(ServeBackend::Cuda),
-        CompiledBackend::Metal => Some(ServeBackend::Metal),
-        #[cfg(feature = "hip")]
-        CompiledBackend::Hip => Some(ServeBackend::Hip),
-        #[cfg(feature = "vulkan")]
-        CompiledBackend::Vulkan => Some(ServeBackend::Vulkan),
-        CompiledBackend::Cpu => Some(ServeBackend::Cpu),
-        #[cfg(not(any(
-            feature = "cuda",
-            feature = "metal",
-            feature = "hip",
-            feature = "vulkan",
-            feature = "cpu"
-        )))]
-        CompiledBackend::None => None,
-    };
-
-    let Some(compiled) = compiled else {
-        return Err(
-            "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"
-                .to_string(),
-        );
-    };
-
-    match requested {
-        None => Ok(compiled),
-        // An explicit backend must match the one compiled in: serving is
-        // in-process, so a mismatch cannot be satisfied.
-        Some(requested) if requested == compiled => Ok(requested),
-        Some(requested) => Err(format!(
-            "requested --backend {} but this binary was built with the {} backend; rebuild with the matching feature or use --backend {}/auto",
-            requested.label(),
-            compiled.label(),
-            compiled.label(),
-        )),
+    if let Some(backend) = requested
+        && !infer_api::is_backend_registered(backend.label())
+    {
+        return Err(format!(
+            "requested --backend {} but this binary has no '{}' backend registered; \
+             rebuild with the matching feature or use --backend auto",
+            backend.label(),
+            backend.label(),
+        ));
     }
+    Ok(requested)
 }
 
 fn model_from_env() -> Option<String> {
@@ -461,7 +437,7 @@ fn model_from_env() -> Option<String> {
 }
 
 fn resolve_engine_config(
-    backend: ServeBackend,
+    backend: &str,
     serve_args: &ServeArgs,
 ) -> Result<EngineLoadConfig, String> {
     let kv_cache_dtype = match serve_args.kv_cache_dtype {
@@ -485,18 +461,16 @@ fn resolve_engine_config(
     // until a TQ paged-prefill path exists).
     match config.kv_cache_dtype {
         // INT8 runs on Metal (int8 cache) and CUDA (paged quant pool, #68 T3).
-        KvCacheDtype::Int8 if backend != ServeBackend::Metal && backend != ServeBackend::Cuda => {
+        KvCacheDtype::Int8 if backend != "metal" && backend != "cuda" => {
             return Err(format!(
-                "--kv-cache-dtype int8 is currently implemented for the Metal and CUDA backends; active backend is {}",
-                backend.label()
+                "--kv-cache-dtype int8 is currently implemented for the Metal and CUDA backends; active backend is {backend}"
             ));
         }
         // FP8 / TQ4 are CUDA-only paged quant modes.
-        KvCacheDtype::Fp8 | KvCacheDtype::Tq4 if backend != ServeBackend::Cuda => {
+        KvCacheDtype::Fp8 | KvCacheDtype::Tq4 if backend != "cuda" => {
             return Err(format!(
-                "--kv-cache-dtype {} is a CUDA-only paged quant mode; active backend is {}",
-                config.kv_cache_dtype.label(),
-                backend.label()
+                "--kv-cache-dtype {} is a CUDA-only paged quant mode; active backend is {backend}",
+                config.kv_cache_dtype.label()
             ));
         }
         _ => {}

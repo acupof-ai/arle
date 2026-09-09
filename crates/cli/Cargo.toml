@@ -9,18 +9,13 @@ publish = false
 # No backend default — pick one explicitly:
 #   --features cuda            Linux + NVIDIA
 #   --features metal,no-cuda   Apple Silicon
-#   --features cpu,no-cuda     portable smoke
 default = []
 cuda = ["infer-api/cuda", "train/cuda", "autograd/cuda"]
 no-cuda = ["infer-api/no-cuda", "train/no-cuda", "autograd/no-cuda"]
-cpu = ["infer-api/cpu"]
-metal = ["infer-api/metal", "train/metal", "autograd/metal"]
-# HIP backend (AMD ROCm, DSv4 GGUF). Pair with `no-cuda` off-box; train/autograd
-# have no HIP code, so only infer-api forwards.
-hip = ["infer-api/hip"]
-# Vulkan backend (cross-vendor / Windows lane). Pair with `no-cuda` off-box;
-# train/autograd have no Vulkan code, so only infer-api forwards.
-vulkan = ["infer-api/vulkan"]
+# Metal backend. infer-api is backend-neutral now; this pulls infer-metal for
+# the CLI's own metal-specific surfaces (--doctor resource planning, hardware
+# working-set) and forwards to train/autograd.
+metal = ["dep:infer-metal", "infer-metal/metal", "train/metal", "autograd/metal"]
 nccl = ["cuda", "infer-api/nccl", "train/nccl", "autograd/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
 # Grammar-constrained decode (xgrammar real backend). Requires
@@ -42,6 +37,7 @@ agent = { path = "../agent" }
 autograd = { path = "../autograd", default-features = false }
 chat = { path = "../chat" }
 infer-api = { path = "../infer-api" }
+infer-metal = { path = "../infer-metal", default-features = false, optional = true }
 infer-plan = { path = "../infer-plan" }
 infer-util = { path = "../infer-util" }
 deepseek-spec = { path = "../deepseek-spec" }

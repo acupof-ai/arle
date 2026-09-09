@@ -120,8 +120,17 @@ dependencies = [
 name = "arle"
 version = "0.5.8"
 dependencies = [
+ "anyhow",
  "cli",
+ "infer-api",
+ "infer-core",
+ "infer-hip",
+ "infer-metal",
+ "infer-seam",
+ "infer-server",
  "infer-util",
+ "infer-vulkan",
+ "log",
  "serde_json",
 ]
 
@@ -389,6 +398,7 @@ dependencies = [
  "hf-hub",
  "indicatif",
  "infer-api",
+ "infer-metal",
  "infer-plan",
  "infer-util",
  "libc",
@@ -1551,13 +1561,10 @@ dependencies = [
  "half",
  "infer-core",
  "infer-cuda",
- "infer-hip",
- "infer-metal",
  "infer-plan",
  "infer-seam",
  "infer-server",
  "infer-util",
- "infer-vulkan",
  "log",
  "safetensors",
  "serde",
@@ -3654,6 +3661,7 @@ dependencies = [
  "infer-plan",
  "infer-server",
  "infer-topo",
+ "infer-util",
  "libc",
  "memmap2",
  "qwen35-spec",

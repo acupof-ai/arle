@@ -72,7 +72,9 @@ mod real {
         CudaExecutor, CudaKvPool, print_dsv4_stage_profile, reset_dsv4_stage_profile,
     };
     use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow, SamplingParams, SlotToken};
-    use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvQuery, PollResult};
+    use infer_seam::{
+        BackendExecutor, KvAllocator, KvBatchDescriptor, KvQuery, KvSlotAccounting, PollResult,
+    };
     use std::{path::Path, time::Instant};
 
     /// Default prompt: "The capital of France is" in the **DeepSeek-V4** tokenizer
@@ -747,7 +749,8 @@ mod real {
         plan: ForwardPlan,
     ) -> Result<Vec<SlotToken>> {
         materialize_plan_kv(kv, &plan)?;
-        let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
+        let batch = KvBatchDescriptor::from_plan(&plan, kv)?;
+        let inflight = exec.submit(&plan, &batch, kv as &mut dyn KvSlotAccounting)?;
         match exec.poll(inflight)? {
             PollResult::Ready(out) => {
                 let tokens = out.tokens;

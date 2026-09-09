@@ -12,6 +12,10 @@ use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow};
 use crate::KvPool;
 
 /// Host-only batch view over the rows scheduled in one forward step.
+///
+/// Built above the seam (engine-core) and passed to `BackendExecutor::submit`
+/// as `&KvBatchDescriptor` — the only KV data the backend sees. Reads that
+/// backends used to do against `&dyn KvPool` are resolved here once.
 #[derive(Debug, Clone)]
 pub struct KvBatchDescriptor {
     pub mode: ForwardMode,
@@ -27,6 +31,12 @@ pub struct KvBatchDescriptor {
     /// [`KvBatchRow::slot_page_range`]. Sequential models usually read only
     /// `page_range`; fixed-band models (DSv4) need the full slot table.
     pub flat_slot_page_ids: Vec<u32>,
+    /// Flattened TP-local-shard page tables. Rows point into this buffer with
+    /// [`KvBatchRow::local_page_range`]. For non-TP builds this is identical
+    /// to `flat_slot_page_ids`; TP builds slice it to the local rank's share.
+    pub flat_local_page_ids: Vec<u32>,
+    /// Pool page size, captured once at construction.
+    pub page_size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +55,9 @@ pub struct KvBatchRow {
     pub token_range: Range<usize>,
     pub page_range: Range<usize>,
     pub slot_page_range: Range<usize>,
+    /// Range into [`KvBatchDescriptor::flat_local_page_ids`] for this row's
+    /// TP-local-shard page table.
+    pub local_page_range: Range<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +67,13 @@ pub enum KvBatchRowKind {
 }
 
 impl KvBatchDescriptor {
-    /// The engine calls this after [`KvPool::alloc`](crate::KvAllocator::alloc)
+    /// Look up the batch row for a slot. O(n) — batch sizes are small (≤128).
+    #[must_use]
+    pub fn row_for_slot(&self, slot: usize) -> Option<&KvBatchRow> {
+        self.rows.iter().find(|r| r.slot == slot)
+    }
+
+    /// The engine calls this after [`KvPool::alloc`](crate::KvSlotAccounting::alloc)
     /// has reserved the row's output span, so the pool length must cover
     /// `append_pos + append_len`.
     pub fn from_plan(plan: &ForwardPlan, kv: &dyn KvPool) -> Result<Self> {
@@ -64,6 +83,8 @@ impl KvBatchDescriptor {
             flat_token_ids: Vec::new(),
             flat_page_ids: Vec::new(),
             flat_slot_page_ids: Vec::new(),
+            flat_local_page_ids: Vec::new(),
+            page_size: kv.page_size(),
         };
 
         for row in &plan.prefill_rows {
@@ -119,6 +140,8 @@ impl KvBatchDescriptor {
             flat_token_ids: Vec::new(),
             flat_page_ids: Vec::new(),
             flat_slot_page_ids: Vec::new(),
+            flat_local_page_ids: Vec::new(),
+            page_size: self.page_size,
         };
         let mut has_prefill = false;
         let mut has_decode = false;
@@ -136,10 +159,14 @@ impl KvBatchDescriptor {
             let slot_page_start = desc.flat_slot_page_ids.len();
             desc.flat_slot_page_ids
                 .extend_from_slice(&self.flat_slot_page_ids[row.slot_page_range.clone()]);
+            let local_page_start = desc.flat_local_page_ids.len();
+            desc.flat_local_page_ids
+                .extend_from_slice(&self.flat_local_page_ids[row.local_page_range.clone()]);
             desc.rows.push(KvBatchRow {
                 token_range: token_start..desc.flat_token_ids.len(),
                 page_range: page_start..desc.flat_page_ids.len(),
                 slot_page_range: slot_page_start..desc.flat_slot_page_ids.len(),
+                local_page_range: local_page_start..desc.flat_local_page_ids.len(),
                 ..row.clone()
             });
         }
@@ -188,9 +215,14 @@ impl KvBatchDescriptor {
         }
         let page_range = page_start..self.flat_page_ids.len();
         let slot_page_start = self.flat_slot_page_ids.len();
-        self.flat_slot_page_ids
-            .extend_from_slice(kv.page_indices(slot));
+        let slot_pages = kv.page_indices(slot);
+        self.flat_slot_page_ids.extend_from_slice(slot_pages);
         let slot_page_range = slot_page_start..self.flat_slot_page_ids.len();
+        let local_page_start = self.flat_local_page_ids.len();
+        let local_count = kv.shard_local_page_count(slot_pages.len());
+        self.flat_local_page_ids
+            .extend_from_slice(&slot_pages[..local_count]);
+        let local_page_range = local_page_start..self.flat_local_page_ids.len();
 
         self.rows.push(KvBatchRow {
             slot,
@@ -203,6 +235,7 @@ impl KvBatchDescriptor {
             token_range,
             page_range,
             slot_page_range,
+            local_page_range,
         });
         Ok(())
     }

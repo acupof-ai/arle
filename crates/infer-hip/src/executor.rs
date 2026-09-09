@@ -12,7 +12,7 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult};
+use infer_seam::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult};
 
 use crate::kv_pool::HipKvPool;
 
@@ -84,7 +84,8 @@ impl BackendExecutor for HipDsv4Executor {
     fn submit(
         &mut self,
         plan: &ForwardPlan,
-        kv: &mut dyn KvPool,
+        batch: &KvBatchDescriptor,
+        _kv: &mut dyn KvSlotAccounting,
     ) -> Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
             return Ok(Box::new(HipInflight::Ready(StepOutput {
@@ -102,7 +103,10 @@ impl BackendExecutor for HipDsv4Executor {
                 !row.tokens.is_empty(),
                 "HIP prefill row must contain at least one token"
             );
-            let epoch = kv.slot_epoch(row.slot);
+            let epoch = batch
+                .row_for_slot(row.slot)
+                .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?
+                .slot_epoch;
             let position = row.end_pos() as u64;
             let token = self.forward_tokens(
                 row.slot,
@@ -123,7 +127,10 @@ impl BackendExecutor for HipDsv4Executor {
             })));
         }
         if let Some(row) = plan.decode_rows.first() {
-            let epoch = kv.slot_epoch(row.slot);
+            let epoch = batch
+                .row_for_slot(row.slot)
+                .ok_or_else(|| anyhow::anyhow!("no batch row for slot {}", row.slot))?
+                .slot_epoch;
             let position = (row.kv_seq_len + 1) as u64;
             let token = self.forward_tokens(
                 row.slot,
@@ -153,7 +160,7 @@ impl BackendExecutor for HipDsv4Executor {
                 std::any::type_name_of_val(&*wrong)
             )
         });
-        match *inflight {
+        match inflight {
             HipInflight::Ready(output) => Ok(PollResult::Ready(output)),
         }
     }

@@ -99,6 +99,7 @@ fn infer_teacher_matches_in_process_on_dominant_logits() -> TestResult {
 }
 
 fn load_infer_engine(model_dir: &Path) -> anyhow::Result<LoadedInferenceEngine> {
+    train::teacher_infer::register_cuda_backend();
     // Single-forward logits-parity check (not serving): one slot, a small KV
     // budget. (Migrated off the legacy ServerRuntimeConfig knobs to the rewrite's
     // EngineLoadConfig; 8 pages x 16 = 128 token capacity matches the old 128 cap.)

@@ -13,6 +13,11 @@ use crate::{KvAllocator, KvPrefixStore, KvQuery};
 /// Every method is expressed in host slot ids, page ids, token counts, and
 /// logical positions. The trait is dyn-safe so engine-core can hold
 /// `&mut dyn KvPool` without knowing the backend.
+///
+/// `KvSlotAccounting` is the narrowed write surface `BackendExecutor::submit`
+/// takes; it is a strict subset of `KvAllocator`, so the supertrait chain
+/// (`KvPool: KvAllocator: KvSlotAccounting`) lets `&mut dyn KvPool` upcast to
+/// it at the engine-core call site.
 pub trait KvPool: KvQuery + KvAllocator + KvPrefixStore {}
 
 impl<T: KvQuery + KvAllocator + KvPrefixStore> KvPool for T {}
