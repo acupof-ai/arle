@@ -180,11 +180,15 @@ impl VulkanExecutor {
 }
 
 impl BackendExecutor for VulkanExecutor {
-    type Inflight = VulkanInflight;
-
-    fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<VulkanInflight> {
+    fn submit(
+        &mut self,
+        plan: &ForwardPlan,
+        kv: &mut dyn KvPool,
+    ) -> Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
-            return Ok(VulkanInflight::Ready(StepOutput { tokens: Vec::new() }));
+            return Ok(Box::new(VulkanInflight::Ready(StepOutput {
+                tokens: Vec::new(),
+            })));
         }
         let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
         ensure!(
@@ -203,7 +207,7 @@ impl BackendExecutor for VulkanExecutor {
                 &row.params,
                 position,
             )?;
-            return Ok(VulkanInflight::Ready(StepOutput {
+            return Ok(Box::new(VulkanInflight::Ready(StepOutput {
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -211,7 +215,7 @@ impl BackendExecutor for VulkanExecutor {
                     top_logprobs: Vec::new(),
                     finish: None,
                 }],
-            }));
+            })));
         }
 
         if let Some(row) = plan.decode_rows.first() {
@@ -225,7 +229,7 @@ impl BackendExecutor for VulkanExecutor {
                 &row.params,
                 position,
             )?;
-            return Ok(VulkanInflight::Ready(StepOutput {
+            return Ok(Box::new(VulkanInflight::Ready(StepOutput {
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -233,15 +237,31 @@ impl BackendExecutor for VulkanExecutor {
                     top_logprobs: Vec::new(),
                     finish: None,
                 }],
-            }));
+            })));
         }
         bail!("Vulkan executor received a non-idle plan with no rows")
     }
 
-    fn poll(&mut self, inflight: VulkanInflight) -> Result<PollResult<VulkanInflight>> {
-        match inflight {
+    fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> Result<PollResult> {
+        let inflight = *inflight
+            .downcast::<VulkanInflight>()
+            .unwrap_or_else(|wrong| {
+                panic!(
+                    "vulkan executor poll received foreign inflight type: {}",
+                    std::any::type_name_of_val(&*wrong)
+                )
+            });
+        match *inflight {
             VulkanInflight::Ready(output) => Ok(PollResult::Ready(output)),
         }
+    }
+
+    fn name(&self) -> &'static str {
+        "vulkan"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn model_stop_token_ids(&self) -> Vec<u32> {

@@ -8,7 +8,6 @@ use std::cmp::Reverse;
 
 use anyhow::Result;
 use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow};
-use infer_seam::{BackendExecutor, KvPool};
 
 use crate::{Engine, RequestPhase, RequestState, WaitingInsertBias};
 
@@ -20,7 +19,7 @@ fn lcm(a: usize, b: usize) -> usize {
     a / gcd(a, b) * b
 }
 
-impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
+impl Engine {
     pub(crate) fn build_forward_plan(&self) -> ForwardPlan {
         let mut prefill_rows = Vec::new();
         let mut decode_rows = Vec::new();
@@ -472,8 +471,7 @@ mod tests {
     use crate::{Engine, RequestHandle, RequestPhase, RequestState, SchedulerConfig};
     use infer_plan::SamplingParams;
     use infer_seam::{
-        BackendExecutor, HostPagedKvPool, KvAllocator, KvPool, KvQuery, KvSlotTier, PollResult,
-        PrefixBlock, PrefixReuse,
+        BackendExecutor, HostPagedKvPool, KvPool, KvSlotTier, PollResult, PrefixBlock, PrefixReuse,
     };
 
     #[derive(Default)]
@@ -562,17 +560,20 @@ mod tests {
     }
 
     impl BackendExecutor for MockExecutor {
-        type Inflight = ();
-
-        fn submit(&mut self, _plan: &ForwardPlan, _kv: &mut dyn KvPool) -> anyhow::Result<()> {
-            Ok(())
+        fn submit(
+            &mut self,
+            _plan: &ForwardPlan,
+            _kv: &mut dyn KvPool,
+        ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
+            Ok(Box::new(()))
         }
 
-        fn poll(
-            &mut self,
-            _inflight: Self::Inflight,
-        ) -> anyhow::Result<PollResult<Self::Inflight>> {
+        fn poll(&mut self, _inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult> {
             unreachable!("planner tests never submit work")
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
         }
 
         fn kv_slot_tier(&mut self) -> Option<&mut dyn KvSlotTier> {
@@ -589,15 +590,15 @@ mod tests {
         pages: usize,
         slot_tier: Option<MockSlotTier>,
         oversubscription: bool,
-    ) -> anyhow::Result<Engine<MockExecutor, HostPagedKvPool>> {
+    ) -> anyhow::Result<Engine> {
         let mut config = SchedulerConfig::for_slots(4);
         config.slot_oversubscription = oversubscription;
         Engine::with_config(
-            MockExecutor {
+            Box::new(MockExecutor {
                 slot_tier,
                 reuse: PagesOnlyReuse,
-            },
-            HostPagedKvPool::new(4, pages, 16),
+            }),
+            Box::new(HostPagedKvPool::new(4, pages, 16)),
             config,
         )
     }
@@ -684,7 +685,10 @@ mod tests {
         assert_eq!(engine.kv.free_pages(), 8);
         assert!(
             engine
-                .executor
+                .executor_mut()
+                .as_any_mut()
+                .downcast_mut::<MockExecutor>()
+                .expect("mock executor")
                 .slot_tier
                 .as_ref()
                 .expect("tier present")

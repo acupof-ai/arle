@@ -184,17 +184,15 @@ impl<M> BufferedDiffusionExecutor<M> {
 
 impl<M> BackendExecutor for BufferedDiffusionExecutor<M>
 where
-    M: DiffusionBlockModel,
+    M: DiffusionBlockModel + 'static,
 {
-    type Inflight = StepOutput;
-
     fn submit(
         &mut self,
         plan: &ForwardPlan,
         kv: &mut dyn KvPool,
-    ) -> anyhow::Result<Self::Inflight> {
+    ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
-            return Ok(StepOutput { tokens: Vec::new() });
+            return Ok(Box::new(StepOutput { tokens: Vec::new() }));
         }
         anyhow::ensure!(
             !self
@@ -209,16 +207,32 @@ where
             "diffusion buffered executor supports exactly one prefill or decode row, got {row_count}"
         );
         if let Some(row) = plan.prefill_rows.first() {
-            return self.submit_prefill(row, kv);
+            return Ok(Box::new(self.submit_prefill(row, kv)?));
         }
         if let Some(row) = plan.decode_rows.first() {
-            return self.next_buffered_token(row.slot, kv.slot_epoch(row.slot));
+            return Ok(Box::new(
+                self.next_buffered_token(row.slot, kv.slot_epoch(row.slot))?,
+            ));
         }
         anyhow::bail!("diffusion buffered executor received a non-idle plan with no rows")
     }
 
-    fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>> {
-        Ok(PollResult::Ready(inflight))
+    fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult> {
+        let output = *inflight.downcast::<StepOutput>().unwrap_or_else(|wrong| {
+            panic!(
+                "buffered-diffusion executor poll received foreign inflight type: {}",
+                std::any::type_name_of_val(&*wrong)
+            )
+        });
+        Ok(PollResult::Ready(output))
+    }
+
+    fn name(&self) -> &'static str {
+        "buffered-diffusion"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn model_stop_token_ids(&self) -> Vec<u32> {

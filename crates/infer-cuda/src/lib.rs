@@ -542,23 +542,35 @@ impl CudaExecutor {
 }
 
 impl BackendExecutor for CudaExecutor {
-    type Inflight = CudaInflight;
-
     fn submit(
         &mut self,
         plan: &ForwardPlan,
         _kv: &mut dyn KvPool,
-    ) -> anyhow::Result<Self::Inflight> {
+    ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         let output = match &mut self.inner {
             CudaExecutorInner::Placeholder => Self::placeholder_forward(plan),
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.submit(plan, _kv)?,
         };
-        Ok(CudaInflight { output })
+        Ok(Box::new(CudaInflight { output }))
     }
 
-    fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>> {
+    fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult> {
+        let inflight = *inflight.downcast::<CudaInflight>().unwrap_or_else(|wrong| {
+            panic!(
+                "cuda executor poll received foreign inflight type: {}",
+                std::any::type_name_of_val(&*wrong)
+            )
+        });
         Ok(PollResult::Ready(inflight.output))
+    }
+
+    fn name(&self) -> &'static str {
+        "cuda"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn poll_background(&mut self) -> anyhow::Result<()> {
