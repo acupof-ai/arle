@@ -33,7 +33,10 @@ pub fn register_all() {
 /// is the Metal facade's surface); a plain file-path check with a clear
 /// error is the MVP contract for GGUF-only backends.
 #[cfg(any(feature = "hip", feature = "vulkan"))]
-pub(crate) fn resolve_gguf_path(model_path: &str, backend_label: &str) -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn resolve_gguf_path(
+    model_path: &str,
+    backend_label: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     use anyhow::{Context, bail, ensure};
 
     let path = std::path::Path::new(model_path);

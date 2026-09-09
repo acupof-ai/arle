@@ -109,11 +109,11 @@ pub fn run() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let command = args.command.take();
-        let _exit_report = if should_print_exit_report(&args, command.as_ref()) {
-            Some(runtime_report::ExitResourceReport::enabled())
-        } else {
-            None
-        };
+    let _exit_report = if should_print_exit_report(&args, command.as_ref()) {
+        Some(runtime_report::ExitResourceReport::enabled())
+    } else {
+        None
+    };
 
     match command {
         Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
@@ -188,9 +188,8 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
     let one_shot = run_args
         .as_ref()
         .is_some_and(|r| r.prompt.is_some() || r.stdin || !r.image.is_empty());
-    let interactive_tty = !args.non_interactive
-        && std::io::stdin().is_terminal()
-        && std::io::stderr().is_terminal();
+    let interactive_tty =
+        !args.non_interactive && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if !one_shot
         && interactive_tty
         && let Some(action) = decide_eli_launch(&args)
@@ -254,10 +253,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
     let load_secs = load_start.elapsed().as_secs_f64();
     banner::print_model_loaded(engine.model_id(), &backend_name, load_secs);
 
-    if !args.non_interactive
-        && std::io::stdin().is_terminal()
-        && std::io::stderr().is_terminal()
-    {
+    if !args.non_interactive && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
         welcome::print_welcome_banner(engine.model_id());
     }
 

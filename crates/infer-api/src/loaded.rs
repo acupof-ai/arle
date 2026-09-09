@@ -473,7 +473,11 @@ pub type BackendBuilderFn = fn(
     model_path: &str,
     config: &EngineLoadConfig,
     shutdown: infer_server::ServeShutdown,
-) -> anyhow::Result<(infer_server::ServeHandle, infer_server::OpenAiTokenizer, String)>;
+) -> anyhow::Result<(
+    infer_server::ServeHandle,
+    infer_server::OpenAiTokenizer,
+    String,
+)>;
 
 struct BackendEntry {
     name: &'static str,
@@ -721,9 +725,7 @@ impl LoadedInferenceEngine {
     /// device pointer, for refreshing the train student's frozen base AFTER
     /// a LoRA re-merge.
     #[cfg(feature = "cuda")]
-    pub fn frozen_base_bf16_pointers(
-        &self,
-    ) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
+    pub fn frozen_base_bf16_pointers(&self) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
         self.engine.frozen_base_bf16_pointers()
     }
 
@@ -799,10 +801,7 @@ impl InferenceEngine for LoadedInferenceEngine {
         self.engine.complete(req)
     }
 
-    fn complete_multimodal_chat(
-        &mut self,
-        req: MultimodalChatRequest,
-    ) -> Result<CompletionOutput> {
+    fn complete_multimodal_chat(&mut self, req: MultimodalChatRequest) -> Result<CompletionOutput> {
         self.engine.complete_multimodal_chat(req)
     }
 
@@ -840,7 +839,7 @@ mod cuda {
     use anyhow::Result;
 
     use super::EngineLoadConfig;
-    use super::{classify_cuda_model, read_config_json, CudaModelKind};
+    use super::{CudaModelKind, classify_cuda_model, read_config_json};
     use infer_cuda::{CudaExecutor, CudaKvPool};
     use infer_seam::BackendExecutor;
 
@@ -1489,4 +1488,4 @@ mod cuda {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::{build_cuda_engine, cuda_model_takes_multiproc_serve, CudaWorkerEngine};
+pub use cuda::{CudaWorkerEngine, build_cuda_engine, cuda_model_takes_multiproc_serve};

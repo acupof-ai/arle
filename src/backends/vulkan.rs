@@ -38,8 +38,7 @@ pub(crate) fn build(
     let max_seq_len = config.max_total_tokens;
     let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
         move || {
-            let (executor, kv) =
-                infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
+            let (executor, kv) = infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
             infer_core::Engine::with_config(Box::new(executor), Box::new(kv), scheduler)
         },
         shutdown,

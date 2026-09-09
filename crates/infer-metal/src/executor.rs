@@ -12,9 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
-use infer_seam::{
-    BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult, PrefixBlock,
-};
+use infer_seam::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult, PrefixBlock};
 
 #[cfg(feature = "metal")]
 use crate::{config, dflash, lfm2, mlx, model_source, qwen35};
@@ -1564,10 +1562,7 @@ impl RealMetalExecutor {
     /// whose token we are about to return). Drain it to extract the committed
     /// K/V + gdr, then prequeue the following step (leaving the session open
     /// again).
-    fn commit_pending_then_prequeue(
-        &mut self,
-        row: &infer_plan::DecodeRow,
-    ) -> anyhow::Result<()> {
+    fn commit_pending_then_prequeue(&mut self, row: &infer_plan::DecodeRow) -> anyhow::Result<()> {
         let model = self.weights.compiled()?;
         {
             let slot = self
@@ -2145,7 +2140,9 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state_a, pool.page_size(), pool.page_indices(state_a.slot)).unwrap();
+        store
+            .publish_slot(&state_a, pool.page_size(), pool.page_indices(state_a.slot))
+            .unwrap();
         let first_key = store
             .logical_key_for_pages(&first_pages)
             .expect("first occupant logical key");
@@ -2182,7 +2179,9 @@ mod tests {
             vec![kv_array(8, 20)],
             vec![gdr_array(2)],
         );
-        store.publish_slot(&state_b, pool.page_size(), pool.page_indices(state_b.slot)).unwrap();
+        store
+            .publish_slot(&state_b, pool.page_size(), pool.page_indices(state_b.slot))
+            .unwrap();
 
         assert!(
             !store.prefixes.contains_key(&first_key),
@@ -2230,7 +2229,9 @@ mod tests {
             vec![kv_array(4, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
         let one_key = store
             .logical_key_for_pages(&one_page)
             .expect("one-page logical key");
@@ -2252,7 +2253,9 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
         let two_key = store
             .logical_key_for_pages(&two_pages)
             .expect("two-page logical key");
@@ -2291,7 +2294,9 @@ mod tests {
             vec![kv_array(4, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
         let first_key = store.logical_key_for_pages(&first).unwrap();
 
         // Next turn: the slot is recycled, restores the shared page, and
@@ -2311,7 +2316,9 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
 
         assert!(
             store.prefixes.contains_key(&first_key),
@@ -2348,7 +2355,9 @@ mod tests {
             vec![kv_array(4, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
 
         // Slot 1 recomputed block 0 (dedup keeps `a`) and added block 1 (`d`).
         KvAllocator::alloc(&mut pool, 1, 8).unwrap();
@@ -2362,7 +2371,9 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
         let canonical = [a, d];
         assert_eq!(
             store.reusable_prefix_blocks(&resident_prefix_blocks(&canonical)),
@@ -2395,7 +2406,9 @@ mod tests {
             vec![kv_array(8, 10)],
             vec![gdr_array(1)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
         let key = store
             .logical_key_for_pages(&pages)
             .expect("published logical key");
@@ -2441,7 +2454,9 @@ mod tests {
             vec![kv_bf16_array(8, 10)],
             vec![gdr_array(7)],
         );
-        store.publish_slot(&state, pool.page_size(), pool.page_indices(state.slot)).unwrap();
+        store
+            .publish_slot(&state, pool.page_size(), pool.page_indices(state.slot))
+            .unwrap();
         // Two 4-token pages; the sidecar binds their content keys and persists
         // the restore snapshot under the key of the last one.
         let tokens: Vec<u32> = (0..8u32).collect();
@@ -2486,7 +2501,14 @@ mod tests {
             2
         );
         let restored = store
-            .materialize_slot_from_prefix(0, pool.slot_epoch(0), pool.page_size(), pool.page_indices(0), 8, 8)
+            .materialize_slot_from_prefix(
+                0,
+                pool.slot_epoch(0),
+                pool.page_size(),
+                pool.page_indices(0),
+                8,
+                8,
+            )
             .unwrap();
         assert_eq!(restored.cache_len, 8);
         let kv = mlx::as_dtype(&restored.kv_flat[0], mlx::Dtype::Float32);

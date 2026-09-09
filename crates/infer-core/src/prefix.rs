@@ -288,7 +288,9 @@ impl Engine {
             // Same degrade contract as the sidecar-miss arm above: an
             // admission alloc failure must not propagate into the fatal step
             // path (#164) — undo the attach and full-recompute instead.
-            if let Err(err) = KvAllocator::alloc(&mut *self.kv, slot, restored_len - prefix_match.matched_len) {
+            if let Err(err) =
+                KvAllocator::alloc(&mut *self.kv, slot, restored_len - prefix_match.matched_len)
+            {
                 log::warn!(
                     "prefix-restore grow alloc failed for slot {slot}: {err:#}; \
                      full recompute fallback"

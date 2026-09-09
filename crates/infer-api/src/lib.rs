@@ -59,6 +59,8 @@ pub const fn kernel_capabilities() -> &'static str {
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
 pub use loaded::LoadedInferenceEngine;
+#[cfg(feature = "cuda")]
+pub use loaded::build_cuda_engine;
 /// Multiproc-serve spawn gate: which CUDA checkpoints join the env-driven TP
 /// world (DSv4 + Qwen3.5/3.6 MoE). Consumed by `cli::serve_multiproc`.
 #[cfg(feature = "cuda")]
@@ -67,8 +69,6 @@ pub use loaded::{
     BackendBuilderFn, EngineLoadConfig, KvCacheDtype, KvTierBudget, default_backend,
     is_backend_registered, register_backend,
 };
-#[cfg(feature = "cuda")]
-pub use loaded::build_cuda_engine;
 #[cfg(feature = "cuda")]
 pub use serve::serve_coordinator_http_dp;
 pub use serve::{

@@ -612,7 +612,10 @@ impl InferenceEngine for ServeInferenceEngine {
     fn supports_multimodal_chat(&self) -> bool {
         self.serve
             .run_on_executor(|executor| {
-                executor.multimodal().and_then(|mm| mm.multimodal_kind()).is_some()
+                executor
+                    .multimodal()
+                    .and_then(|mm| mm.multimodal_kind())
+                    .is_some()
             })
             .unwrap_or(false)
     }

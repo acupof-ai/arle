@@ -471,8 +471,8 @@ mod tests {
     use crate::{Engine, RequestHandle, RequestPhase, RequestState, SchedulerConfig};
     use infer_plan::SamplingParams;
     use infer_seam::{
-        BackendExecutor, HostPagedKvPool, KvAllocator, KvBatchDescriptor, KvSlotAccounting, KvSlotTier,
-        PollResult, PrefixBlock, PrefixReuse,
+        BackendExecutor, HostPagedKvPool, KvAllocator, KvBatchDescriptor, KvSlotAccounting,
+        KvSlotTier, PollResult, PrefixBlock, PrefixReuse,
     };
 
     #[derive(Default)]

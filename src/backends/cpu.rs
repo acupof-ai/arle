@@ -3,9 +3,9 @@
 
 use anyhow::Result;
 use infer_api::EngineLoadConfig;
+use infer_metal::MetalExecutor;
 use infer_seam::HostPagedKvPool;
 use infer_server::{OpenAiTokenizer, ServeHandle, ServeShutdown};
-use infer_metal::MetalExecutor;
 
 pub(crate) fn build(
     model_path: &str,

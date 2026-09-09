@@ -175,9 +175,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
 
     eprintln!(
         "[ARLE serve] starting {} backend in-process on {}:{}",
-        config.backend,
-        config.options.bind,
-        config.options.port,
+        config.backend, config.options.bind, config.options.port,
     );
 
     // `--dspark-markov-init` installs a saved Markov head over the draft
@@ -224,8 +222,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
 
 fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, String> {
     let backend = resolve_backend(serve_args.backend)?;
-    let backend_name = backend
-        .map_or_else(infer_api::default_backend, |b| b.label().to_string());
+    let backend_name = backend.map_or_else(infer_api::default_backend, |b| b.label().to_string());
 
     let model_path = serve_args
         .model_path

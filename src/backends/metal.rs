@@ -7,13 +7,12 @@ use std::path::Path;
 
 use anyhow::Result;
 use infer_api::EngineLoadConfig;
+use infer_metal::{
+    MetalDeepseekOcrModel, MetalExecutor, MetalKvCacheDtype, MetalKvPool, MetalResourceRequest,
+    MetalWeightOnlyResourceRequest, plan_resource_budget, plan_weight_only_resource_budget,
+};
 use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool};
 use infer_server::{OpenAiTokenizer, ServeHandle, ServeShutdown};
-use infer_metal::{
-    MetalDeepseekOcrModel, MetalExecutor, MetalKvCacheDtype, MetalKvPool,
-    MetalResourceRequest, MetalWeightOnlyResourceRequest, plan_resource_budget,
-    plan_weight_only_resource_budget,
-};
 
 pub(crate) fn build(
     model_path: &str,
