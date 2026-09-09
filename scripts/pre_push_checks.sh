@@ -86,7 +86,8 @@ run_fast_checks() {
         test_lever_gate.sh \
         test_kernel_artifact_qualification.sh \
         test_validate_release.sh \
-        test_pod_flow.sh; do
+        test_pod_flow.sh \
+        test_hook_disowns_git_env.sh; do
         run bash "scripts/tests/${test}"
     done
 }

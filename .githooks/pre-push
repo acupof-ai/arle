@@ -4,11 +4,19 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# core.bare has been flipped to true on the shared config repeatedly, breaking
-# every worktree, and the writer is unidentified: the pre-push hook receives no
-# GIT_DIR (only GIT_EDITOR, GIT_PREFIX, GIT_EXEC_PATH), so the GIT_DIR
-# inheritance theory does not apply here. Bracket the next occurrence instead of
-# guessing — the log lives outside the repo so a checkout cannot lose it.
+# A push from a WORKTREE exports GIT_DIR=<repo>/.git/worktrees/<name> to this
+# hook (a push from the main checkout exports none, which is why probing there
+# showed nothing). Its basename is the worktree name, not ".git", and git
+# decides bare-vs-not by that basename — so any `git init` in a subprocess
+# below here reinitializes the SHARED config as bare and every worktree then
+# fails with "this operation must be run in a work tree". Disown at the
+# boundary; the checks below discover the repo from the working directory.
+while IFS='=' read -r name _; do
+    case "$name" in GIT_*) unset "$name" ;; esac
+done < <(env)
+
+# The disown above is the fix; this log stays as its ongoing proof, outside
+# the repo so a checkout cannot lose it.
 BARE_LOG="${TMPDIR:-/tmp}/arle-core-bare.log"
 bare_now() { git --git-dir="${REPO_ROOT}/.git" config core.bare 2>/dev/null || echo "?"; }
 printf '%s enter pid=%s bare=%s\n' "$(date -u +%FT%TZ)" "$$" "$(bare_now)" >> "$BARE_LOG"
