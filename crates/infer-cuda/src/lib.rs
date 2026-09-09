@@ -47,6 +47,11 @@ mod quant_format;
 // gated (device kernels + DSv4 weight matrices).
 #[cfg(feature = "cuda")]
 mod hc;
+// `arle kernel <name>`: one-kernel runner against a CPU f32 reference.
+#[cfg(feature = "cuda")]
+mod kernel_bench;
+#[cfg(feature = "cuda")]
+pub use kernel_bench::run_kernel_bench;
 #[cfg(feature = "cuda")]
 mod linear_profile;
 #[cfg(feature = "cuda")]

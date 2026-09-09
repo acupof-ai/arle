@@ -427,6 +427,28 @@ pub(crate) enum CliCommand {
     Train(Box<TrainArgs>),
     /// Model utilities (download from Hugging Face).
     Model(Box<ModelArgs>),
+    /// Run one registered CUDA kernel against a CPU f32 reference.
+    Kernel(Box<KernelArgs>),
+}
+
+/// `arle kernel <name> --shape M,N,K`: one kernel run alone, printing its
+/// device time and max relative error against a CPU f32 reference.
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct KernelArgs {
+    /// Registered kernel name (an unknown name lists the registry).
+    pub(crate) name: String,
+
+    /// Problem dims as M,N,K (e.g. 1,34816,5120).
+    #[arg(long)]
+    pub(crate) shape: String,
+
+    /// Reference implementation. Only `cpu` exists today.
+    #[arg(long = "ref", default_value = "cpu")]
+    pub(crate) reference: String,
+
+    /// Timed launches; the mean device time is reported.
+    #[arg(long, default_value_t = 20)]
+    pub(crate) iters: usize,
 }
 
 /// OCR mode → prompt preset for DeepSeek-OCR.
