@@ -15,6 +15,7 @@ fi
 # Per-lane tree: running pod.sh from a lane worktree defaults to that lane's
 # remote tree, so one lane's sync cannot land between another lane's sync and
 # build. Override with POD_TREE/NODE_TREE (must be set together, checked above).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 _lane_tree=""
 if [ -z "${POD_TREE:-}" ] && [ -z "${NODE_TREE:-}" ]; then
   case "$ROOT" in
@@ -29,7 +30,6 @@ else
   TREE="${POD_TREE:-/host/arle-build}"
 fi
 STATE="${POD_STATE:-/root/arle-ops}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cmd="${1:-help}"
 shift || true
 
