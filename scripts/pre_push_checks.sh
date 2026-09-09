@@ -136,8 +136,8 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     run cargo clippy -p infer-api --no-default-features --features no-cuda --lib -- -D warnings
     run cargo clippy -p cli --no-default-features --features no-cuda -- -D warnings
     run cargo clippy -p arle --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
-    run cargo clippy -p autograd --features no-cuda --lib -- -D warnings
-    run cargo clippy -p train --features no-cuda --lib -- -D warnings
+    run cargo clippy -p autograd --features no-cuda --all-targets -- -D warnings
+    run cargo clippy -p train --features no-cuda --all-targets -- -D warnings
     run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys -p infer-quant
     run cargo test \
         -p infer-core -p infer-server -p infer-plan -p infer-kvspace -p infer-seam \
@@ -152,6 +152,9 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     # no longer resolves.
     if [[ "$(uname -s)" == "Darwin" ]]; then
         run cargo check -p infer-metal --no-default-features --features metal
+        # Examples have no other compile gate; only the Metal lane carries the
+        # feature this one needs.
+        run cargo build -p cli --example metal_kv_memory_probe --no-default-features --features metal,no-cuda
     fi
 else
     info "skipping cargo steps (docs/config-only push)"

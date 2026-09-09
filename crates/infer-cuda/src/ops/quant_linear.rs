@@ -16,8 +16,8 @@ mod fp8;
 #[path = "quant_linear_int.rs"]
 mod int;
 
-pub(crate) use fp4::{fp4_deepgemm_available, warm_fp4_deepgemm_dense};
-pub(crate) use fp8::{fp8_deepgemm_per_channel_available, warm_fp8_deepgemm_dense};
+pub(crate) use fp4::warm_fp4_deepgemm_dense;
+pub(crate) use fp8::{qwen_fp8_deepgemm_dense_enabled, warm_fp8_deepgemm_dense};
 
 // Only POLICY_ID is read here (stats hash); the route policy lives in fp8.
 mod qwen_fp8_dense_policy {
@@ -457,17 +457,15 @@ mod tests {
                 Fp4Query {
                     marlin_ready: true,
                     sfb: false,
-                    prefill_shape: false,
                 },
                 1,
             ),
             Fp4Route::Marlin
         );
-        // sfb + prefill shape: DeepGEMM at/above its floor, Marlin below.
+        // sfb built by the layout plan: DeepGEMM at/above its floor, Marlin below.
         let prefill = Fp4Query {
             marlin_ready: true,
             sfb: true,
-            prefill_shape: true,
         };
         assert_eq!(fp4::fp4_route(prefill, 512), Fp4Route::DeepGemm);
         assert_eq!(fp4::fp4_route(prefill, 511), Fp4Route::Marlin);

@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 #[path = "ops/quant_linear.rs"]
 mod quant_linear;
+pub(crate) use quant_linear::qwen_fp8_deepgemm_dense_enabled;
 pub(crate) use quant_linear::qwen_fp8_dense_operator_stats;
 
 fn qwen_gemm_profile_enabled() -> bool {
@@ -175,21 +176,6 @@ pub(crate) fn warm_fp8_deepgemm_dense(
     seq_len: usize,
 ) -> Result<bool> {
     quant_linear::warm_fp8_deepgemm_dense(ctx, weight, seq_len)
-}
-
-/// Whether the NVFP4 DeepGEMM prefill arm can serve this weight at some M — the
-/// loader's test for building its `sfb`.
-pub(crate) fn fp4_deepgemm_available(ctx: &DeviceContext, weight: &DeviceMatrix) -> bool {
-    quant_linear::fp4_deepgemm_available(ctx, weight)
-}
-
-/// Whether the per-channel FP8 DeepGEMM prefill arm can serve this weight at
-/// some M — the loader's test for setting `fp8_deepgemm_prefill`.
-pub(crate) fn fp8_deepgemm_per_channel_available(
-    ctx: &DeviceContext,
-    weight: &DeviceMatrix,
-) -> bool {
-    quant_linear::fp8_deepgemm_per_channel_available(ctx, weight)
 }
 
 /// Load-time gate: every M the quant dispatcher can be handed must have a

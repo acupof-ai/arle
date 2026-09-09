@@ -95,8 +95,8 @@ jobs:
           cargo clippy -p infer-api --no-default-features --features no-cuda --lib -- -D warnings
           cargo clippy -p cli --no-default-features --features no-cuda -- -D warnings
           cargo clippy -p arle --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
-          cargo clippy -p autograd --features no-cuda --lib -- -D warnings
-          cargo clippy -p train --features no-cuda --lib -- -D warnings
+          cargo clippy -p autograd --features no-cuda --all-targets -- -D warnings
+          cargo clippy -p train --features no-cuda --all-targets -- -D warnings
           cargo clippy -p kv-native-sys --all-targets -- -D warnings
 
       # The ONLY automated gate for the CUDA-Rust surface: there is no GPU CI

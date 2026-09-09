@@ -153,7 +153,7 @@ fn sfb_ones_len(n: usize, k: usize) -> usize {
     (n.div_ceil(128) + 1) * k.div_ceil(128)
 }
 
-pub(super) fn qwen_fp8_deepgemm_dense_enabled() -> bool {
+pub(crate) fn qwen_fp8_deepgemm_dense_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match cuda_moe::dsv4_deepgemm_native_preflight() {
         Ok(_) => true,
@@ -286,21 +286,6 @@ fn fp8_per_channel_deepgemm_shape(weight: &DeviceMatrix) -> bool {
         && weight.quant_block_k >= weight.cols
         && weight.rows.is_multiple_of(8)
         && weight.cols.is_multiple_of(128)
-}
-
-/// True when the per-channel FP8 DeepGEMM arm can fire for this weight at some
-/// M this engine will actually present. The loader asks this once, at load, and
-/// records the answer in `fp8_deepgemm_prefill`; nothing here can be re-derived
-/// at GEMM time, because the answer also depends on which caller loaded the
-/// weight.
-pub(crate) fn fp8_deepgemm_per_channel_available(
-    ctx: &DeviceContext,
-    weight: &DeviceMatrix,
-) -> bool {
-    fp8_per_channel_deepgemm_shape(weight)
-        && dense_deepgemm_prefill_floor(QWEN_FP8_DEEPGEMM_PER_CHANNEL_MIN_M).is_some()
-        && qwen_fp8_dense_sm_supports_deepgemm(ctx)
-        && qwen_fp8_deepgemm_dense_enabled()
 }
 
 /// The one decision point for both DeepGEMM dense arms, shared by the warm path

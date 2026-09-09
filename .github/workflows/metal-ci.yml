@@ -91,6 +91,11 @@ jobs:
           cargo check -p autograd --release --features metal --lib
           cargo check -p train --release --features metal --lib
 
+      # Examples have no other compile gate; the Metal lane is the only one
+      # that carries the metal feature this one needs.
+      - name: cargo build cli examples (metal)
+        run: cargo build -p cli --example metal_kv_memory_probe --no-default-features --features metal,no-cuda
+
       # Serving is `arle serve` (cli/src/serve.rs); this build is the Metal
       # serve/bench surface and the release-shaped artifact.
       - name: cargo build ARLE CLI
