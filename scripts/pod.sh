@@ -122,7 +122,7 @@ case "$cmd" in
     "$POD" "sccache --show-stats 2>/dev/null | grep -iE 'compile requests|cache hits|cache misses|cache hit rate|stored|errors' | head"
     ;;
   setup-tilelang)
-    "$POD" "bash '$TREE/scripts/pod-tilelang-env.sh'"
+    "$POD" "POD_TREE='$TREE' bash '$TREE/scripts/pod-tilelang-env.sh'"
     ;;
   quantize-w4afp8)
     input="${1:?usage: pod.sh quantize-w4afp8 <input-dir> <output-dir>}"
