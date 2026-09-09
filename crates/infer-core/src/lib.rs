@@ -15,7 +15,7 @@ use radix::{BlockId, PrefixMatch, RadixCache};
 use anyhow::Result;
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
-    AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvAllocator, KvBatchDescriptor, KvPool,
+    AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvBatchDescriptor, KvPool,
     PermissiveGovernor, PollResult, ResourceGovernor, StepBudget,
 };
 
@@ -1274,7 +1274,7 @@ impl Engine {
                 && self.active.contains_key(&row.slot)
                 && self.kv.seq_len(row.slot) > committed_len
             {
-                KvAllocator::truncate_slot(&mut *self.kv, row.slot, committed_len)?;
+                self.kv.truncate_slot(row.slot, committed_len)?;
             }
         }
 

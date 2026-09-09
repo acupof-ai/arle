@@ -3,8 +3,6 @@
 //! Split from the mutating allocation and prefix-store surfaces so the
 //! scheduler can read through this trait alone.
 
-use crate::ShardSpec;
-
 /// Read-only host-indexed KV pool queries visible to engine-core.
 ///
 /// Every method is expressed in host slot ids, page ids, token counts, and
@@ -63,11 +61,5 @@ pub trait KvQuery {
     /// sharding, returns `global_pages`.
     fn shard_local_page_count(&self, global_pages: usize) -> usize {
         global_pages
-    }
-
-    /// The TP shard spec this pool was configured with. The batch captures it
-    /// so backends can slice pre-sharded page lists without pool access.
-    fn shard_spec(&self) -> ShardSpec {
-        ShardSpec::default()
     }
 }

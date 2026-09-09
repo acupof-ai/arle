@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::bail;
 
-use crate::{KvAllocator, KvPrefixStore, KvQuery};
+use crate::{KvAllocator, KvPrefixStore, KvQuery, KvSlotAccounting};
 
 /// Logical-page slot marker for a page that has been **evict-dropped** out of
 /// HBM under the write-through tiered KV model (`KvAllocator::evict_slot_page`).
@@ -290,13 +290,9 @@ impl KvQuery for HostPagedKvPool {
     fn shard_local_page_count(&self, global_pages: usize) -> usize {
         self.shard.local_page_count(global_pages)
     }
-
-    fn shard_spec(&self) -> ShardSpec {
-        self.shard
-    }
 }
 
-impl KvAllocator for HostPagedKvPool {
+impl KvSlotAccounting for HostPagedKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
         if let Some(pages) = self.fixed_pages_per_slot {
             return self.alloc_fixed_band(slot, pages, tokens);
@@ -320,6 +316,31 @@ impl KvAllocator for HostPagedKvPool {
         Ok(())
     }
 
+    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
+        if self.fixed_pages_per_slot.is_some() {
+            if slot >= self.slot_pages.len() {
+                bail!("truncate_slot: slot {slot} out of range");
+            }
+            self.slot_len[slot] = new_len;
+            return Ok(());
+        }
+        let keep_global = self.pages_for_tokens(new_len);
+        let keep_local = self.shard.local_page_count(keep_global);
+        let pages = self
+            .slot_pages
+            .get_mut(slot)
+            .ok_or_else(|| anyhow::anyhow!("truncate_slot: slot {slot} out of range"))?;
+        let cut = keep_local.min(pages.len());
+        let removed: Vec<u32> = pages.split_off(cut);
+        for page in removed {
+            self.detach(page);
+        }
+        self.slot_len[slot] = new_len;
+        Ok(())
+    }
+}
+
+impl KvAllocator for HostPagedKvPool {
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>> {
         if pages > self.free.len() {
             bail!(
@@ -382,29 +403,6 @@ impl KvAllocator for HostPagedKvPool {
         self.attach(page);
         self.slot_pages[slot][logical_page] = page;
         Some(page)
-    }
-
-    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
-        if self.fixed_pages_per_slot.is_some() {
-            if slot >= self.slot_pages.len() {
-                bail!("truncate_slot: slot {slot} out of range");
-            }
-            self.slot_len[slot] = new_len;
-            return Ok(());
-        }
-        let keep_global = self.pages_for_tokens(new_len);
-        let keep_local = self.shard.local_page_count(keep_global);
-        let pages = self
-            .slot_pages
-            .get_mut(slot)
-            .ok_or_else(|| anyhow::anyhow!("truncate_slot: slot {slot} out of range"))?;
-        let cut = keep_local.min(pages.len());
-        let removed: Vec<u32> = pages.split_off(cut);
-        for page in removed {
-            self.detach(page);
-        }
-        self.slot_len[slot] = new_len;
-        Ok(())
     }
 }
 

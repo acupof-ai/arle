@@ -2125,12 +2125,12 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn page_reuse_prunes_stale_prefix_snapshot() {
-        use infer_seam::{KvAllocator, KvQuery};
+        use infer_seam::{KvAllocator, KvQuery, KvSlotAccounting};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(2, 8, 4);
 
-        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
+        pool.alloc(0, 8).unwrap();
         let first_pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state_a = MetalSlotState::from_arrays(
             0,
@@ -2154,7 +2154,7 @@ mod tests {
         // Free slot 0 and allocate slot 1: the LIFO free list recycles the SAME
         // physical page ids (in reversed order) to the new occupant.
         pool.free_slot(0);
-        KvAllocator::alloc(&mut pool, 1, 8).unwrap();
+        pool.alloc(1, 8).unwrap();
         let second_pages: Vec<u32> = pool.page_indices(1).to_vec();
         let sorted = |mut v: Vec<u32>| {
             v.sort_unstable();
@@ -2214,12 +2214,12 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn republish_same_slot_keeps_own_prefix_snapshots() {
-        use infer_seam::{KvAllocator, KvQuery};
+        use infer_seam::{KvQuery, KvSlotAccounting};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
+        pool.alloc(0, 4).unwrap();
         let one_page: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2243,7 +2243,7 @@ mod tests {
         // Second chunk: 8 tokens = 2 pages. Page p0's block is overwritten
         // (insert returns Some) but [p0] is an exact prefix of the live
         // occupant's page list, so its snapshot survives.
-        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
+        pool.alloc(0, 4).unwrap();
         let two_pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2279,12 +2279,12 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn restore_republish_keeps_prior_boundary_snapshots() {
-        use infer_seam::{KvAllocator, KvQuery};
+        use infer_seam::{KvAllocator, KvQuery, KvSlotAccounting};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
+        pool.alloc(0, 4).unwrap();
         let first: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2302,7 +2302,7 @@ mod tests {
         // Next turn: the slot is recycled, restores the shared page, and
         // re-prefills one more page.
         pool.free_slot(0);
-        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
+        pool.alloc(0, 8).unwrap();
         let pages: Vec<u32> = pool.page_indices(0).to_vec();
         assert_eq!(
             pages[0], first[0],
@@ -2340,12 +2340,12 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn sidecar_aliases_snapshots_onto_radix_canonical_chain() {
-        use infer_seam::{KvAllocator, KvQuery};
+        use infer_seam::{KvQuery, KvSlotAccounting};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(2, 16, 4);
 
-        KvAllocator::alloc(&mut pool, 0, 4).unwrap();
+        pool.alloc(0, 4).unwrap();
         let a = pool.page_indices(0)[0];
         let state = MetalSlotState::from_arrays(
             0,
@@ -2360,7 +2360,7 @@ mod tests {
             .unwrap();
 
         // Slot 1 recomputed block 0 (dedup keeps `a`) and added block 1 (`d`).
-        KvAllocator::alloc(&mut pool, 1, 8).unwrap();
+        pool.alloc(1, 8).unwrap();
         let slot_chain: Vec<u32> = pool.page_indices(1).to_vec();
         let d = slot_chain[1];
         let state = MetalSlotState::from_arrays(
@@ -2391,12 +2391,12 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn release_pages_drops_mirrors_and_prefix_snapshots() {
-        use infer_seam::{KvAllocator, KvQuery};
+        use infer_seam::{KvQuery, KvSlotAccounting};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
+        pool.alloc(0, 8).unwrap();
         let pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2437,14 +2437,14 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn ssd_write_through_promotes_released_pages_and_prefix_snapshot() {
-        use infer_seam::{KvAllocator, KvQuery};
+        use infer_seam::{KvQuery, KvSlotAccounting};
         let _guard = mlx_sys::mlx_guard();
         let root = temp_ssd_root("promote");
         let mut store = MetalPageStore::default();
         assert!(store.set_ssd(root.clone(), 8 * 1024 * 1024, 1024, 4, "test-epoch"));
         let mut pool = MetalKvPool::new(1, 8, 4);
 
-        KvAllocator::alloc(&mut pool, 0, 8).unwrap();
+        pool.alloc(0, 8).unwrap();
         let pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state = MetalSlotState::from_arrays(
             0,
@@ -2526,11 +2526,11 @@ mod tests {
 
     #[test]
     fn executor_decode_plumbing_returns_one_token_per_row() {
-        use infer_seam::KvAllocator;
+        use infer_seam::KvSlotAccounting;
         let mut exec = MetalExecutor::new();
         let mut pool = MetalKvPool::new(2, 8, 16);
-        KvAllocator::alloc(&mut pool, 0, 5).unwrap();
-        KvAllocator::alloc(&mut pool, 1, 8).unwrap();
+        pool.alloc(0, 5).unwrap();
+        pool.alloc(1, 8).unwrap();
         let plan = ForwardPlan {
             mode: ForwardMode::Decode,
             decode_rows: vec![
@@ -2567,10 +2567,10 @@ mod tests {
 
     #[test]
     fn executor_prefill_plumbing_returns_completion_token() {
-        use infer_seam::KvAllocator;
+        use infer_seam::KvSlotAccounting;
         let mut exec = MetalExecutor::new();
         let mut pool = MetalKvPool::new(1, 8, 16);
-        KvAllocator::alloc(&mut pool, 0, 3).unwrap();
+        pool.alloc(0, 3).unwrap();
         let plan = ForwardPlan {
             mode: ForwardMode::Prefill,
             decode_rows: Vec::new(),

@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use infer_seam::{BackendExecutor, KvAllocator, KvTierLocation, PrefixBlock};
+use infer_seam::{BackendExecutor, KvTierLocation, PrefixBlock};
 
 use crate::radix::{BlockId, PrefixMatch};
 use crate::{Engine, RequestPhase, RequestState};
@@ -288,9 +288,7 @@ impl Engine {
             // Same degrade contract as the sidecar-miss arm above: an
             // admission alloc failure must not propagate into the fatal step
             // path (#164) — undo the attach and full-recompute instead.
-            if let Err(err) =
-                KvAllocator::alloc(&mut *self.kv, slot, restored_len - prefix_match.matched_len)
-            {
+            if let Err(err) = self.kv.alloc(slot, restored_len - prefix_match.matched_len) {
                 log::warn!(
                     "prefix-restore grow alloc failed for slot {slot}: {err:#}; \
                      full recompute fallback"
@@ -303,7 +301,7 @@ impl Engine {
                 return Ok(0);
             }
         } else if restored_len < prefix_match.matched_len {
-            KvAllocator::truncate_slot(&mut *self.kv, slot, restored_len)?;
+            self.kv.truncate_slot(slot, restored_len)?;
         }
 
         Ok(restored_len)
@@ -328,7 +326,7 @@ impl Engine {
             self.evict_prefix_cache_for_pages(needed - self.kv.free_pages());
         }
 
-        match KvAllocator::alloc(&mut *self.kv, slot, tokens) {
+        match self.kv.alloc(slot, tokens) {
             Ok(()) => Ok(()),
             Err(first_err) => {
                 let needed = self.kv.append_pages_needed(slot, tokens);
@@ -336,7 +334,7 @@ impl Engine {
                 if freed == 0 {
                     return Err(first_err);
                 }
-                KvAllocator::alloc(&mut *self.kv, slot, tokens).map_err(|retry_err| {
+                self.kv.alloc(slot, tokens).map_err(|retry_err| {
                     anyhow!(
                         "KV alloc retry failed after freeing {freed} pages: first error: {first_err}; retry error: {retry_err}"
                     )

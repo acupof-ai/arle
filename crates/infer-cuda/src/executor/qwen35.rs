@@ -268,12 +268,15 @@ impl Qwen35CudaExecutor {
             .row_for_slot(slot)
             .ok_or_else(|| anyhow!("mirror_host_slot: no batch row for slot {slot}"))?;
         let local_pages = &kv_batch.flat_local_page_ids[brow.local_page_range.clone()];
+        // world/rank is a construction-time parameter of this executor, not
+        // per-step batch data — slice with the executor's own shard spec.
+        let (rank, size) = self.kv_shard_spec().unwrap_or((0, 1));
         let pool = self
             .full_attn_kv
             .as_mut()
             .expect("full_attn_kv present (full_attn_paged)");
         let global_pages = seq_len.div_ceil(pool.page_size);
-        let need = kv_batch.shard.local_page_count(global_pages);
+        let need = global_pages.saturating_sub(rank).div_ceil(size);
         ensure!(
             local_pages.len() >= need,
             "batch holds {} local pages for slot {slot}, {need} needed to cover {seq_len} tokens",

@@ -6,7 +6,7 @@
 //! any type implementing all three, so backends implement the three pieces and
 //! engine-core can still hold `&mut dyn KvPool` without knowing the backend.
 
-use crate::{KvAllocator, KvPrefixStore, KvQuery, KvSlotAccounting};
+use crate::{KvAllocator, KvPrefixStore, KvQuery};
 
 /// Host-indexed KV pool surface visible to engine-core.
 ///
@@ -15,8 +15,9 @@ use crate::{KvAllocator, KvPrefixStore, KvQuery, KvSlotAccounting};
 /// `&mut dyn KvPool` without knowing the backend.
 ///
 /// `KvSlotAccounting` is the narrowed write surface `BackendExecutor::submit`
-/// takes; it is a strict subset of `KvAllocator`, so the supertrait bound lets
-/// `&mut dyn KvPool` upcast to it at the engine-core call site.
-pub trait KvPool: KvQuery + KvAllocator + KvPrefixStore + KvSlotAccounting {}
+/// takes; it is a strict subset of `KvAllocator`, so the supertrait chain
+/// (`KvPool: KvAllocator: KvSlotAccounting`) lets `&mut dyn KvPool` upcast to
+/// it at the engine-core call site.
+pub trait KvPool: KvQuery + KvAllocator + KvPrefixStore {}
 
 impl<T: KvQuery + KvAllocator + KvPrefixStore> KvPool for T {}

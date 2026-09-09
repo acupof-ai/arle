@@ -775,7 +775,7 @@ mod real {
                 row.start_pos,
                 row.slot
             );
-            KvAllocator::alloc(kv, row.slot, row.tokens.len())?;
+            kv.alloc(row.slot, row.tokens.len())?;
         }
         for row in &plan.decode_rows {
             anyhow::ensure!(
@@ -785,7 +785,7 @@ mod real {
                 row.kv_seq_len,
                 row.slot
             );
-            KvAllocator::alloc(kv, row.slot, 1)?;
+            kv.alloc(row.slot, 1)?;
         }
         Ok(())
     }

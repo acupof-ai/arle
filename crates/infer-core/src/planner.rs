@@ -471,8 +471,8 @@ mod tests {
     use crate::{Engine, RequestHandle, RequestPhase, RequestState, SchedulerConfig};
     use infer_plan::SamplingParams;
     use infer_seam::{
-        BackendExecutor, HostPagedKvPool, KvAllocator, KvBatchDescriptor, KvSlotAccounting,
-        KvSlotTier, PollResult, PrefixBlock, PrefixReuse,
+        BackendExecutor, HostPagedKvPool, KvBatchDescriptor, KvSlotAccounting, KvSlotTier,
+        PollResult, PrefixBlock, PrefixReuse,
     };
 
     #[derive(Default)]
@@ -630,7 +630,7 @@ mod tests {
             SamplingParams::default(),
         );
         req.phase = RequestPhase::Prefilling { progress: 0 };
-        KvAllocator::alloc(&mut *engine.kv, 0, 64)?;
+        engine.kv.alloc(0, 64)?;
         engine.active.insert(0, req);
 
         let mut plan = engine.build_forward_plan();
@@ -648,8 +648,8 @@ mod tests {
         // Pool fully committed: 2 decoding slots x 4 pages, 0 free. Each decode
         // row needs 1 more page, so demand 2 > capacity 0 with no prefill row
         // to shed: the repair preempts the shorter-generation victim.
-        KvAllocator::alloc(&mut *engine.kv, 0, 64)?;
-        KvAllocator::alloc(&mut *engine.kv, 1, 64)?;
+        engine.kv.alloc(0, 64)?;
+        engine.kv.alloc(1, 64)?;
         engine.active.insert(0, decoding_request(0, 48, 16));
         engine.active.insert(1, decoding_request(1, 48, 32));
 
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn park_demotes_decoding_slot_and_frees_pages() -> anyhow::Result<()> {
         let mut engine = engine_with_pool(8, Some(MockSlotTier::default()), true)?;
-        KvAllocator::alloc(&mut *engine.kv, 0, 48)?; // 3 pages, seq_len 48
+        engine.kv.alloc(0, 48)?; // 3 pages, seq_len 48
         engine.active.insert(0, decoding_request(0, 32, 16));
 
         assert!(engine.try_park_for_oversubscription(0));
@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn park_refuses_non_decoding_slot() -> anyhow::Result<()> {
         let mut engine = engine_with_pool(8, Some(MockSlotTier::default()), true)?;
-        KvAllocator::alloc(&mut *engine.kv, 0, 48)?;
+        engine.kv.alloc(0, 48)?;
         let mut req = decoding_request(0, 32, 16);
         req.phase = RequestPhase::Prefilling { progress: 0 };
         engine.active.insert(0, req);
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn invalidate_prefix_cache_drains_all_cached_blocks() -> anyhow::Result<()> {
         let mut engine = engine_with_pool(8, None, false)?;
-        KvAllocator::alloc(&mut *engine.kv, 0, 32)?; // 2 pages at 16 tokens/page
+        engine.kv.alloc(0, 32)?; // 2 pages at 16 tokens/page
         let tokens: Vec<u32> = (0..32).collect();
         let published = engine.publish_prefix_blocks(0, &tokens);
         assert!(!published.is_empty());
@@ -738,7 +738,7 @@ mod tests {
             }),
             true,
         )?;
-        KvAllocator::alloc(&mut *engine.kv, 0, 48)?;
+        engine.kv.alloc(0, 48)?;
         engine.active.insert(0, decoding_request(0, 32, 16));
 
         assert!(!engine.try_park_for_oversubscription(0));

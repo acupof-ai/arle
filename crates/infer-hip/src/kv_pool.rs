@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use deepseek_spec::v4::DeepSeekV4Config;
-use infer_seam::{KvAllocator, KvPrefixStore, KvQuery};
+use infer_seam::{KvAllocator, KvPrefixStore, KvQuery, KvSlotAccounting};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dsv4CompressorShapeElems {
@@ -201,7 +201,7 @@ impl KvQuery for HipKvPool {
     }
 }
 
-impl KvAllocator for HipKvPool {
+impl KvSlotAccounting for HipKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
         let max_seq_len = self.total_pages * self.page_size;
         if self.seq_len(slot) + tokens > max_seq_len {
@@ -225,6 +225,23 @@ impl KvAllocator for HipKvPool {
         Ok(())
     }
 
+    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
+        let keep_pages = self.pages_for_tokens(new_len);
+        let pages = self
+            .slot_pages
+            .get_mut(slot)
+            .ok_or_else(|| anyhow::anyhow!("truncate_slot: slot {slot} out of range"))?;
+        let cut = keep_pages.min(pages.len());
+        let removed: Vec<u32> = pages.split_off(cut);
+        for page in removed {
+            self.reclaim_page(page);
+        }
+        self.slot_len[slot] = new_len;
+        Ok(())
+    }
+}
+
+impl KvAllocator for HipKvPool {
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>> {
         if pages > self.free.len() {
             anyhow::bail!(
@@ -251,21 +268,6 @@ impl KvAllocator for HipKvPool {
         }
         self.slot_len[slot] = 0;
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
-    }
-
-    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
-        let keep_pages = self.pages_for_tokens(new_len);
-        let pages = self
-            .slot_pages
-            .get_mut(slot)
-            .ok_or_else(|| anyhow::anyhow!("truncate_slot: slot {slot} out of range"))?;
-        let cut = keep_pages.min(pages.len());
-        let removed: Vec<u32> = pages.split_off(cut);
-        for page in removed {
-            self.reclaim_page(page);
-        }
-        self.slot_len[slot] = new_len;
-        Ok(())
     }
 }
 

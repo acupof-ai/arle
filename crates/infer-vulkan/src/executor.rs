@@ -410,7 +410,10 @@ mod tests {
     fn idle_plan_returns_empty_output() {
         let mut exec = VulkanExecutor::unloaded();
         let mut pool = pool();
-        let inflight = exec.submit(&ForwardPlan::idle(), &mut pool).unwrap();
+        let batch = KvBatchDescriptor::from_plan(&ForwardPlan::idle(), &pool).unwrap();
+        let inflight = exec
+            .submit(&ForwardPlan::idle(), &batch, &mut pool)
+            .unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => assert!(out.tokens.is_empty()),
             PollResult::NotReady(_) => panic!("P2 resolves synchronously"),
@@ -421,9 +424,15 @@ mod tests {
     fn unloaded_executor_errors_clearly() {
         let mut exec = VulkanExecutor::unloaded();
         let mut pool = pool();
-        let err = exec.submit(&one_row_plan(false), &mut pool).unwrap_err();
+        pool.alloc(0, 3).unwrap();
+        let prefill = one_row_plan(false);
+        let batch = KvBatchDescriptor::from_plan(&prefill, &pool).unwrap();
+        let err = exec.submit(&prefill, &batch, &mut pool).unwrap_err();
         assert!(err.to_string().contains("no model loaded"), "{err}");
-        let err = exec.submit(&one_row_plan(true), &mut pool).unwrap_err();
+        pool.alloc(0, 1).unwrap();
+        let decode = one_row_plan(true);
+        let batch = KvBatchDescriptor::from_plan(&decode, &pool).unwrap();
+        let err = exec.submit(&decode, &batch, &mut pool).unwrap_err();
         assert!(err.to_string().contains("no model loaded"), "{err}");
     }
 

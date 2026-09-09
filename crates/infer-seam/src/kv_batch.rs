@@ -9,7 +9,7 @@ use std::ops::Range;
 use anyhow::{Result, ensure};
 use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow};
 
-use crate::{KvPool, ShardSpec};
+use crate::KvPool;
 
 /// Host-only batch view over the rows scheduled in one forward step.
 ///
@@ -37,10 +37,6 @@ pub struct KvBatchDescriptor {
     pub flat_local_page_ids: Vec<u32>,
     /// Pool page size, captured once at construction.
     pub page_size: usize,
-    /// TP shard spec, captured once at construction. Backends use it to slice
-    /// pre-sharded `flat_local_page_ids` to the exact count a target length
-    /// needs — the sharding itself was resolved above the seam.
-    pub shard: ShardSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +73,7 @@ impl KvBatchDescriptor {
         self.rows.iter().find(|r| r.slot == slot)
     }
 
-    /// The engine calls this after [`KvPool::alloc`](crate::KvAllocator::alloc)
+    /// The engine calls this after [`KvPool::alloc`](crate::KvSlotAccounting::alloc)
     /// has reserved the row's output span, so the pool length must cover
     /// `append_pos + append_len`.
     pub fn from_plan(plan: &ForwardPlan, kv: &dyn KvPool) -> Result<Self> {
@@ -89,7 +85,6 @@ impl KvBatchDescriptor {
             flat_slot_page_ids: Vec::new(),
             flat_local_page_ids: Vec::new(),
             page_size: kv.page_size(),
-            shard: kv.shard_spec(),
         };
 
         for row in &plan.prefill_rows {
@@ -147,7 +142,6 @@ impl KvBatchDescriptor {
             flat_slot_page_ids: Vec::new(),
             flat_local_page_ids: Vec::new(),
             page_size: self.page_size,
-            shard: self.shard,
         };
         let mut has_prefill = false;
         let mut has_decode = false;
