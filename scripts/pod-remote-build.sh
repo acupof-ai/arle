@@ -12,6 +12,13 @@ ensure_safe_directory() {
   git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$TREE" ||
     git config --global --add safe.directory "$TREE" 2>/dev/null || true
 }
+# Digest in the mode matching the sync that wrote the receipt: a clean sync
+# counts committed + generated/ (CLEAN=1), a dirty sync counts the working
+# tree (default). Using the wrong mode excludes/includes generated/ and
+# mismatches every clean sync once the AOT bundle is present.
+source_digest_for() {  # $1 = dirty flag from the receipt/meta
+  if [ "$1" = 1 ]; then source_digest; else CLEAN=1 source_digest; fi
+}
 
 proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
@@ -241,7 +248,7 @@ case "${1:-}" in
     fi
     actual_head="$(git -C "$TREE" rev-parse HEAD)"
     expected_digest="$(awk -F= '$1=="dirty_digest" {print $2}' "$meta")"
-    actual_digest="$(source_digest)"
+    actual_digest="$(source_digest_for "$dirty")"
     if [ "$actual_head" != "$head" ] || [ "$actual_digest" != "$expected_digest" ]; then
       # Name the offenders before rolling back. A digest mismatch is almost
       # always a stray untracked file left in the remote tree (a probe, a dump,
@@ -301,9 +308,11 @@ case "${1:-}" in
     else
       source_head="$(awk -F= '$1=="head" {print $2}' "$source_receipt")"
       source_digest_value="$(awk -F= '$1=="digest" {print $2}' "$source_receipt")"
+      source_dirty="$(awk -F= '$1=="dirty" {print $2}' "$source_receipt")"
+      source_dirty="${source_dirty:-0}"
       exec 9>"$TREE_LOCK"
       flock 9
-      if [ "$(git rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then
+      if [ "$(git rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest_for "$source_dirty")" != "$source_digest_value" ]; then
         echo "source changed since receipt"
       else
         # shellcheck disable=SC2016
