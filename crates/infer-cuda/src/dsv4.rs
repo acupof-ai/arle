@@ -47,12 +47,17 @@ pub(crate) use forward_state::*;
 pub(crate) use load::load_dspark_draft;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 pub(crate) use mega_moe::Dsv4MegaMoeTransport;
-pub(crate) use mtp::*;
 use probe::Dsv4ProbeCapture;
 pub(crate) use slot::*;
 pub(crate) use slot_image::*;
-pub(crate) use spec_verify::*;
 pub(crate) use weights::*;
+
+// Step-level spec scheduling lives in infer-plan (backend-neutral, tested on
+// Mac); re-exported here so `crate::dsv4::` paths stay stable.
+pub(crate) use infer_plan::{
+    DEFAULT_SPEC_DRAFT_DEPTH, DEFAULT_SPEC_DRAFT_TOPK, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS,
+    MtpDraftRow, SpecVerifySchedule,
+};
 
 pub(crate) struct Dsv4Model {
     pub ctx: DeviceContext,

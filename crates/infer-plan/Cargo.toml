@@ -10,6 +10,7 @@ default = []
 serde = ["dep:serde"]
 
 [dependencies]
+anyhow = "1.0"
 serde = { workspace = true, optional = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 

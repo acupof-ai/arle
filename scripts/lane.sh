@@ -95,6 +95,12 @@ pr)
             echo "lane: rebase stopped with conflicts in $path — resolve, then rerun" >&2; exit 2; }
     fi
     git -C "$path" push -u --force-with-lease origin "lane/$name"
+    # A push can look successful and not take: the hook passing says nothing
+    # about bytes reaching the remote (a kill between hook and upload leaves
+    # the remote ref untouched). Verify the ref itself, not the exit code.
+    want="$(git -C "$path" rev-parse HEAD)"
+    got="$(git -C "$path" ls-remote origin "refs/heads/lane/$name" | cut -f1)"
+    [ "$want" = "$got" ] || { echo "[lane] push did not take: remote=$got want=$want" >&2; exit 1; }
     title="${3:-$(git -C "$path" log -1 --pretty=%s)}"
     gh pr create --repo "$(git -C "$ROOT" remote get-url origin | sed 's#.*[:/]\([^/]*/[^/]*\)\.git#\1#')" \
         --base main --head "lane/$name" --title "$title" \

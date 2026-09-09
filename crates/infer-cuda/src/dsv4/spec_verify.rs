@@ -1,58 +1,6 @@
 use super::layer_block::HcHalf;
 use super::*;
 
-/// `topk` widens candidate matching only; verifier rows remain chain-shaped.
-pub(crate) const MAX_SPEC_DRAFT_DEPTH: usize = 8;
-/// Bounded chain verifier rows per slot. MTP uses `depth + 1`; `topk` adds none.
-pub(crate) const MAX_SPEC_VERIFY_ROWS: usize = 64;
-pub(crate) const DEFAULT_SPEC_DRAFT_DEPTH: usize = 2;
-
-pub(crate) const DEFAULT_SPEC_DRAFT_TOPK: usize = 1;
-
-/// Row schedule for one speculative verify forward. `ancestors` is the prefix
-/// metadata the batched FlashMLA sparse verify lane reads: row `r` attends
-/// committed KV plus the listed earlier chunk rows and self.
-pub(crate) struct SpecVerifySchedule {
-    /// Per row: absolute position (`start_pos + node depth`).
-    pub(crate) positions: Vec<usize>,
-    /// Per row: chunk-row ancestors, shallow to deep, self excluded.
-    pub(crate) ancestors: Vec<Vec<usize>>,
-}
-
-impl SpecVerifySchedule {
-    pub(crate) fn validate_sparse_at(&self, start_pos: usize) -> Result<()> {
-        ensure!(
-            !self.positions.is_empty() && self.positions.len() == self.ancestors.len(),
-            "DSv4 sparse verify schedule shape mismatch: positions={} ancestors={}",
-            self.positions.len(),
-            self.ancestors.len()
-        );
-        ensure!(
-            self.positions.len() <= MAX_SPEC_VERIFY_ROWS,
-            "DSv4 sparse verify rows {} exceed fold cache rows {MAX_SPEC_VERIFY_ROWS}",
-            self.positions.len()
-        );
-        for (row, &pos) in self.positions.iter().enumerate() {
-            ensure!(
-                pos >= start_pos,
-                "DSv4 sparse verify row {row} position {pos} precedes start_pos {start_pos}"
-            );
-            for &ancestor in &self.ancestors[row] {
-                ensure!(
-                    ancestor < row,
-                    "DSv4 sparse verify row {row} has non-causal ancestor row {ancestor}"
-                );
-                ensure!(
-                    self.positions[ancestor] < pos,
-                    "DSv4 sparse verify row {row} position {pos} ancestor {ancestor} position {} is not earlier",
-                    self.positions[ancestor]
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
 pub(crate) struct SpecVerifyResult {
     pub(crate) logits: HiddenStates,
     pub(crate) argmax: Vec<u32>,

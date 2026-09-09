@@ -6,185 +6,13 @@
 
 use anyhow::{Result, anyhow, ensure};
 
-use crate::dsv4::SpecVerifySchedule;
+use infer_plan::DraftChain;
 
 use super::{DeviceVec, Dsv4CudaExecutor};
 
-/// Both CUDA executors resolve this from their own state (`dspark`/`mtp`
-/// handles).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SpecKind {
-    None,
-    Mtp,
-    Dspark,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DecodeRoute {
-    Plain,
-    /// c=1 / low-concurrency win.
-    Mtp,
-    /// c=1 / low-concurrency win.
-    Dspark,
-}
-
-/// Speculate only at or below the concurrency gate. At small batch the GPU is
-/// memory-bound and the B+1 verify positions are ~free, so speculation wins;
-/// above the gate the target forward is compute-bound and the same verify costs
-/// ~(B+1)× step time for ~2.5 committed tokens, a net loss — so fall back to the
-/// plain batched path that scales. `gate` is `--spec-max-batch` (default 1).
-/// Pure so the routing is unit-tested without a GPU.
-///
-/// `vetoed` covers request features the selected speculative implementation
-/// cannot apply to every accepted token in a chain.
-pub(super) fn route_decode(
-    spec_kind: SpecKind,
-    n_rows: usize,
-    gate: usize,
-    vetoed: bool,
-) -> DecodeRoute {
-    if vetoed || n_rows > gate {
-        return DecodeRoute::Plain;
-    }
-    match spec_kind {
-        SpecKind::Dspark => DecodeRoute::Dspark,
-        SpecKind::Mtp => DecodeRoute::Mtp,
-        SpecKind::None => DecodeRoute::Plain,
-    }
-}
-
-struct DraftNode {
-    token: u32,
-    parent: Option<usize>,
-    depth: usize,
-}
-
-struct DraftChain {
-    nodes: Vec<DraftNode>,
-    candidates: Vec<Vec<u32>>,
-    depth: usize,
-}
-
-impl DraftChain {
-    fn verify_schedule(&self, start_pos: usize) -> SpecVerifySchedule {
-        let mut positions = Vec::with_capacity(self.nodes.len());
-        let mut ancestors = Vec::with_capacity(self.nodes.len());
-        for row in 0..self.nodes.len() {
-            let node = &self.nodes[row];
-            positions.push(start_pos + node.depth);
-            let mut path = Vec::with_capacity(node.depth);
-            let mut cur = node.parent;
-            while let Some(parent) = cur {
-                path.push(parent);
-                cur = self.nodes[parent].parent;
-            }
-            path.reverse();
-            ancestors.push(path);
-        }
-        SpecVerifySchedule {
-            positions,
-            ancestors,
-        }
-    }
-
-    fn validate(&self) -> Result<()> {
-        ensure!(!self.nodes.is_empty(), "DSv4 MTP draft chain is empty");
-        ensure!(
-            self.nodes[0].parent.is_none() && self.nodes[0].depth == 0,
-            "DSv4 MTP draft chain root is malformed"
-        );
-        ensure!(
-            self.nodes.len() == self.depth + 1,
-            "DSv4 MTP draft chain rows {} != depth {} + 1",
-            self.nodes.len(),
-            self.depth
-        );
-        ensure!(
-            self.candidates.len() == self.depth,
-            "DSv4 MTP draft candidate rows {} != depth {}",
-            self.candidates.len(),
-            self.depth
-        );
-        for (idx, node) in self.nodes.iter().enumerate().skip(1) {
-            let parent = node
-                .parent
-                .ok_or_else(|| anyhow!("DSv4 MTP draft node {idx} has no parent"))?;
-            ensure!(
-                parent + 1 == idx,
-                "DSv4 MTP draft chain node {idx} parent {parent} is not previous row"
-            );
-            ensure!(
-                node.depth == self.nodes[parent].depth + 1,
-                "DSv4 MTP draft node {idx} depth {} != parent depth {} + 1",
-                node.depth,
-                self.nodes[parent].depth
-            );
-        }
-        for (row, candidates) in self.candidates.iter().enumerate() {
-            ensure!(
-                !candidates.is_empty(),
-                "DSv4 MTP draft candidate row {row} is empty"
-            );
-            ensure!(
-                candidates[0] == self.nodes[row + 1].token,
-                "DSv4 MTP draft row {row} top1 {} != chain token {}",
-                candidates[0],
-                self.nodes[row + 1].token
-            );
-        }
-        Ok(())
-    }
-
-    fn tokens(&self) -> Vec<u32> {
-        self.nodes.iter().map(|node| node.token).collect()
-    }
-
-    fn accept_path(&self, argmax: &[u32]) -> Result<(Vec<usize>, u32, usize, bool)> {
-        ensure!(
-            argmax.len() == self.nodes.len(),
-            "DSv4 MTP draft chain argmax rows {} != nodes {}",
-            argmax.len(),
-            self.nodes.len()
-        );
-        let mut path = vec![0usize];
-        for (row, &target) in argmax.iter().take(self.depth).enumerate() {
-            let topk_hit = self.candidates[row].contains(&target);
-            if topk_hit && target == self.nodes[row + 1].token {
-                path.push(row + 1);
-                continue;
-            }
-            return Ok((path, target, row, topk_hit));
-        }
-        let bonus = *argmax
-            .get(self.depth)
-            .ok_or_else(|| anyhow!("DSv4 MTP draft chain missing bonus row {}", self.depth))?;
-        Ok((path, bonus, self.depth, false))
-    }
-
-    fn accepted_tokens(&self, path: &[usize]) -> Vec<u32> {
-        path.iter()
-            .copied()
-            .skip(1)
-            .map(|row| self.nodes[row].token)
-            .collect()
-    }
-
-    fn add_chain_child(&mut self, token: u32) -> Result<usize> {
-        let parent = self.nodes.len() - 1;
-        ensure!(
-            self.nodes.len() < crate::dsv4::MAX_SPEC_VERIFY_ROWS,
-            "DSv4 MTP draft chain exceeds {} verify rows; reduce --mtp-draft-tokens",
-            crate::dsv4::MAX_SPEC_VERIFY_ROWS
-        );
-        let row = self.nodes.len();
-        self.nodes.push(DraftNode {
-            token,
-            parent: Some(parent),
-            depth: self.nodes[parent].depth + 1,
-        });
-        Ok(row)
-    }
-}
+// Re-exported for `executor::qwen35`, which routes through the same
+// step-level scheduling types.
+pub(crate) use infer_plan::{DecodeRoute, SpecKind, route_decode};
 
 impl Dsv4CudaExecutor {
     /// Returns the committed tokens (accepted drafts + the bonus) and advances
@@ -235,11 +63,11 @@ impl Dsv4CudaExecutor {
         crate::attention::set_dsv4_verify_frozen(false);
         let mut verify = res?;
         ensure!(
-            verify.argmax.len() == chain.nodes.len()
-                && verify.hiddens.len() == chain.nodes.len()
-                && verify.logits.seq_len == chain.nodes.len(),
+            verify.argmax.len() == chain.len()
+                && verify.hiddens.len() == chain.len()
+                && verify.logits.seq_len == chain.len(),
             "DSv4 MTP verify expected {} rows, got argmax={} hidden={} logits={}",
-            chain.nodes.len(),
+            chain.len(),
             verify.argmax.len(),
             verify.hiddens.len(),
             verify.logits.seq_len
@@ -259,8 +87,8 @@ impl Dsv4CudaExecutor {
                 "[dsv4-mtp] depth={} topk={} draft_rows={} verify_rows={} accepted={accepted} topk_bonus_hit={topk_bonus_hit} accept_total={} reject_total={} bonus={bonus}",
                 depth,
                 topk,
-                chain.nodes.len().saturating_sub(1),
-                chain.nodes.len(),
+                chain.len().saturating_sub(1),
+                chain.len(),
                 self.mtp_accepts,
                 self.mtp_rejects
             );
@@ -322,15 +150,7 @@ impl Dsv4CudaExecutor {
         topk: usize,
         start_pos: usize,
     ) -> Result<DraftChain> {
-        let mut chain = DraftChain {
-            nodes: vec![DraftNode {
-                token: pending,
-                parent: None,
-                depth: 0,
-            }],
-            candidates: Vec::with_capacity(depth),
-            depth,
-        };
+        let mut chain = DraftChain::start(pending, depth);
         let mut chain_token = pending;
         let mut chain_hidden: Option<DeviceVec> = None;
         for level in 0..depth {
@@ -359,7 +179,7 @@ impl Dsv4CudaExecutor {
                 "DSv4 MTP draft chain level {level} produced no candidates"
             );
             let next = candidates[0];
-            chain.candidates.push(candidates);
+            chain.push_candidates(candidates);
             chain.add_chain_child(next)?;
             chain_token = next;
             chain_hidden = Some(stream);
