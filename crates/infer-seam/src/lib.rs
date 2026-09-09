@@ -40,6 +40,7 @@ mod prefix_store;
 mod resource;
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
+mod tp_commit;
 
 pub use allocator::{KvAllocator, KvSlotAccounting};
 pub use diffusion_executor::BufferedDiffusionExecutor;
@@ -55,6 +56,7 @@ pub use resource::{
     clamp_to_affordable, dram_l2_budget, nvme_l3_budget, profile_kv_pool_tokens,
 };
 pub use runtime_flags::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
+pub use tp_commit::{agree_abort, agree_rollback};
 
 pub enum PollResult {
     Ready(StepOutput),
