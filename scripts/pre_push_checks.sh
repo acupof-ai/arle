@@ -139,10 +139,10 @@ fi
 METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 
 if [[ "${METAL_CHECKS}" == "1" && "$(uname -s)" == "Darwin" ]]; then
-    run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --release
-    run cargo build --no-default-features --features metal,no-cuda,cli -p arle --release --bin arle
+    run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --profile release-fast
+    run cargo build --no-default-features --features metal,no-cuda,cli -p arle --profile release-fast --bin arle
     # Metal correctness gate: needle ladder on the local 0.8B test model.
-    GATE_BIN="${CARGO_TARGET_DIR}/release/arle"
+    GATE_BIN="${CARGO_TARGET_DIR}/release-fast/arle"
     GATE_MODEL="${REPO_ROOT}/models/Qwen3.5-0.8B-MLX-4bit"
     if [[ -x "$GATE_BIN" && -d "$GATE_MODEL" ]]; then
         info "Metal needle gate (Qwen3.5-0.8B-MLX-4bit, lengths 115/300/446)"
