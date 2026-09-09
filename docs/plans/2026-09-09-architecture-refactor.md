@@ -440,10 +440,36 @@ Second because KV has the clearest existing boundary and because
 Gate: `cargo tree -p infer-kvspace` contains no `cuda-kernels`; contract tests
 run against both the fake and the real adapter.
 
-### Step 3 — `infer-model`
+### Step 3a — disperse the executor file
 
-The host half of `executor/qwen35.rs`, split by §3.2's four stages. Largest
-unit; its output type is `DeviceBatch`, so it must follow steps 1 and 2.
+`executor/qwen35.rs`'s six blocks each go to a destination that already exists
+(the table in §3.2): speculative-decode orchestration and the submit tree to
+`infer-plan`, KV/tier/sidecar to `infer-kvspace`, construction to the weight
+axis, device scheduling to `device_sched`. About 2,800 of 3,529 lines leave;
+550-650 stay.
+
+No new crate. This is the easy 80%, and it follows steps 1, 2 and 5, because
+each block's destination has to exist before the block can move.
+
+The dominant obstacle is not the block boundaries but the functions inside
+them: the recurring shape is host arithmetic and a device call fused in one
+body — `build_prefill_geometry` computes slices and positions and uploads
+them, `mirror_host_slot` does shard arithmetic and a device write,
+`try_graph_decode_paged` does kernel selection, graph capture and launch.
+Each is split along the boundary; the boundary itself does not move.
+
+Gate: no-cuda build of each destination crate; needle gate ×3.
+
+### Step 3b — `infer-model`
+
+The model modules' host halves — `qwen35_forward.rs`, `qwen35_decode.rs`,
+`qwen35_spec.rs`, `qwen35/dspark.rs`, about 4,000 lines — split by §3.2's four
+stages. This is where the stages actually are, and it is the real work.
+
+Blocked on the two missing types named in §3.2. Without a host geometry
+descriptor and a settled-shape descriptor there is nothing for stages 2 and 4
+to produce, and the split would cut through the middle of every function that
+computes host arithmetic and uploads it in the same breath.
 
 Gate: no-cuda build; needle gate ×3 against the baseline envelope.
 
