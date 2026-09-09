@@ -627,3 +627,6 @@ pub fn reject_dsv4_e8m0_scale_abi(
     }
     Ok(())
 }
+
+mod cpu_ref;
+pub use cpu_ref::{GROUP, cpu_ref_fp4, e2m1_to_f32, e4m3_to_f32};

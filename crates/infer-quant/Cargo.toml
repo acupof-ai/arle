@@ -13,6 +13,7 @@ anyhow = "1.0"
 safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+half = "2.4"
 
 [lints]
 workspace = true

@@ -628,6 +628,7 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
+ "infer-quant",
  "log",
  "ring",
  "toml",
@@ -1658,6 +1659,7 @@ name = "infer-quant"
 version = "0.5.8"
 dependencies = [
  "anyhow",
+ "half",
  "safetensors",
  "serde",
  "serde_json",
