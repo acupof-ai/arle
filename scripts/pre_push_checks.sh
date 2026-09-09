@@ -130,7 +130,7 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     # clippy errors pass the hook and fail CI. Debug profile shares the cache with
     # the arle check above; the old --release forced a second full compilation.
     run cargo clippy -p infer-api --no-default-features --features cuda,no-cuda --lib -- -D warnings
-    run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys
+    run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys -p infer-quant
     run cargo test \
         -p infer-core -p infer-server -p infer-plan -p infer-seam \
         -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent

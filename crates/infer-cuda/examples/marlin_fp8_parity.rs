@@ -196,7 +196,7 @@ mod real {
     /// Per-output-channel E4M3 quantization, `scale = amax / 448`.
     ///
     /// The scale is rounded to BF16 because the checkpoint stores `weight_scale`
-    /// as BF16 (`quant_format.rs:192-215` detection arm). That is what makes the
+    /// as BF16 (the `infer-quant` per-channel detection arm). That is what makes the
     /// repack's 2^120 fold bit-exact — handing the harness an f32-only scale
     /// would add a per-channel error the production weight never carries and
     /// blunt the ratio test.
@@ -435,7 +435,7 @@ mod real {
         let (cols, reference) = build_reference(&qbytes, &scales, n, k, m_max, &x_bf16);
 
         // block_m = 1, block_k = K is the per-channel encoding of a block-scaled
-        // FP8 weight — the same one `quant_format.rs` produces for a
+        // FP8 weight — the same one `infer-quant` produces for a
         // compressed-tensors `F8_E4M3` + `[N,1]` weight_scale checkpoint.
         let mut weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
         // The repack releases the source, so lane 2 gets its own unrepacked copy.

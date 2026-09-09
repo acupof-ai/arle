@@ -15,7 +15,7 @@ use safetensors::tensor::Dtype;
 
 use crate::loader::{SafetensorLoader, tensor_bytes_to_f32};
 use crate::moe_config::ExpertSplit;
-use crate::quant_format::{QuantFormat, ScaleApply};
+use infer_quant::{QuantFormat, ScaleApply};
 
 use super::*;
 
@@ -2062,7 +2062,7 @@ impl SafetensorLoader {
         rows: usize,
         cols: usize,
     ) -> Result<Vec<f32>> {
-        use crate::quant_format::decode_f8_e4m3fn;
+        use infer_quant::decode_f8_e4m3fn;
         let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.shape == [rows, cols],

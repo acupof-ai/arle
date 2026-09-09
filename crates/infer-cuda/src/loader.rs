@@ -24,12 +24,12 @@ use crate::ops::{
     fp4_deepgemm_available, fp8_deepgemm_per_channel_available, upload_i32,
     validate_quant_linear_storage,
 };
-use crate::quant_format::{
-    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
-    read_quant_manifest, reject_dsv4_e8m0_scale_abi,
-};
 pub(crate) use crate::qwen35::load::{
     ExpertQuantDispatchSignature, MoeFp8ExpertGroup, MoeLayerHostSnapshot, MoeLayerWeights,
+};
+use infer_quant::{
+    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
+    read_quant_manifest, reject_dsv4_e8m0_scale_abi,
 };
 
 const DEFAULT_SHARD_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;

@@ -10,10 +10,10 @@
 use anyhow::{Result, bail, ensure};
 use cuda_kernels::prelude::DeviceContext;
 use cuda_kernels::quant_linear as cuda_ql;
-use cuda_kernels::tensor::{DeviceMatrix, e2m1_to_f32, e4m3_to_f32};
+use cuda_kernels::tensor::DeviceMatrix;
 use half::bf16;
+use infer_quant::{GROUP, cpu_ref_fp4};
 
-const GROUP: usize = 16;
 const SEED: u64 = 0x5eed_1234;
 const PASS_MAX_REL: f32 = 1e-2;
 
@@ -53,36 +53,6 @@ fn synth_fp4(m: usize, n: usize, k: usize) -> (Vec<u8>, Vec<u8>, f32, Vec<bf16>)
         .map(|i| bf16::from_f32(((i % 13) as f32 - 6.0) * 0.125))
         .collect();
     (packed, scales, global, x)
-}
-
-/// CPU f32 reference: dequantize each weight in f32 (e2m1 * e4m3 group scale *
-/// global scale) and dot with the bf16 input widened to f32, accumulating in
-/// f32. The anchor both GPU arms are measured against — never a second bf16
-/// path.
-fn cpu_ref_fp4(
-    packed: &[u8],
-    scales: &[u8],
-    global: f32,
-    x: &[bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
-    let scale_cols = k / GROUP;
-    let mut out = Vec::with_capacity(m * n);
-    for mi in 0..m {
-        for ni in 0..n {
-            let mut acc = 0f32;
-            for ki in 0..k {
-                let byte = packed[ni * (k / 2) + ki / 2];
-                let nibble = if ki % 2 == 0 { byte & 0xF } else { byte >> 4 };
-                let s = e4m3_to_f32(scales[ni * scale_cols + ki / GROUP]);
-                acc += x[mi * k + ki].to_f32() * e2m1_to_f32(nibble) * s * global;
-            }
-            out.push(acc);
-        }
-    }
-    out
 }
 
 /// Max relative error over all outputs, normalized by the CPU reference's
@@ -297,20 +267,5 @@ mod tests {
         assert_eq!(parse_shape("1,34816,5120").unwrap(), (1, 34816, 5120));
         assert!(parse_shape("1,2").is_err());
         assert!(parse_shape("1,x,3").is_err());
-    }
-
-    /// Hand-computed: n=1, k=16, one group. nibbles 0x2 (1.0) and 0x1 (0.5)
-    /// on the first two columns, e4m3 0x38 = 1.0, global 0.25, x = [1, 2, 0..].
-    /// (1.0*1.0 + 0.5*2.0) * 1.0 * 0.25 = 0.5.
-    #[test]
-    fn cpu_ref_matches_hand_computed() {
-        let mut packed = vec![0u8; 8];
-        packed[0] = 0x12; // lo nibble 0x2, hi nibble 0x1
-        let scales = vec![0x38u8];
-        let mut x = vec![bf16::ZERO; 16];
-        x[0] = bf16::from_f32(1.0);
-        x[1] = bf16::from_f32(2.0);
-        let out = cpu_ref_fp4(&packed, &scales, 0.25, &x, 1, 1, 16);
-        assert!((out[0] - 0.5).abs() < 1e-6, "got {}", out[0]);
     }
 }

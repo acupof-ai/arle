@@ -18,6 +18,7 @@ nccl = ["cuda"]
 anyhow = "1.0"
 half = { version = "2.4", features = ["num-traits"] }
 log = "0.4"
+infer-quant = { path = "../infer-quant" }
 cudarc = { version = "0.19", features = [
     "cuda-version-from-build-system",
     "cublas",
