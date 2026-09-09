@@ -112,12 +112,17 @@ which already has a destination named elsewhere in this plan:
 
 | Block | Lines | Destination |
 |---|---:|---|
-| Speculative decode orchestration | ~1,040 | step scheduling, `infer-plan` |
-| The `submit` tree | ~570 | step scheduling, `infer-plan` |
-| Construction and weight setup | ~430 | weight axis, step 5 |
-| KV / tier / sidecar lifecycle | ~300 | `infer-kvspace`, step 2 |
-| Device scheduling (graph) | ~200 | `device_sched`, step 4 |
-| Launch and OPD surface | ~360 | stays in `infer-cuda` |
+| Speculative decode orchestration | ~1,180 | step scheduling, `infer-plan` |
+| The `submit` tree | ~670 | step scheduling, `infer-plan` |
+| KV / tier / sidecar lifecycle | ~535 | `infer-kvspace`, step 2 |
+| Construction and weight setup | ~370 | weight axis, step 5 |
+| Launch and OPD surface | ~290 | stays in `infer-cuda` |
+| Device scheduling (graph) | ~245 | `device_sched`, step 4 |
+
+Counted per block against `executor/qwen35.rs` at 3,531 lines, comments and
+blank lines included. The KV/tier/sidecar block is the one that moved: it
+holds `demote_slot` / `promote_slot` / `restore_recurrent_sidecar` and the
+pool release/ensure pair as well as the sidecar machinery.
 
 The consequence for the plan is in step 3, which is split in two: the
 executor file disperses to homes that already exist, and `infer-model` takes
@@ -445,7 +450,7 @@ run against both the fake and the real adapter.
 `executor/qwen35.rs`'s six blocks each go to a destination that already exists
 (the table in §3.2): speculative-decode orchestration and the submit tree to
 `infer-plan`, KV/tier/sidecar to `infer-kvspace`, construction to the weight
-axis, device scheduling to `device_sched`. About 2,800 of 3,529 lines leave;
+axis, device scheduling to `device_sched`. About 2,800 of 3,531 lines leave;
 550-650 stay.
 
 No new crate. This is the easy 80%, and it follows steps 1, 2 and 5, because
@@ -457,6 +462,27 @@ body — `build_prefill_geometry` computes slices and positions and uploads
 them, `mirror_host_slot` does shard arithmetic and a device write,
 `try_graph_decode_paged` does kernel selection, graph capture and launch.
 Each is split along the boundary; the boundary itself does not move.
+
+The blocks move one at a time, cheapest first, one pull request each:
+
+1. **KV / tier / sidecar to `infer-kvspace`.** Its host and device halves are
+   already separated — the two-phase commit is in the seam, sidecar
+   serialization is off the hot path, and only four calls touch the device
+   (`snapshot_recurrent`, `restore_recurrent_from_snapshot`, `mirror_slot`,
+   `swap_out` / `swap_in_image`).
+2. **Device scheduling to `device_sched`,** together with graph invalidation,
+   which has to be stated as one policy rather than left where it is. There
+   are six sites of two kinds: five whole-graph (`self.decode_graph = None`),
+   one inside `try_graph_decode_paged` itself and four in the launch/OPD
+   block; and one per-slot rebuild in `submit_prefill_row`, which replaces a
+   single slot's `CudaGraphState` and clears its bake while the rest of the
+   graph stands. Construction and the KV block touch neither.
+3. **The submit tree and speculative-decode orchestration last.** These two
+   are fused: the spec row handlers are the decode path, and
+   `dispatch_decode_rows` is the only seam between them. The fusion sits in
+   the row handlers, not in `spec_verify_forward` — that function is already
+   an orchestration layer that arranges rows and calls `verify_logits`, with
+   no accept or rollback arithmetic in it.
 
 Gate: no-cuda build of each destination crate; needle gate ×3.
 
