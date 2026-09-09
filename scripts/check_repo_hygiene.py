@@ -315,6 +315,34 @@ def git_grep(args: list[str]) -> list[str] | None:
     return [] if result.returncode == 1 else None
 
 
+# A perf entry on/after this date must record the configuration its numbers came
+# from, or waive it. Cost of not having this: a 2026-08-21 entry's numbers were
+# used as a c-sweep baseline for three weeks; when the comparison finally had to
+# be matched, the entry had no Parameters section, the run directory was gone,
+# and there was no prereg row — so the baseline arm was re-run on the GPU.
+WINS_PARAMS_CUTOFF = "2026-09-09"
+_PARAMS_RE = re.compile(r"^#+\s*Parameters", re.MULTILINE)
+
+
+def check_wins_parameters() -> list[str]:
+    errors = []
+    for rel in list_experience_entries(Path("docs/experience/wins")):
+        if Path(rel).name[:10] < WINS_PARAMS_CUTOFF:
+            continue
+        text = (ROOT / rel).read_text(errors="ignore")
+        if (
+            len(_PERF_RE.findall(text)) >= 3
+            and not _PARAMS_RE.search(text)
+            and not _WAIVER_RE.search(text)
+        ):
+            errors.append(
+                f"{rel}: an entry that reports numbers needs a Parameters section "
+                f"recording the configuration they came from, or a 'no baseline' "
+                f"waiver; without it the numbers cannot be a baseline later"
+            )
+    return errors
+
+
 def check_repo_wide_disallowed_markers() -> list[str]:
     own_path = f"scripts/{Path(__file__).name}"
     command = ["-I", "-n"]
@@ -541,6 +569,7 @@ LAUNCHER_FIXTURE = "crates/infer-cuda/src/ops/quant_linear.rs"
 REGISTRY_FIXTURE = "operators/registry.toml"
 MARKER_FIXTURE = "CONTRIBUTING.md"
 WINS_FIXTURE = "docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md"
+WINS_PARAMS_FIXTURE = "docs/experience/wins/2026-09-09-quant-decode-splits-ceiling-64.md"
 ARCHIVE_FIXTURE = "docs/experience/archived"
 
 
@@ -611,6 +640,12 @@ def break_wins_baseline(root: Path) -> None:
     path.write_text(_WAIVER_RE.sub("unmeasured", text))
 
 
+def break_wins_parameters(root: Path) -> None:
+    path = root / WINS_PARAMS_FIXTURE
+    text = _PARAMS_RE.sub("## Setup", path.read_text())
+    path.write_text(_WAIVER_RE.sub("unmeasured", text))
+
+
 def break_archive_seal(root: Path) -> None:
     entries = sorted((root / ARCHIVE_FIXTURE).rglob("*.md"))
     if not entries:
@@ -655,6 +690,7 @@ SELFTEST_WORLDS = [
     ("repo_wide_disallowed_markers", check_repo_wide_disallowed_markers,
      (MARKER_FIXTURE,), break_repo_wide_markers),
     ("wins_baseline_citations", check_wins_baseline_citations, (WINS_FIXTURE,), break_wins_baseline),
+    ("wins_parameters", check_wins_parameters, (WINS_PARAMS_FIXTURE,), break_wins_parameters),
     ("archived_experience", check_archived_experience, (ARCHIVE_FIXTURE,), break_archive_seal),
     ("prereg_no_stale_running", check_prereg_no_stale_running,
      (str(PREREG_WRITER),), break_prereg_stale_running),
@@ -705,6 +741,7 @@ def main() -> int:
     errors.extend(check_experience_doc_inventory())
     errors.extend(check_archived_experience())
     errors.extend(check_wins_baseline_citations())
+    errors.extend(check_wins_parameters())
     errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
     errors.extend(check_launcher_boundary())
@@ -721,7 +758,7 @@ def main() -> int:
     print("[repo-hygiene] OK")
     print(
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
-        "repo-wide marker bans, experience entry caps, frozen archive seal, "
+        "repo-wide marker bans, experience entry caps, wins parameters, frozen archive seal, "
         "workspace truth-surface, CUDA launcher-boundary, registry-coverage, "
         "prereg-ledger, and agenda-ledger checks all passed"
     )
