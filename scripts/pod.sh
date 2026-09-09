@@ -93,7 +93,9 @@ push_or_die() {
 # Ship the local helpers to the tree. sync does this before apply-sync because
 # the remote apply runs the deployed tree's script: a digest-format change
 # (e.g. the blob-identity hash) would otherwise verify with the old format and
-# fail every sync until a human ran push-scripts by hand.
+# fail every sync until a human ran push-scripts by hand. push_scripts itself
+# only transfers files (tn push); it never invokes the remote script, so no
+# protocol change can deadlock it — the bootstrap is one-directional.
 push_scripts() {
   for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh reap_run.py cuda_prebuilt_manifest.sh; do
     push_or_die "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
@@ -194,7 +196,9 @@ case "$cmd" in
     [ "$bundle_mode" = none ] || push_or_die "$stage/source.bundle" "$remote_stage.source.bundle"
     push_or_die "$stage/source.meta" "$remote_stage.source.meta"
     pod_stage="$(pod_path "$remote_stage")"
-    push_scripts
+    # ARLE_SKIP_PUSH_SCRIPTS is the negative-control hook for the bootstrap
+    # fix (test_pod_flow.sh): a protocol-skewed remote must fail without it.
+    [ -n "${ARLE_SKIP_PUSH_SCRIPTS:-}" ] || push_scripts
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' apply-sync '$pod_stage'" || { echo "remote sync apply failed" >&2; exit 1; }
     ;;
   build)

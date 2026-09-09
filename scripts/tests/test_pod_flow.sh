@@ -359,4 +359,38 @@ printf more >> "$LOCAL/untracked space"
 "$LOCAL/scripts/pod.sh" sync >/dev/null
 [ "$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")" = "$clean_digest" ]
 
+# Negative control for the push_scripts-in-sync bootstrap fix. apply-sync runs
+# the deployed tree's script, so a remote whose digest algorithm is older than
+# the pusher's verifies with the old format and fails every sync until a human
+# refreshes the script by hand. Plant a stub with a different digest, then prove
+# sync fails without push_scripts (ARLE_SKIP_PUSH_SCRIPTS) and succeeds with it.
+# The stub is inserted before the case dispatch, not appended: bash parses
+# top-to-bottom, so an appended stub is read only after apply-sync has already
+# run the real digest. --full keeps the deployed script stable across the
+# digest check: bundle_mode=none extracts the tarball over the tree and would
+# overwrite the script mid-execution, so the stub could never gate Arm B.
+python3 - "$TREE/scripts/pod-remote-build.sh" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = 'case "${1:-}" in'
+assert s.count(marker) == 1, "case dispatch marker not unique"
+stub = '''# negative-control stub: a digest algorithm different from the pusher's
+source_digest() { echo stale; }
+
+'''
+open(p, "w").write(s.replace(marker, stub + marker, 1))
+PY
+set +e
+ARLE_SKIP_PUSH_SCRIPTS=1 "$LOCAL/scripts/pod.sh" sync --full >"$TMP/nc-skip.log" 2>&1
+rc=$?; set -e
+# Hard assert: a no-op here (rc==0) would let an inert stub pass the gate.
+[ "$rc" -ne 0 ] || { echo "negative control: sync should have failed without push_scripts" >&2; cat "$TMP/nc-skip.log" >&2; exit 1; }
+grep -q 'sync source mismatch' "$TMP/nc-skip.log"
+# The full-sync rollback restores the stubbed tree, so Arm B starts skewed.
+grep -q 'negative-control stub' "$TREE/scripts/pod-remote-build.sh"
+# push_scripts overwrites the stub with the local script before apply-sync.
+"$LOCAL/scripts/pod.sh" sync --full >/dev/null
+cmp -s "$LOCAL/scripts/pod-remote-build.sh" "$TREE/scripts/pod-remote-build.sh"
+
 echo "pod flow tests: PASS"
