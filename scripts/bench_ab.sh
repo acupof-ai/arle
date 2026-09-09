@@ -22,6 +22,18 @@
 # bench-output/<date>-<label-a>/ and bench-output/<date>-<label-b>/. No
 # wins entries are seeded (exploration mode).
 #
+# Spec-decode readings need their own no-draft arm in the same session:
+#
+#   scripts/bench_ab.sh qwen36-dspark --vs-no-spec \
+#       --cmd-treatment "$BIN --model-path $M --port 8000 \
+#                        --spec-type dspark --mtp-draft-model $DRAFT &" \
+#       --seconds-per-concurrency 120
+#
+# derives the control command by stripping the spec flags
+# (--spec-type, --mtp-draft-model, --dspark-*) and runs both arms.
+# A spec number from a single arm compared against an external row is
+# refused: the diff step fails loud when either arm has no data.
+#
 # Example — MTP vs no-MTP on Qwen3.6 Metal, two-minute cells:
 #
 #   MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
@@ -48,16 +60,50 @@ LABEL_A=""
 LABEL_B=""
 CMD_A=""
 CMD_B=""
+# --vs-no-spec: one label + one treatment command; the control is derived.
+VS_NO_SPEC=false
+CMD_TREATMENT=""
 # Flags forwarded to bench_throughput.py.
 PASSTHROUGH=()
+
+# Spec flags stripped from the treatment command to build the no-draft
+# control arm. Each takes one value.
+SPEC_FLAGS=(
+    --spec-type
+    --mtp-draft-model
+    --dspark-sps-bias-ms
+    --dspark-sps-row-ms
+    --dspark-block-size
+    --dspark-markov-init
+)
+
+strip_spec_flags() {
+    local -a toks out
+    read -ra toks <<< "$1"
+    local skip=0 t
+    for t in "${toks[@]}"; do
+        if (( skip )); then skip=0; continue; fi
+        local s
+        for s in "${SPEC_FLAGS[@]}"; do
+            if [[ "$t" == "$s" ]]; then skip=1; break; fi
+        done
+        (( skip )) || out+=("$t")
+    done
+    local IFS=' '
+    printf '%s' "${out[*]}"
+}
 
 usage() {
     cat <<EOF
 usage: $(basename "$0") <label-a> <label-b> --cmd-a "<launch>" --cmd-b "<launch>" [options]
+       $(basename "$0") <label> --vs-no-spec --cmd-treatment "<launch with spec flags>" [options]
 
   <label-a> / <label-b>   labels for A and B artefacts
   --cmd-a "..."           shell command that starts server A (trailing & required)
   --cmd-b "..."           shell command that starts server B (trailing & required)
+  --vs-no-spec            spec mode: derive the no-draft control from the
+                          treatment command by stripping its spec flags
+  --cmd-treatment "..."   treatment server command (with --spec-type etc.)
 
 Forwarded to bench_throughput.py (one measurement bound required):
   --concurrency-grid LIST e.g. "1,2,4,8"
@@ -81,6 +127,11 @@ while [[ $# -gt 0 ]]; do
         --cmd-b)
             [[ $# -ge 2 ]] || { echo "error: --cmd-b requires a value" >&2; exit 2; }
             CMD_B="$2"; shift 2 ;;
+        --vs-no-spec)
+            VS_NO_SPEC=true; shift ;;
+        --cmd-treatment)
+            [[ $# -ge 2 ]] || { echo "error: --cmd-treatment requires a value" >&2; exit 2; }
+            CMD_TREATMENT="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         --concurrency-grid|--requests-per-concurrency|--seconds-per-concurrency|--max-tokens|--temperature|--model|--prompts-jsonl|--synthetic-prompts|--timeout-seconds|--seed)
@@ -95,6 +146,22 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$VS_NO_SPEC" == true ]]; then
+    if [[ -n "$LABEL_B" || -n "$CMD_A" || -n "$CMD_B" ]]; then
+        echo "error: --vs-no-spec takes one label and --cmd-treatment only" >&2
+        usage >&2
+        exit 2
+    fi
+    [[ -n "$CMD_TREATMENT" ]] || { echo "error: --vs-no-spec requires --cmd-treatment" >&2; exit 2; }
+    [[ -n "$LABEL_A" ]] || { echo "error: --vs-no-spec requires one label" >&2; exit 2; }
+    LABEL_B="${LABEL_A}-no-spec"
+    CMD_A="$CMD_TREATMENT"
+    CMD_B="$(strip_spec_flags "$CMD_TREATMENT")"
+    [[ "$CMD_A" != "$CMD_B" ]] || die "no spec flags found in treatment command: $CMD_TREATMENT"
+    echo "control arm derived by stripping spec flags:"
+    echo "  B: $CMD_B"
+fi
 
 if [[ -z "$LABEL_A" || -z "$LABEL_B" || -z "$CMD_A" || -z "$CMD_B" ]]; then
     echo "error: <label-a>, <label-b>, --cmd-a, --cmd-b are all required" >&2
@@ -174,7 +241,7 @@ run_side "$LABEL_B" "$CMD_B" "$OUT_B"
 # ---- cross-label diff ---------------------------------------------------------
 
 DIFF_FILE="$REPO_ROOT/bench-output/${DATE}-${LABEL_A}-vs-${LABEL_B}-diff.md"
-python3 - "$OUT_A" "$OUT_B" "$LABEL_A" "$LABEL_B" "$DIFF_FILE" <<'PY'
+python3 - "$OUT_A" "$OUT_B" "$LABEL_A" "$LABEL_B" "$DIFF_FILE" <<'PY' || die "diff refused (missing arm data)"
 import sys, json, pathlib
 
 a_dir, b_dir, label_a, label_b, out_path = sys.argv[1:]
@@ -197,6 +264,10 @@ def load(d):
 
 a = load(a_dir) or {}
 b = load(b_dir) or {}
+if not a or not b:
+    print(f"error: refusing to diff without both arms: {label_a}={len(a)} rows, "
+          f"{label_b}={len(b)} rows", file=sys.stderr)
+    sys.exit(1)
 keys = sorted(set(a) | set(b), key=lambda k: (
     0 if k == "sync" else 1 if k.startswith("conc") else 2, k
 ))
