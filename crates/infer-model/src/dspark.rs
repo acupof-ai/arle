@@ -1,5 +1,5 @@
 //! DSpark/DFlash drafter host arithmetic: the deterministic RNG stream,
-//! attention-window math, accept scans, confidence survival, Markov-chain
+//! attention-window math, confidence survival, Markov-chain
 //! settle logic, and the load-time host tensor transforms. The device
 //! launches stay in `infer-cuda`; this module holds only the decisions and
 //! the shapes.
@@ -132,31 +132,6 @@ pub fn draft_route(is_greedy: bool, has_markov: bool) -> DraftRoute {
         (false, false) => DraftRoute::SampledIndependent,
         (false, true) => DraftRoute::SampledMarkov,
     }
-}
-
-/// Greedy accept scan: longest prefix where each draft equals the trunk argmax
-/// at its row. Returns `(emitted, bonus, k)`; the caller crops the paged pool
-/// to `start_pos + k + 1` when `k + 1 < chain.len()`.
-pub fn accept_commit(chain: &[u32], argmax: &[u32], row0: usize) -> Result<(Vec<u32>, u32, usize)> {
-    let depth = chain.len() - 1;
-    ensure!(
-        row0 + chain.len() <= argmax.len(),
-        "dspark accept: chain rows outside the verify argmax"
-    );
-    let mut k = 0usize;
-    let bonus;
-    loop {
-        let am = argmax[row0 + k];
-        if k < depth && am == chain[k + 1] {
-            k += 1;
-        } else {
-            bonus = am;
-            break;
-        }
-    }
-    let mut emitted = chain[1..=k].to_vec();
-    emitted.push(bonus);
-    Ok((emitted, bonus, k))
 }
 
 /// Per-slot draft-keep lengths from the confidence logits: sigmoid cumprod'd
@@ -337,21 +312,6 @@ mod tests {
         assert_eq!(kv_dim(&cfg), 4);
         let bytes = slot_state_bytes(&cfg, 80, 2, 128000);
         assert_eq!(bytes, 2 * 80 * 4 * 2 * 2 + 4 * 128000 * (2 + 4));
-    }
-
-    #[test]
-    fn accept_scan() {
-        let chain = [7, 11, 12, 13];
-        // Full accept: every draft matches.
-        let (emitted, bonus, k) = accept_commit(&chain, &[9, 11, 12, 13, 5], 1).unwrap();
-        assert_eq!((emitted, bonus, k), (vec![11, 12, 13, 5], 5, 3));
-        // Partial: row 2 diverges.
-        let (emitted, bonus, k) = accept_commit(&chain, &[11, 12, 99, 13], 0).unwrap();
-        assert_eq!((emitted, bonus, k), (vec![11, 12, 99], 99, 2));
-        // Zero accept.
-        let (emitted, bonus, k) = accept_commit(&chain, &[99, 11, 12, 13], 0).unwrap();
-        assert_eq!((emitted, bonus, k), (vec![99], 99, 0));
-        assert!(accept_commit(&chain, &[1, 2], 2).is_err());
     }
 
     #[test]
