@@ -18,6 +18,7 @@ members = [
     "crates/infer-hip",
     "crates/infer-kvspace",
     "crates/infer-metal",
+    "crates/infer-model",
     "crates/infer-moe",
     "crates/infer-plan",
     "crates/infer-quant",

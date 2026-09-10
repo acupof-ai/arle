@@ -1595,6 +1595,7 @@ dependencies = [
  "deepseek-spec",
  "half",
  "infer-kvspace",
+ "infer-model",
  "infer-moe",
  "infer-plan",
  "infer-quant",
@@ -1657,6 +1658,18 @@ dependencies = [
  "mlx-sys",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "infer-model"
+version = "0.5.8"
+dependencies = [
+ "anyhow",
+ "half",
+ "infer-moe",
+ "infer-seam",
+ "log",
+ "qwen35-spec",
 ]
 
 [[package]]

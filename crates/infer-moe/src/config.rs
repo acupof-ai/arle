@@ -77,6 +77,14 @@ impl MoeConfig {
         }
     }
 
+    /// TRUE iff a decode step routes on the device (no host sync + D2H):
+    /// greedy top-k with no group limits.
+    pub fn device_route_eligible(&self) -> bool {
+        self.topk_method == TopkMethod::Greedy
+            && self.n_group.is_none()
+            && self.topk_group.is_none()
+    }
+
     /// DSv4 router: selection bias is a runtime gate tensor, not a config field.
     /// DSv4-Flash ships no group-limited routing.
     #[must_use]

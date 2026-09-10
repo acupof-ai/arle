@@ -17,6 +17,7 @@ deepep-sys = { path = "../deepep-sys", optional = true }
 deepseek-spec = { path = "../deepseek-spec", optional = true }
 half = { version = "2.4", features = ["num-traits"], optional = true }
 infer-moe = { path = "../infer-moe" }
+infer-model = { path = "../infer-model" }
 infer-plan = { path = "../infer-plan" }
 infer-kvspace = { path = "../infer-kvspace" }
 infer-quant = { path = "../infer-quant" }

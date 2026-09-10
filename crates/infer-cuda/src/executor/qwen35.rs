@@ -1696,7 +1696,7 @@ impl Qwen35CudaExecutor {
         let hidden_size = model.config.hidden_size;
         let mut rollback: Vec<(usize, usize, usize)> = Vec::with_capacity(batch.len());
         for c in &batch {
-            let (tokens, bonus, k) = model.dspark_accept_commit(&c.chain, &argmax, c.row0)?;
+            let (tokens, bonus, k) = infer_model::dspark::accept_commit(&c.chain, &argmax, c.row0)?;
             if k + 1 < c.chain.len() {
                 rollback.push((c.slot, c.start, k));
             }
@@ -2132,7 +2132,8 @@ impl Qwen35CudaExecutor {
             let spec = ds.spec[c.slot].as_mut().expect("built above");
             let (emitted, bonus, k) = if params.is_greedy() {
                 // Greedy: no behavior logprob.
-                let (tokens, bonus, k) = model.dspark_accept_commit(&c.chain, &argmax, c.row0)?;
+                let (tokens, bonus, k) =
+                    infer_model::dspark::accept_commit(&c.chain, &argmax, c.row0)?;
                 if k + 1 < c.chain.len() {
                     rollback.push((c.slot, c.start, k));
                 }

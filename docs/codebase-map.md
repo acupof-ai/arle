@@ -300,7 +300,7 @@ Metal is wired via the `metal` feature; non-Metal builds fall back to an
 `cudarc`) by feature. Backends plug in here. `cli` depends on `infer-api` (the
 front door) + `infer-util`.
 
-### 3.8 `infer-topo` / `infer-moe` / `infer-util` — pure leaves
+### 3.8 `infer-topo` / `infer-moe` / `infer-model` / `infer-util` — pure leaves
 
 - `crates/infer-topo/src/{lib,sharding,topology,error}.rs`: pure,
  CPU-verifiable TP/EP topology + sharding math (TP rank placement,
@@ -311,6 +311,14 @@ front door) + `infer-util`.
  CPU-verifiable MoE routing/gating math — the reference the GPU kernel is
  verified against (`route`, `RoutingDecision`, `MoeConfig`; DSv4 vs Qwen3.6
  routing rules; `group_limited_mask` reference for grouped routing).
+- `crates/infer-model/src/{lib,qwen35,dspark}.rs`: pure host model geometry —
+ per-rank shard dims, recurrent-state sizes, the joint KV-budget solve,
+ cp-decode/decode-graph routing decisions, and the DSpark drafter's RNG
+ stream, window math, accept scan, confidence survival, and Markov settle.
+ The `model → operator sequence → kernel selection` stages of the request
+ axis; device probes (free-VRAM, NCCL reduces, runtime flags) enter as plain
+ host values and every launch stays in `infer-cuda`. Zero device deps —
+ `cargo tree -p infer-model` contains no `cuda-kernels`.
 - `crates/infer-util/src/{lib,hf_hub,logging}.rs`: backend-agnostic
  HuggingFace model-id/path resolution + download (`hf_hub`, relocated from
  `infer/src/hf_hub.rs`) and stderr logger init (`logging`, from

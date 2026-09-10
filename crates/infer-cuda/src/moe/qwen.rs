@@ -5,14 +5,11 @@ use cuda_kernels::tensor::WeightFormat;
 use cuda_kernels::tensor::cache_ptr;
 use cudarc::driver::sys::CUevent_flags;
 use half::bf16;
-use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
+use infer_moe::{MoeConfig, ScoringFunc};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::{
-    DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
-    deepgemm_contig_rows_cap,
-};
+use super::{DEEPGEMM_CONTIG_ALIGN, QWEN35_MOE_DECODE_MAX_ROUTES, deepgemm_contig_rows_cap};
 use crate::loader::{ExpertQuantDispatchSignature, MoeLayerWeights};
 use crate::moe_config::ExpertSplit;
 use crate::ops::{gemm_batch, silu_mul};
@@ -177,17 +174,6 @@ impl MoeForwardScratch {
     }
 }
 
-fn device_route_eligible(cfg: &MoeConfig) -> bool {
-    cfg.topk_method == TopkMethod::Greedy && cfg.n_group.is_none() && cfg.topk_group.is_none()
-}
-
-/// Decode-graph gate: TRUE iff a `seq_len == 1` MoE step is a pure
-/// device-kernel sequence — the device router (no host sync + D2H) and
-/// `R = top_k` below the DeepGEMM floor, whose JIT is not capture-safe.
-pub(crate) fn qwen35_decode_moe_graph_capturable(cfg: &MoeConfig) -> bool {
-    device_route_eligible(cfg) && cfg.top_k < QWEN35_DEEPGEMM_MIN_ROUTES
-}
-
 /// The block output (routed + sigmoid-gated shared expert) fully overwrites
 /// `out`. Routing runs over ALL `cfg.num_experts`, but only routes landing on
 /// `split`'s local experts contribute — under `ep_size > 1` `out` is a
@@ -262,7 +248,7 @@ pub(crate) fn moe_forward_into(
     gemm_batch(ctx, &weights.router_gate, normed, logits)?;
 
     let total_routes = num_tokens * topk;
-    let (route_indices, route_weights) = if device_route_eligible(cfg) {
+    let (route_indices, route_weights) = if cfg.device_route_eligible() {
         // `dsv4_route` with routing_kind=1 and an all-zero bias IS greedy
         // top-k: key = scores + 0.0 exactly (softmax scores are >= +0.0, so
         // `x + 0.0f == x` bitwise). The `norm_topk_prob` renorm is the
