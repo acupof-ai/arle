@@ -12,6 +12,11 @@
 //! error many× the fallback's error is the silent-wrong-repack / wrong-scale-perm
 //! signal this gate exists to catch. Exits non-zero on any violation.
 //!
+//! `--negative-control` corrupts ONE expectation per comparator family (the
+//! Marlin accepted-shape lane and the declined-shape fallback band); each
+//! family MUST independently FAIL. The run then prints NEGATIVE CONTROL OK and
+//! exits 0.
+//!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/marlin_w8a16_parity`
 
 fn main() -> anyhow::Result<()> {
@@ -19,12 +24,13 @@ fn main() -> anyhow::Result<()> {
         println!("{}", cuda_kernels::KERNEL_BUILD_ID);
         return Ok(());
     }
-    real::run()
+    let negative = std::env::args().any(|a| a == "--negative-control");
+    real::run(negative)
 }
 
 #[cfg(not(feature = "cuda"))]
 mod real {
-    pub(super) fn run() -> anyhow::Result<()> {
+    pub(super) fn run(_negative: bool) -> anyhow::Result<()> {
         eprintln!("marlin_w8a16_parity is a CUDA harness; rebuild with --features cuda.");
         Ok(())
     }
@@ -108,15 +114,26 @@ mod real {
         (q, s)
     }
 
-    pub(super) fn run() -> Result<()> {
+    /// One fail bit per comparator family, so --negative-control can prove
+    /// each family independently has teeth.
+    #[derive(Clone, Copy)]
+    struct Families {
+        /// Marlin GEMM vs f64 reference on accepted (tile-aligned) shapes.
+        marlin_lane: bool,
+        /// dequant→cuBLAS fallback on the shape the repack must decline.
+        declined_fallback: bool,
+    }
+
+    pub(super) fn run(negative: bool) -> Result<()> {
         let ctx = DeviceContext::new()?;
         let cc = ctx.compute_capability();
         eprintln!(
-            "[marlin-parity] device={} cc={}.{} build={}",
+            "[marlin-parity] device={} cc={}.{} build={}{}",
             ctx.ordinal(),
             cc.0,
             cc.1,
-            cuda_kernels::KERNEL_BUILD_ID
+            cuda_kernels::KERNEL_BUILD_ID,
+            if negative { " NEGATIVE-CONTROL" } else { "" }
         );
         ensure!(
             cc.0 >= 8,
@@ -125,24 +142,46 @@ mod real {
             cc.1
         );
 
-        let mut any_fail = false;
+        let mut fams = Families {
+            marlin_lane: false,
+            declined_fallback: false,
+        };
         for &seed in SEEDS {
             // The declined-shape band self-calibrates off the accepted shapes'
             // own fallback floor: same lane, same seed, no magic constant.
             let mut accepted_max_deq = 0f64;
             for &(label, n, k) in SHAPES {
                 for &m in M_SWEEP {
-                    let (fail, deq_err) = probe_one(&ctx, label, m, n, k, seed)?;
-                    any_fail |= fail;
+                    let (marlin_fail, deq_err) = probe_one(&ctx, label, m, n, k, seed, negative)?;
+                    if marlin_fail {
+                        fams.marlin_lane = true;
+                    }
                     accepted_max_deq = accepted_max_deq.max(deq_err);
                 }
             }
             for &(label, n, k) in DECLINED_SHAPES {
-                any_fail |= probe_declined(&ctx, label, n, k, seed, accepted_max_deq)?;
+                if probe_declined(&ctx, label, n, k, seed, accepted_max_deq, negative)? {
+                    fams.declined_fallback = true;
+                }
             }
         }
+
+        if negative {
+            ensure!(
+                fams.marlin_lane,
+                "marlin_w8a16_parity negative control did NOT fail family: marlin lane"
+            );
+            ensure!(
+                fams.declined_fallback,
+                "marlin_w8a16_parity negative control did NOT fail family: declined fallback"
+            );
+            eprintln!(
+                "[marlin-parity] NEGATIVE CONTROL OK (both comparator families failed as required)"
+            );
+            return Ok(());
+        }
         ensure!(
-            !any_fail,
+            !fams.marlin_lane && !fams.declined_fallback,
             "marlin_w8a16_parity FAILED — see violations above"
         );
         eprintln!("[marlin-parity] ALL PASS");
@@ -232,6 +271,7 @@ mod real {
         n: usize,
         k: usize,
         seed: u64,
+        negative: bool,
     ) -> Result<(bool, f64)> {
         let mut seed = shape_seed(seed, label, n, k);
         seed ^= (m as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -308,8 +348,16 @@ mod real {
 
         let marlin = ctx.stream.clone_dtoh(&marlin_out)?;
         let deq = ctx.stream.clone_dtoh(&deq_out)?;
-        let marlin_err = rel_l2(&marlin, &ref_out);
+        // Marlin-lane family corruption: 3x the expectation makes its rel-L2
+        // (~2/3) and ratio blow regardless of output size. The fallback lane
+        // keeps the clean reference.
         let deq_err = rel_l2(&deq, &ref_out);
+        let marlin_err = if negative {
+            let bad_ref: Vec<f64> = ref_out.iter().map(|&r| 3.0 * r).collect();
+            rel_l2(&marlin, &bad_ref)
+        } else {
+            rel_l2(&marlin, &ref_out)
+        };
         let ratio = marlin_err / deq_err.max(1e-9);
         let pass = ratio <= MARLIN_VS_FALLBACK_MAX_RATIO && marlin_err.is_finite();
         eprintln!(
@@ -331,6 +379,7 @@ mod real {
         k: usize,
         seed: u64,
         accepted_max_deq: f64,
+        negative: bool,
     ) -> Result<bool> {
         let mut rng = Rng::new(shape_seed(seed, label, n, k));
         let w_host: Vec<f32> = (0..n * k).map(|_| rng.normal() * 0.1).collect();
@@ -374,7 +423,14 @@ mod real {
             ctx.sync()?;
 
             let deq = ctx.stream.clone_dtoh(&deq_out)?;
-            let deq_err = rel_l2(&deq, &ref_out);
+            let deq_err = if negative {
+                // Declined-fallback family corruption: scale the expectation 3x
+                // so the error must exceed the accepted-shape floor cap.
+                let bad_ref: Vec<f64> = ref_out.iter().map(|&r| 3.0 * r).collect();
+                rel_l2(&deq, &bad_ref)
+            } else {
+                rel_l2(&deq, &ref_out)
+            };
             let cap = accepted_max_deq * MARLIN_VS_FALLBACK_MAX_RATIO;
             let pass = deq_err.is_finite() && deq_err <= cap;
             any_fail |= !pass;

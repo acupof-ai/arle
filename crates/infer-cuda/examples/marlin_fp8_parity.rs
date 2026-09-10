@@ -29,18 +29,24 @@
 //!     so `max|err|/rms` is O(1) while `mean(out/ref)` stays near 1.
 //!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/marlin_fp8_parity`
+//!
+//! `--negative-control` corrupts ONE expectation per comparator family (the
+//! Marlin tensor-core lane and the scalar GEMV lane, the latter including the
+//! declined-shape band); each family MUST independently FAIL, then the run
+//! prints NEGATIVE CONTROL OK and exits 0.
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
         println!("{}", cuda_kernels::KERNEL_BUILD_ID);
         return Ok(());
     }
-    real::run()
+    let negative = std::env::args().any(|a| a == "--negative-control");
+    real::run(negative)
 }
 
 #[cfg(not(feature = "cuda"))]
 mod real {
-    pub(super) fn run() -> anyhow::Result<()> {
+    pub(super) fn run(_negative: bool) -> anyhow::Result<()> {
         eprintln!("marlin_fp8_parity is a CUDA harness; rebuild with --features cuda.");
         Ok(())
     }
@@ -313,16 +319,27 @@ mod real {
         }
     }
 
-    pub(super) fn run() -> Result<()> {
+    /// One fail bit per comparator family, so --negative-control can prove
+    /// each family independently has teeth.
+    #[derive(Clone, Copy)]
+    struct Families {
+        /// Marlin tensor-core lane (accepted shapes).
+        marlin_lane: bool,
+        /// Scalar GEMV lane (carries the declined-shape band alone).
+        gemv_lane: bool,
+    }
+
+    pub(super) fn run(negative: bool) -> Result<()> {
         let ctx = DeviceContext::new()?;
         let cc = ctx.compute_capability();
         eprintln!(
-            "[marlin-fp8-parity] device={} cc={}.{} sms={} build={}",
+            "[marlin-fp8-parity] device={} cc={}.{} sms={} build={}{}",
             ctx.ordinal(),
             cc.0,
             cc.1,
             ctx.sm_count(),
-            cuda_kernels::KERNEL_BUILD_ID
+            cuda_kernels::KERNEL_BUILD_ID,
+            if negative { " NEGATIVE-CONTROL" } else { "" }
         );
         ensure!(cc.0 >= 8, "Marlin needs sm_80+; got sm_{}{}", cc.0, cc.1);
         let m_max = *M_SWEEP
@@ -330,16 +347,45 @@ mod real {
             .max()
             .expect("M_SWEEP must name at least one M");
 
-        let mut any_fail = false;
+        let mut fams = Families {
+            marlin_lane: false,
+            gemv_lane: false,
+        };
         for &seed in SEEDS {
             for &(label, n, k) in SHAPES {
-                any_fail |= probe_shape(&ctx, label, n, k, m_max, seed)?;
+                let (marlin_fail, gemv_fail) =
+                    probe_shape(&ctx, label, n, k, m_max, seed, negative)?;
+                fams.marlin_lane |= marlin_fail;
+                fams.gemv_lane |= gemv_fail;
             }
+            // The declined-shape band is the same GEMV lane carrying a shape
+            // alone; its teeth are already proven by the probe_shape gemv
+            // corruption, so it stays on the clean reference in every mode.
             for &(label, n, k) in DECLINED_SHAPES {
-                any_fail |= probe_declined(&ctx, label, n, k, m_max, seed)?;
+                if probe_declined(&ctx, label, n, k, m_max, seed)? {
+                    fams.gemv_lane = true;
+                }
             }
         }
-        ensure!(!any_fail, "marlin_fp8_parity FAILED — see violations above");
+
+        if negative {
+            ensure!(
+                fams.marlin_lane,
+                "marlin_fp8_parity negative control did NOT fail family: marlin lane"
+            );
+            ensure!(
+                fams.gemv_lane,
+                "marlin_fp8_parity negative control did NOT fail family: gemv lane"
+            );
+            eprintln!(
+                "[marlin-fp8-parity] NEGATIVE CONTROL OK (both comparator families failed as required)"
+            );
+            return Ok(());
+        }
+        ensure!(
+            !fams.marlin_lane && !fams.gemv_lane,
+            "marlin_fp8_parity FAILED — see violations above"
+        );
         eprintln!("[marlin-fp8-parity] ALL PASS");
         Ok(())
     }
@@ -424,7 +470,8 @@ mod real {
         k: usize,
         m_max: usize,
         seed: u64,
-    ) -> Result<bool> {
+        negative: bool,
+    ) -> Result<(bool, bool)> {
         let mut rng = Rng::new(shape_seed(seed, label, n, k));
 
         let (qbytes, scales) = quantize_per_channel_e4m3(&mut rng, n, k);
@@ -460,7 +507,14 @@ mod real {
         let workspace = ctx.stream.alloc_zeros::<i32>(ws_ints)?;
         ctx.sync()?;
 
-        let mut any_fail = false;
+        // Negative-mode corruption: judge BOTH lanes against a 3x expectation,
+        // which gives rel-L2 ≈ 2 independent of output size. Each lane keeps
+        // its own verdict, so the Marlin and GEMV family flags trip
+        // independently (one broken lane cannot mask or fake the other).
+        let bad_reference: Vec<f64> = reference.iter().map(|&r| 3.0 * r).collect();
+        let judge_reference: &[f64] = if negative { &bad_reference } else { &reference };
+        let mut marlin_failed = false;
+        let mut gemv_failed = false;
         for &m in M_SWEEP {
             let mut marlin_out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
             let mut gemv_out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
@@ -510,28 +564,35 @@ mod real {
 
             let marlin = ctx.stream.clone_dtoh(&marlin_out)?;
             let gemv = ctx.stream.clone_dtoh(&gemv_out)?;
-            let ms = lane_stats(&marlin, n, m, &cols, &reference, m_max);
-            let gs = lane_stats(&gemv, n, m, &cols, &reference, m_max);
+            let ms = lane_stats(&marlin, n, m, &cols, judge_reference, m_max);
+            let gs = lane_stats(&gemv, n, m, &cols, judge_reference, m_max);
             let ratio = ms.rel_l2 / gs.rel_l2.max(1e-12);
-            let pass = ms.rel_l2.is_finite()
+            let marlin_pass = ms.rel_l2.is_finite()
                 && ms.rel_l2 <= MAX_REL_L2
                 && ratio <= MARLIN_VS_GEMV_MAX_RATIO;
-            any_fail |= !pass;
+            let gemv_pass = gs.rel_l2.is_finite() && gs.rel_l2 <= MAX_REL_L2;
+            if !marlin_pass {
+                marlin_failed = true;
+            }
+            if !gemv_pass {
+                gemv_failed = true;
+            }
             eprintln!(
                 "[{label} m={m:>3} n={n} k={k} seed={seed:#x}] \
                  marlin relL2={:.4e} max/rms={:.4e} mean(out/ref)={:.6} | \
                  gemv relL2={:.4e} max/rms={:.4e} mean(out/ref)={:.6} | \
-                 ratio={ratio:.2} {}",
+                 ratio={ratio:.2} m:{} g:{}",
                 ms.rel_l2,
                 ms.max_over_rms,
                 ms.mean_ratio,
                 gs.rel_l2,
                 gs.max_over_rms,
                 gs.mean_ratio,
-                if pass { "PASS" } else { "FAIL" }
+                if marlin_pass { "PASS" } else { "FAIL" },
+                if gemv_pass { "PASS" } else { "FAIL" }
             );
         }
-        Ok(any_fail)
+        Ok((marlin_failed, gemv_failed))
     }
 
     /// A shape the repack must decline: assert the source stays resident and
