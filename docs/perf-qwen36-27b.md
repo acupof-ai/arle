@@ -693,7 +693,7 @@ flowchart TB
 
 Prefill and decode rows share a tick (`ForwardMode::Mixed`), but the executor
 still decomposes the mixed plan into per-row prefill submissions followed by a
-batched decode dispatch (`infer-cuda/src/executor/qwen35.rs:2932`).
+batched decode dispatch (`infer-cuda/src/qwen35_decode.rs`, routed from `executor/qwen35.rs` `decode_dispatch`).
 
 **The other served paths.** The anchor chain above is one of several. The
 Metal backend unifies its model families behind one compiled forward trait,
@@ -1114,7 +1114,7 @@ per-row loop, but that is a hypothesis, not a measured effect, until the two
 arms are re-run with equal completion counts and reported prefix hits.
 
 The candidate mechanism is the batched-draft gate at
-`infer-cuda/src/executor/qwen35.rs:1984`:
+`infer-plan/src/spec.rs` (`decide_decode` / the all-greedy batch gate):
 
 ```rust
 if idx.len() >= 2 && decode_rows.iter().all(|r| r.params.is_greedy())
@@ -1326,7 +1326,7 @@ Ceilings belong to levers, not to categories.
 | GDN / gated-delta at c=16 | decode | c=16, 2.5K ctx | 21.0% of a decode tick | open — a same-binary A/B nulled it at 33K, untested here |
 | >1 ms gaps inside decode ticks | decode | c=16, 2.5K ctx | 13.8% of tick span, 53 gaps | open, cause unknown |
 | full-attn KV bandwidth | decode | c=16 | **47% of achievable at 2.5K, 29.2% at 32.5K** | open, but only 1.8% of a tick at short context |
-| batched-draft gate under sampling | decode | c=1…16, 32K | unverified (120 vs 128 complete, cache parity unreported) | hypothesis — `executor/qwen35.rs:1984` tests all rows greedy; re-run same-envelope before ranking |
+| batched-draft gate under sampling | decode | c=1…16, 32K | unverified (120 vs 128 complete, cache parity unreported) | hypothesis — `infer-plan/src/spec.rs` (the `all_greedy` input to `decide_decode`) tests all rows greedy; re-run same-envelope before ranking |
 | prefill GPU idle | prefill | c=1, 33K | 3.97 vs SGLang 0.19 s | **open** — largest single gap, own SLO (TTFT) |
 | sidecar write policy | prefill | c=1…16 | 83 GB / 9.4% of wall | open — hit rate unmeasured |
 | host tail (refresh H2D, sampling sync) | decode | **batch 1** | part of ~4.3 ms residual | open, needs re-pricing at c=16 |
@@ -1515,7 +1515,8 @@ TTFT ratios are hypotheses pending a complete matched run.
 9. **Sampling's cost at c ≥ 8 is not yet a measured decode cost** (§2.4) —
    the arms differ
    120 vs 128 complete, and cache parity is unreported. The gate at
-   `executor/qwen35.rs:1984` tests *all* rows greedy; that stays a hypothesis
+   `infer-plan/src/spec.rs` (the `all_greedy` input to `decide_decode`) tests
+   *all* rows greedy; that stays a hypothesis
    until a same-envelope re-run. Do **not** re-open "acceptance collapses with
    concurrency": withdrawn (`baselines.md:137`), and both 08-08 captures
    measured `accept_rate` ≈ 0.475.

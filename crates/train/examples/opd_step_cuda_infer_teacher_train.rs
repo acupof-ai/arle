@@ -201,7 +201,7 @@ mod app {
         // pristine BF16 base is snapshotted lazily on the first
         // `remerge_lora` (driven by the per-step `sync_lora_from_store`), so
         // the prior temp-PEFT-dir + `INFER_LORA_PATH` juggling is gone (P4
-        // infra hardening — see `infer/src/model/qwen35/weights.rs`).
+        // infra hardening — see `infer-cuda/src/qwen35_load.rs`).
         let infer_student = if infer_rollout_flag_enabled() {
             let infer_student_load_started = Instant::now();
             let engine = load_infer_engine(

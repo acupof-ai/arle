@@ -2,7 +2,7 @@
 Sampling parameter tests — no GPU required.
 
 Tests the sampling math and parameter validation logic that mirrors
-infer/src/sampler.rs. All tests are pure Python.
+crates/infer-plan/src/sample.rs. All tests are pure Python.
 
 Run:
     pytest tests/python/test_sampling.py -v
@@ -17,7 +17,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 class SamplingParams:
-    """CPU-side mirror of infer::sampler::SamplingParams."""
+    """CPU-side mirror of infer_plan::SamplingParams."""
 
     def __init__(
         self,

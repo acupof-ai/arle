@@ -57,8 +57,9 @@ Phase 2b status — AOT swap wired
 `tools/tilelang/gen_tilelang_aot.py` now has a `gdr` kernel family beside the
 paged-attention family. `build.rs` emits the TileLang-backed public C symbols
 (`gated_delta_rule_prefill_chunk_*_cuda`) for the AOT-compatible stages, while
-`csrc/misc/gdr_prefill_solve.cu` owns the solve symbol. Rust FFI and
-`infer/src/ops/recurrent.rs` call sites remain stable. The old external AOT
+`csrc/misc/gdr_prefill_solve.cu` owns the solve symbol. The Rust FFI is
+`cuda-kernels/src/ffi/recurrent.rs` (shim in `cuda-kernels/src/recurrent.rs`),
+called from `infer-cuda/src/qwen35_attention.rs`. The old external AOT
 directory is gone. GPU numerical validation compares this path via the
 existing Qwen3.5 e2e tests and JSON baselines.
 """

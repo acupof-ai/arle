@@ -6,7 +6,7 @@ compile-time constants gives TileLang the freedom to specialize codegen
 per shape instead of paying for runtime parameterization. Add a new
 Qwen3.5 size by extending the lockstep lists in this module,
 cuda-kernels/build.rs, cuda-kernels/src/ffi/attention.rs, and
-infer/src/ops/attention.rs.
+infer-cuda/src/qwen35_attention.rs.
 
 Mirror twin of `batch_prefill_paged_hd128.py`; the deltas vs HD128 are:
 
