@@ -159,7 +159,10 @@ if [[ "${CARGO_RUNS}" == "1" && "${nested_unsafe_shared}" != "1" ]]; then
     info "refreshing shared snapshot at ${SNAPSHOT_ROOT}"
 else
     # Private throwaway snapshot; cleanup removes it on exit.
-    SNAPSHOT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-snapshot.XXXXXX")"
+    # Keep the established nocargo.* private prefix: the orphan sweep below
+    # matches it, and it is not a prefix-sibling of the shared
+    # arle-pre-push-snapshot root.
+    SNAPSHOT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-nocargo.XXXXXX")"
     SNAPSHOT_PRIVATE=1
     if [[ "${CARGO_RUNS}" != "1" ]]; then
         info "cargo-free push; running checks from private snapshot (no lock)"

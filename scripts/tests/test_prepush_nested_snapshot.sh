@@ -71,7 +71,7 @@ grep -q "using private snapshot .*shared snapshot left untouched" "$log" \
   || { echo "FAIL: nested run wiped a peer's deep source file (the live race)" >&2; exit 1; }
 # The private snapshot is removed by the hook's exit trap, so assert its path
 # from the run's log; the sentinels already prove the shared root was untouched.
-grep -qE "using private snapshot ${SCRATCH_TMPDIR}/arle-pre-push-snapshot\.[A-Za-z0-9]{6}" "$log" \
+grep -qE "using private snapshot ${SCRATCH_TMPDIR}/arle-pre-push-nocargo\.[A-Za-z0-9]{6}" "$log" \
   || { echo "FAIL: nested run did not name a private mktemp snapshot" >&2; cat "$log" >&2; exit 1; }
 
 # Control: an EXPLICIT snapshot root is still honored (fixture tests own it and
