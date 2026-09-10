@@ -14,10 +14,11 @@ use crate::{KvAllocator, KvPrefixStore, KvQuery};
 /// logical positions. The trait is dyn-safe so engine-core can hold
 /// `&mut dyn KvPool` without knowing the backend.
 ///
-/// `KvSlotAccounting` is the narrowed write surface `BackendExecutor::submit`
-/// takes; it is a strict subset of `KvAllocator`, so the supertrait chain
-/// (`KvPool: KvAllocator: KvSlotAccounting`) lets `&mut dyn KvPool` upcast to
-/// it at the engine-core call site.
+/// Engine-core is the sole writer: it grows/shrinks slots through the
+/// [`KvAllocator`](crate::KvAllocator)/[`KvSlotAccounting`](crate::KvSlotAccounting)
+/// supertraits (the supertrait chain lets `&mut dyn KvPool` call them at the
+/// engine-core site). Backends receive only the read-only
+/// [`KvBatchDescriptor`] view and report reached lengths in `StepOutput::kv_actual`.
 pub trait KvPool: KvQuery + KvAllocator + KvPrefixStore {}
 
 impl<T: KvQuery + KvAllocator + KvPrefixStore> KvPool for T {}

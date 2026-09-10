@@ -3,9 +3,9 @@
 //! Every method is expressed in host slot ids, page ids, and token counts. The
 //! trait is dyn-safe.
 
-/// The narrow write surface a backend needs during `submit`: grow or shrink a
-/// slot's accounted length. Everything else the backend used to read from
-/// `&dyn KvPool` is resolved above the seam into `KvBatchDescriptor`.
+/// Grow or shrink a slot's accounted length. Engine-core is the sole caller
+/// (prefix attach and post-poll `apply_kv_actual`); a backend reports the
+/// lengths it reached in `StepOutput::kv_actual` instead of writing the pool.
 pub trait KvSlotAccounting {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()>;
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
