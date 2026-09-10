@@ -7,18 +7,21 @@
 
 use crate::SamplingParams;
 
-/// Index of the maximum logit. Ties resolve to the lowest index.
+/// Index of the maximum logit. Ties resolve to the LOWEST index, and NaN is
+/// never selected (an all-NaN row yields 0), matching `sampling.cu`'s
+/// `warp_reduce_argmax`, whose strict `>` compares leave NaN unselected.
+/// `total_cmp` would sort +NaN above +inf and diverge from the CUDA kernel.
 #[must_use]
-/// Ties resolve to the LOWEST index, matching `sampling.cu`'s
-/// `warp_reduce_argmax` — the device fast path and this must agree or greedy
-/// decode depends on which one ran.
 pub fn argmax_logit(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then(bi.cmp(ai)))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    let mut best = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best = i;
+        }
+    }
+    best as u32
 }
 
 /// SplitMix64 — a tiny dependency-free mixer.
