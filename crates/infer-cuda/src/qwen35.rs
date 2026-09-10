@@ -182,9 +182,7 @@ pub(crate) struct Qwen35Model {
     /// `spec_draft_tokens > 0`) only when the constructor was asked to load it;
     /// the default decode path never reads it, so the baseline stays
     /// byte-identical when spec-decode is off.
-    #[allow(dead_code)] // read by the spec-decode draft/verify path (next increment)
     mtp: Option<Qwen35MtpHead>,
-    #[allow(dead_code)] // read by the spec-decode orchestrator (next increment)
     spec_draft_tokens: usize,
     /// Host-resident weight snapshot while the engine is offloaded for the OPD
     /// teacher time-share. `Some` iff [`Qwen35Model::offload_engine_weights`] ran

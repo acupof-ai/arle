@@ -216,9 +216,9 @@ pub(crate) enum SyncArg {
 pub(crate) enum UpdateStrategyArg {
     /// Reject failures, masked CE on full passes (default, unchanged).
     RejectionCe,
-    /// SAO Phase 1: hard-gated per-token PG with a batch-centered advantage.
+    /// Hard-gated per-token PG with a batch-centered advantage.
     SaoDis,
-    /// SAO Phase 2: per-token Skip-Obs GAE from a learned value critic.
+    /// Per-token Skip-Obs GAE from a learned value critic.
     SaoValue,
     /// GRPO: group-normalized advantage, clamped per-token ratio.
     Grpo,
@@ -374,7 +374,7 @@ pub(crate) struct Args {
     pub(crate) non_interactive: bool,
 
     /// Path to a JSONL file that will receive one trajectory record per
-    /// agent turn (Phase 1 / v1 schema). When unset, no trajectory is
+    /// agent turn (v1 schema). When unset, no trajectory is
     /// written. See `docs/projects/agent-trajectory-export.md` for the
     /// canonical schema.
     #[arg(long, value_parser = parse_trace_path)]
@@ -2358,15 +2358,15 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 3.0)]
     pub(crate) sao_eps_high: f32,
 
-    /// SAO Phase 2 GAE discount γ. Only used by `--update-strategy sao-value`.
+    /// SAO value-critic GAE discount γ. Only used by `--update-strategy sao-value`.
     #[arg(long, default_value_t = 1.0)]
     pub(crate) sao_gamma: f32,
 
-    /// SAO Phase 2 GAE trace λ. Only used by `--update-strategy sao-value`.
+    /// SAO value-critic GAE trace λ. Only used by `--update-strategy sao-value`.
     #[arg(long, default_value_t = 0.95)]
     pub(crate) sao_lambda: f32,
 
-    /// SAO Phase 2 value-critic learning rate. Only used by `sao-value`.
+    /// SAO value-critic learning rate. Only used by `sao-value`.
     #[arg(long, default_value_t = 1.0e-3)]
     pub(crate) value_lr: f32,
 

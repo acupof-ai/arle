@@ -9,7 +9,6 @@ use super::*;
 /// pre-verify **snapshot** of the trunk's linear-attn recurrent + conv state,
 /// restored on a rejected draft. Allocated only when spec-decode is on, one per
 /// concurrent slot, so the baseline decode path never pays for it.
-#[allow(dead_code)] // head_k/head_v read by mtp_forward_level; snap by spec_step (next increments)
 pub(crate) struct Qwen35SpecSlotState {
     /// `(depth+1)*kv_dim` bf16, rewritten each draft block.
     pub(crate) head_k: DeviceVec,
@@ -149,7 +148,6 @@ pub(crate) struct Qwen35LinearCapture {
     pub(crate) a_proj: Vec<DeviceVec>,
 }
 
-#[allow(dead_code)] // consumed by mtp_forward_level + spec_step (next increments)
 impl Qwen35SpecSlotState {
     /// Snapshot trunk linear state before verify (for reject rollback).
     pub(crate) fn snapshot_trunk(

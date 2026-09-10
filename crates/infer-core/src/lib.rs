@@ -1537,7 +1537,7 @@ impl Engine {
             }
         }
 
-        // P5 — running-cap oversubscription. Once the scheduler cap is full,
+        // Running-cap oversubscription: once the scheduler cap is full,
         // waiters may rotate in by parking the longest-running decode's
         // whole-slot image. Executor capacity stays independent from this cap.
         if self.config.slot_oversubscription
@@ -1679,7 +1679,7 @@ impl Engine {
         Ok(AdmitOutcome::Admitted)
     }
 
-    /// P5 oversubscription trigger: free a running slot by parking the
+    /// Oversubscription trigger: free a running slot by parking the
     /// longest-running decode (smallest `admit_seq`) and admit a waiter in its
     /// place, capped at `running_cap/4` (>=1) preemptions per call. Terminates:
     /// each iteration either demotes+admits one (decrementing the bounded cap)

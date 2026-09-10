@@ -2,8 +2,8 @@
 //!
 //! Mirrors the HIP/Metal backends' page accounting shape: LIFO free
 //! pages, retained pages survive `free_slot`, and device buffers are hidden
-//! from the seam. P2 allocates host page ids only; real Vulkan arenas land
-//! with the first numeric model path.
+//! from the seam. Only host page ids are allocated here; real Vulkan arenas
+//! land with the first numeric model path.
 
 use std::collections::HashMap;
 

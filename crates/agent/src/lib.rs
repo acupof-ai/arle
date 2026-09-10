@@ -153,7 +153,7 @@ pub struct AgentTurnResult {
     /// monotonic anchor as `time_to_first_token`. Surfaced separately
     /// because the trace writer needs it without re-sampling.
     pub wall_secs: f64,
-    /// Phase 2 trajectory token layer. `Some(TokensRecord)` only when
+    /// Trajectory token layer. `Some(TokensRecord)` only when
     /// every component of the turn's token IDs was available — empty
     /// `prompt_token_ids` from the engine, empty `response_token_ids`
     /// from any sub-turn, or a tokenize failure on a tool result all
@@ -477,7 +477,7 @@ impl AgentSession {
         });
         let mut sub_turns: Vec<SubTurnRecord> = Vec::new();
 
-        // Phase 2 trajectory token layer. `prompt_ids` is set on the
+        // Trajectory token layer. `prompt_ids` is set on the
         // FIRST engine sub-turn from `output.prompt_token_ids`; if that
         // is empty, or any later component is unavailable, we set
         // `tokens_aborted = true` and surface `tokens = None` from the
@@ -579,7 +579,7 @@ impl AgentSession {
                 completion_tokens =
                     completion_tokens.saturating_add(output.usage.completion_tokens as u64);
 
-                // Phase 2 token layer: assemble per-sub-turn deltas.
+                // Token layer: assemble per-sub-turn deltas.
                 //
                 // First engine sub-turn fixes `prompt_ids` from the
                 // engine's view of the original prompt. Subsequent
@@ -691,7 +691,7 @@ impl AgentSession {
                         // `completion_text` and under-reports engine work.
                         sub_turns.push(repair_outcome.record);
 
-                        // Phase 2 token layer: repair was a real engine
+                        // Token layer: repair was a real engine
                         // call. Same prompt-delta accounting as the
                         // main path — first engine call fixes
                         // prompt_ids; subsequent calls' prompt_token_ids
@@ -1071,7 +1071,7 @@ fn finish_reason_to_str(reason: FinishReason) -> &'static str {
     }
 }
 
-/// Phase 2 trajectory token layer assembler. Returns `Some(record)` ONLY
+/// Trajectory token layer assembler. Returns `Some(record)` ONLY
 /// when every required component was available — `tokens_aborted` is
 /// the kill switch that fires the moment any sub-turn or tool result
 /// produced an empty / errored token list. `prompt_ids` must also be
@@ -1130,7 +1130,7 @@ fn scalar_tool_result(result: &str) -> Option<String> {
 struct RepairOutcome {
     parsed: ParsedAssistantResponse,
     record: SubTurnRecord,
-    /// Phase 2 trajectory: the engine's tokenized response (mask=1) for
+    /// The engine's tokenized response (mask=1) for
     /// this repair sub-turn. Empty when the engine didn't surface ids
     /// — caller should abort token tracking.
     response_token_ids: Vec<u32>,
@@ -1218,7 +1218,7 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
         return engine.complete(req).map(Some);
     }
 
-    // Phase 2 trajectory: snapshot the prompt's tokenized form before
+    // Snapshot the prompt's tokenized form before
     // the worker takes ownership of `req`. Empty Vec on failure — the
     // agent loop treats empty as "unavailable" and downgrades
     // `tokens = None`.

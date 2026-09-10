@@ -262,8 +262,8 @@ pub(crate) fn moe_forward_into(
         let route_indices = scratch.route_indices.get(ctx, total_routes)?;
         let route_weights = scratch.route_weights.get(ctx, total_routes)?;
         // SAFETY: logits `[E, T]`, indices/weights `[T*topk]`, bias `[E]`
-        // are live scratch buffers on ctx.stream. Phase 3 of the route
-        // kernel writes EVERY indices/weights slot unconditionally, so
+        // are live scratch buffers on ctx.stream. The route kernel writes
+        // EVERY indices/weights slot unconditionally, so
         // length-matched slot reuse needs no re-init; the renorm kernel
         // rewrites the same freshly written slots in place.
         unsafe {

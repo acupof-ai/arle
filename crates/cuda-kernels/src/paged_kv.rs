@@ -497,7 +497,7 @@ impl TokenKVPool {
             };
 
         // Legacy dtype mapping. PackedBytes carries no per-head quant
-        // dispatch — BF16 is the inert legacy mapping (P2's FlashMLA
+        // dispatch — BF16 is the inert legacy mapping (the FlashMLA
         // consumer reads the packed record directly, never this field).
         let dtype = match format {
             KVFormat::BF16 | KVFormat::PackedBytes { .. } => KVCacheDtype::BF16,
@@ -576,7 +576,7 @@ impl TokenKVPool {
 
     /// Extend a fixed-layout band's page table by `count` pages from the free
     /// list WITHOUT moving the logical token cursor — the band-demand-paging
-    /// counterpart of [`Self::alloc_tokens`] (#154 Phase 3b: DSv4 grows the
+    /// counterpart of [`Self::alloc_tokens`] (DSv4 grows the
     /// comp region at page boundaries; `set_band_cursor` owns the cursor).
     /// Returns the newly attached page ids; the caller must zero them (a
     /// recycled page carries a prior occupant's bytes).
@@ -759,7 +759,7 @@ impl TokenKVPool {
     /// Mirror a fixed logical page band for a slot while setting an independent
     /// logical token cursor. Used by DSv4 FlashMLA: the slot page table is
     /// `[SW ring | compressed region]`, not `ceil(seq_len / page_size)`.
-    /// Returns whether the slot's page list CHANGED (#154 Phase 0: the caller's
+    /// Returns whether the slot's page list CHANGED (the caller's
     /// device-table refresh is dirty-driven). An unchanged page list only
     /// updates the token cursor — no release/claim refcount churn.
     pub fn mirror_band(&mut self, slot: usize, pages: &[BandPage], seq_len: usize) -> Result<bool> {
@@ -1381,8 +1381,9 @@ impl TokenKVPool {
 
     /// Mutable K data CudaSlice ref for a layer. Packed-record pools
     /// (`KVFormat::PackedBytes`) are single-plane - the whole record lives
-    /// here - and their adapters (DSv4 #85 P2) need `slice_mut` views for
-    /// memset / D2D restore paths that the raw-pointer accessors can't serve.
+    /// here - and their adapters (the DSv4 packed-record pools) need `slice_mut`
+    /// views for memset / D2D restore paths that the raw-pointer accessors
+    /// can't serve.
     pub fn k_data_slice_mut(&mut self, layer: usize) -> &mut CudaSlice<u8> {
         &mut self.k_data[layer]
     }

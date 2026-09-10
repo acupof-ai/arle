@@ -49,7 +49,7 @@ pub struct KvBatchRow {
     /// The request's KNOWN final logical length for this phase (prefill: the
     /// full prompt; decode: `append_pos + append_len`). Demand-paged backends
     /// reserve device pages for the whole known span at the first chunk
-    /// instead of growing per chunk (#154 Phase 3b).
+    /// instead of growing per chunk (demand-paged bands).
     pub total_tokens: usize,
     pub slot_epoch: u64,
     pub token_range: Range<usize>,

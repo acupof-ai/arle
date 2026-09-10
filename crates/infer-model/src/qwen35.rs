@@ -169,7 +169,7 @@ pub fn decode_graph_unsupported_reason(
 /// as DSv4.
 pub const KV_MEM_FRACTION: f64 = 0.7;
 
-/// Phase 1 of the joint KV-budget solve: the largest state-affordable slot
+/// The largest state-affordable slot count in the joint KV-budget solve —
 /// count whose pool remainder still funds one full-length (`max_seq_len`)
 /// request, from this rank's free-VRAM probe. Feasibility is monotone in
 /// decreasing n, so the first feasible n scanning down is the max.
@@ -217,7 +217,7 @@ pub fn kv_slot_budget_local(
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-/// Phase 2: the shared-pool page count at the REDUCED slot count. `i32::MAX`
+/// The shared-pool page count at the REDUCED slot count. `i32::MAX`
 /// when the probe failed (every rank failing → the requested floor, in
 /// [`finalize_pool_pages`]). `num_full` / `local_kv_heads` / `head_dim` are the
 /// cell's decomposition, carried for the budget log (the cell itself is

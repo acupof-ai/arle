@@ -537,8 +537,8 @@ mod tests {
 
         let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
 
-        // 1. Snapshot BEFORE the optimizer has any moments for the adapter — the
-        //    "first gated step" scenario from the P1 finding.
+        // 1. Snapshot BEFORE the optimizer has any moments for the adapter —
+        //    the "first gated step" scenario.
         let snap = ema.snapshot(&student, &optimizer, &mut store)?;
 
         // 2. A rejected step: attach a grad to the student adapter and step the
@@ -581,7 +581,7 @@ mod tests {
         Ok(())
     }
 
-    /// P1 regression: the EMA teacher must expose only its own frozen params
+    /// Regression guard: the EMA teacher must expose only its own frozen params
     /// (shared base + frozen EMA adapter), NOT the student's trainable adapter.
     /// `share_base_parameters_from` folds the student adapter ids into the EMA
     /// model's `all_parameter_ids()`, which would make the OPD step reject the

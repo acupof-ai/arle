@@ -1037,7 +1037,7 @@ impl Dsv4LayerAttentionState {
     }
 
     /// Re-sync this layer's persistent FlashMLA device page table from the
-    /// host table. Dirty-bit driven (#154 Phase 0): called via
+    /// host table. Dirty-bit driven: called via
     /// `Dsv4SlotState::refresh_flashmla_device_page_tables` whenever
     /// `Dsv4KvAdapter::take_device_table_dirty` reports the slot's host band
     /// changed — never unconditionally per step (a CUDA-graph capture hazard,

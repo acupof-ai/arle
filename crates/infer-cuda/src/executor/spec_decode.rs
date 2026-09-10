@@ -38,9 +38,9 @@ impl Dsv4CudaExecutor {
             .ok_or_else(|| anyhow!("DSv4 MTP decode missing previous hidden"))?
             .clone();
 
-        // Frozen-KV P1-2: snapshot the ring slots the draft will overwrite
-        // BEFORE any speculative write (the draft writes the frozen target
-        // layer's SW/FP8 ring; the batched verify itself is pure).
+        // Snapshot the ring slots the draft will overwrite BEFORE any
+        // speculative write (the draft writes the frozen target layer's
+        // SW/FP8 ring; the batched verify itself is pure).
         self.model.capture_spec_rings(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
