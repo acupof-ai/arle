@@ -15,13 +15,15 @@
 //! block), 17 and 64 (one FlashMLA paged-KV page). Every slot starts from a
 //! nonzero conv ring and a nonzero recurrent state.
 //!
-//! At (16,48) the SAME single-slot input at the DSpark-relevant row lengths 5
-//! and 17 (and a 64-token reference chunk) is additionally run through BOTH the
+//! At the global (16,48) shard AND the attn_tp=2 (8,24) / attn_tp=4 (4,12)
+//! shards, the SAME single-slot input at the DSpark-relevant row lengths 5 and
+//! 17 (and a 64-token reference chunk) is additionally run through BOTH the
 //! varlen recurrent kernel and the chunked FlashQLA pipeline
 //! (gdr_fq_prep -> cumsum -> kkt -> fwd, one chunk), from the same nonzero
 //! initial state: each path is compared to the f64 anchor, and the varlen-vs-
-//! FlashQLA max output/state diff is printed per length. This is the spot #300
-//! depends on — attn_tp=1 verify takes FQ, attn_tp≥2 takes varlen.
+//! FlashQLA max output/state diff is printed per geometry and length. This is
+//! the spot #300 depends on — the shards taking FQ after this change versus
+//! attn_tp=8, which still takes varlen (no (2,6) AOT instantiation).
 //!
 //! `--negative-control` applies one sabotage per family (conv output, rebuilt
 //! conv ring, GDR output, GDR final state) in separate comparisons and asserts
@@ -85,8 +87,10 @@ mod real {
     const FQ_OUT_ABS_SLOPE: f64 = 8e-2;
     const FQ_STATE_REL_L2_MAX: f64 = 3e-2;
     const FQ_STATE_ABS_MAX: f64 = 1.5e-2;
-    // Cross-path: row lengths where attn_tp=1 verify takes FQ and attn_tp≥2
-    // takes varlen — the 5-token DSpark block, a 17-token row, and one 64 page.
+    // Cross-path: geometries where serve routes verify — global (16,48) and
+    // the attn_tp=2 (8,24) / attn_tp=4 (4,12) shards — at the DSpark-relevant
+    // row lengths (5-token block, 17-row verify) and one 64-token page.
+    const FQ_XCHECK_GEOMS: &[(usize, usize)] = &[(16, 48), (8, 24), (4, 12)];
     const FQ_XCHECK_LENS: &[usize] = &[5, 17, 64];
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -600,47 +604,68 @@ mod real {
         }
 
         let mut fq_ok = true;
-        for &len in FQ_XCHECK_LENS {
-            fq_ok &= probe_flashqla(&ctx, len)?;
+        for &(kh, vh) in FQ_XCHECK_GEOMS {
+            for &len in FQ_XCHECK_LENS {
+                fq_ok &= probe_flashqla(&ctx, kh, vh, len)?;
+            }
         }
         ensure!(fq_ok, "flashqla cross-check FAILED");
         eprintln!("[gdr-varlen-parity] ALL PASS");
         Ok(())
     }
 
-    /// Single-slot (16,48) run at `len` through BOTH production prefill paths on
-    /// identical inputs and the same nonzero initial state — the chunked
-    /// FlashQLA pipeline and the varlen recurrent twin — with each path anchored
-    /// on the same f64 reference and the varlen-vs-FQ max diff printed. This is
-    /// the direct answer to #300 at the lengths (5/17) where attn_tp=1 verify
-    /// takes FQ and attn_tp>=2 takes varlen.
-    fn probe_flashqla(ctx: &DeviceContext, len: usize) -> Result<bool> {
-        const KH: usize = 16;
-        const VH: usize = 48;
-        let ch = 2 * KH * KEY_DIM + VH * VAL_DIM;
-        let mut rng = Rng::new(SEED ^ 0xF1A5 ^ ((len as u64) << 20));
+    /// Single-slot run at geometry (kh,vh) and `len` through BOTH production
+    /// prefill paths on identical inputs and the same nonzero initial state —
+    /// the chunked FlashQLA pipeline and the varlen recurrent twin — with each
+    /// path anchored on the same f64 reference and the varlen-vs-FQ max diff
+    /// printed. Covers global (16,48) and the attn_tp=2 (8,24) / attn_tp=4
+    /// (4,12) shards, the fork behind #300, at lengths 5/17/64.
+    fn probe_flashqla(ctx: &DeviceContext, kh: usize, vh: usize, len: usize) -> Result<bool> {
+        let (cumsum_fn, kkt_fn, fwd_fn): (ffi::FqCumsumFn, ffi::FqKktFn, ffi::FqFwdFn) =
+            match (kh, vh) {
+                (16, 48) => (
+                    ffi::gdr_fq_cumsum_h48_cuda as _,
+                    ffi::gdr_fq_kkt_h48_cuda as _,
+                    ffi::gdr_fq_fwd_h48_cuda as _,
+                ),
+                (8, 24) => (
+                    ffi::gdr_fq_cumsum_h24g8_cuda as _,
+                    ffi::gdr_fq_kkt_h24g8_cuda as _,
+                    ffi::gdr_fq_fwd_h24g8_cuda as _,
+                ),
+                (4, 12) => (
+                    ffi::gdr_fq_cumsum_h12g4_cuda as _,
+                    ffi::gdr_fq_kkt_h12g4_cuda as _,
+                    ffi::gdr_fq_fwd_h12g4_cuda as _,
+                ),
+                _ => unreachable!("cross-check geom not in FQ_XCHECK_GEOMS"),
+            };
+        let ch = 2 * kh * KEY_DIM + vh * VAL_DIM;
+        let mut rng = Rng::new(
+            SEED ^ 0xF1A5 ^ ((len as u64) << 20) ^ ((kh as u64) << 32) ^ ((vh as u64) << 24),
+        );
         let w: Vec<bf16> = (0..ch * K)
             .map(|_| bf((rng.normal() * 0.3) as f64))
             .collect();
-        let dt: Vec<bf16> = (0..VH).map(|_| bf((rng.normal() * 0.5) as f64)).collect();
-        let alog: Vec<f32> = (0..VH).map(|i| -(1.0 + (i as f32 % 3.0) * 0.5)).collect();
+        let dt: Vec<bf16> = (0..vh).map(|_| bf((rng.normal() * 0.5) as f64)).collect();
+        let alog: Vec<f32> = (0..vh).map(|i| -(1.0 + (i as f32 % 3.0) * 0.5)).collect();
         let x: Vec<bf16> = (0..len * ch)
             .map(|_| bf((rng.normal() * 0.5) as f64))
             .collect();
-        let bp: Vec<bf16> = (0..len * VH)
+        let bp: Vec<bf16> = (0..len * vh)
             .map(|_| bf((rng.normal() * 0.5) as f64))
             .collect();
-        let ap: Vec<bf16> = (0..len * VH)
+        let ap: Vec<bf16> = (0..len * vh)
             .map(|_| bf((rng.normal() * 0.5) as f64))
             .collect();
         let ring0: Vec<bf16> = (0..ch * (K - 1))
             .map(|_| bf((rng.normal() * 0.3) as f64))
             .collect();
-        let state0: Vec<f32> = (0..VH * KEY_DIM * VAL_DIM)
+        let state0: Vec<f32> = (0..vh * KEY_DIM * VAL_DIM)
             .map(|_| rng.normal() * 0.02)
             .collect();
         let reference = reference_slot(
-            KH, VH, ch, len, &x, &bp, &ap, &w, &dt, &alog, &ring0, &state0,
+            kh, vh, ch, len, &x, &bp, &ap, &w, &dt, &alog, &ring0, &state0,
         );
 
         let w_d = ctx.stream.clone_htod(&w)?;
@@ -656,9 +681,9 @@ mod real {
         let mut state_vl_d = ctx.stream.clone_htod(&state0)?;
         let mut conv_fq_d = ctx.stream.alloc_zeros::<bf16>(len * ch)?;
         let mut conv_vl_d = ctx.stream.alloc_zeros::<bf16>(len * ch)?;
-        let mut o_fq_d = ctx.stream.alloc_zeros::<bf16>(len * VH * VAL_DIM)?;
-        let mut o_vl_d = ctx.stream.alloc_zeros::<bf16>(len * VH * VAL_DIM)?;
-        let mut ht_fq_d = ctx.stream.alloc_zeros::<f32>(VH * KEY_DIM * VAL_DIM)?;
+        let mut o_fq_d = ctx.stream.alloc_zeros::<bf16>(len * vh * VAL_DIM)?;
+        let mut o_vl_d = ctx.stream.alloc_zeros::<bf16>(len * vh * VAL_DIM)?;
+        let mut ht_fq_d = ctx.stream.alloc_zeros::<f32>(vh * KEY_DIM * VAL_DIM)?;
 
         let (xp, _) = x_d.device_ptr(&ctx.stream);
         let (wp, _) = w_d.device_ptr(&ctx.stream);
@@ -675,13 +700,13 @@ mod real {
             let (cp, _) = conv_fq_d.device_ptr_mut(&ctx.stream);
             conv1d_prefill_raw(&ctx.stream, xp, wp, rp, cp, ch, len, K)?;
 
-            let mut q_d = ctx.stream.alloc_zeros::<bf16>(len * KH * KEY_DIM)?;
-            let mut k_d = ctx.stream.alloc_zeros::<bf16>(len * KH * KEY_DIM)?;
-            let mut v_d = ctx.stream.alloc_zeros::<bf16>(len * VH * VAL_DIM)?;
-            let mut g_d = ctx.stream.alloc_zeros::<f32>(len * VH)?;
-            let mut gc_d = ctx.stream.alloc_zeros::<f32>(len * VH)?;
-            let mut beta_d = ctx.stream.alloc_zeros::<f32>(len * VH)?;
-            let mut ainv_d = ctx.stream.alloc_zeros::<bf16>(len * VH * 64)?;
+            let mut q_d = ctx.stream.alloc_zeros::<bf16>(len * kh * KEY_DIM)?;
+            let mut k_d = ctx.stream.alloc_zeros::<bf16>(len * kh * KEY_DIM)?;
+            let mut v_d = ctx.stream.alloc_zeros::<bf16>(len * vh * VAL_DIM)?;
+            let mut g_d = ctx.stream.alloc_zeros::<f32>(len * vh)?;
+            let mut gc_d = ctx.stream.alloc_zeros::<f32>(len * vh)?;
+            let mut beta_d = ctx.stream.alloc_zeros::<f32>(len * vh)?;
+            let mut ainv_d = ctx.stream.alloc_zeros::<bf16>(len * vh * 64)?;
             gdr_fq_prep_raw(
                 &ctx.stream,
                 cp,
@@ -694,8 +719,8 @@ mod real {
                 v_d.device_ptr_mut(&ctx.stream).0,
                 g_d.device_ptr_mut(&ctx.stream).0,
                 beta_d.device_ptr_mut(&ctx.stream).0,
-                KH,
-                VH,
+                kh,
+                vh,
                 KEY_DIM,
                 VAL_DIM,
                 len,
@@ -714,14 +739,14 @@ mod real {
             // SAFETY: slices sized for `len`; one chunk covers len<=64, so the
             // chunk-local cumsum spans the full sequence.
             unsafe {
-                ffi::gdr_fq_cumsum_h48_cuda(
+                cumsum_fn(
                     gp as *const f32,
                     gcp as *mut f32,
                     len as i32,
                     ctx.stream.cu_stream(),
                 )
                 .result()?;
-                ffi::gdr_fq_kkt_h48_cuda(
+                kkt_fn(
                     kp as *const ffi::Half,
                     betap as *const f32,
                     ainvp as *mut ffi::Half,
@@ -729,7 +754,7 @@ mod real {
                     ctx.stream.cu_stream(),
                 )
                 .result()?;
-                ffi::gdr_fq_fwd_h48_cuda(
+                fwd_fn(
                     qp as *const ffi::Half,
                     kp as *const ffi::Half,
                     vp as *const ffi::Half,
@@ -791,8 +816,8 @@ mod real {
                 state_tbl.device_ptr(&ctx.stream).0,
                 len_d.device_ptr(&ctx.stream).0,
                 ovp,
-                KH,
-                VH,
+                kh,
+                vh,
                 KEY_DIM,
                 VAL_DIM,
                 len,
@@ -860,7 +885,7 @@ mod real {
             .map(|(a, b)| (a - b).abs())
             .fold(0f64, f64::max);
         eprintln!(
-            "[gdr-varlen-parity:xcheck] (16,48) len={len} fq_out(l2={fqorel:.3e},v={fqoviol}) fq_state(l2={fqsrel:.3e},v={fqsviol}) | varlen_out(l2={vlorel:.3e},v={vloviol}) varlen_state(l2={vlsrel:.3e},v={vlsviol}) | VARLEN-vs-FQ maxdiff out={out_xdiff:.4e} state={state_xdiff:.4e}"
+            "[gdr-varlen-parity:xcheck] ({kh},{vh}) len={len} fq_out(l2={fqorel:.3e},v={fqoviol}) fq_state(l2={fqsrel:.3e},v={fqsviol}) | varlen_out(l2={vlorel:.3e},v={vloviol}) varlen_state(l2={vlsrel:.3e},v={vlsviol}) | VARLEN-vs-FQ maxdiff out={out_xdiff:.4e} state={state_xdiff:.4e}"
         );
         Ok(fqop && fqsp && vlop && vlsp)
     }

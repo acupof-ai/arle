@@ -400,7 +400,7 @@ inputs = ["qkv", "b", "a", "conv_state", "gdr_state"]
 outputs = ["gdr_out"]
 reference = "cuda.qwen35.gdr_recurrent_scan"
 correctness_gate = "crates/infer-cuda/examples/gdr_decode_parity.rs;crates/infer-cuda/examples/gdr_varlen_parity.rs;crates/autograd/tests/test_linear_attention.rs"
-gate_gap = "both serving bands gated vs f64 host recurrence at local (K,V)=(16,48) and the attn_tp=2 (8,24) shard: decode (conv1d/gdr decode batch + singular, B=1/8, 5 carried steps) and VARLEN prefill replay (conv1d_prefill_varlen + gdr_prefill_recurrent_varlen, per-slot lengths 1/2/5/17/64 incl a FlashMLA page, B=1/4/8, nonzero initial ring+state, conv output, rebuilt ring, GDR output and final state each an independent comparator/negative tooth), plus a (16,48) cross-path check at lengths 5/17/64 — the DSpark block, a 17-row verify and one FlashMLA page — running the same input through BOTH the varlen recurrent and chunked FlashQLA pipelines against the same f64 anchor, printing the varlen-vs-FQ max diff (covers the attn_tp=1 FQ vs attn_tp>=2 varlen fork behind #300); remaining gaps: the single-row host ABI gdr_prefill_recurrent/conv1d_prefill (non-varlen, same kernel math) is covered only through autograd tests, and training grads have no serving gate"
+gate_gap = "both serving bands gated vs f64 host recurrence at local (K,V)=(16,48) and the attn_tp=2 (8,24) shard: decode (conv1d/gdr decode batch + singular, B=1/8, 5 carried steps) and VARLEN prefill replay (conv1d_prefill_varlen + gdr_prefill_recurrent_varlen, per-slot lengths 1/2/5/17/64 incl a FlashMLA page, B=1/4/8, nonzero initial ring+state, conv output, rebuilt ring, GDR output and final state each an independent comparator/negative tooth), plus a cross-path check at (16,48)/(8,24)/(4,12) lengths 5/17/64 — the DSpark block, a 17-row verify and one FlashMLA page — running the same input through BOTH the varlen recurrent and chunked FlashQLA pipelines against the same f64 anchor, printing the varlen-vs-FQ max diff per geometry; the serve launcher selects chunked FlashQLA at global and attn_tp=2 (8,24) / attn_tp=4 (4,12) shards, while attn_tp=8 (2,6) has no AOT instantiation and batched verify/replay still takes varlen until a (2,6) follow-up enables #300 to delete varlen for every TP; remaining gaps: the single-row host ABI gdr_prefill_recurrent/conv1d_prefill (non-varlen, same kernel math) is covered only through autograd tests, and training grads have no serving gate"
 
 [[implementation]]
 id = "cuda.qwen35.conv1d_front"
@@ -431,7 +431,7 @@ id = "cuda.qwen35.gdr_fq_chunked"
 semantic = "qwen35.linear_attention"
 provider = "tilelang"
 source = "crates/infer-cuda/src/qwen35_attention.rs"
-legality = "seq_len>1 && --qwen35-gdr-chunked && sm==9.0 && flashqla in KERNEL_CAPABILITIES && key/value head_dim==128 && (k_heads,v_heads) in {(16,32),(16,48)}"
+legality = "seq_len>1 && --qwen35-gdr-chunked && sm==9.0 && flashqla in KERNEL_CAPABILITIES && key/value head_dim==128 && (k_heads,v_heads) in {(16,32),(16,48),(8,24),(4,12)} (global and attn_tp=2/4 shards); attn_tp=8 (2,6) has no AOT instantiation and still falls back to the varlen recurrent scan"
 fallback = "cuda.qwen35.gdr_recurrent_scan"
 
 [policy."qwen35.linear_attention"]
