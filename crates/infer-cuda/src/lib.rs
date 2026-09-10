@@ -540,6 +540,9 @@ impl CudaExecutor {
 }
 
 impl BackendExecutor for CudaExecutor {
+    // `batch` is consumed only by the real CUDA backend's submit; the
+    // placeholder path on a no-cuda build leaves it unused.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn submit(
         &mut self,
         plan: &ForwardPlan,

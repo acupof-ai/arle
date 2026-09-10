@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn idle_plan_returns_empty_output() {
         let mut exec = VulkanExecutor::unloaded();
-        let mut pool = pool();
+        let pool = pool();
         let batch = KvBatchDescriptor::from_plan(&ForwardPlan::idle(), &pool).unwrap();
         let inflight = exec.submit(&ForwardPlan::idle(), &batch).unwrap();
         match exec.poll(inflight).unwrap() {
