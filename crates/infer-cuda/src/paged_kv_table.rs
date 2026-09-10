@@ -12,8 +12,9 @@
 //!   device-resident table.
 //! - **Qwen quant-KV pool** (#68): the dense Qwen3 path already pages its KV
 //!   through a real (non-identity) page table; the INT8/FP8 quant store kernels
-//!   (`quantize_paged_kv_*_per_channel`) consume a host-built `new_token_indices`
-//!   of PHYSICAL token rows, built by [`physical_token_rows`].
+//!   (`quantize_paged_kv_per_token`) consume `PageMeta::new_token_rows`:
+//!   physical token rows the host builds with `token_rows_for_range` and
+//!   uploads per step (`upload_i32` on prefill, `memcpy_htod` on decode).
 //!
 //! NAMING RULE (ckl 2026-06-11): the per-page token unit is a "page" everywhere
 //! in this codebase; "block" appears ONLY at the FlashMLA FFI boundary, whose
