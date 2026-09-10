@@ -110,8 +110,9 @@ mismatches, with a negative control (baseline at temperature 0.3) that proves
 the gate can go red. The gate's only run (2026-09-09) went red on the default
 Metal pairing (Qwen3.5-0.8B + r3lax DSpark): 7 of 8 prompts diverged, first
 divergence at token 13-50. That is the gate working — it caught a real DSpark
-Metal parity drift, still open, in which the target's batched verify forward
-and per-token decode forward disagree on the GDR recurrent state
+Metal parity drift, still open: the target's batched verify forward and
+per-token decode forward produce different logits for the same prefix (the
+leading candidate is the GDR recurrent state; cause not fully confirmed)
 ([errors 2026-09-09](../experience/errors/2026-09-09-dspark-draft-metal-parity-drift.md)).
 No Metal draft pairing has passed zero-mismatch; the gate is the admission
 test a pairing must pass before it is used in a benchmark or a default.
