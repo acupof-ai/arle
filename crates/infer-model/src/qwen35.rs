@@ -350,6 +350,27 @@ mod tests {
     }
 
     #[test]
+    fn fa3_workspace_is_the_marginal_reject_before_allocation() {
+        // The resource solve must reject (affordable 0 -> the caller bails on
+        // `affordable > 0` before any pool allocation) when the FA3 workspace,
+        // and only the workspace, pushes one slot over budget.
+        // free=1000, KV_MEM_FRACTION 0.7 -> 700 B for slots. recurrent 600 B:
+        let probe = Some((1000, 1000));
+        // ws=0: granted 600 <= 700 -> one slot fits, startup proceeds.
+        assert_eq!(
+            kv_slot_budget_local(probe, 600, 0, 8, 1, 0.9, 1),
+            1,
+            "without the workspace one slot must be affordable"
+        );
+        // ws=200: granted 800 > 700 -> affordable 0 -> rejected pre-allocation.
+        assert_eq!(
+            kv_slot_budget_local(probe, 600, 200, 8, 1, 0.9, 1),
+            0,
+            "the FA3 workspace crossing the one-slot budget must return 0 (reject)"
+        );
+    }
+
+    #[test]
     fn kv_pool_pages_and_finalize() {
         let pages = kv_pool_pages_local(
             Some((32 << 30, 32 << 30)),
