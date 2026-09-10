@@ -337,7 +337,8 @@ kind = "composite"
 inputs = ["q_prepared", "k_prepared", "latent_kv_pool", "selected_indices"]
 outputs = ["latent_attn_out"]
 reference = "cuda.dsv4.flashmla_sparse_decode"
-correctness_gate = "vendor-trusted: crates/infer-cuda/examples/dsv4_parity.rs; scripts/lever_gate.sh"
+correctness_gate = "crates/infer-cuda/examples/flashmla_sparse_decode_parity.rs"
+gate_gap = "MODEL1 (DSv4-Flash) s_q=1 CSA decode, h_q=64, d=512/64, sliding_window 128, index_topk 512, compress_ratio=4, synthetic packed pool; covers B=1..8 batched decode with per-row start_pos (incl. not-full window and 64-token boundaries), row-specific selected sets and discontinuous Stage-B page tables. Not covered: HCA ratio=128, SparseIndexed/GLM V32, prefill, h_q=128/TP shards, the learned per-head attn_sink (harness uses a fixed random vector), real-checkpoint FP8 values"
 
 [[implementation]]
 id = "cuda.dsv4.flashmla_sparse_prefill"
