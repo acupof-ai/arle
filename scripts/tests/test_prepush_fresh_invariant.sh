@@ -13,6 +13,7 @@
 # guarantee.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 TARGET="$TMP/target"
@@ -28,13 +29,52 @@ version = "0.1.0"
 edition = "2021"
 EOF
 
-# Serialized rsync+cargo, exactly as the hook runs them. $1 = rsync extra
-# flags (the point of the test is -t vs no -t). Returns the number of
-# "Checking freshinvariant" lines cargo prints (1 = rebuilt, 0 = Fresh).
+# Read the snapshot rsync flags FROM THE HOOK rather than hardcoding them: the
+# mtime=now guarantee is only as good as the hook's actual rsync invocation,
+# so a future -a/-t/--times/--archive added there must fail this test.
+HOOK="$ROOT/scripts/pre_push_checks.sh"
+hook_flags="$(sed -n 's/^SNAPSHOT_RSYNC_FLAGS="\(.*\)"$/\1/p' "$HOOK")"
+[ -n "$hook_flags" ] || { echo "FAIL: SNAPSHOT_RSYNC_FLAGS not defined in hook" >&2; exit 1; }
+# Reject every mtime-preserving form. --archive implies --times; -t/-a may be
+# standalone or bundled into a short cluster (e.g. -rlptD, -a).
+for word in $hook_flags; do
+    case "$word" in
+        -a|-t|--archive|--times)
+            echo "FAIL: hook snapshot rsync carries $word; updated files would not get mtime=now" >&2; exit 1 ;;
+        -*)
+            [[ "$word" == --* ]] && continue
+            case "$word" in *a*|*t*) echo "FAIL: hook snapshot rsync cluster $word preserves mtimes" >&2; exit 1 ;; esac
+            ;;
+    esac
+done
+# It must still sync recursively with checksums and deletions, or it is a
+# different rsync than the hook's snapshot refresh (-r may be bundled, e.g.
+# -rlpD).
+has_word() {  # exact word match
+    local want="$1"; shift
+    for word in "$@"; do [ "$word" = "$want" ] && return 0; done
+    return 1
+}
+has_flag_cluster() {  # short flag letter inside a single-dash cluster
+    local letter="$1"; shift
+    for word in "$@"; do
+        case "$word" in
+            -[a-zA-Z]*|--*) [[ "$word" == --* ]] && continue; [[ "$word" == *"$letter"* ]] && return 0 ;;
+        esac
+    done
+    return 1
+}
+has_word --delete $hook_flags || { echo "FAIL: snapshot rsync flags missing --delete" >&2; exit 1; }
+has_word --checksum $hook_flags || { echo "FAIL: snapshot rsync flags missing --checksum" >&2; exit 1; }
+has_flag_cluster r $hook_flags || { echo "FAIL: snapshot rsync flags not recursive (-r)" >&2; exit 1; }
+
+# Serialized rsync+cargo with the hook's exact flags. $1 = extra flags appended
+# (the pre-#302 control appends -t). Returns the count of "Checking" lines.
 build() {
-    local rsync_flags="$1"
+    local extra_flags="$1"
     while ! mkdir "$LOCK" 2>/dev/null; do sleep 0.05; done
-    rsync $rsync_flags -rlpD --delete --checksum "$STAGE/" "$SNAP/" >/dev/null
+    # Word-split is intended: the flags come from the hook's quoted scalar.
+    rsync $hook_flags $extra_flags "$STAGE/" "$SNAP/" >/dev/null
     local n
     n="$(
         cd "$SNAP"
