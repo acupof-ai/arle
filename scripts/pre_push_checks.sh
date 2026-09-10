@@ -129,13 +129,36 @@ run_fast_checks() {
 run_fast_checks &
 FAST_PID=$!
 
+# Asserts a cargo step rebuilt every crate the push changes. All lanes share
+# one target dir and cargo fingerprints path deps by mtime, so a build from
+# another lane can make this step report a changed crate Fresh — stale
+# artifacts, or artifacts from a lane whose trait signatures disagree with
+# this tree (2026-09-10: e2's Step 1b lane built a 3-param `submit` into the
+# shared target; this tree had 4, and the hook failed with fake E0050/E0063
+# that read as real code breakage). cargo prints nothing for a Fresh crate,
+# so absence of Checking/Compiling means the step did no work on it.
+assert_step_rebuilt() {  # $1 = step label, $2 = step output, rest = the step's -p crates
+    local label="$1" out="$2"; shift 2
+    for crate in "$@"; do
+        if grep -qE "^crates/${crate}/" <<< "${changed_files}" \
+           && ! grep -qE "(Checking|Compiling) ${crate}( |\$)" <<< "${out}"; then
+            fail "${label} reported ${crate} Fresh while this push changes it — shared target cross-contaminated by another lane; run 'CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo clean -p ${crate}' and retry"
+            exit 1
+        fi
+    done
+}
+
 # --- Cargo steps (serial — cargo locks the target dir) ---------------------
 if [[ "${SKIP_CARGO}" == "0" ]]; then
     run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
     # CI's test-backend lane runs `-p arle`; the hook did not, so a CLI help
     # rewrite landed on main with cli_smoke red. Same feature set as the check
     # above, so the binary is already built.
-    run cargo test -p arle --no-default-features --features cpu,no-cuda,cli --test cli_smoke
+    cli_smoke_rc=0
+    cli_smoke_out="$(cargo test -p arle --no-default-features --features cpu,no-cuda,cli --test cli_smoke 2>&1)" || cli_smoke_rc=$?
+    printf '%s\n' "${cli_smoke_out}"
+    [[ "${cli_smoke_rc}" -eq 0 ]] || exit "${cli_smoke_rc}"
+    assert_step_rebuilt "cli_smoke" "${cli_smoke_out}" arle
     # Clippy (not check) on the cuda lane: catches clippy lints (missing_safety_doc,
     # needless_borrow) that plain check misses — the gap that let quant_linear.rs
     # clippy errors pass the hook and fail CI. Debug profile shares the cache with
@@ -156,7 +179,7 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
         for crate in infer-cuda cuda-kernels; do
             if grep -qE "^crates/${crate}/" <<< "${changed_files}" \
                && ! grep -qE "(Checking|Compiling) ${crate}( |\$)" <<< "${cuda_lint_out}"; then
-                fail "CUDA lint reported ${crate} Fresh while this push changes it — stale shared target; run 'cargo clean -p ${crate}' and retry"
+                fail "CUDA lint reported ${crate} Fresh while this push changes it — shared target cross-contaminated by another lane; run 'cargo clean -p ${crate}' and retry"
                 exit 1
             fi
         done
@@ -171,10 +194,21 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     run cargo clippy -p arle --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
     run cargo clippy -p autograd --features no-cuda --all-targets -- -D warnings
     run cargo clippy -p train --features no-cuda --all-targets -- -D warnings
-    run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys -p infer-quant
-    run cargo test \
+    test_group1_rc=0
+    test_group1_out="$(cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p spec-train -p kv-native-sys -p infer-quant 2>&1)" || test_group1_rc=$?
+    printf '%s\n' "${test_group1_out}"
+    [[ "${test_group1_rc}" -eq 0 ]] || exit "${test_group1_rc}"
+    assert_step_rebuilt "cargo test group 1" "${test_group1_out}" \
+        chat tools qwen3-spec qwen35-spec spec-train kv-native-sys infer-quant
+    test_group2_rc=0
+    test_group2_out="$(cargo test \
         -p infer-core -p infer-server -p infer-plan -p infer-kvspace -p infer-seam \
-        -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
+        -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent 2>&1)" || test_group2_rc=$?
+    printf '%s\n' "${test_group2_out}"
+    [[ "${test_group2_rc}" -eq 0 ]] || exit "${test_group2_rc}"
+    assert_step_rebuilt "cargo test group 2" "${test_group2_out}" \
+        infer-core infer-server infer-plan infer-kvspace infer-seam \
+        infer-moe infer-topo infer-util deepseek-spec agent
     run cargo clippy -p kv-native-sys --all-targets -- -D warnings
 
     # Metal lib check (default-on, Mac only): catches dead-code/unused lints in
