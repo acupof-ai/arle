@@ -110,7 +110,7 @@ fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
 /// are emitted for). Probing by launching `seq_len = 0` instead would issue a
 /// zero-block grid, which is an illegal launch that compute-sanitizer reports on
 /// every run.
-fn fq_kernels_available(ctx: &DeviceContext) -> bool {
+pub(crate) fn fq_kernels_available(ctx: &DeviceContext) -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         let ok = cuda_kernels::KERNEL_CAPABILITIES

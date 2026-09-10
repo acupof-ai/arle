@@ -1604,6 +1604,28 @@ impl Qwen35Model {
         Ok(())
     }
 
+    /// FlashQLA chunked GDR is available on this device for the model's linear
+    /// geometry (flag on, AOT geometry, sm90). Independent of row count, so an
+    /// all-reject replay (every slot advances one row) still routes to it.
+    pub(crate) fn gdr_fq_available(&self) -> bool {
+        crate::runtime_flags::qwen35_gdr_chunked()
+            && infer_model::qwen35::fq_geometry_supported(
+                self.local_linear_k_heads,
+                self.local_linear_v_heads,
+                self.config.linear_key_head_dim,
+                self.config.linear_value_head_dim,
+            )
+            && fq_kernels_available(&self.ctx)
+    }
+
+    /// The parity-validated FlashQLA *chunked* recurrence is the active kernel
+    /// for a multi-row linear advance. Verify and rollback replay share the
+    /// availability decision (see [`Self::gdr_fq_available`]); a single-row
+    /// advance instead uses the per-token decode kernel.
+    pub(crate) fn gdr_chunked_fq_active(&self, row_len: usize) -> bool {
+        row_len > 1 && self.gdr_fq_available()
+    }
+
     /// Gated-delta-rule linear attention into `out` (`[hidden, rows]`, beta=0
     /// out-proj GEMM). The conv ring + recurrent state advance in place and
     /// carry across prefill/decode.
@@ -1942,7 +1964,10 @@ impl Qwen35Model {
                 let uniform = rs.first().map(|r| r.len).filter(|len| {
                     (1..=LINEAR_BATCH_MAX_LEN).contains(len) && rs.iter().all(|r| r.len == *len)
                 });
-                if let (Some(len), true) = (uniform, rs.len() > 1) {
+                // When chunked FlashQLA is active, use its SAME per-slot kernel
+                // (not the never-parity-gated varlen batched recurrence).
+                let chunked_fq_active = uniform.is_some_and(|len| self.gdr_chunked_fq_active(len));
+                if let (Some(len), true, false) = (uniform, rs.len() > 1, chunked_fq_active) {
                     self.advance_linear_conv_gdr_batched(
                         attn,
                         rs,
@@ -2329,6 +2354,7 @@ impl Qwen35Model {
 
         // The FlashQLA chunked path has one AOT instantiation per (Hg, H)
         // geometry; unknown geometry falls back to the recurrent kernel.
+        let fq_supported = self.gdr_chunked_fq_active(seq_len);
         let fq_fns: Option<(ffi::FqCumsumFn, ffi::FqKktFn, ffi::FqFwdFn)> = match (k_heads, v_heads)
         {
             (16, 32) => Some((
@@ -2343,12 +2369,7 @@ impl Qwen35Model {
             )),
             _ => None,
         };
-        let use_fq_chunked = seq_len > 1
-            && crate::runtime_flags::qwen35_gdr_chunked()
-            && c.linear_key_head_dim == 128
-            && c.linear_value_head_dim == 128
-            && fq_fns.is_some()
-            && fq_kernels_available(&self.ctx);
+        let use_fq_chunked = fq_supported && fq_fns.is_some();
         if use_fq_chunked {
             // The AOT dispatch wrapper resolves SM + module via the calling
             // thread's DRIVER context, which runtime-API kernels never need;
