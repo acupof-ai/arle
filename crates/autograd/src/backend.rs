@@ -2588,7 +2588,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// of upstream into `out[ids[b*S+s], :]` via `atomicAdd`.
     ///
     /// Keeps the embedding backward off the host so the `[B, S, H]` upstream
-    /// tensor — second largest per-step DtoH in the P3.1 residue — never
+    /// tensor — second largest per-step DtoH in the measured residue — never
     /// crosses PCIe. Hand-written because candle's `scatter_add` deliberately
     /// omits atomics.
     fn embedding_backward_device(

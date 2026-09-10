@@ -239,8 +239,7 @@ impl RealCudaExecutor {
     /// Model-default stop tokens, engine-core's fallback stop set for
     /// requests that supply none. Without this every CUDA request ignores the
     /// model's EOS and pads to `max_tokens` with post-EOS degenerate text
-    /// (found via the MTP P0 probe — the Metal executor always had the
-    /// equivalent override).
+    /// (the Metal executor applies the equivalent override).
     pub(crate) fn model_stop_token_ids(&self) -> Vec<u32> {
         match self {
             Self::Qwen35(q) => q.model.config.stop_token_ids.clone(),
@@ -423,8 +422,8 @@ impl RealCudaExecutor {
 
     /// Restore backend side state for `slot` when reusing a prefix of length
     /// `matched_len`. Qwen3.5/3.6 hybrid restores the recurrent sidecar; DSv4
-    /// restores the content-keyed prefix-state pool entries (#154 Phase 2);
-    /// no-op for Qwen3 (pages-only). An `Err` makes the engine free the slot
+    /// restores the content-keyed prefix-state pool entries; no-op for Qwen3
+    /// (pages-only). An `Err` makes the engine free the slot
     /// and fall back to full recompute — never a partial restore.
     pub(crate) fn restore_prefix_sidecar(
         &mut self,
@@ -534,8 +533,7 @@ impl RealCudaExecutor {
     /// device pages in the same tick, or the host admission pool over-reports
     /// free capacity and the planner licenses chunks the device pool can't
     /// hold (engine-fatal at submit). DSv4 returns demand-paged FlashMLA band
-    /// pages (#154 Phase 3b); Qwen3.5/3.6 drops its page mirror (and any recall
-    /// keepalive).
+    /// pages; Qwen3.5/3.6 drops its page mirror (and any recall keepalive).
     pub(crate) fn release_kv_slot(&mut self, slot: usize) {
         match self {
             Self::Qwen35(q) => {
@@ -744,8 +742,8 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Per-step student LoRA re-merge (OPD P2). Only the Qwen3.5/3.6 hybrid
-    /// executor carries the OPD student; DSv4 are not student
+    /// Per-step student LoRA re-merge (OPD). Only the
+    /// Qwen3.5/3.6 hybrid executor carries the OPD student; DSv4 are not student
     /// targets and reject the update.
     pub(crate) fn remerge_student_lora(
         &mut self,
@@ -873,7 +871,7 @@ pub(crate) fn sample_cuda_token(
 /// `alloc_zeros(1)` moved into the workspace `argmax_out` slot). Always runs
 /// OUTSIDE any CUDA-graph capture (argmax syncs + reads D2H). Also returns the
 /// behavior logprob of the drawn token under the filtered sampling dist
-/// (`None` for greedy — the P6 sidecar skips greedy requests).
+/// (`None` for greedy — the multiproc sampling sidecar skips greedy requests).
 pub(crate) fn sample_cuda_token_scratched(
     ctx: &DeviceContext,
     logits: &DeviceVec,

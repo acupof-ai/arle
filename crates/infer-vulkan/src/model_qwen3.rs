@@ -1,9 +1,9 @@
 //! Dense Qwen3 Vulkan forward order.
 //!
 //! Authoritative source: `crates/infer-cuda/src/model.rs` eager
-//! `forward_tokens`. P2 encodes the exact operator order and buffer families;
-//! numeric execution waits for the Vulkan shader ABI and Qwen3 GGUF/safetensor
-//! residency loader.
+//! `forward_tokens`. This module encodes the exact operator order and buffer
+//! families; numeric execution waits for the Vulkan shader ABI and Qwen3
+//! GGUF/safetensor residency loader.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen3Op {

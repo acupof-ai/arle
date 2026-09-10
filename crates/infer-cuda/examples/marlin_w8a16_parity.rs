@@ -1,4 +1,4 @@
-//! Marlin W8A16 numeric-parity gate (Phase 1 of the W8A16 tensor-core port).
+//! Marlin W8A16 numeric-parity gate.
 //!
 //! Standalone kernel harness — NO engine, NO serve. Builds a random BF16 weight,
 //! quantizes per-group symmetric INT8 (mirrors `scripts/w8a16_quant.py`), then

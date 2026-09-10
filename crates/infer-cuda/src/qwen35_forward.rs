@@ -818,7 +818,7 @@ impl Qwen35Model {
     /// and the trunk hidden from a single forward. Byte-identical to
     /// `forward_token_logits_full` for the logits; the extra `copy_row_to_vec`
     /// captures the hidden BEFORE the lm-head norm reuses the workspace.
-    /// (Spec-decode port increment 3a; gated path, no default-decode change.)
+    /// Called only from the spec-decode path.
     pub(crate) fn forward_tokens_with_hidden(
         &self,
         slot: &mut Qwen35SlotState,

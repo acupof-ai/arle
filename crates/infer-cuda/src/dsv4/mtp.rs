@@ -22,7 +22,7 @@ impl Dsv4Model {
         );
         ensure!(
             !crate::runtime_flags::dsv4_moe_transport()?.is_deepep(),
-            "DSv4 MTP Phase 1 supports allreduce transport only"
+            "DSv4 MTP supports allreduce transport only"
         );
         let mtp = self
             .mtp

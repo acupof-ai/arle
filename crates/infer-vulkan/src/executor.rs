@@ -1,7 +1,6 @@
 //! Vulkan `BackendExecutor` skeleton.
 //!
-//! P2 keeps submit/poll behavior identical to the HIP backend: one row per
-//! plan,
+//! submit/poll behavior is identical to the HIP backend: one row per plan,
 //! synchronous completion, and host sampling once numeric logits exist. Until
 //! a model is loaded, every non-idle plan errors loud.
 
@@ -417,7 +416,7 @@ mod tests {
         let inflight = exec.submit(&ForwardPlan::idle(), &batch).unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => assert!(out.tokens.is_empty()),
-            PollResult::NotReady(_) => panic!("P2 resolves synchronously"),
+            PollResult::NotReady(_) => panic!("the Vulkan executor resolves synchronously"),
         }
     }
 

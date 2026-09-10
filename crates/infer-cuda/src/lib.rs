@@ -32,7 +32,7 @@ mod executor;
 #[cfg(feature = "cuda")]
 pub mod graph;
 // Shared paged-KV host math: page table -> byte-offset / physical-row
-// translation. Two consumers — DSv4 FlashMLA arena (#85 P2, packed MLA latent
+// translation. Two consumers — the DSv4 FlashMLA arena (packed MLA latent
 // pool; FlashMLA's FFI calls a page a "block") and the Qwen quant-KV store
 // kernels (#68, physical_token_rows for the identity-assuming quant kernels).
 // Not cuda-gated: pure host math, CPU-testable without nvcc.
@@ -77,7 +77,7 @@ mod qwen35;
 #[cfg(feature = "cuda")]
 mod workspace;
 
-// Per-step student LoRA re-merge contract (OPD P2). The host-side data types
+// Per-step student LoRA re-merge contract for OPD. The host-side data types
 // the train crate pushes into the student engine; re-exported from `infer-api`.
 #[cfg(feature = "cuda")]
 pub use qwen35::{

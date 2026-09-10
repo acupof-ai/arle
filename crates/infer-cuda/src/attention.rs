@@ -5948,7 +5948,7 @@ fn compressor_forward(
             token_count == 1,
             "DSv4 full-flatten compressor defer is decode-only (token_count must be 1, got {token_count})"
         );
-        // Frozen-KV verify never advances state (P1-1) — same guard as the FFI path.
+        // Frozen-KV verify never advances state — same guard as the FFI path.
         if !dsv4_verify_frozen() {
             sink.push(state.batched_update_ptrs(ctx));
             state.compressed.seq_len = compressed_rows;

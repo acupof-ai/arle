@@ -29,7 +29,7 @@ pub(crate) struct Dsv4MlaKvArena {
 pub(crate) struct Dsv4KvBudgetPlan {
     pub(crate) num_slots: usize,
     /// Shared FlashMLA comp token capacity the demand-paged layer pools are
-    /// sized for (#154 Phase 3b) — the engine's admission page count is
+    /// sized for — the engine's admission page count is
     /// `flashmla_pool_tokens / page_block_size`. For identity (V32) models
     /// this is bookkeeping only (`num_slots × max_seq_len`).
     pub(crate) flashmla_pool_tokens: usize,
@@ -318,8 +318,8 @@ impl Dsv4Model {
         max_seq_len: usize,
         extra_per_slot_bytes: usize,
     ) -> Result<Dsv4KvBudgetPlan> {
-        // NO term here for the prefix-state pool (#154 Phase 2): it is
-        // host-DRAM-resident by design (`attention/prefix_state.rs`), funded
+        // NO term here for the prefix-state pool: it is host-DRAM-resident
+        // by design (`attention/prefix_state.rs`), funded
         // by the --kv-dram share — HBM sizes slots, DRAM sizes pool heat.
         const MEM_FRACTION: f64 = 0.9;
         // Official-DSA selector memory splits into the ONE model-wide shared
@@ -620,8 +620,8 @@ impl Dsv4Model {
                 flashmla_pool_tokens: planned.saturating_mul(max_seq_len),
             });
         }
-        // #154 Phase 3b — demand-paged bands: num_slots stops being the
-        // pool's sizing unit. Jointly pick (num_slots, pool_tokens): the
+        // Demand-paged bands: num_slots stops being the pool's sizing unit.
+        // Jointly pick (num_slots, pool_tokens): the
         // largest state-affordable slot count whose pool remainder still
         // holds the per-slot ring/safety reserve PLUS one full-length
         // request's comp capacity, then the largest shared token capacity

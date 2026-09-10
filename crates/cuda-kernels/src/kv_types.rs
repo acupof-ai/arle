@@ -18,7 +18,7 @@ pub enum KVFormat {
     /// RoPE + 8 B e8m0 scale. `num_kv_heads` must be 1 (the latent record is
     /// head-less) and sizing routes through `bytes_per_token`, never
     /// `bytes_per_element`. Per-head attention/quant kernels do not consume
-    /// it; its consumers (FlashMLA block-table paths) arrive in P2.
+    /// it; its consumers are the FlashMLA block-table paths.
     PackedBytes {
         bytes_per_token: usize,
     },
@@ -63,7 +63,7 @@ impl KVFormat {
 
     pub fn needs_work_buffer(self) -> bool {
         // PackedBytes records are written directly by their producer — no
-        // bf16 staging buffer (the P2 FlashMLA pack path writes the packed
+        // bf16 staging buffer (the FlashMLA pack path writes the packed
         // record in one shot).
         !matches!(self, Self::BF16 | Self::PackedBytes { .. })
     }

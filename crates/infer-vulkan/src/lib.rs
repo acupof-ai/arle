@@ -1,9 +1,9 @@
 //! Vulkan backend host substrate for the AIPC lane (#71/#76/#77).
 //!
-//! P2 is a seam-correct skeleton: host GGUF/dequant/deepseek4-config
+//! This is a seam-correct skeleton: host GGUF/dequant/deepseek4-config
 //! modules are re-exported from `infer-gguf`, the KV pool is backend-neutral
 //! host bookkeeping, and dense Qwen3 forward order is pinned in
-//! `model_qwen3`. Device execution stays feature-gated and pending the P1
+//! `model_qwen3`. Device execution stays feature-gated pending the Vulkan
 //! shader ABI.
 
 #[cfg(test)]

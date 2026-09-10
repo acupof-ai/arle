@@ -386,13 +386,13 @@ mod tests {
                 .iter()
                 .all(|m| m["role"] != "tool")
         );
-        // Phase 2: tokens is now a real object when every component
+        // `tokens` is a real object when every component
         // was tracked. The FakeEngine populates non-empty IDs and
         // tokenize() succeeds; the no-tools path means no env tokens,
         // so the mask is all 1s and len matches response_ids.
         assert!(
             parsed["tokens"].is_object(),
-            "tokens must serialize as an object in Phase 2, got {:?}",
+            "tokens must serialize as an object, got {:?}",
             parsed["tokens"]
         );
         assert!(

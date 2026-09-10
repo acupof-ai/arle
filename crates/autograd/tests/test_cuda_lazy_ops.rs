@@ -1128,7 +1128,7 @@ fn cuda_mean_backward_device_matches_cpu() {
         return;
     };
 
-    // P3 production-derivative tile: the CE-loss chain produces a rank-0
+    // Production-derivative tile: the CE-loss chain produces a rank-0
     // scalar `mean` whose backward broadcasts `upstream / N` across
     // `[B=2, S=512]`. Smaller than the `[B, S, V]` softmax tile but still
     // multi-block (1024 / 256 = 4 blocks) so the launch grid is exercised.

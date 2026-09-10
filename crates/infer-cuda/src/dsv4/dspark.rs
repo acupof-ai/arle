@@ -660,7 +660,7 @@ impl Dsv4Model {
         keepalive.keep_hidden(&kv_normed);
         // Dummy q (discarded q_out) — the fused prep requires q heads. Zeroed, not
         // uninit: the kernel RoPE's this buffer in place, and reading uninitialized
-        // device memory is UB / can surface NaN (codex T4.1 P2). RoPE of zeros is
+        // device memory is UB / can surface NaN. RoPE of zeros is
         // zeros; the result is discarded anyway.
         let mut q_dummy = HiddenStates::zeros(ctx, local_width, rows)?;
         keepalive.keep_hidden(&q_dummy);
@@ -698,7 +698,7 @@ impl Dsv4Model {
     }
 }
 
-// TODO(P2): dedup with qwen35::dspark into a shared target-independent
+// TODO: dedup with qwen35::dspark into a shared target-independent
 // dspark_heads module. Kept separate to protect the shipped Qwen3.6 B track —
 // DO NOT touch `qwen35/dspark.rs` for this.
 //

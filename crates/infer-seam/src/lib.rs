@@ -404,9 +404,9 @@ pub trait BackendExecutor: 'static {
     }
 
     /// The engine freed `slot`'s host pages (finish/preempt/abort): release
-    /// any backend device-side per-slot KV the executor allocates on demand
-    /// (#154 Phase 3b: DSv4's FlashMLA band pages return to the layer pools
-    /// here — waiting for the next occupant would starve the free lists).
+    /// any backend device-side per-slot KV the executor allocates on demand.
+    /// DSv4's FlashMLA band pages must return to the layer pools here —
+    /// waiting for the next occupant would starve the free lists.
     /// Default no-op for backends whose per-slot device KV is slot-fixed.
     fn release_kv_slot(&mut self, _slot: usize) {}
 
