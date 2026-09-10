@@ -41,6 +41,132 @@ pub fn route_decode(spec_kind: SpecKind, n_rows: usize, gate: usize, vetoed: boo
     }
 }
 
+/// A verify of `depth` draft rows after `start` committed rows stays under the
+/// trunk cap.
+pub fn speculative_chain_fits(start: usize, depth: usize, max_seq_len: usize) -> bool {
+    start
+        .checked_add(depth)
+        .is_some_and(|last_position| last_position < max_seq_len)
+}
+
+/// Qwen MTP/DSpark can reproduce raw greedy or temperature/top-k/top-p/min-p
+/// sampling. Every other token rewrite needs the plain one-token sampler.
+pub fn qwen_spec_decode_compatible(params: &crate::SamplingParams) -> bool {
+    params.grammar_bitmask.is_none()
+        && params.logit_bias.is_empty()
+        && params.top_logprobs.is_none()
+        && params.force_next_token.is_none()
+        && params.max_thinking_tokens.is_none()
+        && !params.has_penalty()
+}
+
+/// One chain in a batched spec verify; `row0` indexes the shared logits and tap
+/// features. `partial_ctx` is a ctx-ring flag only the DSpark draft sets; MTP
+/// leaves it false.
+pub struct SpecChain {
+    /// Index of the originating row in the tick's decode rows.
+    pub out: usize,
+    pub slot: usize,
+    pub start: usize,
+    pub row0: usize,
+    pub chain: Vec<u32>,
+    pub partial_ctx: bool,
+}
+
+/// Lay chains out back-to-back in the shared verify logits: chain `i` owns
+/// rows `[row0, row0 + chain.len())`. Returns the total row count.
+pub fn assign_row_offsets(chains: &mut [SpecChain]) -> usize {
+    let mut total = 0;
+    for c in chains {
+        c.row0 = total;
+        total += c.chain.len();
+    }
+    total
+}
+
+pub fn flatten_chains(chains: &[SpecChain]) -> Vec<u32> {
+    chains
+        .iter()
+        .flat_map(|c| c.chain.iter().copied())
+        .collect()
+}
+
+/// Accepted/rejected draft counts for a chain of `chain_len` rows (the pending
+/// token plus the drafts) with `k` drafts accepted. The pending row is never a
+/// reject.
+pub fn spec_accept_totals(chain_len: usize, k: usize) -> (usize, usize) {
+    (k, chain_len - 1 - k)
+}
+
+/// The paged KV pool's decode-relevant shape. The executor maps its pool
+/// format and FA3 state onto this class; the dispatch decision reads only the
+/// class, never the format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeKvClass {
+    /// No paged pool (recurrent-only decode).
+    NoPool,
+    /// BF16 pool on the FA3 decode lane.
+    Bf16Fa3,
+    /// BF16 pool without FA3 (tensor-core pool kernel).
+    Bf16NoFa3,
+    /// FP8/INT8 pool: split-KV decode lane with a fixed grid at B=1.
+    Quantized,
+    /// Pool present in a format the spec paths do not batch against.
+    Other,
+}
+
+/// The settled decode route for one tick — a value the caller executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeDispatch {
+    Dspark,
+    Mtp,
+    /// One plain row. `capturable` admits the whole-step B=1 decode graph for
+    /// this pool's format; the armed flag and the seq-len gate stay with the
+    /// graph slot.
+    PlainSingle {
+        capturable: bool,
+    },
+    PlainBatch,
+    Empty,
+}
+
+/// The `dspark → mtp → plain` dispatch ladder as a pure decision. At or below
+/// `spec_max_batch` a spec scheme drafts per row; above it spec is a
+/// compute-bound loss, so decode falls to the plain batched path that scales.
+/// DSpark batches only on BF16 (its quant-KV verify loses above c=1,
+/// errors/2026-08-22-batched-dspark-quant-kv-verify-loses); MTP batches on any
+/// paged pool.
+pub fn decide_decode(
+    kind: SpecKind,
+    n_rows: usize,
+    spec_compatible: bool,
+    all_greedy: bool,
+    kv_class: DecodeKvClass,
+    spec_max_batch: usize,
+) -> DecodeDispatch {
+    let batched = spec_compatible
+        && all_greedy
+        && match kind {
+            SpecKind::Dspark => {
+                matches!(kv_class, DecodeKvClass::Bf16Fa3 | DecodeKvClass::Bf16NoFa3)
+            }
+            SpecKind::Mtp => !matches!(kv_class, DecodeKvClass::NoPool),
+            SpecKind::None => false,
+        };
+    let gate = if batched { spec_max_batch } else { 1 };
+    match route_decode(kind, n_rows, gate, !spec_compatible) {
+        DecodeRoute::Dspark => DecodeDispatch::Dspark,
+        DecodeRoute::Mtp => DecodeDispatch::Mtp,
+        DecodeRoute::Plain => match n_rows {
+            0 => DecodeDispatch::Empty,
+            1 => DecodeDispatch::PlainSingle {
+                capturable: matches!(kv_class, DecodeKvClass::Bf16Fa3 | DecodeKvClass::Quantized),
+            },
+            _ => DecodeDispatch::PlainBatch,
+        },
+    }
+}
+
 /// `topk` widens candidate matching only; verifier rows remain chain-shaped.
 pub const MAX_SPEC_DRAFT_DEPTH: usize = 8;
 /// Bounded chain verifier rows per slot. MTP uses `depth + 1`; `topk` adds none.
@@ -294,6 +420,88 @@ mod tests {
         );
         assert_eq!(route_decode(SpecKind::Mtp, 2, 1, false), DecodeRoute::Plain);
         assert_eq!(route_decode(SpecKind::Mtp, 1, 1, true), DecodeRoute::Plain);
+    }
+
+    #[test]
+    fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {
+        assert!(speculative_chain_fits(12, 3, 16));
+        assert!(!speculative_chain_fits(13, 3, 16));
+        assert!(!speculative_chain_fits(usize::MAX, 1, usize::MAX));
+    }
+
+    #[test]
+    fn qwen_spec_vetoes_token_rewrites_and_thinking_budget() {
+        let mut params = crate::SamplingParams::default();
+        assert!(qwen_spec_decode_compatible(&params));
+
+        params.force_next_token = Some(42);
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.force_next_token = None;
+        params.max_thinking_tokens = Some(8);
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.max_thinking_tokens = None;
+        params.logit_bias.push((42, 1.0));
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.logit_bias.clear();
+        params.grammar_bitmask = Some(vec![u32::MAX].into());
+        assert!(!qwen_spec_decode_compatible(&params));
+        params.grammar_bitmask = None;
+        params.repetition_penalty = 1.1;
+        assert!(!qwen_spec_decode_compatible(&params));
+    }
+
+    #[test]
+    fn decide_decode_routes_the_ladder() {
+        use DecodeDispatch::*;
+        use DecodeKvClass::*;
+        let d =
+            |kind, n, compat, greedy, kv, gate| decide_decode(kind, n, compat, greedy, kv, gate);
+        // Spec schemes draft per row at c=1 on any pool that admits them.
+        assert_eq!(d(SpecKind::Dspark, 1, true, true, Bf16Fa3, 1), Dspark);
+        assert_eq!(d(SpecKind::Dspark, 1, true, true, Quantized, 1), Dspark);
+        assert_eq!(d(SpecKind::Mtp, 1, true, true, Quantized, 1), Mtp);
+        assert_eq!(d(SpecKind::Mtp, 1, true, true, NoPool, 1), Mtp);
+        // Above the gate, only the batched-capable pairings stay on spec.
+        assert_eq!(d(SpecKind::Dspark, 2, true, true, Bf16Fa3, 2), Dspark);
+        assert_eq!(d(SpecKind::Dspark, 2, true, true, Quantized, 2), PlainBatch);
+        assert_eq!(d(SpecKind::Mtp, 2, true, true, Bf16NoFa3, 2), Mtp);
+        assert_eq!(d(SpecKind::Mtp, 2, true, true, NoPool, 2), PlainBatch);
+        // Vetoed rows always go plain; a single sampled DSpark row still takes
+        // the per-row DSpark path (its batched gate is greedy-only).
+        assert_eq!(
+            d(SpecKind::Mtp, 1, false, true, Bf16Fa3, 1),
+            PlainSingle { capturable: true }
+        );
+        assert_eq!(d(SpecKind::Dspark, 1, true, false, Bf16Fa3, 1), Dspark);
+        assert_eq!(d(SpecKind::None, 0, true, true, NoPool, 1), Empty);
+        // Capturable tracks the format/FA3 class only.
+        assert_eq!(
+            d(SpecKind::None, 1, true, true, Bf16Fa3, 1),
+            PlainSingle { capturable: true }
+        );
+        assert_eq!(
+            d(SpecKind::None, 1, true, true, Quantized, 1),
+            PlainSingle { capturable: true }
+        );
+        assert_eq!(
+            d(SpecKind::None, 1, true, true, Bf16NoFa3, 1),
+            PlainSingle { capturable: false }
+        );
+        assert_eq!(
+            d(SpecKind::None, 1, true, true, Other, 1),
+            PlainSingle { capturable: false }
+        );
+        assert_eq!(
+            d(SpecKind::None, 1, true, true, NoPool, 1),
+            PlainSingle { capturable: false }
+        );
+    }
+
+    #[test]
+    fn spec_accept_totals_excludes_the_pending_row_from_rejects() {
+        // chain of 4 (pending + 3 drafts), 2 drafts accepted.
+        assert_eq!(spec_accept_totals(4, 2), (2, 1));
+        assert_eq!(spec_accept_totals(4, 3), (3, 0));
     }
 
     #[test]

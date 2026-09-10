@@ -3,6 +3,11 @@ use crate::qwen35::alloc_recurrent_block;
 use anyhow::anyhow;
 use std::cmp::Ordering;
 
+use super::spec_decode::{
+    DecodeDispatch, DecodeKvClass, SpecChain, assign_row_offsets, decide_decode, flatten_chains,
+    qwen_spec_decode_compatible, spec_accept_totals, speculative_chain_fits,
+};
+
 #[path = "device_sched.rs"]
 mod device_sched;
 use device_sched::{DecodeGraphInvalidation, DecodeGraphSlot};
@@ -26,36 +31,6 @@ fn set_host_slot_to(
         Ordering::Equal => Ok(()),
         Ordering::Greater => kv.alloc(slot, target - current),
     }
-}
-
-fn speculative_chain_fits(start: usize, depth: usize, max_seq_len: usize) -> bool {
-    start
-        .checked_add(depth)
-        .is_some_and(|last_position| last_position < max_seq_len)
-}
-
-/// Qwen MTP/DSpark can reproduce raw greedy or temperature/top-k/top-p/min-p
-/// sampling. Every other token rewrite needs the plain one-token sampler.
-fn qwen_spec_decode_compatible(params: &SamplingParams) -> bool {
-    params.grammar_bitmask.is_none()
-        && params.logit_bias.is_empty()
-        && params.top_logprobs.is_none()
-        && params.force_next_token.is_none()
-        && params.max_thinking_tokens.is_none()
-        && !params.has_penalty()
-}
-
-/// One chain in a batched spec verify; `row0` indexes the shared logits and tap
-/// features. `partial_ctx` is a ctx-ring flag only the DSpark draft sets; MTP
-/// leaves it false.
-struct SpecChain {
-    /// Index of the originating row in the tick's `decode_rows`.
-    out: usize,
-    slot: usize,
-    start: usize,
-    row0: usize,
-    chain: Vec<u32>,
-    partial_ctx: bool,
 }
 
 /// Qwen3.5 / Qwen3.6 hybrid executor. Owns per-slot KV + recurrent state inside the
@@ -945,7 +920,8 @@ impl Qwen35CudaExecutor {
     /// Build the prefill page table + CP ring metadata for a prefill row.
     /// Under 2D, one ring pass over the whole prompt (balanced slices,
     /// block-cyclic scatter). Shared by `prefill_row_paged_default` and
-    /// `prefill_row_recall`.
+    /// `prefill_row_recall`. The host geometry settles in
+    /// [`infer_plan::PrefillGeometry`]; this is the upload half.
     fn build_prefill_geometry(
         &self,
         row: &infer_plan::PrefillRow,
@@ -957,33 +933,35 @@ impl Qwen35CudaExecutor {
         let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
         let len = row.tokens.len();
         let cp_size = self.model.tp.attn_cp_size();
-        if self.two_d_engaged() && self.dspark.is_none() {
-            let per = len.div_ceil(cp_size);
-            let base = len / cp_size;
-            let rem = len % cp_size;
-            let slices: Vec<(usize, usize)> = (0..cp_size)
-                .map(|p| {
-                    let l = base + usize::from(p < rem);
-                    (p * base + p.min(rem), l)
-                })
-                .collect();
-            let (off, my_len) = slices[self.model.tp.attn_cp_rank()];
+        let cp_rank = self.model.tp.attn_cp_rank();
+        let ring = self.two_d_engaged() && self.dspark.is_none();
+        let page_indices: Vec<i32> = if ring {
+            pool.page_indices(slot).iter().map(|&p| p as i32).collect()
+        } else {
+            Vec::new()
+        };
+        let geo = infer_plan::PrefillGeometry::compute(
+            slot,
+            row.start_pos,
+            len,
+            &page_indices,
+            cp_size,
+            cp_rank,
+            ring,
+        );
+        if ring {
+            let (off, my_len) = geo.slices[cp_rank];
             let meta = crate::loader::PageMeta::for_ring_prefill(
                 &self.model.ctx,
                 row.start_pos + off,
                 my_len,
             )?;
-            let kv_indices: Vec<i32> = pool.page_indices(slot).iter().map(|&p| p as i32).collect();
-            let q_pos: Vec<usize> = (0..my_len).map(|i| row.start_pos + off + i).collect();
-            let k_pos: Vec<Vec<usize>> = slices
-                .iter()
-                .map(|&(o, l)| (0..l).map(|i| row.start_pos + o + i).collect())
-                .collect();
             let q_pos_f32 = crate::ops::upload_f32(
                 &self.model.ctx,
-                &q_pos.iter().map(|&p| p as f32).collect::<Vec<_>>(),
+                &geo.q_pos.iter().map(|&p| p as f32).collect::<Vec<_>>(),
             )?;
-            let k_pos_f32 = k_pos
+            let k_pos_f32 = geo
+                .k_pos
                 .iter()
                 .map(|kp| {
                     crate::ops::upload_f32(
@@ -993,11 +971,11 @@ impl Qwen35CudaExecutor {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let cp = crate::qwen35::Qwen35CpPrefill {
-                slices,
-                pad: per,
-                kv_indices: crate::ops::upload_i32(&self.model.ctx, &kv_indices)?,
-                q_pos,
-                k_pos,
+                slices: geo.slices,
+                pad: geo.pad,
+                kv_indices: crate::ops::upload_i32(&self.model.ctx, &geo.page_indices)?,
+                q_pos: geo.q_pos,
+                k_pos: geo.k_pos,
                 q_pos_f32,
                 k_pos_f32,
             };
@@ -1461,9 +1439,9 @@ impl Qwen35CudaExecutor {
         };
         let truncate_to = (emitted.len() < depth + 1).then(|| start + emitted.len());
         let mtp_exec = mtp.as_mut().expect("mtp (gated)");
-        let accepted = emitted.len() - 1;
+        let (accepted, rejected) = spec_accept_totals(depth + 1, emitted.len() - 1);
         mtp_exec.accepts += accepted;
-        mtp_exec.rejects += depth - accepted;
+        mtp_exec.rejects += rejected;
         mtp_exec.chains += 1;
         if let Some(st) = mtp_exec.slots[slot].as_mut() {
             st.pending = next_pending;
@@ -1637,12 +1615,8 @@ impl Qwen35CudaExecutor {
                 partial_ctx: false,
             });
         }
-        let mut total_rows = 0usize;
-        for c in &mut batch {
-            c.row0 = total_rows;
-            total_rows += c.chain.len();
-        }
-        let chains_flat: Vec<u32> = batch.iter().flat_map(|c| c.chain.iter().copied()).collect();
+        let total_rows = assign_row_offsets(&mut batch);
+        let chains_flat = flatten_chains(&batch);
 
         // All-or-nothing: seq_lens advance only on success, so any failure must
         // give every reserved row back.
@@ -1715,8 +1689,9 @@ impl Qwen35CudaExecutor {
                     .map_err(|e| anyhow::anyhow!("mtp batch next-hidden copy failed: {e}"))?;
                 st.pending = bonus;
             }
-            mtp_exec.accepts += k;
-            mtp_exec.rejects += c.chain.len() - 1 - k;
+            let (accepted, rejected) = spec_accept_totals(c.chain.len(), k);
+            mtp_exec.accepts += accepted;
+            mtp_exec.rejects += rejected;
             mtp_exec.chains += 1;
             if k + 1 < c.chain.len() {
                 let len = c.start + k + 1;
@@ -1792,7 +1767,7 @@ impl Qwen35CudaExecutor {
             if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
                 df.pending = None;
             }
-            return self.submit_decode_row(row, false, kv_batch, kv);
+            return self.submit_decode_row(row, false, false, kv_batch, kv);
         }
         {
             let pool = self.full_attn_kv.as_ref().expect("paged (checked)");
@@ -2014,12 +1989,8 @@ impl Qwen35CudaExecutor {
         if batch.is_empty() {
             return Ok(out.into_iter().flatten().collect());
         }
-        let mut total_rows = 0usize;
-        for c in &mut batch {
-            c.row0 = total_rows;
-            total_rows += c.chain.len();
-        }
-        let chains: Vec<u32> = batch.iter().flat_map(|c| c.chain.iter().copied()).collect();
+        let total_rows = assign_row_offsets(&mut batch);
+        let chains = flatten_chains(&batch);
 
         // Snapshot every trunk's linear state as the partial-accept rollback base.
         for c in &batch {
@@ -2178,8 +2149,9 @@ impl Qwen35CudaExecutor {
             }
             model.dspark_append_ctx(&ds.head, df, &mut ds.scratch, c.row0, k + 1, c.start)?;
             df.pending = Some(bonus);
-            ds.accepts += k;
-            ds.rejects += c.chain.len() - 1 - k;
+            let (accepted, rejected) = spec_accept_totals(c.chain.len(), k);
+            ds.accepts += accepted;
+            ds.rejects += rejected;
             ds.chains += 1;
             ds.partial_ctx_chains += usize::from(c.partial_ctx);
             out[c.out] = emitted
@@ -2416,7 +2388,14 @@ impl Qwen35CudaExecutor {
                 finish: None,
             });
         }
-        tokens.extend(self.dispatch_decode_rows(&plan.decode_rows, allow_graph, kv_batch, kv)?);
+        let dispatch = self.decode_dispatch(&plan.decode_rows);
+        tokens.extend(self.execute_decode(
+            dispatch,
+            &plan.decode_rows,
+            allow_graph,
+            kv_batch,
+            kv,
+        )?);
         Ok(StepOutput { tokens })
     }
 
@@ -2431,65 +2410,73 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    fn paged_kv_bf16(&self) -> bool {
-        self.full_attn_kv
-            .as_ref()
-            .is_some_and(|p| p.format == KVFormat::BF16)
+    /// The paged pool's decode-relevant class. BF16 captures the FA3 lane
+    /// (its scheduling ceiling `seqlen_k_capture` pins); FP8/INT8 capture the
+    /// split-KV lane instead, whose grid is fixed at B=1 with the true length
+    /// read on device; other formats have no graph-captured decode kernel.
+    fn decode_kv_class(&self) -> DecodeKvClass {
+        match self.full_attn_kv.as_ref().map(|p| p.format) {
+            None => DecodeKvClass::NoPool,
+            Some(KVFormat::BF16) => {
+                if self.model.paged_decode_fa3_active() {
+                    DecodeKvClass::Bf16Fa3
+                } else {
+                    DecodeKvClass::Bf16NoFa3
+                }
+            }
+            Some(KVFormat::FP8E4M3 | KVFormat::INT8) => DecodeKvClass::Quantized,
+            _ => DecodeKvClass::Other,
+        }
     }
 
-    /// The single `dspark → mtp → plain` dispatch ladder. At or below
-    /// `--spec-max-batch`
-    /// a spec scheme drafts per row; above it spec is a compute-bound loss, so decode
-    /// falls to the plain batched path that scales.
-    fn dispatch_decode_rows(
+    /// Settle the decode route for this tick as a value; [`Self::execute_decode`]
+    /// runs it.
+    fn decode_dispatch(&self, decode_rows: &[DecodeRow]) -> DecodeDispatch {
+        let kind = self.spec_kind();
+        let spec_compatible = decode_rows
+            .iter()
+            .all(|r| qwen_spec_decode_compatible(&r.params));
+        let all_greedy = decode_rows.iter().all(|r| r.params.is_greedy());
+        decide_decode(
+            kind,
+            decode_rows.len(),
+            spec_compatible,
+            all_greedy,
+            self.decode_kv_class(),
+            crate::runtime_flags::spec_max_batch(),
+        )
+    }
+
+    /// Execute a dispatch settled by [`Self::decode_dispatch`]. `allow_graph`
+    /// admits the whole-step B=1 decode-graph lane — true only for rows==1
+    /// pure-decode plans.
+    fn execute_decode(
         &mut self,
+        dispatch: DecodeDispatch,
         decode_rows: &[DecodeRow],
         allow_graph: bool,
         kv_batch: &KvBatchDescriptor,
         kv: &mut dyn KvSlotAccounting,
     ) -> Result<Vec<SlotToken>> {
-        use super::spec_decode::{DecodeRoute, SpecKind};
-        let kind = self.spec_kind();
-        // Only a batched greedy draft pays above c=1: sampling loses −15.5% at
-        // c=8 and −26.4% at c=16. DSpark on quantized KV keeps the per-row
-        // route: its verify runs through the FA3 dequant shim while plain
-        // decode has the tensor-core pool kernel, and on 32K prompts that
-        // verify costs −10 % at c=8 and −16 % at c=16
-        // (errors/2026-08-22-batched-dspark-quant-kv-verify-loses). MTP's
-        // target config is quantized KV, so it has no BF16 gate; the op_timing
-        // mixed-step share is the batched route's license instead.
-        let spec_compatible = decode_rows
-            .iter()
-            .all(|r| qwen_spec_decode_compatible(&r.params));
-        let batched = spec_compatible
-            && decode_rows.iter().all(|r| r.params.is_greedy())
-            && match kind {
-                SpecKind::Dspark => self.paged_kv_bf16(),
-                SpecKind::Mtp => self.full_attn_paged(),
-                SpecKind::None => false,
-            };
-        let gate = match batched {
-            true => crate::runtime_flags::spec_max_batch(),
-            false => 1,
-        };
-        match super::spec_decode::route_decode(kind, decode_rows.len(), gate, !spec_compatible) {
-            DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, kv_batch, kv),
-            DecodeRoute::Mtp => self.mtp_decode_batch(decode_rows, kv_batch, kv),
-            DecodeRoute::Plain => match decode_rows {
-                [] => Ok(Vec::new()),
-                [row] => {
-                    let (token, logprob) =
-                        self.submit_decode_row(row, allow_graph, kv_batch, kv)?;
-                    Ok(vec![SlotToken {
-                        slot: row.slot,
-                        token,
-                        logprob,
-                        top_logprobs: self.take_top_logprobs(&row.params),
-                        finish: None,
-                    }])
-                }
-                rows => self.submit_decode_batch(rows, kv_batch, kv),
-            },
+        match dispatch {
+            DecodeDispatch::Dspark => self.dspark_decode_batch(decode_rows, kv_batch, kv),
+            DecodeDispatch::Mtp => self.mtp_decode_batch(decode_rows, kv_batch, kv),
+            DecodeDispatch::PlainSingle { capturable } => {
+                let [row] = decode_rows else {
+                    unreachable!("PlainSingle dispatch with {} rows", decode_rows.len())
+                };
+                let (token, logprob) =
+                    self.submit_decode_row(row, allow_graph, capturable, kv_batch, kv)?;
+                Ok(vec![SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob,
+                    top_logprobs: self.take_top_logprobs(&row.params),
+                    finish: None,
+                }])
+            }
+            DecodeDispatch::PlainBatch => self.submit_decode_batch(decode_rows, kv_batch, kv),
+            DecodeDispatch::Empty => Ok(Vec::new()),
         }
     }
 
@@ -2663,12 +2650,14 @@ impl Qwen35CudaExecutor {
         self.prefill_row_paged_default(&tail, position, kv_batch)
     }
 
-    /// `allow_graph` admits the whole-step B=1 decode-graph lane — true only for
-    /// rows==1 plans.
+    /// `allow_graph` admits the whole-step B=1 decode-graph lane — true only
+    /// for rows==1 pure-decode plans. `capturable` is the pool format's
+    /// graph-capturability, settled in [`Self::decode_dispatch`].
     fn submit_decode_row(
         &mut self,
         row: &DecodeRow,
         allow_graph: bool,
+        capturable: bool,
         kv_batch: &KvBatchDescriptor,
         _kv: &mut dyn KvSlotAccounting,
     ) -> Result<(u32, Option<f32>)> {
@@ -2690,7 +2679,10 @@ impl Qwen35CudaExecutor {
         // invariant above holds because the recall forward advances it in lockstep.
         // The graph lane runs first when armed; the eager paged forward is the
         // correctness floor and the fallback for every gate miss.
-        if allow_graph && let Some(token) = self.try_graph_decode_paged(row, position, kv_batch)? {
+        if allow_graph
+            && capturable
+            && let Some(token) = self.try_graph_decode_paged(row, position, kv_batch)?
+        {
             return Ok(token);
         }
         self.decode_row_paged_default(row, position, kv_batch)
@@ -3061,38 +3053,5 @@ impl Qwen35CudaExecutor {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
         dspark.head.update_markov_weights(&self.model.ctx, w1, w2)
-    }
-}
-
-#[cfg(test)]
-mod tier_io_tests {
-    use super::*;
-
-    #[test]
-    fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {
-        assert!(speculative_chain_fits(12, 3, 16));
-        assert!(!speculative_chain_fits(13, 3, 16));
-        assert!(!speculative_chain_fits(usize::MAX, 1, usize::MAX));
-    }
-
-    #[test]
-    fn qwen_spec_vetoes_token_rewrites_and_thinking_budget() {
-        let mut params = SamplingParams::default();
-        assert!(qwen_spec_decode_compatible(&params));
-
-        params.force_next_token = Some(42);
-        assert!(!qwen_spec_decode_compatible(&params));
-        params.force_next_token = None;
-        params.max_thinking_tokens = Some(8);
-        assert!(!qwen_spec_decode_compatible(&params));
-        params.max_thinking_tokens = None;
-        params.logit_bias.push((42, 1.0));
-        assert!(!qwen_spec_decode_compatible(&params));
-        params.logit_bias.clear();
-        params.grammar_bitmask = Some(vec![u32::MAX].into());
-        assert!(!qwen_spec_decode_compatible(&params));
-        params.grammar_bitmask = None;
-        params.repetition_penalty = 1.1;
-        assert!(!qwen_spec_decode_compatible(&params));
     }
 }

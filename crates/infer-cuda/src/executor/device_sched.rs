@@ -218,35 +218,17 @@ impl Qwen35CudaExecutor {
     /// Whole-step decode graph over the PAGED pool: the growing page table is absorbed
     /// by a fixed-capacity per-slot [`crate::loader::PageMeta::persistent_decode`]
     /// refreshed outside the graph, with FA3's scheduling ceiling pinned via
-    /// `seqlen_k_capture`. `Ok(None)` on any gate miss.
+    /// `seqlen_k_capture`. `Ok(None)` on any gate miss. The pool format's
+    /// capturability is settled upstream in `decode_kv_class` /
+    /// `decode_dispatch`; the caller only reaches here for a capturable pool.
     pub(super) fn try_graph_decode_paged(
         &mut self,
         row: &DecodeRow,
         position: u64,
         kv_batch: &KvBatchDescriptor,
     ) -> Result<Option<(u32, Option<f32>)>> {
-        // BF16 captures the FA3 lane, whose scheduling ceiling `seqlen_k_capture`
-        // pins. FP8/INT8 capture the split-KV lane instead: its grid is
-        // `(kv_heads * num_splits, batch, q_tiles)` and the split count comes
-        // from `quant_decode_num_splits` (sm_count / (batch * kv_heads), no KV
-        // length), so the grid is fixed at B=1; the true per-row length is read
-        // on device from `seqused_k`, and the workspace is pool-owned. Other
-        // formats have no such decode kernel and stay eager.
-        let capturable = match self.full_attn_kv.as_ref().map(|p| p.format) {
-            Some(KVFormat::BF16) => self.model.paged_decode_fa3_active(),
-            Some(KVFormat::FP8E4M3 | KVFormat::INT8) => true,
-            _ => false,
-        };
-        if !self.decode_graph_armed || !capturable {
-            graph_gate_miss(|| {
-                format!(
-                    "armed={} capturable={} kv_format={:?} fa3_active={}",
-                    self.decode_graph_armed,
-                    capturable,
-                    self.full_attn_kv.as_ref().map(|p| p.format),
-                    self.model.paged_decode_fa3_active(),
-                )
-            });
+        if !self.decode_graph_armed {
+            graph_gate_miss(|| format!("armed={}", self.decode_graph_armed));
             return Ok(None);
         }
         if row.kv_seq_len + 1 > self.model.max_seq_len() {
