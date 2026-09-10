@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use deepseek_spec::v4::DeepSeekV4Config;
-use infer_seam::{KvAllocator, KvPrefixStore, KvQuery, KvSlotAccounting};
+use infer_seam::{KvAllocator, KvPrefixStore, KvQuery};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dsv4CompressorShapeElems {
@@ -201,7 +201,7 @@ impl KvQuery for HipKvPool {
     }
 }
 
-impl KvSlotAccounting for HipKvPool {
+impl KvAllocator for HipKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
         let max_seq_len = self.total_pages * self.page_size;
         if self.seq_len(slot) + tokens > max_seq_len {
@@ -239,9 +239,7 @@ impl KvSlotAccounting for HipKvPool {
         self.slot_len[slot] = new_len;
         Ok(())
     }
-}
 
-impl KvAllocator for HipKvPool {
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>> {
         if pages > self.free.len() {
             anyhow::bail!(

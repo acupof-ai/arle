@@ -3,15 +3,13 @@
 //! Every method is expressed in host slot ids, page ids, and token counts. The
 //! trait is dyn-safe.
 
-/// Grow or shrink a slot's accounted length. Engine-core is the sole caller
-/// (prefix attach and post-poll `apply_kv_actual`); a backend reports the
-/// lengths it reached in `StepOutput::kv_actual` instead of writing the pool.
-pub trait KvSlotAccounting {
+/// Engine-core is the sole writer of a slot's accounted length (prefix attach
+/// and post-poll `apply_kv_actual`); a backend reports the lengths it reached
+/// in `StepOutput::kv_actual` instead of writing the pool.
+pub trait KvAllocator {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()>;
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
-}
 
-pub trait KvAllocator: KvSlotAccounting {
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>>;
 
     /// Must only be called with pages that were never attached to a slot or

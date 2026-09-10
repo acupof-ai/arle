@@ -15,10 +15,10 @@ use crate::{KvAllocator, KvPrefixStore, KvQuery};
 /// `&mut dyn KvPool` without knowing the backend.
 ///
 /// Engine-core is the sole writer: it grows/shrinks slots through the
-/// [`KvAllocator`](crate::KvAllocator)/[`KvSlotAccounting`](crate::KvSlotAccounting)
-/// supertraits (the supertrait chain lets `&mut dyn KvPool` call them at the
-/// engine-core site). Backends receive only the read-only
-/// [`KvBatchDescriptor`] view and report reached lengths in `StepOutput::kv_actual`.
+/// [`KvAllocator`](crate::KvAllocator) supertrait (the supertrait chain lets
+/// `&mut dyn KvPool` call it at the engine-core site). Backends receive only
+/// the read-only [`KvBatchDescriptor`] view and report reached lengths in
+/// `StepOutput::kv_actual`.
 pub trait KvPool: KvQuery + KvAllocator + KvPrefixStore {}
 
 impl<T: KvQuery + KvAllocator + KvPrefixStore> KvPool for T {}

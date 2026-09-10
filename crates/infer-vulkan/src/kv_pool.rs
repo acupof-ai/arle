@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use infer_seam::{KvAllocator, KvPrefixStore, KvQuery, KvSlotAccounting};
+use infer_seam::{KvAllocator, KvPrefixStore, KvQuery};
 
 pub struct VulkanKvPool {
     page_size: usize,
@@ -87,7 +87,7 @@ impl KvQuery for VulkanKvPool {
     }
 }
 
-impl KvSlotAccounting for VulkanKvPool {
+impl KvAllocator for VulkanKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
         if self.seq_len(slot) + tokens > self.max_seq_len {
             anyhow::bail!(
@@ -130,9 +130,7 @@ impl KvSlotAccounting for VulkanKvPool {
         self.slot_len[slot] = new_len;
         Ok(())
     }
-}
 
-impl KvAllocator for VulkanKvPool {
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>> {
         if pages > self.free.len() {
             anyhow::bail!(
