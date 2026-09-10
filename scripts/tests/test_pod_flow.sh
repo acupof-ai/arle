@@ -160,7 +160,7 @@ SH
 chmod +x "$TREE/target/release/arle"
 bsha="$(sha256sum "$TREE/target/release/arle" | cut -d' ' -f1)"
 head="$(git -C "$TREE" rev-parse HEAD)"
-printf 'schema=arle-build-v1\nexit=0\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\n' "$TREE/target/release/arle" "$bsha" "$head" "$digest_before" > "$STATE/builds/good/receipt"
+printf 'schema=arle-build-v1\nexit=0\ntree=%s\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\n' "$TREE" "$TREE/target/release/arle" "$bsha" "$head" "$digest_before" > "$STATE/builds/good/receipt"
 [ "$(awk -F= '$1=="binary_sha" {print $2}' "$STATE/builds/good/receipt")" = "$bsha" ]
 
 printf changed >> "$TREE/new name"
@@ -178,7 +178,7 @@ p, digest = sys.argv[1:]
 lines = open(p).read().splitlines()
 open(p, "w").write("\n".join(f"digest={digest}" if x.startswith("digest=") else x for x in lines) + "\n")
 PY
-printf 'schema=arle-build-v1\nexit=0\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\n' "$TREE/target/release/arle" "$bsha" "$head" "$digest_now" > "$STATE/builds/good/receipt"
+printf 'schema=arle-build-v1\nexit=0\ntree=%s\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\n' "$TREE" "$TREE/target/release/arle" "$bsha" "$head" "$digest_now" > "$STATE/builds/good/receipt"
 
 printf '%s\0' '' 'a b' 'q"uote' '*' > "$TMP/argv"
 export ARGV_OUT="$TMP/seen"
@@ -398,8 +398,8 @@ p, digest = sys.argv[1:]
 lines = open(p).read().splitlines()
 open(p, "w").write("\n".join(f"digest={digest}" if x.startswith("digest=") else x for x in lines) + "\n")
 PY
-printf 'schema=arle-build-v1\nexit=0\nprofile=release\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\nkernel_id=kernel-123\n' "$TREE/target/release/arle-ab" "$absha" "$head_now" "$digest_now" > "$STATE/builds/kab/receipt"
-printf 'schema=arle-build-v1\nexit=0\nprofile=release-fast\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\n' "$TREE/target/release/arle-ab" "$absha" "$head_now" "$digest_now" > "$STATE/builds/kabfast/receipt"
+printf 'schema=arle-build-v1\nexit=0\nprofile=release\ntree=%s\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\nkernel_id=kernel-123\n' "$TREE" "$TREE/target/release/arle-ab" "$absha" "$head_now" "$digest_now" > "$STATE/builds/kab/receipt"
+printf 'schema=arle-build-v1\nexit=0\nprofile=release-fast\ntree=%s\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\n' "$TREE" "$TREE/target/release/arle-ab" "$absha" "$head_now" "$digest_now" > "$STATE/builds/kabfast/receipt"
 export ARGV_APPEND="$TMP/kab-seen"
 KAB_CLAIMS="$TMP/kab-claims"
 set +e

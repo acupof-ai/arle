@@ -25,11 +25,15 @@ fi
 if [ -n "$_lane_tree" ]; then
   NODE_TREE="/root/arle-build-$_lane_tree"
   TREE="/host/arle-build-$_lane_tree"
+  # Per-lane state dir too: the shared /root/arle-ops keys builds/ and runs/ by
+  # label, so two lanes with the same label clobbered one receipt dir and a run
+  # could resolve another tree's build. Explicit POD_STATE still overrides.
+  STATE="${POD_STATE:-/root/arle-ops-$_lane_tree}"
 else
   NODE_TREE="${NODE_TREE:-/root/arle-build}"
   TREE="${POD_TREE:-/host/arle-build}"
+  STATE="${POD_STATE:-/root/arle-ops}"
 fi
-STATE="${POD_STATE:-/root/arle-ops}"
 cmd="${1:-help}"
 shift || true
 
