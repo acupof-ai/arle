@@ -104,9 +104,17 @@ block drafter, c=1
 ([wins 2026-07-11](../experience/wins/2026-07-11-dspark-p1-license-qwen36-27b.md)):
 2.39–3.14× (45.8 → 109.5 tok/s at ~50-token context; 32.1 → 100.9 at ~3K).
 The boundary: net loss from roughly c≥4, −39% at c=16; batched over quantized
-KV, −10% to −19% at c≥8. Correctness: `scripts/spec_parity.py` — N prompts
-greedy with and without `--draft-model`, zero token-id mismatches, with a
-negative control that proves the gate can go red.
+KV, −10% to −19% at c≥8. Correctness gate: `scripts/spec_parity.py` — N
+prompts greedy with and without `--draft-model`, bar is zero token-id
+mismatches, with a negative control (baseline at temperature 0.3) that proves
+the gate can go red. The gate's only run (2026-09-09) went red on the default
+Metal pairing (Qwen3.5-0.8B + r3lax DSpark): 7 of 8 prompts diverged, first
+divergence at token 13-50. That is the gate working — it caught a real DSpark
+Metal parity drift, still open, in which the target's batched verify forward
+and per-token decode forward disagree on the GDR recurrent state
+([errors 2026-09-09](../experience/errors/2026-09-09-dspark-draft-metal-parity-drift.md)).
+No Metal draft pairing has passed zero-mismatch; the gate is the admission
+test a pairing must pass before it is used in a benchmark or a default.
 
 The gain region has a second boundary, independent of concurrency: drafter and
 target mismatch. On Qwen3.8-27B-NVFP4, same card, both without speculation,
