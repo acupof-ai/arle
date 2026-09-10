@@ -42,7 +42,7 @@ mod resource;
 mod runtime_flags;
 mod tp_commit;
 
-pub use allocator::{KvAllocator, KvSlotAccounting};
+pub use allocator::KvAllocator;
 pub use diffusion_executor::BufferedDiffusionExecutor;
 pub use host_paged_kv_pool::{EVICTED_PAGE, HostPagedKvPool, ShardSpec};
 pub use kv::KvPool;

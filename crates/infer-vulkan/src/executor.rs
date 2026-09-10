@@ -344,7 +344,7 @@ pub fn load_qwen3_gguf(
 mod tests {
     use super::*;
     use infer_plan::{DecodeRow, ForwardMode, PrefillRow};
-    use infer_seam::KvSlotAccounting;
+    use infer_seam::KvAllocator;
 
     fn one_row_plan(decode: bool) -> ForwardPlan {
         ForwardPlan {
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn idle_plan_returns_empty_output() {
         let mut exec = VulkanExecutor::unloaded();
-        let mut pool = pool();
+        let pool = pool();
         let batch = KvBatchDescriptor::from_plan(&ForwardPlan::idle(), &pool).unwrap();
         let inflight = exec.submit(&ForwardPlan::idle(), &batch).unwrap();
         match exec.poll(inflight).unwrap() {

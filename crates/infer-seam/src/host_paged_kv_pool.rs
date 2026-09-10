@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::bail;
 
-use crate::{KvAllocator, KvPrefixStore, KvQuery, KvSlotAccounting};
+use crate::{KvAllocator, KvPrefixStore, KvQuery};
 
 /// Logical-page slot marker for a page that has been **evict-dropped** out of
 /// HBM under the write-through tiered KV model (`KvAllocator::evict_slot_page`).
@@ -292,7 +292,7 @@ impl KvQuery for HostPagedKvPool {
     }
 }
 
-impl KvSlotAccounting for HostPagedKvPool {
+impl KvAllocator for HostPagedKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
         if let Some(pages) = self.fixed_pages_per_slot {
             return self.alloc_fixed_band(slot, pages, tokens);
@@ -338,9 +338,7 @@ impl KvSlotAccounting for HostPagedKvPool {
         self.slot_len[slot] = new_len;
         Ok(())
     }
-}
 
-impl KvAllocator for HostPagedKvPool {
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>> {
         if pages > self.free.len() {
             bail!(

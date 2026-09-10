@@ -92,7 +92,6 @@ impl Qwen35Model {
     /// snapshot scratch), sized from this rank's local shard widths and the
     /// requested draft depth. Snapshot scratch matches [`Self::new_slot_state`]'s
     /// linear-state dims exactly so a snapshot/restore is a straight D2D copy.
-    #[allow(dead_code)] // called by the executor spec-slot init in a later increment
     pub(crate) fn linear_state_bytes(&self) -> (usize, usize) {
         infer_model::qwen35::linear_state_bytes(&self.config, self.local_shard())
     }
@@ -820,7 +819,6 @@ impl Qwen35Model {
     /// `forward_token_logits_full` for the logits; the extra `copy_row_to_vec`
     /// captures the hidden BEFORE the lm-head norm reuses the workspace.
     /// (Spec-decode port increment 3a; gated path, no default-decode change.)
-    #[allow(dead_code)] // consumed by mtp_forward_level / spec_step (next increment)
     pub(crate) fn forward_tokens_with_hidden(
         &self,
         slot: &mut Qwen35SlotState,
@@ -869,7 +867,6 @@ impl Qwen35Model {
     /// prefix length is only known after host-argmax, so all rows are captured.
     /// Byte-identical logits to `forward_token_logits_full`; the extra D2D copy of
     /// `ws.hidden` happens BEFORE the lm-head norm reuses the workspace.
-    #[allow(dead_code)] // consumed by spec_step (next increment)
     pub(crate) fn forward_tokens_verify(
         &self,
         slot: &mut Qwen35SlotState,

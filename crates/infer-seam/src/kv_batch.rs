@@ -73,7 +73,7 @@ impl KvBatchDescriptor {
         self.rows.iter().find(|r| r.slot == slot)
     }
 
-    /// The engine calls this after [`KvPool::alloc`](crate::KvSlotAccounting::alloc)
+    /// The engine calls this after [`KvPool::alloc`](crate::KvAllocator::alloc)
     /// has reserved the row's output span, so the pool length must cover
     /// `append_pos + append_len`.
     pub fn from_plan(plan: &ForwardPlan, kv: &dyn KvPool) -> Result<Self> {
