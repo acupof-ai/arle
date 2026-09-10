@@ -85,7 +85,7 @@ unit test vs ref · **—** = no gate.
 |---|---|---|---|
 | `quantize_paged_kv_fp8_cuda` / single | HOT under `--kv-cache-dtype fp8/int8` | INT8 roundtrip unit (2 heads/hd64/32 tok); FP8 no direct numeric test | E2E-only for the FP8 production dtype |
 | `paged_attention_quantized_fa3_workspace_bytes` | host | n/a | — |
-| `quantize_kv_bf16_to_int8` / `dequantize_kv_int8_to_bf16` safe wrappers | **DEAD** (zero callers outside cuda-kernels) | roundtrip test only | deleted in kernel-parity-s11 |
+| `quantize_kv_bf16_to_int8` / `dequantize_kv_int8_to_bf16` safe wrappers | test-only | INT8 roundtrip unit calls them (`gemm_tests.rs`) | retained — that test is the only INT8-KV gate |
 
 ## Production kernels with no numeric gate (or geometry mismatch), ordered by default-path call frequency
 
@@ -132,16 +132,37 @@ unit test vs ref · **—** = no gate.
   exercised only through that one argmax.
 
 ## DEAD production-shaped wrappers / AOT rows (resolved in kernel-parity-s11)
-Zero non-test callers in `infer-cuda/src` at audit time:
-- `attention::dsv4_fp8_kv_pack` (strided variants supersede).
-- `recurrent::gdr_prefill_chunk_prepare_raw` + the 5 AOT
-  `gated_delta_rule_chunk_*` rows (no symbol consumer anywhere).
-- `kv_quant::quantize_kv` / `dequantize_kv`.
+
+**Scope caveat:** the scan that produced the first draft of this list covered
+only the `infer-cuda` **serving** call graph. "Is X wired" requires scanning
+the whole tree — training (`autograd`) and GPU unit tests are separate call
+graphs (the standing rule in the `substrate-audit-grep-full-tree` feedback).
+The two false positives below were caught by a full-tree `rg` and are
+**retained**; the genuinely dead items were deleted.
+
+Deleted (zero callers tree-wide):
+- `attention::dsv4_fp8_kv_pack` safe wrapper + `arle_dsv4_fp8_kv_pack_cuda`
+  extern/native wrapper (strided variants supersede). The shared
+  `dsv4_fp8_kv_pack_kernel<448>` template is retained — the strided entry still
+  instantiates it.
+- The 5 `ffi=false` TileLang AOT rows
+  `gated_delta_rule_chunk_{cumsum,a,recompute,state,o}` plus their
+  `gated_delta_rule.py` factories and `gen_tilelang_aot.py` WrapperSpecs:
+  compiled into the bundle but with no FFI symbol and no launcher anywhere.
+
+RETAINED after the full-tree scan (originally mis-listed as dead):
+- `recurrent::gdr_prefill_chunk_prepare_raw` — **live**:
+  `autograd/src/backend_cuda/linear_attention_forward.rs` calls it in the
+  chunkwise GDN training forward (`gdr_chunkwise_prefill`, default on).
+- `kv_quant::quantize_kv` / `dequantize_kv` — **live**: called by the
+  `int8_kv_quantize_dequantize_roundtrip` GPU unit test, the only INT8-KV
+  numeric round-trip gate.
 
 Intentionally RETAINED (they have a real caller):
 `quant_linear::gemv_fp4_e2m1_group` (a `kernel_bench` example calls it) and
 the `ring_block_*_{bwd,finalize}` / `ring_block_bwd_fa3` family + ring host
 helpers (autograd/training callers).
+
 
 ## Note on the registry
 `operators/registry.toml` `correctness_gate = "numeric+e2e"` is a declarative

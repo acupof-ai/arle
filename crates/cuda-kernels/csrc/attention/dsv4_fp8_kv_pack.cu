@@ -820,39 +820,6 @@ __global__ void dsv4_fp8_kv_pack_completed_compressor_row_batched_kernel(
 } // namespace
 
 // Contiguous-input variant: nope and rope are tightly-packed
-// [n_tokens, HEAD_DIM_NOPE] / [n_tokens, HEAD_DIM_ROPE] bf16 buffers.
-// Kept as a thin wrapper around the strided implementation so callers
-// stay single-sourced on one kernel body.
-extern "C" cudaError_t arle_dsv4_fp8_kv_pack_cuda(
-    const __nv_bfloat16* nope,
-    const __nv_bfloat16* rope,
-    uint8_t* packed_kv,
-    const int* token_block_id,
-    const int* token_in_block_row,
-    int n_tokens,
-    int page_block_size,
-    cudaStream_t stream)
-{
-    if (n_tokens == 0) return cudaSuccess;
-    if (page_block_size <= 0) return cudaErrorInvalidValue;
-    if (nope == nullptr || rope == nullptr || packed_kv == nullptr
-        || token_block_id == nullptr || token_in_block_row == nullptr) {
-        return cudaErrorInvalidValue;
-    }
-
-    dim3 grid((unsigned)n_tokens, 1, 1);
-    dim3 block(THREADS_PER_BLOCK, 1, 1);
-    // MODEL1 contiguous pack: NoPE=448. Strides equal the dims (tight packing).
-    // Stage-A only (no page table) — band addressing via host-physical block ids.
-    dsv4_fp8_kv_pack_kernel<448><<<grid, block, 0, stream>>>(
-        nope, rope, packed_kv,
-        token_block_id, token_in_block_row,
-        n_tokens, page_block_size,
-        448, HEAD_DIM_ROPE,
-        nullptr, 0);
-    return cudaGetLastError();
-}
-
 // Strided-input variant for the runtime decode hooks: NoPE and RoPE may
 // share a single `k_prepared`-style [n_tokens, head_dim=512] buffer where
 // the caller passes (nope_ptr = k_prepared, rope_ptr = k_prepared+NOPE,

@@ -187,34 +187,6 @@ GDR_SPECS = {
     int grid_y = num_value_heads;
     int grid_z = 1;""",
     ),
-    "gdr_chunk_cumsum": WrapperSpec(
-        public_params="""    const float *g_in,
-    float *g_out,
-    int32_t seq_len,
-    int32_t num_value_heads,
-    CUstream stream""",
-        tensor_inputs={"g_in": "g_in", "g_out": "g_out"},
-        scalar_inputs=GDR_SCALAR_INPUTS,
-        prelude="",
-        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
-    int grid_y = num_value_heads;
-    int grid_z = 1;""",
-    ),
-    "gdr_chunk_a": WrapperSpec(
-        public_params="""    const uint16_t *k,
-    const float *g_cumsum,
-    const float *beta,
-    float *a_tril,
-    int32_t seq_len,
-    int32_t num_value_heads,
-    CUstream stream""",
-        tensor_inputs={"k": "k", "g_cumsum": "g_cumsum", "beta": "beta", "a_tril": "a_tril"},
-        scalar_inputs=GDR_SCALAR_INPUTS,
-        prelude="",
-        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
-    int grid_y = num_value_heads;
-    int grid_z = 1;""",
-    ),
     "gdr_chunk_solve": WrapperSpec(
         public_params="""    const float *a_tril,
     uint16_t *a_inv,
@@ -227,70 +199,6 @@ GDR_SPECS = {
         grid="""    int grid_x = ceildiv_i32(seq_len, 64);
     int grid_y = num_value_heads;
     int grid_z = 1;""",
-    ),
-    "gdr_chunk_recompute": WrapperSpec(
-        public_params="""    const uint16_t *k,
-    const uint16_t *v,
-    const float *beta,
-    uint16_t *w,
-    uint16_t *u,
-    const uint16_t *a_inv,
-    const float *g_cumsum,
-    int32_t seq_len,
-    int32_t num_value_heads,
-    CUstream stream""",
-        tensor_inputs={"k": "k", "v": "v", "beta": "beta", "w": "w", "u": "u", "a_inv": "a_inv", "g_cumsum": "g_cumsum"},
-        scalar_inputs=GDR_SCALAR_INPUTS,
-        prelude="",
-        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
-    int grid_y = num_value_heads;
-    int grid_z = 1;""",
-    ),
-    "gdr_chunk_state": WrapperSpec(
-        public_params="""    const uint16_t *k,
-    const uint16_t *w,
-    const uint16_t *u,
-    const float *g_cumsum,
-    const float *initial_state,
-    float *chunk_state,
-    uint16_t *v_new,
-    float *final_state,
-    int32_t seq_len,
-    int32_t num_value_heads,
-    CUstream stream""",
-        tensor_inputs={
-            "k": "k",
-            "w": "w",
-            "u": "u",
-            "g_cumsum": "g_cumsum",
-            "initial_state": "initial_state",
-            "chunk_state": "chunk_state",
-            "v_new": "v_new",
-            "final_state": "final_state",
-        },
-        scalar_inputs=GDR_SCALAR_INPUTS,
-        prelude="",
-        grid="""    int grid_x = 4;
-    int grid_y = num_value_heads;
-    int grid_z = 1;""",
-    ),
-    "gdr_chunk_o": WrapperSpec(
-        public_params="""    const uint16_t *q,
-    const uint16_t *k,
-    const uint16_t *v_new,
-    const float *chunk_state,
-    const float *g_cumsum,
-    uint16_t *output,
-    int32_t seq_len,
-    int32_t num_value_heads,
-    float scale,
-    CUstream stream""",
-        tensor_inputs={"q": "q", "k": "k", "v_new": "v_new", "chunk_state": "chunk_state", "g_cumsum": "g_cumsum", "output": "output"},
-        scalar_inputs=GDR_SCALAR_INPUTS,
-        prelude="",
-        grid="""    int grid_x = 4;
-    int grid_y = ceildiv_i32(seq_len, 64);
-    int grid_z = num_value_heads;""",
     ),
 }
 
