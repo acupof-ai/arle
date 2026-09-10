@@ -551,8 +551,8 @@ kind = "composite"
 inputs = ["hidden", "router_logits", "selection_bias", "expert_weights"]
 outputs = ["moe_out"]
 reference = "cuda.dsv4.moe_fp8_grouped_contig"
-correctness_gate = "crates/cuda-kernels/src/ffi/gemm_tests.rs; crates/infer-cuda/examples/dsv4_parity.rs"
-gate_gap = "grouped decode micro ref is hidden/inter=16 vs production expert dims (thousands); dsv4_parity gates only the first prefill token at TP=8, realistic-scale grouped prefill MoE uncompared"
+correctness_gate = "crates/cuda-kernels/src/ffi/gemm_tests.rs; crates/infer-cuda/examples/dsv4_parity.rs; crates/infer-cuda/examples/deepgemm_grouped_prefill_parity.rs"
+gate_gap = "grouped GEMM compared at production n=4096 on both down (k=2048) and gate/up (k=4096) projections vs an f64 per-128-block fp8 oracle on both masked and contiguous paths: EVERY output column is checked (catches N-tile offset/swizzle/column-mapping), rows sampled as hot-band-all + first/last + 64-row seeded sample per other active band (catches per-row indexing); a 16-band flat/one-hot/bimodal sweep plus a full 256-expert 3072-routed-row distribution (~191 empty bands, independent per-expert weights, real-magnitude block scales, SM90 GPU pod-only); remaining gaps: synthetic random fp8 weights rather than checkpoint tensors, the w13->w2 swiglu and full top-6 routing+reduction end-to-end only, and dsv4_parity still gates only the first prefill token at TP=8"
 
 [[implementation]]
 id = "cuda.dsv4.moe_w4a16_gemv"
