@@ -14,7 +14,8 @@ use super::{DeviceVec, Dsv4CudaExecutor};
 // step-level scheduling types.
 pub(crate) use infer_plan::{
     DecodeDispatch, DecodeKvClass, SpecChain, SpecKind, assign_row_offsets, decide_decode,
-    flatten_chains, qwen_spec_decode_compatible, spec_accept_totals, speculative_chain_fits,
+    flatten_chains, pages_covering, qwen_spec_decode_compatible, spec_accept_greedy,
+    spec_accept_totals, speculative_chain_fits,
 };
 
 impl Dsv4CudaExecutor {
