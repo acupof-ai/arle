@@ -14,6 +14,8 @@ pub(crate) struct HfSearchResult {
     #[serde(default)]
     pub(crate) likes: u64,
     #[serde(default)]
+    /// Wire field of the HF search API; the listing shows downloads/likes
+    /// only, so tags are parsed but never read.
     #[allow(dead_code)]
     pub(crate) tags: Vec<String>,
 }

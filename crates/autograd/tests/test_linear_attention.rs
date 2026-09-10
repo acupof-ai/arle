@@ -72,7 +72,7 @@ fn qwen35_chunked_params(seq_len: usize) -> LinearAttentionParams {
 
 // Qwen3.6-27B GatedDeltaNet: 48 value heads / 16 key heads (vs 35B-A3B's 32/8).
 // Guards the relaxed head-count check in the device LA dispatch.
-#[allow(dead_code)] // only used by the cuda-gated test below
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 fn qwen36_27b_chunked_params(seq_len: usize) -> LinearAttentionParams {
     LinearAttentionParams {
         batch: 1,

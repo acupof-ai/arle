@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub fn num_grad<F: Fn(&[f32]) -> f32>(f: F, x: &mut [f32], eps: f32) -> Vec<f32> {
     let mut grads = Vec::with_capacity(x.len());
     for index in 0..x.len() {
@@ -17,6 +15,7 @@ pub fn num_grad<F: Fn(&[f32]) -> f32>(f: F, x: &mut [f32], eps: f32) -> Vec<f32>
     grads
 }
 
+#[cfg(any(feature = "metal", feature = "cuda"))]
 pub fn max_abs_err(lhs: &[f32], rhs: &[f32]) -> f32 {
     lhs.iter()
         .zip(rhs.iter())
