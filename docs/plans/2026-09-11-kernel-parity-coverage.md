@@ -59,6 +59,7 @@ unit test vs ref · **—** = no gate.
 | Kernel | Heat | Gate | Gap |
 |---|---|---|---|
 | `dsv4_dspark_draft_attention_cuda` | WARM (spec) | **—** numeric; E2E + `sampling_gate --require-spec` counters | draft attention, no ref |
+| `nonpaged_prefill_attention_ring_varlen_cuda` / `..._batched_cuda` (Qwen3.8 DSpark drafter) | WARM (spec; batched is the c≥2 path, c=8 acceptance 0%) | **P** `dspark_draft_attn_parity` (40q/8kv hd128 block 7, f64 ring-window oracle, B=1/8; production window-null request-length cap 32775 full attention over unequal long kv_len up to 4096 with no wrap, `--dspark-block-size` clamp block 4, synthetic cap12/window6 wrap-contract; single-vs-batched exact agreement) | real draft activations (random inputs), GPU run pod-only |
 | DSA official indexer family (`dsa_fused_q_indexer…`, `hadamard128`, `store_index_k_cache`, `pack_index_row`, …) | WARM | **—** (shape guards only) | whole Deep Sparse Attention indexer has no numeric gate |
 | MLA q/k prep, o-rope inverse, compressor update, FP8 kv pack, build_indices (single+batched) | **HOT** DSv4 | **—** direct; dsv4_parity gates only the first prefill token | large HOT surface, token-level-only E2E |
 
@@ -113,8 +114,10 @@ unit test vs ref · **—** = no gate.
    swiglu/routing-reduction end-to-end coverage.
 8. **FP8 paged-KV quantize** — HOT under the production FP8 dtype, E2E only
    (INT8 has a round-trip, FP8 does not).
-9. **DSpark draft attention + DSA indexer family** — WARM spec path, shape
-   guards + counters only.
+9. **DSpark draft attention + DSA indexer family** — the Qwen3.8 drafter's
+   ragged ring-window attention (single + c≥2 batched) is now gated by
+   `dspark_draft_attn_parity`; the DSv4-Flash draft attention and the DSA
+   indexer family remain shape-guards + counters only.
 10. **Sampling DSpark accept/filter/draft kernels** — WARM, behavior-only on
     CUDA (Metal parity doesn't exercise these CUDA implementations).
 
