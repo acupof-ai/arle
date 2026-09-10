@@ -788,3 +788,80 @@ out_name = "tilelang_flashqla_gdr_bwd_h16g16"
 allow_sm70 = false
 gate = "flashqla"
 ffi = false
+
+# H=6/Hg=2 — attn_tp=8 shard of the 27B (48/16 global). Same H/Hg=3 group
+# ratio as the (16,48)/(24,8)/(12,4) serving geometries.
+[[kernel]]
+q_heads = 6
+kv_heads = 2
+phase = "fq_cumsum"
+abi = "fq_cumsum_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_cumsum"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_cumsum_h6g2"
+kernel_name = "gdr_fq_cumsum_h6g2"
+out_name = "tilelang_flashqla_gdr_cumsum_h6g2"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 6
+kv_heads = 2
+phase = "fq_kkt"
+abi = "fq_kkt_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_kkt"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_kkt_h6g2"
+kernel_name = "gdr_fq_kkt_h6g2"
+out_name = "tilelang_flashqla_gdr_kkt_h6g2"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 6
+kv_heads = 2
+phase = "fq_fwd"
+abi = "fq_fwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_fwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_fwd_h6g2"
+kernel_name = "gdr_fq_fwd_h6g2"
+out_name = "tilelang_flashqla_gdr_fwd_h6g2"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 6
+kv_heads = 2
+phase = "fq_prepare_h"
+abi = "fq_prepare_h_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_prepare_h"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_prepare_h_h6g2"
+kernel_name = "gdr_fq_prepare_h_h6g2"
+out_name = "tilelang_flashqla_gdr_prepare_h_h6g2"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 6
+kv_heads = 2
+phase = "fq_bwd"
+abi = "fq_bwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_bwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_bwd_h6g2"
+kernel_name = "gdr_fq_bwd_h6g2"
+out_name = "tilelang_flashqla_gdr_bwd_h6g2"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false

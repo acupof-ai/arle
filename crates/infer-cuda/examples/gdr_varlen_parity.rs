@@ -21,9 +21,10 @@
 //! varlen recurrent kernel and the chunked FlashQLA pipeline
 //! (gdr_fq_prep -> cumsum -> kkt -> fwd, one chunk), from the same nonzero
 //! initial state: each path is compared to the f64 anchor, and the varlen-vs-
-//! FlashQLA max output/state diff is printed per geometry and length. This is
-//! the spot #300 depends on — the shards taking FQ after this change versus
-//! attn_tp=8, which still takes varlen (no (2,6) AOT instantiation).
+//! FlashQLA max output/state diff is printed per geometry and length. All four
+//! GDN shards (global 16,48; attn_tp=2 8,24; attn_tp=4 4,12; attn_tp=8 2,6)
+//! are checked, so the cross-path gate covers every TP size that routes
+//! multi-row advances through chunked FlashQLA.
 //!
 //! `--negative-control` applies one sabotage per family (conv output, rebuilt
 //! conv ring, GDR output, GDR final state) in separate comparisons and asserts
@@ -88,9 +89,10 @@ mod real {
     const FQ_STATE_REL_L2_MAX: f64 = 3e-2;
     const FQ_STATE_ABS_MAX: f64 = 1.5e-2;
     // Cross-path: geometries where serve routes verify — global (16,48) and
-    // the attn_tp=2 (8,24) / attn_tp=4 (4,12) shards — at the DSpark-relevant
-    // row lengths (5-token block, 17-row verify) and one 64-token page.
-    const FQ_XCHECK_GEOMS: &[(usize, usize)] = &[(16, 48), (8, 24), (4, 12)];
+    // the attn_tp=2 (8,24), attn_tp=4 (4,12) and attn_tp=8 (2,6) shards — at
+    // the DSpark-relevant row lengths (5-token block, 17-row verify) and one
+    // 64-token page.
+    const FQ_XCHECK_GEOMS: &[(usize, usize)] = &[(16, 48), (8, 24), (4, 12), (2, 6)];
     const FQ_XCHECK_LENS: &[usize] = &[5, 17, 64];
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -637,6 +639,11 @@ mod real {
                     ffi::gdr_fq_cumsum_h12g4_cuda as _,
                     ffi::gdr_fq_kkt_h12g4_cuda as _,
                     ffi::gdr_fq_fwd_h12g4_cuda as _,
+                ),
+                (2, 6) => (
+                    ffi::gdr_fq_cumsum_h6g2_cuda as _,
+                    ffi::gdr_fq_kkt_h6g2_cuda as _,
+                    ffi::gdr_fq_fwd_h6g2_cuda as _,
                 ),
                 _ => unreachable!("cross-check geom not in FQ_XCHECK_GEOMS"),
             };

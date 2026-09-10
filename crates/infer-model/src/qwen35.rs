@@ -115,11 +115,11 @@ pub fn fq_geometry_supported(
 ) -> bool {
     key_head_dim == 128
         && value_head_dim == 128
-        // (Hg,H): global (16,32)/(16,48) and the attn_tp=2 (8,24) and
-        // attn_tp=4 (4,12) shards; the attn_tp=8 (2,6) shard has no AOT row.
+        // (Hg,H): global (16,32)/(16,48) and the attn_tp=2 (8,24),
+        // attn_tp=4 (4,12) and attn_tp=8 (2,6) shards (H/Hg=3 group ratio).
         && matches!(
             (key_heads, value_heads),
-            (16, 32) | (16, 48) | (8, 24) | (4, 12)
+            (16, 32) | (16, 48) | (8, 24) | (4, 12) | (2, 6)
         )
 }
 
@@ -333,9 +333,10 @@ mod tests {
         assert!(fq_geometry_supported(16, 48, 128, 128));
         assert!(fq_geometry_supported(8, 24, 128, 128));
         assert!(fq_geometry_supported(4, 12, 128, 128));
-        assert!(!fq_geometry_supported(2, 6, 128, 128));
+        assert!(fq_geometry_supported(2, 6, 128, 128));
         assert!(!fq_geometry_supported(16, 32, 256, 256));
         assert!(!fq_geometry_supported(8, 32, 128, 128));
+        assert!(!fq_geometry_supported(1, 3, 128, 128));
         assert!(!fq_geometry_supported(16, 32, 128, 256));
     }
 
