@@ -26,10 +26,9 @@ originSessionId: d301e8fb-4674-4ac9-a73e-639200c55d56
 
 **Where to look in code:**
 - `crates/cuda-kernels/csrc/kv/` — CUDA kernel home for KV ops
-- `infer/src/kv_tier/transport/local_cuda.rs` — current LocalCudaTransport plumbing (uses cudarc / cudaMemcpyAsync analogs)
-- `infer/src/kv_tier/coordinator.rs` — async promote/demote command/event channel; bandwidth-relevant call site
-- `infer/src/kv_tier/host_pool.rs` — HostPinnedPool (kv-native-sys arena), the destination buffer for demote
-- `infer/src/kv_tier/transport.rs` — KVTransport trait (where the kernel-vs-DMA choice would land)
+- `crates/infer-seam/src/host_paged_kv_pool.rs` — host paged KV pool; the destination buffer for any host<->device demote/promote
+- `crates/infer-cuda/src/executor/dsv4/slot_tier.rs` — CUDA DSv4 slot disk/SSD tier wiring (promote/demote call site)
+- `crates/infer-metal/src/kv_ssd.rs` — Metal side of the persistent KV tier
 
 **Industry references** (when implementing):
 - LMSYS / SGLang KV transport (search for `kv_send` / `kv_recv` kernels in their cuda src)

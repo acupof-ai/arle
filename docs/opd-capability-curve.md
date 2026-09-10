@@ -199,7 +199,7 @@ Teach the serve path to load base + an adapter dir and merge at load.
   `adapter_model.safetensors` + `adapter_config.json` and fold `B·A·(α/r)` into the
   target matrices before upload (or as a fused decode add). This mirrors the merge
   math already in `save_full_materialized_weights` /
-  `crates/train/src/qwen35.rs:2263` (`merged_tensor`), so the arithmetic is
+  `crates/train/src/lora.rs:311` (`merged_tensor`), so the arithmetic is
   settled; the work is plumbing + a CUDA-side merge at load.
 - Cost: more surface (CLI + infer-api seam + infer-cuda loader), but checkpoints
   stay tiny (adapter-only) and the curve serves any `{base, adapter}` pair.

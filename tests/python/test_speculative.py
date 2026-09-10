@@ -1,7 +1,7 @@
 """
 Speculative decoding tests — no GPU required.
 
-Mirrors and extends infer/src/speculative.rs in pure Python.
+Mirrors and extends the spec-decode host core in crates/infer-plan/src/spec.rs in pure Python.
 Tests the acceptance/rejection sampling algorithm, AcceptanceTracker,
 and expected_speedup formula.
 

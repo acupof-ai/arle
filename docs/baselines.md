@@ -12,11 +12,13 @@ Screening compares a new run against the SOTA row — no second arm.
    same-shell A/B against the archived binary (≥3 trials/arm, median + range).
 3. **Fingerprint change re-anchors**: model, TP/EP, GPU set, serve flags, slot
    line, dataset, driver/CUDA. Re-measure before comparing.
-   - `--kv-cache-dtype fp8` is not just a KV format. It turns OFF the whole-step
-     decode graph (`qwen35.rs:2106`, `paged_kv_bf16()` gate — the persistent page
-     table is BF16-only) and the batched DSpark draft (`qwen35.rs:2343`). On the
-     35B the decode graph alone is worth 2.4x at c=1. A BF16-KV row and an
-     FP8-KV row are different fingerprints even with every other flag equal.
+   - `--kv-cache-dtype fp8` is not just a KV format. The quantized-KV decode
+     path uses a different attention kernel than BF16 KV, and the DSpark batch
+     gate admits batched DSpark only on a BF16 pool (see
+     `infer-plan/src/spec.rs` `decide_decode` and the decode dispatch in
+     `infer-cuda/src/executor/qwen35.rs`). On the 35B the decode path is a major
+     c=1 term. A BF16-KV row and an FP8-KV row are different fingerprints even
+     with every other flag equal.
 4. **Anchor audit** every ~5 accepted updates and before any default flip: one
    A/B against the oldest archived binary bounds accumulated drift.
 5. **One workload**: the multi-turn long-agent dataset at the TraceLab medians,

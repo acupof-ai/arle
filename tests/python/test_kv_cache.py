@@ -1,7 +1,9 @@
 """
 KV cache metadata and management tests — no GPU required.
 
-Models the resident-only CPU-side metadata tracking of infer/src/model/kv_cache.rs.
+Models the resident-only CPU-side metadata tracking behind
+crates/infer-seam/src/allocator.rs (KvSlotAccounting) and the host paged
+pool in crates/infer-seam/src/host_paged_kv_pool.rs.
 Tests sequence length tracking, prefix truncation, reset behavior, and TokenKVPool
 budget accounting without touching actual GPU memory.
 

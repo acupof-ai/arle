@@ -2,8 +2,9 @@
 Scheduler tests — no GPU required.
 
 Tests SchedulerConfig validation, SchedulerHandle backpressure,
-RequestPriority ordering, and the Phase state machine described in
-infer/src/scheduler.rs — all using pure Python mirrors.
+RequestPriority ordering, and the Phase state machine (RequestPhase) in
+crates/infer-core/src/planner.rs and crates/infer-core/src/lib.rs — all
+using pure Python mirrors.
 
 Run:
     pytest tests/python/test_scheduler.py -v
@@ -60,7 +61,7 @@ class SchedulerFull(Exception):
 
 
 class SchedulerHandle:
-    """Python mirror of infer::scheduler::SchedulerHandle."""
+    """Python mirror of the engine planner's request/phase state (infer-core planner)."""
 
     def __init__(self, model_id: str, max_waiting: int = 0):
         self.model_id = model_id
