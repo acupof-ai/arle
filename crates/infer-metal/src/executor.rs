@@ -2229,7 +2229,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn republish_same_slot_keeps_own_prefix_snapshots() {
-        use infer_seam::KvQuery;
+        use infer_seam::{KvAllocator, KvQuery};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
@@ -2355,7 +2355,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn sidecar_aliases_snapshots_onto_radix_canonical_chain() {
-        use infer_seam::KvQuery;
+        use infer_seam::{KvAllocator, KvQuery};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(2, 16, 4);
@@ -2406,7 +2406,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn release_pages_drops_mirrors_and_prefix_snapshots() {
-        use infer_seam::KvQuery;
+        use infer_seam::{KvAllocator, KvQuery};
         let _guard = mlx_sys::mlx_guard();
         let mut store = MetalPageStore::default();
         let mut pool = MetalKvPool::new(1, 8, 4);
@@ -2452,7 +2452,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn ssd_write_through_promotes_released_pages_and_prefix_snapshot() {
-        use infer_seam::KvQuery;
+        use infer_seam::{KvAllocator, KvQuery};
         let _guard = mlx_sys::mlx_guard();
         let root = temp_ssd_root("promote");
         let mut store = MetalPageStore::default();
