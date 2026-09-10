@@ -1,0 +1,23 @@
+[package]
+name = "infer-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Host-side model geometry and routing (architecture refactor step 3b): the
+# `model → operator sequence → kernel selection` stages of the request axis.
+# Pure arithmetic on config + per-rank values — device probes enter as plain
+# host values, and every upload/launch stays in `infer-cuda`. Zero device deps
+# by design: `cargo tree -p infer-model` must never contain cuda-kernels.
+
+[dependencies]
+anyhow = "1.0"
+half = "2.4"
+log = "0.4"
+infer-moe = { path = "../infer-moe" }
+infer-seam = { path = "../infer-seam" }
+qwen35-spec = { path = "../qwen35-spec" }
+
+[lints]
+workspace = true

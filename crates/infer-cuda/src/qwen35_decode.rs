@@ -34,11 +34,7 @@ impl Qwen35Model {
         if cp_size <= 1 {
             return None;
         }
-        if !self.local_q_heads.is_multiple_of(cp_size)
-            || !self.local_kv_heads.is_multiple_of(cp_size)
-            || !self.local_linear_k_heads.is_multiple_of(cp_size)
-            || !self.local_linear_v_heads.is_multiple_of(cp_size)
-        {
+        if !infer_model::qwen35::cp_decode_possible(cp_size, self.local_shard()) {
             log::info!(
                 "CP decode disabled: a head count is indivisible by cp={cp_size} \
                  (q={} kv={} lin_k={} lin_v={})",
@@ -56,20 +52,11 @@ impl Qwen35Model {
     }
 
     pub(crate) fn decode_graph_unsupported_reason(&self) -> Option<&'static str> {
-        let has_moe = self.layers.iter().any(|l| l.moe.is_some());
-        if !has_moe {
-            return None;
-        }
-        let Some(cfg) = self.moe_config.as_ref() else {
-            return Some("MoE layers present but no moe_config");
-        };
-        if !crate::moe::qwen35_decode_moe_graph_capturable(cfg) {
-            return Some(
-                "MoE decode is not device-routable (host router fallback active — \
-                 non-greedy/grouped routing)",
-            );
-        }
-        None
+        infer_model::qwen35::decode_graph_unsupported_reason(
+            self.layers.iter().any(|l| l.moe.is_some()),
+            self.moe_config.as_ref(),
+            crate::runtime_flags::qwen35_deepgemm_min_routes(),
+        )
     }
 
     pub(crate) fn batched_copy(

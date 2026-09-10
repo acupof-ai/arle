@@ -11,7 +11,7 @@ use super::*;
 
 use crate::ops::rms_norm_batch;
 use cuda_kernels::attention as cuda_attn;
-use qwen35_spec::{DsparkConfig, DsparkSps, dspark_tensor_names, dspark_verify_lens};
+use qwen35_spec::{DsparkConfig, DsparkSps, dspark_tensor_names};
 
 struct DsparkLayer {
     /// Gate-padded `[2*q_dim, hidden]`: head `h` at rows
@@ -66,10 +66,10 @@ pub(crate) struct Qwen35DsparkHead {
 
 impl Qwen35DsparkHead {
     fn q_dim(&self) -> usize {
-        self.cfg.num_attention_heads * self.cfg.head_dim
+        infer_model::dspark::q_dim(&self.cfg)
     }
     fn kv_dim(&self) -> usize {
-        self.cfg.num_key_value_heads * self.cfg.head_dim
+        infer_model::dspark::kv_dim(&self.cfg)
     }
     pub(crate) fn block_size(&self) -> usize {
         self.cfg.block_size
@@ -81,28 +81,14 @@ impl Qwen35DsparkHead {
     /// so they must be reserved out of the KV budget or the first dspark step
     /// OOMs behind an already-sized pool.
     pub(crate) fn slot_state_bytes(&self, vocab: usize) -> usize {
-        let per_head = self.cfg.num_key_value_heads * self.cfg.head_dim;
-        let ctx = 2 * self.cap * per_head * self.layers.len() * std::mem::size_of::<bf16>();
-        let draft = self.cfg.block_size
-            * vocab
-            * (std::mem::size_of::<bf16>() + std::mem::size_of::<f32>());
-        ctx + draft
+        infer_model::dspark::slot_state_bytes(&self.cfg, self.cap, self.layers.len(), vocab)
     }
     pub(crate) fn mode_label(&self) -> &'static str {
-        match (
+        infer_model::dspark::mode_label(
             self.cfg.next_token_heads,
             self.markov.is_some(),
             self.confidence.is_some(),
-        ) {
-            (false, false, false) => "dflash-backbone",
-            (false, true, false) => "dspark-sp+markov",
-            (false, false, true) => "dspark-sp+confidence",
-            (false, true, true) => "dspark-sp+markov+confidence",
-            (true, false, false) => "dspark-backbone",
-            (true, true, false) => "dspark+markov",
-            (true, false, true) => "dspark+confidence",
-            (true, true, true) => "dspark+markov+confidence",
-        }
+        )
     }
 
     /// Hot-swap the Markov head weights from a host f32 snapshot. `w1`/`w2` are
@@ -231,20 +217,7 @@ impl Qwen35DsparkTaps {
     /// out-of-range id leaves `capture` nothing to write and hands the reader a
     /// zero buffer indistinguishable from a real one.
     pub(crate) fn validate(targets: &[i64], num_layers: usize) -> Result<()> {
-        let mut seen = targets.to_vec();
-        seen.sort_unstable();
-        seen.dedup();
-        ensure!(
-            seen.len() == targets.len(),
-            "duplicate dspark target_layer_ids: {targets:?}"
-        );
-        for &t in targets {
-            ensure!(
-                t == -1 || (0..num_layers as i64).contains(&t),
-                "dspark target layer {t} outside -1..{num_layers}"
-            );
-        }
-        Ok(())
+        infer_model::dspark::validate_target_layer_ids(targets, num_layers)
     }
 
     pub(crate) fn prepare(&mut self, targets: &[i64], hidden: usize, seq: usize) {
@@ -389,33 +362,10 @@ struct ConfScratch {
     copy: Qwen35CopyScratch,
 }
 
-/// Uniform-stream salts: draft draw / accept test / residual+bonus draw at the
-/// same position must be independent or the rejection identity breaks.
-pub(super) const SALT_DRAW: u64 = 0;
-pub(super) const SALT_ACCEPT: u64 = 0x9E37_79B9_7F4A_7C15;
-pub(super) const SALT_RESIDUAL: u64 = 0xC2B2_AE3D_27D4_EB4F;
-
-/// SplitMix64 — mirrors `infer_plan::sample`'s private mixer bit-for-bit.
-fn splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-/// Deterministic uniform in [0, 1) from `(seed, salt, position)` — the engine
-/// sampler's stream (`infer_plan::sample_token`), so same-config-twice
-/// reproduces. `SALT_DRAW = 0` makes the draft draw consume exactly the uniform
-/// plain decode would at that position.
-pub(super) fn unit_uniform(seed: Option<u64>, salt: u64, position: u64) -> f32 {
-    let bits = splitmix64(
-        seed.unwrap_or(0)
-            .wrapping_add(salt)
-            .wrapping_add(position)
-            .wrapping_add(1),
-    );
-    (bits >> 40) as f32 / (1u32 << 24) as f32
-}
+// The deterministic RNG stream is host arithmetic shared with the sampler's
+// stream contract; it lives in `infer-model`. Re-exported so the spec path's
+// `dspark::unit_uniform` / `dspark::SALT_*` calls keep their paths.
+pub(super) use infer_model::dspark::{SALT_ACCEPT, SALT_DRAW, SALT_RESIDUAL, unit_uniform};
 
 /// Built only under `--spec-type dspark`, so the baseline executor allocates
 /// nothing.
@@ -546,16 +496,10 @@ pub(crate) fn load_dspark_head(
     // fc [hidden, n_taps*hidden] → one [hidden, hidden] per tap.
     let n_taps = cfg.target_layer_ids.len();
     let fc_host = load_host_matrix(&loader, &names.fc, hidden, n_taps * hidden)?;
-    let fc = (0..n_taps)
-        .map(|t| {
-            let part: Vec<bf16> = (0..hidden)
-                .flat_map(|r| {
-                    let row = &fc_host[r * n_taps * hidden..];
-                    row[t * hidden..(t + 1) * hidden].iter().copied()
-                })
-                .collect();
-            DeviceMatrix::from_host(ctx, &part, hidden, hidden)
-        })
+    let fc_parts = infer_model::dspark::split_fc_taps(&fc_host, hidden, n_taps);
+    let fc = fc_parts
+        .iter()
+        .map(|part| DeviceMatrix::from_host(ctx, part, hidden, hidden))
         .collect::<Result<Vec<_>>>()?;
 
     let layers = names
@@ -563,13 +507,12 @@ pub(crate) fn load_dspark_head(
         .iter()
         .map(|n| {
             let q_host = load_host_matrix(&loader, &n.q_proj, q_dim, hidden)?;
-            let mut q_padded = vec![bf16::ZERO; 2 * q_dim * hidden];
-            for h in 0..cfg.num_attention_heads {
-                let src = h * cfg.head_dim * hidden;
-                let dst = 2 * h * cfg.head_dim * hidden;
-                q_padded[dst..dst + cfg.head_dim * hidden]
-                    .copy_from_slice(&q_host[src..src + cfg.head_dim * hidden]);
-            }
+            let q_padded = infer_model::dspark::pad_gated_q(
+                &q_host,
+                cfg.num_attention_heads,
+                cfg.head_dim,
+                hidden,
+            );
             Ok(DsparkLayer {
                 q_proj: DeviceMatrix::from_host(ctx, &q_padded, 2 * q_dim, hidden)?,
                 k_proj: loader.load_matrix(ctx, &n.k_proj)?,
@@ -657,8 +600,8 @@ pub(crate) fn load_dspark_head(
         );
     }
 
-    let rope_cap = max_seq_len.min(max_total_tokens.max(1)) + cfg.block_size;
-    let cap = cfg.sliding_window.map_or(rope_cap, |w| w + cfg.block_size);
+    let rope_cap = infer_model::dspark::rope_cap(max_seq_len, max_total_tokens, cfg.block_size);
+    let cap = infer_model::dspark::ctx_cap(cfg.sliding_window, rope_cap, cfg.block_size);
     match cfg.sliding_window {
         // No window costs a request-length ring: 671 MB/slot at 32k vs 42 MB.
         None => log::info!(
@@ -741,13 +684,6 @@ pub(crate) struct DsparkRollback<'a> {
     pub(crate) spec: &'a mut Qwen35SpecSlotState,
     pub(crate) start_pos: usize,
     pub(crate) k: usize,
-}
-
-/// Lowest absolute key position a draft row at `pos` may read: HF sliding
-/// window keeps keys with `q_pos - k_pos < window`.
-fn window_lo(cfg: &DsparkConfig, pos: usize) -> usize {
-    cfg.sliding_window
-        .map_or(0, |w| pos.saturating_sub(w.saturating_sub(1)))
 }
 
 fn add_vec_into(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
@@ -914,7 +850,6 @@ impl Qwen35Model {
         let hidden = cfg.hidden_size;
         let (q_dim, kv_dim) = (head.q_dim(), head.kv_dim());
         let eps = cfg.rms_norm_eps;
-        let kv_len_total = start + block;
 
         let mut ids = vec![cfg.mask_token_id as i32; block];
         ids[0] = anchor as i32;
@@ -928,16 +863,13 @@ impl Qwen35Model {
         // Per-row attention windows, never below `ctx_base`. `lo` is
         // layer-independent, so one table serves all layers and one
         // ragged-window launch replaces `block` single-row ones.
-        let mut win = vec![0i32; 2 * block];
-        for row in 0..block {
-            let lo = window_lo(cfg, start + row).max(df.ctx_base);
-            let kv_len = kv_len_total - lo;
-            // kv_len == q_pos+1−lo ≤ cap, so the ring read never revisits a
-            // physical row (the kernel cannot check this host-side).
-            ensure!(kv_len <= head.cap, "dspark draft row window {kv_len} > cap");
-            win[row] = lo as i32;
-            win[block + row] = kv_len as i32;
-        }
+        let win = infer_model::dspark::draft_attention_windows(
+            cfg.sliding_window,
+            start,
+            block,
+            df.ctx_base,
+            head.cap,
+        )?;
         let win_dev = scratch.attn_win.upload(&self.ctx, &win)?;
         for (li, layer) in head.layers.iter().enumerate() {
             let cap_li = head.cap;
@@ -1091,145 +1023,146 @@ impl Qwen35Model {
         // (DFlash) rows 1.. fill their own positions.
         let sampling = !params.is_greedy();
         df.q_rows = 0;
-        let first_row = usize::from(!cfg.next_token_heads);
+        let first_row = infer_model::dspark::first_row(cfg.next_token_heads);
         let mut drafts = Vec::with_capacity(block);
         // Greedy resolves the whole block in one batched pass; sampling walks
         // the chain because a markov bias makes row r depend on row r-1's draw.
-        if !sampling {
-            crate::profile::profile_op(ctx, "sample", None, block, || {
-                self.dspark_settle_rows(
-                    head.markov.as_ref(),
-                    df.logits.get(ctx, vocab, block)?,
-                    &mut scratch.mk,
-                    &[anchor],
-                    block,
-                    first_row,
-                )
-            })
-            .map(|am| drafts.extend_from_slice(&am[first_row..block]))?;
-        }
-        // No markov head: every row reads a precomputed logits row, so the
-        // draws do not depend on each other — issue them all, then sync once.
-        if sampling && head.markov.is_none() {
-            let n = block - first_row;
-            crate::profile::profile_op(ctx, "sample", None, n, || {
-                let logits = df.logits.get(ctx, vocab, block)?;
-                let q_all = df.q_probs.get(ctx, n * vocab)?;
-                let tok_dev = scratch.sample_tok.get(ctx, n)?;
-                let filter = cuda_kernels::sampling::DsparkFilter {
-                    inv_temperature: 1.0 / params.temperature,
-                    top_k: params.top_k,
-                    top_p: params.top_p,
-                    min_p: params.min_p,
-                };
-                for i in 0..n {
-                    let u = unit_uniform(params.seed, SALT_DRAW, (start + first_row + i) as u64);
-                    // Logits row `first_row + i` of `block`; q row `i` of `n`;
-                    // one i32 out slot per row.
-                    let row = first_row + i;
-                    let logits_row = logits.data.slice(row * vocab..(row + 1) * vocab);
-                    let mut q_row = q_all.slice_mut(i * vocab..(i + 1) * vocab);
-                    let mut tok = tok_dev.slice_mut(i..i + 1);
-                    cuda_kernels::sampling::dspark_draft_sample(
-                        ctx,
-                        &logits_row,
-                        &mut q_row,
-                        &mut tok,
-                        vocab,
-                        filter,
-                        u,
-                    )?;
-                }
-                ctx.sync()?;
-                Ok(())
-            })?;
-            let src = scratch.sample_tok.get(ctx, n)?.clone();
-            let host = scratch.tok_host.get(ctx, n)?;
-            ctx.stream
-                .memcpy_dtoh(&src, host)
-                .map_err(|e| anyhow!("D2H dspark draws failed: {e}"))?;
-            let drawn: Vec<i32> = host.as_slice()?.to_vec();
-            for tok in drawn {
-                ensure!(
-                    (0..vocab as i32).contains(&tok),
-                    "dspark sampled draft token {tok} oob"
-                );
-                drafts.push(tok as u32);
+        use infer_model::dspark::DraftRoute;
+        match infer_model::dspark::draft_route(!sampling, head.markov.is_some()) {
+            DraftRoute::Greedy => {
+                crate::profile::profile_op(ctx, "sample", None, block, || {
+                    self.dspark_settle_rows(
+                        head.markov.as_ref(),
+                        df.logits.get(ctx, vocab, block)?,
+                        &mut scratch.mk,
+                        &[anchor],
+                        block,
+                        first_row,
+                    )
+                })
+                .map(|am| drafts.extend_from_slice(&am[first_row..block]))?;
             }
-            df.q_rows = n;
-        }
-        let mut prev = anchor;
-        let sample_rows = if sampling && head.markov.is_some() {
-            first_row..block
-        } else {
-            0..0
-        };
-        for row in sample_rows {
-            let (src, src_row) = if let Some(m) = &head.markov {
-                crate::profile::profile_op(ctx, "mtp_fc", None, 1, || {
-                    let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
-                    let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
-                    embedding_batch(ctx, &m.w1, tok_dev, emb)?;
-                    let bias = scratch.markov_bias.get(ctx, vocab, 1)?;
-                    gemm_batch(ctx, &m.w2, emb, bias)?;
-                    let step = scratch.step_logits.get(ctx, vocab, 1)?;
-                    {
-                        let logits = df.logits.get(ctx, vocab, block)?;
-                        let src = logits.data.slice(row * vocab..(row + 1) * vocab);
-                        ctx.stream
-                            .memcpy_dtod(&src, &mut step.data)
-                            .map_err(|e| anyhow!("dspark markov row copy failed: {e}"))?;
-                    }
-                    let sum = scratch.step_sum.get(ctx, vocab, 1)?;
-                    add_batch(
-                        ctx,
-                        scratch.step_logits.get(ctx, vocab, 1)?,
-                        scratch.markov_bias.get(ctx, vocab, 1)?,
-                        sum,
-                    )?;
-                    Ok(())
-                })?;
-                (scratch.step_sum.get(ctx, vocab, 1)?, 0)
-            } else {
-                (df.logits.get(ctx, vocab, block)?, row)
-            };
-            let tok = crate::profile::profile_op(ctx, "sample", None, 1, || {
-                // Uniform from the host (seed, position) stream plain decode
-                // would consume at this position (SALT_DRAW = 0).
-                let u = unit_uniform(params.seed, SALT_DRAW, (start + row) as u64);
-                let q_all = df.q_probs.get(ctx, block * vocab)?;
-                let tok_out = scratch.sample_tok.get(ctx, 1)?;
-                // `src` row holds `vocab` bf16 (src_row bounded by its
-                // seq_len); q row index == drafts.len() < block.
-                let logits_row = src.data.slice(src_row * vocab..(src_row + 1) * vocab);
-                let q_row_idx = drafts.len();
-                let mut q_row = q_all.slice_mut(q_row_idx * vocab..(q_row_idx + 1) * vocab);
-                cuda_kernels::sampling::dspark_draft_sample(
-                    ctx,
-                    &logits_row,
-                    &mut q_row,
-                    tok_out,
-                    vocab,
-                    cuda_kernels::sampling::DsparkFilter {
+            // No markov head: every row reads a precomputed logits row, so the
+            // draws do not depend on each other — issue them all, then sync once.
+            DraftRoute::SampledIndependent => {
+                let n = block - first_row;
+                crate::profile::profile_op(ctx, "sample", None, n, || {
+                    let logits = df.logits.get(ctx, vocab, block)?;
+                    let q_all = df.q_probs.get(ctx, n * vocab)?;
+                    let tok_dev = scratch.sample_tok.get(ctx, n)?;
+                    let filter = cuda_kernels::sampling::DsparkFilter {
                         inv_temperature: 1.0 / params.temperature,
                         top_k: params.top_k,
                         top_p: params.top_p,
                         min_p: params.min_p,
-                    },
-                    u,
-                )?;
-                ctx.sync()?;
-                let src = tok_out.clone();
-                let host = scratch.tok_host.get(ctx, 1)?;
+                    };
+                    for i in 0..n {
+                        let u =
+                            unit_uniform(params.seed, SALT_DRAW, (start + first_row + i) as u64);
+                        // Logits row `first_row + i` of `block`; q row `i` of `n`;
+                        // one i32 out slot per row.
+                        let row = first_row + i;
+                        let logits_row = logits.data.slice(row * vocab..(row + 1) * vocab);
+                        let mut q_row = q_all.slice_mut(i * vocab..(i + 1) * vocab);
+                        let mut tok = tok_dev.slice_mut(i..i + 1);
+                        cuda_kernels::sampling::dspark_draft_sample(
+                            ctx,
+                            &logits_row,
+                            &mut q_row,
+                            &mut tok,
+                            vocab,
+                            filter,
+                            u,
+                        )?;
+                    }
+                    ctx.sync()?;
+                    Ok(())
+                })?;
+                let src = scratch.sample_tok.get(ctx, n)?.clone();
+                let host = scratch.tok_host.get(ctx, n)?;
                 ctx.stream
                     .memcpy_dtoh(&src, host)
-                    .map_err(|e| anyhow!("D2H dspark draft token failed: {e}"))?;
-                let tok = host.as_slice()?[0] as u32;
-                df.q_rows += 1;
-                Ok(tok)
-            })?;
-            drafts.push(tok);
-            prev = tok;
+                    .map_err(|e| anyhow!("D2H dspark draws failed: {e}"))?;
+                let drawn: Vec<i32> = host.as_slice()?.to_vec();
+                for tok in drawn {
+                    ensure!(
+                        (0..vocab as i32).contains(&tok),
+                        "dspark sampled draft token {tok} oob"
+                    );
+                    drafts.push(tok as u32);
+                }
+                df.q_rows = n;
+            }
+            DraftRoute::SampledMarkov => {
+                let mut prev = anchor;
+                for row in first_row..block {
+                    let (src, src_row) = if let Some(m) = &head.markov {
+                        crate::profile::profile_op(ctx, "mtp_fc", None, 1, || {
+                            let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
+                            let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
+                            embedding_batch(ctx, &m.w1, tok_dev, emb)?;
+                            let bias = scratch.markov_bias.get(ctx, vocab, 1)?;
+                            gemm_batch(ctx, &m.w2, emb, bias)?;
+                            let step = scratch.step_logits.get(ctx, vocab, 1)?;
+                            {
+                                let logits = df.logits.get(ctx, vocab, block)?;
+                                let src = logits.data.slice(row * vocab..(row + 1) * vocab);
+                                ctx.stream
+                                    .memcpy_dtod(&src, &mut step.data)
+                                    .map_err(|e| anyhow!("dspark markov row copy failed: {e}"))?;
+                            }
+                            let sum = scratch.step_sum.get(ctx, vocab, 1)?;
+                            add_batch(
+                                ctx,
+                                scratch.step_logits.get(ctx, vocab, 1)?,
+                                scratch.markov_bias.get(ctx, vocab, 1)?,
+                                sum,
+                            )?;
+                            Ok(())
+                        })?;
+                        (scratch.step_sum.get(ctx, vocab, 1)?, 0)
+                    } else {
+                        (df.logits.get(ctx, vocab, block)?, row)
+                    };
+                    let tok = crate::profile::profile_op(ctx, "sample", None, 1, || {
+                        // Uniform from the host (seed, position) stream plain decode
+                        // would consume at this position (SALT_DRAW = 0).
+                        let u = unit_uniform(params.seed, SALT_DRAW, (start + row) as u64);
+                        let q_all = df.q_probs.get(ctx, block * vocab)?;
+                        let tok_out = scratch.sample_tok.get(ctx, 1)?;
+                        // `src` row holds `vocab` bf16 (src_row bounded by its
+                        // seq_len); q row index == drafts.len() < block.
+                        let logits_row = src.data.slice(src_row * vocab..(src_row + 1) * vocab);
+                        let q_row_idx = drafts.len();
+                        let mut q_row = q_all.slice_mut(q_row_idx * vocab..(q_row_idx + 1) * vocab);
+                        cuda_kernels::sampling::dspark_draft_sample(
+                            ctx,
+                            &logits_row,
+                            &mut q_row,
+                            tok_out,
+                            vocab,
+                            cuda_kernels::sampling::DsparkFilter {
+                                inv_temperature: 1.0 / params.temperature,
+                                top_k: params.top_k,
+                                top_p: params.top_p,
+                                min_p: params.min_p,
+                            },
+                            u,
+                        )?;
+                        ctx.sync()?;
+                        let src = tok_out.clone();
+                        let host = scratch.tok_host.get(ctx, 1)?;
+                        ctx.stream
+                            .memcpy_dtoh(&src, host)
+                            .map_err(|e| anyhow!("D2H dspark draft token failed: {e}"))?;
+                        let tok = host.as_slice()?[0] as u32;
+                        df.q_rows += 1;
+                        Ok(tok)
+                    })?;
+                    drafts.push(tok);
+                    prev = tok;
+                }
+            }
         }
 
         // Goodput-budget the proposal (R=1 here); absent head keeps the block.
@@ -1300,13 +1233,15 @@ impl Qwen35Model {
             );
             ids[s * block] = anchors[s] as i32;
             pos[s] = start as i32;
-            for row in 0..block {
-                let lo = window_lo(cfg, start + row).max(df.ctx_base);
-                let kv_len = start + block - lo;
-                ensure!(kv_len <= head.cap, "dspark draft row window {kv_len} > cap");
-                win[s * block + row] = lo as i32;
-                win[rows + s * block + row] = kv_len as i32;
-            }
+            let win_slot = infer_model::dspark::draft_attention_windows(
+                cfg.sliding_window,
+                start,
+                block,
+                df.ctx_base,
+                head.cap,
+            )?;
+            win[s * block..(s + 1) * block].copy_from_slice(&win_slot[..block]);
+            win[rows + s * block..rows + (s + 1) * block].copy_from_slice(&win_slot[block..]);
         }
 
         let ids_dev = scratch.ids.upload(ctx, &ids)?;
@@ -1468,7 +1403,7 @@ impl Qwen35Model {
             gemm_batch(ctx, self.output_projection(), final_normed, logits)
         })?;
 
-        let first_row = usize::from(!cfg.next_token_heads);
+        let first_row = infer_model::dspark::first_row(cfg.next_token_heads);
         let am = crate::profile::profile_op(ctx, "sample", None, rows, || {
             self.dspark_settle_rows(
                 head.markov.as_ref(),
@@ -1549,17 +1484,8 @@ impl Qwen35Model {
             return Ok(toks);
         };
         // The anchor feeds the slot's first drafted row, then its own tokens.
-        let mut prevs = vec![0i32; rows];
         for _ in 0..block {
-            for (s, &anchor) in anchors.iter().enumerate() {
-                for row in 0..block {
-                    prevs[s * block + row] = if row <= first_row {
-                        anchor as i32
-                    } else {
-                        toks[s * block + row - 1] as i32
-                    };
-                }
-            }
+            let prevs = infer_model::dspark::markov_prevs(anchors, &toks, block, first_row);
             let tok_dev = mk.prevs.upload(ctx, &prevs)?;
             let emb = mk.emb.get(ctx, m.rank, rows)?;
             embedding_batch(ctx, &m.w1, tok_dev, emb)?;
@@ -1574,10 +1500,8 @@ impl Qwen35Model {
                 self.argmax_rows_into(logits, ids, &mut host)
             }?;
             // "the correction moved no row another row's bias depends on".
-            let settled = (0..b).all(|s| {
-                (first_row..block.saturating_sub(1))
-                    .all(|r| toks[s * block + r] == next[s * block + r])
-            });
+            let settled =
+                infer_model::dspark::markov_settled(anchors, &toks, &next, block, first_row);
             toks = next;
             if settled {
                 return Ok(toks);
@@ -1668,21 +1592,13 @@ impl Qwen35Model {
             .clone_dtoh(&cs.out.get(ctx, 1, total)?.data)
             .map_err(|e| anyhow!("D2H dspark confidence failed: {e}"))?;
         ctx.sync()?;
-        let survivals: Vec<Vec<f32>> = (0..b)
-            .map(|s| {
-                let mut acc = 1.0f32;
-                host[s * n..(s + 1) * n]
-                    .iter()
-                    .map(|h| {
-                        let logit = h.to_f32() + conf.bias;
-                        acc *= 1.0 / (1.0 + (-logit).exp());
-                        acc
-                    })
-                    .collect()
-            })
-            .collect();
-        let refs: Vec<&[f32]> = survivals.iter().map(Vec::as_slice).collect();
-        Ok(dspark_verify_lens(&refs, head.sps))
+        let logits: Vec<f32> = host.iter().map(|h| h.to_f32()).collect();
+        Ok(infer_model::dspark::confidence_keep_lengths(
+            Some((&logits, conf.bias)),
+            b,
+            n,
+            head.sps,
+        ))
     }
 
     /// Size the reused per-slot spec state (`new_spec_slot_state` capture rows,
@@ -1734,40 +1650,6 @@ impl Qwen35Model {
                 Ok(id as u32)
             })
             .collect()
-    }
-
-    /// Accept scan over a DSpark verify. This chain occupies `logits` rows
-    /// `[row0, row0 + chain_len)` of the (possibly batched) verify output;
-    /// `argmax` is that whole output's per-row argmax. Returns `(emitted,
-    /// bonus, k)`; the caller crops the paged pool to `start_pos + k + 1` when
-    /// `k + 1 < chain.len()`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dspark_accept_commit(
-        &self,
-        chain: &[u32],
-        argmax: &[u32],
-        row0: usize,
-    ) -> Result<(Vec<u32>, u32, usize)> {
-        let depth = chain.len() - 1;
-        ensure!(
-            row0 + chain.len() <= argmax.len(),
-            "dspark accept: chain rows outside the verify argmax"
-        );
-        // Longest prefix where each draft equals the trunk argmax at its row.
-        let mut k = 0usize;
-        let bonus;
-        loop {
-            let am = argmax[row0 + k];
-            if k < depth && am == chain[k + 1] {
-                k += 1;
-            } else {
-                bonus = am;
-                break;
-            }
-        }
-        let mut emitted: Vec<u32> = chain[1..=k].to_vec();
-        emitted.push(bonus);
-        Ok((emitted, bonus, k))
     }
 
     /// Rewind a partially-accepted batch: restore every slot's gated-delta

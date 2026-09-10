@@ -15,13 +15,13 @@ impl Qwen35Model {
     }
 
     pub(crate) fn local_full_attn_q_dim(&self) -> usize {
-        self.local_q_heads * self.config.head_dim
+        infer_model::qwen35::local_full_attn_q_dim(&self.config, self.local_shard())
     }
 
     /// This rank's GATED q_proj output width: the projection interleaves
     /// `[query; gate]` per head, so each local head contributes `2*head_dim` rows.
     pub(crate) fn local_full_attn_q_proj_dim(&self) -> usize {
-        self.local_q_heads * self.config.head_dim * 2
+        infer_model::qwen35::local_full_attn_q_proj_dim(&self.config, self.local_shard())
     }
 
     /// Single source for every full-attn K/V cache / pool size on this rank.
@@ -32,35 +32,34 @@ impl Qwen35Model {
     /// are bit-identical. GQA then runs independently per rank against its own
     /// copy — no cross-replica KV exchange is needed or done.
     pub(crate) fn local_full_attn_kv_dim(&self) -> usize {
-        self.local_kv_heads * self.config.head_dim
+        infer_model::qwen35::local_full_attn_kv_dim(&self.config, self.local_shard())
     }
 
     pub(crate) fn local_linear_qkv_dim(&self) -> usize {
-        let qk = 2 * self.local_linear_k_heads * self.config.linear_key_head_dim;
-        qk + self.local_linear_v_heads * self.config.linear_value_head_dim
+        infer_model::qwen35::local_linear_qkv_dim(&self.config, self.local_shard())
     }
 
     pub(crate) fn local_linear_z_dim(&self) -> usize {
-        self.local_linear_v_heads * self.config.linear_value_head_dim
+        infer_model::qwen35::local_linear_z_dim(&self.config, self.local_shard())
     }
 
     /// B2 CP decode per-rank head counts: 1/cp of the local attn_tp shard.
     /// Equal to the local counts when cp=1 or a head count is indivisible
     /// (decode then runs replicated, `cp_decode_handle` is None).
     pub(crate) fn decode_q_heads(&self) -> usize {
-        self.local_q_heads / self.cp_decode_divisor()
+        infer_model::qwen35::decode_q_heads(self.local_shard(), self.cp_decode_divisor())
     }
 
     pub(crate) fn decode_kv_heads(&self) -> usize {
-        self.local_kv_heads / self.cp_decode_divisor()
+        infer_model::qwen35::decode_kv_heads(self.local_shard(), self.cp_decode_divisor())
     }
 
     pub(crate) fn decode_linear_k_heads(&self) -> usize {
-        self.local_linear_k_heads / self.cp_decode_divisor()
+        infer_model::qwen35::decode_linear_k_heads(self.local_shard(), self.cp_decode_divisor())
     }
 
     pub(crate) fn decode_linear_v_heads(&self) -> usize {
-        self.local_linear_v_heads / self.cp_decode_divisor()
+        infer_model::qwen35::decode_linear_v_heads(self.local_shard(), self.cp_decode_divisor())
     }
 
     fn cp_decode_divisor(&self) -> usize {
@@ -72,24 +71,14 @@ impl Qwen35Model {
     /// recurrent slabs / qkv conv channels). Single source for both
     /// [`Qwen35SlotState::acquire_recurrent`] and the spec snapshot scratch.
     pub(crate) fn recurrent_dims(&self) -> (usize, usize, usize) {
-        let c = &self.config;
-        let num_linear = c.num_hidden_layers - c.num_full_attention_layers();
-        let gdr_state_len =
-            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
-        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
-        (num_linear, gdr_state_len, conv_len)
+        infer_model::qwen35::recurrent_dims(&self.config, self.local_shard())
     }
 
     /// B2 CP decode dims for the 1/cp-head recurrent pair: same layer count,
     /// 1/cp the gdr/conv widths (the engage guard makes both head counts
     /// divisible by cp).
     pub(crate) fn recurrent_dims_decode(&self, cp_size: usize) -> (usize, usize, usize) {
-        let c = &self.config;
-        let num_linear = c.num_hidden_layers - c.num_full_attention_layers();
-        let gdr_state_len =
-            (self.local_linear_v_heads / cp_size) * c.linear_key_head_dim * c.linear_value_head_dim;
-        let conv_len = (self.local_linear_qkv_dim() / cp_size) * (c.linear_conv_kernel_dim - 1);
-        (num_linear, gdr_state_len, conv_len)
+        infer_model::qwen35::recurrent_dims_decode(&self.config, self.local_shard(), cp_size)
     }
 
     /// A fresh idle slot — allocates nothing. The recurrent state is drawn from
@@ -105,11 +94,7 @@ impl Qwen35Model {
     /// linear-state dims exactly so a snapshot/restore is a straight D2D copy.
     #[allow(dead_code)] // called by the executor spec-slot init in a later increment
     pub(crate) fn linear_state_bytes(&self) -> (usize, usize) {
-        let c = &self.config;
-        (
-            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim * 4,
-            self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1) * 2,
-        )
+        infer_model::qwen35::linear_state_bytes(&self.config, self.local_shard())
     }
 
     pub(crate) fn new_spec_slot_state(&self) -> Result<Qwen35SpecSlotState> {
@@ -173,21 +158,7 @@ impl Qwen35Model {
     }
 
     pub(crate) fn per_slot_kv_bytes(&self) -> (usize, usize, usize, usize) {
-        let c = &self.config;
-        let num_full = c.num_full_attention_layers();
-        let num_linear = c.num_hidden_layers - num_full;
-        let bf16 = std::mem::size_of::<half::bf16>();
-        let f32sz = std::mem::size_of::<f32>();
-        // Full-attn K/V is paged (shared pool), not per-slot → 0 here.
-        let kv_bytes = 0usize;
-        let gdr_len = self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
-        let gdr_bytes = num_linear.saturating_mul(gdr_len).saturating_mul(f32sz);
-        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
-        let conv_bytes = num_linear.saturating_mul(conv_len).saturating_mul(bf16);
-        let per_slot = kv_bytes
-            .saturating_add(gdr_bytes)
-            .saturating_add(conv_bytes);
-        (per_slot, kv_bytes, gdr_bytes, conv_bytes)
+        infer_model::qwen35::per_slot_kv_bytes(&self.config, self.local_shard())
     }
 
     /// Jointly pick `(num_slots, pool_pages)` — the DSv4
@@ -220,7 +191,6 @@ impl Qwen35Model {
         mem_fraction_static: f64,
         kv_format: cuda_kernels::KVFormat,
     ) -> Result<Qwen35KvBudgetPlan> {
-        const MEM_FRACTION: f64 = 0.7;
         const PAGE: usize = crate::executor::SUPPORTED_PAGE_SIZE;
         let (per_slot, kv_bytes, gdr_bytes, conv_bytes) = self.per_slot_kv_bytes();
         let per_slot = per_slot.saturating_add(extra_per_slot_bytes);
@@ -230,59 +200,44 @@ impl Qwen35Model {
         let cell_bytes_per_token =
             PagedKVPool::budget_bytes_for_tokens(num_full, local_kv_heads, head_dim, 1, kv_format)
                 as u64;
-        let pool_tokens_at = |free: usize, total: usize, n: usize| -> u64 {
-            infer_seam::profile_kv_pool_tokens(
-                (free as u64).saturating_sub(per_slot.saturating_mul(n) as u64),
-                total as u64,
-                cell_bytes_per_token,
-                mem_fraction_static,
-            )
+        let probe = match cudarc::driver::result::mem_get_info() {
+            Ok((raw_free, total)) => {
+                let free = match memory_budget_bytes {
+                    Some(grant) => {
+                        let capped = raw_free.min(grant);
+                        log::info!(
+                            "Qwen3.5 KV budget: fixed grant {}MB caps measured free {}MB -> {}MB",
+                            grant >> 20,
+                            raw_free >> 20,
+                            capped >> 20,
+                        );
+                        capped
+                    }
+                    None => raw_free,
+                };
+                log::info!(
+                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB)",
+                    free >> 20,
+                    per_slot >> 20,
+                    kv_bytes >> 20,
+                    gdr_bytes >> 20,
+                    conv_bytes >> 20,
+                    extra_per_slot_bytes >> 20,
+                );
+                Some((free, total))
+            }
+            // Can't query (no active context / driver error) → don't bind the
+            // min; the other ranks' budgets still apply.
+            Err(_) => None,
         };
-        let (n_local, probe): (i32, Option<(usize, usize)>) =
-            match cudarc::driver::result::mem_get_info() {
-                Ok((free, total)) => {
-                    let free = match memory_budget_bytes {
-                        Some(grant) => {
-                            let capped = free.min(grant);
-                            log::info!(
-                                "Qwen3.5 KV budget: fixed grant {}MB caps measured free {}MB -> {}MB",
-                                grant >> 20,
-                                free >> 20,
-                                capped >> 20,
-                            );
-                            capped
-                        }
-                        None => free,
-                    };
-                    // Same neutral kernel as DSv4: floor(free × fraction) / per_slot.
-                    let budget = infer_seam::SlotBudget::from_free(free, MEM_FRACTION, 0, per_slot);
-                    log::info!(
-                        "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB)",
-                        free >> 20,
-                        per_slot >> 20,
-                        kv_bytes >> 20,
-                        gdr_bytes >> 20,
-                        conv_bytes >> 20,
-                        extra_per_slot_bytes >> 20,
-                    );
-                    let affordable = budget.affordable().unwrap_or(usize::MAX);
-                    // Joint solve: shed slots until the pool remainder funds one
-                    // full-length request. n=1 is the best-effort floor — the
-                    // pool collapse warning below reports it, matching the old
-                    // profile path instead of DSv4's hard reject.
-                    let mut n = requested.max(1).min(affordable);
-                    while n > 1 && pool_tokens_at(free, total, n) < self.max_seq_len as u64 {
-                        n -= 1;
-                    }
-                    if affordable == 0 {
-                        n = 0;
-                    }
-                    (i32::try_from(n).unwrap_or(i32::MAX), Some((free, total)))
-                }
-                // Can't query (no active context / driver error) → don't bind the
-                // min; the other ranks' budgets still apply.
-                Err(_) => (i32::MAX, None),
-            };
+        let n_local = infer_model::qwen35::kv_slot_budget_local(
+            probe,
+            per_slot,
+            requested,
+            self.max_seq_len,
+            mem_fraction_static,
+            cell_bytes_per_token,
+        );
         let affordable = self.tp.all_reduce_min_scalar_i32(&self.ctx, n_local)? as usize;
         // Reject-below-fixed guard (parity with Metal's fits_fixed + DSv4): a
         // cross-rank-min affordable of 0 means post-weights free VRAM cannot
@@ -292,20 +247,22 @@ impl Qwen35Model {
         anyhow::ensure!(
             affordable > 0,
             "Qwen3.5 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
-             max_seq_len {} (per_slot ~{}MB exceeds {MEM_FRACTION} of free). Free VRAM or \
+             max_seq_len {} (per_slot ~{}MB exceeds {} of free). Free VRAM or \
              lower --max-total-tokens.",
             self.max_seq_len,
             per_slot >> 20,
+            infer_model::qwen35::KV_MEM_FRACTION,
         );
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
         if clamped {
             log::warn!(
                 "Qwen3.5 KV budget: requested {requested} slots × ~{}MB/slot exceeds the \
-                 cross-rank-min joint-affordable {affordable} (local {n_local}, {MEM_FRACTION} \
+                 cross-rank-min joint-affordable {affordable} (local {n_local}, {} \
                  of post-weights free minus the shared-pool funding for one full-length \
                  request); clamping num_slots to {affordable}. Lower --max-total-tokens \
                  (max_seq_len {}) to raise concurrency.",
                 per_slot >> 20,
+                infer_model::qwen35::KV_MEM_FRACTION,
                 self.max_seq_len,
             );
         }
@@ -318,57 +275,20 @@ impl Qwen35Model {
         // Pool pages at the REDUCED slot count: n is rank-identical, and pages
         // shrink as n grows, so min-reducing the per-rank profile at the same n
         // yields a capacity every rank can hold.
-        let pages_local: i32 = match probe {
-            Some((free, total)) => {
-                let profiled_tokens = pool_tokens_at(free, total, planned);
-                if profiled_tokens == infer_seam::PROFILE_KV_TOKENS_FLOOR {
-                    // `mem_fraction_static` bounds the engine's share of TOTAL, so a
-                    // value under the weights' own share caps admission at 4096
-                    // tokens even at num_slots 1.
-                    let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
-                    log::warn!(
-                        "KV pool collapsed to the {}-token floor even at num_slots {planned}: \
-                         free {}MB − recurrent {}MB − reserve {}MB (= total {}MB × (1 − \
-                         mem_fraction_static {mem_fraction_static})) leaves nothing for \
-                         {cell_bytes_per_token}B/tok cells. Raise mem_fraction_static, or free \
-                         VRAM: every prompt over {} tokens will abort.",
-                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
-                        free >> 20,
-                        per_slot.saturating_mul(planned) >> 20,
-                        reserve >> 20,
-                        total >> 20,
-                        infer_seam::PROFILE_KV_TOKENS_FLOOR,
-                    );
-                }
-                let profiled_pages = (profiled_tokens / PAGE as u64).max(1) as usize;
-                log::info!(
-                    "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
-                     total {}MB, recurrent reservation {}MB ({planned} slots × {}MB), \
-                     mem_fraction_static {mem_fraction_static}, cell {cell_bytes_per_token}B/tok \
-                     ({num_full} full-attn layers × {local_kv_heads} kv-heads × {head_dim} hd) \
-                     -> max_total_tokens {profiled_tokens} ({profiled_pages} pages); requested \
-                     {requested_pages} pages (advisory)",
-                    free >> 20,
-                    total >> 20,
-                    per_slot.saturating_mul(planned) >> 20,
-                    per_slot >> 20,
-                );
-                i32::try_from(profiled_pages).unwrap_or(i32::MAX)
-            }
-            None => i32::MAX,
-        };
+        let pages_local = infer_model::qwen35::kv_pool_pages_local(
+            probe,
+            planned,
+            per_slot,
+            cell_bytes_per_token,
+            num_full,
+            local_kv_heads,
+            head_dim,
+            requested_pages,
+            mem_fraction_static,
+            PAGE,
+        );
         let pool_pages = self.tp.all_reduce_min_scalar_i32(&self.ctx, pages_local)? as usize;
-        let pool_pages = if pool_pages == i32::MAX as usize {
-            // Every rank's free-VRAM probe failed → the requested floor, matching
-            // the old profile-failure fallback.
-            log::warn!(
-                "CUDA Qwen3.6 full-attn KV pool: free-VRAM probe failed on every rank; \
-                 falling back to requested floor {requested_pages} pages"
-            );
-            requested_pages
-        } else {
-            pool_pages
-        };
+        let pool_pages = infer_model::qwen35::finalize_pool_pages(pool_pages, requested_pages);
         Ok(Qwen35KvBudgetPlan {
             num_slots: planned,
             pool_pages,
@@ -799,6 +719,17 @@ impl Qwen35Model {
 
     pub(crate) fn local_kv_heads(&self) -> usize {
         self.local_kv_heads
+    }
+
+    /// This rank's per-shard head counts as the host-geometry `infer-model`
+    /// types take.
+    pub(crate) fn local_shard(&self) -> infer_model::qwen35::LocalShard {
+        infer_model::qwen35::LocalShard {
+            q_heads: self.local_q_heads,
+            kv_heads: self.local_kv_heads,
+            linear_k_heads: self.local_linear_k_heads,
+            linear_v_heads: self.local_linear_v_heads,
+        }
     }
 
     /// Run the full forward over `tokens` and return the FULL `[seq_len, vocab]`
