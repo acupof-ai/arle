@@ -117,6 +117,14 @@ LOCK_DIR="${TMPDIR:-/tmp}/arle-pre-push-cargo.lock"
 LOCK_HELD=0
 acquire_cargo_lock() {
     [[ "${ARLE_PRE_PUSH_NESTED:-0}" == "1" ]] && return 0
+    # Skip when this run executes no cargo step: the lock guards the shared
+    # CARGO_TARGET_DIR, and a run that never touches it must not wait behind
+    # one that does. The criterion is "no cargo step runs", not "docs-only
+    # push": the Metal section has its own switch and runs regardless of
+    # SKIP_CARGO, so a Metal-enabled run keeps the lock.
+    if [[ "${SKIP_CARGO}" == "1" && "${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}" != "1" ]]; then
+        return 0
+    fi
     local waited=0 holder
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
         holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo unknown)"

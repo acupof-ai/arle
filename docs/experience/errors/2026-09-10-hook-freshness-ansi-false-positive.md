@@ -53,3 +53,10 @@ When a hook greps cargo's human-readable output, strip ANSI first or set
 and an undecorated grep cannot coexist. A mock for such a test must emit the
 same decoration the real binary does — a plain-output mock proves nothing
 about a colored world.
+
+Both reverse controls in this incident chain were written by the gate's
+author, and both holes were found by someone else constructing a shape the
+author did not imagine: `Option::take()` on the hygiene gate, ANSI
+decoration on this one. The control's world is best constructed by someone
+other than the gate's author; an author-built control replays the author's
+blind spots.
