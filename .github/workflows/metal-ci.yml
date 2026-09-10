@@ -86,6 +86,17 @@ jobs:
           --lib --release
           -- --test-threads 1
 
+      # infer-metal's own lib tests (KvPool/page/SSD/prefix mechanics + the
+      # executor plumbing). Separate step: infer-metal exposes only a `metal`
+      # feature (no no-cuda), so it can't join the --features metal,no-cuda run
+      # above. Without this the crate's unit tests never compiled in CI — a
+      # nonexistent mlx Dtype in kv_ssd's test module shipped until 2026-09.
+      # Single-threaded: parallel Metal command buffers race and abort.
+      - name: cargo test (infer-metal)
+        run: >
+          cargo test -p infer-metal --release --features metal --lib
+          -- --test-threads 1
+
       - name: cargo check (metal train/autograd libs)
         run: |
           cargo check -p autograd --release --features metal --lib
