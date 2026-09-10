@@ -1906,6 +1906,31 @@ impl DeviceMatrix {
     }
 }
 
+impl From<&DeviceMatrix> for infer_quant::WeightLayoutQuery {
+    fn from(m: &DeviceMatrix) -> Self {
+        use infer_quant::WeightFormatKind;
+        let format = match m.weight_format {
+            WeightFormat::Fp8BlockScaled => WeightFormatKind::Fp8BlockScaled,
+            WeightFormat::Fp8PerShard => WeightFormatKind::Fp8PerShard,
+            WeightFormat::Fp4E2M1Group => WeightFormatKind::Fp4E2M1Group,
+            WeightFormat::W8A16 => WeightFormatKind::W8A16,
+            WeightFormat::W4A16 => WeightFormatKind::W4A16,
+            WeightFormat::Dsv4Fp8BlockScaled => WeightFormatKind::Dsv4Fp8BlockScaled,
+            _ => WeightFormatKind::Other,
+        };
+        Self {
+            format,
+            n: m.rows,
+            k: m.cols,
+            group_size: m.group_size,
+            quant_block_m: m.quant_block_m,
+            quant_block_k: m.quant_block_k,
+            scale_rows: m.quant_scale_rows,
+            scale_cols: m.quant_scale_cols,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1987,31 +2012,6 @@ mod tests {
                 "from_safetensors/from_host mismatch at index {}",
                 idx
             );
-        }
-    }
-}
-
-impl From<&DeviceMatrix> for infer_quant::WeightLayoutQuery {
-    fn from(m: &DeviceMatrix) -> Self {
-        use infer_quant::WeightFormatKind;
-        let format = match m.weight_format {
-            WeightFormat::Fp8BlockScaled => WeightFormatKind::Fp8BlockScaled,
-            WeightFormat::Fp8PerShard => WeightFormatKind::Fp8PerShard,
-            WeightFormat::Fp4E2M1Group => WeightFormatKind::Fp4E2M1Group,
-            WeightFormat::W8A16 => WeightFormatKind::W8A16,
-            WeightFormat::W4A16 => WeightFormatKind::W4A16,
-            WeightFormat::Dsv4Fp8BlockScaled => WeightFormatKind::Dsv4Fp8BlockScaled,
-            _ => WeightFormatKind::Other,
-        };
-        Self {
-            format,
-            n: m.rows,
-            k: m.cols,
-            group_size: m.group_size,
-            quant_block_m: m.quant_block_m,
-            quant_block_k: m.quant_block_k,
-            scale_rows: m.quant_scale_rows,
-            scale_cols: m.quant_scale_cols,
         }
     }
 }

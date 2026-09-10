@@ -19,9 +19,11 @@ mod int;
 pub(crate) use fp4::warm_fp4_deepgemm_dense;
 pub(crate) use fp8::{qwen_fp8_deepgemm_dense_enabled, warm_fp8_deepgemm_dense};
 
-// Only POLICY_ID is read here (stats hash); the route policy lives in fp8.
+// Only POLICY_ID is read here (stats hash); the Route/select_exact/fallback
+// policy items are consumed by the same generated file's fp8 inclusion below,
+// so they are dead-but-shared in this module.
+#[allow(dead_code)]
 mod qwen_fp8_dense_policy {
-    #![allow(dead_code)]
     include!("generated/qwen_fp8_dense_projection.rs");
 }
 

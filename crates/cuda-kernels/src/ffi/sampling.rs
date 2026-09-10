@@ -1,6 +1,5 @@
 use super::{CUresult, CUstream, Half};
 
-#[allow(dead_code)]
 unsafe extern "C" {
     pub fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream) -> CUresult;
 

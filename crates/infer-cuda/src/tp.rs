@@ -479,7 +479,6 @@ impl TpRuntime {
     /// # Errors
     /// Propagates the NCCL all-reduce error on multi-rank builds.
     #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
     // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused.
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub fn all_reduce_sum_over(
@@ -492,7 +491,6 @@ impl TpRuntime {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
     // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused.
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     fn all_reduce_sum_over_stream(
@@ -897,7 +895,6 @@ impl TpRuntime {
     /// Allocate one zeroed CUDA-IPC region per rank and map every peer in
     /// rank order. Collective: every rank must call with the same `bytes`.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
-    #[allow(dead_code)]
     pub(crate) fn alloc_symmetric_ipc(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,

@@ -19,7 +19,6 @@ pub struct Sm90MegaMoeWorkspaceLayoutRaw {
     pub num_max_tokens_per_rank: i32,
 }
 
-#[allow(dead_code)]
 unsafe extern "C" {
     pub fn dsv4_sm90_mega_moe_workspace_layout_cuda(
         num_ranks: i32,

@@ -214,7 +214,6 @@ impl Dsv4SharedDecodeScratch {
             .saturating_add(4usize.saturating_mul(std::mem::size_of::<i32>()))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes_live(&self) -> usize {
         let f32_sz = std::mem::size_of::<f32>();
         let i32_sz = std::mem::size_of::<i32>();
@@ -532,6 +531,9 @@ pub(crate) struct Dsv4W4A16GemvTables {
     group_size: usize,
     /// Owned transposed scale buffers (W4AFP8 decode lane only — the W4A16
     /// lane points into per-expert `DeviceMatrix.qscales` and leaves this empty).
+    /// Held for ownership/Drop only: the W4AFP8 kernel reads these by device
+    /// pointer, so Rust never references the Vec after construction.
+    #[allow(dead_code)]
     scale_storage: Vec<CudaSlice<u8>>,
 }
 

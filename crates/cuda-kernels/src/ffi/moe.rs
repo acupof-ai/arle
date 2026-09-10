@@ -1,6 +1,5 @@
 use super::{CUresult, CUstream, Half};
 
-#[allow(dead_code)]
 unsafe extern "C" {
 
     pub fn dsv4_route_cuda(

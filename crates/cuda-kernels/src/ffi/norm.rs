@@ -1,6 +1,5 @@
 use super::{CUresult, CUstream, Half};
 
-#[allow(dead_code)]
 unsafe extern "C" {
     pub fn rms_norm_cuda(
         x: *const Half,

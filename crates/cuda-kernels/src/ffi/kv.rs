@@ -1,6 +1,5 @@
 use super::{CUresult, CUstream, Half};
 
-#[allow(dead_code)]
 unsafe extern "C" {
 
     pub fn quantize_kv_bf16_to_int8_cuda(

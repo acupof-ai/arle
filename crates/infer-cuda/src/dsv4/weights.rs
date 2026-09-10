@@ -102,15 +102,12 @@ pub(crate) struct Dsv4Attention {
     pub indexer: Option<Dsv4Indexer>,
     /// GLM plain output projection `[hidden, num_heads*v_head_dim]`, replacing the
     /// DSv4 `wo_a`/`wo_b` low-rank. `Some` ⇔ `config.plain_o_proj`.
-    #[allow(dead_code)]
     pub o_proj: Option<DeviceMatrix>,
     /// GLM `kv_b` absorption split, folded at runtime around the V32 FlashMLA
     /// call. `w_kc[heads, qk_nope_head_dim, kv_lora_rank]` lifts q_nope into the
     /// 512-latent; `w_vc[heads, kv_lora_rank, v_head_dim]` projects back to v.
     /// `Some` ⇔ GLM (`config.kv_lora_rank > 0`); DSv4 is pre-absorbed.
-    #[allow(dead_code)]
     pub w_kc: Option<DeviceMatrix>,
-    #[allow(dead_code)]
     pub w_vc: Option<DeviceMatrix>,
 }
 
@@ -200,7 +197,6 @@ pub(crate) struct Dsv4MoeLayer {
 /// bf16 at load — GLM's F32 `weight_scale_inv` lacks the E8M0 `dsv4_scales`
 /// layout the FP8 DeepGEMM caches need. `allow(dead_code)`: the DSv4-only build
 /// (every layer MoE) never constructs this.
-#[allow(dead_code)]
 pub(crate) struct Dsv4DenseMlp {
     /// Gate projection `[intermediate, hidden]` (bf16).
     pub gate: DeviceMatrix,
@@ -227,7 +223,6 @@ pub(crate) struct Dsv4Layer {
     pub compress_ratio: usize,
     /// GLM dense layers only (`config.per_layer_dense_mlp[i]`): `Some` ⇒ the
     /// forward runs `dense_mlp` instead of `moe`. DSv4 layers leave this `None`.
-    #[allow(dead_code)]
     pub dense_mlp: Option<Dsv4DenseMlp>,
 }
 
@@ -250,7 +245,6 @@ pub(crate) struct Dsv4MtpLayer {
 /// (`markov_w1`/`markov_w2`) and `confidence_proj`; middle stages leave all
 /// extras `None`. Logits decode through the base model's separate `head.weight`
 /// (`tie_word_embeddings=false`), not a draft-local or embed-tied head.
-#[allow(dead_code)]
 pub(crate) struct Dsv4DsparkStage {
     pub layer: Dsv4Layer,
     pub main_proj: Option<DeviceMatrix>,
@@ -262,7 +256,6 @@ pub(crate) struct Dsv4DsparkStage {
     pub confidence_proj: Option<DeviceMatrix>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct Dsv4DsparkDraft {
     pub stages: Vec<Dsv4DsparkStage>,
 }

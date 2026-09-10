@@ -162,7 +162,6 @@ impl Dsv4SlotState {
         self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
         let attention_bytes: usize = self.attention.iter().map(|s| s.device_bytes()).sum();
         let spec_rings_bytes: usize = self
@@ -195,17 +194,14 @@ impl Dsv4SlotState {
         ]
     }
 
-    #[allow(dead_code)]
     pub(crate) fn dspark_taps(&self) -> &[DeviceVec] {
         &self.dspark_taps
     }
 
-    #[allow(dead_code)]
     pub(crate) fn take_dspark_prompt_taps(&mut self) -> Option<Dsv4DsparkPromptTaps> {
         self.dspark_prompt_taps.take()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn attention_breakdown_total(&self) -> Vec<(&'static str, usize)> {
         let mut totals: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();

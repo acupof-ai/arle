@@ -2721,7 +2721,6 @@ pub(crate) fn tensor_bytes_to_f32(
 // caller count: individual dtype loaders are config-selected, so some read as dead
 // under a
 // given build.
-#[allow(dead_code)]
 impl SafetensorLoader {
     /// Dtype-agnostic full-tensor read (shape + raw bytes + dtype).
     pub(crate) fn load_raw_tensor(&self, name: &str) -> Result<OwnedTensor> {

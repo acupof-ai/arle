@@ -1,6 +1,5 @@
 use super::{CUresult, CUstream, Half};
 
-#[allow(dead_code)]
 unsafe extern "C" {
     pub fn gated_delta_rule_decode_cuda(
         qkv: *const Half,
@@ -211,7 +210,6 @@ pub type FqBwdFn = unsafe extern "C" fn(
     i32,
     CUstream,
 ) -> CUresult;
-#[allow(dead_code)]
 unsafe extern "C" {
     pub fn gdr_fq_prep_cuda(
         qkv: *const Half,

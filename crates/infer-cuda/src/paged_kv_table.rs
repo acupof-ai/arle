@@ -12,8 +12,9 @@
 //!   device-resident table.
 //! - **Qwen quant-KV pool** (#68): the dense Qwen3 path already pages its KV
 //!   through a real (non-identity) page table; the INT8/FP8 quant store kernels
-//!   (`quantize_paged_kv_*_per_channel`) consume a host-built `new_token_indices`
-//!   of PHYSICAL token rows, built by [`physical_token_rows`].
+//!   (`quantize_paged_kv_per_token`) consume `PageMeta::new_token_rows`:
+//!   physical token rows the host builds with `token_rows_for_range` and
+//!   uploads per step (`upload_i32` on prefill, `memcpy_htod` on decode).
 //!
 //! NAMING RULE (ckl 2026-06-11): the per-page token unit is a "page" everywhere
 //! in this codebase; "block" appears ONLY at the FlashMLA FFI boundary, whose
@@ -31,36 +32,6 @@ pub(crate) fn physical_page(table: &[u32], logical_page: usize) -> Result<u32> {
             table.len()
         )
     })
-}
-
-/// The `quantize_paged_kv_*_per_channel` kernels assume an IDENTITY page map
-/// (`page_idx = token_row / page_size`), so a non-identity Qwen page table must
-/// be flattened to PHYSICAL rows here: for each logical position `p`,
-/// `physical_row = table[p / page_size] * page_size + (p % page_size)`. Feeding
-/// the kernel these rows makes its identity arithmetic land in the right
-/// physical slot. Returns `i32` rows (the kernel's index type).
-// Consumer is the #68 T3 quant-KV store glue in `executor`/`attention` (pod
-// build): the CPU-tested host helper lands ahead of its cuda-only caller.
-#[allow(dead_code)]
-pub(crate) fn physical_token_rows(
-    table: &[u32],
-    page_size: usize,
-    start_pos: usize,
-    num_tokens: usize,
-) -> Result<Vec<i32>> {
-    ensure!(page_size > 0, "paged-KV page_size must be non-zero");
-    let rows = (0..num_tokens)
-        .map(|offset| {
-            let pos = start_pos + offset;
-            let physical = physical_page(table, pos / page_size)? as usize;
-            let row = physical
-                .checked_mul(page_size)
-                .and_then(|base| base.checked_add(pos % page_size))
-                .ok_or_else(|| anyhow!("paged-KV physical token row overflow at pos {pos}"))?;
-            i32::try_from(row).map_err(|_| anyhow!("paged-KV physical token row {row} exceeds i32"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rows)
 }
 
 /// Semantic honesty (codex review on 9d63682d): this proves CONTIGUITY —

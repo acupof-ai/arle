@@ -50,7 +50,6 @@ impl Dsv4SpecVerifyScratch {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(super) fn device_bytes(&self) -> usize {
         self.embeddings.device_bytes()
             + self.initial_stream.device_bytes()
@@ -97,7 +96,6 @@ impl Dsv4SpecVerifyLayerScratch {
         self.ffn_stream.seq_len = rows;
     }
 
-    #[allow(dead_code)]
     pub(super) fn device_bytes(&self) -> usize {
         self.attn_normed.device_bytes()
             + self.attn_out.device_bytes()

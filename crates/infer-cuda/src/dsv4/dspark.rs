@@ -6,7 +6,6 @@ use cuda_kernels::attention as flash_kv;
 /// out `[position][head_dim]`, LINEAR from `ctx_base` (`row = abs − ctx_base`),
 /// sized `context_capacity + block_size`. Noise rows self-heal: rejected rows
 /// are overwritten by the next block's context/noise writes before any read.
-#[allow(dead_code)]
 pub(crate) struct Dsv4DsparkSlotState {
     latent_kv: Vec<DeviceVec>,
     ctx_base: usize,
@@ -14,7 +13,6 @@ pub(crate) struct Dsv4DsparkSlotState {
     pending: Option<u32>,
 }
 
-#[allow(dead_code)]
 impl Dsv4DsparkSlotState {
     /// Call only under `config.is_dspark()`.
     pub(crate) fn new(
@@ -36,10 +34,6 @@ impl Dsv4DsparkSlotState {
         })
     }
 
-    pub(crate) fn reset(&mut self) {
-        self.rebase(0);
-    }
-
     /// No zeroing: stale rows are overwritten by post-rebase appends before any read.
     pub(crate) fn rebase(&mut self, pos: usize) {
         self.ctx_base = pos;
@@ -51,7 +45,6 @@ impl Dsv4DsparkSlotState {
 /// Draft-side persistent scratch (exact-shape reuse; spec steps are serial, so
 /// the per-block forward never churns fixed-shaped allocations).
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct Dsv4DsparkScratch {
     q_prepped: HsSlot,
     /// The full-latent value side fed to `mla_oproj` (Flag #1:
@@ -86,7 +79,6 @@ impl HsSlot {
 }
 
 impl Dsv4Model {
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_stage_forward(
         &self,
@@ -353,7 +345,6 @@ impl Dsv4Model {
     /// in the absolute frame, decoupled from the draft-local `latent_kv` write
     /// offset, so the context→block relative offsets the draft attends are the
     /// true trunk distances.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_forward_block(
         &self,
@@ -460,7 +451,6 @@ impl Dsv4Model {
     /// to EVERY stage's `latent_kv`, RoPE'ing each token at its OWN absolute
     /// trunk position `start_abs + j` (the geometry invariant). Advances
     /// `df.ctx_end` by `rows`.
-    #[allow(dead_code)]
     pub(crate) fn dspark_append_context(
         &self,
         draft: &Dsv4DsparkDraft,
@@ -708,14 +698,12 @@ impl Dsv4Model {
 // head = `AcceptRatePredictor` (`proj = Linear(in_dim, 1)`, no bias in this
 // checkpoint) — `sigmoid(logit) < threshold` gives the dynamic draft length.
 
-#[allow(dead_code)]
 pub(crate) struct Dsv4DsparkProposal {
     pub chain: Vec<u32>,
     pub draft_len: usize,
 }
 
 impl Dsv4Model {
-    #[allow(dead_code)]
     pub(crate) fn dspark_build_proposal(
         &self,
         draft: &Dsv4DsparkDraft,

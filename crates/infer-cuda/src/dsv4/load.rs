@@ -26,7 +26,6 @@ use super::*;
 /// the position-dependent extras load conditionally: `main_proj` via the
 /// fp8-block loader the attn `wq_a`/`wkv` projections use, the Markov head in
 /// checkpoint BF16, and the remaining small tensors through their native loaders.
-#[allow(dead_code)]
 pub(crate) fn load_dspark_draft(
     loader: &SafetensorLoader,
     ctx: &DeviceContext,
@@ -584,7 +583,6 @@ fn encode_f8_e4m3fn_sat(val: f32) -> u8 {
 /// NVFP4→W4AFP8 per-tensor conversion result: (packed int4 weights, bf16 scales, n, k, scale_rows).
 type W4Afp8Converted = (Vec<u8>, Vec<u8>, usize, usize, usize);
 
-#[allow(dead_code)]
 impl SafetensorLoader {
     /// Load a DSv4 1D norm/bias vector — BF16 or F32 in the checkpoint, normalized to
     /// BF16.
@@ -864,44 +862,6 @@ impl SafetensorLoader {
             }
             Dtype::I8 => bail!("{name}: non-replicated DSv4 FP4 TP sharding is not implemented"),
             other => bail!("{name}: unsupported DSv4 block-scaled dtype {other:?}"),
-        }
-    }
-
-    /// Dense-bf16 dequant copy of one DSv4 FP8 block-scaled tensor, TP-sharded like the
-    /// FP8
-    /// original. Costs 2× the F8 bytes in VRAM.
-    fn load_dsv4_block_scaled_bf16_copy(
-        &self,
-        ctx: &DeviceContext,
-        name: &str,
-        shard: Shard,
-        tp: &TpConfig,
-    ) -> Result<DeviceMatrix> {
-        let tensor = self.borrow_raw_tensor(name)?;
-        ensure!(
-            tensor.shape.len() == 2,
-            "{name}: expected 2D quantized tensor, got shape {:?}",
-            tensor.shape
-        );
-        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
-        let f32 = self.dequantize_dsv4_block_scaled_to_f32_host(name, rows, cols)?;
-        let bytes: Vec<u8> = f32
-            .iter()
-            .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
-            .collect();
-        if tp.is_single() || shard == Shard::Replicated {
-            return DeviceMatrix::from_safetensors(ctx, &bytes, rows, cols)
-                .with_context(|| format!("upload bf16 dequant copy {name}"));
-        }
-        match shard {
-            Shard::Column { dim: 0 } => {
-                let spec = infer_topo::column_shard(rows, tp);
-                let sharded =
-                    crate::shard_slice::shard_column_parallel(&bytes, rows, cols, 2, &spec)?;
-                DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
-                    .with_context(|| format!("upload sharded bf16 dequant copy {name}"))
-            }
-            other => bail!("{name}: unsupported bf16-copy TP shard policy {other:?}"),
         }
     }
 
