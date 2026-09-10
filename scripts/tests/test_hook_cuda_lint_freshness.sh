@@ -12,8 +12,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
 FIX="$TMP/fix"
-SNAP_HASH="$(printf '%s' "$FIX" | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-16)"
-trap 'rm -rf "$TMP" "${TMPDIR:-/tmp}/arle-pre-push-snapshot-${SNAP_HASH}"' EXIT
+SNAP="$TMP/snapshot"
+LOCK="$TMP/snapshot.lock"
+trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/bin"; mkdir -p "$BIN"
 
 # Fixture repo: base carries no-op stand-ins for the hook's fast checks, the
@@ -76,9 +77,10 @@ chmod +x "$BIN/cargo"
 
 ZERO=0000000000000000000000000000000000000000
 run_hook() {  # $1 = local sha, $2 = remote sha
-  # NESTED bypasses the machine-global cargo lock: this fixture runs inside a
-  # real hook's fast checks, which already hold it, and its cargo is the mock.
-  ( cd "$FIX" && ARLE_PRE_PUSH_NESTED=1 PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
+  # NESTED bypasses the machine lock (this fixture runs inside a real hook's
+  # fast checks, which already hold it) and the cargo is the mock. Override the
+  # shared snapshot/lock paths so the fixture never touches the real ones.
+  ( cd "$FIX" && ARLE_PRE_PUSH_NESTED=1 ARLE_PREPUSH_SNAPSHOT_ROOT="$SNAP" ARLE_PREPUSH_LOCK_DIR="$LOCK" PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
 }
 
 # Red world: the push changes infer-cuda, the lint reports it Fresh.
@@ -141,10 +143,11 @@ MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernel
 
 
 # --- Lock worlds -----------------------------------------------------------
-# The cargo lock is machine-global (${TMPDIR}/arle-pre-push-cargo.lock). These
-# worlds run the hook with a private TMPDIR so they cannot collide with a real
-# hook's lock, and without ARLE_PRE_PUSH_NESTED so the lock is live. A run that
-# executes no cargo step must skip it; a run that does must wait on it.
+# The hook lock is machine-global at ${TMPDIR}/arle-pre-push-cargo.lock (the
+# acquired only for runs that do cargo work. These worlds use a private TMPDIR
+# (no collision with a real lock) and no ARLE_PRE_PUSH_NESTED so the lock is
+# live. A cargo-free (docs-only, Metal off) run takes a PRIVATE snapshot and
+# must NOT wait; a .rs run uses the shared snapshot + lock and must wait.
 LOCK_TMP="$TMP/locktmp"; mkdir -p "$LOCK_TMP"
 run_hook_locked() {  # $1 = local sha, $2 = remote sha
   ( cd "$FIX" && TMPDIR="$LOCK_TMP" PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
@@ -152,10 +155,9 @@ run_hook_locked() {  # $1 = local sha, $2 = remote sha
 hold_lock() { mkdir "$LOCK_TMP/arle-pre-push-cargo.lock"; printf '%s\n' "$$" > "$LOCK_TMP/arle-pre-push-cargo.lock/pid"; }
 release_lock() { rm -rf "$LOCK_TMP/arle-pre-push-cargo.lock"; }
 
-# Skip world: docs-only push, Metal off — no cargo step runs, so the hook must
-# not wait on the held lock. The docs commit is built with coretip (not the
-# current HEAD, which carries the examples .rs commit) as its parent, so the
-# pushed range coretip..docstip contains only a README change.
+# No-wait world: docs-only, Metal off — no cargo step, so the hook takes a
+# private snapshot and must not wait on a peer's held lock. The docs commit has
+# coretip as parent, so coretip..docstip is README-only.
 export GIT_INDEX_FILE="$TMP/docsidx"
 git -C "$FIX" read-tree "$coretip"
 dblob="$(printf 'docs\n' | git -C "$FIX" hash-object -w --stdin)"
@@ -169,26 +171,27 @@ skip_pid=$!
 for _ in $(seq 1 60); do kill -0 "$skip_pid" 2>/dev/null || break; sleep 0.5; done
 if kill -0 "$skip_pid" 2>/dev/null; then
   kill "$skip_pid" 2>/dev/null || true
-  echo "FAIL: docs-only push waited on the cargo lock" >&2; cat "$TMP/skip.log" >&2; exit 1
+  echo "FAIL: docs-only push waited on the snapshot lock" >&2; cat "$TMP/skip.log" >&2; exit 1
 fi
-[ "$(cat "$TMP/skip.rc")" = 0 ] || { echo "FAIL: docs-only push rejected" >&2; cat "$TMP/skip.log" >&2; exit 1; }
-! grep -q 'waiting for peer hook' "$TMP/skip.log" || { echo "FAIL: skip world printed the wait message" >&2; cat "$TMP/skip.log" >&2; exit 1; }
+[ "$(cat "$TMP/skip.rc")" = "0" ] || { echo "FAIL: docs-only push rejected" >&2; cat "$TMP/skip.log" >&2; exit 1; }
+! grep -q 'waiting for peer pre-push hook' "$TMP/skip.log" || { echo "FAIL: no-wait world printed the wait message" >&2; cat "$TMP/skip.log" >&2; exit 1; }
+grep -q 'private snapshot' "$TMP/skip.log" || { echo "FAIL: docs-only push did not select a private snapshot" >&2; cat "$TMP/skip.log" >&2; exit 1; }
 release_lock
 
-# Wait world: a push changing .rs runs cargo steps, so it waits for the held
-# lock and completes once it is released.
+# Wait world: a .rs push runs cargo steps, uses the shared snapshot + lock, and
+# waits for the held lock, completing once released.
 hold_lock
 (run_hook_locked "$coretip" "$corebase" >"$TMP/wait.log" 2>&1; echo $? > "$TMP/wait.rc") &
 wait_pid=$!
 sleep 2
 kill -0 "$wait_pid" 2>/dev/null || { echo "FAIL: .rs push did not wait for the held lock" >&2; cat "$TMP/wait.log" >&2; exit 1; }
-grep -q 'waiting for peer hook' "$TMP/wait.log" || { echo "FAIL: wait message missing" >&2; cat "$TMP/wait.log" >&2; exit 1; }
+grep -q 'waiting for peer pre-push hook' "$TMP/wait.log" || { echo "FAIL: wait message missing" >&2; cat "$TMP/wait.log" >&2; exit 1; }
 release_lock
 for _ in $(seq 1 120); do kill -0 "$wait_pid" 2>/dev/null || break; sleep 0.5; done
 if kill -0 "$wait_pid" 2>/dev/null; then
   kill "$wait_pid" 2>/dev/null || true
   echo "FAIL: hook did not complete after lock release" >&2; cat "$TMP/wait.log" >&2; exit 1
 fi
-[ "$(cat "$TMP/wait.rc")" = 0 ] || { echo "FAIL: wait world rejected" >&2; cat "$TMP/wait.log" >&2; exit 1; }
+[ "$(cat "$TMP/wait.rc")" = "0" ] || { echo "FAIL: wait world rejected" >&2; cat "$TMP/wait.log" >&2; exit 1; }
 
-echo "PASS: CUDA lint + test-step freshness (red/green/new-branch/control/test-red/color/examples-red/examples-green), cargo lock (skip/wait)"
+echo "PASS: CUDA lint + test-step freshness (red/green/new-branch/control/test-red/color/examples-red/examples-green), snapshot lock (docs no-wait / .rs wait)"

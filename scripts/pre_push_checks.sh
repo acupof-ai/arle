@@ -25,12 +25,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Per-worktree snapshot: a shared dir lets concurrent lane hooks rsync
-# different HEADs into one tree, and an interrupted rsync leaves a mix that
-# fails content-hash tests (kernel bundle id drift, 2026-09-09).
-SNAPSHOT_HASH="$(printf '%s' "$REPO_ROOT" | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-16)"
-SNAPSHOT_ROOT="${TMPDIR:-/tmp}/arle-pre-push-snapshot-${SNAPSHOT_HASH}"
 STAGE_ROOT=""
+SNAPSHOT_ROOT=""
+LOCK_DIR=""
+LOCK_HELD=0
 
 info() { echo "[pre-push] $*"; }
 fail() { echo "[pre-push] $*" >&2; }
@@ -41,6 +39,11 @@ run() {
 }
 
 cleanup() {
+    # A private (cargo-free) snapshot is a mktemp dir only this run uses; the
+    # shared snapshot is persistent and must not be removed.
+    if [[ "${SNAPSHOT_PRIVATE:-0}" == "1" && -n "${SNAPSHOT_ROOT}" && -d "${SNAPSHOT_ROOT}" ]]; then
+        rm -rf "${SNAPSHOT_ROOT}"
+    fi
     if [[ -n "${STAGE_ROOT}" && -d "${STAGE_ROOT}" ]]; then
         rm -rf "${STAGE_ROOT}"
     fi
@@ -51,46 +54,18 @@ cleanup() {
 
 trap cleanup EXIT
 
-STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-stage.XXXXXX")"
-info "refreshing HEAD snapshot at ${SNAPSHOT_ROOT}"
-git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${STAGE_ROOT}"
-mkdir -p "${SNAPSHOT_ROOT}"
-# --checksum keeps mtimes of content-identical files untouched (cargo sees
-# them as unchanged); --delete drops files removed from HEAD.
-rsync -a --delete --checksum "${STAGE_ROOT}/" "${SNAPSHOT_ROOT}/"
-# Sweep orphan snapshots: a deleted lane leaves its per-worktree snapshot dir
-# behind (20 dirs / 1.9 GB observed 2026-09-10). The rsync above refreshes the
-# live dir's mtime, so one untouched for a week is an orphan.
-find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'arle-pre-push-snapshot-*' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
-cd "${SNAPSHOT_ROOT}"
-
-export CARGO_TERM_COLOR=always
-export RUSTFLAGS="-D warnings"
-# REPO_ROOT is the *worktree* root, so this used to give every lane its own
-# pre-push target tree — 4.8 GB each, 18.6 GB across four lanes, and the env var
-# beat the shared `target-dir` in ../arle-lanes/.cargo/config.toml. Anchor it to
-# the main checkout (the parent of the common git dir) so all worktrees share
-# one, the way ordinary builds already do.
-MAIN_ROOT="$(dirname "$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" 2>/dev/null)"
-[[ -d "${MAIN_ROOT}" ]] || MAIN_ROOT="${REPO_ROOT}"
-export CARGO_TARGET_DIR="${MAIN_ROOT}/target/pre-push-quick"
-# cudarc probes the CUDA version at build time; pin it so the cuda,no-cuda
-# typecheck works on hosts without nvcc.
-export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
-
-# --- Determine whether cargo steps can skip -------------------------------
+# --- Read the push range FIRST to decide what this run must do -------------
 # Pre-push stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>.
-# If the pushed range has zero .rs files, compilation cannot catch anything
-# new — skip it. Empty stdin (manual run) defaults to compiling.
-# changed_files also drives the CUDA lint freshness assertion below.
+# Empty stdin (manual run) defaults to compiling.
 SKIP_CARGO=0
 SKIP_SHELL_TESTS=0
 CUDA_CRATES_CHANGED=0
+METAL_WANTED="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 changed_files=""
 while read -r _local_ref local_sha _remote_ref remote_sha; do
     if [[ "$remote_sha" =~ ^0{40}$ ]]; then
-        # New branch: no remote tip to diff. The merge-base with main is the
-        # range the push actually adds; HEAD~1 covers a repo with no origin.
+        # New branch: no remote tip. The merge-base with main is the range the
+        # push actually adds; HEAD~1 covers a repo with no origin.
         base="$(git -C "${REPO_ROOT}" merge-base HEAD origin/main 2>/dev/null || echo HEAD~1)"
         changed_files="$(git -C "${REPO_ROOT}" diff --name-only "${base}..HEAD" 2>/dev/null || true)"
     else
@@ -98,73 +73,117 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     fi
     if ! grep -q '\.rs$' <<< "${changed_files}"; then
         SKIP_CARGO=1
-        info "no .rs files in pushed range; skipping cargo steps"
     fi
     if grep -qE '^crates/(infer-cuda|cuda-kernels)/' <<< "${changed_files}"; then
         CUDA_CRATES_CHANGED=1
     fi
-    # The scripts/tests/*.sh batch (lever gate, pod flow, prebuilt export, …)
-    # takes minutes and can hold the already-open SSH connection idle long
-    # enough for the remote to drop it (push exits 141 after the checks pass).
-    # Run it whenever the push could change what those tests exercise. Their
-    # inputs are not only scripts/ and CI: several read real tree files —
-    #   test_cuda_prebuilt_export / test_kernel_artifact_qualification /
-    #   test_pod_flow read crates/cuda-kernels/{build.rs,kernels.toml,generated}
-    #   and the crate as a package; test_hook_disowns_git_env reads
-    #   .githooks/pre-push; test_pod_flow also copies the root .gitignore.
-    # Trigger on the whole crates/cuda-kernels/ crate (conservative) plus
-    # scripts/ .githooks/ .github/ and .gitignore. Everything else (docs-only,
-    # ledger) skips; hygiene and fmt always run (whole tree). Empty stdin
-    # (manual run) defaults to running the batch.
+    # The scripts/tests/*.sh batch takes minutes and holds the pre-push SSH
+    # connection idle (push exits 141 after the checks pass). Run it only when
+    # the push could change what those tests exercise. Several read real tree
+    # files, not only scripts/: cuda_prebuilt_export / kernel_artifact /
+    # pod_flow read crates/cuda-kernels/{build.rs,kernels.toml,generated} and
+    # the crate package; hook_disowns reads .githooks/pre-push; pod_flow copies
+    # the root .gitignore. Trigger on the whole cuda-kernels crate (conservative)
+    # plus scripts/ .githooks/ .github/ .gitignore. Hygiene and fmt always run.
     if ! grep -qE '^(scripts|\.githooks|\.github)/|^\.gitignore$|^crates/cuda-kernels/' <<< "${changed_files}"; then
         SKIP_SHELL_TESTS=1
         info "no shell-test inputs (scripts/.githooks/.github/cuda-kernels/.gitignore) in pushed range; skipping shell test batch"
     fi
     break
 done
+if [[ "${SKIP_CARGO}" == "1" ]]; then
+    info "no .rs files in pushed range; skipping cargo steps"
+fi
 
-# --- Cargo lock (machine-global) -------------------------------------------
-# Every lane's hook shares one CARGO_TARGET_DIR with no interlock. A
-# `rm -rf` / `cargo clean` by one session while another's hook is building
-# leaves self-inconsistent artifacts that fail as fake API-mismatch errors
-# (2026-09-10: two sessions independently deleted a peer's in-flight build).
-# The lock makes an in-flight build visible — check it before cleaning the
-# shared target. mkdir is atomic (no flock on macOS). Nested fixture runs
-# from the hook's own fast checks bypass it; they run mock cargo.
-LOCK_DIR="${TMPDIR:-/tmp}/arle-pre-push-cargo.lock"
-LOCK_HELD=0
-acquire_cargo_lock() {
-    [[ "${ARLE_PRE_PUSH_NESTED:-0}" == "1" ]] && return 0
-    # Skip when this run executes no cargo step: the lock guards the shared
-    # CARGO_TARGET_DIR, and a run that never touches it must not wait behind
-    # one that does. The criterion is "no cargo step runs", not "docs-only
-    # push": the Metal section has its own switch and runs regardless of
-    # SKIP_CARGO, so a Metal-enabled run keeps the lock.
-    if [[ "${SKIP_CARGO}" == "1" && "${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}" != "1" ]]; then
-        return 0
-    fi
-    local waited=0 holder
+# --- Snapshot + lock selection ---------------------------------------------
+# The lock keeps its historical path arle-pre-push-cargo.lock: lanes on the
+# old hook and lanes on this one must take the SAME lock during rollout, or two
+# hooks compiling into the shared pre-push-quick target would run concurrently.
+# It now spans the snapshot refresh through the cargo steps (the old hook held
+# it only around cargo), which is exactly the window that must be serialized.
+#
+# A run WITH cargo steps (any .rs change, or Metal enabled) compiles into the
+# SHARED CARGO_TARGET_DIR, so it must build from the ONE shared snapshot and
+# hold the machine lock across refresh -> cargo, or artifacts from different
+# source roots mix in one target (the snapshot-mtime false-Fresh bug).
+#
+# A cargo-FREE run (no .rs, Metal off) never touches the shared target; the
+# mtime/shared-root problem is moot. It builds from a PRIVATE mktemp snapshot
+# and takes NO lock, so a docs-only push never waits behind a peer's minutes-
+# long cargo run — waiting held its already-open SSH connection idle until the
+# remote dropped it (push exit 141).
+CARGO_RUNS=1
+if [[ "${SKIP_CARGO}" == "1" && "${METAL_WANTED}" != "1" ]]; then
+    CARGO_RUNS=0
+fi
+
+if [[ "${CARGO_RUNS}" == "1" && "${ARLE_PRE_PUSH_NESTED:-0}" != "1" ]]; then
+    LOCK_DIR="${ARLE_PREPUSH_LOCK_DIR:-${TMPDIR:-/tmp}/arle-pre-push-cargo.lock}"
+    waited=0
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
         holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo unknown)"
         if [[ "$holder" != "unknown" ]] && ! kill -0 "$holder" 2>/dev/null; then
-            info "removing stale cargo lock (dead pid $holder)"
+            info "removing stale hook lock (dead pid $holder)"
             rm -rf "$LOCK_DIR"
             continue
         fi
-        # Backstop for PID reuse: a lock older than an hour is abandoned.
         if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]]; then
-            info "removing stale cargo lock (pid $holder, older than 60 min)"
+            info "removing stale hook lock (pid $holder, older than 60 min)"
             rm -rf "$LOCK_DIR"
             continue
         fi
-        [[ "$waited" -eq 0 ]] && info "waiting for peer hook (pid $holder) to finish its cargo steps"
+        [[ "$waited" -eq 0 ]] && info "waiting for peer pre-push hook (pid $holder) to finish"
         sleep 5
         waited=$((waited + 5))
     done
     printf '%s\n' "$$" > "$LOCK_DIR/pid"
     LOCK_HELD=1
-}
-acquire_cargo_lock
+fi
+
+STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-stage.XXXXXX")"
+if [[ "${CARGO_RUNS}" == "1" ]]; then
+    # One shared source root for every build in the shared target.
+    SNAPSHOT_ROOT="${ARLE_PREPUSH_SNAPSHOT_ROOT:-${TMPDIR:-/tmp}/arle-pre-push-snapshot}"
+    mkdir -p "${SNAPSHOT_ROOT}"
+    info "refreshing shared snapshot at ${SNAPSHOT_ROOT}"
+else
+    # Private throwaway snapshot; cleanup removes it on exit.
+    SNAPSHOT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-nocargo.XXXXXX")"
+    SNAPSHOT_PRIVATE=1
+    info "cargo-free push; running checks from private snapshot (no lock)"
+fi
+git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${STAGE_ROOT}"
+# rsync WITHOUT -t (no mtime preservation): `git archive | tar` stamps files
+# with the COMMIT time, and `-a`'s `-t` would restore that older mtime onto a
+# source newer build artifacts already exist for — cargo then sees source mtime
+# <= output mtime and reports a content-CHANGED crate Fresh (false negative).
+# Transferred files take mtime=now so a content change always forces a rebuild;
+# --checksum keeps content-IDENTICAL files' mtimes (warm cache hits); -r -l -p
+# -D keep recursion/symlinks/perms/specials; --delete drops removed files.
+rsync -rlpD --delete --checksum "${STAGE_ROOT}/" "${SNAPSHOT_ROOT}/"
+
+# Orphan sweeps:
+# - Legacy per-worktree snapshot dirs (`snapshot-<hash>`) left by lanes on the
+#   old hook (1.9 GB / 20 dirs observed 2026-09-10). The shared dir has no
+#   `-<hash>` suffix so the glob never touches it; +7 days also protects
+#   not-yet-rebased lanes still refreshing those dirs during rollout.
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'arle-pre-push-snapshot-*' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+# - Private cargo-free snapshots: normally removed by the EXIT trap, but a
+#   SIGKILL skips the trap. Reap any older than two hours (a live one is
+#   minutes old).
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'arle-pre-push-nocargo.*' -mmin +120 -exec rm -rf {} + 2>/dev/null || true
+cd "${SNAPSHOT_ROOT}"
+
+export CARGO_TERM_COLOR=always
+export RUSTFLAGS="-D warnings"
+# The shared pre-push target is the compile cache for every worktree (ordinary
+# lane builds use the shared target-dir in ../arle-lanes/.cargo/config.toml).
+MAIN_ROOT="$(dirname "$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" 2>/dev/null)"
+[[ -d "${MAIN_ROOT}" ]] || MAIN_ROOT="${REPO_ROOT}"
+export CARGO_TARGET_DIR="${MAIN_ROOT}/target/pre-push-quick"
+# cudarc probes the CUDA version at build time; pin it so the cuda,no-cuda
+# typecheck works on hosts without nvcc.
+export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
 
 # --- Fast checks (parallel with cargo) ------------------------------------
 # This block runs in the background, so its failure surfaces only as the exit
@@ -193,6 +212,7 @@ run_fast_checks() {
         test_pod_tree_identity.sh \
         test_hook_disowns_git_env.sh \
         test_hook_cuda_lint_freshness.sh \
+        test_prepush_snapshot_mtime.sh \
         test_hook_skips_shell_tests.sh \
         test_bench_ab_control_arm.sh; do
         run_fast bash "scripts/tests/${test}"
