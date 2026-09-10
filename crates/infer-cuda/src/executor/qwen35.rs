@@ -2541,46 +2541,20 @@ impl Qwen35CudaExecutor {
     ) -> Result<(u32, Option<f32>)> {
         let start = row.start_pos;
         let end = row.end_pos();
-        let is_final = row.is_final_chunk();
-        let lstar = row.total_tokens.saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
-        let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
-
         // Ordered snapshot cuts in `[start, end)`; `bool` = is-`L*`.
-        let mut cuts: Vec<(usize, bool)> = Vec::new();
-        // A prior chunk ending exactly on a stride multiple leaves a boundary that is
-        // never `< end` of any chunk, so snapshot the already-materialized state here.
-        if start > 0 && start.is_multiple_of(stride) {
-            cuts.push((start, is_final && start == lstar));
-        }
-        let mut s = (start / stride + 1) * stride;
-        while s < end {
-            cuts.push((s, is_final && s == lstar));
-            s += stride;
-        }
-        // `L*` on the final chunk (non-aligned residue can land on `start`).
-        if is_final
-            && lstar > 0
-            && lstar >= start
-            && lstar < end
-            && !cuts.iter().any(|&(p, _)| p == lstar)
-        {
-            cuts.push((lstar, true));
-        }
-        cuts.sort_unstable_by_key(|&(p, _)| p);
+        let cuts = infer_plan::prefill_snapshot_cuts(
+            start,
+            end,
+            row.total_tokens,
+            SUPPORTED_PAGE_SIZE,
+            SIDECAR_SNAPSHOT_STRIDE_PAGES,
+        );
 
         let mut cursor = start;
         let mut did_cut = false;
         for (cut, is_lstar) in cuts {
             if cut > cursor {
-                let seg = infer_plan::PrefillRow {
-                    slot: row.slot,
-                    tokens: row.tokens[cursor - start..cut - start].to_vec(),
-                    start_pos: cursor,
-                    total_tokens: row.total_tokens,
-                    params: row.params.clone(),
-                    penalty_history: row.penalty_history.clone(),
-                    penalty_prompt_len: row.penalty_prompt_len,
-                };
+                let seg = row.slice(cursor, cut);
                 self.prefill_row_paged_default(&seg, cut as u64, kv_batch)?; // token discarded
                 cursor = cut;
             }
@@ -2597,15 +2571,7 @@ impl Qwen35CudaExecutor {
             return self.prefill_row_paged_default(row, position, kv_batch);
         }
         // Cuts are all `< end`, so this tail is non-empty.
-        let tail = infer_plan::PrefillRow {
-            slot: row.slot,
-            tokens: row.tokens[cursor - start..].to_vec(),
-            start_pos: cursor,
-            total_tokens: row.total_tokens,
-            params: row.params.clone(),
-            penalty_history: row.penalty_history.clone(),
-            penalty_prompt_len: row.penalty_prompt_len,
-        };
+        let tail = row.slice(cursor, end);
         self.prefill_row_paged_default(&tail, position, kv_batch)
     }
 

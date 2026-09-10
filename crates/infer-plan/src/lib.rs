@@ -85,6 +85,62 @@ impl PrefillRow {
     pub fn is_final_chunk(&self) -> bool {
         self.end_pos() >= self.total_tokens
     }
+
+    /// A sub-row over absolute positions `[from, to)`, starting at `from`.
+    /// `from`/`to` are logical positions, not token indices.
+    #[must_use]
+    pub fn slice(&self, from: usize, to: usize) -> Self {
+        Self {
+            slot: self.slot,
+            tokens: self.tokens[from - self.start_pos..to - self.start_pos].to_vec(),
+            start_pos: from,
+            total_tokens: self.total_tokens,
+            params: self.params.clone(),
+            penalty_history: self.penalty_history.clone(),
+            penalty_prompt_len: self.penalty_prompt_len,
+        }
+    }
+}
+
+/// Snapshot cut positions for a chunked hybrid prefill, in `[start, end)`,
+/// each tagged `is_lstar` (the exact-resend target on the final chunk).
+///
+/// Cuts are the stride multiples inside the chunk plus `start` itself when it
+/// lands on one; `L*` (the last page-aligned position before `total_tokens`)
+/// is added once on the final chunk. The caller materializes recurrent state
+/// at each cut and stores it by the tag. Pure host.
+#[must_use]
+pub fn prefill_snapshot_cuts(
+    start: usize,
+    end: usize,
+    total_tokens: usize,
+    page_size: usize,
+    stride_pages: usize,
+) -> Vec<(usize, bool)> {
+    let stride = stride_pages * page_size;
+    let is_final = end >= total_tokens;
+    let lstar = total_tokens.saturating_sub(1) / page_size * page_size;
+    let mut cuts: Vec<(usize, bool)> = Vec::new();
+    // A prior chunk ending exactly on a stride multiple leaves a boundary that
+    // is never `< end` of any chunk, so snapshot the materialized state here.
+    if start > 0 && start.is_multiple_of(stride) {
+        cuts.push((start, is_final && start == lstar));
+    }
+    let mut s = (start / stride + 1) * stride;
+    while s < end {
+        cuts.push((s, is_final && s == lstar));
+        s += stride;
+    }
+    if is_final
+        && lstar > 0
+        && lstar >= start
+        && lstar < end
+        && !cuts.iter().any(|&(p, _)| p == lstar)
+    {
+        cuts.push((lstar, true));
+    }
+    cuts.sort_unstable_by_key(|&(p, _)| p);
+    cuts
 }
 
 /// Backend-independent forward plan produced by engine-core.
@@ -315,5 +371,47 @@ impl SamplingParams {
             && top_logprobs.is_none()
             && force_next_token.is_none()
             && !self.has_penalty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAGE: usize = 16;
+    const STRIDE_PAGES: usize = 2; // stride = 32 tokens
+
+    #[test]
+    fn prefill_snapshot_cuts_are_stride_aligned_and_lstar_tagged() {
+        // Fresh final chunk: stride multiples inside, L* coincides with one.
+        let cuts = prefill_snapshot_cuts(0, 100, 100, PAGE, STRIDE_PAGES);
+        assert_eq!(cuts, vec![(32, false), (64, false), (96, true)]);
+        // start on a stride boundary: the boundary itself is a cut.
+        let cuts = prefill_snapshot_cuts(64, 100, 200, PAGE, STRIDE_PAGES);
+        assert_eq!(cuts, vec![(64, false), (96, false)]);
+        // Final chunk whose L* is not a stride multiple: L* added once.
+        let cuts = prefill_snapshot_cuts(100, 120, 120, PAGE, STRIDE_PAGES);
+        assert_eq!(cuts, vec![(112, true)]);
+        // No stride multiple inside and not final: no cuts.
+        let cuts = prefill_snapshot_cuts(0, 10, 100, PAGE, STRIDE_PAGES);
+        assert!(cuts.is_empty());
+    }
+
+    #[test]
+    fn prefill_row_slice_uses_absolute_positions() {
+        let row = PrefillRow {
+            slot: 2,
+            tokens: vec![1, 2, 3, 4, 5],
+            start_pos: 10,
+            total_tokens: 100,
+            params: SamplingParams::default(),
+            penalty_history: None,
+            penalty_prompt_len: 0,
+        };
+        let sub = row.slice(12, 15);
+        assert_eq!(sub.tokens, vec![3, 4, 5]);
+        assert_eq!(sub.start_pos, 12);
+        assert_eq!(sub.total_tokens, 100);
+        assert_eq!(sub.slot, 2);
     }
 }
