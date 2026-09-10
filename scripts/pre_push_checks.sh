@@ -176,6 +176,7 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
         -p infer-core -p infer-server -p infer-plan -p infer-kvspace -p infer-seam \
         -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
     run cargo clippy -p kv-native-sys --all-targets -- -D warnings
+    run cargo clippy -p infer-hip -p infer-vulkan -- -D warnings
 
     # Metal lib check (default-on, Mac only): catches dead-code/unused lints in
     # infer-metal that CI's Metal lane runs with -D warnings. The full binary

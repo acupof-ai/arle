@@ -98,6 +98,9 @@ jobs:
           cargo clippy -p autograd --features no-cuda --all-targets -- -D warnings
           cargo clippy -p train --features no-cuda --all-targets -- -D warnings
           cargo clippy -p kv-native-sys --all-targets -- -D warnings
+          # The HIP and Vulkan backends had no gate at all; both compile on
+          # this runner, so lint them like every other CPU-only surface.
+          cargo clippy -p infer-hip -p infer-vulkan -- -D warnings
 
       # The ONLY automated gate for the CUDA-Rust surface: there is no GPU CI
       # (no self-hosted GPU runner; the full CUDA build is manual on the pod /
