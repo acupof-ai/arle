@@ -344,7 +344,7 @@ pub fn load_qwen3_gguf(
 mod tests {
     use super::*;
     use infer_plan::{DecodeRow, ForwardMode, PrefillRow};
-    use infer_seam::KvSlotAccounting;
+    use infer_seam::KvAllocator;
 
     fn one_row_plan(decode: bool) -> ForwardPlan {
         ForwardPlan {

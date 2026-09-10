@@ -1564,7 +1564,6 @@ dependencies = [
  "infer-plan",
  "infer-seam",
  "infer-server",
- "infer-util",
  "log",
  "safetensors",
  "serde",
