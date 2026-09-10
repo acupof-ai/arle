@@ -243,6 +243,7 @@ run_fast_checks() {
         test_prepush_fresh_invariant.sh \
         test_prepush_snapshot_mtime.sh \
         test_hook_skips_shell_tests.sh \
+        test_parity_gpu_batch.sh \
         test_bench_ab_control_arm.sh; do
         run_fast bash "scripts/tests/${test}"
     done
