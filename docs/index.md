@@ -32,6 +32,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | Agent task harness (goals, gates, execution, report) | [plans/2026-09-09-agent-task-harness.md](plans/2026-09-09-agent-task-harness.md) |
 | Design theses (depth track) | [plans/2026-09-02-design-theses.md](plans/2026-09-02-design-theses.md) |
 | Architecture refactor (stage boundaries) | [plans/2026-09-09-architecture-refactor.md](plans/2026-09-09-architecture-refactor.md) |
+| CUDA kernel parity-coverage audit | [plans/2026-09-11-kernel-parity-coverage.md](plans/2026-09-11-kernel-parity-coverage.md) |
 | Design notes | [1 prefix cache](design/hybrid-prefix-cache.md) · [2 speculative decoding](design/speculative-decoding.md) · [3 backend seam](design/seam-cost-contract.md) · [4 memory](design/memory-is-the-product.md) · [5 matched measurement](design/matched-measurement.md) · [what-breaks](design/what-breaks.md) |
 | Env / flags | [environment.md](environment.md) |
 | Capability evals | [eval.md](eval.md) |

@@ -332,84 +332,9 @@ allow_sm70 = false
 ffi = true
 
 # ===========================================================================
-# Gated Delta Rule (Qwen3.5 fixed shape). build-only (ffi=false); 5 phases.
-# kernel_family "gdr"; allow_sm70=true (all phases). prepare + solve are
-# native CUDA C (csrc/recurrent/) — TileLang lowers them pathologically.
-# ===========================================================================
-
-[[kernel]]
-phase = "cumsum"
-abi = "gdr_cumsum_v1"
-kernel_family = "gdr"
-kernel_key = "gdr_chunk_cumsum"
-py_module = "tools/tilelang/gated_delta_rule.py"
-artifact_dir = "gated_delta_rule_chunk_cumsum"
-kernel_name = "gated_delta_rule_prefill_chunk_cumsum"
-out_name = "tilelang_gated_delta_rule_chunk_cumsum"
-allow_sm70 = true
-ffi = false
-
-[[kernel]]
-phase = "a"
-abi = "gdr_a_v1"
-kernel_family = "gdr"
-kernel_key = "gdr_chunk_a"
-py_module = "tools/tilelang/gated_delta_rule.py"
-artifact_dir = "gated_delta_rule_chunk_a"
-kernel_name = "gated_delta_rule_prefill_chunk_a"
-out_name = "tilelang_gated_delta_rule_chunk_a"
-allow_sm70 = true
-ffi = false
-
-[[kernel]]
-phase = "recompute"
-abi = "gdr_recompute_v1"
-kernel_family = "gdr"
-kernel_key = "gdr_chunk_recompute"
-py_module = "tools/tilelang/gated_delta_rule.py"
-artifact_dir = "gated_delta_rule_chunk_recompute"
-kernel_name = "gated_delta_rule_prefill_chunk_recompute"
-out_name = "tilelang_gated_delta_rule_chunk_recompute"
-allow_sm70 = true
-ffi = false
-
-[[kernel]]
-phase = "state"
-abi = "gdr_state_v1"
-kernel_family = "gdr"
-kernel_key = "gdr_chunk_state"
-py_module = "tools/tilelang/gated_delta_rule.py"
-artifact_dir = "gated_delta_rule_chunk_state"
-kernel_name = "gated_delta_rule_prefill_chunk_state"
-out_name = "tilelang_gated_delta_rule_chunk_state"
-allow_sm70 = true
-ffi = false
-
-[[kernel]]
-phase = "o"
-abi = "gdr_o_v1"
-kernel_family = "gdr"
-kernel_key = "gdr_chunk_o"
-py_module = "tools/tilelang/gated_delta_rule.py"
-artifact_dir = "gated_delta_rule_chunk_o"
-kernel_name = "gated_delta_rule_prefill_chunk_o"
-out_name = "tilelang_gated_delta_rule_chunk_o"
-allow_sm70 = true
-ffi = false
-
-# ===========================================================================
 # FlashQLA chunked GDR fwd — sm_90 only.
-# gate="flashqla": build.rs stubs (NOT_SUPPORTED) unless flag set AND sm_90 in
-# targets. build-only (ffi=false), but every row here also lands in the
-# generated `FLASHQLA_GDR_TABLE` (build.rs -> flashqla_gdr_generated.rs) that
-# autograd's GDN dispatch reads — a row with no matching extern in
-# src/ffi/recurrent.rs is a compile error. 5 phases x one row group per GDN
-# head geometry (q_heads=H value heads, kv_heads=Hg key heads; DK=DV=128).
-# Geometry is per (model, cp_size): the linear-attention CP transport is a
-# seq<->head all-to-all, so each rank owns H/cp and Hg/cp heads.
 # ===========================================================================
 
-# H=32/Hg=16 — Qwen3.6-35B GDN single-GPU shard.
 [[kernel]]
 q_heads = 32
 kv_heads = 16

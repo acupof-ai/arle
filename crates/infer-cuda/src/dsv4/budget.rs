@@ -10,7 +10,7 @@ use super::{Dsv4Model, Dsv4SlotState, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS
 /// Unlike the per-head BF16 [`cuda_kernels::prelude::PagedKVPool`], MLA caches a
 /// single compressed latent per token in the flat FP8 block layout FlashMLA's
 /// sparse-decode consumes: `[NoPE | RoPE]` packed to `bytes_per_token` bytes
-/// (`cuda-kernels/src/attention.rs` `dsv4_fp8_kv_pack`, 584 B/token for the
+/// (`csrc/attention/dsv4_fp8_kv_pack.cu`, 584 B/token for the
 /// canonical NoPE=448 / RoPE=64 / head_dim=512 shape).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Dsv4MlaKvArena {
@@ -36,7 +36,7 @@ pub(crate) struct Dsv4KvBudgetPlan {
 }
 
 /// Packed bytes per token the FlashMLA sparse-FP8 decode reads for the canonical
-/// MODEL1 NoPE=448 / RoPE=64 shape (`dsv4_fp8_kv_pack` doc):
+/// MODEL1 NoPE=448 / RoPE=64 shape (see `csrc/attention/dsv4_fp8_kv_pack.cu`):
 /// 448 fp8 NoPE + 128 bf16 RoPE + 8 e8m0 scales = 584.
 const DSV4_FLASH_KV_BYTES_PER_TOKEN: usize = 584;
 /// V32 / GLM shape NoPE=512 (= `kv_lora_rank`) / RoPE=64:
