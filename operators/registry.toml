@@ -337,8 +337,8 @@ kind = "composite"
 inputs = ["q_prepared", "k_prepared", "latent_kv_pool", "selected_indices"]
 outputs = ["latent_attn_out"]
 reference = "cuda.dsv4.flashmla_sparse_decode"
-correctness_gate = "crates/infer-cuda/examples/flashmla_sparse_decode_parity.rs; crates/infer-cuda/examples/flashmla_hca_decode_parity.rs"
-gate_gap = "MODEL1 (DSv4-Flash) s_q=1 decode, h_q=64, d=512/64, sliding_window 128, synthetic packed pool; covers B=1..8 batched CSA (index_topk 512, compress_ratio=4, row-specific selected sets) and HCA (compress_ratio=128 dense compressed rows) with per-row start_pos across the 64/128-token boundaries and discontinuous Stage-B page tables. Not covered: SparseIndexed/GLM V32, prefill, h_q=128/TP shards, the learned per-head attn_sink (harnesses use a fixed random vector), real-checkpoint FP8 values"
+correctness_gate = "crates/infer-cuda/examples/flashmla_sparse_decode_parity.rs; crates/infer-cuda/examples/flashmla_hca_decode_parity.rs; crates/infer-cuda/examples/flashmla_prefill_parity.rs"
+gate_gap = "MODEL1 (DSv4-Flash), h_q=64, d=512/64, sliding_window 128, synthetic pools; covers s_q=1 B=1..8 batched decode (CSA selected/HCA dense, 64/128 boundaries, fragmented Stage-B page tables) and sparse prefill s_q in {128,2048,4096} for CSA+HCA with causal within-chunk masking, rebased SW window and BF16 unified pool. Not covered: SparseIndexed/GLM V32, h_q=128/TP shards, the learned per-head attn_sink (harnesses use a fixed random vector), real-checkpoint FP8 KV (prefill pool is synthetic BF16)"
 
 [[implementation]]
 id = "cuda.dsv4.flashmla_sparse_prefill"

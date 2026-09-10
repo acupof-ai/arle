@@ -93,5 +93,10 @@ name = "flashmla_hca_decode_parity"
 path = "examples/flashmla_hca_decode_parity.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "flashmla_prefill_parity"
+path = "examples/flashmla_prefill_parity.rs"
+required-features = ["cuda"]
+
 [lints]
 workspace = true
