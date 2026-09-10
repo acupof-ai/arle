@@ -131,6 +131,8 @@ mod real {
     /// env mutation; the no-other-threads precondition is what makes it sound.
     #[cfg(feature = "nccl")]
     fn export_nccl_id(hex: &str) {
+        // SAFETY: called once at process start, single-threaded, before any
+        // NCCL init / executor build / thread spawn.
         unsafe { std::env::set_var("INFER_NCCL_UNIQUE_ID", hex) };
     }
 

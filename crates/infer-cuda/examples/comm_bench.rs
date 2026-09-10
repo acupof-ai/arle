@@ -4,11 +4,11 @@
 //! critical path (2× allreduce + 1× Q-allgather per layer; bf16, 14–450 KB).
 //!
 //! Arms:
-//!   - `nccl`      — plain ncclAllReduce / ncclAllGather (B0 baseline)
-//!   - `nccl_sym`  — same calls over `ncclMemAlloc`+`ncclCommWindowRegister`
-//!                   symmetric windows (NCCL ≥ 2.27 low-latency kernels, C4)
-//!   - `car_1stage`/`car_2stage` — vendored sgl-kernel/vLLM custom allreduce (C2)
-//!   - `car_ag`    — one-shot all-gather on the same IPC framework
+//! - `nccl`      — plain ncclAllReduce / ncclAllGather (B0 baseline)
+//! - `nccl_sym`  — same calls over `ncclMemAlloc`+`ncclCommWindowRegister`
+//!   symmetric windows (NCCL ≥ 2.27 low-latency kernels, C4)
+//! - `car_1stage`/`car_2stage` — vendored sgl-kernel/vLLM custom allreduce (C2)
+//! - `car_ag`    — one-shot all-gather on the same IPC framework
 //!
 //! Timing: per arm × shape, K-iteration stream loop bracketed by CUDA events,
 //! in two modes — `exposed` (a 1-thread chain kernel makes iteration k+1's
@@ -108,19 +108,32 @@ fn rank_main(rank: usize, world: usize) -> Result<()> {
 
     // Custom-AR bootstrap (IPC handle exchange through the same dir).
     let cdir = std::ffi::CString::new(dir.clone())?;
+    // SAFETY: FFI bootstrap with a valid CString ptr; the handle is
+    // null-checked below.
     let car_handle =
         unsafe { car::arle_car_bootstrap(rank as i32, world as i32, cdir.as_ptr(), MAX_BYTES) };
     ensure!(
         !car_handle.is_null(),
         "rank {rank} custom-AR bootstrap failed"
     );
-    let car_in = unsafe { car::arle_car_input_ptr(car_handle) };
-    let car_out = unsafe { car::arle_car_output_ptr(car_handle) };
+    // SAFETY: car_handle is live (bootstrap succeeded, not yet destroyed).
+    let (car_in, car_out) = unsafe {
+        (
+            car::arle_car_input_ptr(car_handle),
+            car::arle_car_output_ptr(car_handle),
+        )
+    };
 
     // NCCL symmetric windows (C4) — optional: skip arm if registration fails
     // (e.g. runtime NCCL < 2.27). COLLECTIVE: all ranks attempt together.
-    let sym = match unsafe { backend.mem_alloc_symmetric_window(MAX_BYTES) } {
-        Ok((input, win_in)) => match unsafe { backend.mem_alloc_symmetric_window(MAX_BYTES) } {
+    let sym = match unsafe {
+        // SAFETY: FFI on a live NCCL backend; returns owned window handles.
+        backend.mem_alloc_symmetric_window(MAX_BYTES)
+    } {
+        Ok((input, win_in)) => match unsafe {
+            // SAFETY: FFI on a live NCCL backend; returns owned window handles.
+            backend.mem_alloc_symmetric_window(MAX_BYTES)
+        } {
             Ok((output, win_out)) => Some(SymPair {
                 input,
                 output,
@@ -129,6 +142,8 @@ fn rank_main(rank: usize, world: usize) -> Result<()> {
             }),
             Err(err) => {
                 eprintln!("[comm-bench rank={rank}] symmetric output window failed: {err:#}");
+                // SAFETY: freeing the input window on the output-window
+                // failure path; handles from the matching alloc above.
                 unsafe { backend.free_symmetric_window(input, win_in)? };
                 None
             }
@@ -153,11 +168,14 @@ fn rank_main(rank: usize, world: usize) -> Result<()> {
     run_matrix(&mut rc)?;
 
     if let Some(sym) = rc.sym.take() {
+        // SAFETY: both windows came from the matching allocs above and are
+        // freed once here.
         unsafe {
             rc.backend.free_symmetric_window(sym.input, sym.win_in)?;
             rc.backend.free_symmetric_window(sym.output, sym.win_out)?;
         }
     }
+    // SAFETY: car handle is live and destroyed once at teardown.
     unsafe { car::arle_car_destroy(rc.car) };
     Ok(())
 }
@@ -169,6 +187,7 @@ fn nccl_rendezvous(rank: usize, dir: &str) -> Result<nccl::ncclUniqueId> {
         internal: [0i8; 128],
     };
     if rank == 0 {
+        // SAFETY: id is a local 128-byte out-param; the FFI writes only it.
         nccl::check(unsafe { nccl::ncclGetUniqueId(&mut id) })?;
         let bytes: Vec<u8> = id.internal.iter().map(|&b| b as u8).collect();
         let tmp = format!("{path}.tmp");
@@ -178,13 +197,13 @@ fn nccl_rendezvous(rank: usize, dir: &str) -> Result<nccl::ncclUniqueId> {
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if let Ok(bytes) = std::fs::read(&path) {
-            if bytes.len() == 128 {
-                for (dst, src) in id.internal.iter_mut().zip(bytes) {
-                    *dst = src as i8;
-                }
-                return Ok(id);
+        if let Ok(bytes) = std::fs::read(&path)
+            && bytes.len() == 128
+        {
+            for (dst, src) in id.internal.iter_mut().zip(bytes) {
+                *dst = src as i8;
             }
+            return Ok(id);
         }
         ensure!(
             Instant::now() < deadline,
@@ -354,6 +373,8 @@ fn issue_op(rc: &RankCtx, op: Op, arm: Arm, elems: usize) -> Result<()> {
     let (input, output) = arm_ptrs(rc, arm);
     match (op, arm) {
         (Op::AllReduce, Arm::Nccl) | (Op::AllReduce, Arm::NcclSym) => unsafe {
+            // SAFETY: input/output are the arm's live device buffers, elems
+            // their bf16 count.
             rc.backend.all_reduce_out_of_place(
                 input as *const _,
                 output as *mut _,
@@ -366,6 +387,8 @@ fn issue_op(rc: &RankCtx, op: Op, arm: Arm, elems: usize) -> Result<()> {
         (Op::AllReduce, Arm::Car1Stage) | (Op::AllReduce, Arm::Car2Stage) => {
             let force = if arm == Arm::Car1Stage { 1 } else { 2 };
             let res = unsafe {
+                // SAFETY: rc.car is live; elems and the block params are this
+                // bench's own constants.
                 car::arle_car_allreduce_bf16(
                     rc.car,
                     rc.ctx.stream.cu_stream(),
@@ -382,6 +405,8 @@ fn issue_op(rc: &RankCtx, op: Op, arm: Arm, elems: usize) -> Result<()> {
             Ok(())
         }
         (Op::AllGather, Arm::Nccl) | (Op::AllGather, Arm::NcclSym) => unsafe {
+            // SAFETY: input/output are the arm's live device buffers, elems
+            // their bf16 count.
             rc.backend.all_gather(
                 input as *const _,
                 output as *mut _,
@@ -392,6 +417,8 @@ fn issue_op(rc: &RankCtx, op: Op, arm: Arm, elems: usize) -> Result<()> {
         },
         (Op::AllGather, Arm::CarAg) => {
             let res = unsafe {
+                // SAFETY: rc.car is live; elems and the block params are this
+                // bench's own constants.
                 car::arle_car_allgather_bf16(
                     rc.car,
                     rc.ctx.stream.cu_stream(),
@@ -431,6 +458,7 @@ fn bench_one(
     let stream = &rc.ctx.stream;
 
     // Deterministic fill (per-rank seed), then one correctness invocation.
+    // SAFETY: input is a live device buffer of elems bf16.
     let res =
         unsafe { car::arle_car_fill_bf16(stream.cu_stream(), input, elems as i32, rc.rank as i32) };
     ensure!(
@@ -440,6 +468,8 @@ fn bench_one(
     issue_op(rc, op, arm, elems)?;
     stream.synchronize().map_err(|e| anyhow!("sync: {e}"))?;
     let mut host: Vec<u16> = vec![0; out_elems];
+    // SAFETY: output is a live device buffer of out_elems; the sync copy
+    // reads only that many.
     unsafe {
         cudarc::driver::result::memcpy_dtoh_sync(&mut host, output)
             .map_err(|e| anyhow!("dtoh: {e}"))?;
@@ -500,6 +530,8 @@ fn timed_loop(
         for _ in 0..iters {
             issue_op(rc, op, arm, elems)?;
             if chained {
+                // SAFETY: output/input are live device buffers; the chain
+                // kernel only touches their elems.
                 let res =
                     unsafe { car::arle_car_chain_touch(rc.ctx.stream.cu_stream(), output, input) };
                 ensure!(
@@ -530,6 +562,8 @@ fn timed_chain_only(rc: &RankCtx, iters: usize, repeats: usize) -> Result<f64> {
             .record(&rc.ctx.stream)
             .map_err(|e| anyhow!("record start: {e}"))?;
         for _ in 0..iters {
+            // SAFETY: car_out/car_in are the live IPC buffers; the chain
+            // kernel only touches their elems.
             let res = unsafe {
                 car::arle_car_chain_touch(rc.ctx.stream.cu_stream(), rc.car_out, rc.car_in)
             };

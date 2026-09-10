@@ -262,6 +262,7 @@ mod real {
         let sms = ctx.sm_count() as i32;
         // SAFETY: size queries only.
         let c_tmp_floats = unsafe { ffi::marlin_c_tmp_floats(m as i32, sms) } as usize;
+        // SAFETY: size queries only.
         let ws_ints = unsafe { ffi::marlin_workspace_ints(sms) } as usize;
         let c_tmp = ctx.stream.alloc_zeros::<f32>(c_tmp_floats)?;
         let workspace = ctx.stream.alloc_zeros::<i32>(ws_ints)?;

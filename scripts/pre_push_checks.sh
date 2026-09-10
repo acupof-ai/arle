@@ -217,7 +217,13 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
     if [[ "${CUDA_CRATES_CHANGED}" == "1" ]]; then
         cuda_lint_rc=0
         cuda_lint_out="$(CARGO_TERM_COLOR=never cargo clippy -v -p infer-api --no-default-features --features cuda,no-cuda --lib -- -D warnings 2>&1)" || cuda_lint_rc=$?
+        # infer-cuda examples link the CUDA runtime, so clippy --examples (no
+        # link) is their only gate; mirrors CI Lint's cuda section. Captured
+        # separately: merged into cuda_lint_out, the lib run's "Checking
+        # infer-cuda" would mask a Fresh examples run.
+        examples_lint_out="$(CARGO_TERM_COLOR=never cargo clippy -v -p infer-cuda --no-default-features --features cuda,no-cuda,nccl --examples -- -D warnings 2>&1)" || cuda_lint_rc=$?
         printf '%s\n' "${cuda_lint_out}"
+        printf '%s\n' "${examples_lint_out}"
         [[ "${cuda_lint_rc}" -eq 0 ]] || exit "${cuda_lint_rc}"
         for crate in infer-cuda cuda-kernels; do
             if grep -qE "^crates/${crate}/" <<< "${changed_files}" \
@@ -226,8 +232,21 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
                 exit 1
             fi
         done
+        # A push touching infer-cuda forces at least one example target to
+        # rebuild (a lib change forces all, an examples/<name>.rs change that
+        # one), so a Fresh examples run — zero Checking lines — checked
+        # nothing.
+        if grep -qE "^crates/infer-cuda/" <<< "${changed_files}" \
+           && compgen -G "crates/infer-cuda/examples/*.rs" > /dev/null \
+           && ! grep -qE "(Checking|Compiling) " <<< "${examples_lint_out}"; then
+            fail "CUDA examples lint reported everything Fresh while this push changes infer-cuda — shared target cross-contaminated by another lane; run 'cargo clean -p infer-cuda' and retry"
+            exit 1
+        fi
     else
         run cargo clippy -p infer-api --no-default-features --features cuda,no-cuda --lib -- -D warnings
+        # infer-cuda examples link the CUDA runtime, so clippy --examples (no
+        # link) is their only gate; mirrors CI Lint's cuda section.
+        run cargo clippy -p infer-cuda --no-default-features --features cuda,no-cuda,nccl --examples -- -D warnings
     fi
     # CI's CPU-only clippy lane (job "cargo clippy (CPU-only surfaces)"): a push
     # that is clean on the cuda lane above still failed CI here (#258). Same

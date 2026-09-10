@@ -117,6 +117,9 @@ jobs:
           cargo clippy -p infer-api --release --no-default-features --features cuda,no-cuda,nccl,deepep --lib -- -D warnings
           cargo clippy -p arle --release --no-default-features --features cuda,no-cuda,cli,nccl,deepep --bin arle -- -D warnings
           cargo clippy -p cli --release --no-default-features --features cuda,no-cuda,nccl,deepep -- -D warnings
+          # Examples link the CUDA runtime (unavailable in CI), so clippy
+          # --examples (no link) is their only gate.
+          cargo clippy -p infer-cuda --release --no-default-features --features cuda,no-cuda,nccl --examples -- -D warnings
 
       # Enforced 2026-08-23: tree clean (zero advisories; paste 1.0.15 is an
       # unmaintained warning, which does not fail the lane).

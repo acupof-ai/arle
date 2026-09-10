@@ -84,6 +84,7 @@ mod real {
     pub(super) fn run() -> Result<()> {
         let ctx = DeviceContext::new()?;
         let sms = ctx.sm_count() as i32;
+        // SAFETY: size queries only.
         let (c_tmp_floats, ws_ints) = unsafe {
             (
                 ffi::marlin_c_tmp_floats(64, sms) as usize,
@@ -154,11 +155,13 @@ mod real {
                 let x: Vec<bf16> = (0..m * k)
                     .map(|i| bf16::from_f32(((i % 13) as f32 - 6.0) * 0.125))
                     .collect();
-                let x_dev = ctx.stream.memcpy_stod(&x)?;
+                let x_dev = ctx.stream.clone_htod(&x)?;
                 let mut out_dev = ctx.stream.alloc_zeros::<bf16>(m * n)?;
                 let (x_ptr, _gx) = x_dev.device_ptr(&ctx.stream);
                 {
                     let (out_ptr, _go) = out_dev.device_ptr_mut(&ctx.stream);
+                    // SAFETY: ptrs from live device allocations sized to the
+                    // m/n/k dims passed; scratch sized above.
                     unsafe {
                         ffi::marlin_fp4_gemm_cuda(
                             x_ptr as *const ffi::Half,
