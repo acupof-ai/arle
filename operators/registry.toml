@@ -359,6 +359,40 @@ fallback = ""
 fallback_status = "legacy-default-unqualified"
 
 [[semantic]]
+id = "dsv4.tp_q_repack"
+kind = "primitive"
+inputs = ["allgathered_q"]
+outputs = ["flashmla_q"]
+reference = "cuda.dsv4.tp_q_repack"
+correctness_gate = "crates/infer-cuda/examples/dsv4_decode_moe_parity.rs"
+gate_scope = "production"
+
+[[implementation]]
+id = "cuda.dsv4.tp_q_repack"
+semantic = "dsv4.tp_q_repack"
+provider = "arle"
+source = "crates/cuda-kernels/src/attention.rs"
+legality = "TP sparse-prefill; exact [tp,s,h_local,d] -> [s,tp*h_local,d] AllGather Q shuffle, bit-exact"
+fallback = ""
+
+[[semantic]]
+id = "dsv4.olora_o_proj"
+kind = "primitive"
+inputs = ["local_attn"]
+outputs = ["latent"]
+reference = "cuda.dsv4.wo_a_dense_cublas"
+correctness_gate = "none"
+gate_gap = "dense-BF16 low-rank wo_a (o_groups 8, o_lora_rank 1024) is a plain cuBLAS gemm (vendor-trusted, no custom kernel to gate); the FP8 grouped wo_a path runs DeepGEMM and is exercised by the prefill probe, not an f64 parity gate"
+
+[[implementation]]
+id = "cuda.dsv4.wo_a_dense_cublas"
+semantic = "dsv4.olora_o_proj"
+provider = "cublas"
+source = "crates/infer-cuda/src/attention.rs"
+legality = "dense-BF16 low-rank wo_a (o_groups 8, o_lora_rank 1024; TP<o_groups owns >1 output group)"
+fallback = ""
+
+[[semantic]]
 id = "qwen35.linear_attention"
 kind = "composite"
 inputs = ["qkv", "b", "a", "conv_state", "gdr_state"]
@@ -551,8 +585,8 @@ kind = "composite"
 inputs = ["hidden", "router_logits", "selection_bias", "expert_weights"]
 outputs = ["moe_out"]
 reference = "cuda.dsv4.moe_fp8_grouped_contig"
-correctness_gate = "crates/cuda-kernels/src/ffi/gemm_tests.rs; crates/infer-cuda/examples/dsv4_parity.rs; crates/infer-cuda/examples/deepgemm_grouped_prefill_parity.rs"
-gate_gap = "grouped GEMM compared at production n=4096 on both down (k=2048) and gate/up (k=4096) projections vs an f64 per-128-block fp8 oracle on both masked and contiguous paths: EVERY output column is checked (catches N-tile offset/swizzle/column-mapping), rows sampled as hot-band-all + first/last + 64-row seeded sample per other active band (catches per-row indexing); a 16-band flat/one-hot/bimodal sweep plus a full 256-expert 3072-routed-row distribution (~191 empty bands, independent per-expert weights, real-magnitude block scales, SM90 GPU pod-only); remaining gaps: synthetic random fp8 weights rather than checkpoint tensors, the w13->w2 swiglu and full top-6 routing+reduction end-to-end only, and dsv4_parity still gates only the first prefill token at TP=8"
+correctness_gate = "crates/cuda-kernels/src/ffi/gemm_tests.rs; crates/infer-cuda/examples/dsv4_parity.rs; crates/infer-cuda/examples/deepgemm_grouped_prefill_parity.rs; crates/infer-cuda/examples/dsv4_decode_moe_parity.rs"
+gate_gap = "grouped GEMMs compared at production n=4096 against f64 per-128-block fp8 oracles on both SM90 paths: PREFILL masked+contiguous via deepgemm_grouped_prefill_parity (EVERY output column checked, rows sampled hot-band-all + first/last + seeded 64-row bands, 16-band flat/one-hot/bimodal sweep plus a full 256-expert ~3072-routed-row distribution with ~191 empty bands), DECODE fused swiglu+down via dsv4_decode_moe_parity (EVERY output row swiglu N=2048/down N=4096, top-6 at B=1/8 = up to 48 distinct experts with distinct full-size matrices and ids spread non-contiguously over 0..=255, compact group-major pointer tables, rel-L2 cap 0.06 plus slope 0.10/floor 0.02 elementwise bound); remaining gaps: synthetic random fp8 weights rather than checkpoint tensors, prefill w13->w2 swiglu and full top-6 routing+reduction end-to-end only, dsv4_parity still gates only the first prefill token at TP=8, SM90 GPU pod-only"
 
 [[implementation]]
 id = "cuda.dsv4.moe_w4a16_gemv"

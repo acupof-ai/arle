@@ -65,8 +65,8 @@ unit test vs ref · **—** = no gate.
 | Kernel | Heat | Gate | Gap |
 |---|---|---|---|
 | Marlin FP8/W8A16/W4A16/NVFP4 GEMM + GEMV (dense quant) | **HOT** | **P** strong: `marlin_{fp8,w8a16,fp4}_parity/correctness` examples at production shapes vs f64/f32 + 9 GPU unit tests + `kernel_ab_fp4` | best-covered family |
-| `dsv4_fp8_grouped_{swiglu,down}_decode` (hand-grouped) | **HOT** 1×H20 FP8 | **U** one micro test (`dsv4_fp8_grouped_decode_matches_reference`, hidden/inter=16) | tested shape far below production expert dims |
-| DeepGEMM native masked/contiguous grouped FP8 + BF16 (`m_grouped_*`) | HOT decode / WARM prefill | prefill = perf probes with scale=1.0 ("not numerical quality"); decode micro U only | realistic-scale grouped prefill MoE has no numeric gate |
+| `dsv4_fp8_grouped_{swiglu,down}_decode` (hand-grouped) | **HOT** 1×H20 FP8 | **P** micro test (`dsv4_fp8_grouped_decode_matches_reference`, hidden/inter=16) + `dsv4_decode_moe_parity` at production geometry (K=4096,N=2048, top-6 fan-out B=1/8 = up to 48 experts over ids 0..=255, every output row vs f64) | prefill grouped MoE still uncovered |
+| DeepGEMM native masked/contiguous grouped FP8 + BF16 (`m_grouped_*`) | HOT decode / WARM prefill | **P** `deepgemm_grouped_prefill_parity` at production n=4096 vs f64 per-block fp8 oracle (masked+contiguous, full 256-expert distribution); decode micro U + decode parity above | synthetic weights; swiglu/routing end-to-end only |
 | routing family (`dsv4_route`, renorm, count, scan, pack, scatter/combine) | **HOT** | **—** direct; E2E | high-call-count, no isolated gate |
 | MegaMoE `sm90_*` (vendored) | COLD (TP>1 ∪ transport flag) | **—** | multi-card only |
 | W4A8 CUTLASS grouped `w4a8_*_sm90` | HOT on W4A8 ckpt | marlin_fp4 + repack-quality script (partly) | distinct CUTLASS path |
@@ -103,9 +103,10 @@ unit test vs ref · **—** = no gate.
 5. **routing family** (`dsv4_route`, renorm, count/scan/pack/scatter/combine)
    — many launches per MoE layer, E2E only.
 6. **rms_norm/silu/split/embedding elementwise** — HOT every layer, no unit.
-7. **DeepGEMM grouped prefill MoE** — WARM but large; perf-only probes
-   (scale=1.0), realistic-scale numerics never compared; decode has only a
-   tiny-shape micro test.
+7. **DeepGEMM grouped prefill MoE** — WARM but large; now compared at
+   production n=4096 on masked+contiguous paths by
+   `deepgemm_grouped_prefill_parity`; remaining gap is synthetic weights and
+   swiglu/routing-reduction end-to-end coverage.
 8. **FP8 paged-KV quantize** — HOT under the production FP8 dtype, E2E only
    (INT8 has a round-trip, FP8 does not).
 9. **DSpark draft attention + DSA indexer family** — WARM spec path, shape
@@ -125,11 +126,10 @@ unit test vs ref · **—** = no gate.
   exposed config.
 - **FA2 sm70 gate** is dense seq4/q2-kv1/hd256 only; production V100 paged or
   larger batches untested.
-- **dsv4_fp8_grouped decode micro-test** uses hidden/inter=16 vs production
-  MoE widths (thousands).
 - **DSv4 TP/EP sharding**: dsv4_parity runs TP=8 but gates only the first
-  prefill token; TP repack/o-slice/grouped-o-proj kernels are numerically
-  exercised only through that one argmax.
+  prefill token; the decode-band TP Q-repack is bit-exact gated at TP=2/4/8 by
+  `dsv4_decode_moe_parity`, while the o-slice and grouped-o-proj remain
+  exercised only through that one argmax (dense-BF16 o-proj is cuBLAS).
 
 ## DEAD production-shaped wrappers / AOT rows (resolved in kernel-parity-s11)
 
