@@ -77,6 +77,8 @@ SPEC_FLAGS=(
     --dspark-markov-init
 )
 
+die() { echo "error: $*" >&2; exit 3; }
+
 strip_spec_flags() {
     local -a toks out
     read -ra toks <<< "$1"
@@ -182,8 +184,6 @@ if [[ "$has_exploration" == false ]]; then
     exit 2
 fi
 
-die() { echo "error: $*" >&2; exit 3; }
-
 # Kill only serves: comm=arle plus ' serve' in args leaves `arle kernel`
 # and other subcommands alone. SIGKILL — serve ignores SIGTERM.
 kill_arle_serve() {
@@ -244,71 +244,8 @@ run_side "$LABEL_B" "$CMD_B" "$OUT_B"
 # ---- cross-label diff ---------------------------------------------------------
 
 DIFF_FILE="$REPO_ROOT/bench-output/${DATE}-${LABEL_A}-vs-${LABEL_B}-diff.md"
-python3 - "$OUT_A" "$OUT_B" "$LABEL_A" "$LABEL_B" "$DIFF_FILE" <<'PY' || die "diff refused (missing arm data)"
-import sys, json, pathlib
-
-a_dir, b_dir, label_a, label_b, out_path = sys.argv[1:]
-
-def load(d):
-    p = pathlib.Path(d) / "bench_throughput.json"
-    if not p.exists():
-        return None
-    j = json.loads(p.read_text())
-    rows = {}
-    for point in j.get("points", []):
-        m = point.get("summary", {})
-        key = f"conc{m.get('concurrency', '?')}"
-        rows[key] = {
-            "ttft_p50": (m.get("ttft") or {}).get("p50_ms"),
-            "itl_p50":  (m.get("itl") or {}).get("p50_ms"),
-            "tok_s":    (1000.0 / im if (im := (m.get("itl") or {}).get("mean_ms")) else None),
-        }
-    return rows
-
-a = load(a_dir) or {}
-b = load(b_dir) or {}
-if not a or not b:
-    print(f"error: refusing to diff without both arms: {label_a}={len(a)} rows, "
-          f"{label_b}={len(b)} rows", file=sys.stderr)
-    sys.exit(1)
-keys = sorted(set(a) | set(b), key=lambda k: (
-    0 if k == "sync" else 1 if k.startswith("conc") else 2, k
-))
-
-def pct(x, y):
-    if x is None or y is None or x == 0:
-        return "n/a"
-    return f"{((y - x) / x) * 100:+.1f}%"
-
-def fmt(x, d=1):
-    if x is None:
-        return "n/a"
-    return f"{x:.{d}f}"
-
-lines = []
-lines.append(f"# A/B diff — {label_a} vs {label_b}")
-lines.append("")
-lines.append(f"- A: {a_dir}")
-lines.append(f"- B: {b_dir}")
-lines.append("")
-lines.append("| rate | A decode tok/s | B decode tok/s | Δ decode | A TTFT p50 | B TTFT p50 | Δ TTFT |")
-lines.append("|---|---|---|---|---|---|---|")
-for k in keys:
-    av, bv = a.get(k, {}), b.get(k, {})
-    lines.append(
-        f"| {k} | {fmt(av.get('tok_s'),2)} | {fmt(bv.get('tok_s'),2)} "
-        f"| {pct(av.get('tok_s'), bv.get('tok_s'))} "
-        f"| {fmt(av.get('ttft_p50'),1)} | {fmt(bv.get('ttft_p50'),1)} "
-        f"| {pct(av.get('ttft_p50'), bv.get('ttft_p50'))} |"
-    )
-lines.append("")
-lines.append("Δ is (B - A) / A. Negative TTFT Δ is faster; positive tok/s Δ is faster.")
-lines.append("")
-lines.append("Reminder: effects <=10% in a single session are thermal noise; rerun")
-lines.append("or extend the cell duration before trusting small deltas.")
-
-pathlib.Path(out_path).write_text("\n".join(lines) + "\n")
-print("".join(f"{l}\n" for l in lines))
-PY
+python3 "$REPO_ROOT/scripts/bench_ab_diff.py" \
+    "$OUT_A" "$OUT_B" "$LABEL_A" "$LABEL_B" "$DIFF_FILE" \
+    || die "diff refused: need data from both arms (single-arm comparison is not an A/B)"
 
 echo ">>> diff: $DIFF_FILE"

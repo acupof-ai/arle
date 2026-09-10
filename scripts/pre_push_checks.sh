@@ -170,7 +170,8 @@ run_fast_checks() {
         test_validate_release.sh \
         test_pod_flow.sh \
         test_hook_disowns_git_env.sh \
-        test_hook_cuda_lint_freshness.sh; do
+        test_hook_cuda_lint_freshness.sh \
+        test_bench_ab_control_arm.sh; do
         run_fast bash "scripts/tests/${test}"
     done
 }
