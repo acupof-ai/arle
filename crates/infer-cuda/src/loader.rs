@@ -99,13 +99,7 @@ pub fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId
 #[cfg(feature = "nccl")]
 pub fn mint_nccl_unique_id_hex() -> Result<String> {
     use cuda_kernels::ffi::nccl;
-    let mut id = nccl::ncclUniqueId {
-        internal: [0i8; 128],
-    };
-    // SAFETY: `id` is a valid, fully-initialized 128-byte ncclUniqueId; NCCL
-    // writes the rendezvous handle into it. Single-threaded, no aliasing.
-    let res = unsafe { nccl::ncclGetUniqueId(&mut id) };
-    nccl::check(res).context("ncclGetUniqueId failed")?;
+    let id = nccl::unique_id().context("ncclGetUniqueId failed")?;
     let mut hex = String::with_capacity(256);
     for &b in &id.internal {
         use std::fmt::Write;

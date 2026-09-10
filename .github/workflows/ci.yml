@@ -142,8 +142,12 @@ jobs:
           cargo clippy -p cuda-kernels --release --no-default-features --features cuda,no-cuda,nccl --tests -- -D warnings
           # train/autograd CUDA examples previously typechecked only in the
           # no-cuda shape; their CUDA example bodies (#286 dsv4_parity class)
-          # were ungated. clippy --examples (no link).
-          cargo clippy -p train -p autograd --no-default-features --features cuda,no-cuda --examples -- -D warnings
+          # were ungated. nccl is added because the transport-parity examples
+          # (cp/nd/moe/a2) gate their real bodies on all(cuda,nccl); under
+          # cuda,no-cuda alone only their inert `requires cuda,nccl` stub
+          # compiles. No example is gated nccl-off, so the superset loses
+          # none. clippy --examples (no link).
+          cargo clippy -p train -p autograd --no-default-features --features cuda,no-cuda,nccl --examples -- -D warnings
 
       # Enforced 2026-08-23: tree clean (zero advisories; paste 1.0.15 is an
       # unmaintained warning, which does not fail the lane).

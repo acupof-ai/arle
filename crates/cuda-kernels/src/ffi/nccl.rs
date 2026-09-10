@@ -186,6 +186,19 @@ pub fn check(result: ncclResult_t) -> anyhow::Result<()> {
     }
 }
 
+/// Zero-initialize an `ncclUniqueId` and fill it with `ncclGetUniqueId`.
+/// Host call: no CUDA context required.
+#[cfg(feature = "nccl")]
+pub fn unique_id() -> anyhow::Result<ncclUniqueId> {
+    let mut id = ncclUniqueId {
+        internal: [0i8; 128],
+    };
+    // SAFETY: `id` is a valid zeroed out-param and the call only writes its
+    // 128-byte `internal` buffer, which no alias references.
+    check(unsafe { ncclGetUniqueId(&mut id) })?;
+    Ok(id)
+}
+
 #[cfg(all(test, feature = "nccl"))]
 mod tests {
     use super::*;

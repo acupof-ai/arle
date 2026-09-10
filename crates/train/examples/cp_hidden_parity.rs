@@ -489,7 +489,7 @@ fn nccl_rendezvous(rank: usize, dir: &str) -> Result<nccl::ncclUniqueId> {
         internal: [0i8; 128],
     };
     if rank == 0 {
-        nccl::check(unsafe { nccl::ncclGetUniqueId(&mut id) })?;
+        let id = nccl::unique_id()?;
         let bytes: Vec<u8> = id.internal.iter().map(|&b| b as u8).collect();
         let tmp = format!("{path}.tmp");
         std::fs::write(&tmp, &bytes)?;
