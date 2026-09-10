@@ -83,5 +83,10 @@ name = "fp8_decode_probe"
 path = "examples/fp8_decode_probe.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "flashmla_sparse_decode_parity"
+path = "examples/flashmla_sparse_decode_parity.rs"
+required-features = ["cuda"]
+
 [lints]
 workspace = true
