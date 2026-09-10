@@ -98,5 +98,10 @@ name = "flashmla_prefill_parity"
 path = "examples/flashmla_prefill_parity.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "paged_quant_attn_parity"
+path = "examples/paged_quant_attn_parity.rs"
+required-features = ["cuda"]
+
 [lints]
 workspace = true
