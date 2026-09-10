@@ -71,6 +71,7 @@ jobs:
           bash scripts/tests/test_validate_release.sh
           bash scripts/tests/test_pod_flow.sh
           bash scripts/tests/test_hook_disowns_git_env.sh
+          bash scripts/tests/test_prepush_snapshot_mtime.sh
           bash scripts/tests/test_hook_skips_shell_tests.sh
 
   # macOS Metal coverage lives in metal-ci.yml (superset: checks + tests +
