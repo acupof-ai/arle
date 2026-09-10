@@ -548,24 +548,7 @@ include!(concat!(env!("OUT_DIR"), "/ffi_tilelang_generated.rs"));
 // `arle_flashmla_sm90_sparse_decode_fwd`; runtime wire-up is a separate
 // downstream item.
 unsafe extern "C" {
-    /// Pack `n_tokens` worth of (NoPE bf16, RoPE bf16) into the MODEL1 FP8
-    /// block-paged layout. `page_block_size` is the upstream
-    /// `page_block_size` (64 for DSv4-Flash). `token_block_id[i]` is the
-    /// destination block for token `i`; `token_in_block_row[i]` is the
-    /// 0..page_block_size-1 row within that block.
-    pub fn arle_dsv4_fp8_kv_pack_cuda(
-        nope: *const Half,
-        rope: *const Half,
-        packed_kv: *mut u8,
-        token_block_id: *const i32,
-        token_in_block_row: *const i32,
-        n_tokens: i32,
-        page_block_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    /// Strided variant — same packing contract as `arle_dsv4_fp8_kv_pack_cuda`
-    /// but the NoPE and RoPE buffers carry an explicit per-token element
+    /// Strided variant of the FP8 KV pack — the NoPE and RoPE buffers carry
     /// stride. Used by the Phase D-4 decode hooks to feed
     /// `k_prepared`-shaped `[n_tokens, head_dim=512]` interleaved input
     /// without an intermediate deinterleave: caller passes

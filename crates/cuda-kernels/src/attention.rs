@@ -5,63 +5,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec};
-
-/// Pack `n_tokens` worth of (NoPE bf16, RoPE bf16) tensors into the MODEL1
-/// FP8 block-paged layout that FlashMLA's sparse-FP8 decode consumes
-/// (584 bytes/token; see `csrc/attention/dsv4_fp8_kv_pack.cu` for the
-/// byte layout + e8m0 scale encoding).
-///
-/// - `nope`: bf16 `[n_tokens, 448]` (NoPE dims, host-allocated DeviceVec).
-/// - `rope`: bf16 `[n_tokens, 64]`  (RoPE dims, host-allocated DeviceVec).
-/// - `packed_kv`: u64 device pointer into the FP8 KV pool. Caller sizes
-///   the pool to `num_blocks * page_block_size * 584` bytes.
-/// - `token_block_id`: i32 `[n_tokens]` — destination block index per token.
-/// - `token_in_block_row`: i32 `[n_tokens]` — 0..page_block_size-1 per token.
-/// - `page_block_size`: upstream's `page_block_size` (64 for DSv4-Flash MODEL1).
-///
-#[allow(clippy::too_many_arguments)]
-pub fn dsv4_fp8_kv_pack(
-    ctx: &DeviceContext,
-    nope: &DeviceVec,
-    rope: &DeviceVec,
-    packed_kv_ptr: u64,
-    token_block_id: &CudaSlice<i32>,
-    token_in_block_row: &CudaSlice<i32>,
-    n_tokens: usize,
-    page_block_size: usize,
-) -> Result<()> {
-    if n_tokens == 0 {
-        return Ok(());
-    }
-
-    let (nope_ptr, _gn) = nope.data.device_ptr(&ctx.stream);
-    let (rope_ptr, _gr) = rope.data.device_ptr(&ctx.stream);
-    let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
-    let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
-
-    // SAFETY: NoPE/RoPE/index pointers come from live device buffers pinned by
-    // the `_g*` guards, each holding `n_tokens` rows; `packed_kv_ptr` is the
-    // caller's FP8 pool sized per the doc contract (`num_blocks *
-    // page_block_size * 584` B). Writes land only at `[block_id, row]` slots
-    // named per token, stream-ordered on `ctx.stream`.
-    unsafe {
-        ffi::arle_dsv4_fp8_kv_pack_cuda(
-            nope_ptr as *const ffi::Half,
-            rope_ptr as *const ffi::Half,
-            packed_kv_ptr as *mut u8,
-            tbid_ptr as *const i32,
-            tibr_ptr as *const i32,
-            n_tokens as i32,
-            page_block_size as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-
-    Ok(())
-}
-
+use crate::tensor::DeviceContext;
 /// Strided-input pack variant — accepts raw u64 NoPE/RoPE pointers plus an
 /// explicit element stride per axis. Phase D-4 runtime hooks feed this
 /// from `k_prepared` (interleaved [NoPE 448 | RoPE 64] bf16, head_dim=512
