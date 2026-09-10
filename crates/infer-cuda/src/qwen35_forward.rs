@@ -200,6 +200,22 @@ impl Qwen35Model {
         let cell_bytes_per_token =
             PagedKVPool::budget_bytes_for_tokens(num_full, local_kv_heads, head_dim, 1, kv_format)
                 as u64;
+        // The quantized-FA3 split-KV workspace is sized `num_splits × num_slots
+        // × …` at pool construction, so it is a per-slot charge the solve must
+        // deduct (0 for non-quantized pools).
+        let attn_ws_per_slot = if matches!(
+            kv_format,
+            cuda_kernels::KVFormat::INT8 | cuda_kernels::KVFormat::FP8E4M3
+        ) {
+            cuda_kernels::kv_quant::paged_attention_quantized_fa3_workspace_bytes(
+                1,
+                local_kv_heads * 8,
+                head_dim,
+                64,
+            )
+        } else {
+            0
+        };
         let probe = match cudarc::driver::result::mem_get_info() {
             Ok((raw_free, total)) => {
                 let free = match memory_budget_bytes {
@@ -216,13 +232,14 @@ impl Qwen35Model {
                     None => raw_free,
                 };
                 log::info!(
-                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB)",
+                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB) + FA3 attn workspace {}MB/slot",
                     free >> 20,
                     per_slot >> 20,
                     kv_bytes >> 20,
                     gdr_bytes >> 20,
                     conv_bytes >> 20,
                     extra_per_slot_bytes >> 20,
+                    attn_ws_per_slot >> 20,
                 );
                 Some((free, total))
             }
@@ -233,12 +250,14 @@ impl Qwen35Model {
         let n_local = infer_model::qwen35::kv_slot_budget_local(
             probe,
             per_slot,
+            attn_ws_per_slot,
             requested,
             self.max_seq_len,
             mem_fraction_static,
             cell_bytes_per_token,
         );
         let affordable = self.tp.all_reduce_min_scalar_i32(&self.ctx, n_local)? as usize;
+        let granted_per_slot = per_slot.saturating_add(attn_ws_per_slot);
         // Reject-below-fixed guard (parity with Metal's fits_fixed + DSv4): a
         // cross-rank-min affordable of 0 means post-weights free VRAM cannot
         // hold even one slot at this max_seq_len. Fail closed uniformly
@@ -247,21 +266,25 @@ impl Qwen35Model {
         anyhow::ensure!(
             affordable > 0,
             "Qwen3.5 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
-             max_seq_len {} (per_slot ~{}MB exceeds {} of free). Free VRAM or \
-             lower --max-total-tokens.",
+             max_seq_len {} (per_slot ~{}MB, recurrent {}MB + FA3 attn workspace {}MB, \
+             exceeds {} of free). Free VRAM or lower --max-total-tokens.",
             self.max_seq_len,
+            granted_per_slot >> 20,
             per_slot >> 20,
+            attn_ws_per_slot >> 20,
             infer_model::qwen35::KV_MEM_FRACTION,
         );
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
         if clamped {
             log::warn!(
-                "Qwen3.5 KV budget: requested {requested} slots × ~{}MB/slot exceeds the \
-                 cross-rank-min joint-affordable {affordable} (local {n_local}, {} \
-                 of post-weights free minus the shared-pool funding for one full-length \
-                 request); clamping num_slots to {affordable}. Lower --max-total-tokens \
-                 (max_seq_len {}) to raise concurrency.",
+                "Qwen3.5 KV budget: requested {requested} slots × ~{}MB/slot (recurrent {}MB + \
+                 FA3 attn workspace {}MB) exceeds the cross-rank-min joint-affordable \
+                 {affordable} (local {n_local}, {} of post-weights free minus the shared-pool \
+                 funding for one full-length request); clamping num_slots to {affordable}. \
+                 Lower --max-total-tokens (max_seq_len {}) to raise concurrency.",
+                granted_per_slot >> 20,
                 per_slot >> 20,
+                attn_ws_per_slot >> 20,
                 infer_model::qwen35::KV_MEM_FRACTION,
                 self.max_seq_len,
             );
@@ -279,6 +302,7 @@ impl Qwen35Model {
             probe,
             planned,
             per_slot,
+            attn_ws_per_slot,
             cell_bytes_per_token,
             num_full,
             local_kv_heads,
