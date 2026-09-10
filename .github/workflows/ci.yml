@@ -106,12 +106,13 @@ jobs:
           # HIP/Vulkan backend bodies sit behind their feature; the no-feature
           # lint above compiles almost none of them. With the feature on, the
           # -sys crates fall back to host stubs on this runner (no ROCm/Vulkan
-          # needed). HIP is clippy-clean; Vulkan's -D warnings clippy is blocked
-          # on ~193 safety-comment cleanups, so Vulkan is a `cargo check` type
-          # gate (catches type breaks) for now.
+          # needed).
           cargo clippy -p infer-hip -p infer-vulkan -- -D warnings
           cargo clippy -p infer-hip --features hip --lib -- -D warnings
-          cargo check -p infer-vulkan --features vulkan --lib
+          # Vulkan real backend under -D warnings (previously blocked by 96
+          # undocumented unsafe blocks in vulkan-sys). All three crates define a
+          # `vulkan` feature; vulkan-kernels' build.rs typechecks without glslc.
+          cargo clippy -p infer-vulkan -p vulkan-sys -p vulkan-kernels --features vulkan --all-targets -- -D warnings
           # deepep-sys: `deepep` typechecks the FFI but build.rs skips the
           # native kernel (no nvcc on this runner) — kernel compile is GPU-only.
 

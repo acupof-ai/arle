@@ -519,7 +519,82 @@ pub mod upload {
 
     #[cfg(test)]
     mod tests {
+        #[cfg(feature = "vulkan")]
+        use self::synth_gguf::{T, V, write_to_temp};
         use super::*;
+
+        // Synthetic GGUF writer for the device-residency test. The shared
+        // infer-gguf test writer was removed with the inline-test sweep; this
+        // is its only remaining consumer.
+        #[cfg(feature = "vulkan")]
+        mod synth_gguf {
+            use infer_gguf::gguf::GGUF_DEFAULT_ALIGNMENT;
+
+            pub enum V {
+                Str(&'static str),
+            }
+
+            pub struct T {
+                pub name: String,
+                pub dims: Vec<u64>,
+                pub type_id: u32,
+                pub data: Vec<u8>,
+            }
+
+            fn put_str(buf: &mut Vec<u8>, s: &str) {
+                buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+
+            fn write(kvs: &[(&str, V)], tensors: &[T]) -> Vec<u8> {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(b"GGUF");
+                buf.extend_from_slice(&3u32.to_le_bytes());
+                buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+                buf.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+                for (key, value) in kvs {
+                    put_str(&mut buf, key);
+                    let V::Str(v) = value;
+                    buf.extend_from_slice(&8u32.to_le_bytes());
+                    put_str(&mut buf, v);
+                }
+                let align = GGUF_DEFAULT_ALIGNMENT as usize;
+                let mut offset = 0usize;
+                for t in tensors {
+                    put_str(&mut buf, &t.name);
+                    buf.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+                    for d in &t.dims {
+                        buf.extend_from_slice(&d.to_le_bytes());
+                    }
+                    buf.extend_from_slice(&t.type_id.to_le_bytes());
+                    buf.extend_from_slice(&(offset as u64).to_le_bytes());
+                    offset += t.data.len().div_ceil(align) * align;
+                }
+                while !buf.len().is_multiple_of(align) {
+                    buf.push(0);
+                }
+                for t in tensors {
+                    buf.extend_from_slice(&t.data);
+                    while !buf.len().is_multiple_of(align) {
+                        buf.push(0);
+                    }
+                }
+                buf
+            }
+
+            pub fn write_to_temp(
+                kvs: &[(&str, V)],
+                tensors: &[T],
+                tag: &str,
+            ) -> std::path::PathBuf {
+                let path = std::env::temp_dir().join(format!(
+                    "arle-infer-vulkan-{tag}-{}.gguf",
+                    std::process::id()
+                ));
+                std::fs::write(&path, write(kvs, tensors)).unwrap();
+                path
+            }
+        }
 
         #[test]
         fn f16_pinned() {
@@ -542,7 +617,7 @@ pub mod upload {
             assert_eq!(nan & 0x7C00, 0x7C00);
             assert_ne!(nan & 0x03FF, 0);
             // Smallest normal/subnormal halves round-trip sanity.
-            assert_eq!(f32_to_f16(6.103515625e-5), 0x0400); // 2^-14 smallest normal
+            assert_eq!(f32_to_f16(f32::from_bits(0x3880_0000)), 0x0400); // 2^-14 smallest normal
             assert_eq!(f32_to_f16(5.9604645e-8), 0x0001); // smallest subnormal
         }
 
@@ -551,7 +626,6 @@ pub mod upload {
         fn upload_plan_lands_bytes_on_device() {
             use crate::loader::plan_model;
             use infer_gguf::gguf::GgufFile;
-            use infer_gguf::gguf::test_writer::{T, V, write_to_temp};
             use vulkan_sys::VulkanContext;
 
             let ctx = match VulkanContext::create() {
