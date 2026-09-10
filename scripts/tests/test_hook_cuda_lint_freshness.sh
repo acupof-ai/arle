@@ -76,11 +76,12 @@ SH
 chmod +x "$BIN/cargo"
 
 ZERO=0000000000000000000000000000000000000000
-run_hook() {  # $1 = local sha, $2 = remote sha
+run_hook() {  # $1 = local sha, $2 = remote sha, optional $3 = snapshot dir
   # NESTED bypasses the machine lock (this fixture runs inside a real hook's
   # fast checks, which already hold it) and the cargo is the mock. Override the
   # shared snapshot/lock paths so the fixture never touches the real ones.
-  ( cd "$FIX" && ARLE_PRE_PUSH_NESTED=1 ARLE_PREPUSH_SNAPSHOT_ROOT="$SNAP" ARLE_PREPUSH_LOCK_DIR="$LOCK" PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
+  local snap="${3:-$SNAP}"
+  ( cd "$FIX" && ARLE_PRE_PUSH_NESTED=1 ARLE_PREPUSH_SNAPSHOT_ROOT="$snap" ARLE_PREPUSH_LOCK_DIR="$LOCK" PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
 }
 
 # Red world: the push changes infer-cuda, the lint reports it Fresh.
@@ -88,18 +89,20 @@ set +e
 MOCK_LINT_LINES='Checking infer-api \n' run_hook "$tip" "$base" >"$TMP/red.log" 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ] || { echo "FAIL: red world passed — Fresh infer-cuda not caught" >&2; cat "$TMP/red.log" >&2; exit 1; }
-grep -q 'infer-cuda Fresh while this push changes it' "$TMP/red.log"
+grep -q 'infer-cuda Fresh while rsync updated its lib' "$TMP/red.log"
 
 # Green world: the lint checks infer-cuda.
 MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' run_hook "$tip" "$base" >"$TMP/green.log" 2>&1 \
   || { echo "FAIL: green world rejected" >&2; cat "$TMP/green.log" >&2; exit 1; }
 
-# New branch (zero remote sha): the merge-base fallback still sees the CUDA change.
+# New branch (zero remote sha): a brand-new lane also starts with a fresh
+# (empty) snapshot, so give this world its own — rsync must copy the lib once.
 set +e
-MOCK_LINT_LINES='Checking infer-api \n' run_hook "$tip" "$ZERO" >"$TMP/new.log" 2>&1
+NEWSNAP="$TMP/snapshot-new"; mkdir -p "$NEWSNAP"
+MOCK_LINT_LINES='Checking infer-api \n' run_hook "$tip" "$ZERO" "$NEWSNAP" >"$TMP/new.log" 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ] || { echo "FAIL: new-branch red world passed" >&2; cat "$TMP/new.log" >&2; exit 1; }
-grep -q 'infer-cuda Fresh while this push changes it' "$TMP/new.log"
+grep -q 'infer-cuda Fresh while rsync updated its lib' "$TMP/new.log"
 
 # False-positive control: a push that does NOT touch the CUDA crates must not
 # assert, however Fresh the lint is — a false-positive gate gets disabled.
@@ -113,16 +116,23 @@ MOCK_LINT_LINES='Checking infer-api \n' run_hook "$coretip" "$corebase" >"$TMP/c
 # Red world for the test-step guard: the same infer-core change, but a test
 # step reports it Fresh (mock suppresses its Checking line).
 set +e
-MOCK_TEST_SKIP=infer-core run_hook "$coretip" "$corebase" >"$TMP/test-red.log" 2>&1
+CORE_SNAP="$TMP/snapshot-core"; mkdir -p "$CORE_SNAP"
+MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' \
+  MOCK_TEST_SKIP=infer-core run_hook "$coretip" "$corebase" "$CORE_SNAP" >"$TMP/test-red.log" 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ] || { echo "FAIL: test-step red world passed — Fresh infer-core not caught" >&2; cat "$TMP/test-red.log" >&2; exit 1; }
-grep -q 'reported infer-core Fresh while this push changes it' "$TMP/test-red.log"
+grep -q 'reported infer-core Fresh while rsync updated its lib' "$TMP/test-red.log"
 
 # Color world: the hook exports CARGO_TERM_COLOR=always, decorating the test
 # steps' output with ANSI codes; the strip must still see the rebuilt crate.
 # Uses the core commit so the test-step guard (group 2 lists infer-core) is
 # what exercises it — the CUDA lint path sets never and would pass regardless.
-MOCK_COLOR=1 run_hook "$coretip" "$corebase" >"$TMP/color.log" 2>&1 \
+# Its own snapshot: a rerun against the already-synced snapshot has zero rsync
+# deltas, which would (correctly) disarm the guard; ANSI stripping is the
+# thing under test here and needs a real sync.
+COLOR_SNAP="$TMP/snapshot-color"; mkdir -p "$COLOR_SNAP"
+MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' \
+  MOCK_COLOR=1 run_hook "$coretip" "$corebase" "$COLOR_SNAP" >"$TMP/color.log" 2>&1 \
   || { echo "FAIL: color world rejected rebuilt crates" >&2; cat "$TMP/color.log" >&2; exit 1; }
 
 # Red world for the examples guard: a push changing an example file, the
@@ -132,14 +142,32 @@ printf 'fn main() { infer_cuda::fixture(); println!("tick"); }\n' > "$FIX/crates
 git -C "$FIX" add -A && git -C "$FIX" commit -qm examples
 exbase="$(git -C "$FIX" rev-parse HEAD~1)"; extip="$(git -C "$FIX" rev-parse HEAD)"
 set +e
-MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' MOCK_EXAMPLES_LINES='' run_hook "$extip" "$exbase" >"$TMP/ex-red.log" 2>&1
+# Pre-seed the snapshot at the PARENT (cuda commit) so rsync's only delta is
+# the example file: this is the real examples-only world — the lib fingerprint
+# is unchanged and the lib lint is legitimately Fresh.
+EX_SNAP="$TMP/snapshot-examples"; mkdir -p "$EX_SNAP"
+( cd "$FIX" && git archive "$exbase" | tar -x -C "$EX_SNAP" )
+MOCK_LINT_LINES='Checking infer-api \n' MOCK_EXAMPLES_LINES='' run_hook "$extip" "$exbase" "$EX_SNAP" >"$TMP/ex-red.log" 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ] || { echo "FAIL: examples red world passed — Fresh examples run not caught" >&2; cat "$TMP/ex-red.log" >&2; exit 1; }
-grep -q 'examples lint reported everything Fresh' "$TMP/ex-red.log"
+grep -q 'examples lint reported everything Fresh while rsync updated' "$TMP/ex-red.log"
 
 # Green world for the examples guard: the examples clippy checks the example.
-MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' MOCK_EXAMPLES_LINES='Checking fixture_example \n' run_hook "$extip" "$exbase" >"$TMP/ex-green.log" 2>&1 \
+# Same pre-seeded parent snapshot, independent dir so rsync re-delivers the
+# example delta.
+EX_GREEN_SNAP="$TMP/snapshot-examples-green"; mkdir -p "$EX_GREEN_SNAP"
+( cd "$FIX" && git archive "$exbase" | tar -x -C "$EX_GREEN_SNAP" )
+MOCK_LINT_LINES='Checking infer-api \n' MOCK_EXAMPLES_LINES='Checking fixture_example \n' run_hook "$extip" "$exbase" "$EX_GREEN_SNAP" >"$TMP/ex-green.log" 2>&1 \
   || { echo "FAIL: examples green world rejected" >&2; cat "$TMP/ex-green.log" >&2; exit 1; }
+
+# Examples-only false-positive control (the #312/#313 bug): lib reports
+# infer-cuda Fresh (its fingerprint did not change), the example target
+# rebuilds. rsync delta is examples-only, so the lib guard must stay silent.
+EX_ONLY_SNAP="$TMP/snapshot-examples-only"; mkdir -p "$EX_ONLY_SNAP"
+( cd "$FIX" && git archive "$exbase" | tar -x -C "$EX_ONLY_SNAP" )
+MOCK_LINT_LINES='Checking infer-api \nChecking cuda-kernels \n' MOCK_EXAMPLES_LINES='Checking fixture_example \n' \
+  run_hook "$extip" "$exbase" "$EX_ONLY_SNAP" >"$TMP/ex-only-green.log" 2>&1 \
+  || { echo "FAIL: examples-only push with a legitimately Fresh lib was rejected" >&2; cat "$TMP/ex-only-green.log" >&2; exit 1; }
 
 
 # --- Lock worlds -----------------------------------------------------------
@@ -194,4 +222,4 @@ if kill -0 "$wait_pid" 2>/dev/null; then
 fi
 [ "$(cat "$TMP/wait.rc")" = "0" ] || { echo "FAIL: wait world rejected" >&2; cat "$TMP/wait.log" >&2; exit 1; }
 
-echo "PASS: CUDA lint + test-step freshness (red/green/new-branch/control/test-red/color/examples-red/examples-green), snapshot lock (docs no-wait / .rs wait)"
+echo "PASS: CUDA lint + test-step freshness (red/green/new-branch/control/test-red/color/examples-red/examples-green/examples-only-fresh-lib), snapshot lock (docs no-wait / .rs wait)"

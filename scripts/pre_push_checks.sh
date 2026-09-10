@@ -48,6 +48,7 @@ cleanup() {
         rm -rf "${STAGE_ROOT}"
     fi
     [[ -n "${FAST_STEP:-}" ]] && rm -f "${FAST_STEP}"
+    [[ -n "${SYNCED_FILES:-}" ]] && rm -f "${SYNCED_FILES}"
     [[ "${LOCK_HELD:-0}" -eq 1 ]] && rm -rf "${LOCK_DIR:-}"
     return 0
 }
@@ -152,6 +153,21 @@ else
     SNAPSHOT_PRIVATE=1
     info "cargo-free push; running checks from private snapshot (no lock)"
 fi
+# True iff rsync actually updated a LIB-AFFECTING file of crate $1 in this
+# snapshot: crates/<crate>/src/**, crates/<crate>/build.rs, or
+# crates/<crate>/Cargo.toml. Examples/tests/benches never change a lib
+# fingerprint, so an examples-only push must not demand a lib Checking line.
+rsync_touched_lib() {
+    local crate="$1"
+    grep -qE "^crates/${crate}/(src/|build\.rs$|Cargo\.toml$)" "${SYNCED_FILES}"
+}
+
+# True iff rsync updated anything under the crate at all (examples included).
+rsync_touched_crate() {
+    local crate="$1"
+    grep -qE "^crates/${crate}/" "${SYNCED_FILES}"
+}
+
 git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${STAGE_ROOT}"
 # rsync WITHOUT -t (no mtime preservation): `git archive | tar` stamps files
 # with the COMMIT time, and `-a`'s `-t` would restore that older mtime onto a
@@ -160,7 +176,23 @@ git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${STAGE_ROOT}"
 # Transferred files take mtime=now so a content change always forces a rebuild;
 # --checksum keeps content-IDENTICAL files' mtimes (warm cache hits); -r -l -p
 # -D keep recursion/symlinks/perms/specials; --delete drops removed files.
-rsync -rlpD --delete --checksum "${STAGE_ROOT}/" "${SNAPSHOT_ROOT}/"
+#
+# `--out-format='%n'` lists every path rsync UPDATES (content differs by
+# checksum, including files the --delete phase drops as `deleting <p>`). These
+# are the only paths whose mtime identity changed vs the previous snapshot, so
+# they — not the full pushed-range `changed_files` — decide which crates a
+# cargo step must have rebuilt. A pushed range can include a crate whose files
+# are unchanged IN THIS SNAPSHOT (examples-only changes never touch lib
+# fingerprints); keying the Fresh assertion on the push range then failed
+# legitimately-Fresh lib builds (2026-09-11 false positive on #312).
+SYNCED_FILES="$(mktemp "${TMPDIR:-/tmp}/arle-pre-push-synced.XXXXXX")"
+rsync -rlpD --delete --checksum --out-format='%n' "${STAGE_ROOT}/" "${SNAPSHOT_ROOT}/" \
+    | sed -E 's/^deleting //' > "${SYNCED_FILES}"
+# NOTE: the CUDA_CRATES_CHANGED branch gate stays keyed on the PUSH RANGE (set
+# from stdin above): it decides whether this run does the verbose strict lint
+# at all. Only the per-crate Fresh ASSERTIONS below consult rsync's actual
+# delta — an examples-only range enters the strict branch but its lib
+# assertion stays silent because rsync touched no lib fingerprint file.
 
 # Orphan sweeps:
 # - Legacy per-worktree snapshot dirs (`snapshot-<hash>`) left by lanes on the
@@ -221,12 +253,12 @@ run_fast_checks() {
 run_fast_checks &
 FAST_PID=$!
 
-# Asserts a cargo step rebuilt every crate the push changes. All lanes share
-# one target dir and cargo fingerprints path deps by mtime, so a build from
-# another lane can make this step report a changed crate Fresh — stale
-# artifacts, or artifacts from a lane whose trait signatures disagree with
-# this tree (2026-09-10: e2's Step 1b lane built a 3-param `submit` into the
-# shared target; this tree had 4, and the hook failed with fake E0050/E0063
+# Asserts a cargo step rebuilt every crate whose LIB rsync actually updated.
+# All lanes share one target dir and cargo fingerprints path deps by mtime, so
+# a build from another lane can make this step report a changed crate Fresh —
+# stale artifacts, or artifacts from a lane whose trait signatures disagree
+# with this tree (2026-09-10: e2's Step 1b lane built a 3-param `submit` into
+# the shared target; this tree had 4, and the hook failed with fake E0050/E0063
 # that read as real code breakage). cargo prints nothing for a Fresh crate,
 # so absence of Checking/Compiling means the step did no work on it.
 assert_step_rebuilt() {  # $1 = step label, $2 = step output, rest = the step's -p crates
@@ -235,9 +267,9 @@ assert_step_rebuilt() {  # $1 = step label, $2 = step output, rest = the step's 
     # "Compiling" and the crate name; strip them or a rebuilt crate reads Fresh.
     out="$(printf '%s' "${out}" | sed $'s/\x1b\\[[0-9;]*m//g')"
     for crate in "$@"; do
-        if grep -qE "^crates/${crate}/" <<< "${changed_files}" \
+        if rsync_touched_lib "${crate}" \
            && ! grep -qE "(Checking|Compiling) ${crate}( |\$)" <<< "${out}"; then
-            fail "${label} reported ${crate} Fresh while this push changes it — shared target cross-contaminated by another lane; run 'CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo clean -p ${crate}' and retry"
+            fail "${label} reported ${crate} Fresh while rsync updated its lib in the snapshot — shared target cross-contaminated by another lane; run 'CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo clean -p ${crate}' and retry"
             exit 1
         fi
     done
@@ -278,20 +310,20 @@ if [[ "${SKIP_CARGO}" == "0" ]]; then
         printf '%s\n' "${examples_lint_out}"
         [[ "${cuda_lint_rc}" -eq 0 ]] || exit "${cuda_lint_rc}"
         for crate in infer-cuda cuda-kernels; do
-            if grep -qE "^crates/${crate}/" <<< "${changed_files}" \
+            if rsync_touched_lib "${crate}" \
                && ! grep -qE "(Checking|Compiling) ${crate}( |\$)" <<< "${cuda_lint_out}"; then
-                fail "CUDA lint reported ${crate} Fresh while this push changes it — shared target cross-contaminated by another lane; run 'cargo clean -p ${crate}' and retry"
+                fail "CUDA lint reported ${crate} Fresh while rsync updated its lib in the snapshot — shared target cross-contaminated by another lane; run 'cargo clean -p ${crate}' and retry"
                 exit 1
             fi
         done
-        # A push touching infer-cuda forces at least one example target to
-        # rebuild (a lib change forces all, an examples/<name>.rs change that
-        # one), so a Fresh examples run — zero Checking lines — checked
-        # nothing.
-        if grep -qE "^crates/infer-cuda/" <<< "${changed_files}" \
+        # rsync updating ANY infer-cuda file (examples included) forces at
+        # least one example target to rebuild; a zero-Checking examples run
+        # checked nothing. A lib-less (examples-only) sync still arms this,
+        # while the lib assertion above stays silent.
+        if rsync_touched_crate infer-cuda \
            && compgen -G "crates/infer-cuda/examples/*.rs" > /dev/null \
            && ! grep -qE "(Checking|Compiling) " <<< "${examples_lint_out}"; then
-            fail "CUDA examples lint reported everything Fresh while this push changes infer-cuda — shared target cross-contaminated by another lane; run 'cargo clean -p infer-cuda' and retry"
+            fail "CUDA examples lint reported everything Fresh while rsync updated crates/infer-cuda — shared target cross-contaminated by another lane; run 'cargo clean -p infer-cuda' and retry"
             exit 1
         fi
     else
