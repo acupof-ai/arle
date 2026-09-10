@@ -200,3 +200,64 @@ expect_fail env PATH="$tmp/mock-bin:$PATH" ARLE_GPU_CLAIMS="$tmp/claims" \
 expect_fail env PATH="$tmp/mock-bin:$PATH" ARLE_GPU_CLAIMS="$tmp/claims" \
     GATE_PROFILE=dsv4 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 INFER_TP_SIZE=4 \
     "$tmp/root/scripts/lever_gate.sh" dsv4-preflight
+
+# --- Inert-baseline gate: a reference that never matched a needle cannot pass a treatment.
+# Validate-only entry (LEVER_GATE_VALIDATE_LOG) exercises the real envelope code with no serve.
+vgate() { LEVER_GATE_VALIDATE_LOG="$1" BASELINE_LOG="$2" LENGTHS=115,300 RUNS=3 \
+    "$ROOT/scripts/lever_gate.sh" test >/dev/null; }
+
+# (a) present baseline, ZERO exact hits (all miss) -> red, even if treatment == baseline.
+cat >"$tmp/inert-baseline.log" <<'INERT_EOF'
+SUMMARY len=115 depth=0.00 exact=0 partial=0 miss=3 DET
+SUMMARY len=300 depth=0.00 exact=0 partial=0 miss=3 DET
+INERT_EOF
+expect_fail env LEVER_GATE_VALIDATE_LOG="$tmp/inert-baseline.log" BASELINE_LOG="$tmp/inert-baseline.log" \
+    LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test
+
+# (a2) non-obvious inert shape: zero EXACT but nonzero partial still totals 0 exact -> red.
+cat >"$tmp/partial-only-baseline.log" <<'PARTIAL_EOF'
+SUMMARY len=115 depth=0.00 exact=0 partial=3 miss=0 NONDET
+SUMMARY len=300 depth=0.00 exact=0 partial=3 miss=0 NONDET
+PARTIAL_EOF
+cat >"$tmp/partial-only-treat.log" <<'PARTIAL_EOF'
+SUMMARY len=115 depth=0.00 exact=3 partial=0 miss=0 DET
+SUMMARY len=300 depth=0.00 exact=3 partial=0 miss=0 DET
+PARTIAL_EOF
+expect_fail env LEVER_GATE_VALIDATE_LOG="$tmp/partial-only-treat.log" BASELINE_LOG="$tmp/partial-only-baseline.log" \
+    LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test
+
+# Healthy reference: exact hits at both lengths.
+cat >"$tmp/healthy-baseline.log" <<'HEALTHY_EOF'
+SUMMARY len=115 depth=0.00 exact=3 partial=0 miss=0 DET
+SUMMARY len=300 depth=0.00 exact=2 partial=1 miss=0 NONDET
+HEALTHY_EOF
+
+# (b) healthy baseline, treatment inside the envelope (miss not higher, counts within +-1) -> green.
+cat >"$tmp/in-envelope.log" <<'INENV_EOF'
+SUMMARY len=115 depth=0.00 exact=2 partial=1 miss=0 NONDET
+SUMMARY len=300 depth=0.00 exact=1 partial=2 miss=0 NONDET
+INENV_EOF
+vgate "$tmp/in-envelope.log" "$tmp/healthy-baseline.log"
+
+# (c) healthy baseline, treatment outside the envelope (new miss class) -> red.
+cat >"$tmp/out-envelope.log" <<'OUTENV_EOF'
+SUMMARY len=115 depth=0.00 exact=1 partial=0 miss=2 DET
+SUMMARY len=300 depth=0.00 exact=2 partial=1 miss=0 NONDET
+OUTENV_EOF
+expect_fail env LEVER_GATE_VALIDATE_LOG="$tmp/out-envelope.log" BASELINE_LOG="$tmp/healthy-baseline.log" \
+    LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test
+
+# Per-length zero exact is still valid: only an ALL-zero baseline is inert. A length the
+# reference never matches may gate on miss count, as long as another length scored.
+cat >"$tmp/one-zero-len-baseline.log" <<'ONEZERO_EOF'
+SUMMARY len=115 depth=0.00 exact=3 partial=0 miss=0 DET
+SUMMARY len=300 depth=0.00 exact=0 partial=0 miss=3 DET
+ONEZERO_EOF
+cat >"$tmp/one-zero-len-treat.log" <<'ONEZERO_EOF'
+SUMMARY len=115 depth=0.00 exact=3 partial=0 miss=0 DET
+SUMMARY len=300 depth=0.00 exact=1 partial=0 miss=2 DET
+ONEZERO_EOF
+vgate "$tmp/one-zero-len-treat.log" "$tmp/one-zero-len-baseline.log"
+
+echo "lever gate inert-baseline worlds PASS (inert-red/partial-red/in-green/out-red/perlen-green)"
+
