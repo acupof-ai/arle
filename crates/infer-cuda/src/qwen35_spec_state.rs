@@ -136,7 +136,6 @@ impl Qwen35ReplayTables {
 ///
 /// Caches are token-major `[(depth+1), width]` bf16 (token `t` at `t*width`), so rows
 /// `[0..=k]` slice contiguously as `[0..(k+1)*width]`.
-#[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
 pub(crate) struct Qwen35LinearCapture {
     /// `num_linear`; per-row stride = `len / (depth+1)`.
     pub(crate) rows: usize,

@@ -263,7 +263,6 @@ impl Dsv4FlashMlaDecodeState {
 
     /// Scheduler metadata only; the FP8 KV pool pages this slot reads are owned
     /// (and summed) by [`Dsv4LayerKvLayout::flashmla_kv_pool`].
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         self.topk_length.len() * i32_sz
@@ -397,7 +396,6 @@ impl Dsv4FlashMlaDecodeScratch {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         let f32_sz = std::mem::size_of::<f32>();
@@ -575,7 +573,6 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         let f32_sz = std::mem::size_of::<f32>();
@@ -1378,7 +1375,6 @@ impl Dsv4FusedWqkvDecodeScratch {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         let f32_sz = std::mem::size_of::<f32>();
@@ -1531,7 +1527,6 @@ impl Dsv4PrefillDeepGemmLinearScratch {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         let f32_sz = std::mem::size_of::<f32>();

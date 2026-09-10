@@ -122,7 +122,6 @@ fn alloc_neg1_i32(
 mod qwen;
 // `dead_code` marks pending-consumer infra (the `model.rs` DSv4 branch), not cruft.
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
 #[path = "moe/dsv4.rs"]
 mod dsv4;
 #[cfg(feature = "deepep")]

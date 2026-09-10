@@ -14,10 +14,11 @@ use super::{
     qwen_quant_profile, with_marlin_scratch,
 };
 
-// The dense-route policy; POLICY_ID is consumed by the stats aggregation in
-// the parent module's own inclusion, hence the dead-code allow here.
+// The dense-route policy: this inclusion reads HAS_EXACT_CELLS/select_exact/
+// fallback; POLICY_ID is dead-but-shared here because only the parent module's
+// own inclusion (quant_linear.rs) consumes it for stats aggregation.
+#[allow(dead_code)]
 mod qwen_fp8_dense_policy {
-    #![allow(dead_code)]
     include!("generated/qwen_fp8_dense_projection.rs");
 }
 

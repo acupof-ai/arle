@@ -76,7 +76,6 @@ impl Dsv4DsaOfficialState {
     /// state: the transient `rotated_keys` staging buffer only. The slot's
     /// `dsa_key_cache` band is owned by [`Dsv4LayerKvLayout::dsa_key_cache`]
     /// (summed there once), not here.
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.rotated_keys.len() * std::mem::size_of::<half::bf16>()
     }
@@ -333,7 +332,6 @@ impl Dsv4DsaSharedScratch {
     /// [`dsv4_dsa_shared_scratch_bytes`] predicts the batch-INDEPENDENT part for
     /// the KV budget; the batched part is folded into the per-slot budget term
     /// since it scales with `num_slots`.)
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
         let f32_sz = std::mem::size_of::<f32>();
@@ -577,7 +575,6 @@ pub(crate) struct Dsv4SpecRingSnapshot {
 impl Dsv4SpecRingSnapshot {
     /// Exact requested device bytes owned by this per-(slot,layer) spec-ring
     /// snapshot: the bf16 `sw_slots` + the optional `u8` `fp8_slots`.
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.sw_slots.len() * std::mem::size_of::<half::bf16>()
             + self.fp8_slots.as_ref().map_or(0, |s| s.len())
@@ -842,7 +839,6 @@ impl Dsv4LayerAttentionState {
     /// state: `sw_window_cache` + each `Option` sub-struct's `device_bytes()`.
     /// `prefill_linear` was hoisted out to the adapter (#85) and is summed
     /// there; the FlashMLA FP8 KV pool pages live in `Dsv4LayerKvLayout`.
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.sw_window_cache.len() * std::mem::size_of::<half::bf16>()
             + self.compressor.as_ref().map_or(0, |s| s.device_bytes())
@@ -931,7 +927,6 @@ impl Dsv4LayerAttentionState {
     }
 
     /// Per-component byte breakdown for the VRAM ledger log.
-    #[allow(dead_code)]
     pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
         vec![
             (

@@ -131,7 +131,6 @@ impl Dsv4CompressorState {
         (pkv, psc, prkv, prsc, comp)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let bf16 = std::mem::size_of::<half::bf16>();
         let f32 = std::mem::size_of::<f32>();
@@ -820,12 +819,10 @@ impl Dsv4KvAdapter {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
         let layers_bytes: usize = self.layers.iter().map(|l| l.device_bytes()).sum();
         vec![
@@ -1466,7 +1463,6 @@ impl Dsv4LayerKvLayout {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.flashmla_kv_pool
             .as_ref()

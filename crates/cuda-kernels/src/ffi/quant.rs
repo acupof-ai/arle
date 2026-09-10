@@ -1,6 +1,5 @@
 use super::{CUresult, CUstream, Half};
 
-#[allow(dead_code)]
 unsafe extern "C" {
     pub fn cast_bf16_to_f32_cuda(
         r#in: *const Half,

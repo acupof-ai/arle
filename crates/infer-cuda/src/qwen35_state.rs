@@ -193,7 +193,6 @@ pub(crate) fn alloc_recurrent_block(
 }
 
 impl Qwen35RecurrentSnapshot {
-    #[allow(dead_code)]
     pub(crate) fn host_bytes(&self) -> usize {
         self.gdr.iter().map(|v| v.len() * 4).sum::<usize>()
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
@@ -872,7 +871,6 @@ impl Qwen35SlotState {
     }
 }
 
-#[allow(dead_code)] // consumed by mtp_forward_level + spec_step
 impl DenseMlp {
     /// Half the fused projection's output rows (SwiGLU gate+up).
     pub(crate) fn inter_dim(&self) -> usize {
