@@ -84,6 +84,7 @@ export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
 # new — skip it. Empty stdin (manual run) defaults to compiling.
 # changed_files also drives the CUDA lint freshness assertion below.
 SKIP_CARGO=0
+SKIP_SHELL_TESTS=0
 CUDA_CRATES_CHANGED=0
 changed_files=""
 while read -r _local_ref local_sha _remote_ref remote_sha; do
@@ -101,6 +102,23 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     fi
     if grep -qE '^crates/(infer-cuda|cuda-kernels)/' <<< "${changed_files}"; then
         CUDA_CRATES_CHANGED=1
+    fi
+    # The scripts/tests/*.sh batch (lever gate, pod flow, prebuilt export, …)
+    # takes minutes and can hold the already-open SSH connection idle long
+    # enough for the remote to drop it (push exits 141 after the checks pass).
+    # Run it whenever the push could change what those tests exercise. Their
+    # inputs are not only scripts/ and CI: several read real tree files —
+    #   test_cuda_prebuilt_export / test_kernel_artifact_qualification /
+    #   test_pod_flow read crates/cuda-kernels/{build.rs,kernels.toml,generated}
+    #   and the crate as a package; test_hook_disowns_git_env reads
+    #   .githooks/pre-push; test_pod_flow also copies the root .gitignore.
+    # Trigger on the whole crates/cuda-kernels/ crate (conservative) plus
+    # scripts/ .githooks/ .github/ and .gitignore. Everything else (docs-only,
+    # ledger) skips; hygiene and fmt always run (whole tree). Empty stdin
+    # (manual run) defaults to running the batch.
+    if ! grep -qE '^(scripts|\.githooks|\.github)/|^\.gitignore$|^crates/cuda-kernels/' <<< "${changed_files}"; then
+        SKIP_SHELL_TESTS=1
+        info "no shell-test inputs (scripts/.githooks/.github/cuda-kernels/.gitignore) in pushed range; skipping shell test batch"
     fi
     break
 done
@@ -163,6 +181,9 @@ run_fast_checks() {
     run_fast python3 scripts/check_repo_hygiene.py
     run_fast python3 scripts/check_repo_hygiene.py --selftest
     run_fast cargo fmt --all -- --check
+    if [[ "${SKIP_SHELL_TESTS}" == "1" ]]; then
+        return 0
+    fi
     for test in \
         test_cuda_prebuilt_export.sh \
         test_lever_gate.sh \
@@ -172,6 +193,7 @@ run_fast_checks() {
         test_pod_tree_identity.sh \
         test_hook_disowns_git_env.sh \
         test_hook_cuda_lint_freshness.sh \
+        test_hook_skips_shell_tests.sh \
         test_bench_ab_control_arm.sh; do
         run_fast bash "scripts/tests/${test}"
     done
