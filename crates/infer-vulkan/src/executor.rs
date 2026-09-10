@@ -7,7 +7,7 @@
 
 use anyhow::{Result, bail, ensure};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult};
+use infer_seam::{BackendExecutor, KvBatchDescriptor, PollResult};
 
 use crate::kv_pool::VulkanKvPool;
 
@@ -184,10 +184,10 @@ impl BackendExecutor for VulkanExecutor {
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        _kv: &mut dyn KvSlotAccounting,
     ) -> Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
             return Ok(Box::new(VulkanInflight::Ready(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: Vec::new(),
             })));
         }
@@ -212,6 +212,7 @@ impl BackendExecutor for VulkanExecutor {
                 position,
             )?;
             return Ok(Box::new(VulkanInflight::Ready(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -237,6 +238,7 @@ impl BackendExecutor for VulkanExecutor {
                 position,
             )?;
             return Ok(Box::new(VulkanInflight::Ready(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -342,6 +344,7 @@ pub fn load_qwen3_gguf(
 mod tests {
     use super::*;
     use infer_plan::{DecodeRow, ForwardMode, PrefillRow};
+    use infer_seam::KvSlotAccounting;
 
     fn one_row_plan(decode: bool) -> ForwardPlan {
         ForwardPlan {
@@ -411,9 +414,7 @@ mod tests {
         let mut exec = VulkanExecutor::unloaded();
         let mut pool = pool();
         let batch = KvBatchDescriptor::from_plan(&ForwardPlan::idle(), &pool).unwrap();
-        let inflight = exec
-            .submit(&ForwardPlan::idle(), &batch, &mut pool)
-            .unwrap();
+        let inflight = exec.submit(&ForwardPlan::idle(), &batch).unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => assert!(out.tokens.is_empty()),
             PollResult::NotReady(_) => panic!("P2 resolves synchronously"),
@@ -427,12 +428,12 @@ mod tests {
         pool.alloc(0, 3).unwrap();
         let prefill = one_row_plan(false);
         let batch = KvBatchDescriptor::from_plan(&prefill, &pool).unwrap();
-        let err = exec.submit(&prefill, &batch, &mut pool).unwrap_err();
+        let err = exec.submit(&prefill, &batch).unwrap_err();
         assert!(err.to_string().contains("no model loaded"), "{err}");
         pool.alloc(0, 1).unwrap();
         let decode = one_row_plan(true);
         let batch = KvBatchDescriptor::from_plan(&decode, &pool).unwrap();
-        let err = exec.submit(&decode, &batch, &mut pool).unwrap_err();
+        let err = exec.submit(&decode, &batch).unwrap_err();
         assert!(err.to_string().contains("no model loaded"), "{err}");
     }
 

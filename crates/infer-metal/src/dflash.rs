@@ -1131,6 +1131,7 @@ pub(crate) fn qwen35_speculative_block(
 
     Ok(DFlashBlockResult {
         output: StepOutput {
+            kv_actual: Vec::new(),
             tokens: accepted_tokens
                 .into_iter()
                 .map(|token| SlotToken {

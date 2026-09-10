@@ -9,7 +9,7 @@ use infer_plan::{
     SamplingParams, SlotToken, StepOutput, generate_diffusion_with_cancel,
 };
 
-use crate::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult};
+use crate::{BackendExecutor, KvBatchDescriptor, PollResult};
 
 #[derive(Debug, Clone)]
 struct BufferedToken {
@@ -99,6 +99,7 @@ impl<M> BufferedDiffusionExecutor<M> {
             state.prompt.clear();
         }
         Ok(StepOutput {
+            kv_actual: Vec::new(),
             tokens: vec![SlotToken {
                 slot,
                 token: token.token,
@@ -134,7 +135,10 @@ impl<M> BufferedDiffusionExecutor<M> {
             }
             state.prompt.extend_from_slice(&row.tokens);
             if state.prompt.len() < row.total_tokens {
-                return Ok(StepOutput { tokens: Vec::new() });
+                return Ok(StepOutput {
+                    tokens: Vec::new(),
+                    kv_actual: Vec::new(),
+                });
             }
             state.prompt.clone()
         };
@@ -193,10 +197,12 @@ where
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        _kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
-            return Ok(Box::new(StepOutput { tokens: Vec::new() }));
+            return Ok(Box::new(StepOutput {
+                tokens: Vec::new(),
+                kv_actual: Vec::new(),
+            }));
         }
         anyhow::ensure!(
             !self

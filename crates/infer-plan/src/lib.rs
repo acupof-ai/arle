@@ -145,6 +145,12 @@ pub struct SlotToken {
 pub struct StepOutput {
     /// Tokens sampled by this step, keyed by engine slot.
     pub tokens: Vec<SlotToken>,
+    /// Host KV length the backend actually reached per slot this step. The
+    /// engine is the sole writer of the host KV pool; backends report the
+    /// adjustment and the engine applies it after poll. Last entry wins per
+    /// slot within a step.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub kv_actual: Vec<(usize, usize)>,
 }
 
 /// Pure-data subset of the runtime sampling contract; penalty and filtering

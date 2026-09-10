@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult, PrefixBlock};
+use infer_seam::{BackendExecutor, KvBatchDescriptor, PollResult, PrefixBlock};
 
 #[cfg(feature = "metal")]
 use crate::{config, dflash, lfm2, mlx, model_source, qwen35};
@@ -239,6 +239,7 @@ fn sample_inflight(
         Vec::new()
     };
     MetalInflight::Ready(StepOutput {
+        kv_actual: Vec::new(),
         tokens: vec![SlotToken {
             slot,
             token,
@@ -256,6 +257,7 @@ fn materialize_inflight_now(inflight: MetalInflight) -> anyhow::Result<StepOutpu
         MetalInflight::Sampled { slot, sampled } => {
             mlx::eval(&[&sampled]);
             Ok(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: vec![SlotToken {
                     slot,
                     token: sampled.item_i32() as u32,
@@ -379,7 +381,10 @@ impl MetalExecutor {
                 finish: None,
             }))
             .collect();
-        StepOutput { tokens }
+        StepOutput {
+            tokens,
+            kv_actual: Vec::new(),
+        }
     }
 }
 
@@ -388,16 +393,15 @@ impl BackendExecutor for MetalExecutor {
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {
             return real
-                .submit(plan, batch, kv)
+                .submit(plan, batch)
                 .map(|i| Box::new(i) as Box<dyn std::any::Any + Send>);
         }
         #[cfg(not(feature = "metal"))]
-        let _ = (batch, kv);
+        let _ = batch;
 
         Ok(Box::new(MetalInflight::Ready(Self::placeholder_forward(
             plan,
@@ -421,6 +425,7 @@ impl BackendExecutor for MetalExecutor {
                 mlx::eval(&[&sampled]);
                 let token = sampled.item_i32() as u32;
                 Ok(PollResult::Ready(StepOutput {
+                    kv_actual: Vec::new(),
                     tokens: vec![SlotToken {
                         slot,
                         token,
@@ -714,7 +719,6 @@ impl RealMetalExecutor {
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        _kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<MetalInflight> {
         let _guard = mlx_sys::mlx_guard();
         let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
@@ -794,7 +798,10 @@ impl RealMetalExecutor {
         // running the more expensive prefill sub-steps.
         let mut tokens = self.run_dflash_decode_rows(decode_rows)?.tokens;
         tokens.extend(self.run_dflash_prefill_rows(prefill_rows, batch)?.tokens);
-        Ok(MetalInflight::Ready(StepOutput { tokens }))
+        Ok(MetalInflight::Ready(StepOutput {
+            tokens,
+            kv_actual: Vec::new(),
+        }))
     }
 
     fn preflight_dflash_prefill_rows(&self, rows: &[infer_plan::PrefillRow]) -> anyhow::Result<()> {
@@ -847,7 +854,10 @@ impl RealMetalExecutor {
             let output = materialize_inflight_now(self.submit_prefill(row, batch)?)?;
             tokens.extend(output.tokens);
         }
-        Ok(StepOutput { tokens })
+        Ok(StepOutput {
+            tokens,
+            kv_actual: Vec::new(),
+        })
     }
 
     fn submit_prefill(
@@ -1047,7 +1057,10 @@ impl RealMetalExecutor {
             let output = self.run_dflash_decode_row(row)?;
             tokens.extend(output.tokens);
         }
-        Ok(StepOutput { tokens })
+        Ok(StepOutput {
+            tokens,
+            kv_actual: Vec::new(),
+        })
     }
 
     fn preflight_dflash_decode_rows(
@@ -1248,6 +1261,7 @@ impl RealMetalExecutor {
                 );
             }
             return Ok(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token: next_token,
@@ -1414,6 +1428,7 @@ impl RealMetalExecutor {
         }
         tokens.push(next_token);
         Ok(StepOutput {
+            kv_actual: Vec::new(),
             tokens: tokens
                 .into_iter()
                 .map(|token| SlotToken {
@@ -2554,7 +2569,7 @@ mod tests {
             prefill_rows: Vec::new(),
         };
         let batch = KvBatchDescriptor::from_plan(&plan, &pool).unwrap();
-        let inflight = exec.submit(&plan, &batch, &mut pool).unwrap();
+        let inflight = exec.submit(&plan, &batch).unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => {
                 assert_eq!(out.tokens.len(), 2);
@@ -2585,7 +2600,7 @@ mod tests {
             }],
         };
         let batch = KvBatchDescriptor::from_plan(&plan, &pool).unwrap();
-        let inflight = exec.submit(&plan, &batch, &mut pool).unwrap();
+        let inflight = exec.submit(&plan, &batch).unwrap();
         match exec.poll(inflight).unwrap() {
             PollResult::Ready(out) => {
                 assert_eq!(out.tokens.len(), 1);
