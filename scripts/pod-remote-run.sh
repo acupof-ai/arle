@@ -9,6 +9,10 @@ sha256() { sha256sum "$1" | cut -d' ' -f1; }
 source_digest() { bash "$TREE/scripts/pod-remote-build.sh" source-digest "$TREE"; }
 field() { awk -F= -v key="$2" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "$1" 2>/dev/null; }
 proc_start() { awk '{print $22}' "$PROC_ROOT/$1/stat" 2>/dev/null; }
+# VRAM occupancy in MiB, empty on query failure. The entry gate fails OPEN on
+# an unreadable GPU (claims still apply) and CLOSED on a busy one — a process
+# without a claim is invisible to pick-gpu, so the hard check is the VRAM read.
+gpu_used_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$1" 2>/dev/null | tr -d ' '; }
 write_receipt() { local dst="$1" tmp="$1.tmp.$$"; shift; printf '%s\n' "$@" > "$tmp" && mv "$tmp" "$dst"; }
 update_receipt() {
   python3 - "$@" <<'PY'
@@ -192,7 +196,7 @@ PY
     process_pgid="$(ps -o pgid= -p $$ | tr -d ' ')"; process_start="$(proc_start $$)"
     printf '%s\n' "schema=arle-process-v1" "kind=run" "expected_helper=$TREE/scripts/pod-remote-run.sh" "operation=$OP" "pid=$$" "pgid=$process_pgid" "start=$process_start" "expected_binary=$binary" > "$DIR/process"
     exec >"$LOG" 2>&1
-    rc=1; claims=(); binary_sha=""; source_head=""; source_digest_value=""; kernel_id=""; producer_id=""; embedded_id=""; selected_gpu="$GPU"
+    rc=1; claims=(); binary_sha=""; source_head=""; source_digest_value=""; kernel_id=""; producer_id=""; embedded_id=""; selected_gpu="$GPU"; selected_gpus=()
     if [ ! -f "$BUILD_RECEIPT" ] || [ "$(field "$BUILD_RECEIPT" schema)" != arle-build-v1 ] || [ "$(field "$BUILD_RECEIPT" exit)" != 0 ]; then
       echo "successful build receipt required: build:$BUILD"
     else
@@ -214,7 +218,20 @@ PY
         else
           IFS=',' read -r -a selected_gpus <<< "$selected_gpu"
           for gpu in "${selected_gpus[@]}"; do claims+=("${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$gpu"); done
-          if ! write_receipt "$RECEIPT" "schema=arle-run-v1" "state=running-unobserved" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "claim_pid=$$" "claim_start=$process_start" "pid=$$" "pgid=$process_pgid" "start=$process_start" "launched_at=$(date -u +%FT%TZ)"; then
+          # Hard entry gate: refuse when a selected card already holds a
+          # process (>= GPU_BUSY_MIB used), claimed or not. An idle card reads
+          # a few MiB; 64 is the busy cutoff. Fails open on query failure.
+          busy_threshold="${GPU_BUSY_MIB:-64}"
+          busy=""
+          for gpu in "${selected_gpus[@]}"; do
+            used="$(gpu_used_mib "$gpu")"
+            if [ -n "$used" ] && [ -z "${used//[0-9]/}" ] && [ "$used" -ge "$busy_threshold" ]; then
+              busy="$busy $gpu(${used}MiB)"
+            fi
+          done
+          if [ -n "$busy" ]; then
+            echo "gpu busy, refusing:$busy"
+          elif ! write_receipt "$RECEIPT" "schema=arle-run-v1" "state=running-unobserved" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "claim_pid=$$" "claim_start=$process_start" "pid=$$" "pgid=$process_pgid" "start=$process_start" "launched_at=$(date -u +%FT%TZ)"; then
             echo "failed to persist launch receipt"
             rc=1
           else
@@ -258,6 +275,10 @@ PY
       write_receipt "$RECEIPT" "schema=arle-run-v1" "state=exited" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "pid=$$" "pgid=$process_pgid" "start=$process_start" "exit=$rc" "finished_at=$(date -u +%FT%TZ)"
     fi
     write_receipt "$MARKER" "RUN_EXIT=$rc" "operation=$OP"
+    for gpu in "${selected_gpus[@]}"; do
+      used="$(gpu_used_mib "$gpu")"
+      printf 'gpu %s used %s MiB at exit\n' "$gpu" "${used:-unknown}"
+    done
     printf 'RUN_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;

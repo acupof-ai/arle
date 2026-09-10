@@ -110,6 +110,7 @@ cat > "$BIN/nvidia-smi" <<'SH'
 case "$*" in
   *--query-compute-apps=gpu_uuid*) printf '%b' "${SMI_COMPUTE:-}" ;;
   *--query-gpu=index,uuid,memory.used,compute_cap*) printf '%b\n' "${SMI:-0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0}" ;;
+  *--query-gpu=memory.used*) printf '%s\n' "${SMI_USED:-0}" ;;
   *) printf '%b\n' "${SMI:-0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0}" ;;
 esac
 SH
@@ -208,6 +209,22 @@ POD_TREE="$TREE" POD_STATE="$STATE" ARLE_GPU_CLAIMS="$TP4_CLAIMS" SMI="$TP4_SET"
 [ "$(awk -F= '$1=="op" {print $2}' "$TP4_CLAIMS/2")" = foreign ]
 for gpu in 0 1 3; do [ ! -e "$TP4_CLAIMS/$gpu" ]; done
 unset CLAIM_SWAP ENV_OUT
+
+# Entry gate: a card holding >= GPU_BUSY_MIB is refused even with no claim on
+# it (harder than the claim convention — a non-claimant process is invisible
+# to pick-gpu). Reverse control: under the threshold the same run launches.
+printf '%s\0' serve > "$TMP/gate-argv"
+printf '%s\0' serve > "$TMP/gate-pass-argv"
+set +e
+SMI_USED=200 ARLE_GPU_CLAIMS="$TMP/gate-claims" POD_TREE="$TREE" POD_STATE="$STATE" setsid bash "$TREE/scripts/pod-remote-run.sh" run good busy-gpu 0 op-busy "$TMP/gate-argv" >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] || { echo "entry gate did not refuse a busy GPU" >&2; exit 1; }
+grep -q 'gpu busy, refusing' "$STATE/runs/busy-gpu/log"
+set +e
+SMI_USED=0 ARLE_GPU_CLAIMS="$TMP/gate-claims" POD_TREE="$TREE" POD_STATE="$STATE" setsid bash "$TREE/scripts/pod-remote-run.sh" run good gate-pass 0 op-pass "$TMP/gate-pass-argv" >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -eq 0 ] || { command cat "$STATE/runs/gate-pass/log" >&2; exit 1; }
+[ "$(awk -F= '$1=="exit" {print $2}' "$STATE/runs/gate-pass/receipt")" = 0 ]
 
 mkdir -p "$STATE/runs/stale"
 printf 'op=foreign\npid=%s\npgid=%s\nstart=0\n' "$$" "$$" > "$STATE/runs/stale/process"
