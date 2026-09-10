@@ -26,9 +26,9 @@ fn tensors(pairs: &[(&str, Dtype, &[usize])]) -> BTreeMap<String, TensorHeader> 
         .collect()
 }
 
-fn detect<'a>(
+fn detect(
     name: &str,
-    t: &'a BTreeMap<String, TensorHeader>,
+    t: &BTreeMap<String, TensorHeader>,
     manifest: Option<&QuantManifest>,
 ) -> anyhow::Result<Option<infer_quant::QuantTensorView>> {
     detect_quant_format(name, t, manifest)
