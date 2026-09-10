@@ -359,6 +359,66 @@ printf more >> "$LOCAL/untracked space"
 "$LOCAL/scripts/pod.sh" sync >/dev/null
 [ "$(awk -F= '$1=="digest" {print $2}' "$TREE/.arle-source-receipt")" = "$clean_digest" ]
 
+# kernel-ab: both arms run at the same shape/iters against one build, and a
+# failing arm propagates. The mock appends argv — the run mode's mock
+# overwrites ARGV_OUT per call and could not see both invocations.
+mkdir -p "$STATE/builds/kab" "$STATE/builds/kabfast"
+cat > "$TREE/target/release/arle-ab" <<'SH'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >> "$ARGV_APPEND"
+[ -z "${KAB_FAIL:-}" ] || exit 1
+SH
+chmod +x "$TREE/target/release/arle-ab"
+absha="$(sha256sum "$TREE/target/release/arle-ab" | cut -d' ' -f1)"
+head_now="$(git -C "$TREE" rev-parse HEAD)"
+# Live dirty digest, not the sync receipt's: the guard recomputes dirty, and
+# the gitignored generated/ bundle makes them differ. The run test patches
+# both receipts to the live value for the same reason.
+digest_now="$(POD_TREE="$TREE" bash "$TREE/scripts/pod-remote-build.sh" source-digest "$TREE")"
+python3 - "$TREE/.arle-source-receipt" "$digest_now" <<'PY'
+import sys
+p, digest = sys.argv[1:]
+lines = open(p).read().splitlines()
+open(p, "w").write("\n".join(f"digest={digest}" if x.startswith("digest=") else x for x in lines) + "\n")
+PY
+printf 'schema=arle-build-v1\nexit=0\nprofile=release\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\nkernel_id=kernel-123\n' "$TREE/target/release/arle-ab" "$absha" "$head_now" "$digest_now" > "$STATE/builds/kab/receipt"
+printf 'schema=arle-build-v1\nexit=0\nprofile=release-fast\nbinary=%s\nbinary_sha=%s\nsource_head=%s\nsource_digest=%s\n' "$TREE/target/release/arle-ab" "$absha" "$head_now" "$digest_now" > "$STATE/builds/kabfast/receipt"
+export ARGV_APPEND="$TMP/kab-seen"
+KAB_CLAIMS="$TMP/kab-claims"
+set +e
+POD_TREE="$TREE" POD_STATE="$STATE" ARLE_GPU_CLAIMS="$KAB_CLAIMS" bash "$TREE/scripts/pod-remote-run.sh" kernel-ab kab kabok 0 1,64,32 7 >/dev/null
+rc=$?; set -e
+[ "$rc" -eq 0 ] || { cat "$STATE/runs/kabok/log" >&2; exit 1; }
+tr '\0' '\n' < "$TMP/kab-seen" > "$TMP/kab-seen.lines"
+grep -Fxq fp4-gemv "$TMP/kab-seen.lines"
+grep -Fxq marlin-fp4-gemm "$TMP/kab-seen.lines"
+[ "$(grep -c '^1,64,32$' "$TMP/kab-seen.lines")" = 2 ]
+[ "$(grep -c '^7$' "$TMP/kab-seen.lines")" = 2 ]
+python3 - "$TMP/kab-seen.lines" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+assert lines.index("fp4-gemv") < lines.index("marlin-fp4-gemm"), "arm order changed"
+PY
+grep -Fxq 'gpu=0' "$STATE/runs/kabok/receipt"
+grep -Fxq 'shape=1,64,32' "$STATE/runs/kabok/receipt"
+grep -Fxq 'iters=7' "$STATE/runs/kabok/receipt"
+grep -Fxq 'KERNEL_AB_EXIT=0' "$STATE/runs/kabok/terminal"
+[ ! -e "$KAB_CLAIMS/0" ]
+# A failing arm propagates to the run exit and still releases the GPU.
+set +e
+KAB_FAIL=1 POD_TREE="$TREE" POD_STATE="$STATE" ARLE_GPU_CLAIMS="$KAB_CLAIMS" bash "$TREE/scripts/pod-remote-run.sh" kernel-ab kab kabfail 0 1,64,32 7 >/dev/null
+rc=$?; set -e
+[ "$rc" -eq 1 ] || { cat "$STATE/runs/kabfail/log" >&2; exit 1; }
+grep -Fxq 'KERNEL_AB_EXIT=1' "$STATE/runs/kabfail/terminal"
+grep -Fxq 'exit=1' "$STATE/runs/kabfail/receipt"
+[ ! -e "$KAB_CLAIMS/0" ]
+# A bench-labelled A/B refuses a non-release build.
+set +e
+POD_TREE="$TREE" POD_STATE="$STATE" ARLE_GPU_CLAIMS="$KAB_CLAIMS" bash "$TREE/scripts/pod-remote-run.sh" kernel-ab kabfast bench-kabguard 0 1,64,32 7 >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] && grep -q 'bench run requires a release build' "$STATE/runs/bench-kabguard/log"
+unset ARGV_APPEND KAB_FAIL
+
 # Negative control for the push_scripts-in-sync bootstrap fix. apply-sync runs
 # the deployed tree's script, so a remote whose digest algorithm is older than
 # the pusher's verifies with the old format and fails every sync until a human

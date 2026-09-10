@@ -239,6 +239,16 @@ case "$cmd" in
     "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-run.sh' run '$build' '$label' '$gpu' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
     echo "run '$label' launched from build:$build; GPU=$gpu"
     ;;
+  kernel-ab)
+    build="${1:-}"
+    [ -n "$build" ] || { echo "usage: pod.sh kernel-ab <build-label> [run-label] [auto|GPU] [shape] [iters]" >&2; exit 2; }
+    label="${2:-$(new_label kab)}"; gpu="${3:-auto}"; shape="${4:-1,34816,5120}"; iters="${5:-100}"
+    valid_label "$build"; valid_label "$label"
+    [ "$gpu" = auto ] || case "$gpu" in ''|*[!0-9]*) echo "invalid GPU: $gpu (auto or one index)" >&2; exit 2;; esac
+    case "$iters" in ''|*[!0-9]*) echo "invalid iters: $iters" >&2; exit 2;; esac
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-run.sh' kernel-ab '$build' '$label' '$gpu' '$shape' '$iters' </dev/null >/dev/null 2>&1 &"
+    echo "kernel-ab '$label' launched from build:$build; GPU=$gpu shape=$shape iters=$iters"
+    ;;
   gpus)
     "$POD" "nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader"
     ;;
@@ -267,6 +277,7 @@ case "$cmd" in
       'pod.sh sync [--dirty] [--full]' \
       'pod.sh build [label] [cargo argv...]' \
       'pod.sh run <build-label> [run-label] [auto|GPU|GPU,...] -- [arle argv...]' \
+      'pod.sh kernel-ab <build-label> [run-label] [auto|GPU] [shape] [iters]' \
       'pod.sh status [run-label] (no arg: tree head + latest build sha)' \
       'pod.sh ready|log|kill <run-label> [timeout]' \
       'pod.sh gpus | setup | setup-sccache | sccache-stats'
