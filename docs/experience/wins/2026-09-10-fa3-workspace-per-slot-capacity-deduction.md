@@ -1,5 +1,13 @@
 # FA3 quantized-attention workspace becomes a per-slot line item in the qwen35 capacity solve
 
+Status: **pending-remote** — code landed on `lane/fa3-ws-solve` (PR #281); the
+GPU boot/refusal outcome below has not run. Do not read the correctness claims
+as verified. What IS verified locally (Mac, no GPU): the infer-model solve
+tests (15/15, incl. the per-slot workspace deduction), the Mac CUDA clippy
+gate, hygiene, and fmt. What is NOT verified: that the Qwen3.8-27B-NVFP4 /
+32K / 256-slot config now boots with reduced slots or is refused at boot with
+the shortfall named — that needs the model on a GPU.
+
 Date: 2026-09-10 · Lane: lane/fa3-ws-solve · Task #18 (fa3-workspace-in-resource-solve)
 
 ## Context
