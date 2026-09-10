@@ -32,7 +32,11 @@ shift || true
 # broke on every other box layout (silent exit 3 at serve boot).
 BIN="${BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/arle}"
 MODEL="${MODEL:-/data00/DeepSeek-V4-Flash-FP8}"
-PORT="${PORT:-18189}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Per-tree port: two lanes pushing at once both run this gate from their own
+# snapshot tree, and a fixed default made the second serve fail to bind.
+PORT="${PORT:-$((18189 + 0x$(printf '%s' "$ROOT" | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-4) % 200))}"
+export PORT
 LENGTHS="${LENGTHS:-115,300,446,2000,8000}"
 RUNS="${RUNS:-3}"
 SERVE_FLAGS="${SERVE_FLAGS:-}"
@@ -40,7 +44,6 @@ OUT="${OUT:-needle_gate_${LABEL}.log}"
 STATS_OUT="${STATS_OUT:-}"
 EXPECTED_PRODUCT_SHA256="${EXPECTED_PRODUCT_SHA256:-}"
 EXPECTED_KERNEL_BUNDLE_ID="${EXPECTED_KERNEL_BUNDLE_ID:-}"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export RUST_LOG="${RUST_LOG:-info}"
 
 validate_summary() {

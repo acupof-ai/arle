@@ -147,6 +147,41 @@ expect_fail env EXPECTED_PRODUCT_SHA256="$SHA" STATS_OUT="$tmp/one.json" \
 expect_fail env EXPECTED_KERNEL_BUNDLE_ID="$KERNEL_ID" STATS_OUT="$tmp/one.json" \
     "$ROOT/scripts/lever_gate.sh" one-sided
 
+# Per-tree port derivation: two lanes pushing at once both run this gate, and a
+# fixed default made the second serve fail to bind. Two trees must derive
+# different ports and run concurrently without colliding.
+mkdir -p "$tmp/root2/scripts"
+cp "$ROOT/scripts/lever_gate.sh" "$tmp/root2/scripts/lever_gate.sh"
+cp "$ROOT/scripts/pick-gpu.sh" "$tmp/root2/scripts/pick-gpu.sh"
+cp "$ROOT/scripts/needle_summary.py" "$tmp/root2/scripts/needle_summary.py"
+cp "$tmp/needle.py" "$tmp/root2/scripts/needle_gate.py"
+cat >"$tmp/root2/scripts/needle_concurrent.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+sys.exit(0)
+EOF
+port_of() {  # mirror lever_gate.sh's derivation
+  local h; h="$(printf '%s' "$1" | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-4)"
+  echo $((18189 + 0x$h % 200))
+}
+p1="$(port_of "$tmp/root")"
+n=0; while [ "$(port_of "$tmp/root2$n")" = "$p1" ]; do n=$((n+1)); [ "$n" -lt 50 ] || { echo "port derivation collided 50 times" >&2; exit 1; }; done
+root2="$tmp/root2$n"
+mkdir -p "$root2/scripts"
+cp "$tmp/root2/scripts/"* "$root2/scripts/"
+run_gate_default() {  # $1 = tree root, $2 = stats out, $3 = log out
+  STATS="$STATS" SERVER="$tmp/server.py" BIN="$tmp/bin" MODEL=model GATE_PROFILE=generic \
+      LENGTHS=115 RUNS=1 STATS_OUT="$2" OUT="$3" EXPECTED_PRODUCT_SHA256="sha256:$SHA" \
+      EXPECTED_KERNEL_BUNDLE_ID="$KERNEL_ID" BASELINE_LOG="$tmp/identity-baseline.log" \
+      "$1/scripts/lever_gate.sh" identity >/dev/null
+}
+run_gate_default "$tmp/root" "$tmp/concurrent-1.json" "$tmp/gate-1.log" &
+wait1=$!
+run_gate_default "$root2" "$tmp/concurrent-2.json" "$tmp/gate-2.log"
+wait "$wait1"
+cmp <(printf '%s' "$STATS") "$tmp/concurrent-1.json"
+cmp <(printf '%s' "$STATS") "$tmp/concurrent-2.json"
+
 mkdir -p "$tmp/mock-bin" "$tmp/claims"
 cat > "$tmp/mock-bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
