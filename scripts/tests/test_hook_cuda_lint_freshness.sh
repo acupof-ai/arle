@@ -32,17 +32,24 @@ git -C "$FIX" config user.email t@e; git -C "$FIX" config user.name t
 git -C "$FIX" add -A && git -C "$FIX" commit -qm base
 printf '[package]\nname = "infer-cuda"\nedition = "2021"\n' > "$FIX/crates/infer-cuda/Cargo.toml"
 printf 'pub fn fixture() {}\n' > "$FIX/crates/infer-cuda/src/lib.rs"
+mkdir -p "$FIX/crates/infer-cuda/examples"
+printf 'fn main() { infer_cuda::fixture(); }\n' > "$FIX/crates/infer-cuda/examples/fixture_example.rs"
 git -C "$FIX" add -A && git -C "$FIX" commit -qm cuda
 base="$(git -C "$FIX" rev-parse HEAD~1)"; tip="$(git -C "$FIX" rev-parse HEAD)"
 
 # Mock cargo: every invocation exits 0. The CUDA clippy (-v, cuda,no-cuda)
-# prints MOCK_LINT_LINES; test and non-verbose clippy invocations print a
+# prints MOCK_LINT_LINES; the examples clippy (-v, --examples) prints
+# MOCK_EXAMPLES_LINES; test and non-verbose clippy invocations print a
 # Checking line per -p crate, unless MOCK_TEST_SKIP names it — the suppressed
 # crate is exactly what a Fresh / cross-contaminated target looks like.
 cat > "$BIN/cargo" <<'SH'
 #!/usr/bin/env bash
 verbose=0
 for a in "$@"; do [ "$a" = -v ] && verbose=1; done
+if [ "$verbose" = 1 ] && [[ " $* " == *" --examples "* ]]; then
+  printf '%b' "${MOCK_EXAMPLES_LINES-Checking fixture_example \n}"
+  exit 0
+fi
 if [ "$verbose" = 1 ] && [[ " $* " == *" cuda,no-cuda "* ]]; then
   printf '%b' "${MOCK_LINT_LINES:-Checking infer-api }"
   exit 0
@@ -116,4 +123,20 @@ grep -q 'reported infer-core Fresh while this push changes it' "$TMP/test-red.lo
 MOCK_COLOR=1 run_hook "$coretip" "$corebase" >"$TMP/color.log" 2>&1 \
   || { echo "FAIL: color world rejected rebuilt crates" >&2; cat "$TMP/color.log" >&2; exit 1; }
 
-echo "PASS: CUDA lint + test-step freshness assertions (red/green/new-branch/control/test-red/color)"
+# Red world for the examples guard: a push changing an example file, the
+# examples clippy reports everything Fresh. The lib lint passes (its Checking
+# lines are present) so this isolates the examples assertion.
+printf 'fn main() { infer_cuda::fixture(); println!("tick"); }\n' > "$FIX/crates/infer-cuda/examples/fixture_example.rs"
+git -C "$FIX" add -A && git -C "$FIX" commit -qm examples
+exbase="$(git -C "$FIX" rev-parse HEAD~1)"; extip="$(git -C "$FIX" rev-parse HEAD)"
+set +e
+MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' MOCK_EXAMPLES_LINES='' run_hook "$extip" "$exbase" >"$TMP/ex-red.log" 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] || { echo "FAIL: examples red world passed — Fresh examples run not caught" >&2; cat "$TMP/ex-red.log" >&2; exit 1; }
+grep -q 'examples lint reported everything Fresh' "$TMP/ex-red.log"
+
+# Green world for the examples guard: the examples clippy checks the example.
+MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' MOCK_EXAMPLES_LINES='Checking fixture_example \n' run_hook "$extip" "$exbase" >"$TMP/ex-green.log" 2>&1 \
+  || { echo "FAIL: examples green world rejected" >&2; cat "$TMP/ex-green.log" >&2; exit 1; }
+
+echo "PASS: CUDA lint + test-step freshness assertions (red/green/new-branch/control/test-red/color/examples-red/examples-green)"
