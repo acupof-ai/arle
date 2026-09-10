@@ -58,7 +58,10 @@ match — that would break the real code. The instinct is doubly dangerous now:
 e2's #276 changes that exact signature for real, so the fake error and the
 real migration look identical.** A fake API-mismatch error in the hook
 (E0050/E0063 naming APIs that match main) means the shared target was damaged
-by a concurrent deletion; clean before touching code:
+by a concurrent deletion. First rule out the ANSI false positive (Follow-up
+2): a *stable* `Fresh while this push changes it` on every push touching a
+crate is the color bug, not contamination — cleaning does not help and sends
+you in circles. Otherwise clean before touching code:
 
 ```
 CARGO_TARGET_DIR=<main-checkout>/target/pre-push-quick cargo clean
@@ -78,6 +81,14 @@ unlocked shared target:
 - The cold rebuild that follows a full clean OOM-killed the push on a Mac
   under memory pressure. `CARGO_BUILD_JOBS=4` on the `lane.sh pr` invocation
   caps it; the push then completes.
+
+## Follow-up 2 (same day): the test-step assertion's ANSI false positive
+
+`assert_step_rebuilt` shipped with a stable false positive — every push
+touching a group-2 crate blocked, and the clean remedy did nothing. Full
+account in `2026-09-10-hook-freshness-ansi-false-positive.md`; fixed in #282.
+The lesson for this entry's remedy: a *stable* Fresh failure on every push
+is the ANSI bug, not contamination — clean first only after ruling it out.
 
 ## Rule
 
