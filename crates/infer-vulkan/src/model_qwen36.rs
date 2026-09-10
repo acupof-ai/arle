@@ -358,11 +358,10 @@ mod tests {
             }
 
             let mut generated = Vec::new();
-            let mut pos = prompt_ids.len();
             let decode_start = std::time::Instant::now();
             let submits_before = model.decode_submit_count();
             let mut decode_tokens = 0usize;
-            for _ in 0..max_new {
+            for next_pos in (prompt_ids.len()..).take(max_new) {
                 let next = argmax_of(&last_logits) as u32;
                 if Some(next) == eos {
                     eprintln!("  hit eos at gen step {}", generated.len());
@@ -370,14 +369,13 @@ mod tests {
                 }
                 generated.push(next);
                 last_logits = model
-                    .forward_token(0, 0, next, pos)
-                    .unwrap_or_else(|e| panic!("gen forward_token(pos={pos}) failed: {e}"));
+                    .forward_token(0, 0, next, next_pos)
+                    .unwrap_or_else(|e| panic!("gen forward_token(pos={next_pos}) failed: {e}"));
                 assert!(
                     last_logits.iter().all(|v| v.is_finite()),
-                    "gen logits at pos {pos} contain NaN/Inf"
+                    "gen logits at pos {next_pos} contain NaN/Inf"
                 );
                 decode_tokens += 1;
-                pos += 1;
             }
             let elapsed = decode_start.elapsed().as_secs_f64();
             if decode_tokens > 0 {

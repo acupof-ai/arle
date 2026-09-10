@@ -91,8 +91,10 @@ fn read_f32(buf: &DeviceBuffer<'_>, n: usize) -> Vec<f32> {
     let mut bytes = vec![0u8; n * 4];
     buf.copy_to_host(&mut bytes).expect("read back f32 buffer");
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -309,8 +311,10 @@ fn f16_kv_pack_matches_host_rne_oracle() {
         let mut bytes = vec![0u8; n * 2];
         buf_dst.copy_to_host(&mut bytes).expect("read back f16 dst");
         let got: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
             assert_eq!(

@@ -165,8 +165,10 @@ fn plain_gemv(
     let mut out_bytes = vec![0u8; out_len];
     buf_d.copy_to_host(&mut out_bytes).expect("read back dst");
     out_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -218,8 +220,10 @@ fn fused_gemv_id(
         .copy_to_host(&mut out_bytes)
         .expect("read back fused dst");
     out_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

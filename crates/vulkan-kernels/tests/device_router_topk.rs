@@ -49,8 +49,10 @@ fn read_f32(buf: &DeviceBuffer<'_>, n: usize) -> Vec<f32> {
     let mut bytes = vec![0u8; n * 4];
     buf.copy_to_host(&mut bytes).expect("read back f32 buffer");
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -58,8 +60,10 @@ fn read_i32(buf: &DeviceBuffer<'_>, n: usize) -> Vec<i32> {
     let mut bytes = vec![0u8; n * 4];
     buf.copy_to_host(&mut bytes).expect("read back i32 buffer");
     bytes
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
         .collect()
 }
 
