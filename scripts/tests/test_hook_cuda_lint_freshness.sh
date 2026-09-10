@@ -63,7 +63,9 @@ chmod +x "$BIN/cargo"
 
 ZERO=0000000000000000000000000000000000000000
 run_hook() {  # $1 = local sha, $2 = remote sha
-  ( cd "$FIX" && PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
+  # NESTED bypasses the machine-global cargo lock: this fixture runs inside a
+  # real hook's fast checks, which already hold it, and its cargo is the mock.
+  ( cd "$FIX" && ARLE_PRE_PUSH_NESTED=1 PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
 }
 
 # Red world: the push changes infer-cuda, the lint reports it Fresh.

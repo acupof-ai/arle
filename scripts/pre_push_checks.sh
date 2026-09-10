@@ -45,6 +45,7 @@ cleanup() {
         rm -rf "${STAGE_ROOT}"
     fi
     [[ -n "${FAST_STEP:-}" ]] && rm -f "${FAST_STEP}"
+    [[ "${LOCK_HELD:-0}" -eq 1 ]] && rm -rf "${LOCK_DIR:-}"
     return 0
 }
 
@@ -57,6 +58,10 @@ mkdir -p "${SNAPSHOT_ROOT}"
 # --checksum keeps mtimes of content-identical files untouched (cargo sees
 # them as unchanged); --delete drops files removed from HEAD.
 rsync -a --delete --checksum "${STAGE_ROOT}/" "${SNAPSHOT_ROOT}/"
+# Sweep orphan snapshots: a deleted lane leaves its per-worktree snapshot dir
+# behind (20 dirs / 1.9 GB observed 2026-09-10). The rsync above refreshes the
+# live dir's mtime, so one untouched for a week is an orphan.
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'arle-pre-push-snapshot-*' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 cd "${SNAPSHOT_ROOT}"
 
 export CARGO_TERM_COLOR=always
@@ -99,6 +104,41 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     fi
     break
 done
+
+# --- Cargo lock (machine-global) -------------------------------------------
+# Every lane's hook shares one CARGO_TARGET_DIR with no interlock. A
+# `rm -rf` / `cargo clean` by one session while another's hook is building
+# leaves self-inconsistent artifacts that fail as fake API-mismatch errors
+# (2026-09-10: two sessions independently deleted a peer's in-flight build).
+# The lock makes an in-flight build visible — check it before cleaning the
+# shared target. mkdir is atomic (no flock on macOS). Nested fixture runs
+# from the hook's own fast checks bypass it; they run mock cargo.
+LOCK_DIR="${TMPDIR:-/tmp}/arle-pre-push-cargo.lock"
+LOCK_HELD=0
+acquire_cargo_lock() {
+    [[ "${ARLE_PRE_PUSH_NESTED:-0}" == "1" ]] && return 0
+    local waited=0 holder
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo unknown)"
+        if [[ "$holder" != "unknown" ]] && ! kill -0 "$holder" 2>/dev/null; then
+            info "removing stale cargo lock (dead pid $holder)"
+            rm -rf "$LOCK_DIR"
+            continue
+        fi
+        # Backstop for PID reuse: a lock older than an hour is abandoned.
+        if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]]; then
+            info "removing stale cargo lock (pid $holder, older than 60 min)"
+            rm -rf "$LOCK_DIR"
+            continue
+        fi
+        [[ "$waited" -eq 0 ]] && info "waiting for peer hook (pid $holder) to finish its cargo steps"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=1
+}
+acquire_cargo_lock
 
 # --- Fast checks (parallel with cargo) ------------------------------------
 # This block runs in the background, so its failure surfaces only as the exit
