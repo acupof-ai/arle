@@ -12,7 +12,10 @@ use super::{DeviceVec, Dsv4CudaExecutor};
 
 // Re-exported for `executor::qwen35`, which routes through the same
 // step-level scheduling types.
-pub(crate) use infer_plan::{DecodeRoute, SpecKind, route_decode};
+pub(crate) use infer_plan::{
+    DecodeDispatch, DecodeKvClass, SpecChain, SpecKind, assign_row_offsets, decide_decode,
+    flatten_chains, qwen_spec_decode_compatible, spec_accept_totals, speculative_chain_fits,
+};
 
 impl Dsv4CudaExecutor {
     /// Returns the committed tokens (accepted drafts + the bonus) and advances

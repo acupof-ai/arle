@@ -5,13 +5,16 @@
 //! or backend runtime types.
 
 mod diffusion;
+mod geometry;
 mod sample;
 mod spec;
 
+pub use geometry::PrefillGeometry;
 pub use spec::{
-    DEFAULT_SPEC_DRAFT_DEPTH, DEFAULT_SPEC_DRAFT_TOPK, DecodeRoute, DraftChain,
-    MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, MtpDraftRow, SpecKind, SpecVerifySchedule,
-    route_decode,
+    DEFAULT_SPEC_DRAFT_DEPTH, DEFAULT_SPEC_DRAFT_TOPK, DecodeDispatch, DecodeKvClass, DecodeRoute,
+    DraftChain, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, MtpDraftRow, SpecChain, SpecKind,
+    SpecVerifySchedule, assign_row_offsets, decide_decode, flatten_chains,
+    qwen_spec_decode_compatible, route_decode, spec_accept_totals, speculative_chain_fits,
 };
 
 pub use diffusion::{
