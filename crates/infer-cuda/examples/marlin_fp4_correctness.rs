@@ -6,16 +6,26 @@
 //! serving GEMM against a CPU ground truth at the model's actual shapes,
 //! sampling a subset of output rows to keep the reference tractable.
 //!
+//! `--negative-control` scales the CPU expectation 3x for the single GEMM
+//! comparator family; the run MUST fail it, then print NEGATIVE CONTROL OK
+//! and exit 0. Positive success prints ALL PASS.
+//!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/marlin_fp4_correctness`
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
+        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
+        return Ok(());
+    }
+    let negative = std::env::args().any(|a| a == "--negative-control");
     #[cfg(not(feature = "cuda"))]
     {
+        let _ = negative;
         eprintln!("marlin_fp4_correctness is a CUDA harness; rebuild with --features cuda.");
         Ok(())
     }
     #[cfg(feature = "cuda")]
-    real::run()
+    real::run(negative)
 }
 
 #[cfg(feature = "cuda")]
@@ -81,7 +91,7 @@ mod real {
         out
     }
 
-    pub(super) fn run() -> Result<()> {
+    pub(super) fn run(negative: bool) -> Result<()> {
         let ctx = DeviceContext::new()?;
         let sms = ctx.sm_count() as i32;
         // SAFETY: size queries only.
@@ -97,16 +107,15 @@ mod real {
         let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
         let stream = ctx.stream.cu_stream();
 
-        println!(
-            "Marlin fp4 correctness: GPU vs CPU reference, build={}\n",
-            cuda_kernels::KERNEL_BUILD_ID
-        );
-        println!(
-            "{:<14}{:>7}{:>6}{:>10}{:>10}{:>8}",
-            "shape", "N", "M", "max_rel", "mean_rel", "status"
+        eprintln!(
+            "[marlin-fp4-parity] device={} build={}{}",
+            ctx.ordinal(),
+            cuda_kernels::KERNEL_BUILD_ID,
+            if negative { " NEGATIVE-CONTROL" } else { "" }
         );
 
-        let mut any_fail = false;
+        // Single comparator family: Marlin GEMM vs the sampled CPU rows.
+        let mut gemm_fail = false;
         for &(label, n, k) in SHAPES {
             let seed = 0x5eed_1234u64.wrapping_add(n as u64);
             let mut rng = Lcg(seed);
@@ -183,7 +192,14 @@ mod real {
                 let gpu_out: Vec<bf16> = ctx.stream.clone_dtoh(&out_dev)?;
                 ctx.sync()?;
 
-                let cpu = cpu_ref_rows(&packed, &scales, global_scale, &x, m, k, &check_rows);
+                let mut cpu = cpu_ref_rows(&packed, &scales, global_scale, &x, m, k, &check_rows);
+                // Negative corruption: 3x expectation gives rel ~2 regardless
+                // of shape, so the family must trip.
+                if negative {
+                    for v in cpu.iter_mut() {
+                        *v *= 3.0;
+                    }
+                }
 
                 let mut max_rel = 0f32;
                 let mut sum_rel = 0f32;
@@ -201,19 +217,29 @@ mod real {
                 let mean_rel = sum_rel / count;
                 let ok = max_rel < 1e-2;
                 if !ok {
-                    any_fail = true;
+                    gemm_fail = true;
                 }
-                println!(
-                    "{label:<14}{n:>7}{m:>6}{max_rel:>10.4}{mean_rel:>10.6}{:>8}",
+                eprintln!(
+                    "[{label} n={n} m={m}] max_rel={max_rel:.4} mean_rel={mean_rel:.6} {}",
                     if ok { "PASS" } else { "FAIL" }
                 );
             }
         }
 
-        if any_fail {
+        if negative {
+            ensure!(
+                gemm_fail,
+                "marlin_fp4_correctness negative control did NOT fail family: gemm"
+            );
+            eprintln!(
+                "[marlin-fp4-parity] NEGATIVE CONTROL OK (the GEMM family failed as required)"
+            );
+            return Ok(());
+        }
+        if gemm_fail {
             anyhow::bail!("Marlin fp4 correctness check FAILED");
         }
-        println!("\nAll shapes passed.");
+        eprintln!("[marlin-fp4-parity] ALL PASS");
         Ok(())
     }
 }

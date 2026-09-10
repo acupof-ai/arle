@@ -154,9 +154,9 @@ cap_log() {
     fi
 }
 
-# Verdict extraction: positive needs rc 0 plus the gate's success marker;
-# negative needs rc 0 AND the NEGATIVE CONTROL OK line.
-pos_marker() { grep -E 'ALL PASS|All shapes passed' "$1" | tail -n 1 || true; }
+# Verdict extraction: positive needs rc 0 plus ALL PASS; negative needs
+# rc 0 AND the NEGATIVE CONTROL OK line.
+pos_marker() { grep -F 'ALL PASS' "$1" | tail -n 1 || true; }
 neg_marker() { grep -F 'NEGATIVE CONTROL OK' "$1" | tail -n 1 || true; }
 fail_lines() {  # FAIL / family-teeth lines, TSV-safe single line
     grep -E 'FAIL|negative teeth OK' "$1" | tail -n 20 \

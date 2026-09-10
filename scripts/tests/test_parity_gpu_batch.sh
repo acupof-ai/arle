@@ -34,7 +34,7 @@ case "$kind" in
     echo "[mock] ALL PASS" ;;
   plain)
     if [ "\${1:-}" = "--negative-control" ]; then exit 2; fi
-    echo "All shapes passed." ;;
+    echo "[mock] ALL PASS" ;;
 esac
 SH
     chmod +x "$BIN/$name"
