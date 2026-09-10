@@ -85,6 +85,13 @@ if not baseline and not require_exact and not allow_no_baseline:
     )
 if baseline:
     baseline_counts = load(baseline)
+    base_exact_total = sum(exact for exact, _partial, _miss in baseline_counts.values())
+    if base_exact_total == 0:
+        raise SystemExit(
+            f"[gate] inert baseline: {baseline} scored 0 exact hits across "
+            f"{len(expected_lengths)} lengths; the envelope cannot gate a treatment "
+            "against a reference that never matched a needle (re-seed a healthy baseline)"
+        )
     for length in expected_lengths:
         exact, partial, miss = counts[length]
         base_exact, base_partial, base_miss = baseline_counts[length]
