@@ -66,6 +66,64 @@ mod real {
         value != 0
     }
 
+    /// Map `memory` for `len` bytes at `offset`, copy `src` in, unmap.
+    fn write_mapped(
+        device: &ash::Device,
+        memory: vk::DeviceMemory,
+        offset: u64,
+        src: &[u8],
+        dir: &'static str,
+    ) -> Result<()> {
+        // SAFETY: `memory` is bound to the caller's buffer with at least
+        // `offset + src.len()` bytes; the caller asserts the bounds. The mapping
+        // is used only between this call and the matching unmap below.
+        let ptr = unsafe {
+            device.map_memory(
+                memory,
+                offset,
+                src.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(|e| vk_error(&format!("mapping Vulkan buffer for {dir}"), e))?;
+        // SAFETY: `ptr` is a valid mapping of exactly `src.len()` bytes, so the
+        // non-overlapping copy is in bounds; unmap releases the mapping used here.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.cast::<u8>(), src.len());
+            device.unmap_memory(memory);
+        }
+        Ok(())
+    }
+
+    /// Map `memory` for `len` bytes at `offset`, copy out into `dst`, unmap.
+    fn read_mapped(
+        device: &ash::Device,
+        memory: vk::DeviceMemory,
+        offset: u64,
+        dst: &mut [u8],
+        dir: &'static str,
+    ) -> Result<()> {
+        // SAFETY: `memory` is bound to the caller's buffer with at least
+        // `offset + dst.len()` bytes; the caller asserts the bounds. The mapping
+        // is used only between this call and the matching unmap below.
+        let ptr = unsafe {
+            device.map_memory(
+                memory,
+                offset,
+                dst.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(|e| vk_error(&format!("mapping Vulkan buffer for {dir}"), e))?;
+        // SAFETY: `ptr` maps exactly `dst.len()` bytes, so the copy into the
+        // `dst` buffer is in bounds; unmap releases the mapping used here.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), dst.as_mut_ptr(), dst.len());
+            device.unmap_memory(memory);
+        }
+        Ok(())
+    }
+
     fn create_instance(entry: &Entry) -> Result<ash::Instance> {
         let app_name = CString::new("arle-vulkan")
             .map_err(|e| runtime_error("building Vulkan app name", e))?;
@@ -78,6 +136,8 @@ mod real {
             .engine_version(1)
             .api_version(REQUIRED_API_VERSION);
         let create = vk::InstanceCreateInfo::default().application_info(&app);
+        // SAFETY: `entry` is the successfully loaded Vulkan loader and `create`
+        // points at valid NUL-terminated app/engine names built above.
         unsafe { entry.create_instance(&create, None) }
             .map_err(|e| vk_error("creating Vulkan instance", e))
     }
@@ -87,11 +147,14 @@ mod real {
         physical_device: vk::PhysicalDevice,
         name: &CStr,
     ) -> Result<bool> {
+        // SAFETY: `physical_device` came from this instance's
+        // `enumerate_physical_devices`, so it is a valid handle for it.
         let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
             .map_err(|e| vk_error("enumerating Vulkan device extensions", e))?;
         Ok(extensions.iter().any(|extension| {
-            let extension_name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
-            extension_name == name
+            extension
+                .extension_name_as_c_str()
+                .is_ok_and(|extension_name| extension_name == name)
         }))
     }
 
@@ -106,6 +169,8 @@ mod real {
             .push_next(&mut integer_dot)
             .push_next(&mut vulkan12)
             .push_next(&mut storage16);
+        // SAFETY: `physical_device` belongs to `instance`; the pNext chain
+        // references the stack-local structs above for the duration of the call.
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
 
         vk_bool(features2.features.shader_int16)
@@ -117,15 +182,19 @@ mod real {
     }
 
     fn load_entry() -> Result<Entry> {
+        // SAFETY: `Entry::load` resolves the Vulkan loader symbols from the
+        // process's linked/`dlopen`ed loader; it returns Err when none is present.
         unsafe { Entry::load() }.map_err(|e| runtime_error("loading Vulkan loader", e))
     }
 
     fn pick_compute_queue(
         instance: &ash::Instance,
     ) -> Result<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> {
+        // SAFETY: `instance` is live and enumeration takes no external inputs.
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| vk_error("enumerating Vulkan physical devices", e))?;
         for physical_device in devices {
+            // SAFETY: `physical_device` was just enumerated from `instance`.
             let props = unsafe { instance.get_physical_device_properties(physical_device) };
             if props.api_version < REQUIRED_API_VERSION {
                 continue;
@@ -140,8 +209,11 @@ mod real {
             if !supports_required_shader_features(instance, physical_device) {
                 continue;
             }
-            let families =
-                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+            let families = {
+                // SAFETY: `physical_device` belongs to `instance`; the returned
+                // Vec is owned by ash and valid immediately below.
+                unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+            };
             for (idx, family) in families.iter().enumerate() {
                 if family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::COMPUTE) {
                     let queue_family_index = u32::try_from(idx)
@@ -154,8 +226,10 @@ mod real {
     }
 
     fn device_name_from_properties(props: &vk::PhysicalDeviceProperties) -> String {
-        let raw = unsafe { CStr::from_ptr(props.device_name.as_ptr()) };
-        raw.to_string_lossy().into_owned()
+        props
+            .device_name_as_c_str()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "<invalid name>".to_string())
     }
 
     pub struct VulkanContext {
@@ -180,6 +254,8 @@ mod real {
             let picked = match pick_compute_queue(&instance) {
                 Ok(picked) => picked,
                 Err(e) => {
+                    // SAFETY: `instance` was just created and no device exists
+                    // yet, so it is exclusively owned and safe to destroy.
                     unsafe { instance.destroy_instance(None) };
                     return Err(e);
                 }
@@ -219,26 +295,42 @@ mod real {
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&extensions)
                 .push_next(&mut features2);
-            let device = match unsafe { instance.create_device(physical_device, &create, None) } {
+            let device = {
+                // SAFETY: `physical_device` was selected from `instance`; the
+                // pNext chain and queue/extension slices are stack-local and live
+                // for the call.
+                unsafe { instance.create_device(physical_device, &create, None) }
+            };
+            let device = match device {
                 Ok(device) => device,
                 Err(e) => {
+                    // SAFETY: the failed device left only `instance` to clean up.
                     unsafe { instance.destroy_instance(None) };
                     return Err(vk_error("creating Vulkan device", e));
                 }
             };
+            // SAFETY: the device owns queue family `queue_family_index`, which
+            // enumeration confirmed has a compute queue; queue 0 exists.
             let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
             let pipeline_cache_create = vk::PipelineCacheCreateInfo::default();
-            let pipeline_cache =
-                match unsafe { device.create_pipeline_cache(&pipeline_cache_create, None) } {
-                    Ok(cache) => cache,
-                    Err(e) => {
-                        unsafe {
-                            device.destroy_device(None);
-                            instance.destroy_instance(None);
-                        }
-                        return Err(vk_error("creating Vulkan pipeline cache", e));
+            let pipeline_cache = {
+                // SAFETY: the device is freshly created and idle; an empty cache
+                // create info is valid.
+                unsafe { device.create_pipeline_cache(&pipeline_cache_create, None) }
+            };
+            let pipeline_cache = match pipeline_cache {
+                Ok(cache) => cache,
+                Err(e) => {
+                    unsafe {
+                        // SAFETY: nothing else has been created on the device, and
+                        // the instance outlives it; both are exclusively owned on
+                        // this error path.
+                        device.destroy_device(None);
+                        instance.destroy_instance(None);
                     }
-                };
+                    return Err(vk_error("creating Vulkan pipeline cache", e));
+                }
+            };
             Ok(Self {
                 _entry: entry,
                 instance,
@@ -283,6 +375,8 @@ mod real {
         /// descriptor offset (e.g. an arena slot's start) must be a multiple of
         /// this. Queried from `vkPhysicalDeviceProperties.limits`.
         pub fn min_storage_buffer_offset_alignment(&self) -> u64 {
+            // SAFETY: `self.physical_device` is owned by `self.instance`, both
+            // held for `self`'s lifetime; the returned properties are copied out.
             let props = unsafe {
                 self.instance
                     .get_physical_device_properties(self.physical_device)
@@ -294,10 +388,14 @@ mod real {
         /// profiling. `valid_bits == 0` means the compute queue does not support
         /// timestamps (profiling must be disabled).
         pub fn timestamp_info(&self) -> (f32, u32) {
+            // SAFETY: both queries read `self.physical_device`, owned by
+            // `self.instance` for the context's lifetime; results are copied.
             let props = unsafe {
                 self.instance
                     .get_physical_device_properties(self.physical_device)
             };
+            // SAFETY: same owned physical device; the queue-family Vec is read
+            // only via the bounded index below.
             let qf = unsafe {
                 self.instance
                     .get_physical_device_queue_family_properties(self.physical_device)
@@ -317,12 +415,16 @@ mod real {
         pub fn subgroup_size(&self) -> (u32, u32, u32) {
             let mut size_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut size_control);
+            // SAFETY: `self.physical_device` is valid for `self.instance`; the
+            // pNext chain points at the local struct filled by the query.
             unsafe {
                 self.instance
                     .get_physical_device_properties2(self.physical_device, &mut props2);
             }
             let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+            // SAFETY: same valid physical device; the local pNext chain outlives
+            // the call.
             unsafe {
                 self.instance
                     .get_physical_device_properties2(self.physical_device, &mut p2);
@@ -335,6 +437,8 @@ mod real {
         }
 
         pub fn memory_heaps(&self) -> Vec<(u64, bool)> {
+            // SAFETY: `self.physical_device` is owned by `self.instance`; the
+            // returned arrays are read only within the copied-out ranges below.
             let props = unsafe {
                 self.instance
                     .get_physical_device_memory_properties(self.physical_device)
@@ -351,6 +455,7 @@ mod real {
         }
 
         pub fn memory_types(&self) -> Vec<(u32, bool, bool)> {
+            // SAFETY: valid owned physical device; only copied-out fields are read.
             let props = unsafe {
                 self.instance
                     .get_physical_device_memory_properties(self.physical_device)
@@ -374,6 +479,8 @@ mod real {
             type_bits: u32,
             required: vk::MemoryPropertyFlags,
         ) -> Result<u32> {
+            // SAFETY: valid owned physical device; heap/type indices are bounded
+            // by the counts returned in the same `props`.
             let props = unsafe {
                 self.instance
                     .get_physical_device_memory_properties(self.physical_device)
@@ -408,6 +515,10 @@ mod real {
 
     impl Drop for VulkanContext {
         fn drop(&mut self) {
+            // SAFETY: `drop` has exclusive ownership: no other thread can touch
+            // the device or instance once `self` is being dropped. The pipeline
+            // cache is destroyed before its parent device, the device before its
+            // instance, matching creation order.
             unsafe {
                 self.device
                     .destroy_pipeline_cache(self.pipeline_cache, None);
@@ -426,8 +537,11 @@ mod real {
     pub fn device_count() -> Result<usize> {
         let entry = load_entry()?;
         let instance = create_instance(&entry)?;
+        // SAFETY: `instance` is live and takes no handle input.
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| vk_error("enumerating Vulkan physical devices", e));
+        // SAFETY: no device was created from this throwaway instance, so it is
+        // exclusively owned at destroy.
         unsafe { instance.destroy_instance(None) };
         devices.map(|d| d.len())
     }
@@ -435,10 +549,12 @@ mod real {
     pub fn device_name(device_index: usize) -> Result<String> {
         let entry = load_entry()?;
         let instance = create_instance(&entry)?;
+        // SAFETY: live instance, no handle argument.
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| vk_error("enumerating Vulkan physical devices", e))?;
         let name = match devices.get(device_index) {
             Some(device) => {
+                // SAFETY: `device` was just enumerated from `instance`.
                 let props = unsafe { instance.get_physical_device_properties(*device) };
                 Ok(device_name_from_properties(&props))
             }
@@ -447,6 +563,7 @@ mod real {
                 devices.len()
             ))),
         };
+        // SAFETY: throwaway instance with no child device.
         unsafe { instance.destroy_instance(None) };
         name
     }
@@ -514,13 +631,18 @@ mod real {
                 .size(len as vk::DeviceSize)
                 .usage(usage)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: the device is held by `ctx`; the create info references
+            // only stack-local data valid for the call.
             let buffer = unsafe { ctx.device.create_buffer(&create, None) }
                 .map_err(|e| vk_error("creating Vulkan buffer", e))?;
+            // SAFETY: `buffer` is a fresh handle from `create_buffer`.
             let req = unsafe { ctx.device.get_buffer_memory_requirements(buffer) };
             let memory_type_index = match ctx.memory_type_index(req.memory_type_bits, memory_flags)
             {
                 Ok(idx) => idx,
                 Err(e) => {
+                    // SAFETY: memory was not yet allocated for `buffer`, which is
+                    // unbound and exclusively held on this error path.
                     unsafe { ctx.device.destroy_buffer(buffer, None) };
                     return Err(e);
                 }
@@ -528,15 +650,24 @@ mod real {
             let alloc = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(memory_type_index);
+            // SAFETY: `memory_type_index` is one of the device's types from the
+            // requirements above, and `alloc.size == req.size`, so the allocation
+            // satisfies `buffer`'s requirements.
             let memory = match unsafe { ctx.device.allocate_memory(&alloc, None) } {
                 Ok(memory) => memory,
                 Err(e) => {
+                    // SAFETY: `buffer` is unbound (bind happens below) and only
+                    // this function holds it.
                     unsafe { ctx.device.destroy_buffer(buffer, None) };
                     return Err(vk_error("allocating Vulkan buffer memory", e));
                 }
             };
+            // SAFETY: `buffer` and `memory` are fresh, unbound handles and
+            // `memory` was sized from `buffer`'s own memory requirements.
             if let Err(e) = unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) } {
                 unsafe {
+                    // SAFETY: on bind failure ownership stays here; free memory
+                    // then the unbound buffer in reverse creation order.
                     ctx.device.free_memory(memory, None);
                     ctx.device.destroy_buffer(buffer, None);
                 }
@@ -583,20 +714,9 @@ mod real {
             if src.is_empty() {
                 return Ok(());
             }
-            let ptr = unsafe {
-                self.ctx.device.map_memory(
-                    self.memory,
-                    offset,
-                    src.len() as vk::DeviceSize,
-                    vk::MemoryMapFlags::empty(),
-                )
-            }
-            .map_err(|e| vk_error("mapping Vulkan buffer for H2D", e))?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.cast::<u8>(), src.len());
-                self.ctx.device.unmap_memory(self.memory);
-            }
-            Ok(())
+            // SAFETY rationale lives in `write_mapped`; the assert above bounds
+            // the slice to this buffer's allocated length.
+            write_mapped(&self.ctx.device, self.memory, offset, src, "H2D")
         }
 
         pub fn copy_to_host_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
@@ -607,20 +727,9 @@ mod real {
             if dst.is_empty() {
                 return Ok(());
             }
-            let ptr = unsafe {
-                self.ctx.device.map_memory(
-                    self.memory,
-                    offset,
-                    dst.len() as vk::DeviceSize,
-                    vk::MemoryMapFlags::empty(),
-                )
-            }
-            .map_err(|e| vk_error("mapping Vulkan buffer for D2H", e))?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), dst.as_mut_ptr(), dst.len());
-                self.ctx.device.unmap_memory(self.memory);
-            }
-            Ok(())
+            // SAFETY rationale lives in `read_mapped`; the assert above bounds
+            // the slice to this buffer's allocated length.
+            read_mapped(&self.ctx.device, self.memory, offset, dst, "D2H")
         }
 
         /// Allocate a **DEVICE_LOCAL** (not host-visible) buffer and fill it from
@@ -655,6 +764,9 @@ mod real {
             let pool = CommandPool::create(ctx)?;
             pool.one_shot_submit(|cmd| {
                 let region = vk::BufferCopy::default().size(src.len() as vk::DeviceSize);
+                // SAFETY: `cmd` is the recording primary buffer handed to this
+                // closure; both buffers were created with TRANSFER usage and
+                // `dst` holds `region.size` bytes.
                 unsafe {
                     ctx.device
                         .cmd_copy_buffer(cmd, staging.buffer, dst.buffer, &[region]);
@@ -667,6 +779,9 @@ mod real {
 
     impl Drop for DeviceBuffer<'_> {
         fn drop(&mut self) {
+            // SAFETY: `drop` gives exclusive ownership; the buffer and its memory
+            // were created together from `ctx` and are not in use (all GPU work
+            // using them is fence-waited before the owning weights are dropped).
             unsafe {
                 self.ctx.device.destroy_buffer(self.buffer, None);
                 self.ctx.device.free_memory(self.memory, None);
@@ -684,6 +799,7 @@ mod real {
             let create = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(ctx.queue_family_index)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            // SAFETY: the device and queue family index both belong to `ctx`.
             let pool = unsafe { ctx.device.create_command_pool(&create, None) }
                 .map_err(|e| vk_error("creating Vulkan command pool", e))?;
             Ok(Self { ctx, pool })
@@ -701,6 +817,7 @@ mod real {
                 .command_pool(self.pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1);
+            // SAFETY: `self.pool` is live and the alloc info only references it.
             let buffers = unsafe { self.ctx.device.allocate_command_buffers(&alloc) }
                 .map_err(|e| vk_error("allocating Vulkan command buffer", e))?;
             let command_buffer = buffers.first().copied().ok_or_else(|| {
@@ -711,23 +828,32 @@ mod real {
             let result = (|| {
                 let begin = vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                // SAFETY: `command_buffer` is freshly allocated and not being
+                // recorded elsewhere.
                 unsafe { self.ctx.device.begin_command_buffer(command_buffer, &begin) }
                     .map_err(|e| vk_error("beginning Vulkan command buffer", e))?;
                 record(command_buffer)?;
+                // SAFETY: the closure ended recording successfully.
                 unsafe { self.ctx.device.end_command_buffer(command_buffer) }
                     .map_err(|e| vk_error("ending Vulkan command buffer", e))?;
                 let command_buffers = [command_buffer];
                 let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+                // SAFETY: the buffer is in the executable state after end, and the
+                // single queue belongs to this device; the NULL fence is paired
+                // with the immediate `queue_wait_idle` below.
                 unsafe {
                     self.ctx
                         .device
                         .queue_submit(self.ctx.queue, &submits, vk::Fence::null())
                 }
                 .map_err(|e| vk_error("submitting Vulkan command buffer", e))?;
+                // SAFETY: waiting the device's own queue needs no external input.
                 unsafe { self.ctx.device.queue_wait_idle(self.ctx.queue) }
                     .map_err(|e| vk_error("waiting for Vulkan queue idle", e))?;
                 Ok(())
             })();
+            // SAFETY: queue is idle, so the GPU has finished with
+            // `command_buffer`, which belongs to `self.pool`.
             unsafe {
                 self.ctx
                     .device
@@ -739,6 +865,8 @@ mod real {
 
     impl Drop for CommandPool<'_> {
         fn drop(&mut self) {
+            // SAFETY: exclusive ownership at drop; all buffers from this pool are
+            // freed by their one-shot paths before the pool goes.
             unsafe { self.ctx.device.destroy_command_pool(self.pool, None) };
         }
     }
@@ -798,6 +926,7 @@ mod real {
             let pool_create = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(ctx.queue_family_index)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            // SAFETY: device and queue family both belong to `ctx`.
             let pool = unsafe { ctx.device.create_command_pool(&pool_create, None) }
                 .map_err(|e| vk_error("creating Vulkan command pool", e))?;
 
@@ -805,10 +934,12 @@ mod real {
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1);
+            // SAFETY: `pool` is the freshly created, live command pool.
             let command_buffer = match unsafe { ctx.device.allocate_command_buffers(&alloc) } {
                 Ok(buffers) => match buffers.first().copied() {
                     Some(buffer) => buffer,
                     None => {
+                        // SAFETY: the pool owns no buffers on this path.
                         unsafe { ctx.device.destroy_command_pool(pool, None) };
                         return Err(VulkanError::Runtime(
                             "Vulkan command buffer allocation returned no buffers".to_string(),
@@ -816,15 +947,19 @@ mod real {
                     }
                 },
                 Err(e) => {
+                    // SAFETY: nothing was allocated from the failed pool.
                     unsafe { ctx.device.destroy_command_pool(pool, None) };
                     return Err(vk_error("allocating Vulkan command buffer", e));
                 }
             };
 
             let fence_create = vk::FenceCreateInfo::default();
+            // SAFETY: empty create info and a live device are valid inputs.
             let fence = match unsafe { ctx.device.create_fence(&fence_create, None) } {
                 Ok(fence) => fence,
                 Err(e) => {
+                    // SAFETY: on failure the command buffer is still owned by
+                    // `pool`, so destroying the pool frees it too.
                     unsafe { ctx.device.destroy_command_pool(pool, None) };
                     return Err(vk_error("creating Vulkan fence", e));
                 }
@@ -840,6 +975,8 @@ mod real {
                     let info = vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
                         .query_count(capacity);
+                    // SAFETY: live device; the query count and type are the only
+                    // inputs and both are valid.
                     match unsafe { ctx.device.create_query_pool(&info, None) } {
                         Ok(qpool) => Some(GpuProf {
                             pool: qpool,
@@ -918,6 +1055,9 @@ mod real {
         /// command buffer.
         pub fn begin(&mut self) -> Result<()> {
             if self.pending {
+                // SAFETY: `self.fence` is the reusable fence submitted with the
+                // in-flight batch; waiting an infinite timeout returns only when
+                // the GPU is done.
                 unsafe {
                     self.ctx
                         .device
@@ -926,8 +1066,12 @@ mod real {
                 .map_err(|e| vk_error("waiting for Vulkan fence", e))?;
                 self.pending = false;
             }
+            // SAFETY: the fence is now signalled (or was never submitted), the
+            // only state in which reset is valid.
             unsafe { self.ctx.device.reset_fences(&[self.fence]) }
                 .map_err(|e| vk_error("resetting Vulkan fence", e))?;
+            // SAFETY: the waited fence means no recording is in flight, so the
+            // buffer is idle and resettable (the pool allows reset).
             unsafe {
                 self.ctx
                     .device
@@ -936,6 +1080,7 @@ mod real {
             .map_err(|e| vk_error("resetting Vulkan command buffer", e))?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: the buffer was just reset and is not being recorded.
             unsafe {
                 self.ctx
                     .device
@@ -945,6 +1090,9 @@ mod real {
             self.dispatches_in_batch = 0;
             if let Some((pool, cap)) = self.prof.as_ref().map(|p| (p.pool, p.capacity)) {
                 let cmd = self.command_buffer;
+                // SAFETY: `cmd` is recording and the timestamp query pool was
+                // created with `cap` TIMESTAMP queries, so resetting [0, cap) and
+                // writing query 0 at TOP_OF_PIPE are in range.
                 unsafe {
                     self.ctx.device.cmd_reset_query_pool(cmd, pool, 0, cap);
                     self.ctx.device.cmd_write_timestamp(
@@ -990,6 +1138,11 @@ mod real {
         ) {
             let device = &self.ctx.device;
             let cmd = self.command_buffer;
+            // SAFETY: `cmd` is in the recording state between `begin` and
+            // `submit_and_wait`. The pipeline was created with `pipeline.layout`,
+            // the descriptor set was allocated for that layout, and `push` is
+            // within the pipeline's declared push-constant range; `groups` is
+            // caller-supplied dispatch geometry with no handle validity concern.
             unsafe {
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.raw());
                 device.cmd_bind_descriptor_sets(
@@ -1024,6 +1177,8 @@ mod real {
                 }
             });
             if let Some((pool, idx)) = slot {
+                // SAFETY: `cmd` is still recording and `idx < capacity` (the slot
+                // closure above bounds it); BOTTOM_OF_PIPE is a valid stage.
                 unsafe {
                     self.ctx.device.cmd_write_timestamp(
                         cmd,
@@ -1044,6 +1199,8 @@ mod real {
             let memory_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            // SAFETY: `self.command_buffer` is recording; the global barrier uses
+            // no handles, and the stage/access masks are compile-time constants.
             unsafe {
                 self.ctx.device.cmd_pipeline_barrier(
                     self.command_buffer,
@@ -1063,10 +1220,15 @@ mod real {
         /// `2037-2067`/`13474-13485` (one fence wait per batch). A YIELD-spin
         /// tail-latency variant can replace the blocking wait later.
         pub fn submit_and_wait(&mut self) -> Result<()> {
+            // SAFETY: recording finished without error; the buffer is in the
+            // executable state required for submit.
             unsafe { self.ctx.device.end_command_buffer(self.command_buffer) }
                 .map_err(|e| vk_error("ending Vulkan command buffer", e))?;
             let command_buffers = [self.command_buffer];
             let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            // SAFETY: the buffer is executable, the queue is this device's
+            // compute queue, and `self.fence` is unsignalled after `begin`'s
+            // reset, so one submit can signal it.
             unsafe {
                 self.ctx
                     .device
@@ -1075,6 +1237,8 @@ mod real {
             .map_err(|e| vk_error("submitting Vulkan command buffer", e))?;
             self.pending = true;
             self.submit_count += 1;
+            // SAFETY: the fence was just submitted and will become signalled; an
+            // infinite timeout blocks until the batch completes.
             unsafe {
                 self.ctx
                     .device
@@ -1083,28 +1247,31 @@ mod real {
             .map_err(|e| vk_error("waiting for Vulkan fence", e))?;
             self.pending = false;
             let read = self.prof.as_ref().map(|p| (p.pool, p.idx, p.valid_mask));
-            if let Some((pool, idx, mask)) = read {
-                if idx > 1 {
-                    let mut data = vec![0u64; idx as usize];
-                    let ok = unsafe {
-                        self.ctx.device.get_query_pool_results(
-                            pool,
-                            0,
-                            &mut data,
-                            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                        )
-                    };
-                    if ok.is_ok() {
-                        if let Some(p) = self.prof.as_mut() {
-                            for j in 0..p.labels.len() {
-                                let a = data[j] & mask;
-                                let b = data[j + 1] & mask;
-                                let dt = b.wrapping_sub(a) as u128;
-                                let e = p.totals.entry(p.labels[j]).or_insert((0u64, 0u128));
-                                e.0 += 1;
-                                e.1 += dt;
-                            }
-                        }
+            if let Some((pool, idx, mask)) = read
+                && idx > 1
+            {
+                let mut data = vec![0u64; idx as usize];
+                // SAFETY: the waited fence means the recorded query writes are
+                // available; `data.len() == idx` matches the [0, idx) range
+                // and the pool was created with >= idx TIMESTAMP queries.
+                let ok = unsafe {
+                    self.ctx.device.get_query_pool_results(
+                        pool,
+                        0,
+                        &mut data,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                };
+                if ok.is_ok()
+                    && let Some(p) = self.prof.as_mut()
+                {
+                    for j in 0..p.labels.len() {
+                        let a = data[j] & mask;
+                        let b = data[j + 1] & mask;
+                        let dt = b.wrapping_sub(a) as u128;
+                        let e = p.totals.entry(p.labels[j]).or_insert((0u64, 0u128));
+                        e.0 += 1;
+                        e.1 += dt;
                     }
                 }
             }
@@ -1114,6 +1281,10 @@ mod real {
 
     impl Drop for CommandRecorder<'_> {
         fn drop(&mut self) {
+            // SAFETY: drop is exclusive. The fence wait below (only when a batch
+            // is pending) guarantees the GPU has finished with the command buffer
+            // before its pool, the fence, and the optional query pool are
+            // destroyed; creation order is reversed.
             unsafe {
                 // The fence guarantees the GPU is done with the buffer before we
                 // free its pool; only wait if a submission is still in flight.
@@ -1153,6 +1324,9 @@ mod real {
 
         pub fn from_spirv_words(ctx: &'a VulkanContext, words: &[u32]) -> Result<Self> {
             let create = vk::ShaderModuleCreateInfo::default().code(words);
+            // SAFETY: the device is held by `ctx`; `words` is a valid SPIR-V
+            // blob (length-multiple-of-4 checked by the caller), referenced for
+            // the create call only.
             let module = unsafe { ctx.device.create_shader_module(&create, None) }
                 .map_err(|e| vk_error("creating Vulkan shader module", e))?;
             Ok(Self { ctx, module })
@@ -1165,6 +1339,8 @@ mod real {
 
     impl Drop for ShaderModule<'_> {
         fn drop(&mut self) {
+            // SAFETY: exclusive ownership at drop; the module is not referenced by
+            // any live pipeline (pipelines are built from it but do not keep it).
             unsafe { self.ctx.device.destroy_shader_module(self.module, None) };
         }
     }
@@ -1193,6 +1369,8 @@ mod real {
                 })
                 .collect();
             let create = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            // SAFETY: the device is held by `ctx`; `bindings` is stack-local and
+            // all values are compile-time-valid descriptor descriptions.
             let layout = unsafe { ctx.device.create_descriptor_set_layout(&create, None) }
                 .map_err(|e| vk_error("creating Vulkan descriptor set layout", e))?;
             Ok(Self { ctx, layout })
@@ -1205,6 +1383,9 @@ mod real {
 
     impl Drop for DescriptorSetLayout<'_> {
         fn drop(&mut self) {
+            // SAFETY: exclusive ownership at drop; descriptor sets allocated for
+            // a layout do not keep it alive, and this layout's sets belong to
+            // pools dropped first (see DescriptorSet/ring Drop).
             unsafe {
                 self.ctx
                     .device
@@ -1238,15 +1419,19 @@ mod real {
             let pool_create = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&pool_sizes);
+            // SAFETY: live device; the one pool size covers the single set's
+            // STORAGE_BUFFER descriptors counted above.
             let pool = unsafe { ctx.device.create_descriptor_pool(&pool_create, None) }
                 .map_err(|e| vk_error("creating Vulkan descriptor pool", e))?;
             let layouts = [layout.raw()];
             let alloc = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
                 .set_layouts(&layouts);
+            // SAFETY: `pool` has max_sets(1) and enough descriptors for `layout`.
             let sets = match unsafe { ctx.device.allocate_descriptor_sets(&alloc) } {
                 Ok(sets) => sets,
                 Err(e) => {
+                    // SAFETY: failed allocation leaves the pool holding no sets.
                     unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
                     return Err(vk_error("allocating Vulkan descriptor set", e));
                 }
@@ -1254,6 +1439,7 @@ mod real {
             let set = match sets.first().copied() {
                 Some(set) => set,
                 None => {
+                    // SAFETY: empty result means no set was handed out.
                     unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
                     return Err(VulkanError::Runtime(
                         "Vulkan descriptor allocation returned no sets".to_string(),
@@ -1280,6 +1466,9 @@ mod real {
                         .buffer_info(std::slice::from_ref(info))
                 })
                 .collect();
+            // SAFETY: every write targets `set` (allocated from `pool`) and
+            // references a live DeviceBuffer whose byte range covers the
+            // descriptor; there are no copy descriptors.
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
             Ok(Self { ctx, pool, set })
         }
@@ -1311,15 +1500,19 @@ mod real {
             let pool_create = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&pool_sizes);
+            // SAFETY: live device; the one pool size covers the single set's
+            // STORAGE_BUFFER descriptors counted above.
             let pool = unsafe { ctx.device.create_descriptor_pool(&pool_create, None) }
                 .map_err(|e| vk_error("creating Vulkan descriptor pool", e))?;
             let layouts = [layout.raw()];
             let alloc = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
                 .set_layouts(&layouts);
+            // SAFETY: `pool` has max_sets(1) and enough descriptors for `layout`.
             let sets = match unsafe { ctx.device.allocate_descriptor_sets(&alloc) } {
                 Ok(sets) => sets,
                 Err(e) => {
+                    // SAFETY: failed allocation leaves the pool holding no sets.
                     unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
                     return Err(vk_error("allocating Vulkan descriptor set", e));
                 }
@@ -1327,6 +1520,7 @@ mod real {
             let set = match sets.first().copied() {
                 Some(set) => set,
                 None => {
+                    // SAFETY: empty result means no set was handed out.
                     unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
                     return Err(VulkanError::Runtime(
                         "Vulkan descriptor allocation returned no sets".to_string(),
@@ -1353,6 +1547,9 @@ mod real {
                         .buffer_info(std::slice::from_ref(info))
                 })
                 .collect();
+            // SAFETY: every write targets `set` (allocated from `pool`) and
+            // references a live DeviceBuffer whose byte range covers the
+            // descriptor; there are no copy descriptors.
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
             Ok(Self { ctx, pool, set })
         }
@@ -1364,6 +1561,8 @@ mod real {
 
     impl Drop for DescriptorSet<'_> {
         fn drop(&mut self) {
+            // SAFETY: exclusive ownership at drop; the GPU work using this set is
+            // fence-waited by the recorder before the owning weights are dropped.
             unsafe { self.ctx.device.destroy_descriptor_pool(self.pool, None) };
         }
     }
@@ -1418,15 +1617,20 @@ mod real {
             let pool_create = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(ring_size_u32)
                 .pool_sizes(&pool_sizes);
+            // SAFETY: live device; max_sets and the pool descriptor count match
+            // `ring_size` sets of this `binding_count`-binding layout.
             let pool = unsafe { ctx.device.create_descriptor_pool(&pool_create, None) }
                 .map_err(|e| vk_error("creating Vulkan descriptor pool", e))?;
             let layouts: Vec<_> = std::iter::repeat_n(layout.raw(), ring_size).collect();
             let alloc = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
                 .set_layouts(&layouts);
+            // SAFETY: the pool was sized for exactly `ring_size` sets of `layout`,
+            // and `layouts` repeats that layout `ring_size` times.
             let sets = match unsafe { ctx.device.allocate_descriptor_sets(&alloc) } {
                 Ok(sets) => sets,
                 Err(e) => {
+                    // SAFETY: failed allocation leaves the pool with no sets.
                     unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
                     return Err(vk_error("allocating Vulkan descriptor sets", e));
                 }
@@ -1490,6 +1694,9 @@ mod real {
                         .buffer_info(std::slice::from_ref(info))
                 })
                 .collect();
+            // SAFETY: the target is one of this ring's own sets, and each write
+            // references a live buffer spanning its declared offset/range; sets
+            // are reused only after the batch using them has been waited on.
             unsafe { self.ctx.device.update_descriptor_sets(&writes, &[]) };
             Ok(set)
         }
@@ -1497,6 +1704,8 @@ mod real {
 
     impl Drop for DescriptorSetRing<'_> {
         fn drop(&mut self) {
+            // SAFETY: exclusive ownership at drop; all sets are freed with the
+            // pool, and the in-flight token using them is fence-waited first.
             unsafe { self.ctx.device.destroy_descriptor_pool(self.pool, None) };
         }
     }
@@ -1587,6 +1796,8 @@ mod real {
             let layout_create = vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&set_layouts)
                 .push_constant_ranges(&push_ranges);
+            // SAFETY: live device; both slices are stack-local, and the push range
+            // size is what the shaders declare via `push_constant_bytes`.
             let layout = unsafe { ctx.device.create_pipeline_layout(&layout_create, None) }
                 .map_err(|e| vk_error("creating Vulkan pipeline layout", e))?;
             let entry =
@@ -1629,13 +1840,19 @@ mod real {
             let create = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout)];
-            let pipeline = match unsafe {
+            // SAFETY: the shader module and `layout` are both live (owned by the
+            // caller/`ctx`), the pipeline cache is the context's, and the create
+            // structs/specialization bytes are stack-local.
+            let pipeline_result = unsafe {
                 ctx.device
                     .create_compute_pipelines(ctx.pipeline_cache, &create, None)
-            } {
+            };
+            let pipeline = match pipeline_result {
                 Ok(mut pipelines) => match pipelines.pop() {
                     Some(pipeline) => pipeline,
                     None => {
+                        // SAFETY: empty result; only the successfully created
+                        // layout needs destroying.
                         unsafe { ctx.device.destroy_pipeline_layout(layout, None) };
                         return Err(VulkanError::Runtime(
                             "Vulkan compute pipeline creation returned no pipelines".to_string(),
@@ -1644,8 +1861,12 @@ mod real {
                 },
                 Err((pipelines, e)) => {
                     for pipeline in pipelines {
+                        // SAFETY: these are pipeline handles the failed create
+                        // reports as successfully built; none is in use.
                         unsafe { ctx.device.destroy_pipeline(pipeline, None) };
                     }
+                    // SAFETY: layout has no pipeline referencing it after the
+                    // created ones are destroyed above.
                     unsafe { ctx.device.destroy_pipeline_layout(layout, None) };
                     return Err(vk_error("creating Vulkan compute pipeline", e));
                 }
@@ -1668,6 +1889,9 @@ mod real {
 
     impl Drop for ComputePipeline<'_> {
         fn drop(&mut self) {
+            // SAFETY: exclusive ownership at drop; every submit is fence-waited
+            // before the owning weights drop, so the pipeline is not executing.
+            // Destroy the pipeline before its layout.
             unsafe {
                 self.ctx.device.destroy_pipeline(self.pipeline, None);
                 self.ctx.device.destroy_pipeline_layout(self.layout, None);
@@ -2149,6 +2373,9 @@ void main() {
                 let push = push_for(addend);
                 pool.one_shot_submit(|cmd| {
                     let device = ctx.raw_device();
+                    // SAFETY: `cmd` is recording; `pipeline`, its layout, the set
+                    // (allocated for that layout), and the push slice are all live
+                    // for the closure. This mirrors `CommandRecorder::dispatch_raw`.
                     unsafe {
                         device.cmd_bind_pipeline(
                             cmd,
