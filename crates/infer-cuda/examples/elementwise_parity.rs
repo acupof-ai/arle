@@ -11,8 +11,9 @@
 //!   - `embedding_batched_cuda`: table gather, bit-exact
 //!
 //! Production geometry: Qwen3.6-27B (hidden 5120, inter 17408, split_qkv
-//! q=6144/kv=1024, 24×256-attn / 4 KV heads) and DSv4 backbone (hidden 7168,
-//! inter 20480), batch 1 and 8; RMSNorm eps = 1e-6 (the model config value).
+//! q=6144/kv=1024, 24×256-attn / 4 KV heads) and DeepSeek-V4-Flash-0731
+//! (hidden 4096, moe inter 2048, per the model's config.json), batch 1 and 8;
+//! RMSNorm eps = 1e-6 (the model config value).
 //! Embedding additionally runs at the production 151936-row × 5120 table
 //! (~1.5 GB) with ids at 0, the last rows and both ends.
 //!
@@ -49,8 +50,10 @@ mod real {
     const EPS: f64 = 1e-6;
     const BATCHES: &[usize] = &[1, 8];
     const SEED: u64 = 0xe1e4_1515_e1e4_1515;
-    // (label, hidden, inter) — Qwen3.6-27B dense and the DSv4 backbone.
-    const MODELS: &[(&str, usize, usize)] = &[("qwen36-27b", 5120, 17_408), ("dsv4", 7168, 20_480)];
+    // (label, hidden, inter) — Qwen3.6-27B dense dims and DeepSeek-V4-Flash-0731
+    // (hidden_size 4096 / moe_intermediate_size 2048; rms_norm_eps 1e-6,
+    // vocab 129280 — read from the model's config.json).
+    const MODELS: &[(&str, usize, usize)] = &[("qwen36-27b", 5120, 17_408), ("dsv4", 4_096, 2_048)];
     // 27B attention geometry: q 24×256=6144, kv 4×256=1024.
     const Q_DIM: usize = 6144;
     const KV_DIM: usize = 1024;
