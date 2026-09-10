@@ -1,38 +1,37 @@
 //! FlashMLA SM90 sparse-decode numeric-parity gate for the DSv4-Flash MODEL1
-//! CSA (compress_ratio=4) BATCHED decode path.
+//! HCA (HybridCompressed, compress_ratio=128) decode path.
 //!
-//! Standalone harness — NO engine, NO model. Drives the same public
-//! `cuda_kernels::attention` wrappers production drives, at the
-//! DeepSeek-V4-Flash-0731 decode geometry: h_q=64, d_qk=d_v=512, packed
-//! latent KV 584 B/token (448 FP8-E4M3 NoPE in 64-elem tiles, 64 BF16 RoPE
-//! dims, 8 E8M0 per-tile scales), page block 64, sliding_window 128,
-//! index_topk 512, topk_unified 640.
+//! Sibling of `flashmla_sparse_decode_parity.rs` (CSA, ratio=4). HCA layers
+//! are roughly half of DSv4-Flash's decode layers (compress_ratios alternates
+//! 4 and 128). The difference is index construction: HCA has no indexer
+//! selection — every causally-visible compressed ROW attends, via the same
+//! decode index builder with mode_int=2 and selected=null (dense branch
+//! `k < start_pos/128`).
 //!
-//! Batched shape B=8 with per-row distinct start_pos (a not-yet-full window,
-//! 64-token ring boundaries ±1, and compressed-block boundaries),
-//! row-specific selected sets, and discontinuous per-row Stage-B page tables.
+//! Standalone harness — NO engine, NO model. Same production geometry and
+//! packed 584 B/token pool as the CSA gate. B=8 rows whose start_pos straddle
+//! the 128-token compression boundary ±1 (127,128,129,255,256,257,383,384),
+//! plus discontinuous per-row Stage-B page tables.
 //!
-//! Compared families, each with its own verdict and negative flag:
-//!   - pack — production `dsv4_fp8_kv_pack_strided` output decoded from pool
-//!     bytes vs the BF16 sources, within the E4M3×E8M0 half-ULP bound;
-//!   - indices — production batched `..._build_indices_batched` vs an oracle
-//!     written from address semantics (last-128 positions routed through the
-//!     page table, then selected indexer keys, causally gated);
-//!   - attention output — batched sparse decode fwd vs an f32 host reference
-//!     that decodes the pool bytes and masks softmax over each row's index set;
-//!   - LSE — fwd log-sum-exp vs the reference, split-path sink aware;
-//!   - scheduler metadata — determinism and bounds of `..._sched_meta`.
+//! Families, each with its own verdict and negative flag:
+//!   - pack — production `dsv4_fp8_kv_pack_strided` output vs BF16 sources;
+//!   - indices — production batched mode_int=2 builder vs a semantic oracle
+//!     (last-128 positions through the page table, then every compressed row
+//!     k < floor(start_pos/128));
+//!   - attention output — batched sparse decode fwd vs an f32 reference over
+//!     each row's dense index set;
+//!   - LSE — split-path sink aware;
+//!   - scheduler metadata — determinism and bounds.
 //!
-//! Normal run: every family must pass. Under `--negative-control` one
-//! corruption per family must independently FAIL it; the run prints
-//! NEGATIVE CONTROL OK and exits 0 only if all five flags fired.
+//! `--negative-control` runs one corruption per family; prints NEGATIVE
+//! CONTROL OK and exits 0 only if all five flags fired.
 //!
 //! sm90 only (H20). Build/run on a pod (pod.sh build rejects --example):
 //!   cargo build --release -p infer-cuda --features cuda \
-//!     --example flashmla_sparse_decode_parity
-//!   target/release/examples/flashmla_sparse_decode_parity --kernel-build-id
-//!   target/release/examples/flashmla_sparse_decode_parity
-//!   target/release/examples/flashmla_sparse_decode_parity --negative-control
+//!     --example flashmla_hca_decode_parity
+//!   target/release/examples/flashmla_hca_decode_parity --kernel-build-id
+//!   target/release/examples/flashmla_hca_decode_parity
+//!   target/release/examples/flashmla_hca_decode_parity --negative-control
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -48,7 +47,7 @@ fn main() -> anyhow::Result<()> {
 mod real {
     pub(super) fn run(_negative: bool) -> anyhow::Result<()> {
         eprintln!(
-            "flashmla_sparse_decode_parity is a CUDA/sm90 harness; rebuild with \
+            "flashmla_hca_decode_parity is a CUDA/sm90 harness; rebuild with \
              --features cuda."
         );
         Ok(())
@@ -63,40 +62,40 @@ mod real {
     use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    // DeepSeek-V4-Flash-0731 MODEL1 decode geometry (config.json).
     const H_Q: usize = 64;
     const H_KV: i32 = 1;
-    const D_QK: usize = 512; // 448 NoPE + 64 RoPE
+    const D_QK: usize = 512;
     const D_V: usize = 512;
     const HEAD_NOPE: usize = 448;
     const HEAD_ROPE: usize = 64;
     const PAGE: usize = 64;
     const SLIDING_WINDOW: usize = 128;
     const SW_BLOCKS: usize = 2;
-    const INDEX_TOPK: usize = 512;
-    const COMPRESS_RATIO: usize = 4;
-    const MODE_CSA: i32 = 1;
+    const COMPRESS_RATIO: usize = 128; // HCA
+    const MODE_HCA: i32 = 2;
     const MODEL1: i32 = 1;
-    const TOPK_UNIFIED: usize = SLIDING_WINDOW + INDEX_TOPK; // 640
     const ROW_BYTES: usize = 584;
-    const BLOCK_BYTES: usize = PAGE * ROW_BYTES; // 37376
+    const BLOCK_BYTES: usize = PAGE * ROW_BYTES;
 
     const B: usize = 8;
-    // 2 SW + up to 2 compressed logical blocks per row (start_pos ≤ 256).
-    const BLOCKS_PER_ROW: usize = 4;
+    // 2 SW + up to 4 compressed logical blocks (384 comp rows = 6 pages;
+    // start_pos 384 → floor/128 = 3 rows, but padded max_compressed_keys to
+    // 512 ⇒ 8 blocks; size for the worst row).
+    const BLOCKS_PER_ROW: usize = 2 + 8;
     const TOTAL_BLOCKS: usize = B * BLOCKS_PER_ROW;
 
-    // Not-yet-full window (63), ring-block boundaries ±1 (64,65,127,128,129),
-    // compressed-block boundary (255,256 → floor/4 = 63,64 keys).
-    const START_POS: [i32; B] = [63, 64, 65, 127, 128, 129, 255, 256];
-    const DOM_SLOT: usize = 0;
+    // Straddle 128-token compression boundaries ±1. floor(start/128) gives
+    // 0,1,1,1,2,2,2,3 visible compressed rows.
+    const START_POS: [i32; B] = [127, 128, 129, 255, 256, 257, 383, 384];
 
-    // Caps for THIS construction: the dominant 0.5 latent packs exactly
-    // (0.5/2^-9 = 256, an E4M3 level) and carries ~all the weight, so the
-    // dominant-key channel is quantization-exact and only small random keys
-    // contribute bounded error (E4M3 worst half-ULP 1/16 in the top binade;
-    // they land in much tighter low binades). Pre-GPU analytic caps, to be
-    // confirmed/tightened from the measured run.
+    // HCA max_compressed_keys = ceil(comp_rows/128)*128 with
+    // comp_rows = ceil(max_seq/128). At the widest row (start 384) the shape
+    // reserves 512; topk_unified must be a multiple of 128.
+    const MAX_COMPRESSED_KEYS: usize = 512;
+    const TOPK_UNIFIED: usize = SLIDING_WINDOW + MAX_COMPRESSED_KEYS; // 640
+
+    // HCA has no selected indexer; the builder reads selected=null.
+
     const PASS_MAX_REL_OUT: f64 = 0.05;
     const PASS_MAX_ABS_LSE: f64 = 0.10;
     const PACK_NOPE_REL: f64 = 0.07;
@@ -108,8 +107,7 @@ mod real {
         lse: Vec<f32>,
     }
 
-    /// Physical block for (row, logical block): a row-specific rotation so no
-    /// row's logical block order equals its physical order.
+    /// Row-specific rotation: logical block order != physical order.
     fn phys_of(r: usize, l: usize) -> usize {
         r * BLOCKS_PER_ROW + (l + 1 + r) % BLOCKS_PER_ROW
     }
@@ -118,7 +116,7 @@ mod real {
         let ctx = DeviceContext::new()?;
         let cc = ctx.compute_capability();
         eprintln!(
-            "[flashmla-sparse-parity] device={} cc={}.{} sms={} b={B} build={}",
+            "[flashmla-hca-parity] device={} cc={}.{} sms={} b={B} build={}",
             ctx.ordinal(),
             cc.0,
             cc.1,
@@ -148,14 +146,13 @@ mod real {
         let mut nope_src = vec![0f32; total_tokens * HEAD_NOPE];
         let mut rope_src = vec![0f32; total_tokens * HEAD_ROPE];
         let mut used = vec![false; total_tokens];
-        let mut selected = vec![-1i32; B * INDEX_TOPK];
+        // Per-row dominant compressed row (last causal) → physical token.
         let mut dom_phys = [0usize; B];
-
         let mut pool = ctx.stream.alloc_zeros::<u8>(TOTAL_BLOCKS * BLOCK_BYTES)?;
 
         for r in 0..B {
             let start = START_POS[r];
-            let comp_count = (start / COMPRESS_RATIO as i32) as usize;
+            let comp_count = (start / COMPRESS_RATIO as i32) as usize; // dense rows
             let dom_c = comp_count - 1;
             dom_phys[r] = {
                 let logical = SW_BLOCKS + dom_c / PAGE;
@@ -217,7 +214,6 @@ mod real {
                 );
             }
             for c in 0..comp_count {
-                let is_dom = c == dom_c;
                 emit(
                     &mut pack_nope,
                     &mut pack_rope,
@@ -225,7 +221,7 @@ mod real {
                     &mut pack_row,
                     SW_BLOCKS + c / PAGE,
                     c % PAGE,
-                    is_dom,
+                    c == dom_c,
                     &mut nope_src,
                     &mut rope_src,
                     &mut used,
@@ -240,32 +236,9 @@ mod real {
                 &pack_block,
                 &pack_row,
             )?;
-
-            // Fisher-Yates of the causal keys; dominant pinned at DOM_SLOT.
-            let row_sel = &mut selected[r * INDEX_TOPK..(r + 1) * INDEX_TOPK];
-            let mut order: Vec<i32> = (0..comp_count as i32).collect();
-            let mut state =
-                0x9e37_79b9_7f4a_7c15u64 ^ (r as u64).wrapping_mul(0x517c_c1cc_9e37_79b9);
-            let mut next = || {
-                state ^= state >> 33;
-                state = state.wrapping_mul(0xff51_afd7_ed55_8ccd);
-                state ^= state >> 33;
-                state
-            };
-            for i in (1..order.len()).rev() {
-                let j = (next() as usize) % (i + 1);
-                order.swap(i, j);
-            }
-            // Place dominant at slot 0; shift whoever was there to dom's spot.
-            let dom_pos = order.iter().position(|&k| k as usize == dom_c).unwrap();
-            order.swap(0, dom_pos);
-            for (slot, &k) in order.iter().enumerate() {
-                row_sel[slot] = k;
-            }
         }
         ctx.sync()?;
 
-        // Nonzero random per-head sink, sign + scale covered.
         let sink: Vec<f32> = (0..H_Q)
             .map(|h| rand01(0xA11C, h as u64, 0, 7, 3) * 1.0 - 0.2)
             .collect();
@@ -274,7 +247,7 @@ mod real {
         let pool_bytes = ctx.stream.clone_dtoh(&pool)?;
         let records = decode_pool(&pool_bytes);
         let (pack_ok, pack_max_nope, pack_max_rope) =
-            check_pack(&pool_bytes, &nope_src, &rope_src, &used, &tables);
+            check_pack(&pool_bytes, &nope_src, &rope_src, &used);
 
         let (num_sm_parts, fixed_overhead, block_size_topk) =
             attention::flashmla_sm90_sparse_decode_get_meta(H_Q as i32, 1, MODEL1)?;
@@ -286,7 +259,6 @@ mod real {
         let offsets_dev = ctx.stream.clone_htod(&vec![0i32; B])?;
         let sink_dev = ctx.stream.clone_htod(&sink)?;
 
-        let selected_dev = ctx.stream.clone_htod(&selected)?;
         ensure!(
             pack_ok,
             "pack family: decoded pool differs from BF16 sources (nope {pack_max_nope}, rope {pack_max_rope})"
@@ -317,7 +289,6 @@ mod real {
                     &q_dev,
                     &pool,
                     &table_dev,
-                    &selected_dev,
                     &start_dev,
                     &offsets_dev,
                     &sink_dev,
@@ -326,7 +297,7 @@ mod real {
                     &splits_good,
                     b,
                 )?;
-                let ref_indices = oracle_indices(&tables, &selected, b);
+                let ref_indices = oracle_indices(&tables, b);
                 let (ref_out, ref_lse) =
                     reference_attention(&records, &ref_indices, &sink, &splits_good, b);
                 let idx_ok = got.indices == ref_indices;
@@ -368,7 +339,7 @@ mod real {
                     "B={b} scheduler metadata not deterministic/bounded"
                 );
             }
-            println!("[flashmla-sparse-parity] ALL PASS");
+            println!("[flashmla-hca-parity] ALL PASS");
             return Ok(());
         }
 
@@ -386,21 +357,22 @@ mod real {
             &mut splits_good,
             B,
         )?;
-        let ref_indices = oracle_indices(&tables, &selected, B);
+        let ref_indices = oracle_indices(&tables, B);
         let (ref_out, ref_lse) =
             reference_attention(&records, &ref_indices, &sink, &splits_good, B);
 
-        // Mask row 0's dominant selected entry.
-        let mut bad_sel = selected.clone();
-        bad_sel[DOM_SLOT] = -1;
-        let bad_sel_dev = ctx.stream.clone_htod(&bad_sel)?;
+        // Force row 0's start one compressed row into the future; adds a dense
+        // compressed key and rotates its SW positions, moving indices, output
+        // and LSE while other rows stay fixed.
+        let mut bad_starts = START_POS;
+        bad_starts[0] = START_POS[0] + COMPRESS_RATIO as i32;
+        let bad_start_dev = ctx.stream.clone_htod(&bad_starts)?;
         let got_neg = run_fwd(
             &ctx,
             &q_dev,
             &pool,
             &table_dev,
-            &bad_sel_dev,
-            &start_dev,
+            &bad_start_dev,
             &offsets_dev,
             &sink_dev,
             num_sm_parts,
@@ -408,7 +380,7 @@ mod real {
             &splits_good,
             B,
         )?;
-        let bad_oracle = oracle_indices(&tables, &bad_sel, B);
+        let bad_oracle = oracle_indices_starts(&tables, &bad_starts, B);
         let (rel_bad, lse_bad) = {
             let (o, l) = reference_attention(&records, &bad_oracle, &sink, &splits_good, B);
             compare(&got_neg, &o, &l)
@@ -419,13 +391,12 @@ mod real {
         let neg_lse = lse_good > PASS_MAX_ABS_LSE;
         let bad_self_consistent = rel_bad <= PASS_MAX_REL_OUT && lse_bad <= PASS_MAX_ABS_LSE;
 
-        // Pack family: flip a NoPE exponent byte on a written token.
+        // Pack: flip a NoPE exponent byte on a written token.
         let mut corrupt = pool_bytes.clone();
-        let byte_idx = dom_phys[0] * ROW_BYTES;
-        corrupt[byte_idx] ^= 0x20;
-        let (neg_pack, _, _) = check_pack(&corrupt, &nope_src, &rope_src, &used, &tables);
+        corrupt[dom_phys[0] * ROW_BYTES] ^= 0x20;
+        let (neg_pack, _, _) = check_pack(&corrupt, &nope_src, &rope_src, &used);
 
-        // Scheduler: 8x topk forces a different partition.
+        // Scheduler: 8x topk.
         let mut meta8 = Vec::new();
         let mut splits8 = Vec::new();
         build_sched(
@@ -441,18 +412,16 @@ mod real {
         )?;
         let neg_sched = meta8 != sched_good || splits8 != splits_good;
 
-        println!("negative pack fired={neg_pack} (nope rel {pack_max_nope:.6})");
+        println!("negative pack fired={neg_pack}");
         println!("negative indices fired={neg_indices}");
-        println!(
-            "negative out rel_vs_good={rel_good:.6} (self-consistent {bad_self_consistent}) fired={neg_out}"
-        );
+        println!("negative out rel_vs_good={rel_good:.6} (self {rel_bad:.6}, fired={neg_out})");
         println!("negative lse abs_vs_good={lse_good:.6} fired={neg_lse}");
         println!("negative scheduler fired={neg_sched}");
         ensure!(!neg_pack, "pack negative control unexpectedly passed");
         ensure!(neg_indices, "negative control did not fail indices");
         ensure!(
             neg_out && bad_self_consistent,
-            "output negative control invalid (move {rel_good}, self {rel_bad})"
+            "output control invalid (move {rel_good}, self {rel_bad})"
         );
         ensure!(neg_lse, "negative control did not fail LSE");
         ensure!(neg_sched, "negative control did not fail scheduler");
@@ -508,17 +477,12 @@ mod real {
         )
     }
 
-    /// Pack family: every written pool token decodes back to the BF16 source
-    /// within the tile half-ULP (NoPE) and bf16 half-ULP (RoPE copy).
-    #[allow(clippy::too_many_arguments)]
     fn check_pack(
         pool: &[u8],
         nope_src: &[f32],
         rope_src: &[f32],
         used: &[bool],
-        tables: &[i32],
     ) -> (bool, f64, f32) {
-        let _ = tables;
         let mut max_rel_nope = 0f64;
         let mut max_abs_rope = 0f32;
         for phys in 0..used.len() {
@@ -540,16 +504,15 @@ mod real {
                     let d = tile * 64 + lane;
                     let got = decode_e4m3(pool[data_base + d]) * scale;
                     let want = nope_src[phys * HEAD_NOPE + d];
-                    let denom = want.abs().max(f32::MIN_POSITIVE);
-                    max_rel_nope = max_rel_nope.max(((got - want) / denom).abs() as f64);
+                    max_rel_nope = max_rel_nope
+                        .max(((got - want) / want.abs().max(f32::MIN_POSITIVE)).abs() as f64);
                 }
             }
             for d in 0..HEAD_ROPE {
                 let lo = u16::from(pool[data_base + HEAD_NOPE + d * 2]);
                 let hi = u16::from(pool[data_base + HEAD_NOPE + d * 2 + 1]);
                 let got = bf16::from_bits(lo | (hi << 8)).to_f32();
-                let want = rope_src[phys * HEAD_ROPE + d];
-                max_abs_rope = max_abs_rope.max((got - want).abs());
+                max_abs_rope = max_abs_rope.max((got - rope_src[phys * HEAD_ROPE + d]).abs());
             }
         }
         let ok = max_rel_nope <= PACK_NOPE_REL && max_abs_rope <= PACK_ROPE_ABS;
@@ -572,8 +535,8 @@ mod real {
                         2f32.powi(i32::from(e8m0) - 127)
                     };
                     for lane in 0..64usize {
-                        let d = tile * 64 + lane;
-                        v[d] = decode_e4m3(bytes[data_base + d]) * scale;
+                        v[tile * 64 + lane] =
+                            decode_e4m3(bytes[data_base + tile * 64 + lane]) * scale;
                     }
                 }
                 for d in 0..HEAD_ROPE {
@@ -601,53 +564,43 @@ mod real {
         sign * mag
     }
 
-    /// Semantic index oracle, independent of the device index_at code.
-    /// Per row: the last min(128, start+1) token POSITIONS, each mapped
-    /// (ring slot → logical SW block → physical via the table), then the
-    /// selected indexer keys k in [0, floor(start/4)] mapped to compressed
-    /// physical rows via the table. Order matches the kernel slot order
-    /// (SW first, then selected slots); -1 elsewhere.
-    fn oracle_indices(tables: &[i32], selected: &[i32], b: usize) -> Vec<i32> {
+    /// Semantic HCA oracle at the default start positions.
+    fn oracle_indices(tables: &[i32], b: usize) -> Vec<i32> {
+        oracle_indices_starts(tables, &START_POS, b)
+    }
+
+    /// Semantic HCA oracle: last min(128, start+1) token positions routed via
+    /// the page table, then EVERY dense compressed row k < floor(start/128),
+    /// also routed. -1 beyond. Written from the addressing semantics, not
+    /// ported from the device index_at code.
+    fn oracle_indices_starts(tables: &[i32], starts: &[i32; B], b: usize) -> Vec<i32> {
         let mut out = vec![-1i32; b * TOPK_UNIFIED];
         for r in 0..b {
-            let start = START_POS[r];
+            let start = starts[r];
             let table = &tables[r * BLOCKS_PER_ROW..(r + 1) * BLOCKS_PER_ROW];
             let row_out = &mut out[r * TOPK_UNIFIED..(r + 1) * TOPK_UNIFIED];
-            let sel = &selected[r * INDEX_TOPK..(r + 1) * INDEX_TOPK];
 
             let sw_start = (start - SLIDING_WINDOW as i32 + 1).max(0);
             let sw_count = (start - sw_start + 1) as usize;
             for (p, ()) in std::iter::repeat_n((), sw_count).enumerate() {
-                let pos = sw_start + p as i32;
-                let ring = pos % SLIDING_WINDOW as i32;
-                let logical_block = ring / PAGE as i32;
+                let ring = (sw_start + p as i32) % SLIDING_WINDOW as i32;
+                let logical_block = (ring / PAGE as i32) as usize;
                 let row_in_block = ring % PAGE as i32;
-                if (logical_block as usize) < SW_BLOCKS {
-                    let phys_block = table[logical_block as usize];
-                    row_out[p] = phys_block * PAGE as i32 + row_in_block;
+                if logical_block < SW_BLOCKS {
+                    row_out[p] = table[logical_block] * PAGE as i32 + row_in_block;
                 }
             }
-            for (slot, &k) in sel.iter().enumerate() {
-                if k < 0 {
-                    continue;
-                }
-                let block_end = k * COMPRESS_RATIO as i32 + (COMPRESS_RATIO as i32 - 1);
-                if block_end > start {
-                    continue;
-                }
-                let logical_block = SW_BLOCKS as i32 + k / PAGE as i32;
-                let row_in_block = k % PAGE as i32;
-                let phys_block = table[logical_block as usize];
-                row_out[sw_count + slot] = phys_block * PAGE as i32 + row_in_block;
+            let comp_rows = (start / COMPRESS_RATIO as i32) as usize;
+            for k in 0..comp_rows {
+                let logical_block = SW_BLOCKS + k / PAGE;
+                let row_in_block = (k % PAGE) as i32;
+                row_out[sw_count + k] = table[logical_block] * PAGE as i32 + row_in_block;
             }
         }
         out
     }
 
-    /// f32 masked sparse attention. Q is the bf16 constant 0.5; V is the
-    /// same 512-dim latent record. The zero-of-many-heads sink here is
-    /// nonzero per head (given). Output denominator always includes
-    /// exp(sink - m); LSE includes it only on the multi-split combine path.
+    #[allow(clippy::too_many_arguments)]
     fn reference_attention(
         records: &[Vec<f32>],
         indices: &[i32],
@@ -677,17 +630,14 @@ mod real {
                 let m_eff = maxs.max(sink_eff);
                 let tok_exp: f32 = scores.iter().map(|&s| (s - m_eff).exp()).sum();
                 let sink_exp = (sink_eff - m_eff).exp();
-                // Single-split kernel writes token-only LSE; multi-split
-                // combine folds the sink in. Output always divides by the
-                // token+sink sum.
                 lse[r * H_Q + h] = if multi {
                     m_eff + (tok_exp + sink_exp).ln()
                 } else {
                     m_eff + tok_exp.ln()
                 };
-                let out_denom = tok_exp + sink_exp;
+                let denom = tok_exp + sink_exp;
                 for (&idx, &s) in valid.iter().zip(&scores) {
-                    let p = (s - m_eff).exp() / out_denom;
+                    let p = (s - m_eff).exp() / denom;
                     for d in 0..D_V {
                         out[r * H_Q * D_V + h * D_V + d] += p * records[idx][d];
                     }
@@ -703,7 +653,6 @@ mod real {
         q: &CudaSlice<bf16>,
         pool: &CudaSlice<u8>,
         table: &CudaSlice<i32>,
-        selected: &CudaSlice<i32>,
         start: &CudaSlice<i32>,
         offsets: &CudaSlice<i32>,
         sink: &CudaSlice<f32>,
@@ -721,26 +670,27 @@ mod real {
             let (idx_ptr, _gi) = indices.device_ptr_mut(&ctx.stream);
             let (start_ptr, _gp) = start.device_ptr(&ctx.stream);
             let (off_ptr, _go) = offsets.device_ptr(&ctx.stream);
-            let (sel_ptr, _gs) = selected.device_ptr(&ctx.stream);
             let (topk_ptr, _gt) = topk_length.device_ptr_mut(&ctx.stream);
+            // HCA: selected=null, mode_int=2, max_compressed_keys=512, ratio=128.
             attention::dsv4_flashmla_decode_build_indices_batched_raw(
                 ctx,
                 idx_ptr,
                 start_ptr,
                 off_ptr,
-                sel_ptr,
+                0, // no selected indexer
                 topk_ptr,
                 b,
                 SW_BLOCKS,
                 SLIDING_WINDOW,
-                INDEX_TOPK,
+                MAX_COMPRESSED_KEYS,
                 COMPRESS_RATIO,
-                MODE_CSA,
+                MODE_HCA,
                 PAGE,
                 TOTAL_BLOCKS,
                 Some(table),
                 BLOCKS_PER_ROW,
             )?;
+            let _ = (_gp, _go, _gt);
         }
         ctx.sync()?;
         let indices_host = ctx.stream.clone_dtoh(&indices)?;
@@ -774,13 +724,13 @@ mod real {
                 oacc_ptr,
                 meta_ptr,
                 split_ptr,
-                b as i32,
+                B as i32,
                 1,
                 H_Q as i32,
                 H_KV,
                 D_QK as i32,
                 D_V as i32,
-                TOTAL_BLOCKS as i32,
+                BLOCKS_PER_ROW as i32,
                 PAGE as i32,
                 TOPK_UNIFIED as i32,
                 num_sm_parts,
