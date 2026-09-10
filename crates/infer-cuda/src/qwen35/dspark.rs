@@ -1679,14 +1679,25 @@ impl Qwen35Model {
         // Restore: live <- snapshot, so the snapshot side is the source.
         self.batched_copy(copy, &gdr.1, &gdr.0, &[gdr_bytes])?;
         self.batched_copy(copy, &conv.1, &conv.0, &[conv_bytes])?;
-        let ks: Vec<usize> = rolls.iter().map(|r| r.k).collect();
-        let mut slots: Vec<&mut Qwen35SlotState> = Vec::with_capacity(rolls.len());
-        let mut captures: Vec<&Qwen35LinearCapture> = Vec::with_capacity(rolls.len());
-        for DsparkRollback { slot, spec, .. } in rolls.iter_mut() {
-            slots.push(&mut **slot);
-            captures.push(&spec.capture);
+        // Route on kernel availability, not max_len: an all-reject replay
+        // (every slot k=0 → one row) must take the same per-slot path c=1 uses,
+        // not the never-parity-gated varlen batch.
+        if self.gdr_fq_available() {
+            // Per-slot replay through the parity-validated recurrence; k=0
+            // slots advance one row on the single-token decode kernel.
+            for r in rolls.iter_mut() {
+                self.replay_linear_only(r.slot, ws, &r.spec.capture, r.k)?;
+            }
+        } else {
+            let ks: Vec<usize> = rolls.iter().map(|r| r.k).collect();
+            let mut slots: Vec<&mut Qwen35SlotState> = Vec::with_capacity(rolls.len());
+            let mut captures: Vec<&Qwen35LinearCapture> = Vec::with_capacity(rolls.len());
+            for DsparkRollback { slot, spec, .. } in rolls.iter_mut() {
+                slots.push(&mut **slot);
+                captures.push(&spec.capture);
+            }
+            self.replay_linear_only_batched(&mut slots, &captures, &ks, tables, ws)?;
         }
-        self.replay_linear_only_batched(&mut slots, &captures, &ks, tables, ws)?;
         for r in rolls.iter_mut() {
             r.slot.set_seq_len(r.start_pos + r.k + 1);
         }

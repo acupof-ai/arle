@@ -102,6 +102,22 @@ pub fn linear_state_bytes(cfg: &Qwen35Config, shard: LocalShard) -> (usize, usiz
     )
 }
 
+/// FlashQLA chunked GDR has an AOT instantiation for this geometry. This is the
+/// single geometry predicate for every "use the chunked FlashQLA recurrence"
+/// decision — the per-row `use_fq_chunked` dispatch and the uniform-multi-chain
+/// verify router must agree, or batched spec verify silently drops to a
+/// different (never parity-gated) varlen recurrent kernel.
+pub fn fq_geometry_supported(
+    key_heads: usize,
+    value_heads: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+) -> bool {
+    key_head_dim == 128
+        && value_head_dim == 128
+        && matches!((key_heads, value_heads), (16, 32) | (16, 48))
+}
+
 /// `(per_slot, kv_bytes, gdr_bytes, conv_bytes)` — full-attn K/V is paged
 /// (shared pool), so `kv_bytes` is 0.
 pub fn per_slot_kv_bytes(cfg: &Qwen35Config, shard: LocalShard) -> (usize, usize, usize, usize) {
@@ -300,6 +316,19 @@ mod tests {
         assert!(cp_decode_possible(4, shard));
         assert!(!cp_decode_possible(3, shard));
         assert!(!cp_decode_possible(8, shard)); // kv 8 ok, lin 4 not
+    }
+
+    /// The chunked-GDR router and the per-row `use_fq_chunked` dispatch must use
+    /// exactly this predicate, so c=1 verify and c=N batched verify pick the
+    /// same FlashQLA recurrence. A geometry drifting out of sync silently drops
+    /// the batch to the unvalidated varlen recurrent kernel.
+    #[test]
+    fn fq_geometry_matches_aot_instantiations() {
+        assert!(fq_geometry_supported(16, 32, 128, 128));
+        assert!(fq_geometry_supported(16, 48, 128, 128));
+        assert!(!fq_geometry_supported(16, 32, 256, 256));
+        assert!(!fq_geometry_supported(8, 32, 128, 128));
+        assert!(!fq_geometry_supported(16, 32, 128, 256));
     }
 
     #[test]
