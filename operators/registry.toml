@@ -632,3 +632,51 @@ fallback = ""
 
 [policy."dsv4.moe_transport"]
 fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "dsv4.dspark_draft_attention"
+kind = "kernel"
+inputs = ["draft_q", "committed_latent_kv"]
+outputs = ["draft_attn_out"]
+reference = "cuda.dsv4.dspark_draft_attention"
+correctness_gate = "crates/infer-cuda/examples/dspark_dsa_parity.rs"
+gate_gap = "production DSv4-Flash geometry (head_dim 512 = 448 nope + 64 rope, dspark_block_size 5, local_heads 64 = draft wq_b rows 32768/512 at TP=1, kv_len 133 = sliding_window 128 + block) with f64 oracle + bf16-derived bound, plus 1024/4096 stress lengths; not covered: TP>1 head sharding (64/tp), real draft activations (inputs random), and the GPU run is pod-only"
+
+[[implementation]]
+id = "cuda.dsv4.dspark_draft_attention"
+semantic = "dsv4.dspark_draft_attention"
+provider = "arle"
+source = "crates/cuda-kernels/csrc/attention/dsv4_dspark_draft_attention.cu"
+legality = "DSpark draft stage; non-causal dense MLA-latent attention, head-shared latent, inverse-RoPE value tail; kv_len<=9216"
+fallback = ""
+
+[policy."dsv4.dspark_draft_attention"]
+fallback_status = "no-fallback"
+
+[[semantic]]
+id = "dsv4.dsa_indexer"
+kind = "composite"
+inputs = ["indexer_q", "freqs_cis", "indexer_scores", "page_table"]
+outputs = ["q_fp8", "q_scales", "topk_page_indices", "topk_raw_indices"]
+reference = "cuda.dsv4.dsa_fused_q_indexer"
+correctness_gate = "crates/infer-cuda/examples/dspark_dsa_parity.rs"
+gate_gap = "building blocks in isolation at production DSv4-Flash dims (index_n_heads 64, index_head_dim 128, index_topk 512; seq 512/2049/4096, B4) with f32/f64 oracles (top-k compared as sets with the cutoff-tie rule); scores/inputs are synthetic, ratio-4 production context lengths and the paged-MQA logits DeepGEMM kernel between Q-build and topk are not exercised, and the GPU run is pod-only"
+
+[[implementation]]
+id = "cuda.dsv4.dsa_fused_q_indexer"
+semantic = "dsv4.dsa_indexer"
+provider = "sgl-kernel"
+source = "crates/cuda-kernels/csrc/attention/dsv4_dsa_official.cu"
+legality = "DSA mode; per-token indexer Q: partial RoPE 64 + H128 rotate + per-row FP8 e4m3 quant with scale; 128 dim, n_heads in {32,64}"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.dsa_topk_transform"
+semantic = "dsv4.dsa_indexer"
+provider = "sgl-kernel"
+source = "crates/cuda-kernels/csrc/attention/dsv4_dsa_official.cu"
+legality = "radix top-k over indexer logits (topk<=1024) with 64-token page-table mapping; naive branch when seq_len<=topk"
+fallback = ""
+
+[policy."dsv4.dsa_indexer"]
+fallback_status = "no-fallback"
