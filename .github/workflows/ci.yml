@@ -100,9 +100,20 @@ jobs:
           cargo clippy -p autograd --features no-cuda --all-targets -- -D warnings
           cargo clippy -p train --features no-cuda --all-targets -- -D warnings
           cargo clippy -p kv-native-sys --all-targets -- -D warnings
-          # The HIP and Vulkan backends had no gate at all; both compile on
-          # this runner, so lint them like every other CPU-only surface.
+          # cli's example has a Linux typecheck (it is otherwise built only on
+          # the Metal lane).
+          cargo clippy -p cli --no-default-features --features no-cuda --examples -- -D warnings
+          # HIP/Vulkan backend bodies sit behind their feature; the no-feature
+          # lint above compiles almost none of them. With the feature on, the
+          # -sys crates fall back to host stubs on this runner (no ROCm/Vulkan
+          # needed). HIP is clippy-clean; Vulkan's -D warnings clippy is blocked
+          # on ~193 safety-comment cleanups, so Vulkan is a `cargo check` type
+          # gate (catches type breaks) for now.
           cargo clippy -p infer-hip -p infer-vulkan -- -D warnings
+          cargo clippy -p infer-hip --features hip --lib -- -D warnings
+          cargo check -p infer-vulkan --features vulkan --lib
+          # deepep-sys: `deepep` typechecks the FFI but build.rs skips the
+          # native kernel (no nvcc on this runner) — kernel compile is GPU-only.
 
       # The ONLY automated gate for the CUDA-Rust surface: there is no GPU CI
       # (no self-hosted GPU runner; the full CUDA build is manual on the pod /
@@ -122,6 +133,17 @@ jobs:
           # Examples link the CUDA runtime (unavailable in CI), so clippy
           # --examples (no link) is their only gate.
           cargo clippy -p infer-cuda --release --no-default-features --features cuda,no-cuda,nccl --examples -- -D warnings
+          # `--lib`/`--examples` do NOT compile #[cfg(test)] modules, so the
+          # CUDA backend's inline tests never typechecked (same class as the
+          # 2026-09 Metal infer-metal miss). `--tests` compiles them without
+          # linking (no GPU toolchain): infer-cuda lib-tests, cuda-kernels
+          # inline tests + tests/.
+          cargo clippy -p infer-cuda --release --no-default-features --features cuda,no-cuda,nccl --tests -- -D warnings
+          cargo clippy -p cuda-kernels --release --no-default-features --features no-cuda --tests -- -D warnings
+          # train/autograd CUDA examples previously typechecked only in the
+          # no-cuda shape; their CUDA example bodies (#286 dsv4_parity class)
+          # were ungated. clippy --examples (no link).
+          cargo clippy -p train -p autograd --no-default-features --features cuda,no-cuda --examples -- -D warnings
 
       # Enforced 2026-08-23: tree clean (zero advisories; paste 1.0.15 is an
       # unmaintained warning, which does not fail the lane).
@@ -192,9 +214,9 @@ jobs:
         run: >-
           cargo test --profile release-fast
           -p infer-core -p infer-server -p infer-plan -p infer-kvspace -p infer-seam
-          -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
+          -p infer-moe -p infer-model -p infer-topo -p infer-util -p deepseek-spec -p agent
           -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys
-          -p infer-quant
+          -p infer-quant -p infer-gguf
           -p spec-train
 
   fmt:
