@@ -163,9 +163,15 @@ pub const KV_MEM_FRACTION: f64 = 0.7;
 /// failed — that rank must not bind the cross-rank min. A 0 return means
 /// post-weights free VRAM holds no slot at all; the reject guard fires on the
 /// reduced value in the caller.
+///
+/// `attn_ws_per_slot` is the quantized-FA3 split-KV workspace, charged per
+/// slot because the kernel sizes it `num_splits × num_slots × …` (0 for
+/// non-quantized pools). It is deducted alongside the recurrent per-slot
+/// grant so the pool remainder funds only what survives both.
 pub fn kv_slot_budget_local(
     probe: Option<(usize, usize)>,
     per_slot: usize,
+    attn_ws_per_slot: usize,
     requested: usize,
     max_seq_len: usize,
     mem_fraction_static: f64,
@@ -174,15 +180,16 @@ pub fn kv_slot_budget_local(
     let Some((free, total)) = probe else {
         return i32::MAX;
     };
+    let granted_per_slot = per_slot.saturating_add(attn_ws_per_slot);
     let pool_tokens_at = |free: usize, n: usize| -> u64 {
         profile_kv_pool_tokens(
-            (free as u64).saturating_sub(per_slot.saturating_mul(n) as u64),
+            (free as u64).saturating_sub(granted_per_slot.saturating_mul(n) as u64),
             total as u64,
             cell_bytes_per_token,
             mem_fraction_static,
         )
     };
-    let budget = SlotBudget::from_free(free, KV_MEM_FRACTION, 0, per_slot);
+    let budget = SlotBudget::from_free(free, KV_MEM_FRACTION, 0, granted_per_slot);
     let affordable = budget.affordable().unwrap_or(usize::MAX);
     let mut n = requested.max(1).min(affordable);
     while n > 1 && pool_tokens_at(free, n) < max_seq_len as u64 {
@@ -203,6 +210,7 @@ pub fn kv_pool_pages_local(
     probe: Option<(usize, usize)>,
     planned: usize,
     per_slot: usize,
+    attn_ws_per_slot: usize,
     cell_bytes_per_token: u64,
     num_full: usize,
     local_kv_heads: usize,
@@ -214,8 +222,11 @@ pub fn kv_pool_pages_local(
     let Some((free, total)) = probe else {
         return i32::MAX;
     };
+    let granted_per_slot = per_slot.saturating_add(attn_ws_per_slot);
+    let recurrent_bytes = per_slot.saturating_mul(planned);
+    let attn_ws_bytes = attn_ws_per_slot.saturating_mul(planned);
     let profiled_tokens = profile_kv_pool_tokens(
-        (free as u64).saturating_sub(per_slot.saturating_mul(planned) as u64),
+        (free as u64).saturating_sub(granted_per_slot.saturating_mul(planned) as u64),
         total as u64,
         cell_bytes_per_token,
         mem_fraction_static,
@@ -227,13 +238,14 @@ pub fn kv_pool_pages_local(
         let reserve = (total as f64 * (1.0 - mem_fraction_static)) as u64;
         log::warn!(
             "KV pool collapsed to the {}-token floor even at num_slots {planned}: \
-             free {}MB − recurrent {}MB − reserve {}MB (= total {}MB × (1 − \
-             mem_fraction_static {mem_fraction_static})) leaves nothing for \
-             {cell_bytes_per_token}B/tok cells. Raise mem_fraction_static, or free \
-             VRAM: every prompt over {} tokens will abort.",
+             free {}MB − recurrent {}MB − FA3 attn workspace {}MB − reserve {}MB \
+             (= total {}MB × (1 − mem_fraction_static {mem_fraction_static})) leaves \
+             nothing for {cell_bytes_per_token}B/tok cells. Raise mem_fraction_static, \
+             or free VRAM: every prompt over {} tokens will abort.",
             PROFILE_KV_TOKENS_FLOOR,
             free >> 20,
-            per_slot.saturating_mul(planned) >> 20,
+            recurrent_bytes >> 20,
+            attn_ws_bytes >> 20,
             reserve >> 20,
             total >> 20,
             PROFILE_KV_TOKENS_FLOOR,
@@ -242,15 +254,17 @@ pub fn kv_pool_pages_local(
     let profiled_pages = (profiled_tokens / page_size as u64).max(1) as usize;
     log::info!(
         "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
-         total {}MB, recurrent reservation {}MB ({planned} slots × {}MB), \
-         mem_fraction_static {mem_fraction_static}, cell {cell_bytes_per_token}B/tok \
-         ({num_full} full-attn layers × {local_kv_heads} kv-heads × {head_dim} hd) \
-         -> max_total_tokens {profiled_tokens} ({profiled_pages} pages); requested \
-         {requested_pages} pages (advisory)",
+         total {}MB, recurrent {}MB + FA3 attn workspace {}MB ({planned} slots × \
+         {}MB recurrent + {}MB workspace), mem_fraction_static {mem_fraction_static}, \
+         cell {cell_bytes_per_token}B/tok ({num_full} full-attn layers × {local_kv_heads} \
+         kv-heads × {head_dim} hd) -> max_total_tokens {profiled_tokens} ({profiled_pages} \
+         pages); requested {requested_pages} pages (advisory)",
         free >> 20,
         total >> 20,
-        per_slot.saturating_mul(planned) >> 20,
+        recurrent_bytes >> 20,
+        attn_ws_bytes >> 20,
         per_slot >> 20,
+        attn_ws_per_slot >> 20,
     );
     i32::try_from(profiled_pages).unwrap_or(i32::MAX)
 }
@@ -307,15 +321,32 @@ mod tests {
         // affordable = 0.7*1e6/1e4 = 70, but at n=70 the pool remainder
         // (900_000 − 700_000 = 200_000 tokens) cannot fund 300_000 → the scan
         // sheds to n=60 (remainder 300_000, exactly feasible).
-        let n = kv_slot_budget_local(Some((1_000_000, 1_000_000)), 10_000, 80, 300_000, 0.9, 1);
+        let n = kv_slot_budget_local(Some((1_000_000, 1_000_000)), 10_000, 0, 80, 300_000, 0.9, 1);
         assert_eq!(n, 60);
         // Probe failure must not bind the min.
-        assert_eq!(kv_slot_budget_local(None, 1, 1, 1, 0.9, 1), i32::MAX);
+        assert_eq!(kv_slot_budget_local(None, 1, 0, 1, 1, 0.9, 1), i32::MAX);
         // Nothing affordable → 0 (the caller rejects on the reduced value).
         assert_eq!(
-            kv_slot_budget_local(Some((1024, 1024)), 1 << 30, 1, 1, 0.9, 1),
+            kv_slot_budget_local(Some((1024, 1024)), 1 << 30, 0, 1, 1, 0.9, 1),
             0
         );
+    }
+
+    #[test]
+    fn kv_slot_budget_charges_fa3_workspace_per_slot() {
+        // Same inputs as kv_slot_budget_joint_solve but with a 2_000B/slot FA3
+        // workspace: granted/slot rises 10_000 → 12_000, so the scan sheds from
+        // n=60 to n=50 (900_000 − 12_000·50 = 300_000, exactly feasible).
+        let n = kv_slot_budget_local(
+            Some((1_000_000, 1_000_000)),
+            10_000,
+            2_000,
+            80,
+            300_000,
+            0.9,
+            1,
+        );
+        assert_eq!(n, 50);
     }
 
     #[test]
@@ -324,6 +355,7 @@ mod tests {
             Some((32 << 30, 32 << 30)),
             64,
             64 << 20,
+            0,
             584,
             4,
             8,
@@ -334,7 +366,7 @@ mod tests {
         );
         assert!(pages > 0 && pages != i32::MAX);
         assert_eq!(
-            kv_pool_pages_local(None, 64, 1, 1, 4, 8, 128, 4096, 0.9, 128),
+            kv_pool_pages_local(None, 64, 1, 0, 1, 4, 8, 128, 4096, 0.9, 128),
             i32::MAX
         );
         assert_eq!(finalize_pool_pages(i32::MAX as usize, 4096), 4096);
