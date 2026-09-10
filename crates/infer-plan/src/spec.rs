@@ -150,6 +150,55 @@ pub fn spec_accept_greedy(chain: &[u32], argmax: &[u32], row0: usize) -> Result<
     })
 }
 
+/// The seeded rows that share one batched DSpark draft forward: slot-sorted
+/// row indices with the anchor tokens and start positions the draft kernel
+/// reads. `dspark_draft_plan` returns `None` when fewer than two rows seeded
+/// or any row is sampled — the batched gate is greedy-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsparkDraftPlan {
+    pub idx: Vec<usize>,
+    pub anchors: Vec<u32>,
+    pub starts: Vec<usize>,
+}
+
+/// Pure host half of the batched DSpark draft: which rows draft together and
+/// what each one drafts from. The caller gathers the per-slot device state
+/// (`pick`/`dfs`) by slot and runs `dspark_draft_blocks`.
+pub fn dspark_draft_plan(seeded: &[bool], rows: &[crate::DecodeRow]) -> Option<DsparkDraftPlan> {
+    let mut idx: Vec<usize> = (0..seeded.len()).filter(|&i| seeded[i]).collect();
+    if idx.len() < 2 || !rows.iter().all(|r| r.params.is_greedy()) {
+        return None;
+    }
+    idx.sort_by_key(|&i| rows[i].slot);
+    let anchors = idx.iter().map(|&i| rows[i].last_token).collect();
+    let starts = idx.iter().map(|&i| rows[i].kv_seq_len).collect();
+    Some(DsparkDraftPlan {
+        idx,
+        anchors,
+        starts,
+    })
+}
+
+impl DsparkDraftPlan {
+    /// Place each drafted chain at its row in `pre` (caller-sized, one slot
+    /// per decode row).
+    pub fn scatter_into(&self, chains: &[Vec<u32>], pre: &mut [Option<Vec<u32>>]) {
+        for (n, &i) in self.idx.iter().enumerate() {
+            pre[i] = Some(chains[n].clone());
+        }
+    }
+}
+
+/// Slot-sorted indices of the seeded, greedy rows; empty when no row
+/// qualifies — the caller then skips the batched path.
+pub fn greedy_seeded_indices(seeded: &[bool], rows: &[crate::DecodeRow]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..seeded.len())
+        .filter(|&i| seeded[i] && rows[i].params.is_greedy())
+        .collect();
+    idx.sort_by_key(|&i| rows[i].slot);
+    idx
+}
+
 /// The paged KV pool's decode-relevant shape. The executor maps its pool
 /// format and FA3 state onto this class; the dispatch decision reads only the
 /// class, never the format.
@@ -593,6 +642,63 @@ mod tests {
         assert_eq!(pages_covering(1, 16), 1);
         assert_eq!(pages_covering(16, 16), 1);
         assert_eq!(pages_covering(17, 16), 2);
+    }
+
+    fn draft_row(slot: usize, last_token: u32, kv_seq_len: usize, temp: f32) -> crate::DecodeRow {
+        crate::DecodeRow {
+            slot,
+            last_token,
+            kv_seq_len,
+            params: crate::SamplingParams {
+                temperature: temp,
+                ..Default::default()
+            },
+            penalty_history: None,
+            penalty_prompt_len: 0,
+        }
+    }
+
+    #[test]
+    fn dspark_draft_plan_batches_two_or_more_greedy_seeded_rows() {
+        let rows = vec![
+            draft_row(3, 10, 100, 0.0),
+            draft_row(1, 11, 200, 0.0),
+            draft_row(2, 12, 300, 0.0),
+        ];
+        // Fewer than two seeded: no batch.
+        assert_eq!(dspark_draft_plan(&[true, false, false], &rows), None);
+        // Two seeded, slot-sorted: row 2 (slot 1) before row 0 (slot 3).
+        let plan = dspark_draft_plan(&[true, false, true], &rows).expect("2 seeded greedy rows");
+        assert_eq!(plan.idx, vec![2, 0]);
+        assert_eq!(plan.anchors, vec![12, 10]);
+        assert_eq!(plan.starts, vec![300, 100]);
+        // Any sampled row vetoes the greedy-only batch.
+        let mut sampled = rows.clone();
+        sampled[1].params.temperature = 0.7;
+        assert_eq!(dspark_draft_plan(&[true, true, true], &sampled), None);
+        // scatter places each chain at its row.
+        let mut pre = vec![None; 3];
+        plan.scatter_into(&[vec![1, 2], vec![3, 4]], &mut pre);
+        assert_eq!(pre[0], Some(vec![3, 4]));
+        assert_eq!(pre[1], None);
+        assert_eq!(pre[2], Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn greedy_seeded_indices_filters_and_sorts() {
+        let rows = vec![
+            draft_row(3, 10, 100, 0.0),
+            draft_row(1, 11, 200, 0.7),
+            draft_row(2, 12, 300, 0.0),
+        ];
+        // Row 1 is seeded but sampled; row 2 is greedy but unseeded.
+        assert_eq!(greedy_seeded_indices(&[true, true, false], &rows), vec![0]);
+        assert!(greedy_seeded_indices(&[false, true, false], &rows).is_empty());
+        // Slot-sorted: slot 1 (row 1) is sampled, so only rows 0 and 2 qualify.
+        assert_eq!(
+            greedy_seeded_indices(&[true, false, true], &rows),
+            vec![2, 0]
+        );
     }
 
     #[test]

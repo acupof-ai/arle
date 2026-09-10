@@ -12,10 +12,11 @@ mod spec;
 pub use geometry::PrefillGeometry;
 pub use spec::{
     DEFAULT_SPEC_DRAFT_DEPTH, DEFAULT_SPEC_DRAFT_TOPK, DecodeDispatch, DecodeKvClass, DecodeRoute,
-    DraftChain, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, MtpDraftRow, SpecAcceptOutcome,
-    SpecChain, SpecKind, SpecVerifySchedule, assign_row_offsets, decide_decode, flatten_chains,
-    pages_covering, qwen_spec_decode_compatible, route_decode, spec_accept_greedy,
-    spec_accept_totals, speculative_chain_fits,
+    DraftChain, DsparkDraftPlan, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, MtpDraftRow,
+    SpecAcceptOutcome, SpecChain, SpecKind, SpecVerifySchedule, assign_row_offsets, decide_decode,
+    dspark_draft_plan, flatten_chains, greedy_seeded_indices, pages_covering,
+    qwen_spec_decode_compatible, route_decode, spec_accept_greedy, spec_accept_totals,
+    speculative_chain_fits,
 };
 
 pub use diffusion::{
@@ -139,6 +140,21 @@ pub struct SlotToken {
     pub top_logprobs: Vec<(u32, f32)>,
     /// Set when this token terminates the slot.
     pub finish: Option<FinishReason>,
+}
+
+impl SlotToken {
+    /// One accepted spec token: no logprob capture (spec is vetoed for
+    /// logprobs requests) and no finish (the chain accepted, it did not end).
+    #[must_use]
+    pub fn spec_accepted(slot: usize, token: u32, logprob: Option<f32>) -> Self {
+        Self {
+            slot,
+            token,
+            logprob,
+            top_logprobs: Vec::new(),
+            finish: None,
+        }
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
