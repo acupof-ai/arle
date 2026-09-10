@@ -72,7 +72,9 @@ mod real {
         CudaExecutor, CudaKvPool, print_dsv4_stage_profile, reset_dsv4_stage_profile,
     };
     use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow, SamplingParams, SlotToken};
-    use infer_seam::{BackendExecutor, KvAllocator, KvBatchDescriptor, KvQuery, PollResult};
+    use infer_seam::{
+        BackendExecutor, KvAllocator, KvBatchDescriptor, KvQuery, KvSlotAccounting, PollResult,
+    };
     use std::{path::Path, time::Instant};
 
     /// Default prompt: "The capital of France is" in the **DeepSeek-V4** tokenizer
