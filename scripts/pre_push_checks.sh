@@ -142,16 +142,33 @@ if [[ "${CARGO_RUNS}" == "1" && "${ARLE_PRE_PUSH_NESTED:-0}" != "1" ]]; then
 fi
 
 STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-stage.XXXXXX")"
-if [[ "${CARGO_RUNS}" == "1" ]]; then
+# A nested run (a shell-test fixture driving the real hook) skips the lock, so
+# it must NEVER rsync --delete into the shared snapshot: without the lock its
+# tiny fixture tree would erase the real tree a peer hook is compiling (live
+# race, 2026-09-11). A nested run may still point at an EXPLICIT test-owned
+# root via ARLE_PREPUSH_SNAPSHOT_ROOT (the fixture tests do that); only the
+# unset/empty default is forced private. Same private path as cargo-free runs.
+nested_unsafe_shared=0
+if [[ "${ARLE_PRE_PUSH_NESTED:-0}" == "1" && -z "${ARLE_PREPUSH_SNAPSHOT_ROOT:-}" ]]; then
+    nested_unsafe_shared=1
+fi
+if [[ "${CARGO_RUNS}" == "1" && "${nested_unsafe_shared}" != "1" ]]; then
     # One shared source root for every build in the shared target.
     SNAPSHOT_ROOT="${ARLE_PREPUSH_SNAPSHOT_ROOT:-${TMPDIR:-/tmp}/arle-pre-push-snapshot}"
     mkdir -p "${SNAPSHOT_ROOT}"
     info "refreshing shared snapshot at ${SNAPSHOT_ROOT}"
 else
     # Private throwaway snapshot; cleanup removes it on exit.
+    # Keep the established nocargo.* private prefix: the orphan sweep below
+    # matches it, and it is not a prefix-sibling of the shared
+    # arle-pre-push-snapshot root.
     SNAPSHOT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-nocargo.XXXXXX")"
     SNAPSHOT_PRIVATE=1
-    info "cargo-free push; running checks from private snapshot (no lock)"
+    if [[ "${CARGO_RUNS}" != "1" ]]; then
+        info "cargo-free push; running checks from private snapshot (no lock)"
+    else
+        info "nested hook without ARLE_PREPUSH_SNAPSHOT_ROOT; using private snapshot ${SNAPSHOT_ROOT} (shared snapshot left untouched)"
+    fi
 fi
 # True iff rsync actually updated a LIB-AFFECTING file of crate $1 in this
 # snapshot: crates/<crate>/src/**, crates/<crate>/build.rs, or
@@ -244,6 +261,7 @@ run_fast_checks() {
         test_pod_tree_identity.sh \
         test_hook_disowns_git_env.sh \
         test_hook_cuda_lint_freshness.sh \
+        test_prepush_nested_snapshot.sh \
         test_prepush_snapshot_mtime.sh \
         test_hook_skips_shell_tests.sh \
         test_bench_ab_control_arm.sh; do
