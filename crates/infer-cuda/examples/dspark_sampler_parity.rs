@@ -9,14 +9,13 @@
 //!   - `dspark_chain_accept_cuda`: flashinfer/SGLang chain rejection with
 //!     renormalized max(0,p-q) residual, p fallback on ~0 mass, bonus draw
 //!
-//! The draws are DETERMINISTIC functions of the host-supplied uniforms. At
-//! vocab <= 256 one thread owns one index, so the kernel CDF walk is index
-//! order and the sampled token id compares exactly (targets sit in the middle
-//! of the winning token's mass interval); at larger vocab the walk is a
-//! thread-strided permutation, so only positive reference mass is asserted.
-//! Degenerate-row fallback is the strict-> argmax one-hot. Chain coverage:
-//! depth 1..=4 with rejection at every position, all-accept + bonus, and
-//! zero-residual p fallback; batch 1 and 8.
+//! Prob vectors are compared at small vocab 255..16384 AND the production
+//! vocabularies Qwen 151936 / DSv4 129280 (representative filter cases); one
+//! chain rejection runs at 151936 to cover the multi-pass residual-mass
+//! reduction. Synthetic chain coverage: depth 1..=4 at vocab 32 with
+//! rejection at every position, all-accept + bonus, and the zero-residual p
+//! fallback; B=1/8. Exact draw ids only hold at vocab <= 256 (index-order
+//! CDF); above that they assert positive reference mass.
 //!
 //! `--negative-control` perturbs one expected probability; the gate MUST FAIL.
 //!
@@ -47,12 +46,19 @@ mod real {
         DsparkFilter, dspark_chain_accept, dspark_draft_sample, dspark_filter_probs,
     };
     use half::bf16;
-    // 255 <= SAMPLE_BLOCK(256) makes the CDF traversal index-order so the
-    // sampled token id is exact; larger rows exercise multi-pass reductions
-    // and the thread-strided CDF permutation (probs still exact-compared).
+    // Small-vocab sweep: every filter case, incl. multi-pass reductions.
     const FILTER_VOCABS: &[usize] = &[255, 257, 2048, 16_384];
+    // Production vocabularies (prob-vector compare): Qwen 151936 and the
+    // DeepSeek-V3/V4 tokenizer family 129280. Only the representative cases
+    // run at this size; the residual-mass chain reduction is also exercised at
+    // 151936 below (single-pass at vocab=32 would not cover it).
+    const PROD_VOCABS: &[(usize, &str)] = &[(151_936, "qwen"), (129_280, "dsv4")];
+    const PROD_CASES: &[usize] = &[0, 5, 6]; // unfiltered, combined, all-neg-inf
     // Synthetic chain tests use a small alphabet with hand-placed mass.
     const CHAIN_VOCAB: usize = 32;
+    // One chain rejection at the production vocab: the residual mass and CDF
+    // reductions are multi-pass above SAMPLE_BLOCK.
+    const CHAIN_PROD_VOCAB: usize = 151_936;
     const FILTER_BATCHES: &[usize] = &[1, 8];
     const MAX_DEPTH: usize = 4;
     const SEED: u64 = 0xd54a_1200_d54a_1200;
@@ -299,104 +305,113 @@ mod real {
         negative: bool,
         any_fail: &mut bool,
     ) -> Result<()> {
-        // The batch kernel launches with ONE DsparkFilter for every row.
+        // Small sweep: every filter case at B=1/8. Production vocabs run the
+        // representative cases at B=1 (~1.2 MB logits + probs per row).
+        let mut jobs: Vec<(usize, usize, Vec<usize>)> = Vec::new();
         for &vocab in FILTER_VOCABS {
             for &rows in FILTER_BATCHES {
-                for case_idx in 0..filter_cases().len() {
-                    let (name, f) = filter_cases()[case_idx];
-                    let mut rng = Rng::new(
-                        SEED ^ ((vocab as u64) << 24) ^ ((rows as u64) << 12) ^ case_idx as u64,
+                jobs.push((vocab, rows, (0..filter_cases().len()).collect()));
+            }
+        }
+        for &(vocab, _) in PROD_VOCABS {
+            jobs.push((vocab, 1, PROD_CASES.to_vec()));
+        }
+        for (vocab, rows, case_indices) in jobs {
+            // The batch kernel launches with ONE DsparkFilter for every row.
+            for case_idx in case_indices {
+                let (name, f) = filter_cases()[case_idx];
+                let mut rng = Rng::new(
+                    SEED ^ ((vocab as u64) << 24) ^ ((rows as u64) << 12) ^ case_idx as u64,
+                );
+                let mut logits = Vec::with_capacity(rows * vocab);
+                let mut refs: Vec<Vec<f64>> = Vec::with_capacity(rows);
+                let mut uniforms: Vec<f32> = Vec::with_capacity(rows);
+                let mut first_positive = vec![0usize; rows];
+                for (lane, first_positive) in first_positive.iter_mut().enumerate() {
+                    let row = build_filter_row(&mut rng, vocab, name);
+                    let mut pref = f64_filter(
+                        &row,
+                        f.inv_temperature as f64,
+                        f.top_k as i64,
+                        f.top_p as f64,
+                        f.min_p as f64,
                     );
-                    let mut logits = Vec::with_capacity(rows * vocab);
-                    let mut refs: Vec<Vec<f64>> = Vec::with_capacity(rows);
-                    let mut uniforms: Vec<f32> = Vec::with_capacity(rows);
-                    let mut fallback = vec![0usize; rows];
-                    for (lane, first_positive) in fallback.iter_mut().enumerate() {
-                        let row = build_filter_row(&mut rng, vocab, name);
-                        let mut pref = f64_filter(
-                            &row,
-                            f.inv_temperature as f64,
-                            f.top_k as i64,
-                            f.top_p as f64,
-                            f.min_p as f64,
-                        );
-                        if negative && lane == 0 {
-                            pref[0] += 0.1;
-                        }
-                        // Uniform at the middle of the first positive token's
-                        // mass interval, off the reference: no f32 CDF boundary.
-                        let w0 = pref.iter().position(|&x| x > 0.0).unwrap_or(0);
-                        let lo: f64 = pref[..w0].iter().sum();
-                        uniforms.push(((lo + lo + pref[w0]) * 0.5).clamp(1e-6, 0.999_999) as f32);
-                        *first_positive = w0;
-                        refs.push(pref);
-                        logits.extend(row.iter().map(|v| bf16::from_f32(*v)));
+                    if negative && lane == 0 {
+                        pref[0] += 0.1;
                     }
+                    // Uniform at the middle of the first positive token's mass
+                    // interval, off the reference: no f32 CDF boundary.
+                    let w0 = pref.iter().position(|&x| x > 0.0).unwrap_or(0);
+                    let lo: f64 = pref[..w0].iter().sum();
+                    uniforms.push(((lo + lo + pref[w0]) * 0.5).clamp(1e-6, 0.999_999) as f32);
+                    *first_positive = w0;
+                    refs.push(pref);
+                    logits.extend(row.iter().map(|v| bf16::from_f32(*v)));
+                }
 
-                    // ── filter_probs batch ──
-                    let logits_d = ctx.stream.clone_htod(&logits)?;
-                    let mut probs_d = ctx.stream.alloc_zeros::<f32>(rows * vocab)?;
-                    dspark_filter_probs(ctx, &logits_d, &mut probs_d, rows, vocab, f)?;
+                // ── filter_probs batch ──
+                let logits_d = ctx.stream.clone_htod(&logits)?;
+                let mut probs_d = ctx.stream.alloc_zeros::<f32>(rows * vocab)?;
+                dspark_filter_probs(ctx, &logits_d, &mut probs_d, rows, vocab, f)?;
+                ctx.sync()?;
+                let probs = ctx.stream.clone_dtoh(&probs_d)?;
+                for lane in 0..rows {
+                    check_probs(
+                        &format!("filter vocab={vocab} B={rows} {name} lane={lane}"),
+                        &probs[lane * vocab..(lane + 1) * vocab],
+                        &refs[lane],
+                        any_fail,
+                    );
+                }
+
+                // ── draft_sample per row: the q row equals the filter output,
+                // token id is the CDF draw at the supplied uniform ──
+                for lane in 0..rows {
+                    let row_bf: Vec<bf16> = logits[lane * vocab..(lane + 1) * vocab].to_vec();
+                    let row_d = ctx.stream.clone_htod(&row_bf)?;
+                    let mut q_d = ctx.stream.alloc_zeros::<f32>(vocab)?;
+                    let mut tok_d = ctx.stream.alloc_zeros::<i32>(1)?;
+                    dspark_draft_sample(
+                        ctx,
+                        &row_d,
+                        &mut q_d,
+                        &mut tok_d,
+                        vocab,
+                        f,
+                        uniforms[lane],
+                    )?;
                     ctx.sync()?;
-                    let probs = ctx.stream.clone_dtoh(&probs_d)?;
-                    for lane in 0..rows {
-                        check_probs(
-                            &format!("filter vocab={vocab} B={rows} {name} lane={lane}"),
-                            &probs[lane * vocab..(lane + 1) * vocab],
-                            &refs[lane],
+                    let q = ctx.stream.clone_dtoh(&q_d)?;
+                    let tok = ctx.stream.clone_dtoh(&tok_d)?;
+                    check_probs(
+                        &format!("draft-q vocab={vocab} B={rows} {name} lane={lane}"),
+                        &q,
+                        &refs[lane],
+                        any_fail,
+                    );
+                    // w0 IS the degenerate-row argmax for all-neg-inf (the
+                    // one-hot's first index).
+                    if vocab <= 256 {
+                        check_eq(
+                            &format!("draft-tok vocab={vocab} B={rows} {name} lane={lane}"),
+                            tok[0],
+                            first_positive[lane],
                             any_fail,
                         );
-                    }
-
-                    // ── draft_sample per row: q row equals the filter output,
-                    // token id the CDF draw at the supplied uniform ──
-                    for lane in 0..rows {
-                        let row_bf: Vec<bf16> = logits[lane * vocab..(lane + 1) * vocab].to_vec();
-                        let row_d = ctx.stream.clone_htod(&row_bf)?;
-                        let mut q_d = ctx.stream.alloc_zeros::<f32>(vocab)?;
-                        let mut tok_d = ctx.stream.alloc_zeros::<i32>(1)?;
-                        dspark_draft_sample(
-                            ctx,
-                            &row_d,
-                            &mut q_d,
-                            &mut tok_d,
-                            vocab,
-                            f,
-                            uniforms[lane],
-                        )?;
-                        ctx.sync()?;
-                        let q = ctx.stream.clone_dtoh(&q_d)?;
-                        let tok = ctx.stream.clone_dtoh(&tok_d)?;
-                        check_probs(
-                            &format!("draft-q vocab={vocab} B={rows} {name} lane={lane}"),
-                            &q,
-                            &refs[lane],
-                            any_fail,
-                        );
-                        // w0 IS the degenerate-row argmax for all-neg-inf
-                        // (first index of the one-hot).
-                        if vocab <= 256 {
-                            check_eq(
-                                &format!("draft-tok vocab={vocab} B={rows} {name} lane={lane}"),
-                                tok[0],
-                                fallback[lane],
-                                any_fail,
-                            );
-                        } else {
-                            // Large-vocab kernel CDF is a thread-strided
-                            // permutation of the host scan; assert the drawn id
-                            // carries positive reference mass instead.
-                            let id = tok[0] as usize;
-                            let pass = id < vocab && refs[lane][id] > 1e-6;
-                            if !pass {
-                                *any_fail = true;
-                            }
-                            eprintln!(
-                                "[draft-tok vocab={vocab} B={rows} {name} lane={lane}] id={id} refmass={:.4e} {}",
-                                refs[lane].get(id).copied().unwrap_or(-1.0),
-                                if pass { "PASS" } else { "FAIL" }
-                            );
+                    } else {
+                        // Above SAMPLE_BLOCK the kernel CDF walks indices in a
+                        // thread-strided permutation; assert the drawn id carries
+                        // positive reference mass.
+                        let id = tok[0] as usize;
+                        let pass = id < vocab && refs[lane][id] > 1e-6;
+                        if !pass {
+                            *any_fail = true;
                         }
+                        eprintln!(
+                            "[draft-tok vocab={vocab} B={rows} {name} lane={lane}] id={id} refmass={:.4e} {}",
+                            refs[lane].get(id).copied().unwrap_or(-1.0),
+                            if pass { "PASS" } else { "FAIL" }
+                        );
                     }
                 }
             }
@@ -563,6 +578,77 @@ mod real {
         Ok(())
     }
 
+    /// One rejection at the production vocab. The accept decision and accepted
+    /// length are exact; the residual draw walks the kernel's >256 thread-strided
+    /// CDF, so the token is asserted to carry positive residual mass. This is
+    /// the multi-pass path for both the residual-mass reduction and the draw:
+    /// the vocab=32 cases above reduce both in a single pass.
+    fn run_chain_prod(ctx: &DeviceContext, any_fail: &mut bool) -> Result<()> {
+        let v = CHAIN_PROD_VOCAB;
+        let depth = 1;
+        let draft_tok = 3i32;
+        let mut q = vec![vec![0f32; v]; depth];
+        let mut p = vec![vec![0f32; v]; depth + 1];
+        let u_accept = vec![0.99f32; depth];
+        let mut u_res = vec![0.5f32; depth + 1];
+
+        // q confident at the draft token; p puts a bigger spike at token 20003,
+        // weak mass at the draft so accept = p/q < 1 and a reject fires.
+        q[0] = two_spike(v, draft_tok as usize, 0.5, SEED ^ 0x5052_0001);
+        p[0] = two_spike(v, 20_003, 0.8, SEED ^ 0x5052_0002);
+        p[0][draft_tok as usize] = 0.2;
+        let s: f32 = p[0].iter().sum();
+        for x in &mut p[0] {
+            *x /= s;
+        }
+        p[depth] = two_spike(v, 40_007, 0.8, SEED ^ 0x5052_0003);
+        u_res[depth] = 0.5;
+
+        let residual_mass: f32 = p[0]
+            .iter()
+            .zip(&q[0])
+            .map(|(pi, qi)| (pi - qi).max(0.0))
+            .sum();
+        ensure!(
+            residual_mass > 1e-3,
+            "production chain case needs a real residual mass, got {residual_mass}"
+        );
+
+        let q_d = ctx.stream.clone_htod(&q.concat())?;
+        let p_d = ctx.stream.clone_htod(&p.concat())?;
+        let draft_d = ctx.stream.clone_htod(&vec![draft_tok; depth])?;
+        let ua_d = ctx.stream.clone_htod(&u_accept)?;
+        let ur_d = ctx.stream.clone_htod(&u_res)?;
+        let mut out_d = ctx.stream.alloc_zeros::<i32>(2)?;
+        dspark_chain_accept(
+            ctx, &q_d, &p_d, &draft_d, &ua_d, &ur_d, &mut out_d, depth, v,
+        )?;
+        ctx.sync()?;
+        let out = ctx.stream.clone_dtoh(&out_d)?;
+
+        let len_pass = out[0] == 0;
+        if !len_pass {
+            *any_fail = true;
+        }
+        eprintln!(
+            "[chain-prod vocab={v}] accepted_len={} (want 0) residual_mass={residual_mass:.4e} {}",
+            out[0],
+            if len_pass { "PASS" } else { "FAIL" }
+        );
+        let id = out[1] as usize;
+        let res_at =
+            (p[0].get(id).copied().unwrap_or(0.0) - q[0].get(id).copied().unwrap_or(0.0)).max(0.0);
+        let tok_pass = id < v && res_at > 1e-9;
+        if !tok_pass {
+            *any_fail = true;
+        }
+        eprintln!(
+            "[chain-prod vocab={v}] residual token={id} residual_mass_at={res_at:.4e} {}",
+            if tok_pass { "PASS" } else { "FAIL" }
+        );
+        Ok(())
+    }
+
     pub(super) fn run(negative: bool) -> Result<()> {
         let ctx = DeviceContext::new()?;
         eprintln!(
@@ -575,6 +661,7 @@ mod real {
         let mut any_fail = false;
         run_filter_and_draft(&ctx, negative, &mut any_fail)?;
         run_chain(&ctx, negative, &mut any_fail)?;
+        run_chain_prod(&ctx, &mut any_fail)?;
 
         if negative {
             ensure!(

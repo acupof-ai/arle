@@ -148,7 +148,7 @@ inputs = ["embed_table", "token_ids"]
 outputs = ["hidden_rows"]
 reference = "cuda.qwen.embedding_batched"
 correctness_gate = "crates/infer-cuda/examples/elementwise_parity.rs"
-gate_gap = "gather is bit-exact at production hidden 5120/7168 and B=1/8; gate uses a synthetic 256-row table, not the production 151936-row table (row count is index math only)"
+gate_scope = "production"
 
 [[implementation]]
 id = "cuda.qwen.embedding_batched"
@@ -409,7 +409,7 @@ inputs = ["logits", "draft_tokens", "uniforms"]
 outputs = ["token_ids", "accepted_len"]
 reference = "cuda.qwen.argmax"
 correctness_gate = "scripts/sampling_gate.py;crates/infer-cuda/examples/argmax_parity.rs;crates/infer-cuda/examples/dspark_sampler_parity.rs"
-gate_gap = "argmax/argmax_batch covered at production vocab 151936; dspark filter/draft-sample prob vectors covered vs f64 host reference to vocab 16384 (full-vocab softmax, top-k/top-p/min-p, degenerate row, B=1/8) with exact draw ids at vocab<=256 (larger vocab kernel CDF is thread-strided and asserts positive reference mass); chain_accept covered on a synthetic vocab=32 alphabet (depth 1..4, reject at every position, all-accept+bonus, zero-residual p fallback); no run at the production 151936 vocab and sampling_gate.py remains live-serve HTTP only"
+gate_gap = "filter/draft-sample prob vectors covered vs f64 reference at production Qwen 151936 and DSv4 129280 (representative cases, full-vocab softmax + top-k/top-p/min-p + degenerate row, B=1/8 small sweep); chain_accept covered depth 1..4 at vocab 32 plus one rejection at 151936 (multi-pass residual reduction); exact sampled token ids are only asserted at vocab<=256 — above SAMPLE_BLOCK the kernel CDF walk is a thread-strided permutation, so large-vocab draws assert positive reference/positive residual mass, not the id; sampling_gate.py remains live-serve HTTP only"
 
 [[implementation]]
 id = "cuda.qwen.argmax"

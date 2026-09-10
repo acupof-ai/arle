@@ -13,6 +13,8 @@
 //! Production geometry: Qwen3.6-27B (hidden 5120, inter 17408, split_qkv
 //! q=6144/kv=1024, 24×256-attn / 4 KV heads) and DSv4 backbone (hidden 7168,
 //! inter 20480), batch 1 and 8; RMSNorm eps = 1e-6 (the model config value).
+//! Embedding additionally runs at the production 151936-row × 5120 table
+//! (~1.5 GB) with ids at 0, the last rows and both ends.
 //!
 //! `--negative-control` perturbs one reference element; the gate MUST FAIL.
 //!
@@ -52,6 +54,7 @@ mod real {
     // 27B attention geometry: q 24×256=6144, kv 4×256=1024.
     const Q_DIM: usize = 6144;
     const KV_DIM: usize = 1024;
+    // Small synthetic table for the per-model hidden-width gather.
     const EMBED_ROWS: usize = 256;
 
     // BF16 outputs off f64 anchors: truncation floor ~4e-3 rel.
@@ -395,6 +398,54 @@ mod real {
         Ok(())
     }
 
+    /// Production-shape embedding gather: Qwen 151936-row table × 5120 bf16
+    /// (~1.5 GB). Ids cover 0, the last rows, and rows near both ends — the
+    /// table offset is the arithmetic that can overflow. One B=8 launch spans
+    /// both ends. The table is a periodic pattern over the flat index, so every
+    /// row differs and a wrong base cannot mask.
+    fn probe_embedding_production(
+        ctx: &DeviceContext,
+        negative: bool,
+        any_fail: &mut bool,
+    ) -> Result<()> {
+        const ROWS: usize = 151_936;
+        let hidden: usize = MODELS[0].1;
+        let ids: Vec<i32> = vec![
+            0,
+            1,
+            2,
+            3,
+            (ROWS - 4) as i32,
+            (ROWS - 3) as i32,
+            (ROWS - 2) as i32,
+            (ROWS - 1) as i32,
+        ];
+        let b = ids.len();
+        let table: Vec<bf16> = (0..ROWS * hidden)
+            .map(|i| bf16::from_f32((i % 101) as f32 * 0.01))
+            .collect();
+        let mut expect: Vec<bf16> = Vec::with_capacity(b * hidden);
+        for &id in &ids {
+            let base = id as usize * hidden;
+            expect.extend((base..base + hidden).map(|i| table[i]));
+        }
+        if negative {
+            expect[0] = bf16::from_f32(f32::from(expect[0]) + 0.1);
+        }
+        let table_d = ctx.stream.clone_htod(&table)?;
+        let ids_d = ctx.stream.clone_htod(&ids)?;
+        let mut out_d = ctx.stream.alloc_zeros::<bf16>(b * hidden)?;
+        embedding_batched(ctx, &table_d, &ids_d, &mut out_d, hidden, b)?;
+        ctx.sync()?;
+        check_bitexact(
+            &format!("embedding-prod rows={ROWS} h={hidden} B={b}"),
+            &ctx.stream.clone_dtoh(&out_d)?,
+            &expect,
+            any_fail,
+        );
+        Ok(())
+    }
+
     pub(super) fn run(negative: bool) -> Result<()> {
         let ctx = DeviceContext::new()?;
         eprintln!(
@@ -407,6 +458,7 @@ mod real {
         let mut any_fail = false;
         probe_rms(&ctx, negative, &mut any_fail)?;
         probe_silu_split_embed(&ctx, negative, &mut any_fail)?;
+        probe_embedding_production(&ctx, negative, &mut any_fail)?;
 
         if negative {
             ensure!(
