@@ -916,3 +916,229 @@ fn int8_kv_quantize_dequantize_roundtrip() {
     // bf16 rounding of the input and the absmax edge case.
     assert_bf16_close(&got, &expected, 2e-2);
 }
+
+/// Full E4M3 (FP8 FN) decode, all 256 codes. NaN codes (0x7F/0xFF) map to NaN.
+fn decode_e4m3_full(byte: u8) -> f32 {
+    let sign = if byte & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((byte >> 3) & 0x0F) as i32;
+    let mant = (byte & 0x07) as f32;
+    let mag = if exp == 0 {
+        mant * (1.0 / 512.0) // 2^(1-bias) / 8 = 2^-9 per mantissa step
+    } else if exp == 15 {
+        if mant == 6.0 || mant == 7.0 {
+            f32::NAN
+        } else {
+            (1.0 + mant / 8.0) * 256.0 // E=15 is not infinity in E4M3: max finite 448
+        }
+    } else {
+        (1.0 + mant / 8.0) * 2f32.powi(exp - 7)
+    };
+    sign * mag
+}
+
+/// Half the E4M3 level step (quantized units) of `byte`'s binade. The exp
+/// FIELD bits `e` carry bias 7, so the step is 2^(e-10) and half is 2^(e-11):
+/// field e=14 ([128,256)) gives 8, field e=15 ([256,448], the 448 endcap that
+/// replaces infinity) gives 16. Subnormals step 2^-9, half 2^-10.
+fn e4m3_half_ulp_scaled(byte: u8) -> f32 {
+    let e = (byte >> 3) & 0x0F;
+    if e == 0 {
+        1.0f32 / 1024.0
+    } else {
+        2f32.powi(i32::from(e) - 11)
+    }
+}
+
+/// Round-to-nearest-even E4M3 encode over the finite level table.
+fn encode_e4m3_rne(x: f32) -> u8 {
+    debug_assert!(x.is_finite() && x.abs() <= 448.0);
+    let mut best = 0u8;
+    let mut best_err = f32::INFINITY;
+    for byte in 0u8..=255 {
+        let v = decode_e4m3_full(byte);
+        if v.is_nan() {
+            continue;
+        }
+        let err = (v - x).abs();
+        if err < best_err || (err == best_err && (byte & 0x07) < (best & 0x07)) {
+            best_err = err;
+            best = byte;
+        }
+    }
+    best
+}
+
+/// FP8 E4M3 paged-KV per-token quantize against an f32 reference, over a slot
+/// whose logical pages are discontiguous in the physical pool (slot pages
+/// [31,30,28,29]): physical token rows come from the production
+/// `TokenKVPool::token_rows_for_range` mapping, so the kernel must land bytes
+/// at the rows it names rather than at logical positions.
+///
+/// Per (physical row, kv head) the kernel sets `scale = absmax / 448` and
+/// encodes `x / scale` to E4M3. Tolerance is per element: half the level step
+/// of the binade the scaled value lands in (RNE), converted back through the
+/// kernel's own scale. E4M3 (bias 7, 3 mantissa bits) binade `[2^e,2^(e+1))`
+/// has step 2^(e-3) quantized units, so the top finite binade [256, 448]
+/// (unbiased e=8, stored field 15) has ULP 32 and a max error of 16*scale;
+/// small binades keep their tight bound. A uniform tolerance would either
+/// fail near 448 or loosen every small value.
+#[test]
+fn fp8_paged_kv_quantize_roundtrip_discontinuous_pages() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let num_kv_heads = 2usize;
+    let head_dim = 64usize; // two warps: exercises the cross-warp absmax smem path
+    let kv_dim = num_kv_heads * head_dim;
+    let page_size = 16usize;
+
+    // 1 layer, kv_dim=128: 272 B storage + 512 B work = 784 B/token.
+    // K+V data + K+V f32 scales (storage), K+V bf16 work buffer (1 layer).
+    let per_token = kv_dim * 2 + num_kv_heads * 8 + kv_dim * 4;
+    let mut pool = crate::paged_kv::TokenKVPool::with_format(
+        &ctx,
+        1,
+        num_kv_heads,
+        head_dim,
+        4,
+        512 * per_token,
+        crate::kv_types::KVFormat::FP8E4M3,
+    )
+    .expect("pool");
+    assert_eq!(pool.page_size, page_size);
+
+    // free_pages starts at the highest page id and pops from the end. With a
+    // 32-page pool: s0a -> [31,30], s1 -> [29,28], s2 -> [27,26]; freeing s1
+    // recycles 29,28 and s0's extension pops 28 then 29, leaving s0 =
+    // [31,30,28,29].
+    pool.alloc_tokens(0, 32).expect("alloc s0a");
+    pool.alloc_tokens(1, 32).expect("alloc s1");
+    pool.alloc_tokens(2, 32).expect("alloc s2");
+    pool.free_slot(1);
+    pool.alloc_tokens(0, 32).expect("alloc s0b");
+
+    let rows: Vec<i32> = pool
+        .token_rows_for_range(0, 0, 64)
+        .iter()
+        .map(|&r| r as i32)
+        .collect();
+    // free_pages pops highest-first: slot 0's table is [31,30,28,29] —
+    // its last two logical pages are both recycled and non-adjacent.
+    assert_eq!(&rows[0..16], &(496..512).collect::<Vec<_>>());
+    assert_eq!(&rows[16..32], &(480..496).collect::<Vec<_>>());
+    assert_eq!(&rows[32..48], &(448..464).collect::<Vec<_>>());
+    assert_eq!(&rows[48..64], &(464..480).collect::<Vec<_>>());
+
+    // PHND bf16 source for every physical row: [row][kv_head][dim].
+    let total_rows = pool.max_total_tokens;
+    let amps = [0.0f32, 6e-4, 0.5, 2.0, 0.03];
+    let mut src_host = vec![bf16::ZERO; total_rows * kv_dim];
+    for r in 0..total_rows {
+        let amp = amps[r % amps.len()];
+        for h in 0..num_kv_heads {
+            for d in 0..head_dim {
+                let pseudo = ((r * 7 + h * 131 + d * 37 + 13) % 256) as f32 / 256.0 * 2.0 - 1.0;
+                // Pin one element per row/head at the absmax so scale is exact.
+                let v = if d == 0 { amp } else { amp * pseudo };
+                src_host[(r * kv_dim) + h * head_dim + d] = bf16::from_f32(v);
+            }
+        }
+    }
+    let src_dev = DeviceVec::from_host(&ctx, &src_host).expect("src H2D");
+    let mut kv_dev = ctx
+        .stream
+        .alloc_zeros::<u8>(total_rows * kv_dim)
+        .expect("kv alloc");
+    let mut scales_dev = ctx
+        .stream
+        .alloc_zeros::<f32>(total_rows * num_kv_heads)
+        .expect("scales alloc");
+    let rows_dev = ctx.stream.clone_htod(&rows).expect("rows H2D");
+
+    let (src_ptr, _g1) = src_dev.data.device_ptr(&ctx.stream);
+    let (kv_ptr, _g2) = kv_dev.device_ptr_mut(&ctx.stream);
+    let (scales_ptr, _g3) = scales_dev.device_ptr_mut(&ctx.stream);
+    crate::kv_quant::quantize_paged_kv_per_token(
+        &ctx,
+        src_ptr,
+        kv_ptr,
+        scales_ptr,
+        &rows_dev,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        rows.len(),
+        crate::kv_types::KVFormat::FP8E4M3,
+    )
+    .expect("fp8 paged quantize");
+    drop((_g1, _g2, _g3));
+    ctx.sync().expect("sync");
+
+    let kv_bytes = ctx.stream.clone_dtoh(&kv_dev).expect("kv D2H");
+    let scales = ctx.stream.clone_dtoh(&scales_dev).expect("scales D2H");
+
+    for (pos, &row) in rows.iter().enumerate() {
+        let r = row as usize;
+        for h in 0..num_kv_heads {
+            let mut amax = 0.0f32;
+            for d in 0..head_dim {
+                amax = amax.max(src_host[r * kv_dim + h * head_dim + d].to_f32().abs());
+            }
+            let expect_scale = if amax > 0.0 { amax / 448.0 } else { 1.0 };
+            let got_scale = scales[r * num_kv_heads + h];
+            assert!(
+                (got_scale - expect_scale).abs() <= 1e-6 * expect_scale.max(1.0),
+                "row {r} head {h}: scale {got_scale} vs {expect_scale}"
+            );
+            for d in 0..head_dim {
+                let idx = r * kv_dim + h * head_dim + d;
+                let byte = kv_bytes[idx];
+                let x = src_host[idx].to_f32();
+                // Reference: same scale the kernel writes, encoded on host.
+                let expect_byte = encode_e4m3_rne(x / expect_scale);
+                let dequant = decode_e4m3_full(byte) * got_scale;
+                // Tolerance follows the REFERENCE binade, not the kernel's
+                // output byte: a wrong quant into a higher binade must not
+                // loosen its own bound.
+                let tol = e4m3_half_ulp_scaled(expect_byte) * got_scale * 1.02;
+                assert!(
+                    (dequant - x).abs() <= tol,
+                    "row {r} head {h} d {d} (logical pos {pos}): x {x} byte 0x{byte:02x} \
+                     (ref 0x{expect_byte:02x}) dequant {dequant} err {} > tol {tol}",
+                    (dequant - x).abs()
+                );
+                assert!(
+                    (byte & 0x7f) < 0x7f,
+                    "row {r} head {h} d {d}: NaN/inf E4M3 code 0x{byte:02x}"
+                );
+                if amax == 0.0 {
+                    assert_eq!(byte & 0x7f, 0, "zero row produced nonzero byte");
+                }
+            }
+        }
+    }
+
+    // Negative control: flip one quantized byte to its same-binade neighbor.
+    // That moves the value by a full ULP, 2x the half-ULP tolerance, so a
+    // kernel producing the flipped byte must fail the per-element check.
+    // Choose an exp>0, non-448-endcap element on the first named physical row.
+    let nr = rows[0] as usize;
+    let ns = scales[nr * num_kv_heads];
+    let cand = (1..head_dim)
+        .map(|d| nr * kv_dim + d)
+        .find(|&i| {
+            let b = encode_e4m3_rne(src_host[i].to_f32() / ns);
+            (b & 0x78) != 0 && b & 0x7f != 0x7e
+        })
+        .expect("negative-control candidate");
+    assert_eq!(
+        kv_bytes[cand] & 0x7e,
+        encode_e4m3_rne(src_host[cand].to_f32() / ns) & 0x7e
+    );
+    let neg_byte = kv_bytes[cand];
+    let bad = neg_byte ^ 0x01; // adjacent mantissa level, same sign/binade
+    let neg_tol = e4m3_half_ulp_scaled(neg_byte) * ns * 1.02;
+    let neg_err = (decode_e4m3_full(bad) - decode_e4m3_full(neg_byte)).abs() * ns;
+    assert!(
+        neg_err > neg_tol,
+        "negative control weak: perturbation {neg_err} <= tolerance {neg_tol}"
+    );
+}
