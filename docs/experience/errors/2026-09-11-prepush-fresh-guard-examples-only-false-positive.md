@@ -49,3 +49,11 @@ A freshness/rebuild assertion must key on the inputs that actually change the
 build fingerprint, observed after the source sync — not on the set of files a
 push happens to carry under a crate directory. `examples/` and `tests/` are
 not lib inputs.
+
+## Follow-up (S18d)
+
+This guard was deleted entirely the same day: under the post-#302 rsync
+(mtime=now) plus the machine lock, cargo's own mtime fingerprint guarantees a
+changed dep-info input rebuilds, so the output-scraping guard was redundant
+and could only false-positive. See
+`2026-09-11-prepush-fresh-guard-was-redundant.md`.
