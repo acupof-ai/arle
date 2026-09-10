@@ -294,7 +294,8 @@ kind = "composite"
 inputs = ["q", "kv_pool", "page_table", "q_indptr", "kv_lens"]
 outputs = ["attn_out"]
 reference = "cuda.qwen35.paged_attn_v1"
-correctness_gate = "vendor-trusted: scripts/lever_gate.sh"
+correctness_gate = "crates/infer-cuda/examples/fa3_hd256_shim_parity.rs"
+gate_gap = "Qwen3.6-27B full-attention geometry confirmed from the host config.json of Qwen3.6-27B-FP8 and ThinkingCap-27B (24 q heads / 4 kv heads / head_dim 256, 16 full-attention layers; page_size 16) at B in {1,8}: arle_fa3_fwd_hd256_bf16_cuda over a paged BF16 pool (split-KV decode with PackGQA+combine, mixed-q causal varlen, short causal prefill) and arle_fa3_fwd_hd256_quant_cuda over FP8 e4m3 and INT8 pools with per-(token, kv_head) scales (decode takes the dequant-to-bf16 form; one qlen-256/kv-65537 row forces the requantized-e4m3 form, checked by both the mirrored device-chain oracle and an unmirrored f64 anchor over the raw dequantized KV); every case walks a non-identity discontinuous-LCG or rotated page table over a junk-filled pool and mixes per-row kv lengths including 1 and the 15/16/17,127/128/129 page boundaries; per-form negative control (bf16/int8/fp8-dequant/fp8-requant). Not covered: other head dims (gate is hd256 only; the shim rejects other dims), non-sm90 hosts (the FA3 shim is sm_90-only), real checkpoint KV (synthetic normal*0.3 tokens with planted per-token scales), the 65537 case samples first/last query tokens only, the native paged_attention_quantized_fa3_cuda sm80 split-KV kernel, the nonpaged/bwd shims, and TP/CP sharding; the GPU run is pod-only"
 
 [[implementation]]
 id = "cuda.qwen35.paged_quantized_fa3"
