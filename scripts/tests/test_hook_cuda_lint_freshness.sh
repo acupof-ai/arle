@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# The CUDA clippy is the only automated gate for the CUDA-Rust surface (no GPU
-# CI), and a shared target dir lets cargo report it Fresh across lanes — so the
-# gate can pass having checked nothing (a real infer-cuda compile error went
-# green on 2026-09-10). The hook now asserts the lint recompiled the crates
-# the push changes. This test constructs the stale-artifact world — mock cargo
-# reports Fresh — and proves the gate goes red, plus the controls that keep it
-# from false-positiving.
+# The CUDA clippy and the cargo test steps are the automated gates for the
+# CUDA-Rust surface (no GPU CI), and a shared target dir lets cargo report
+# their crates Fresh across lanes — stale artifacts, or artifacts from a lane
+# whose trait signatures disagree with this tree (2026-09-10: a concurrent
+# lane's 3-param `submit` produced fake E0050/E0063 here). The hook asserts
+# every step recompiled the crates the push changes. This test constructs
+# that world — mock cargo reports Fresh — and proves the gate goes red, plus
+# the controls that keep it from false-positiving.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,15 +35,27 @@ printf 'pub fn fixture() {}\n' > "$FIX/crates/infer-cuda/src/lib.rs"
 git -C "$FIX" add -A && git -C "$FIX" commit -qm cuda
 base="$(git -C "$FIX" rev-parse HEAD~1)"; tip="$(git -C "$FIX" rev-parse HEAD)"
 
-# Mock cargo: every invocation exits 0; the CUDA clippy (-v, cuda,no-cuda)
-# prints MOCK_LINT_LINES, so the worlds differ only in whether the output shows
-# infer-cuda being checked — exactly what a stale shared target suppresses.
+# Mock cargo: every invocation exits 0. The CUDA clippy (-v, cuda,no-cuda)
+# prints MOCK_LINT_LINES; test and non-verbose clippy invocations print a
+# Checking line per -p crate, unless MOCK_TEST_SKIP names it — the suppressed
+# crate is exactly what a Fresh / cross-contaminated target looks like.
 cat > "$BIN/cargo" <<'SH'
 #!/usr/bin/env bash
 verbose=0
 for a in "$@"; do [ "$a" = -v ] && verbose=1; done
 if [ "$verbose" = 1 ] && [[ " $* " == *" cuda,no-cuda "* ]]; then
   printf '%b' "${MOCK_LINT_LINES:-Checking infer-api }"
+  exit 0
+fi
+if [ "$1" = test ] || { [ "$1" = clippy ] && [ "$verbose" = 0 ]; }; then
+  take=0
+  for a in "$@"; do
+    if [ "$take" = 1 ]; then
+      [ "$a" = "${MOCK_TEST_SKIP:-__}" ] || printf 'Checking %s v0.5.8\n' "$a"
+      take=0
+    fi
+    [ "$a" = "-p" ] && take=1
+  done
 fi
 exit 0
 SH
@@ -50,7 +63,9 @@ chmod +x "$BIN/cargo"
 
 ZERO=0000000000000000000000000000000000000000
 run_hook() {  # $1 = local sha, $2 = remote sha
-  ( cd "$FIX" && PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
+  # NESTED bypasses the machine-global cargo lock: this fixture runs inside a
+  # real hook's fast checks, which already hold it, and its cargo is the mock.
+  ( cd "$FIX" && ARLE_PRE_PUSH_NESTED=1 PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
 }
 
 # Red world: the push changes infer-cuda, the lint reports it Fresh.
@@ -80,4 +95,12 @@ corebase="$(git -C "$FIX" rev-parse HEAD~1)"; coretip="$(git -C "$FIX" rev-parse
 MOCK_LINT_LINES='Checking infer-api \n' run_hook "$coretip" "$corebase" >"$TMP/ctrl.log" 2>&1 \
   || { echo "FAIL: unchanged-crate push asserted (false positive)" >&2; cat "$TMP/ctrl.log" >&2; exit 1; }
 
-echo "PASS: CUDA lint freshness assertion (red/green/new-branch/control)"
+# Red world for the test-step guard: the same infer-core change, but a test
+# step reports it Fresh (mock suppresses its Checking line).
+set +e
+MOCK_TEST_SKIP=infer-core run_hook "$coretip" "$corebase" >"$TMP/test-red.log" 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] || { echo "FAIL: test-step red world passed — Fresh infer-core not caught" >&2; cat "$TMP/test-red.log" >&2; exit 1; }
+grep -q 'reported infer-core Fresh while this push changes it' "$TMP/test-red.log"
+
+echo "PASS: CUDA lint + test-step freshness assertions (red/green/new-branch/control/test-red)"
