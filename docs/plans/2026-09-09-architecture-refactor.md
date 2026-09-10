@@ -450,11 +450,30 @@ run against both the fake and the real adapter.
 `executor/qwen35.rs`'s six blocks each go to a destination that already exists
 (the table in §3.2): speculative-decode orchestration and the submit tree to
 `infer-plan`, KV/tier/sidecar to `infer-kvspace`, construction to the weight
-axis, device scheduling to `device_sched`. About 2,800 of 3,531 lines leave;
-550-650 stay.
+axis, device scheduling to `device_sched`.
 
-No new crate. This is the easy 80%, and it follows steps 1, 2 and 5, because
-each block's destination has to exist before the block can move.
+**The first estimate here said about 2,800 of 3,531 lines leave. That was
+wrong, and the way it was wrong is worth keeping.** It came from counting
+lines that do not mention a device type and calling them movable. Measured
+after the move: the KV/tier and device-scheduling blocks left whole (about 780
+lines), and the two fused decode functions gave up their pure arithmetic and
+then stopped — `mtp_decode_batch` 278 to 271 lines, `dspark_decode_batch` 361
+to 356.
+
+What stays is not arithmetic waiting to be extracted. Roughly 40% of each
+function is the device half's input preparation, and most of it *cannot* move
+at any effort: it gathers `&mut` references to types that own device
+resources, and those references do not cross a crate boundary. A line like
+`let mut pick = vec![false; slots.len()]` reads as host arithmetic and exists
+only to drive the iterator filter on the next `linear_state_addrs` call. The
+rest is state conjunctions in seed predicates (extracting them means
+parameterizing an `&&`), validations, and counter updates.
+
+A per-line count cannot see any of this, so do not re-derive the movable
+fraction that way.
+
+No new crate. It follows steps 1, 2 and 5, because each block's destination has
+to exist before the block can move.
 
 The dominant obstacle is not the block boundaries but the functions inside
 them: the recurring shape is host arithmetic and a device call fused in one
