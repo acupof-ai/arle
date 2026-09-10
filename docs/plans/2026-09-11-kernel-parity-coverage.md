@@ -35,10 +35,11 @@ unit test vs ref · **—** = no gate.
 | Kernel | Heat | Gate | Geometry gap |
 |---|---|---|---|
 | `gdr_fq_prep` + AOT `gdr_fq_{cumsum,kkt,fwd}` (FlashQLA) | WARM | **U+P** (`crates/autograd` `test_linear_attention.rs`, vs CPU f32 incl grads; k8/v32 **and 16/48**, d128, chunk+batched) | tested heads 8/32 & 16/48; serve launcher only emits (16,32)/(16,48); AOT also compiles (24,8)(12,4)(16,8)(16,16) used only by training backward |
-| `gdr_decode_cuda` / `gdr_decode_batch_cuda` | **HOT** (c=1 default; c≥2 batch) | **—** (no direct numeric gate; batched only via `needle_concurrent.py` E2E) | HOT decode kernel with no tensor-parity test |
-| `conv1d_decode_batch_cuda` | HOT (c≥2) | **—** direct (conv1d boundary covered training-side only) | same |
-| `gated_delta_rule_prefill_recurrent_cuda` (non-chunked / fq-unavailable) | WARM | **U+P** training-side vs CPU | serve geometry path (attn_tp≥2 local K=8) not the tested head set |
-| `conv1d_prefill_cuda` | WARM | **U+P** (training) | — |
+| `gdr_decode_cuda` / `gdr_decode_batch_cuda` | **HOT** (c=1 default; c≥2 batch) | **P** `gdr_decode_parity` (B=1/8, (16,48)/(8,24), 5 carried steps, output+state vs f32 anchor) | — |
+| `conv1d_decode_batch_cuda` | HOT (c≥2) | **P** same `gdr_decode_parity` (conv output + shifted ring) | — |
+| `*_prefill_recurrent_varlen_cuda` + `conv1d_prefill_varlen_cuda` (attn_tp≥2 spec verify / DSpark replay) | WARM | **P** `gdr_varlen_parity` (lengths 1/2/5/17/64, B=1/4/8, nonzero init, output+ring+final state vs f64) + FlashQLA-vs-varlen cross-path check at (16,48) lengths 5/17/64 with max-diff output | — |
+| `gated_delta_rule_prefill_recurrent_cuda` (non-chunked / fq-unavailable) | WARM | **U+P** training-side vs CPU; `gdr_varlen_parity` covers the same kernel math via the varlen ABI at the serve head set | single-row host ABI itself only driven in autograd tests |
+| `conv1d_prefill_cuda` | WARM | **U+P** (training) + **P** (`gdr_varlen_parity` FlashQLA cross-check drives the single-row prefill ABI) | — |
 | 5 AOT `gated_delta_rule_chunk_{cumsum,a,recompute,state,o}` (serving build matrix) | **DEAD** | **—** zero callers + no test | kernels.toml rows with no symbol consumer anywhere (deleted in kernel-parity-s11) |
 | `batched_copy_uniform_cuda` | HOT (c≥2 setup) | E2E only | memcpy, low risk |
 
@@ -95,9 +96,12 @@ unit test vs ref · **—** = no gate.
    H20 (every quant-pool decode + bf16 short prefill); vendor-trusted, no
    in-repo numeric gate, E2E only.
 3. **`gdr_decode_cuda` / `gdr_decode_batch_cuda` + `conv1d_decode_batch_cuda`**
-   — HOT GDN decode (c=1 default and c≥2 batch); no tensor-parity test. The
-   varlen incident's neighbor: the recurrent decode scan is assumed, never
-   directly compared. (S12 adds the host-written parity gate.)
+   — HOT GDN decode (c=1 default and c≥2 batch); the varlen incident's
+   neighbor. The recurrent decode scan is now compared by `gdr_decode_parity`
+   (S12/#308), and the attn_tp≥2 varlen prefill replay kernels by
+   `gdr_varlen_parity` (lengths 1/2/5/17/64, B=1/4/8, output+ring+final
+   state vs an f64 anchor, varlen-vs-FlashQLA cross-path check at (16,48)
+   lengths 5/17/64 with per-length max diff — the fork behind #300).
 4. **`argmax_cuda` / `argmax_batch_cuda`** — HOT every greedy token; no serve
    CUDA numeric test (a wrong tie-break silently changes output). (S12.)
 5. **routing family** (`dsv4_route`, renorm, count/scan/pack/scatter/combine)
@@ -116,10 +120,10 @@ unit test vs ref · **—** = no gate.
 
 ### Geometry mismatches (gate exists but doesn't cover the production shape)
 - **attn_tp≥2 GDN**: local K = 16/attn_tp = 8 at TP2; `fq_geometry_supported`
-  rejects (needs local K=16), so serve falls to the un-gated recurrent scan.
-  FlashQLA AOT compiles (16,8)/(12,4)/(24,8) but the serve launcher never
-  references them (training-backward only). Autograd parity uses heads 8/32
-  and 16/48 — not the serve TP≥2 shard.
+  rejects (needs local K=16), so serve falls to the recurrent scan — now gated
+  at the (8,24) shard by `gdr_varlen_parity` (varlen replay) and
+  `gdr_decode_parity` (decode). FlashQLA AOT compiles (16,8)/(12,4)/(24,8) but
+  the serve launcher never references them (training-backward only).
 - **paged_attn_v1 AOT has no hd128 row** (hd256 + one hd64 only): on a
   non-sm90 box, hd128 full-attn paged decode/prefill that declines FA3 has no
   fallback kernel. H20 hides it (FA3 native); A100/sm80 + a hd128 model is the
