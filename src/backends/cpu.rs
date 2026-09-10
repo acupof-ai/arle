@@ -12,13 +12,6 @@ pub(crate) fn build(
     config: &EngineLoadConfig,
     shutdown: ServeShutdown,
 ) -> Result<(ServeHandle, OpenAiTokenizer, String)> {
-    if config.mtp_enabled() {
-        anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-    }
-    anyhow::ensure!(
-        !config.kv_ssd_requested(),
-        "--kv-disk: the CPU backend has no KV tier store"
-    );
     // CPU smoke: placeholder executor over a real host KV pool; still
     // needs a tokenizer dir for encode/decode.
     let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;

@@ -19,9 +19,6 @@ pub(crate) fn build(
     config: &EngineLoadConfig,
     shutdown: ServeShutdown,
 ) -> Result<(ServeHandle, OpenAiTokenizer, String)> {
-    if config.mtp_enabled() {
-        anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-    }
     // Flags land in the statics before executor construction (spec-decode
     // resolver + pipeline/warmup/paged-read/sampling gates).
     infer_metal::apply_runtime_flags(&config.metal);

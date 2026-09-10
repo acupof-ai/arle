@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Result;
 use infer_api::EngineLoadConfig;
 use infer_server::{OpenAiTokenizer, ServeHandle, ServeShutdown};
 
@@ -15,13 +15,6 @@ pub(crate) fn build(
     config: &EngineLoadConfig,
     shutdown: ServeShutdown,
 ) -> Result<(ServeHandle, OpenAiTokenizer, String)> {
-    if config.mtp_enabled() {
-        anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-    }
-    anyhow::ensure!(
-        !config.kv_ssd_requested(),
-        "--kv-disk: the HIP backend has no KV tier store"
-    );
     let gguf_path = super::resolve_gguf_path(model_path, "HIP")?;
     let tokenizer_dir = gguf_path
         .parent()
