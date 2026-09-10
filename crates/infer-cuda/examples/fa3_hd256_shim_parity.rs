@@ -13,9 +13,10 @@
 //!   (batch row, kv_head).
 //!
 //! Geometry is Qwen3.6-27B full attention: 24 query heads / 4 KV heads
-//! (GQA ratio 6), head_dim 256, paged pool page_size 16
-//! (`docs/research/2026-07-27-longctx-decode-attention-plan.md:44`,
-//! `docs/experience/wins/2026-08-04-fa3-decode-splits-fill-the-sms.md:37`).
+//! (GQA ratio 6), head_dim 256, 16 full-attention layers — from the
+//! Qwen3.6-27B-FP8 and ThinkingCap-27B host `config.json` (read on the H20
+//! box); page_size 16 is the shim's non-TMA paged lane
+//! (`arle_fa3_shim.cu`, "qwen35's page_size (16)").
 //!
 //! The four shim responsibilities named in the plan get independent coverage:
 //! - page-table translation: every case uses a non-identity table, either
@@ -32,34 +33,48 @@
 //!   mixed per-row KV extents through `seqused_k`, including kv_len 1 and the
 //!   page boundaries 15/16/17, 127/128/129, 257.
 //!
-//! The oracle is f64 softmax written from the kernel contract, independent of
-//! the CUDA sources. Every output column is compared on sampled (long case) or
-//! all (short cases) query rows, L2-relative plus elementwise floor+slope; the
-//! bound comes from the KV quantization error and the single final bf16
+//! The requantized-e4m3 case gets TWO oracles. The mirrored oracle models the
+//! device chain (descale -> e4m3 round) exactly; it cannot see a descale that
+//! saturates or loses range, because kernel and oracle requantize identically.
+//! The unmirrored anchor is f64 attention over the raw dequantized KV
+//! (`e4m3_decode(byte) * scale`) and the unrequantized bf16 Q, compared under
+//! a band widened for one extra e4m3 round of Q/K/V.
+//!
+//! The oracles are f64 softmax written from the kernel contract, independent
+//! of the CUDA sources. Every output column is compared on sampled (long case)
+//! or all (short cases) query rows, L2-relative plus elementwise floor+slope;
+//! the bound comes from the KV quantization error and the single final bf16
 //! rounding against FA3's f32 accumulation.
 //!
-//! `--negative-control[=bf16|fp8|int8]` corrupts one path family's
-//! expectations; that family MUST fail and the other two MUST still pass
-//! (bare flag corrupts all three).
+//! Negative control is per FORM family — bf16, int8, fp8-dequant (the decode
+//! dequant-to-bf16 form), fp8-requant (the q256/kv65537 form):
+//! `--negative-control=<family>` corrupts one family and the other three MUST
+//! still pass; the bare flag corrupts all four.
 //!
 //! Run on a pod (sm_90):
+//!   cargo build --release -p infer-cuda --features cuda \
+//!     --example fa3_hd256_shim_parity
+//!   target/release/examples/fa3_hd256_shim_parity --kernel-build-id
 //!   INFER_CUDA_DEVICE=<free-gpu> target/release/examples/fa3_hd256_shim_parity
-//!   INFER_CUDA_DEVICE=<free-gpu> target/release/examples/fa3_hd256_shim_parity --negative-control=fp8
+//!   INFER_CUDA_DEVICE=<free-gpu> \
+//!     target/release/examples/fa3_hd256_shim_parity --negative-control
+//!   ... --negative-control=bf16|int8|fp8-dequant|fp8-requant
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
         println!("{}", cuda_kernels::KERNEL_BUILD_ID);
         return Ok(());
     }
-    let mut negative: Option<Option<PoolSel>> = None;
+    let mut negative: Option<Option<Family>> = None;
     for arg in std::env::args().skip(1) {
         if arg == "--negative-control" {
             negative = Some(None);
         } else if let Some(v) = arg.strip_prefix("--negative-control=") {
             let sel = match v {
-                "bf16" => PoolSel::Bf16,
-                "fp8" => PoolSel::Fp8,
-                "int8" => PoolSel::Int8,
+                "bf16" => Family::Bf16,
+                "int8" => Family::Int8,
+                "fp8-dequant" => Family::Fp8Dequant,
+                "fp8-requant" => Family::Fp8Requant,
                 other => anyhow::bail!("unknown --negative-control family {other:?}"),
             };
             negative = Some(Some(sel));
@@ -70,18 +85,23 @@ fn main() -> anyhow::Result<()> {
     real::run(negative)
 }
 
+/// Negative-control families are the four shim FORMS. The fp8 pool has two
+/// forms (decode dequant-to-bf16 and the long-context requantized-e4m3 form),
+/// so pool-level grouping would let a dead requant comparator hide behind the
+/// decode case.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PoolSel {
+enum Family {
     Bf16,
-    Fp8,
     Int8,
+    Fp8Dequant,
+    Fp8Requant,
 }
 
 #[cfg(not(feature = "cuda"))]
 mod real {
-    use super::PoolSel;
+    use super::Family;
 
-    pub(super) fn run(_negative: Option<Option<PoolSel>>) -> anyhow::Result<()> {
+    pub(super) fn run(_negative: Option<Option<Family>>) -> anyhow::Result<()> {
         eprintln!("fa3_hd256_shim_parity is a CUDA harness; rebuild with --features cuda.");
         Ok(())
     }
@@ -89,7 +109,7 @@ mod real {
 
 #[cfg(feature = "cuda")]
 mod real {
-    use super::PoolSel;
+    use super::Family;
     use anyhow::{Result, ensure};
     use cuda_kernels::attention::{fa3_fwd_hd256_bf16, fa3_fwd_hd256_quant};
     use cuda_kernels::ffi;
@@ -143,6 +163,16 @@ mod real {
         floor: 4e-2,
         max_viol_frac: 5e-3,
     };
+    // Unmirrored anchor for the requant form: f64 attention over the raw
+    // dequantized KV and the unrequantized Q. The gap is the ORIGINAL pool
+    // e4m3 round plus one extra e4m3 round each of Q/K/V and the bf16 output,
+    // so the band is wider than the mirrored comparator's.
+    const TOL_FP8_ANCHOR: Tol = Tol {
+        rel_l2: 2.2e-1,
+        slope: 1.6e-1,
+        floor: 5e-2,
+        max_viol_frac: 5e-3,
+    };
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum TableKind {
@@ -162,11 +192,12 @@ mod real {
     }
 
     impl Form {
-        fn family(self) -> PoolSel {
+        fn family(self) -> Family {
             match self {
-                Form::Bf16Pool => PoolSel::Bf16,
-                Form::QuantBf16 { is_fp8: true } | Form::QuantFp8 => PoolSel::Fp8,
-                Form::QuantBf16 { is_fp8: false } => PoolSel::Int8,
+                Form::Bf16Pool => Family::Bf16,
+                Form::QuantBf16 { is_fp8: true } => Family::Fp8Dequant,
+                Form::QuantBf16 { is_fp8: false } => Family::Int8,
+                Form::QuantFp8 => Family::Fp8Requant,
             }
         }
         fn tol(self) -> &'static Tol {
@@ -301,7 +332,7 @@ mod real {
         fn qlen_of(&self, b: usize) -> usize {
             (self.cu_q[b + 1] - self.cu_q[b]) as usize
         }
-        fn family(&self) -> PoolSel {
+        fn family(&self) -> Family {
             self.form.family()
         }
         fn row_of_token(&self, t: usize) -> usize {
@@ -348,6 +379,24 @@ mod real {
                     f64::from(e4m3_decode(e4m3_encode(v0))) * f64::from(descales[b * HK + hk])
                 }
             }
+        }
+
+        /// Raw dequantized K/V value: pool byte decoded and multiplied by its
+        /// per-token scale, with NO second e4m3 round and NO bf16 round. This
+        /// is the unmirrored anchor's KV for the requant form: it sees descale
+        /// saturation or range loss that the mirrored chain hides.
+        fn kv_value_raw(&self, is_v: bool, b: usize, t: usize, hk: usize, d: usize) -> f64 {
+            let phys = self.table[b * self.table_stride + t / PAGE] as usize;
+            let off = t % PAGE;
+            let pool = if is_v { &self.v_q } else { &self.k_q };
+            let scales = if is_v { &self.v_scales } else { &self.k_scales };
+            let byte = pool[(phys * PAGE + off) * HK * D + hk * D + d];
+            f64::from(e4m3_decode(byte)) * f64::from(scales[(phys * PAGE + off) * HK + hk])
+        }
+
+        /// Unrequantized Q value (the bf16 Q the device q_quant kernel reads).
+        fn q_value_raw(&self, t: usize, h: usize, d: usize) -> f64 {
+            f64::from(self.q_packed[(t * H + h) * D + d].to_f32())
         }
 
         /// Logical Q value the FA3 math units consume at global token `t`.
@@ -619,13 +668,54 @@ mod real {
         RowKV { k, v }
     }
 
+    /// Unmirrored anchor matrices: raw dequantized values, no second round.
+    fn build_row_kv_raw(case: &Case, b: usize, hk: usize, lim: usize) -> RowKV {
+        let mut k = vec![0f64; lim * D];
+        let mut v = vec![0f64; lim * D];
+        for j in 0..lim {
+            for d in 0..D {
+                k[j * D + d] = case.kv_value_raw(false, b, j, hk, d);
+                v[j * D + d] = case.kv_value_raw(true, b, j, hk, d);
+            }
+        }
+        RowKV { k, v }
+    }
+
     #[allow(clippy::needless_range_loop)]
     fn attention_with_kv(case: &Case, token: usize, h: usize, kv: &RowKV, lim: usize) -> Vec<f64> {
+        attention_with_kv_q(case, token, h, kv, lim, false)
+    }
+
+    /// Anchor variant uses the raw (unrequantized) Q.
+    fn attention_with_kv_raw_q(
+        case: &Case,
+        token: usize,
+        h: usize,
+        kv: &RowKV,
+        lim: usize,
+    ) -> Vec<f64> {
+        attention_with_kv_q(case, token, h, kv, lim, true)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn attention_with_kv_q(
+        case: &Case,
+        token: usize,
+        h: usize,
+        kv: &RowKV,
+        lim: usize,
+        raw_q: bool,
+    ) -> Vec<f64> {
         let mut scores = vec![0f64; lim];
         for (j, s) in scores.iter_mut().enumerate() {
             let mut dot = 0f64;
             for d in 0..D {
-                dot += case.q_value(token, h, d) * kv.k[j * D + d];
+                let q = if raw_q {
+                    case.q_value_raw(token, h, d)
+                } else {
+                    case.q_value(token, h, d)
+                };
+                dot += q * kv.k[j * D + d];
             }
             *s = dot * SM_SCALE;
         }
@@ -650,7 +740,90 @@ mod real {
         max_dev: f64,
     }
 
-    fn compare(case: &Case, got: &[bf16], corrupt_family: bool) -> (bool, Metrics) {
+    /// Verdict of one comparator pair: per-comparator pass flags and metrics.
+    struct CmpOutcome {
+        mirror_ok: bool,
+        anchor_ok: Option<bool>,
+        mirror: Metrics,
+        anchor: Option<Metrics>,
+    }
+
+    /// All three evaluations of one case from a single oracle build: the clean
+    /// run, a mirror-expectation corruption (anchor stays clean in the same
+    /// evaluation), and an anchor-expectation corruption (mirror stays clean).
+    /// Negative control uses the last two as independent teeth.
+    struct CompareAll {
+        clean: CmpOutcome,
+        mirror_neg: CmpOutcome,
+        anchor_neg: Option<CmpOutcome>,
+    }
+
+    fn eval_pair(
+        case: &Case,
+        got: &[bf16],
+        rows: &[(usize, usize)],
+        wants: &[Vec<f64>],
+        wants_anchor: Option<&[Vec<f64>]>,
+        corrupt_mirror: bool,
+        corrupt_anchor: bool,
+    ) -> CmpOutcome {
+        let eval = |corrupt: bool, wants: &[Vec<f64>], tol: &Tol| -> Metrics {
+            let mut diff_sq = 0f64;
+            let mut ref_sq = 0f64;
+            let mut violators = 0usize;
+            let mut total = 0usize;
+            let mut max_dev = 0f64;
+            for (i, (token, h)) in rows.iter().enumerate() {
+                for d in 0..D {
+                    let mut w = wants[i][d];
+                    // Corrupt the whole first checked row so the violation-rate
+                    // gate trips at every geometry (one element would dilute
+                    // below max_viol_frac on the long/batched cases).
+                    if corrupt && i == 0 {
+                        w += 0.5;
+                    }
+                    let g = f64::from(got[(*token * H + h) * D + d].to_f32());
+                    let dev = (g - w).abs();
+                    diff_sq += dev.powi(2);
+                    ref_sq += w.powi(2);
+                    max_dev = max_dev.max(dev);
+                    total += 1;
+                    if dev > tol.floor + tol.slope * w.abs() {
+                        violators += 1;
+                    }
+                }
+            }
+            let rel_l2 = (diff_sq / ref_sq.max(1e-12)).sqrt();
+            let viol_frac = violators as f64 / total as f64;
+            Metrics {
+                rel_l2,
+                viol_frac,
+                max_dev,
+            }
+        };
+        let tol = case.form.tol();
+        let m = eval(corrupt_mirror, wants, tol);
+        let mirror_ok = m.rel_l2 < tol.rel_l2 && m.viol_frac <= tol.max_viol_frac;
+        let Some(wants_anchor) = wants_anchor else {
+            return CmpOutcome {
+                mirror_ok,
+                anchor_ok: None,
+                mirror: m,
+                anchor: None,
+            };
+        };
+        let ma = eval(corrupt_anchor, wants_anchor, &TOL_FP8_ANCHOR);
+        let anchor_ok =
+            ma.rel_l2 < TOL_FP8_ANCHOR.rel_l2 && ma.viol_frac <= TOL_FP8_ANCHOR.max_viol_frac;
+        CmpOutcome {
+            mirror_ok,
+            anchor_ok: Some(anchor_ok),
+            mirror: m,
+            anchor: Some(ma),
+        }
+    }
+
+    fn compare(case: &Case, got: &[bf16]) -> CompareAll {
         let rows: Vec<(usize, usize)> = case
             .checked_tokens
             .iter()
@@ -671,91 +844,112 @@ mod real {
             v.dedup();
             v
         };
-        let mut kv_by_row: Vec<Vec<RowKV>> = (0..rows_checked.len())
-            .map(|_| Vec::with_capacity(HK))
-            .collect();
-        let built = std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (ri, &b) in rows_checked.iter().enumerate() {
-                for hk in 0..HK {
+        let build_matrices = |raw: bool| -> Vec<Vec<RowKV>> {
+            let mut by_row: Vec<Vec<RowKV>> = (0..rows_checked.len())
+                .map(|_| Vec::with_capacity(HK))
+                .collect();
+            let built = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for (ri, &b) in rows_checked.iter().enumerate() {
+                    for hk in 0..HK {
+                        let case_ref = &*case;
+                        let lim = case.kvlens[b];
+                        handles.push(scope.spawn(move || {
+                            if raw {
+                                (ri, hk, build_row_kv_raw(case_ref, b, hk, lim))
+                            } else {
+                                (ri, hk, build_row_kv(case_ref, b, hk, lim))
+                            }
+                        }));
+                    }
+                }
+                let mut built: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                built.sort_by_key(|(ri, hk, _)| (*ri, *hk));
+                built
+            });
+            for (ri, hk, kv) in built {
+                if hk == 0 {
+                    by_row[ri] = Vec::with_capacity(HK);
+                }
+                by_row[ri].push(kv);
+            }
+            by_row
+        };
+        let kv_by_row = build_matrices(false);
+        // The requant form gets a second, unmirrored anchor over the raw
+        // dequantized KV and unrequantized Q.
+        let kv_by_row_raw = if case.form == Form::QuantFp8 {
+            build_matrices(true)
+        } else {
+            Vec::new()
+        };
+
+        let build_wants = |raw_q: bool, matrices: &[Vec<RowKV>]| -> Vec<Vec<f64>> {
+            let mut wants: Vec<Vec<f64>> = (0..rows.len()).map(|_| Vec::new()).collect();
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for (i, (token, h)) in rows.iter().enumerate() {
+                    let b = case.row_of_token(*token);
+                    let ri = rows_checked.iter().position(|&rb| rb == b).unwrap();
+                    let hk = h / G;
+                    let kv = &matrices[ri][hk];
+                    let lim = row_lim(case, *token);
                     let case_ref = &*case;
-                    let lim = case.kvlens[b];
-                    handles.push(scope.spawn(move || (ri, hk, build_row_kv(case_ref, b, hk, lim))));
+                    handles.push(scope.spawn(move || {
+                        if raw_q {
+                            (i, attention_with_kv_raw_q(case_ref, *token, *h, kv, lim))
+                        } else {
+                            (i, attention_with_kv(case_ref, *token, *h, kv, lim))
+                        }
+                    }));
                 }
-            }
-            let mut built: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            built.sort_by_key(|(ri, hk, _)| (*ri, *hk));
-            built
-        });
-        for (ri, hk, kv) in built {
-            if hk == 0 {
-                kv_by_row[ri] = Vec::with_capacity(HK);
-            }
-            kv_by_row[ri].push(kv);
-        }
+                for handle in handles {
+                    let (i, v) = handle.join().unwrap();
+                    wants[i] = v;
+                }
+            });
+            wants
+        };
+        let wants = build_wants(false, &kv_by_row);
+        let wants_anchor = if case.form == Form::QuantFp8 {
+            Some(build_wants(true, &kv_by_row_raw))
+        } else {
+            None
+        };
 
-        let mut wants: Vec<Vec<f64>> = (0..rows.len()).map(|_| Vec::new()).collect();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (i, (token, h)) in rows.iter().enumerate() {
-                let b = case.row_of_token(*token);
-                let ri = rows_checked.iter().position(|&rb| rb == b).unwrap();
-                let hk = h / G;
-                let kv = &kv_by_row[ri][hk];
-                let lim = row_lim(case, *token);
-                let case_ref = &*case;
-                handles.push(
-                    scope.spawn(move || (i, attention_with_kv(case_ref, *token, *h, kv, lim))),
-                );
-            }
-            for handle in handles {
-                let (i, v) = handle.join().unwrap();
-                wants[i] = v;
-            }
-        });
-
-        let tol = case.form.tol();
-        let mut diff_sq = 0f64;
-        let mut ref_sq = 0f64;
-        let mut violators = 0usize;
-        let mut total = 0usize;
-        let mut max_dev = 0f64;
-        for (i, (token, h)) in rows.iter().enumerate() {
-            for d in 0..D {
-                let mut w = wants[i][d];
-                // Corrupt the whole first checked row so the violation-rate
-                // gate trips at every geometry (one element would dilute below
-                // max_viol_frac on the long/batched cases).
-                if corrupt_family && i == 0 {
-                    w += 0.5;
-                }
-                let g = f64::from(got[(*token * H + h) * D + d].to_f32());
-                let dev = (g - w).abs();
-                diff_sq += dev.powi(2);
-                ref_sq += w.powi(2);
-                max_dev = max_dev.max(dev);
-                total += 1;
-                if dev > tol.floor + tol.slope * w.abs() {
-                    violators += 1;
-                }
-            }
+        let clean = eval_pair(
+            case,
+            got,
+            &rows,
+            &wants,
+            wants_anchor.as_deref(),
+            false,
+            false,
+        );
+        // The mirror corruption also lands in the anchor's first row, so for
+        // the requant family evaluate the anchor separately with its own flag.
+        let mirror_neg = eval_pair(
+            case,
+            got,
+            &rows,
+            &wants,
+            wants_anchor.as_deref(),
+            true,
+            false,
+        );
+        let anchor_neg = wants_anchor
+            .as_ref()
+            .map(|wa| eval_pair(case, got, &rows, &wants, Some(wa), false, true));
+        CompareAll {
+            clean,
+            mirror_neg,
+            anchor_neg,
         }
-        let rel_l2 = (diff_sq / ref_sq.max(1e-12)).sqrt();
-        let viol_frac = violators as f64 / total as f64;
-        let pass = rel_l2 < tol.rel_l2 && viol_frac <= tol.max_viol_frac;
-        (
-            pass,
-            Metrics {
-                rel_l2,
-                viol_frac,
-                max_dev,
-            },
-        )
     }
 
     // ── device run ──────────────────────────────────────────────────────────
 
-    fn run_case(ctx: &DeviceContext, case: &Case, corrupt_family: bool) -> Result<bool> {
+    fn run_kernel(ctx: &DeviceContext, case: &Case) -> Result<Vec<bf16>> {
         let batch = case.batch();
         let total_q = case.total_q();
         let max_q = case
@@ -884,27 +1078,48 @@ mod real {
             }
         }
         ctx.sync()?;
-        let got = ctx.stream.clone_dtoh(&o_d)?;
-        let (pass, m) = compare(case, &got, corrupt_family);
-        eprintln!(
-            "[{} B={} total_q={} kv={:?} table={:?} causal={} splits={}] rel_l2={:.2e} \
-             viol_frac={:.2e} max_dev={:.2e} {}",
-            case.label,
-            batch,
-            total_q,
-            case.kvlens,
-            case.table_kind,
-            case.is_causal,
-            case.splits,
-            m.rel_l2,
-            m.viol_frac,
-            m.max_dev,
-            if pass { "PASS" } else { "FAIL" }
-        );
-        Ok(pass)
+        ctx.stream
+            .clone_dtoh(&o_d)
+            .map_err(|e| anyhow::anyhow!("clone_dtoh output failed: {e}"))
     }
 
-    pub(super) fn run(negative: Option<Option<PoolSel>>) -> Result<()> {
+    fn print_verdict(case: &Case, out: &CmpOutcome) {
+        let mirror_pass = out.mirror_ok && out.anchor_ok.unwrap_or(true);
+        if let Some(ma) = &out.anchor {
+            eprintln!(
+                "[{} B={} kv={:?} table={:?} splits={}] mirrored rel_l2={:.2e} viol={:.2e} \
+                 max={:.2e} | unmirrored-anchor rel_l2={:.2e} viol={:.2e} max={:.2e} {}",
+                case.label,
+                case.batch(),
+                case.kvlens,
+                case.table_kind,
+                case.splits,
+                out.mirror.rel_l2,
+                out.mirror.viol_frac,
+                out.mirror.max_dev,
+                ma.rel_l2,
+                ma.viol_frac,
+                ma.max_dev,
+                if mirror_pass { "PASS" } else { "FAIL" }
+            );
+        } else {
+            eprintln!(
+                "[{} B={} kv={:?} table={:?} splits={}] rel_l2={:.2e} viol_frac={:.2e} \
+                 max_dev={:.2e} {}",
+                case.label,
+                case.batch(),
+                case.kvlens,
+                case.table_kind,
+                case.splits,
+                out.mirror.rel_l2,
+                out.mirror.viol_frac,
+                out.mirror.max_dev,
+                if mirror_pass { "PASS" } else { "FAIL" }
+            );
+        }
+    }
+
+    pub(super) fn run(negative: Option<Option<Family>>) -> Result<()> {
         let ctx = DeviceContext::new()?;
         // SAFETY: marker is an argumentless C ABI probe.
         let marker = unsafe { ffi::attention::arle_fa3_real_kernel_marker_cuda() };
@@ -1015,44 +1230,102 @@ mod real {
             ),
         ];
 
-        let mut per_family = [
-            (PoolSel::Bf16, true),
-            (PoolSel::Fp8, true),
-            (PoolSel::Int8, true),
-        ];
-        for case in &cases {
-            let corrupt = match negative {
-                None => false,
-                Some(None) => true,
-                Some(Some(fam)) => fam == case.family(),
-            };
-            let pass = run_case(&ctx, case, corrupt)?;
-            for entry in &mut per_family {
-                if entry.0 == case.family() {
-                    entry.1 &= pass;
-                }
+        // Per-family state over that family's cases: the clean verdict plus
+        // the negative teeth (the requant form's anchor has its own tooth).
+        struct FamState {
+            clean: bool,
+            any_case: bool,
+            mirror_tooth: bool,
+            anchor_tooth: bool,
+            has_anchor: bool,
+        }
+        let mut fam = std::array::from_fn::<FamState, 4, _>(|_| FamState {
+            clean: true,
+            any_case: false,
+            mirror_tooth: true,
+            anchor_tooth: true,
+            has_anchor: false,
+        });
+        let fam_idx = |f: Family| match f {
+            Family::Bf16 => 0,
+            Family::Int8 => 1,
+            Family::Fp8Dequant => 2,
+            Family::Fp8Requant => 3,
+        };
+
+        let fam_name = |f: Family| -> &'static str {
+            match f {
+                Family::Bf16 => "bf16",
+                Family::Int8 => "int8",
+                Family::Fp8Dequant => "fp8-dequant",
+                Family::Fp8Requant => "fp8-requant",
             }
+        };
+
+        for case in &cases {
+            // One kernel launch and one oracle build per case; compare()
+            // derives the clean verdict and both negative teeth from it.
+            let got = run_kernel(&ctx, case)?;
+            let out = compare(case, &got);
+            let st = &mut fam[fam_idx(case.family())];
+            st.any_case = true;
+            st.has_anchor |= out.clean.anchor_ok.is_some();
+            st.clean &= out.clean.mirror_ok && out.clean.anchor_ok.unwrap_or(true);
+            // Mirror tooth: the corrupted mirror expectation MUST fail; the
+            // anchor comparator, evaluated uncorrupted in the same pair, MUST
+            // still pass for the requant family.
+            st.mirror_tooth &=
+                !out.mirror_neg.mirror_ok && out.mirror_neg.anchor_ok.is_none_or(|ok| ok);
+            if let Some(an) = &out.anchor_neg {
+                // Anchor tooth: corrupted anchor expectation MUST fail while
+                // the uncorrupted mirror in that pair still passes.
+                st.anchor_tooth &= an.mirror_ok && !an.anchor_ok.unwrap_or(true);
+            }
+            print_verdict(case, &out.clean);
         }
 
+        let families = [
+            Family::Bf16,
+            Family::Int8,
+            Family::Fp8Dequant,
+            Family::Fp8Requant,
+        ];
         match negative {
             None => {
-                let all = per_family.iter().all(|(_, ok)| *ok);
-                ensure!(all, "fa3_hd256_shim_parity FAILED — see violations above");
+                for (i, f) in families.iter().enumerate() {
+                    ensure!(
+                        fam[i].any_case && fam[i].clean,
+                        "fa3_hd256_shim_parity clean run FAILED for the {} family",
+                        fam_name(*f)
+                    );
+                }
                 eprintln!("[fa3-hd256-shim-parity] ALL PASS");
             }
             Some(maybe_fam) => {
-                for (fam, ok) in per_family {
-                    let corrupted = maybe_fam.is_none_or(|f| f == fam);
-                    if corrupted {
+                for (i, f) in families.iter().enumerate() {
+                    let targeted = maybe_fam.is_none_or(|tf| tf == *f);
+                    ensure!(fam[i].any_case, "family {} has no cases", fam_name(*f));
+                    if !targeted {
+                        // An untargeted family runs its CLEAN expectations even
+                        // under a single-family negative flag.
                         ensure!(
-                            !ok,
-                            "fa3_hd256_shim_parity negative control did NOT fail the {fam:?} family"
+                            fam[i].clean,
+                            "fa3_hd256_shim_parity collateral failure in the {} family",
+                            fam_name(*f)
                         );
                     } else {
                         ensure!(
-                            ok,
-                            "fa3_hd256_shim_parity collateral failure in the {fam:?} family"
+                            fam[i].mirror_tooth,
+                            "fa3_hd256_shim_parity negative control did NOT fail the {} mirror comparator",
+                            fam_name(*f)
                         );
+                        if fam[i].has_anchor {
+                            ensure!(
+                                fam[i].anchor_tooth,
+                                "fa3_hd256_shim_parity negative control did NOT fail the {} unmirrored anchor",
+                                fam_name(*f)
+                            );
+                        }
                     }
                 }
                 eprintln!("[fa3-hd256-shim-parity] NEGATIVE CONTROL OK");
