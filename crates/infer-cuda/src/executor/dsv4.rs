@@ -532,11 +532,15 @@ impl Dsv4CudaExecutor {
                 kv_batch.rows.is_empty(),
                 "DSv4 empty plan got non-empty KV batch descriptor"
             );
-            return Ok(StepOutput { tokens: Vec::new() });
+            return Ok(StepOutput {
+                tokens: Vec::new(),
+                kv_actual: Vec::new(),
+            });
         }
 
         if plan.prefill_rows.is_empty() {
             return Ok(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: self.forward_decode_batch(&plan.decode_rows, kv_batch)?,
             });
         }
@@ -573,7 +577,10 @@ impl Dsv4CudaExecutor {
             let sub_batch = kv_batch.subset(n_prefill..kv_batch.rows.len())?;
             tokens.extend(self.forward_decode_batch(&plan.decode_rows, &sub_batch)?);
         }
-        Ok(StepOutput { tokens })
+        Ok(StepOutput {
+            tokens,
+            kv_actual: Vec::new(),
+        })
     }
 
     /// `kv_batch` must be the row's own single-row (sub-)descriptor.

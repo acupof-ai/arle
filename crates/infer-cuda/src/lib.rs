@@ -16,8 +16,7 @@ use std::path::Path;
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{
-    BackendExecutor, HostPagedKvPool, KvBatchDescriptor, KvSlotAccounting, KvTierLocation,
-    PollResult, PrefixBlock,
+    BackendExecutor, HostPagedKvPool, KvBatchDescriptor, KvTierLocation, PollResult, PrefixBlock,
 };
 
 #[cfg(feature = "cuda")]
@@ -533,7 +532,10 @@ impl CudaExecutor {
                 finish: None,
             });
         }
-        StepOutput { tokens }
+        StepOutput {
+            tokens,
+            kv_actual: Vec::new(),
+        }
     }
 }
 
@@ -542,12 +544,11 @@ impl BackendExecutor for CudaExecutor {
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
         let output = match &mut self.inner {
             CudaExecutorInner::Placeholder => Self::placeholder_forward(plan),
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.submit(plan, batch, kv)?,
+            CudaExecutorInner::Real(real) => real.submit(plan, batch)?,
         };
         Ok(Box::new(CudaInflight { output }))
     }

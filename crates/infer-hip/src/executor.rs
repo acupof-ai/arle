@@ -12,7 +12,7 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvBatchDescriptor, KvSlotAccounting, PollResult};
+use infer_seam::{BackendExecutor, KvBatchDescriptor, PollResult};
 
 use crate::kv_pool::HipKvPool;
 
@@ -85,10 +85,10 @@ impl BackendExecutor for HipDsv4Executor {
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        _kv: &mut dyn KvSlotAccounting,
     ) -> Result<Box<dyn std::any::Any + Send>> {
         if plan.is_idle() {
             return Ok(Box::new(HipInflight::Ready(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: Vec::new(),
             })));
         }
@@ -117,6 +117,7 @@ impl BackendExecutor for HipDsv4Executor {
                 position,
             )?;
             return Ok(Box::new(HipInflight::Ready(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -141,6 +142,7 @@ impl BackendExecutor for HipDsv4Executor {
                 position,
             )?;
             return Ok(Box::new(HipInflight::Ready(StepOutput {
+                kv_actual: Vec::new(),
                 tokens: vec![SlotToken {
                     slot: row.slot,
                     token,

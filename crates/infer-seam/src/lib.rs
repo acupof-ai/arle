@@ -346,13 +346,13 @@ pub struct BackendStats {
 pub trait BackendExecutor: 'static {
     /// Submit one forward step. `batch` carries every host KV read the backend
     /// needs (page tables, epochs, lengths, page size), resolved above the seam.
-    /// `kv` is the narrow write surface (grow/shrink a slot's accounted length)
-    /// — the only mutable pool access left below the seam.
+    /// The backend never writes the host KV pool: it reports the per-slot
+    /// lengths it actually reached in `StepOutput::kv_actual`, and the engine
+    /// applies them after poll.
     fn submit(
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        kv: &mut dyn KvSlotAccounting,
     ) -> anyhow::Result<Box<dyn std::any::Any + Send>>;
 
     fn poll(&mut self, inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult>;

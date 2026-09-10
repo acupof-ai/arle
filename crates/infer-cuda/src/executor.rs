@@ -8,8 +8,7 @@ use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 use cuda_kernels::tensor::{CudaPipelineFence, CudaPipelineFenceStatus, CudaPipelineStreamKind};
 use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
-    KvBatchDescriptor, KvBatchRowKind, KvSlotAccounting, PrefixBlock,
-    pages_only_reusable_prefix_blocks,
+    KvBatchDescriptor, KvBatchRowKind, PrefixBlock, pages_only_reusable_prefix_blocks,
 };
 use log::{info, warn};
 
@@ -211,10 +210,9 @@ impl RealCudaExecutor {
         &mut self,
         plan: &ForwardPlan,
         batch: &KvBatchDescriptor,
-        kv: &mut dyn KvSlotAccounting,
     ) -> Result<StepOutput> {
         match self {
-            Self::Qwen35(q) => q.submit(plan, batch, kv),
+            Self::Qwen35(q) => q.submit(plan, batch),
             Self::Dsv4(d) => d.submit(plan, batch),
         }
     }

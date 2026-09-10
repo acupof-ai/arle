@@ -471,8 +471,8 @@ mod tests {
     use crate::{Engine, RequestHandle, RequestPhase, RequestState, SchedulerConfig};
     use infer_plan::SamplingParams;
     use infer_seam::{
-        BackendExecutor, HostPagedKvPool, KvBatchDescriptor, KvSlotAccounting, KvSlotTier,
-        PollResult, PrefixBlock, PrefixReuse,
+        BackendExecutor, HostPagedKvPool, KvBatchDescriptor, KvSlotTier, PollResult, PrefixBlock,
+        PrefixReuse,
     };
 
     #[derive(Default)]
@@ -565,7 +565,6 @@ mod tests {
             &mut self,
             _plan: &ForwardPlan,
             _batch: &KvBatchDescriptor,
-            _kv: &mut dyn KvSlotAccounting,
         ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
             Ok(Box::new(()))
         }

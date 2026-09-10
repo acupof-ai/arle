@@ -831,6 +831,7 @@ impl Engine {
                     }
                     applied_decode_only = plan.prefill_rows.is_empty();
                     phase!(0);
+                    self.apply_kv_actual(&output.kv_actual)?;
                     self.apply_output(&plan, output)?;
                     phase!(1);
                 }
@@ -898,7 +899,7 @@ impl Engine {
         }
         let submit_at = std::time::Instant::now();
         let batch = KvBatchDescriptor::from_plan(&plan, &*self.kv)?;
-        self.inflight = Some(self.executor.submit(&plan, &batch, &mut *self.kv)?);
+        self.inflight = Some(self.executor.submit(&plan, &batch)?);
         self.inflight_submit_at = Some(submit_at);
         phase!(5);
         let decode_only = plan.prefill_rows.is_empty() && applied_decode_only;
@@ -1164,6 +1165,23 @@ impl Engine {
         } else {
             self.waiting.push_back(request);
         }
+    }
+
+    /// Converge the host pool to the lengths the backend actually reached.
+    /// The engine pre-budgets the full spec chain at `allocate_for_plan`; a
+    /// warm row or a chain shorter than the budget leaves the pool ahead of
+    /// the device truth until this trims it. Backends never write the pool —
+    /// they report `kv_actual` and the engine is the sole writer.
+    fn apply_kv_actual(&mut self, kv_actual: &[(usize, usize)]) -> Result<()> {
+        for &(slot, target) in kv_actual {
+            let current = self.kv.seq_len(slot);
+            if target < current {
+                self.kv.truncate_slot(slot, target)?;
+            } else if target > current {
+                self.kv.alloc(slot, target - current)?;
+            }
+        }
+        Ok(())
     }
 
     fn apply_output(&mut self, plan: &ForwardPlan, output: StepOutput) -> Result<()> {
@@ -1944,5 +1962,53 @@ mod think_state_tests {
         s.update_think_state(128822);
         assert!(!s.in_thinking);
         assert!(s.sampling.force_next_token.is_none());
+    }
+}
+
+#[cfg(test)]
+mod kv_actual_tests {
+    use super::*;
+    use infer_seam::HostPagedKvPool;
+
+    struct MockExecutor;
+    impl BackendExecutor for MockExecutor {
+        fn submit(
+            &mut self,
+            _plan: &ForwardPlan,
+            _batch: &KvBatchDescriptor,
+        ) -> anyhow::Result<Box<dyn std::any::Any + Send>> {
+            Ok(Box::new(()))
+        }
+        fn poll(&mut self, _inflight: Box<dyn std::any::Any + Send>) -> anyhow::Result<PollResult> {
+            unreachable!()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    fn engine_with_pool() -> Engine {
+        let kv: Box<dyn KvPool> = Box::new(HostPagedKvPool::new(4, 64, 16));
+        Engine::with_config(Box::new(MockExecutor), kv, SchedulerConfig::for_slots(4)).unwrap()
+    }
+
+    #[test]
+    fn apply_kv_actual_shrinks_noops_grows() {
+        let mut engine = engine_with_pool();
+        engine.kv.alloc(0, 10).unwrap();
+        engine.apply_kv_actual(&[(0, 4)]).unwrap();
+        assert_eq!(engine.kv.seq_len(0), 4);
+        engine.apply_kv_actual(&[(0, 4)]).unwrap();
+        assert_eq!(engine.kv.seq_len(0), 4);
+        engine.apply_kv_actual(&[(0, 12)]).unwrap();
+        assert_eq!(engine.kv.seq_len(0), 12);
+    }
+
+    #[test]
+    fn apply_kv_actual_last_entry_wins() {
+        let mut engine = engine_with_pool();
+        engine.kv.alloc(0, 10).unwrap();
+        engine.apply_kv_actual(&[(0, 8), (0, 3), (0, 6)]).unwrap();
+        assert_eq!(engine.kv.seq_len(0), 6);
     }
 }
