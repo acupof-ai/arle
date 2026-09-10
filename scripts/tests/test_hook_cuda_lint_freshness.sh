@@ -51,7 +51,13 @@ if [ "$1" = test ] || { [ "$1" = clippy ] && [ "$verbose" = 0 ]; }; then
   take=0
   for a in "$@"; do
     if [ "$take" = 1 ]; then
-      [ "$a" = "${MOCK_TEST_SKIP:-__}" ] || printf 'Checking %s v0.5.8\n' "$a"
+      if [ "$a" != "${MOCK_TEST_SKIP:-__}" ]; then
+        if [ -n "${MOCK_COLOR:-}" ]; then
+          printf '\033[1m\033[92m   Compiling\033[0m %s v0.5.8\n' "$a"
+        else
+          printf 'Checking %s v0.5.8\n' "$a"
+        fi
+      fi
       take=0
     fi
     [ "$a" = "-p" ] && take=1
@@ -103,4 +109,11 @@ rc=$?; set -e
 [ "$rc" -ne 0 ] || { echo "FAIL: test-step red world passed — Fresh infer-core not caught" >&2; cat "$TMP/test-red.log" >&2; exit 1; }
 grep -q 'reported infer-core Fresh while this push changes it' "$TMP/test-red.log"
 
-echo "PASS: CUDA lint + test-step freshness assertions (red/green/new-branch/control/test-red)"
+# Color world: the hook exports CARGO_TERM_COLOR=always, decorating the test
+# steps' output with ANSI codes; the strip must still see the rebuilt crate.
+# Uses the core commit so the test-step guard (group 2 lists infer-core) is
+# what exercises it — the CUDA lint path sets never and would pass regardless.
+MOCK_COLOR=1 run_hook "$coretip" "$corebase" >"$TMP/color.log" 2>&1 \
+  || { echo "FAIL: color world rejected rebuilt crates" >&2; cat "$TMP/color.log" >&2; exit 1; }
+
+echo "PASS: CUDA lint + test-step freshness assertions (red/green/new-branch/control/test-red/color)"
