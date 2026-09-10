@@ -119,11 +119,12 @@ unit test vs ref · **—** = no gate.
     CUDA (Metal parity doesn't exercise these CUDA implementations).
 
 ### Geometry mismatches (gate exists but doesn't cover the production shape)
-- **attn_tp≥2 GDN**: local K = 16/attn_tp = 8 at TP2; `fq_geometry_supported`
-  rejects (needs local K=16), so serve falls to the recurrent scan — now gated
-  at the (8,24) shard by `gdr_varlen_parity` (varlen replay) and
-  `gdr_decode_parity` (decode). FlashQLA AOT compiles (16,8)/(12,4)/(24,8) but
-  the serve launcher never references them (training-backward only).
+- **attn_tp≥2 GDN**: local K = 16/attn_tp. The serve launcher now selects
+  chunked FlashQLA at (8,24) (attn_tp=2) and (4,12) (attn_tp=4); the AOT
+  instantiations already shipped, and `gdr_varlen_parity` cross-checks FQ vs
+  varlen there. attn_tp=8 shard (2,6) has no AOT instantiation, so batched
+  verify/replay still takes the recurrent varlen kernel there. FlashQLA AOT
+  also compiles (16,8)/(12,4)/(24,8) used only by training backward.
 - **paged_attn_v1 AOT has no hd128 row** (hd256 + one hd64 only): on a
   non-sm90 box, hd128 full-attn paged decode/prefill that declines FA3 has no
   fallback kernel. H20 hides it (FA3 native); A100/sm80 + a hd128 model is the

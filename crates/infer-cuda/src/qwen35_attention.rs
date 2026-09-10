@@ -2367,6 +2367,16 @@ impl Qwen35Model {
                 ffi::gdr_fq_kkt_h48_cuda as _,
                 ffi::gdr_fq_fwd_h48_cuda as _,
             )),
+            (8, 24) => Some((
+                ffi::gdr_fq_cumsum_h24g8_cuda as _,
+                ffi::gdr_fq_kkt_h24g8_cuda as _,
+                ffi::gdr_fq_fwd_h24g8_cuda as _,
+            )),
+            (4, 12) => Some((
+                ffi::gdr_fq_cumsum_h12g4_cuda as _,
+                ffi::gdr_fq_kkt_h12g4_cuda as _,
+                ffi::gdr_fq_fwd_h12g4_cuda as _,
+            )),
             _ => None,
         };
         let use_fq_chunked = fq_supported && fq_fns.is_some();
