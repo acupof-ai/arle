@@ -17,7 +17,10 @@
 //! Embedding additionally runs at the production 151936-row × 5120 table
 //! (~1.5 GB) with ids at 0, the last rows and both ends.
 //!
-//! `--negative-control` perturbs one reference element; the gate MUST FAIL.
+//! `--negative-control` perturbs one reference element IN EACH comparator
+//! family (batched/single RMSNorm, separate/fused SiLU, split2 halves,
+//! split_qkv q/k/v, embedding, production embedding); every family MUST
+//! independently FAIL.
 //!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/elementwise_parity`
 
@@ -65,6 +68,40 @@ mod real {
     const ABS_FLOOR: f32 = 3e-3;
     const ABS_SLOPE: f32 = 3e-2;
 
+    /// One fail bit per comparator family, so --negative-control can prove
+    /// each family independently has teeth.
+    #[derive(Clone, Copy)]
+    struct Families {
+        rms_batched: bool,
+        rms_single: bool,
+        silu_separate: bool,
+        silu_fused: bool,
+        split2_first: bool,
+        split2_second: bool,
+        splitqkv_q: bool,
+        splitqkv_k: bool,
+        splitqkv_v: bool,
+        embedding: bool,
+        embedding_prod: bool,
+    }
+    impl Families {
+        fn entries(self) -> [(&'static str, bool); 11] {
+            [
+                ("rms_norm batched", self.rms_batched),
+                ("rms_norm single", self.rms_single),
+                ("silu_mul separate", self.silu_separate),
+                ("silu_mul fused", self.silu_fused),
+                ("split2 first half", self.split2_first),
+                ("split2 second half", self.split2_second),
+                ("split_qkv q", self.splitqkv_q),
+                ("split_qkv k", self.splitqkv_k),
+                ("split_qkv v", self.splitqkv_v),
+                ("embedding", self.embedding),
+                ("embedding production", self.embedding_prod),
+            ]
+        }
+    }
+
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
@@ -96,7 +133,7 @@ mod real {
         (num / den.max(1e-12)).sqrt()
     }
 
-    fn check(label: &str, got: &[bf16], want: &[f64], any_fail: &mut bool) {
+    fn check(label: &str, got: &[bf16], want: &[f64], failed: &mut bool) {
         let rel = rel_l2(got, want);
         let mut max_excess = f32::NEG_INFINITY;
         for (g, r) in got.iter().zip(want) {
@@ -106,7 +143,7 @@ mod real {
         let pass =
             rel.is_finite() && rel <= REL_L2_MAX && max_excess.is_finite() && max_excess <= 0.0;
         if !pass {
-            *any_fail = true;
+            *failed = true;
         }
         eprintln!(
             "[{label}] relL2={rel:.4e} maxExcess={max_excess:.4e} {}",
@@ -114,7 +151,7 @@ mod real {
         );
     }
 
-    fn check_bitexact(label: &str, got: &[bf16], want: &[bf16], any_fail: &mut bool) {
+    fn check_bitexact(label: &str, got: &[bf16], want: &[bf16], failed: &mut bool) {
         let mut bad = 0usize;
         for (a, b) in got.iter().zip(want) {
             if a.to_bits() != b.to_bits() {
@@ -123,7 +160,7 @@ mod real {
         }
         let pass = bad == 0 && got.len() == want.len();
         if !pass {
-            *any_fail = true;
+            *failed = true;
         }
         eprintln!(
             "[{label}] n={} mismatches={bad} {}",
@@ -170,7 +207,7 @@ mod real {
             .collect()
     }
 
-    fn probe_rms(ctx: &DeviceContext, negative: bool, any_fail: &mut bool) -> Result<()> {
+    fn probe_rms(ctx: &DeviceContext, negative: bool, fams: &mut Families) -> Result<()> {
         let mut rng = Rng::new(SEED ^ 0x524d_5300);
         for &(name, hidden, _) in MODELS {
             let w: Vec<bf16> = (0..hidden)
@@ -198,7 +235,7 @@ mod real {
                         &format!("rms-batched {name} h={hidden} B={rows} lane={lane}"),
                         &got[lane * hidden..(lane + 1) * hidden],
                         &want,
-                        any_fail,
+                        &mut fams.rms_batched,
                     );
                 }
 
@@ -208,12 +245,15 @@ mod real {
                     rms_norm(ctx, &x_d, &w_d, &mut one_d, hidden, EPS as f32)?;
                     ctx.sync()?;
                     let got = ctx.stream.clone_dtoh(&one_d)?;
-                    let want = rms_ref(&x[..hidden], &w, true);
+                    let mut want = rms_ref(&x[..hidden], &w, true);
+                    if negative {
+                        want[0] += 0.1;
+                    }
                     check(
                         &format!("rms-single {name} h={hidden}"),
                         &got,
                         &want,
-                        any_fail,
+                        &mut fams.rms_single,
                     );
                 }
             }
@@ -224,7 +264,7 @@ mod real {
     fn probe_silu_split_embed(
         ctx: &DeviceContext,
         negative: bool,
-        any_fail: &mut bool,
+        fams: &mut Families,
     ) -> Result<()> {
         let mut rng = Rng::new(SEED ^ 0x5349_4c55);
         for &(name, hidden, inter) in MODELS {
@@ -249,7 +289,7 @@ mod real {
                     &format!("silu_mul {name} inter={inter} B=1"),
                     &ctx.stream.clone_dtoh(&out_d)?,
                     &want,
-                    any_fail,
+                    &mut fams.silu_separate,
                 );
 
                 // ── silu_mul_fused [B, 2*inter] ──
@@ -280,7 +320,7 @@ mod real {
                         &format!("silu_fused {name} inter={inter} B={rows} lane={lane}"),
                         &fused_got[lane * inter..(lane + 1) * inter],
                         &wants[lane],
-                        any_fail,
+                        &mut fams.silu_fused,
                     );
                 }
 
@@ -303,23 +343,29 @@ mod real {
                 ctx.sync()?;
                 let first_got = ctx.stream.clone_dtoh(&first_d)?;
                 let second_got = ctx.stream.clone_dtoh(&second_d)?;
-                check_bitexact(
-                    &format!("split2-first {name} d={inter} B={rows}"),
-                    &first_got,
-                    &fused[..rows * inter],
-                    any_fail,
-                );
+                let mut first_want: Vec<bf16> = fused[..rows * inter].to_vec();
                 let mut second_want = Vec::with_capacity(rows * inter);
                 for lane in 0..rows {
                     second_want.extend_from_slice(
                         &fused[lane * 2 * inter + inter..(lane + 1) * 2 * inter],
                     );
                 }
+                if negative {
+                    // Bit-exact family: flip the expected bits at one element.
+                    first_want[0] = bf16::from_f32(f32::from(first_want[0]) + 0.5);
+                    second_want[0] = bf16::from_f32(f32::from(second_want[0]) + 0.5);
+                }
+                check_bitexact(
+                    &format!("split2-first {name} d={inter} B={rows}"),
+                    &first_got,
+                    &first_want,
+                    &mut fams.split2_first,
+                );
                 check_bitexact(
                     &format!("split2-second {name} d={inter} B={rows}"),
                     &second_got,
                     &second_want,
-                    any_fail,
+                    &mut fams.split2_second,
                 );
 
                 // ── split_qkv at 27B attention geometry (27B model only) ──
@@ -348,23 +394,28 @@ mod real {
                         k_want.extend_from_slice(&row[Q_DIM..Q_DIM + KV_DIM]);
                         v_want.extend_from_slice(&row[Q_DIM + KV_DIM..]);
                     }
+                    if negative {
+                        for w in [&mut q_want, &mut k_want, &mut v_want] {
+                            w[0] = bf16::from_f32(f32::from(w[0]) + 0.5);
+                        }
+                    }
                     check_bitexact(
                         &format!("split_qkv-q {name} B={rows}"),
                         &q_got,
                         &q_want,
-                        any_fail,
+                        &mut fams.splitqkv_q,
                     );
                     check_bitexact(
                         &format!("split_qkv-k {name} B={rows}"),
                         &k_got,
                         &k_want,
-                        any_fail,
+                        &mut fams.splitqkv_k,
                     );
                     check_bitexact(
                         &format!("split_qkv-v {name} B={rows}"),
                         &v_got,
                         &v_want,
-                        any_fail,
+                        &mut fams.splitqkv_v,
                     );
                 }
 
@@ -393,7 +444,7 @@ mod real {
                     &format!("embedding {name} h={hidden} B={rows}"),
                     &emb_got,
                     &expect,
-                    any_fail,
+                    &mut fams.embedding,
                 );
                 let _ = hidden;
             }
@@ -409,7 +460,7 @@ mod real {
     fn probe_embedding_production(
         ctx: &DeviceContext,
         negative: bool,
-        any_fail: &mut bool,
+        fams: &mut Families,
     ) -> Result<()> {
         const ROWS: usize = 151_936;
         let hidden: usize = MODELS[0].1;
@@ -444,7 +495,7 @@ mod real {
             &format!("embedding-prod rows={ROWS} h={hidden} B={b}"),
             &ctx.stream.clone_dtoh(&out_d)?,
             &expect,
-            any_fail,
+            &mut fams.embedding_prod,
         );
         Ok(())
     }
@@ -458,22 +509,48 @@ mod real {
             if negative { " NEGATIVE-CONTROL" } else { "" }
         );
 
-        let mut any_fail = false;
-        probe_rms(&ctx, negative, &mut any_fail)?;
-        probe_silu_split_embed(&ctx, negative, &mut any_fail)?;
-        probe_embedding_production(&ctx, negative, &mut any_fail)?;
+        let mut fams = Families {
+            rms_batched: false,
+            rms_single: false,
+            silu_separate: false,
+            silu_fused: false,
+            split2_first: false,
+            split2_second: false,
+            splitqkv_q: false,
+            splitqkv_k: false,
+            splitqkv_v: false,
+            embedding: false,
+            embedding_prod: false,
+        };
+        probe_rms(&ctx, negative, &mut fams)?;
+        probe_silu_split_embed(&ctx, negative, &mut fams)?;
+        probe_embedding_production(&ctx, negative, &mut fams)?;
 
         if negative {
+            let unfired = fams
+                .entries()
+                .into_iter()
+                .filter_map(|(n, fired)| (!fired).then_some(n))
+                .collect::<Vec<_>>();
             ensure!(
-                any_fail,
-                "elementwise_parity negative control did NOT fail — gate has no teeth"
+                unfired.is_empty(),
+                "elementwise_parity negative control did NOT fail family: {}",
+                unfired.join(", ")
             );
-            eprintln!("[elementwise-parity] NEGATIVE CONTROL OK (gate failed as required)");
+            eprintln!(
+                "[elementwise-parity] NEGATIVE CONTROL OK (all 11 comparator families failed as required)"
+            );
             return Ok(());
         }
+        let failed = fams
+            .entries()
+            .into_iter()
+            .filter_map(|(n, fired)| fired.then_some(n))
+            .collect::<Vec<_>>();
         ensure!(
-            !any_fail,
-            "elementwise_parity FAILED — see violations above"
+            failed.is_empty(),
+            "elementwise_parity FAILED families: {}",
+            failed.join(", ")
         );
         eprintln!("[elementwise-parity] ALL PASS");
         Ok(())

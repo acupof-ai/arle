@@ -17,7 +17,10 @@
 //! fallback; B=1/8. Exact draw ids only hold at vocab <= 256 (index-order
 //! CDF); above that they assert positive reference mass.
 //!
-//! `--negative-control` perturbs one expected probability; the gate MUST FAIL.
+//! `--negative-control` corrupts ONE expectation per comparator family
+//! (filter probs, draft q row, draft token id, chain accepted length, chain
+//! token, production chain length, production residual token); every family
+//! MUST independently FAIL.
 //!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/dspark_sampler_parity`
 
@@ -65,6 +68,31 @@ mod real {
 
     const PROB_REL_L2_MAX: f64 = 2e-2;
     const PROB_ABS_FLOOR: f32 = 2e-4;
+
+    /// One fail bit per comparator family.
+    #[derive(Clone, Copy)]
+    struct Families {
+        filter_probs: bool,
+        draft_q: bool,
+        draft_token: bool,
+        chain_len: bool,
+        chain_token: bool,
+        chain_prod_len: bool,
+        chain_prod_token: bool,
+    }
+    impl Families {
+        fn entries(self) -> [(&'static str, bool); 7] {
+            [
+                ("filter probs", self.filter_probs),
+                ("draft q row", self.draft_q),
+                ("draft token id", self.draft_token),
+                ("chain accepted_len", self.chain_len),
+                ("chain token", self.chain_token),
+                ("prod chain accepted_len", self.chain_prod_len),
+                ("prod chain residual token", self.chain_prod_token),
+            ]
+        }
+    }
 
     struct Rng(u64);
     impl Rng {
@@ -196,7 +224,7 @@ mod real {
         (num / den.max(1e-12)).sqrt()
     }
 
-    fn check_probs(label: &str, got: &[f32], want: &[f64], any_fail: &mut bool) {
+    fn check_probs(label: &str, got: &[f32], want: &[f64], failed: &mut bool) {
         let rel = rel_l2(got, want);
         let mut max_excess = f32::NEG_INFINITY;
         for (g, r) in got.iter().zip(want) {
@@ -205,7 +233,7 @@ mod real {
         }
         let pass = rel.is_finite() && rel <= PROB_REL_L2_MAX && max_excess <= 0.0;
         if !pass {
-            *any_fail = true;
+            *failed = true;
         }
         eprintln!(
             "[{label}] relL2={rel:.4e} maxExcess={max_excess:.4e} sum={:.6} {}",
@@ -214,10 +242,10 @@ mod real {
         );
     }
 
-    fn check_eq(label: &str, got: i32, want: usize, any_fail: &mut bool) {
+    fn check_eq(label: &str, got: i32, want: usize, failed: &mut bool) {
         let pass = got as usize == want;
         if !pass {
-            *any_fail = true;
+            *failed = true;
         }
         eprintln!(
             "[{label}] got={got} want={want} {}",
@@ -303,7 +331,7 @@ mod real {
     fn run_filter_and_draft(
         ctx: &DeviceContext,
         negative: bool,
-        any_fail: &mut bool,
+        fams: &mut Families,
     ) -> Result<()> {
         // Small sweep: every filter case at B=1/8. Production vocabs run the
         // representative cases at B=1 (~1.2 MB logits + probs per row).
@@ -327,24 +355,21 @@ mod real {
                 let mut refs: Vec<Vec<f64>> = Vec::with_capacity(rows);
                 let mut uniforms: Vec<f32> = Vec::with_capacity(rows);
                 let mut first_positive = vec![0usize; rows];
-                for (lane, first_positive) in first_positive.iter_mut().enumerate() {
+                for slot in first_positive.iter_mut() {
                     let row = build_filter_row(&mut rng, vocab, name);
-                    let mut pref = f64_filter(
+                    let pref = f64_filter(
                         &row,
                         f.inv_temperature as f64,
                         f.top_k as i64,
                         f.top_p as f64,
                         f.min_p as f64,
                     );
-                    if negative && lane == 0 {
-                        pref[0] += 0.1;
-                    }
                     // Uniform at the middle of the first positive token's mass
                     // interval, off the reference: no f32 CDF boundary.
                     let w0 = pref.iter().position(|&x| x > 0.0).unwrap_or(0);
                     let lo: f64 = pref[..w0].iter().sum();
                     uniforms.push(((lo + lo + pref[w0]) * 0.5).clamp(1e-6, 0.999_999) as f32);
-                    *first_positive = w0;
+                    *slot = w0;
                     refs.push(pref);
                     logits.extend(row.iter().map(|v| bf16::from_f32(*v)));
                 }
@@ -356,11 +381,19 @@ mod real {
                 ctx.sync()?;
                 let probs = ctx.stream.clone_dtoh(&probs_d)?;
                 for lane in 0..rows {
+                    let mut wrong: Vec<f64>;
+                    let want: &[f64] = if negative && lane == 0 {
+                        wrong = refs[lane].clone();
+                        wrong[0] += 0.1;
+                        &wrong
+                    } else {
+                        &refs[lane]
+                    };
                     check_probs(
                         &format!("filter vocab={vocab} B={rows} {name} lane={lane}"),
                         &probs[lane * vocab..(lane + 1) * vocab],
-                        &refs[lane],
-                        any_fail,
+                        want,
+                        &mut fams.filter_probs,
                     );
                 }
 
@@ -383,29 +416,48 @@ mod real {
                     ctx.sync()?;
                     let q = ctx.stream.clone_dtoh(&q_d)?;
                     let tok = ctx.stream.clone_dtoh(&tok_d)?;
+                    let mut wrong_q: Vec<f64>;
+                    let want_q: &[f64] = if negative && lane == 0 {
+                        wrong_q = refs[lane].clone();
+                        wrong_q[0] += 0.1;
+                        &wrong_q
+                    } else {
+                        &refs[lane]
+                    };
                     check_probs(
                         &format!("draft-q vocab={vocab} B={rows} {name} lane={lane}"),
                         &q,
-                        &refs[lane],
-                        any_fail,
+                        want_q,
+                        &mut fams.draft_q,
                     );
                     // w0 IS the degenerate-row argmax for all-neg-inf (the
                     // one-hot's first index).
                     if vocab <= 256 {
+                        // Negative: expect a different id than the CDF draw.
+                        let want_tok = if negative && lane == 0 {
+                            (first_positive[lane] + 1).rem_euclid(vocab)
+                        } else {
+                            first_positive[lane]
+                        };
                         check_eq(
                             &format!("draft-tok vocab={vocab} B={rows} {name} lane={lane}"),
                             tok[0],
-                            first_positive[lane],
-                            any_fail,
+                            want_tok,
+                            &mut fams.draft_token,
                         );
                     } else {
                         // Above SAMPLE_BLOCK the kernel CDF walks indices in a
                         // thread-strided permutation; assert the drawn id carries
-                        // positive reference mass.
+                        // positive reference mass. Negative flips the verdict on
+                        // lane 0; only the small-vocab branch above asserts the
+                        // exact id, so this family's teeth are proven there.
                         let id = tok[0] as usize;
-                        let pass = id < vocab && refs[lane][id] > 1e-6;
+                        let mut pass = id < vocab && refs[lane][id] > 1e-6;
+                        if negative && lane == 0 {
+                            pass = !pass;
+                        }
                         if !pass {
-                            *any_fail = true;
+                            fams.draft_token = true;
                         }
                         eprintln!(
                             "[draft-tok vocab={vocab} B={rows} {name} lane={lane}] id={id} refmass={:.4e} {}",
@@ -465,7 +517,7 @@ mod real {
         p
     }
 
-    fn run_chain(ctx: &DeviceContext, negative: bool, any_fail: &mut bool) -> Result<()> {
+    fn run_chain(ctx: &DeviceContext, negative: bool, fams: &mut Families) -> Result<()> {
         for &batch in FILTER_BATCHES {
             for depth in 1..=MAX_DEPTH {
                 // Scenario per lane: reject at position r in 0..depth, plus an
@@ -539,7 +591,7 @@ mod real {
                         let lo: f32 = p[depth][..11].iter().sum();
                         u_res[depth] = (lo + p[depth][11] * 0.5).clamp(1e-4, 0.999);
 
-                        let (want_len, want_tok) = chain_reference(
+                        let (want_len0, want_tok0) = chain_reference(
                             &q,
                             &p,
                             &vec![draft_tok; depth],
@@ -547,8 +599,12 @@ mod real {
                             &u_res,
                             depth,
                         );
-                        let mut want_tok = want_tok;
+                        let mut want_len = want_len0;
+                        let mut want_tok = want_tok0;
                         if negative {
+                            // Corrupt each comparator independently: a length
+                            // one slot off, and a different residual token.
+                            want_len = (want_len + 1) % (depth + 1);
                             want_tok = if want_tok == 0 { 1 } else { 0 };
                         }
 
@@ -569,8 +625,18 @@ mod real {
 
                         let label =
                             format!("chain depth={depth} B={batch} sc={scenario} lane={lane_base}");
-                        check_eq(&format!("{label} accepted_len"), out[0], want_len, any_fail);
-                        check_eq(&format!("{label} token"), out[1], want_tok, any_fail);
+                        check_eq(
+                            &format!("{label} accepted_len"),
+                            out[0],
+                            want_len,
+                            &mut fams.chain_len,
+                        );
+                        check_eq(
+                            &format!("{label} token"),
+                            out[1],
+                            want_tok,
+                            &mut fams.chain_token,
+                        );
                     }
                 }
             }
@@ -583,7 +649,7 @@ mod real {
     /// CDF, so the token is asserted to carry positive residual mass. This is
     /// the multi-pass path for both the residual-mass reduction and the draw:
     /// the vocab=32 cases above reduce both in a single pass.
-    fn run_chain_prod(ctx: &DeviceContext, any_fail: &mut bool) -> Result<()> {
+    fn run_chain_prod(ctx: &DeviceContext, negative: bool, fams: &mut Families) -> Result<()> {
         let v = CHAIN_PROD_VOCAB;
         let depth = 1;
         let draft_tok = 3i32;
@@ -626,21 +692,28 @@ mod real {
         ctx.sync()?;
         let out = ctx.stream.clone_dtoh(&out_d)?;
 
-        let len_pass = out[0] == 0;
+        let len_want = if negative { 1 } else { 0 };
+        let len_pass = out[0] == len_want;
         if !len_pass {
-            *any_fail = true;
+            fams.chain_prod_len = true;
         }
         eprintln!(
-            "[chain-prod vocab={v}] accepted_len={} (want 0) residual_mass={residual_mass:.4e} {}",
+            "[chain-prod vocab={v}] accepted_len={} (want {len_want}) residual_mass={residual_mass:.4e} {}",
             out[0],
             if len_pass { "PASS" } else { "FAIL" }
         );
         let id = out[1] as usize;
         let res_at =
             (p[0].get(id).copied().unwrap_or(0.0) - q[0].get(id).copied().unwrap_or(0.0)).max(0.0);
-        let tok_pass = id < v && res_at > 1e-9;
+        // Healthy: drawn id is in-vocab with positive residual mass. Negative:
+        // demand an out-of-range id, which the kernel can never produce.
+        let tok_pass = if negative {
+            id == v + 7
+        } else {
+            id < v && res_at > 1e-9
+        };
         if !tok_pass {
-            *any_fail = true;
+            fams.chain_prod_token = true;
         }
         eprintln!(
             "[chain-prod vocab={v}] residual token={id} residual_mass_at={res_at:.4e} {}",
@@ -658,22 +731,44 @@ mod real {
             if negative { " NEGATIVE-CONTROL" } else { "" }
         );
 
-        let mut any_fail = false;
-        run_filter_and_draft(&ctx, negative, &mut any_fail)?;
-        run_chain(&ctx, negative, &mut any_fail)?;
-        run_chain_prod(&ctx, &mut any_fail)?;
+        let mut fams = Families {
+            filter_probs: false,
+            draft_q: false,
+            draft_token: false,
+            chain_len: false,
+            chain_token: false,
+            chain_prod_len: false,
+            chain_prod_token: false,
+        };
+        run_filter_and_draft(&ctx, negative, &mut fams)?;
+        run_chain(&ctx, negative, &mut fams)?;
+        run_chain_prod(&ctx, negative, &mut fams)?;
 
         if negative {
+            let unfired = fams
+                .entries()
+                .into_iter()
+                .filter_map(|(n, fired)| (!fired).then_some(n))
+                .collect::<Vec<_>>();
             ensure!(
-                any_fail,
-                "dspark_sampler_parity negative control did NOT fail — gate has no teeth"
+                unfired.is_empty(),
+                "dspark_sampler_parity negative control did NOT fail family: {}",
+                unfired.join(", ")
             );
-            eprintln!("[dspark-parity] NEGATIVE CONTROL OK (gate failed as required)");
+            eprintln!(
+                "[dspark-parity] NEGATIVE CONTROL OK (all 7 comparator families failed as required)"
+            );
             return Ok(());
         }
+        let failed = fams
+            .entries()
+            .into_iter()
+            .filter_map(|(n, fired)| fired.then_some(n))
+            .collect::<Vec<_>>();
         ensure!(
-            !any_fail,
-            "dspark_sampler_parity FAILED — see violations above"
+            failed.is_empty(),
+            "dspark_sampler_parity FAILED families: {}",
+            failed.join(", ")
         );
         eprintln!("[dspark-parity] ALL PASS");
         Ok(())

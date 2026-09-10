@@ -12,8 +12,8 @@
 //! including an odd length (tail-element lane) and a production-scale vocab;
 //! batch 1 and 8 mixing normal / tie / NaN / -inf / mixed rows.
 //!
-//! `--negative-control` expects the wrong index for one row; the gate MUST
-//! then FAIL (used to prove the gate has teeth).
+//! `--negative-control` expects the wrong index for row 0 of EACH selector
+//! family (batch and singular); both MUST independently FAIL.
 //!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/argmax_parity`
 
@@ -155,7 +155,8 @@ mod real {
             if negative { " NEGATIVE-CONTROL" } else { "" }
         );
 
-        let mut any_fail = false;
+        let mut batch_fail = false;
+        let mut singular_fail = false;
         for &vocab in VOCABS {
             for &batch in BATCHES {
                 let mut rng = Rng::new(SEED ^ ((vocab as u64) << 20) ^ ((batch as u64) << 8));
@@ -187,7 +188,7 @@ mod real {
                 for lane in 0..batch {
                     let pass = got[lane] as usize == expect[lane];
                     if !pass {
-                        any_fail = true;
+                        batch_fail = true;
                     }
                     eprintln!(
                         "[vocab={vocab:>6} B={batch} lane={lane} kind={:?}] got={} want={} {}",
@@ -214,7 +215,7 @@ mod real {
                     }
                     let pass = one[0] as usize == want;
                     if !pass {
-                        any_fail = true;
+                        singular_fail = true;
                     }
                     eprintln!(
                         "[vocab={vocab:>6} B={batch} lane={lane} kind={:?} singular] got={} want={} {}",
@@ -229,13 +230,22 @@ mod real {
 
         if negative {
             ensure!(
-                any_fail,
-                "argmax_parity negative control did NOT fail — gate has no teeth"
+                batch_fail,
+                "argmax_parity negative control did NOT fail family: batch selector"
             );
-            eprintln!("[argmax-parity] NEGATIVE CONTROL OK (gate failed as required)");
+            ensure!(
+                singular_fail,
+                "argmax_parity negative control did NOT fail family: singular selector"
+            );
+            eprintln!(
+                "[argmax-parity] NEGATIVE CONTROL OK (both selector families failed as required)"
+            );
             return Ok(());
         }
-        ensure!(!any_fail, "argmax_parity FAILED — see violations above");
+        ensure!(
+            !batch_fail && !singular_fail,
+            "argmax_parity FAILED — see violations above"
+        );
         eprintln!("[argmax-parity] ALL PASS");
         Ok(())
     }
