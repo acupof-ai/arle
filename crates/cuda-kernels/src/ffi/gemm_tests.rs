@@ -1095,7 +1095,10 @@ fn fp8_paged_kv_quantize_roundtrip_discontinuous_pages() {
                 // Reference: same scale the kernel writes, encoded on host.
                 let expect_byte = encode_e4m3_rne(x / expect_scale);
                 let dequant = decode_e4m3_full(byte) * got_scale;
-                let tol = e4m3_half_ulp_scaled(byte) * got_scale * 1.02;
+                // Tolerance follows the REFERENCE binade, not the kernel's
+                // output byte: a wrong quant into a higher binade must not
+                // loosen its own bound.
+                let tol = e4m3_half_ulp_scaled(expect_byte) * got_scale * 1.02;
                 assert!(
                     (dequant - x).abs() <= tol,
                     "row {r} head {h} d {d} (logical pos {pos}): x {x} byte 0x{byte:02x} \
