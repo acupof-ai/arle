@@ -234,6 +234,8 @@ struct FileEntry {
     #[serde(rename = "Size", default)]
     size: u64,
     #[serde(rename = "Type", default)]
+    /// Wire field of the ModelScope file API; parsed for schema completeness
+    /// but the CLI never reads it.
     #[allow(dead_code)]
     file_type: String,
 }

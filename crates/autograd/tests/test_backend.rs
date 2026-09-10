@@ -6,32 +6,20 @@
 use autograd::{
     CpuBackend,
     backend::{
-        Backend, cpu_embedding_forward, cpu_gather_last_dim_forward,
-        cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_matmul_bt_forward,
-        cpu_matmul_forward, cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward,
-        cpu_neg_forward, cpu_rms_norm_forward, cpu_rope_forward, cpu_scatter_add_rows_forward,
-        cpu_silu_forward, cpu_softmax_forward_last_axis, cpu_sum_last_axis_forward,
+        Backend, cpu_embedding_forward, cpu_gather_last_dim_forward, cpu_matmul_backward,
+        cpu_matmul_bt_forward, cpu_matmul_forward, cpu_mean_last_axis_forward,
+        cpu_mul_scalar_forward, cpu_rms_norm_forward, cpu_rope_forward,
+        cpu_scatter_add_rows_forward, cpu_silu_forward, cpu_sum_last_axis_forward,
     },
 };
 
-#[allow(dead_code)]
-fn _touch_refs() {
-    // Keep the reference imports live on builds where the CUDA test block is
-    // gated off (e.g. `--features cuda,no-cuda` — types check but tests skip).
-    let _ = cpu_softmax_forward_last_axis;
-    let _ = cpu_log_softmax_forward_last_axis;
-    let _ = cpu_mul_forward;
-    let _ = cpu_mul_scalar_forward;
-    let _ = cpu_neg_forward;
-    let _ = cpu_silu_forward;
-    let _ = cpu_rms_norm_forward;
-    let _ = cpu_embedding_forward;
-    let _ = cpu_sum_last_axis_forward;
-    let _ = cpu_mean_last_axis_forward;
-    let _ = cpu_rope_forward;
-    let _ = cpu_gather_last_dim_forward;
-    let _ = cpu_scatter_add_rows_forward;
-}
+// Softmax/mul/neg references are only consulted by the metal and real-cuda
+// parity tests; absent under the `cuda,no-cuda` stub build.
+#[cfg(any(feature = "metal", all(feature = "cuda", not(feature = "no-cuda"))))]
+use autograd::backend::{
+    cpu_log_softmax_forward_last_axis, cpu_mul_forward, cpu_neg_forward,
+    cpu_softmax_forward_last_axis,
+};
 
 fn lcg_step(s: u64) -> u64 {
     s.wrapping_mul(6364136223846793005)

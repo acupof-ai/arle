@@ -51,11 +51,13 @@ pub(crate) struct MessagesRequest {
     #[serde(default)]
     pub top_k: Option<i32>,
     /// `{"type":"enabled","budget_tokens":N}` or `{"type":"disabled"}`. Maps to
-    /// the internal `enable_thinking` chat-template kwarg; `budget_tokens` is
-    /// not enforced (the server's `max_thinking_tokens` caps it).
+    /// the internal `enable_thinking` chat-template kwarg. The coordinator
+    /// resolves the budget as reasoning_effort > this `budget_tokens` >
+    /// server config > DSv4 default.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
-    /// End-user metadata. Accepted but not echoed (the engine has no storage).
+    /// End-user metadata. Wire field: kept so the request deserializes; the
+    /// engine has no storage, so it is never read or echoed after parse.
     #[serde(default)]
     #[allow(dead_code)]
     pub metadata: Option<Value>,
@@ -75,10 +77,9 @@ impl ThinkingConfig {
 pub(crate) struct ThinkingConfig {
     #[serde(rename = "type")]
     pub kind: String,
-    /// Thinking token budget. Accepted but not enforced (the server's
-    /// `max_thinking_tokens` caps it).
+    /// Thinking token budget. Read by the coordinator to cap generated
+    /// thinking tokens (`max_thinking_tokens`).
     #[serde(default)]
-    #[allow(dead_code)]
     pub budget_tokens: Option<usize>,
 }
 

@@ -1,3 +1,5 @@
+//! Shared Qwen3.5 config builders included by several integration-test
+//! binaries; each pulls in only the subset it needs, so the rest read as dead.
 #![allow(dead_code)]
 
 use std::error::Error;
@@ -6,9 +8,6 @@ use train::qwen35::{LayerType, Qwen35Config};
 
 pub type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-pub const TEST_LR: f32 = 5.0e-3;
-
-#[allow(dead_code)]
 pub fn hybrid_qwen35_config() -> Qwen35Config {
     let mut cfg = base_qwen35_config();
     cfg.rotary_dim = cfg.head_dim / 2;
@@ -19,12 +18,10 @@ pub fn hybrid_qwen35_config() -> Qwen35Config {
     cfg
 }
 
-#[allow(dead_code)]
 pub fn tiny_qwen35_scratch_config(max_seq_len: usize) -> Qwen35Config {
     tiny_qwen35_scratch_config_with_vocab(max_seq_len, 16)
 }
 
-#[allow(dead_code)]
 pub fn tiny_qwen35_scratch_config_with_vocab(
     max_seq_len: usize,
     vocab_size: usize,
@@ -35,7 +32,6 @@ pub fn tiny_qwen35_scratch_config_with_vocab(
     cfg
 }
 
-#[allow(dead_code)]
 pub fn tiny_hybrid_qwen35_scratch_config_with_vocab(
     max_seq_len: usize,
     vocab_size: usize,
