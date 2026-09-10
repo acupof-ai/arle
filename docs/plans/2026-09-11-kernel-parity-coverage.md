@@ -48,7 +48,7 @@ unit test vs ref · **—** = no gate.
 |---|---|---|---|
 | `arle_fa3_fwd_hd256_bf16_cuda` (vendored FA3) | **HOT** H20 | **—** direct; E2E only (`lever --kv-cache-dtype fp8` / needle) | HOT kernel, vendor-trusted, no in-repo numeric gate |
 | `arle_fa3_fwd_hd256_quant_cuda` (FP8/INT8 paged split-KV) | HOT under quant pool | **—** direct; E2E only | quantized decode path |
-| `paged_attention_v1` TileLang AOT (25-row resolve) | HOT sm80 / fallback on H20 | **—** (no test/example launches any AOT paged row) | AOT table has hd256 (q8/16/24 kv1/2/4) + one hd64 row; **no hd128** — non-sm90 hd128 full-attn paged decode has no row and errors |
+| `paged_attention_v1` TileLang AOT (25-row resolve) | HOT sm80 / fallback on H20 | **—** (no test/example launches any AOT paged row) | AOT table has hd256 (q8/16/24 kv1/2/4) + one hd64 row, no hd128 — investigated 2026-09-11: hd128 is unreachable in serving (all CUDA targets hd256; see geometry-mismatch note), no row needed |
 | `arle_fa2_sm70_attention_cuda` | COLD (V100) | **U** (`fa2_sm70_matches_host_reference`, dense seq4 q2/kv1 hd256) | tiny dense only; no paged/decode-batch |
 | FlashMLA sparse decode/prefill shims (`arle_flashmla_sm90_sparse_{decode,prefill}_fwd`, `get_meta`,`sched_meta`) | **HOT** DSv4 | **—** direct; dsv4 E2E prefill-argmax only | HOT DSv4 decode kernel family with no numeric gate |
 | FlashMLA CSA/HCA/chain-verify build_indices, csa_pack_kv | WARM DSv4 | **—** direct; E2E | — |
@@ -125,10 +125,18 @@ unit test vs ref · **—** = no gate.
   varlen kernel at each geometry (5/17/64). Varlen therefore has no production
   multi-row caller; #300 removes it. FlashQLA AOT also compiles
   (16,8)/(12,4)/(24,8) used only by training backward.
-- **paged_attn_v1 AOT has no hd128 row** (hd256 + one hd64 only): on a
-  non-sm90 box, hd128 full-attn paged decode/prefill that declines FA3 has no
-  fallback kernel. H20 hides it (FA3 native); A100/sm80 + a hd128 model is the
-  exposed config.
+- **paged_attn_v1 hd128 AOT rows: investigated 2026-09-11, not a gap — no
+  row needed.** `paged_attn_v1_raw` has one caller (the Qwen3.5-family full
+  attention layer, `qwen35_attention.rs:961`); every supported CUDA target is
+  hd256 per host/HF config.json (Qwen3.5-0.8B 8/2/256, Qwen3.5-4B
+  16/4/256, Qwen3.6-27B 24/4/256, Qwen3.6-35B-A3B 16/2/256, Qwen3.8-27B
+  24/4/256), and Qwen3 dense (hd128) was removed from CUDA
+  (support-matrix.md:116). The only hd128 checkpoints on the host are the
+  DFlash/DSpark drafters (32/8/128, 40/8/128), which run their own draft
+  attention (`qwen35/dspark.rs:866`), not paged_attn_v1. The hd128 struct at
+  infer-model/src/qwen35.rs:428 is `kv_pool_pages` unit-test arguments, not a
+  model fixture. The AOT table's hd256 rows (incl. q16_kv4) resolve the A100
+  BF16 paged fallback for every reachable config.
 - **FA2 sm70 gate** is dense seq4/q2-kv1/hd256 only; production V100 paged or
   larger batches untested.
 - **DSv4 TP/EP sharding**: dsv4_parity runs TP=8 but gates only the first

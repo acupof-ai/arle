@@ -60,6 +60,10 @@
 //!     target/release/examples/fa3_hd256_shim_parity --negative-control
 //!   ... --negative-control=bf16|int8|fp8-dequant|fp8-requant
 
+#[cfg(feature = "cuda")]
+#[path = "support/attn_common.rs"]
+mod attn_common;
+
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
         println!("{}", cuda_kernels::KERNEL_BUILD_ID);
@@ -110,6 +114,7 @@ mod real {
 #[cfg(feature = "cuda")]
 mod real {
     use super::Family;
+    use super::attn_common::{self, Rng, Tol, bf, e4m3_decode, e4m3_encode, i8_encode, lcg_perm};
     use anyhow::{Result, ensure};
     use cuda_kernels::attention::{fa3_fwd_hd256_bf16, fa3_fwd_hd256_quant};
     use cuda_kernels::ffi;
@@ -133,12 +138,6 @@ mod real {
     // bf16 pool has no KV error; the bf16 form carries one 1-byte round
     // (e4m3 ~3%/elem, int8 ~0.4%/elem, averaged over the softmax weights);
     // the fp8 form carries a second e4m3 round, hence the widest band.
-    struct Tol {
-        rel_l2: f64,
-        slope: f64,
-        floor: f64,
-        max_viol_frac: f64,
-    }
     const TOL_BF16_POOL: Tol = Tol {
         rel_l2: 6e-2,
         slope: 5e-2,
@@ -208,87 +207,6 @@ mod real {
                 Form::QuantFp8 => &TOL_FP8_FORM,
             }
         }
-    }
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn normal(&mut self) -> f32 {
-            let u1 = self.unit().max(1e-7);
-            let u2 = self.unit();
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
-    }
-
-    fn bf(v: f32) -> bf16 {
-        bf16::from_f32(v)
-    }
-
-    fn round_even(x: f64) -> f64 {
-        let r = x.round();
-        if (x.fract().abs() - 0.5).abs() < 1e-12 && (r as i64) % 2 != 0 {
-            r - x.signum()
-        } else {
-            r
-        }
-    }
-
-    /// Encode f32 to an e4m3 byte (1 sign, 4 exp bias 7, 3 mantissa), RN-even.
-    /// Normal E field: value = (8+m)·2^(E-10), m in 0..=7. Subnormal E=0:
-    /// value = m·2^-9. Max finite 448.
-    fn e4m3_encode(x: f32) -> u8 {
-        let bits = x.to_bits();
-        let sign = ((bits >> 31) as u8) << 7;
-        if x.is_nan() {
-            return 0x7f;
-        }
-        let v = f64::from(x).abs();
-        if v >= 448.0 {
-            return sign | 0x7e;
-        }
-        if v == 0.0 {
-            return sign;
-        }
-        let e2 = v.log2().floor() as i32;
-        if e2 >= -6 {
-            let step = 2f64.powi(e2 - 3);
-            let mut sig = round_even(v / step) as i32; // 8..=16
-            let mut field = e2 + 7;
-            if sig == 16 {
-                sig = 8;
-                field += 1;
-            }
-            sign | ((field as u8) << 3) | ((sig - 8) as u8)
-        } else {
-            let sig = round_even(v / 2f64.powi(-9)).clamp(0.0, 7.0) as i32;
-            sign | sig as u8
-        }
-    }
-
-    fn e4m3_decode(b: u8) -> f32 {
-        let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-        let field = (b >> 3) & 0x0f;
-        let mant = f32::from(b & 0x07);
-        if field == 0 {
-            sign * mant * 2f32.powi(-9)
-        } else {
-            sign * (8.0 + mant) * 2f32.powi(i32::from(field) - 10)
-        }
-    }
-
-    fn i8_encode(x: f32) -> u8 {
-        round_even(f64::from(x)).clamp(-127.0, 127.0) as i8 as u8
     }
 
     /// One built case: durable host pools, rectangular page table, and the
@@ -413,27 +331,6 @@ mod real {
                 v
             }
         }
-    }
-
-    /// Permutation of 0..n from an LCG over a power-of-two modulus (multiplier
-    /// 5 mod 8 gives a full cycle); out-of-range draws are rejected.
-    fn lcg_perm(n: usize, seed: u64) -> Vec<usize> {
-        let modulus = n.next_power_of_two() as u64;
-        let mut state = seed | 1;
-        let mut out = Vec::with_capacity(n);
-        let mut guard = 0usize;
-        while out.len() < n {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let v = (state >> 40) % modulus;
-            guard += 1;
-            assert!(guard < 10_000_000, "lcg_perm stall");
-            if (v as usize) < n && !out.contains(&(v as usize)) {
-                out.push(v as usize);
-            }
-        }
-        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -706,46 +603,24 @@ mod real {
         lim: usize,
         raw_q: bool,
     ) -> Vec<f64> {
-        let mut scores = vec![0f64; lim];
-        for (j, s) in scores.iter_mut().enumerate() {
-            let mut dot = 0f64;
-            for d in 0..D {
-                let q = if raw_q {
+        let q: Vec<f64> = (0..D)
+            .map(|d| {
+                if raw_q {
                     case.q_value_raw(token, h, d)
                 } else {
                     case.q_value(token, h, d)
-                };
-                dot += q * kv.k[j * D + d];
-            }
-            *s = dot * SM_SCALE;
-        }
-        let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let exps: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
-        let denom: f64 = exps.iter().sum();
-
-        let mut out = vec![0f64; D];
-        for d in 0..D {
-            let mut acc = 0f64;
-            for j in 0..lim {
-                acc += (exps[j] / denom) * kv.v[j * D + d];
-            }
-            out[d] = f64::from(bf(acc as f32).to_f32());
-        }
-        out
-    }
-
-    struct Metrics {
-        rel_l2: f64,
-        viol_frac: f64,
-        max_dev: f64,
+                }
+            })
+            .collect();
+        attn_common::attention_row(&q, &kv.k, &kv.v, lim, D, SM_SCALE)
     }
 
     /// Verdict of one comparator pair: per-comparator pass flags and metrics.
     struct CmpOutcome {
         mirror_ok: bool,
         anchor_ok: Option<bool>,
-        mirror: Metrics,
-        anchor: Option<Metrics>,
+        mirror: attn_common::Metrics,
+        anchor: Option<attn_common::Metrics>,
     }
 
     /// All three evaluations of one case from a single oracle build: the clean
@@ -767,43 +642,9 @@ mod real {
         corrupt_mirror: bool,
         corrupt_anchor: bool,
     ) -> CmpOutcome {
-        let eval = |corrupt: bool, wants: &[Vec<f64>], tol: &Tol| -> Metrics {
-            let mut diff_sq = 0f64;
-            let mut ref_sq = 0f64;
-            let mut violators = 0usize;
-            let mut total = 0usize;
-            let mut max_dev = 0f64;
-            for (i, (token, h)) in rows.iter().enumerate() {
-                for d in 0..D {
-                    let mut w = wants[i][d];
-                    // Corrupt the whole first checked row so the violation-rate
-                    // gate trips at every geometry (one element would dilute
-                    // below max_viol_frac on the long/batched cases).
-                    if corrupt && i == 0 {
-                        w += 0.5;
-                    }
-                    let g = f64::from(got[(*token * H + h) * D + d].to_f32());
-                    let dev = (g - w).abs();
-                    diff_sq += dev.powi(2);
-                    ref_sq += w.powi(2);
-                    max_dev = max_dev.max(dev);
-                    total += 1;
-                    if dev > tol.floor + tol.slope * w.abs() {
-                        violators += 1;
-                    }
-                }
-            }
-            let rel_l2 = (diff_sq / ref_sq.max(1e-12)).sqrt();
-            let viol_frac = violators as f64 / total as f64;
-            Metrics {
-                rel_l2,
-                viol_frac,
-                max_dev,
-            }
-        };
         let tol = case.form.tol();
-        let m = eval(corrupt_mirror, wants, tol);
-        let mirror_ok = m.rel_l2 < tol.rel_l2 && m.viol_frac <= tol.max_viol_frac;
+        let m = attn_common::compare_rows(got, wants, rows.len(), D, H, rows, tol, corrupt_mirror);
+        let mirror_ok = attn_common::metrics_pass(&m, tol);
         let Some(wants_anchor) = wants_anchor else {
             return CmpOutcome {
                 mirror_ok,
@@ -812,9 +653,17 @@ mod real {
                 anchor: None,
             };
         };
-        let ma = eval(corrupt_anchor, wants_anchor, &TOL_FP8_ANCHOR);
-        let anchor_ok =
-            ma.rel_l2 < TOL_FP8_ANCHOR.rel_l2 && ma.viol_frac <= TOL_FP8_ANCHOR.max_viol_frac;
+        let ma = attn_common::compare_rows(
+            got,
+            wants_anchor,
+            rows.len(),
+            D,
+            H,
+            rows,
+            &TOL_FP8_ANCHOR,
+            corrupt_anchor,
+        );
+        let anchor_ok = attn_common::metrics_pass(&ma, &TOL_FP8_ANCHOR);
         CmpOutcome {
             mirror_ok,
             anchor_ok: Some(anchor_ok),
