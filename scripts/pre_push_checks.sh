@@ -179,6 +179,9 @@ FAST_PID=$!
 # so absence of Checking/Compiling means the step did no work on it.
 assert_step_rebuilt() {  # $1 = step label, $2 = step output, rest = the step's -p crates
     local label="$1" out="$2"; shift 2
+    # CARGO_TERM_COLOR=always (exported above) inserts ANSI codes between
+    # "Compiling" and the crate name; strip them or a rebuilt crate reads Fresh.
+    out="$(printf '%s' "${out}" | sed $'s/\x1b\\[[0-9;]*m//g')"
     for crate in "$@"; do
         if grep -qE "^crates/${crate}/" <<< "${changed_files}" \
            && ! grep -qE "(Checking|Compiling) ${crate}( |\$)" <<< "${out}"; then
