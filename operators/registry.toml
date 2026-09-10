@@ -287,8 +287,8 @@ kind = "composite"
 inputs = ["qkv", "b", "a", "conv_state", "gdr_state"]
 outputs = ["gdr_out"]
 reference = "cuda.qwen35.gdr_recurrent_scan"
-correctness_gate = "crates/autograd/tests/test_linear_attention.rs"
-gate_gap = "training-side geometry (local heads 8/32,16/48 incl grads); serving GDN decode gdr_decode/gdr_decode_batch/conv1d_decode_batch and the attn_tp>=2 local (K,V)=(8,24) shard (16/48 global at attn_tp=2, rejected by fq_geometry_supported) have no numeric gate"
+correctness_gate = "crates/infer-cuda/examples/gdr_decode_parity.rs;crates/autograd/tests/test_linear_attention.rs"
+gate_gap = "decode covered: conv1d_decode_batch + gdr_decode_batch + singular gdr_decode at local (K,V)=(16,48) and the attn_tp=2 (8,24) shard, B=1/8, 5 carried-forward steps, output and state vs f32 anchor; recurrent prefill (gdr_prefill_recurrent host/varlen ABIs, seq_len>1) and training grads remain without a serving numeric gate"
 
 [[implementation]]
 id = "cuda.qwen35.conv1d_front"
@@ -331,8 +331,8 @@ kind = "composite"
 inputs = ["logits", "draft_tokens", "uniforms"]
 outputs = ["token_ids", "accepted_len"]
 reference = "cuda.qwen.argmax"
-correctness_gate = "scripts/sampling_gate.py"
-gate_gap = "live-serve HTTP behavior only; the HOT serve-path CUDA argmax/argmax_batch selector (wrong tie-break silently changes output) has no CUDA numeric unit"
+correctness_gate = "scripts/sampling_gate.py;crates/infer-cuda/examples/argmax_parity.rs"
+gate_gap = "argmax/argmax_batch covered (tie-lowest-index, NaN, -inf, odd tail, vocab to 151936, B=1/8, singular+batch ABIs vs CPU scan); dspark_filter_probs/dspark_draft_sample/dspark_chain_accept have no CUDA numeric unit, and sampling_gate.py remains live-serve HTTP only"
 
 [[implementation]]
 id = "cuda.qwen.argmax"
