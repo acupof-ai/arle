@@ -15,8 +15,10 @@
 //! reads and models the kernel's BF16 conv-sum truncation; GDR internal math
 //! is f32, so state tolerance is tight. Exits non-zero on any violation.
 //!
-//! `--negative-control` perturbs one reference state element; the gate MUST
-//! then FAIL (used to prove the gate has teeth).
+//! `--negative-control` perturbs one reference element IN EACH comparator
+//! family (batch conv_out/conv_state/gdr_out/gdr_state plus the three singular
+//! cross-checks); every family MUST independently FAIL — a family whose
+//! corrupted comparison still passes has no teeth.
 //!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/gdr_decode_parity`
 
@@ -214,13 +216,39 @@ mod real {
         (num / den.max(1e-12)).sqrt()
     }
 
+    /// One fail bit per comparator family, so --negative-control can prove
+    /// each family independently has teeth.
+    #[derive(Clone, Copy)]
+    struct Families {
+        batch_conv_out: bool,
+        batch_conv_state: bool,
+        batch_gdr_out: bool,
+        batch_gdr_state: bool,
+        sing_gdr_out: bool,
+        sing_gdr_state: bool,
+        sing_conv_state: bool,
+    }
+    impl Families {
+        fn entries(self) -> [(&'static str, bool); 7] {
+            [
+                ("batch conv_out", self.batch_conv_out),
+                ("batch conv_state", self.batch_conv_state),
+                ("batch gdr_out", self.batch_gdr_out),
+                ("batch gdr_state", self.batch_gdr_state),
+                ("singular gdr_out", self.sing_gdr_out),
+                ("singular gdr_state", self.sing_gdr_state),
+                ("singular conv_state", self.sing_conv_state),
+            ]
+        }
+    }
+
     fn check(
         label: &str,
         got: &[f32],
         want: &[f32],
         rel_cap: f64,
         tol: impl Fn(f32) -> f32,
-        any_fail: &mut bool,
+        failed: &mut bool,
     ) {
         let rel = rel_l2(got, want);
         let mut max_excess = f32::NEG_INFINITY;
@@ -229,7 +257,7 @@ mod real {
         }
         let pass = rel.is_finite() && rel <= rel_cap && max_excess.is_finite() && max_excess <= 0.0;
         if !pass {
-            *any_fail = true;
+            *failed = true;
         }
         eprintln!(
             "[{label}] relL2={rel:.4e} maxExcess={max_excess:.4e} {}",
@@ -245,7 +273,7 @@ mod real {
         b: usize,
         seed: u64,
         negative: bool,
-        any_fail: &mut bool,
+        fams: &mut Families,
     ) -> Result<()> {
         let ch = 2 * kh * KEY_DIM + vh * VAL_DIM;
         let label = format!("gdr geom=({kh},{vh}) B={b} seed={seed:#x}");
@@ -376,45 +404,55 @@ mod real {
                     .iter()
                     .map(|v| f32::from(*v))
                     .collect();
-                let want_co: Vec<f32> = reference.conv_out[lane]
+                let mut want_co: Vec<f32> = reference.conv_out[lane]
                     .iter()
                     .map(|v| f32::from(*v))
                     .collect();
+                if negative && step == 0 && lane == 0 {
+                    want_co[0] += 1.0;
+                }
                 check(
                     &format!("{label} step={step} lane={lane} conv_out"),
                     &co,
                     &want_co,
                     OUT_REL_L2_MAX,
                     |r| OUT_ABS_FLOOR + OUT_ABS_SLOPE * r.abs(),
-                    any_fail,
+                    &mut fams.batch_conv_out,
                 );
 
                 let cr_got: Vec<f32> = conv_got[lane].iter().map(|v| f32::from(*v)).collect();
-                let cr_want: Vec<f32> =
+                let mut cr_want: Vec<f32> =
                     reference.conv[lane].iter().map(|v| f32::from(*v)).collect();
+                if negative && step == 0 && lane == 0 {
+                    cr_want[0] += 1.0;
+                }
                 check(
                     &format!("{label} step={step} lane={lane} conv_state"),
                     &cr_got,
                     &cr_want,
                     OUT_REL_L2_MAX,
                     |_| OUT_ABS_FLOOR,
-                    any_fail,
+                    &mut fams.batch_conv_state,
                 );
 
                 let go: Vec<f32> = gdr_out_bf[lane * vh * VAL_DIM..(lane + 1) * vh * VAL_DIM]
                     .iter()
                     .map(|v| f32::from(*v))
                     .collect();
+                let mut want_go = reference.gdr_out[lane].clone();
+                if negative && step == 0 && lane == 0 {
+                    want_go[0] += 1.0;
+                }
                 check(
                     &format!("{label} step={step} lane={lane} gdr_out"),
                     &go,
-                    &reference.gdr_out[lane],
+                    &want_go,
                     OUT_REL_L2_MAX,
                     |r| OUT_ABS_FLOOR + OUT_ABS_SLOPE * r.abs(),
-                    any_fail,
+                    &mut fams.batch_gdr_out,
                 );
 
-                if negative && lane == 0 {
+                if negative && step == 0 && lane == 0 {
                     reference.state[lane][0] += 1.0;
                 }
                 check(
@@ -423,9 +461,9 @@ mod real {
                     &reference.state[lane],
                     STATE_REL_L2_MAX,
                     |_| STATE_ABS_MAX,
-                    any_fail,
+                    &mut fams.batch_gdr_state,
                 );
-                if negative && lane == 0 {
+                if negative && step == 0 && lane == 0 {
                     reference.state[lane][0] -= 1.0;
                 }
             }
@@ -435,7 +473,7 @@ mod real {
         // same stream must match the same reference trajectory.
         if b == 1 {
             probe_singular(
-                ctx, kh, vh, seed, &w, &dt, &alog, &conv0[0], &state0[0], any_fail,
+                ctx, kh, vh, seed, negative, &w, &dt, &alog, &conv0[0], &state0[0], fams,
             )?;
         }
         Ok(())
@@ -449,12 +487,13 @@ mod real {
         kh: usize,
         vh: usize,
         seed: u64,
+        negative: bool,
         w: &[bf16],
         dt: &[bf16],
         alog: &[f32],
         conv0: &[bf16],
         state0: &[f32],
-        any_fail: &mut bool,
+        fams: &mut Families,
     ) -> Result<()> {
         let ch = 2 * kh * KEY_DIM + vh * VAL_DIM;
         let mut rng = Rng::new(seed ^ ((kh as u64) << 40) ^ ((vh as u64) << 32) ^ (1u64 << 24));
@@ -541,31 +580,44 @@ mod real {
             let state_got = ctx.stream.clone_dtoh(&state_sd)?;
             let conv_got = ctx.stream.clone_dtoh(&conv_sd)?;
             let go: Vec<f32> = out_got.iter().map(|v| f32::from(*v)).collect();
+            let mut want_go = reference.gdr_out[0].clone();
+            if negative && step == 0 {
+                want_go[0] += 1.0;
+            }
             check(
                 &format!("gdr-singular geom=({kh},{vh}) step={step} gdr_out"),
                 &go,
-                &reference.gdr_out[0],
+                &want_go,
                 OUT_REL_L2_MAX,
                 |r| OUT_ABS_FLOOR + OUT_ABS_SLOPE * r.abs(),
-                any_fail,
+                &mut fams.sing_gdr_out,
             );
+            if negative && step == 0 {
+                reference.state[0][0] += 1.0;
+            }
             check(
                 &format!("gdr-singular geom=({kh},{vh}) step={step} gdr_state"),
                 &state_got,
                 &reference.state[0],
                 STATE_REL_L2_MAX,
                 |_| STATE_ABS_MAX,
-                any_fail,
+                &mut fams.sing_gdr_state,
             );
+            if negative && step == 0 {
+                reference.state[0][0] -= 1.0;
+            }
             let cr: Vec<f32> = conv_got.iter().map(|v| f32::from(*v)).collect();
-            let cr_want: Vec<f32> = reference.conv[0].iter().map(|v| f32::from(*v)).collect();
+            let mut cr_want: Vec<f32> = reference.conv[0].iter().map(|v| f32::from(*v)).collect();
+            if negative && step == 0 {
+                cr_want[0] += 1.0;
+            }
             check(
                 &format!("gdr-singular geom=({kh},{vh}) step={step} conv_state"),
                 &cr,
                 &cr_want,
                 OUT_REL_L2_MAX,
                 |_| OUT_ABS_FLOOR,
-                any_fail,
+                &mut fams.sing_conv_state,
             );
         }
         Ok(())
@@ -580,24 +632,49 @@ mod real {
             if negative { " NEGATIVE-CONTROL" } else { "" }
         );
 
-        let mut any_fail = false;
+        let mut fams = Families {
+            batch_conv_out: false,
+            batch_conv_state: false,
+            batch_gdr_out: false,
+            batch_gdr_state: false,
+            sing_gdr_out: false,
+            sing_gdr_state: false,
+            sing_conv_state: false,
+        };
         for &seed in SEEDS {
             for &(kh, vh) in GEOMS {
                 for &b in BATCHES {
-                    probe(&ctx, kh, vh, b, seed, negative, &mut any_fail)?;
+                    probe(&ctx, kh, vh, b, seed, negative, &mut fams)?;
                 }
             }
         }
 
         if negative {
+            let unfired = fams
+                .entries()
+                .into_iter()
+                .filter_map(|(n, fired)| (!fired).then_some(n))
+                .collect::<Vec<_>>();
             ensure!(
-                any_fail,
-                "gdr_decode_parity negative control did NOT fail — gate has no teeth"
+                unfired.is_empty(),
+                "gdr_decode_parity negative control did NOT fail family: {}",
+                unfired.join(", ")
             );
-            eprintln!("[gdr-parity] NEGATIVE CONTROL OK (gate failed as required)");
+            eprintln!(
+                "[gdr-parity] NEGATIVE CONTROL OK (all 7 comparator families failed as required)"
+            );
             return Ok(());
         }
-        ensure!(!any_fail, "gdr_decode_parity FAILED — see violations above");
+        let failed = fams
+            .entries()
+            .into_iter()
+            .filter_map(|(n, fired)| fired.then_some(n))
+            .collect::<Vec<_>>();
+        ensure!(
+            failed.is_empty(),
+            "gdr_decode_parity FAILED families: {}",
+            failed.join(", ")
+        );
         eprintln!("[gdr-parity] ALL PASS");
         Ok(())
     }
