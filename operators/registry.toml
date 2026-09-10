@@ -680,3 +680,76 @@ fallback = ""
 
 [policy."dsv4.dsa_indexer"]
 fallback_status = "no-fallback"
+
+[[semantic]]
+id = "dsv4.moe_routing"
+kind = "dispatch"
+inputs = ["router_logits", "gate_bias"]
+outputs = ["route_indices", "route_weights", "expert_counts", "expert_offsets", "packed_slots", "m_indices", "combined_hidden"]
+reference = "deepseek-spec::v4::{router_scores_from_logits, moe_routes_from_scores}"
+correctness_gate = "crates/infer-cuda/examples/moe_routing_parity.rs"
+gate_gap = "DSv4-Flash-0731 config geometry (256 experts, topk 6, hidden 4096, sqrtsoftplus/noaux_tc, routed_scaling 1.5). Three regimes at B in {1,8,32} and single-rank contiguous EP window 32/64/128/256: hash (routing_kind=0, tid2eid table); learned-bias coarse (routing_kind=1, exact planted tie, lower-expert-wins deterministic); and learned-bias score-decides (bias ~ score spread so the sqrtsoftplus term chooses experts; near-tie rows below a fast-math epsilon exempted and counted, run fails >5% exempt). Integer indices/counts/offsets/totals/packed-slot/m-indices exact; route weights (in-kernel norm_topk_prob renorm) vs f64; scatter+combine vs the kernel slot map with exact bf16 rounding. Per-family negative teeth (route/counts/offsets/pack/weights/combine each trip on its own corruption). Not covered: scoring_kind 0/1 (softmax/sigmoid; DSv4-Flash ships sqrtsoftplus=2) and real multi-rank TP sharding. Standalone qwen36_renorm_topk_weights is not on the DSv4 path (only caller moe/qwen.rs:287) and is not gated here"
+
+[[implementation]]
+id = "cuda.dsv4.route"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "per-token softmax/sigmoid/sqrtsoftplus scores + hash-table or learned noaux_tc-bias masked top-k + in-kernel selected-sum renorm (norm_topk_prob)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.count_local_experts"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "histogram global expert ids into this rank's contiguous [start,start+ep) window"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.exclusive_scan_i32"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "exclusive prefix-sum of per-expert counts (<=256 groups)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.exclusive_scan_aligned_i32"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "exclusive prefix-sum with each group span padded to a 128-row tile (DeepGEMM m-grouped-contiguous layout)"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.pack_local_experts_with_slots"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "copy local routes' hidden/weight into packed per-expert rows and record slot->route"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.fill_m_indices_from_counts"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "fill the aligned grouped-GEMM m-index vector with each group id over its count span"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.scatter_all_route_slots"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "weight each packed expert output and place it back at its global route slot"
+fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.combine_route_slot_outputs"
+semantic = "dsv4.moe_routing"
+provider = "arle"
+source = "crates/cuda-kernels/src/moe.rs"
+legality = "sum a token's top-k weighted route outputs into its final hidden"
+fallback = ""
