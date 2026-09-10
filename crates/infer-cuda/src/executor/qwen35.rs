@@ -3,9 +3,9 @@ use crate::qwen35::alloc_recurrent_block;
 use anyhow::anyhow;
 
 use super::spec_decode::{
-    DecodeDispatch, DecodeKvClass, SpecChain, assign_row_offsets, decide_decode, flatten_chains,
-    pages_covering, qwen_spec_decode_compatible, spec_accept_greedy, spec_accept_totals,
-    speculative_chain_fits,
+    DecodeDispatch, DecodeKvClass, SpecChain, assign_row_offsets, decide_decode, dspark_draft_plan,
+    flatten_chains, greedy_seeded_indices, pages_covering, qwen_spec_decode_compatible,
+    spec_accept_greedy, spec_accept_totals, speculative_chain_fits,
 };
 
 #[path = "device_sched.rs"]
@@ -1500,14 +1500,11 @@ impl Qwen35CudaExecutor {
             }
         }
 
-        let mut idx: Vec<usize> = (0..decode_rows.len())
-            .filter(|&i| seeded[i] && decode_rows[i].params.is_greedy())
-            .collect();
+        // Slot-ascending: the spec-state Vec below is built by slot index.
+        let idx = greedy_seeded_indices(&seeded, decode_rows);
         if idx.is_empty() {
             return Ok(out.into_iter().flatten().collect());
         }
-        // Slot-ascending: the spec-state Vec below is built by slot index.
-        idx.sort_by_key(|&i| decode_rows[i].slot);
 
         let Self {
             model,
@@ -1687,14 +1684,7 @@ impl Qwen35CudaExecutor {
             }
             out[c.out] = tokens
                 .into_iter()
-                .map(|token| SlotToken {
-                    slot: c.slot,
-                    token,
-                    logprob: None,
-                    // Spec is vetoed for logprobs requests, so no capture here.
-                    top_logprobs: Vec::new(),
-                    finish: None,
-                })
+                .map(|token| SlotToken::spec_accepted(c.slot, token, None))
                 .collect();
         }
         if !rollback.is_empty() {
@@ -1879,15 +1869,11 @@ impl Qwen35CudaExecutor {
         // Draft: no trunk/pool state touched, and weight-bound at block rows, so every
         // seeded slot shares one forward.
         let mut pre: Vec<Option<Vec<u32>>> = vec![None; decode_rows.len()];
-        let mut idx: Vec<usize> = (0..decode_rows.len()).filter(|&i| seeded[i]).collect();
-        if idx.len() >= 2 && decode_rows.iter().all(|r| r.params.is_greedy()) {
-            idx.sort_by_key(|&i| decode_rows[i].slot);
-            let anchors: Vec<u32> = idx.iter().map(|&i| decode_rows[i].last_token).collect();
-            let starts: Vec<usize> = idx.iter().map(|&i| decode_rows[i].kv_seq_len).collect();
+        if let Some(plan) = dspark_draft_plan(&seeded, decode_rows) {
             let Self { model, dspark, .. } = self;
             let ds = dspark.as_mut().expect("dspark");
             let mut pick = vec![false; ds.slots.len()];
-            for &i in &idx {
+            for &i in &plan.idx {
                 pick[decode_rows[i].slot] = true;
             }
             let mut dfs: Vec<&mut crate::qwen35::dspark::Qwen35DsparkSlotState> = ds
@@ -1897,18 +1883,17 @@ impl Qwen35CudaExecutor {
                 .filter(|(s, _)| pick[*s])
                 .map(|(_, st)| st.as_mut().expect("seeded slot"))
                 .collect();
-            let sp: Vec<&SamplingParams> = idx.iter().map(|&i| &decode_rows[i].params).collect();
+            let sp: Vec<&SamplingParams> =
+                plan.idx.iter().map(|&i| &decode_rows[i].params).collect();
             let chains = model.dspark_draft_blocks(
                 &ds.head,
                 &mut dfs,
                 &mut ds.scratch,
-                &anchors,
-                &starts,
+                &plan.anchors,
+                &plan.starts,
                 &sp,
             )?;
-            for (n, &i) in idx.iter().enumerate() {
-                pre[i] = Some(chains[n].clone());
-            }
+            plan.scatter_into(&chains, &mut pre);
         }
 
         for (i, row) in decode_rows.iter().enumerate() {
@@ -2139,14 +2124,7 @@ impl Qwen35CudaExecutor {
             ds.partial_ctx_chains += usize::from(c.partial_ctx);
             out[c.out] = emitted
                 .into_iter()
-                .map(|(token, logprob)| SlotToken {
-                    slot: c.slot,
-                    token,
-                    logprob,
-                    // Spec is vetoed for logprobs requests, so no capture here.
-                    top_logprobs: Vec::new(),
-                    finish: None,
-                })
+                .map(|(token, logprob)| SlotToken::spec_accepted(c.slot, token, logprob))
                 .collect();
         }
         if !rollback.is_empty() {
