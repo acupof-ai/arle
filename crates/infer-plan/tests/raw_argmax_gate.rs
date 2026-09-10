@@ -183,3 +183,33 @@ fn top_logprobs_vetoes_the_fast_path_and_top1_matches_the_sampled_token() {
     let sum: f32 = logits.iter().map(|&l| (l - 2.0).exp()).sum();
     assert!((cap[0].1 - (0.0 - sum.ln())).abs() < 1e-6);
 }
+
+/// argmax_logit must encode the CUDA argmax contract (sampling.cu strict `>`):
+/// ties → lowest index, NaN never selected, all-NaN/all-neg-inf → 0.
+#[test]
+fn argmax_logit_matches_cuda_contract() {
+    use infer_plan::argmax_logit;
+
+    assert_eq!(
+        argmax_logit(&[3.0, 1.0, 3.0, 0.0]),
+        0,
+        "tie goes to the lowest index"
+    );
+    assert_eq!(
+        argmax_logit(&[f32::NAN, 1.0, 4.0, f32::NAN, -2.0]),
+        2,
+        "NaN, including at index 0, is never selected"
+    );
+    assert_eq!(argmax_logit(&[f32::NAN; 4]), 0, "all-NaN row yields 0");
+    assert_eq!(
+        argmax_logit(&[f32::NEG_INFINITY, f32::NEG_INFINITY, 0.5]),
+        2,
+        "finite max beats -inf"
+    );
+    assert_eq!(
+        argmax_logit(&[f32::NEG_INFINITY; 3]),
+        0,
+        "all -inf row yields 0"
+    );
+    assert_eq!(argmax_logit(&[]), 0, "empty row yields 0");
+}
