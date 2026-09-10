@@ -202,7 +202,8 @@ PY
     else
       binary_sha="$(field "$BUILD_RECEIPT" binary_sha)"; source_head="$(field "$BUILD_RECEIPT" source_head)"; source_digest_value="$(field "$BUILD_RECEIPT" source_digest)"
       kernel_id="$(field "$BUILD_RECEIPT" kernel_id)"; producer_id="$(field "$BUILD_RECEIPT" producer_id)"; embedded_id="$(field "$BUILD_RECEIPT" embedded_id)"
-      if [ "$(sha256 "$binary" 2>/dev/null)" != "$binary_sha" ]; then echo "binary SHA mismatch"
+      if [ "$(field "$BUILD_RECEIPT" tree)" != "$TREE" ]; then echo "build belongs to another tree: build:$BUILD tree=$(field "$BUILD_RECEIPT" tree) run_tree=$TREE"
+      elif [ "$(sha256 "$binary" 2>/dev/null)" != "$binary_sha" ]; then echo "binary SHA mismatch"
       elif [ ! -f "$TREE/.arle-source-receipt" ] || [ "$(field "$TREE/.arle-source-receipt" head)" != "$source_head" ] || [ "$(field "$TREE/.arle-source-receipt" digest)" != "$source_digest_value" ] || [ "$(git -C "$TREE" rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then echo "source changed since build"
       elif [ "${LABEL#bench}" != "$LABEL" ] && [ "$(field "$BUILD_RECEIPT" profile)" != release ]; then echo "bench run requires a release build: build=$BUILD profile=$(field "$BUILD_RECEIPT" profile)"
       else
@@ -302,6 +303,8 @@ PY
     rc=1; selected_gpu=""
     if [ ! -f "$BUILD_RECEIPT" ] || [ "$(field "$BUILD_RECEIPT" schema)" != arle-build-v1 ] || [ "$(field "$BUILD_RECEIPT" exit)" != 0 ]; then
       echo "successful build receipt required: build:$BUILD"
+    elif [ "$(field "$BUILD_RECEIPT" tree)" != "$TREE" ]; then
+      echo "build belongs to another tree: build:$BUILD tree=$(field "$BUILD_RECEIPT" tree) run_tree=$TREE"
     elif [ "$(sha256 "$binary" 2>/dev/null)" != "$(field "$BUILD_RECEIPT" binary_sha)" ]; then
       echo "binary SHA mismatch"
     elif [ ! -f "$TREE/.arle-source-receipt" ] || [ "$(field "$TREE/.arle-source-receipt" head)" != "$source_head" ] || [ "$(field "$TREE/.arle-source-receipt" digest)" != "$source_digest_value" ] || [ "$(git -C "$TREE" rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then

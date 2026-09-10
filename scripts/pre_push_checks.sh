@@ -169,6 +169,7 @@ run_fast_checks() {
         test_kernel_artifact_qualification.sh \
         test_validate_release.sh \
         test_pod_flow.sh \
+        test_pod_tree_identity.sh \
         test_hook_disowns_git_env.sh \
         test_hook_cuda_lint_freshness.sh \
         test_bench_ab_control_arm.sh; do
