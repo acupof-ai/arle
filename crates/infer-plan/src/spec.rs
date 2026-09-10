@@ -98,6 +98,58 @@ pub fn spec_accept_totals(chain_len: usize, k: usize) -> (usize, usize) {
     (k, chain_len - 1 - k)
 }
 
+/// Page count covering `len` tokens at `page_size` tokens per page.
+pub fn pages_covering(len: usize, page_size: usize) -> usize {
+    len.div_ceil(page_size)
+}
+
+/// The outcome of a greedy accept scan over one verified chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecAcceptOutcome {
+    /// Accepted draft tokens plus the bonus token, in commit order.
+    pub emitted: Vec<u32>,
+    /// The first mismatched trunk argmax (or the last row's argmax on a full
+    /// accept); the next pending token.
+    pub bonus: u32,
+    /// Number of draft tokens accepted.
+    pub k: usize,
+    /// The chain has unaccepted rows the caller rolls back (`k + 1 <
+    /// chain.len()`).
+    pub partial: bool,
+}
+
+/// Greedy accept scan: the longest prefix where each draft token equals the
+/// trunk argmax at its row. `chain[0]` is the pending token, `chain[1..]` the
+/// drafts; `argmax[row0..row0+chain.len()]` is the verified target. Pure host —
+/// the executor's accept loop calls this and runs the device leaf calls
+/// (truncate, mirror, ctx append) on the outcome.
+pub fn spec_accept_greedy(chain: &[u32], argmax: &[u32], row0: usize) -> Result<SpecAcceptOutcome> {
+    let depth = chain.len() - 1;
+    ensure!(
+        row0 + chain.len() <= argmax.len(),
+        "spec accept: chain rows outside the verify argmax"
+    );
+    let mut k = 0usize;
+    let bonus;
+    loop {
+        let am = argmax[row0 + k];
+        if k < depth && am == chain[k + 1] {
+            k += 1;
+        } else {
+            bonus = am;
+            break;
+        }
+    }
+    let mut emitted: Vec<u32> = chain[1..=k].to_vec();
+    emitted.push(bonus);
+    Ok(SpecAcceptOutcome {
+        emitted,
+        bonus,
+        k,
+        partial: k + 1 < chain.len(),
+    })
+}
+
 /// The paged KV pool's decode-relevant shape. The executor maps its pool
 /// format and FA3 state onto this class; the dispatch decision reads only the
 /// class, never the format.
@@ -502,6 +554,45 @@ mod tests {
         // chain of 4 (pending + 3 drafts), 2 drafts accepted.
         assert_eq!(spec_accept_totals(4, 2), (2, 1));
         assert_eq!(spec_accept_totals(4, 3), (3, 0));
+    }
+
+    #[test]
+    fn spec_accept_greedy_scans_the_longest_matching_prefix() {
+        // chain = [pending, d0, d1, d2]; argmax matches d0, d1, misses d2.
+        let chain = [7, 11, 12, 13];
+        let argmax = [11, 12, 99, 0];
+        let out = spec_accept_greedy(&chain, &argmax, 0).unwrap();
+        assert_eq!(out.emitted, vec![11, 12, 99]);
+        assert_eq!(out.bonus, 99);
+        assert_eq!(out.k, 2);
+        assert!(out.partial);
+        // Full accept: every draft matches, bonus is the last row's argmax.
+        let argmax = [11, 12, 13, 14];
+        let out = spec_accept_greedy(&chain, &argmax, 0).unwrap();
+        assert_eq!(out.emitted, vec![11, 12, 13, 14]);
+        assert_eq!(out.k, 3);
+        assert!(!out.partial);
+        // First-row miss: only the bonus commits.
+        let argmax = [99, 12, 13, 14];
+        let out = spec_accept_greedy(&chain, &argmax, 0).unwrap();
+        assert_eq!(out.emitted, vec![99]);
+        assert_eq!(out.k, 0);
+        assert!(out.partial);
+        // row0 offsets into a shared argmax buffer.
+        let argmax = [0, 0, 11, 12, 99, 0];
+        let out = spec_accept_greedy(&chain, &argmax, 2).unwrap();
+        assert_eq!(out.k, 2);
+        assert_eq!(out.bonus, 99);
+        // Chains outside the argmax buffer are rejected, not truncated.
+        assert!(spec_accept_greedy(&chain, &argmax, 4).is_err());
+    }
+
+    #[test]
+    fn pages_covering_rounds_up() {
+        assert_eq!(pages_covering(0, 16), 0);
+        assert_eq!(pages_covering(1, 16), 1);
+        assert_eq!(pages_covering(16, 16), 1);
+        assert_eq!(pages_covering(17, 16), 2);
     }
 
     #[test]

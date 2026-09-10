@@ -1693,7 +1693,7 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Rejection-sampling twin of [`Self::dspark_accept_commit`] (mirrors
+    /// Rejection-sampling twin of `infer_plan::spec_accept_greedy` (mirrors
     /// flashinfer/SGLang `chain_speculative_sampling`): accept `chain[j+1]`
     /// with prob min(1, p_j(tok)/q_j(tok)) under the engine-sampler-filtered
     /// distributions; the first reject commits a residual `max(0, p−q)` draw

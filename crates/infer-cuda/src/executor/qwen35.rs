@@ -4,7 +4,8 @@ use anyhow::anyhow;
 
 use super::spec_decode::{
     DecodeDispatch, DecodeKvClass, SpecChain, assign_row_offsets, decide_decode, flatten_chains,
-    qwen_spec_decode_compatible, spec_accept_totals, speculative_chain_fits,
+    pages_covering, qwen_spec_decode_compatible, spec_accept_greedy, spec_accept_totals,
+    speculative_chain_fits,
 };
 
 #[path = "device_sched.rs"]
@@ -1431,7 +1432,7 @@ impl Qwen35CudaExecutor {
             && let Some(pool) = full_attn_kv.as_mut()
         {
             self.kv_actual.push((slot, len));
-            let need = len.div_ceil(pool.page_size);
+            let need = pages_covering(len, pool.page_size);
             let brow = kv_batch
                 .row_for_slot(slot)
                 .ok_or_else(|| anyhow!("no batch row for slot {slot}"))?;
@@ -1627,7 +1628,7 @@ impl Qwen35CudaExecutor {
                     let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
                     let local_pages =
                         brow.map(|b| &kv_batch.flat_local_page_ids[b.local_page_range.clone()]);
-                    let need = c.start.div_ceil(pool.page_size);
+                    let need = pages_covering(c.start, pool.page_size);
                     if let Some(pages) = local_pages {
                         ensure!(
                             pages.len() >= need,
@@ -1649,10 +1650,11 @@ impl Qwen35CudaExecutor {
         let hidden_size = model.config.hidden_size;
         let mut rollback: Vec<(usize, usize, usize)> = Vec::with_capacity(batch.len());
         for c in &batch {
-            let (tokens, bonus, k) = infer_model::dspark::accept_commit(&c.chain, &argmax, c.row0)?;
-            if k + 1 < c.chain.len() {
-                rollback.push((c.slot, c.start, k));
+            let outcome = spec_accept_greedy(&c.chain, &argmax, c.row0)?;
+            if outcome.partial {
+                rollback.push((c.slot, c.start, outcome.k));
             }
+            let (tokens, bonus, k) = (outcome.emitted, outcome.bonus, outcome.k);
             // The accepted row's raw trunk hidden seeds the next block's level-0
             // draft; the verify left every row's hidden in `workspace.hidden`.
             {
@@ -1676,7 +1678,7 @@ impl Qwen35CudaExecutor {
                 let len = c.start + k + 1;
                 let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
                 self.kv_actual.push((c.slot, len));
-                let need = len.div_ceil(pool.page_size);
+                let need = pages_covering(len, pool.page_size);
                 let brow = kv_batch
                     .row_for_slot(c.slot)
                     .ok_or_else(|| anyhow!("no batch row for slot {}", c.slot))?;
@@ -2046,7 +2048,7 @@ impl Qwen35CudaExecutor {
                         self.kv_actual.push((c.slot, c.start));
                     }
                     let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-                    let need = c.start.div_ceil(pool.page_size);
+                    let need = pages_covering(c.start, pool.page_size);
                     if let Some(pages) =
                         brow.map(|b| &kv_batch.flat_local_page_ids[b.local_page_range.clone()])
                     {
@@ -2080,15 +2082,18 @@ impl Qwen35CudaExecutor {
             let spec = ds.spec[c.slot].as_mut().expect("built above");
             let (emitted, bonus, k) = if params.is_greedy() {
                 // Greedy: no behavior logprob.
-                let (tokens, bonus, k) =
-                    infer_model::dspark::accept_commit(&c.chain, &argmax, c.row0)?;
-                if k + 1 < c.chain.len() {
-                    rollback.push((c.slot, c.start, k));
+                let outcome = spec_accept_greedy(&c.chain, &argmax, c.row0)?;
+                if outcome.partial {
+                    rollback.push((c.slot, c.start, outcome.k));
                 }
                 (
-                    tokens.into_iter().map(|t| (t, None)).collect::<Vec<_>>(),
-                    bonus,
-                    k,
+                    outcome
+                        .emitted
+                        .into_iter()
+                        .map(|t| (t, None))
+                        .collect::<Vec<_>>(),
+                    outcome.bonus,
+                    outcome.k,
                 )
             } else {
                 let df = ds.slots[c.slot].as_mut().expect("seeded slot");
@@ -2113,7 +2118,7 @@ impl Qwen35CudaExecutor {
                 let len = c.start + k + 1;
                 let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
                 self.kv_actual.push((c.slot, len));
-                let need = len.div_ceil(pool.page_size);
+                let need = pages_covering(len, pool.page_size);
                 let brow = kv_batch
                     .row_for_slot(c.slot)
                     .ok_or_else(|| anyhow!("no batch row for slot {}", c.slot))?;
@@ -2212,7 +2217,7 @@ impl Qwen35CudaExecutor {
                 .row_for_slot(c.slot)
                 .ok_or_else(|| anyhow!("no batch row for slot {}", c.slot))?;
             let slot_pages = &kv_batch.flat_slot_page_ids[brow.slot_page_range.clone()];
-            let need = len.div_ceil(pool.page_size);
+            let need = pages_covering(len, pool.page_size);
             ensure!(
                 slot_pages.len() >= need,
                 "batch holds {} pages for slot {}, {need} needed to cover {len} tokens",
