@@ -14,16 +14,9 @@ pub(crate) fn build(
     config: &EngineLoadConfig,
     shutdown: ServeShutdown,
 ) -> Result<(ServeHandle, OpenAiTokenizer, String)> {
-    if config.mtp_enabled() {
-        anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
-    }
     if let Some(cap) = config.vulkan_submit_cap {
         infer_vulkan::forward::set_submit_cap(cap);
     }
-    anyhow::ensure!(
-        !config.kv_ssd_requested(),
-        "--kv-disk: the Vulkan backend has no KV tier store"
-    );
     let gguf_path = super::resolve_gguf_path(model_path, "Vulkan")?;
     let tokenizer_dir = gguf_path
         .parent()

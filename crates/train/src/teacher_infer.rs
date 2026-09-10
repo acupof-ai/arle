@@ -446,7 +446,14 @@ pub fn register_cuda_backend() {
         )?;
         Ok((serve, tokenizer, model_id))
     }
-    infer_api::register_backend("cuda", build);
+    infer_api::register_backend(
+        "cuda",
+        build,
+        infer_api::BackendCapabilities {
+            mtp_spec_decode: true,
+            kv_ssd_tier: true,
+        },
+    );
 }
 
 #[cfg(feature = "cuda")]

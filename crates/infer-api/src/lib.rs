@@ -66,8 +66,8 @@ pub use loaded::build_cuda_engine;
 #[cfg(feature = "cuda")]
 pub use loaded::cuda_model_takes_multiproc_serve;
 pub use loaded::{
-    BackendBuilderFn, EngineLoadConfig, KvCacheDtype, KvTierBudget, default_backend,
-    is_backend_registered, register_backend,
+    BackendBuilderFn, BackendCapabilities, EngineLoadConfig, KvCacheDtype, KvTierBudget,
+    default_backend, is_backend_registered, register_backend,
 };
 #[cfg(feature = "cuda")]
 pub use serve::serve_coordinator_http_dp;

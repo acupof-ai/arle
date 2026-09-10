@@ -479,28 +479,80 @@ pub type BackendBuilderFn = fn(
     String,
 )>;
 
+/// Load-time backend capabilities, declared ONCE per backend at registration.
+/// These gate feature requests before the executor is constructed — the
+/// runtime [`infer_seam::BackendExecutor`] capability accessors cover the step
+/// path, but no executor exists yet at load. A field left `false` is a written
+/// opt-out: the engine rejects that request at dispatch. Adding a load-time
+/// feature means one new field here, one check in
+/// [`check_load_capabilities`], and a declaration per backend — nothing in the
+/// backend builders themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    /// MTP / speculative-decode draft heads.
+    pub mtp_spec_decode: bool,
+    /// L3 NVMe page-tier spill (`--kv-disk`).
+    pub kv_ssd_tier: bool,
+}
+
+impl BackendCapabilities {
+    /// The least-capable backend: every load-time feature opted out.
+    pub const NONE: Self = Self {
+        mtp_spec_decode: false,
+        kv_ssd_tier: false,
+    };
+}
+
 struct BackendEntry {
     name: &'static str,
     build: BackendBuilderFn,
+    caps: BackendCapabilities,
 }
 
 static REGISTRY: std::sync::OnceLock<std::sync::RwLock<Vec<BackendEntry>>> =
     std::sync::OnceLock::new();
 
-/// Register a backend builder. Called by the leaf binary at startup, before
-/// any engine load. Duplicate names are ignored (first registration wins).
-pub fn register_backend(name: &'static str, build: BackendBuilderFn) {
+/// Register a backend builder plus its declared load-time capabilities. Called
+/// by the leaf binary at startup, before any engine load. Duplicate names are
+/// ignored (first registration wins).
+pub fn register_backend(name: &'static str, build: BackendBuilderFn, caps: BackendCapabilities) {
     let registry = REGISTRY.get_or_init(|| std::sync::RwLock::new(Vec::new()));
     let mut guard = registry.write().unwrap();
     if !guard.iter().any(|e| e.name == name) {
-        guard.push(BackendEntry { name, build });
+        guard.push(BackendEntry { name, build, caps });
     }
 }
 
-pub(crate) fn lookup_backend(name: &str) -> Option<BackendBuilderFn> {
+fn registry_entry(name: &str) -> Option<(BackendBuilderFn, BackendCapabilities)> {
     let registry = REGISTRY.get()?;
     let guard = registry.read().unwrap();
-    guard.iter().find(|e| e.name == name).map(|e| e.build)
+    guard
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| (e.build, e.caps))
+}
+
+pub(crate) fn lookup_backend(name: &str) -> Option<BackendBuilderFn> {
+    registry_entry(name).map(|(build, _caps)| build)
+}
+
+/// Reject requested load-time features the chosen backend did not declare.
+/// Runs before the executor is built so an unsupported request fails fast with
+/// one consistent message; the backend builders carry no per-feature gates.
+/// Model-kind-conditional limits a backend discovers only after loading (e.g.
+/// the Metal diffusion/VLM path's tier restriction) stay in that builder.
+pub(crate) fn check_load_capabilities(
+    backend: &str,
+    caps: BackendCapabilities,
+    config: &EngineLoadConfig,
+) -> anyhow::Result<()> {
+    if config.mtp_enabled() && !caps.mtp_spec_decode {
+        anyhow::bail!("MTP speculative decode is not supported by the '{backend}' backend");
+    }
+    if config.kv_ssd_requested() && !caps.kv_ssd_tier {
+        anyhow::bail!("--kv-disk (KV SSD tier spill) is not supported by the '{backend}' backend");
+    }
+    Ok(())
 }
 
 /// The first registered backend name, or `"cpu"` when the registry is empty.
@@ -552,9 +604,10 @@ impl LoadedInferenceEngine {
                 .with_overrides(config.temperature, config.repetition_penalty),
         );
         let backend = config.backend.clone().unwrap_or_else(default_backend);
-        let build = lookup_backend(&backend).ok_or_else(|| {
+        let (build, caps) = registry_entry(&backend).ok_or_else(|| {
             anyhow::anyhow!("backend '{backend}' not registered; compiled-in backends only")
         })?;
+        check_load_capabilities(&backend, caps, &config)?;
         let (serve, tokenizer, model_id) =
             build(model_path, &config, infer_server::ServeShutdown::new())?;
         Ok(Self {
@@ -763,9 +816,10 @@ pub(crate) fn router_for_backend(
             .with_overrides(config.temperature, config.repetition_penalty),
     );
     let backend = config.backend.clone().unwrap_or_else(default_backend);
-    let build = lookup_backend(&backend).ok_or_else(|| {
+    let (build, caps) = registry_entry(&backend).ok_or_else(|| {
         anyhow::anyhow!("backend '{backend}' not registered; compiled-in backends only")
     })?;
+    check_load_capabilities(&backend, caps, &config)?;
     let (serve, tokenizer, model_id) = build(model_path, &config, shutdown)?;
     let serve_engine = ServeInferenceEngine::new(model_id.clone(), tokenizer.clone(), serve);
     let serve_arc = serve_engine.serve_arc();
@@ -1489,3 +1543,90 @@ mod cuda {
 
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaWorkerEngine, build_cuda_engine, cuda_model_takes_multiproc_serve};
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn config_with(mtp: bool, kv_ssd: bool) -> EngineLoadConfig {
+        let mut cfg = EngineLoadConfig::default();
+        if mtp {
+            cfg.mtp_draft_tokens = Some(crate::DEFAULT_MTP_DRAFT_TOKENS);
+        }
+        if kv_ssd {
+            cfg.kv_ssd_root = Some(std::path::PathBuf::from("/tmp/kv-ssd-tier"));
+        }
+        cfg
+    }
+
+    #[test]
+    fn none_requested_passes_for_any_backend() {
+        check_load_capabilities("cpu", BackendCapabilities::NONE, &config_with(false, false))
+            .unwrap();
+        check_load_capabilities(
+            "cuda",
+            BackendCapabilities {
+                mtp_spec_decode: true,
+                kv_ssd_tier: true,
+            },
+            &config_with(false, false),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mtp_gated_by_declared_capability() {
+        // An opted-out backend (cpu/hip/vulkan/metal) refuses MTP; CUDA accepts.
+        assert!(
+            check_load_capabilities("cpu", BackendCapabilities::NONE, &config_with(true, false))
+                .is_err()
+        );
+        assert!(
+            check_load_capabilities(
+                "cuda",
+                BackendCapabilities {
+                    mtp_spec_decode: true,
+                    kv_ssd_tier: false,
+                },
+                &config_with(true, false)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn kv_ssd_gated_by_declared_capability() {
+        assert!(
+            check_load_capabilities("hip", BackendCapabilities::NONE, &config_with(false, true))
+                .is_err()
+        );
+        assert!(
+            check_load_capabilities(
+                "metal",
+                BackendCapabilities {
+                    mtp_spec_decode: false,
+                    kv_ssd_tier: true,
+                },
+                &config_with(false, true)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejection_names_the_backend_not_a_specific_other_backend() {
+        let err =
+            check_load_capabilities("hip", BackendCapabilities::NONE, &config_with(true, false))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("'hip'"),
+            "error should name the chosen backend: {err}"
+        );
+        // The gate no longer points at a concrete sibling backend.
+        assert!(
+            !err.contains("CUDA backend"),
+            "error must not hard-code another backend name: {err}"
+        );
+    }
+}
