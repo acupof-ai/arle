@@ -485,6 +485,9 @@ mod real {
         nrows: i64,
         stream: *mut c_void,
     ) -> Result<()> {
+        // SAFETY: caller guarantees the `x`/`y_q8_1` device extents and the
+        // valid stream documented on this fn; the FFI call only dereferences
+        // those pointers with the matching nrows/ncols.
         check(unsafe { ffi::arle_quantize_row_q8_1_cuda(x, y_q8_1, ncols, nrows, stream) })
     }
 
@@ -503,6 +506,9 @@ mod real {
         nrows: i32,
         stream: *mut c_void,
     ) -> Result<()> {
+        // SAFETY: caller guarantees the `w_blocks`/`x_q8_1`/`y` device extents
+        // and valid stream in this fn's # Safety; the kernel reads one q8_1 row
+        // and writes exactly nrows f32 to `y`.
         check(unsafe { ffi::arle_mmvq_iq2_xxs_cuda(w_blocks, x_q8_1, y, ncols, nrows, stream) })
     }
 
@@ -519,6 +525,8 @@ mod real {
         nrows: i32,
         stream: *mut c_void,
     ) -> Result<()> {
+        // SAFETY: same pointer-extent/stream contract as `mmvq_iq2_xxs`, with
+        // q2_k-shaped weight rows the caller guarantees; `y` receives nrows f32.
         check(unsafe { ffi::arle_mmvq_q2_k_cuda(w_blocks, x_q8_1, y, ncols, nrows, stream) })
     }
 }

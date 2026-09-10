@@ -553,6 +553,9 @@ mod device {
             let kind = gemv_kind(w.residency)
                 .ok_or_else(|| anyhow!("no HIP GEMV for residency {:?}", w.residency))?;
             let s = self.st();
+            // SAFETY: `w_ptr` is the weight's packed block sized for n·k, and
+            // `x_bf16`/`y_bf16` are construction-sized scratch for k inputs and
+            // n outputs; `s` is the executor's stream.
             unsafe {
                 match kind {
                     GemvKind::Q4K => check(
@@ -616,6 +619,8 @@ mod device {
             n: usize,
             y: *mut u16,
         ) -> Result<()> {
+            // SAFETY: `x`/`y` hold n bf16 and `weight` holds the row's RMS
+            // gamma, all construction-sized scratch/weight pointers.
             unsafe {
                 check(
                     ffi::rms_norm_cuda(
@@ -642,6 +647,8 @@ mod device {
                 mix.n()
             );
             self.gemv_full(mix, stream, self.scratch.mixes.as_ptr().cast())?;
+            // SAFETY: scratch mixes/params buffers and the stream are
+            // construction-sized for the layer's mixer-head count.
             unsafe {
                 check(
                     ffi::dsv4_mhc_params_cuda(
@@ -671,6 +678,8 @@ mod device {
             norm: &WeightEntry,
             out: *mut u16,
         ) -> Result<()> {
+            // SAFETY: `stream`/`norm`/`out` are construction-sized for the
+            // mixer row length; kernel writes only that row.
             unsafe {
                 check(
                     ffi::dsv4_mhc_pre_rms_norm_cuda(
@@ -690,6 +699,8 @@ mod device {
         }
 
         fn mhc_post(&self, new_x: *const u16, residual: *const u16, out: *mut u16) -> Result<()> {
+            // SAFETY: the three buffers each span the mixer row length and
+            // belong to this tick's scratch.
             unsafe {
                 check(
                     ffi::dsv4_mhc_post_cuda(
@@ -770,6 +781,8 @@ mod device {
 
             let embed = self.w("token_embd.weight")?;
             let emb = self.scratch.emb.as_ptr() as *mut u16;
+            // SAFETY: the token id is scratch for one decode row; the embedding
+            // weight and `emb` are sized for the hidden width h.
             unsafe {
                 let tok = self.scratch.token_id.as_ptr() as *const i32;
                 match gemv_kind(embed.residency) {
@@ -811,6 +824,8 @@ mod device {
             let stream_a = self.scratch.stream_a.as_ptr() as *const u16;
             let head_mix = self.w("hc_head_fn")?;
             self.gemv_full(head_mix, stream_a, self.scratch.mixes.as_ptr().cast())?;
+            // SAFETY: stream_a/mixes scratch and head base/bias weights span
+            // the mixer head width this kernel reduces over.
             unsafe {
                 check(
                     ffi::dsv4_mhc_head_pre_cuda(
@@ -845,6 +860,8 @@ mod device {
                 self.scratch.normed.as_ptr().cast(),
                 stage_bf16,
             )?;
+            // SAFETY: stage_bf16 holds vocab bf16 and y_f32 vocab f32; the cast
+            // reads/writes exactly that many elements.
             unsafe {
                 check(
                     ffi::cast_bf16_to_f32_cuda(
@@ -903,6 +920,9 @@ mod device {
                 let st = self.slots[slot].as_ref().expect("slot ensured");
                 (st.arena.as_ptr(), st.start_pos.as_ptr() as *const i32)
             };
+            // SAFETY: every caller passes an offset from this slot's
+            // pre-sized `offsets` table, so `arena_base + off` stays inside the
+            // slot's arena allocation.
             let arena = |off: usize| unsafe { (arena_base as *mut u16).add(off) };
             let off = self.offsets[layer_idx];
 
@@ -937,6 +957,8 @@ mod device {
                 self.scratch.kv_raw.as_ptr().cast(),
             )?;
 
+            // SAFETY: q_raw/kv_raw inputs and q_prep output scratch are sized
+            // for the layer's one-token QK prep.
             unsafe {
                 check(
                     ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
@@ -964,6 +986,8 @@ mod device {
             let sm_scale = 1.0 / (head_dim as f32).sqrt();
             let sink = self.lw(layer_idx, "attn_sinks")?;
             match plan.mode {
+                // SAFETY: q/k prep scratch and the per-slot arena windows from
+                // `arena(...)` are pre-sized for the sliding-window attention.
                 DeepSeekV4AttentionMode::SlidingWindow => unsafe {
                     check(
                         ffi::dsv4_swa_attention_start_pos_ptr_cuda(
@@ -1037,6 +1061,8 @@ mod device {
                         let key_count = (start_pos + 1) / ratio;
                         let score_scale = (cfg.index_head_dim as f32).powf(-0.5)
                             * (cfg.index_n_heads as f32).powf(-0.5);
+                        // SAFETY: idx_q/idx_w scratch and the compressed arena
+                        // window span the indexed-attention shapes for this plan.
                         unsafe {
                             check(
                                 ffi::dsv4_csa_select_start_pos_ptr_cuda(
@@ -1073,6 +1099,8 @@ mod device {
                     } else {
                         2
                     };
+                    // SAFETY: q/k prep and the SWA/hybrid arena windows are
+                    // pre-sized for the hybrid-attention row.
                     unsafe {
                         check(
                             ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
@@ -1162,8 +1190,12 @@ mod device {
             self.gemv_full(wgate, hidden, self.scratch.comp_score.as_ptr().cast())?;
             let ape = self.lw(layer, &format!("{prefix}_ape"))?;
             let norm = self.lw(layer, &format!("{prefix}_norm.weight"))?;
+            // SAFETY: offsets are from this slot's pre-sized `offsets` table,
+            // so `arena_base + o` stays inside its arena.
             let a = |o: usize| unsafe { (arena_base as *mut u16).add(o) };
             let rope = &cfg.rope_parameters;
+            // SAFETY: comp_kv/comp_score scratch, ape/norm weights, and the
+            // arena windows are sized for the compressor width/rope shape.
             unsafe {
                 check(
                     ffi::dsv4_compressor_update_start_pos_ptr_cuda(
@@ -1251,9 +1283,16 @@ mod device {
                 expert_bytes(down_w)?,
             );
             for (expert, weight) in routes {
-                let up_ptr = unsafe { (up_w.ptr() as *const u8).add(expert * up_eb) };
-                let gate_ptr = unsafe { (gate_w.ptr() as *const u8).add(expert * gate_eb) };
-                let down_ptr = unsafe { (down_w.ptr() as *const u8).add(expert * down_eb) };
+                // SAFETY: `expert` is a routed expert id and `*_eb` is the
+                // per-expert byte stride, so each offset lands inside the
+                // contiguous packed up/gate/down weight buffers.
+                let (up_ptr, gate_ptr, down_ptr) = unsafe {
+                    (
+                        (up_w.ptr() as *const u8).add(expert * up_eb),
+                        (gate_w.ptr() as *const u8).add(expert * gate_eb),
+                        (down_w.ptr() as *const u8).add(expert * down_eb),
+                    )
+                };
                 self.gemv(
                     up_w,
                     up_ptr,
@@ -1270,6 +1309,8 @@ mod device {
                     normed,
                     self.scratch.gate.as_ptr().cast(),
                 )?;
+                // SAFETY: gate/up inputs and act output scratch span `inter`
+                // activations; the kernel clamps to swiglu_limit.
                 unsafe {
                     check(
                         ffi::dsv4_swiglu_clamped_cuda(
@@ -1291,6 +1332,8 @@ mod device {
                     self.scratch.act.as_ptr().cast(),
                     self.scratch.expert_out.as_ptr().cast(),
                 )?;
+                // SAFETY: expert_out and the MoE accumulator span the hidden
+                // width; this expert's routed weight gates the scale applied.
                 unsafe {
                     check(
                         ffi::add_scaled_row_cuda(
@@ -1318,6 +1361,8 @@ mod device {
                     self.scratch.gate.as_ptr().cast(),
                 )?;
                 let sh_inter = self.lw(layer_idx, "ffn_up_shexp.weight")?.n();
+                // SAFETY: shared-expert gate/up and act scratch span the layer
+                // width; kernel clamps to the same swiglu limit.
                 unsafe {
                     check(
                         ffi::dsv4_swiglu_clamped_cuda(
@@ -1336,6 +1381,8 @@ mod device {
                     self.scratch.act.as_ptr().cast(),
                     self.scratch.expert_out.as_ptr().cast(),
                 )?;
+                // SAFETY: the shared-expert output accumulates in-place over
+                // hidden-width act scratch.
                 unsafe {
                     check(
                         ffi::add_assign_cuda(
