@@ -139,7 +139,7 @@ jobs:
           # linking (no GPU toolchain): infer-cuda lib-tests, cuda-kernels
           # inline tests + tests/.
           cargo clippy -p infer-cuda --release --no-default-features --features cuda,no-cuda,nccl --tests -- -D warnings
-          cargo clippy -p cuda-kernels --release --no-default-features --features no-cuda --tests -- -D warnings
+          cargo clippy -p cuda-kernels --release --no-default-features --features cuda,no-cuda,nccl --tests -- -D warnings
           # train/autograd CUDA examples previously typechecked only in the
           # no-cuda shape; their CUDA example bodies (#286 dsv4_parity class)
           # were ungated. clippy --examples (no link).
