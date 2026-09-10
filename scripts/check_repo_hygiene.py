@@ -440,6 +440,67 @@ def check_registry_covers_runtime_counters() -> list[str]:
     ]
 
 
+# A correctness_gate must be an EXECUTABLE reference, not a declarative label
+# ("numeric+e2e" shipped the varlen kernel as "listed = verified"). Allowed
+# values: "none" (no gate — a tracked gap), "vendor-trusted: <path>" (vendored
+# kernel with only an e2e/parity path), or one or more repo-relative files or
+# commands separated by ";". Every referenced path must exist.
+def _registry_semantic_entries() -> list[dict]:
+    import tomllib
+    return tomllib.loads(load_text(ROOT / REGISTRY_PATH)).get("semantic", [])
+
+
+def _gate_relpaths(gate: str) -> list[str]:
+    gate = gate.strip()
+    if gate == "none":
+        return []
+    if gate.startswith("vendor-trusted:"):
+        gate = gate.split(":", 1)[1].strip()
+    return [p.strip() for p in gate.split(";") if p.strip()]
+
+
+def check_registry_gate_paths() -> list[str]:
+    errors: list[str] = []
+    try:
+        entries = _registry_semantic_entries()
+    except Exception as exc:  # malformed TOML is its own failure
+        return [f"{REGISTRY_PATH}: cannot parse correctness_gate entries: {exc}"]
+    for entry in entries:
+        sid = entry.get("id", "<unknown>")
+        gate = str(entry.get("correctness_gate", "")).strip()
+        if not gate:
+            errors.append(f"{REGISTRY_PATH}: semantic {sid} has no correctness_gate")
+            continue
+        paths = _gate_relpaths(gate)
+        for part in paths:
+            # Entries here are files. Require an existing repo-relative path so
+            # a renamed/deleted gate can't leave a declarative ghost reference.
+            if not (ROOT / part).exists():
+                errors.append(
+                    f"{REGISTRY_PATH}: semantic {sid} gate path does not exist: {part}"
+                )
+        # A concrete gate path must explicitly state its coverage: either it
+        # exercises the production geometry (gate_scope="production") or it says
+        # which production shape/path it does NOT cover (gate_gap). A path that
+        # merely exists must not read as "verified" — a small-shape test next to
+        # a production-shaped kernel is the varlen class of false coverage.
+        # "none"/"vendor-trusted" entries declare their status in the gate value.
+        if paths and gate != "none" and not gate.startswith("vendor-trusted:"):
+            scope = str(entry.get("gate_scope", "")).strip()
+            gap = str(entry.get("gate_gap", "")).strip()
+            if scope != "production" and not gap:
+                errors.append(
+                    f"{REGISTRY_PATH}: semantic {sid} has a concrete gate path but neither "
+                    'gate_scope="production" nor a non-empty gate_gap — state coverage explicitly'
+                )
+            elif scope == "production" and gap:
+                errors.append(
+                    f"{REGISTRY_PATH}: semantic {sid} sets both gate_scope=production and gate_gap; "
+                    "pick one"
+                )
+    return errors
+
+
 def check_experience_doc_inventory() -> list[str]:
     errors = []
     for rel_path, max_entries in MAX_EXPERIENCE_ENTRIES.items():
@@ -656,6 +717,32 @@ def break_registry_coverage(root: Path) -> None:
     path.write_text("".join(kept))
 
 
+def break_registry_gate_path(root: Path) -> None:
+    """Delete one gate file the registry references, so the executable-path
+    check has a concrete missing path to report (the declarative-label world it
+    replaces would have passed silently)."""
+    with rooted(root):
+        relpaths = [
+            p for entry in _registry_semantic_entries()
+            for p in _gate_relpaths(str(entry.get("correctness_gate", "")))
+        ]
+    if not relpaths:
+        raise AssertionError("registry has no concrete gate path to remove")
+    (root / relpaths[0]).unlink()
+
+
+def break_registry_gate_undeclared_scope(root: Path) -> None:
+    """A concrete gate path with neither gate_scope="production" nor a gate_gap
+    must fail: an existing small-shape test must not silently read as production
+    coverage."""
+    path = root / REGISTRY_FIXTURE
+    lines = path.read_text().splitlines(keepends=True)
+    kept = [ln for ln in lines if not re.match(r'\s*gate_scope\s*=\s*"production"', ln)]
+    if len(kept) == len(lines):
+        raise AssertionError("no gate_scope=\"production\" line to remove")
+    path.write_text("".join(kept))
+
+
 def break_repo_wide_markers(root: Path) -> None:
     path = root / MARKER_FIXTURE
     path.write_text(path.read_text() + "\nbuilt at /Users/someone/code/agent-infer\n")
@@ -717,6 +804,18 @@ SELFTEST_WORLDS = [
      (LAUNCHER_FIXTURE,), break_decode_graph_invalidation),
     ("registry_covers_runtime_counters", check_registry_covers_runtime_counters,
      (REGISTRY_FIXTURE, LAUNCHER_FIXTURE), break_registry_coverage),
+    ("registry_gate_paths_exist", check_registry_gate_paths,
+     (REGISTRY_FIXTURE, *sorted({
+         p for entry in _registry_semantic_entries()
+         for p in _gate_relpaths(str(entry.get("correctness_gate", "")))
+     })),
+     break_registry_gate_path),
+    ("registry_gate_scope_declared", check_registry_gate_paths,
+     (REGISTRY_FIXTURE, *sorted({
+         p for entry in _registry_semantic_entries()
+         for p in _gate_relpaths(str(entry.get("correctness_gate", "")))
+     })),
+     break_registry_gate_undeclared_scope),
     ("repo_wide_disallowed_markers", check_repo_wide_disallowed_markers,
      (MARKER_FIXTURE,), break_repo_wide_markers),
     ("wins_baseline_citations", check_wins_baseline_citations, (WINS_FIXTURE,), break_wins_baseline),
@@ -777,6 +876,7 @@ def main() -> int:
     errors.extend(check_launcher_boundary())
     errors.extend(check_decode_graph_invalidation())
     errors.extend(check_registry_covers_runtime_counters())
+    errors.extend(check_registry_gate_paths())
     errors.extend(check_prereg_no_stale_running())
     errors.extend(check_agenda_ledger())
 

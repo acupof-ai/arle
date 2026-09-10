@@ -4,7 +4,8 @@ kind = "composite"
 inputs = ["activation", "fp8_weight", "block_scales"]
 outputs = ["projection"]
 reference = "cuda.qwen.fp8_gemv"
-correctness_gate = "numeric+e2e"
+correctness_gate = "crates/infer-cuda/examples/marlin_fp8_parity.rs"
+gate_scope = "production"
 
 [[implementation]]
 id = "cuda.qwen.fp8_pack_deepgemm"
@@ -59,7 +60,7 @@ kind = "primitive"
 inputs = ["hidden", "gamma"]
 outputs = ["normed"]
 reference = "cuda.qwen.rms_norm_batched"
-correctness_gate = "numeric+e2e"
+correctness_gate = "none"
 
 [[implementation]]
 id = "cuda.qwen.rms_norm_batched"
@@ -89,7 +90,8 @@ kind = "composite"
 inputs = ["activation", "int8_weight", "group_scales"]
 outputs = ["projection"]
 reference = "cuda.w8a16.gemv"
-correctness_gate = "numeric+e2e"
+correctness_gate = "crates/infer-cuda/examples/marlin_w8a16_parity.rs"
+gate_scope = "production"
 
 [[implementation]]
 id = "cuda.w8a16.marlin_tensorcore"
@@ -124,7 +126,8 @@ kind = "composite"
 inputs = ["activation", "int4_weight", "group_scales"]
 outputs = ["projection"]
 reference = "cuda.w4a16.gemv"
-correctness_gate = "numeric+e2e"
+correctness_gate = "crates/cuda-kernels/src/ffi/gemm_tests.rs"
+gate_gap = "w4a16_gemv_matches_reference is n=4 k=256 m=1; production W4A16 (only path is w4a16_gemv/batch, quant_linear_int.rs) runs hidden-dim widths and batched prefill m>1, neither covered"
 
 [[implementation]]
 id = "cuda.w4a16.gemv"
@@ -143,7 +146,8 @@ kind = "composite"
 inputs = ["activation", "fp4_marlin_weight", "group_scales", "global_scale"]
 outputs = ["projection"]
 reference = "cuda.fp4.marlin_tensorcore"
-correctness_gate = "numeric+e2e"
+correctness_gate = "crates/infer-cuda/examples/marlin_fp4_correctness.rs; scripts/kernel_ab_fp4.sh"
+gate_scope = "production"
 
 [[implementation]]
 id = "cuda.fp4.widen_fp8_deepgemm"
@@ -170,7 +174,7 @@ kind = "composite"
 inputs = ["q", "k_cache", "v_cache", "start_pos"]
 outputs = ["attn_out"]
 reference = "cuda.qwen35.attn_nonpaged_prefill"
-correctness_gate = "numeric+e2e"
+correctness_gate = "vendor-trusted: scripts/lever_gate.sh"
 
 [[implementation]]
 id = "cuda.qwen35.attn_fa2_sm70"
@@ -213,7 +217,7 @@ kind = "composite"
 inputs = ["q", "kv_pool", "page_table", "q_indptr", "kv_lens"]
 outputs = ["attn_out"]
 reference = "cuda.qwen35.paged_attn_v1"
-correctness_gate = "numeric+e2e"
+correctness_gate = "vendor-trusted: scripts/lever_gate.sh"
 
 [[implementation]]
 id = "cuda.qwen35.paged_quantized_fa3"
@@ -256,7 +260,7 @@ kind = "composite"
 inputs = ["q_prepared", "k_prepared", "latent_kv_pool", "selected_indices"]
 outputs = ["latent_attn_out"]
 reference = "cuda.dsv4.flashmla_sparse_decode"
-correctness_gate = "numeric+e2e"
+correctness_gate = "vendor-trusted: crates/infer-cuda/examples/dsv4_parity.rs; scripts/lever_gate.sh"
 
 [[implementation]]
 id = "cuda.dsv4.flashmla_sparse_prefill"
@@ -283,7 +287,8 @@ kind = "composite"
 inputs = ["qkv", "b", "a", "conv_state", "gdr_state"]
 outputs = ["gdr_out"]
 reference = "cuda.qwen35.gdr_recurrent_scan"
-correctness_gate = "numeric+e2e"
+correctness_gate = "crates/autograd/tests/test_linear_attention.rs"
+gate_gap = "training-side geometry (local heads 8/32,16/48 incl grads); serving GDN decode gdr_decode/gdr_decode_batch/conv1d_decode_batch and the attn_tp>=2 local (K,V)=(8,24) shard (16/48 global at attn_tp=2, rejected by fq_geometry_supported) have no numeric gate"
 
 [[implementation]]
 id = "cuda.qwen35.conv1d_front"
@@ -326,7 +331,8 @@ kind = "composite"
 inputs = ["logits", "draft_tokens", "uniforms"]
 outputs = ["token_ids", "accepted_len"]
 reference = "cuda.qwen.argmax"
-correctness_gate = "numeric+e2e"
+correctness_gate = "scripts/sampling_gate.py"
+gate_gap = "live-serve HTTP behavior only; the HOT serve-path CUDA argmax/argmax_batch selector (wrong tie-break silently changes output) has no CUDA numeric unit"
 
 [[implementation]]
 id = "cuda.qwen.argmax"
@@ -377,7 +383,7 @@ kind = "composite"
 inputs = ["hidden_bf16"]
 outputs = ["hidden_bf16"]
 reference = "cuda.arle.allreduce_nccl"
-correctness_gate = "numeric+e2e"
+correctness_gate = "none"
 
 [[implementation]]
 id = "cuda.arle.allreduce_oneshot"
@@ -412,7 +418,7 @@ kind = "composite"
 inputs = ["tape_tensors"]
 outputs = ["tape_tensors"]
 reference = "cuda.opd.nvrtc_catalog"
-correctness_gate = "numeric+e2e"
+correctness_gate = "none"
 
 [[implementation]]
 id = "cuda.opd.nvrtc_catalog"
@@ -432,7 +438,7 @@ kind = "composite"
 inputs = ["hidden", "router_logits", "expert_weights"]
 outputs = ["moe_out"]
 reference = "cuda.qwen35.moe_grouped_gemm_batch"
-correctness_gate = "numeric+e2e"
+correctness_gate = "none"
 
 [[implementation]]
 id = "cuda.qwen35.moe_deepgemm_grouped"
@@ -468,7 +474,8 @@ kind = "composite"
 inputs = ["hidden", "router_logits", "selection_bias", "expert_weights"]
 outputs = ["moe_out"]
 reference = "cuda.dsv4.moe_fp8_grouped_contig"
-correctness_gate = "numeric+e2e"
+correctness_gate = "crates/cuda-kernels/src/ffi/gemm_tests.rs; crates/infer-cuda/examples/dsv4_parity.rs"
+gate_gap = "grouped decode micro ref is hidden/inter=16 vs production expert dims (thousands); dsv4_parity gates only the first prefill token at TP=8, realistic-scale grouped prefill MoE uncompared"
 
 [[implementation]]
 id = "cuda.dsv4.moe_w4a16_gemv"
@@ -520,7 +527,7 @@ kind = "transport"
 inputs = ["hidden_owned_slice", "routing"]
 outputs = ["moe_out_owned_slice"]
 reference = "cuda.dsv4.moe_local_ep"
-correctness_gate = "e2e"
+correctness_gate = "none"
 
 [[implementation]]
 id = "cuda.dsv4.moe_deepep_low_latency"
