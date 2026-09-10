@@ -812,7 +812,9 @@ mod tests {
     use super::*;
 
     fn tiny_array() -> mlx::MlxArray {
-        mlx::MlxArray::from_bytes(vec![0u8; 8], &[2], mlx::Dtype::float32)
+        // shape [2] × Float32 (4 B) = 8 bytes.
+        let bytes = vec![0u8; 8];
+        mlx::MlxArray::from_bytes(&bytes, &[2], mlx::Dtype::Float32)
     }
 
     #[test]
