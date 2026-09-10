@@ -139,4 +139,56 @@ grep -q 'examples lint reported everything Fresh' "$TMP/ex-red.log"
 MOCK_LINT_LINES='Checking infer-api \nChecking infer-cuda \nChecking cuda-kernels \n' MOCK_EXAMPLES_LINES='Checking fixture_example \n' run_hook "$extip" "$exbase" >"$TMP/ex-green.log" 2>&1 \
   || { echo "FAIL: examples green world rejected" >&2; cat "$TMP/ex-green.log" >&2; exit 1; }
 
-echo "PASS: CUDA lint + test-step freshness assertions (red/green/new-branch/control/test-red/color/examples-red/examples-green)"
+
+# --- Lock worlds -----------------------------------------------------------
+# The cargo lock is machine-global (${TMPDIR}/arle-pre-push-cargo.lock). These
+# worlds run the hook with a private TMPDIR so they cannot collide with a real
+# hook's lock, and without ARLE_PRE_PUSH_NESTED so the lock is live. A run that
+# executes no cargo step must skip it; a run that does must wait on it.
+LOCK_TMP="$TMP/locktmp"; mkdir -p "$LOCK_TMP"
+run_hook_locked() {  # $1 = local sha, $2 = remote sha
+  ( cd "$FIX" && TMPDIR="$LOCK_TMP" PATH="$BIN:$PATH" bash "$FIX/scripts/pre_push_checks.sh" ) <<<"refs/heads/lane/x $1 refs/heads/lane/x $2"
+}
+hold_lock() { mkdir "$LOCK_TMP/arle-pre-push-cargo.lock"; printf '%s\n' "$$" > "$LOCK_TMP/arle-pre-push-cargo.lock/pid"; }
+release_lock() { rm -rf "$LOCK_TMP/arle-pre-push-cargo.lock"; }
+
+# Skip world: docs-only push, Metal off — no cargo step runs, so the hook must
+# not wait on the held lock. The docs commit is built with coretip (not the
+# current HEAD, which carries the examples .rs commit) as its parent, so the
+# pushed range coretip..docstip contains only a README change.
+export GIT_INDEX_FILE="$TMP/docsidx"
+git -C "$FIX" read-tree "$coretip"
+dblob="$(printf 'docs\n' | git -C "$FIX" hash-object -w --stdin)"
+git -C "$FIX" update-index --add --cacheinfo 100644,"$dblob",README.md
+dtree="$(git -C "$FIX" write-tree)"
+docstip="$(git -C "$FIX" commit-tree "$dtree" -p "$coretip" -m docs)"
+unset GIT_INDEX_FILE
+hold_lock
+(run_hook_locked "$docstip" "$coretip" >"$TMP/skip.log" 2>&1; echo $? > "$TMP/skip.rc") &
+skip_pid=$!
+for _ in $(seq 1 60); do kill -0 "$skip_pid" 2>/dev/null || break; sleep 0.5; done
+if kill -0 "$skip_pid" 2>/dev/null; then
+  kill "$skip_pid" 2>/dev/null || true
+  echo "FAIL: docs-only push waited on the cargo lock" >&2; cat "$TMP/skip.log" >&2; exit 1
+fi
+[ "$(cat "$TMP/skip.rc")" = 0 ] || { echo "FAIL: docs-only push rejected" >&2; cat "$TMP/skip.log" >&2; exit 1; }
+! grep -q 'waiting for peer hook' "$TMP/skip.log" || { echo "FAIL: skip world printed the wait message" >&2; cat "$TMP/skip.log" >&2; exit 1; }
+release_lock
+
+# Wait world: a push changing .rs runs cargo steps, so it waits for the held
+# lock and completes once it is released.
+hold_lock
+(run_hook_locked "$coretip" "$corebase" >"$TMP/wait.log" 2>&1; echo $? > "$TMP/wait.rc") &
+wait_pid=$!
+sleep 2
+kill -0 "$wait_pid" 2>/dev/null || { echo "FAIL: .rs push did not wait for the held lock" >&2; cat "$TMP/wait.log" >&2; exit 1; }
+grep -q 'waiting for peer hook' "$TMP/wait.log" || { echo "FAIL: wait message missing" >&2; cat "$TMP/wait.log" >&2; exit 1; }
+release_lock
+for _ in $(seq 1 120); do kill -0 "$wait_pid" 2>/dev/null || break; sleep 0.5; done
+if kill -0 "$wait_pid" 2>/dev/null; then
+  kill "$wait_pid" 2>/dev/null || true
+  echo "FAIL: hook did not complete after lock release" >&2; cat "$TMP/wait.log" >&2; exit 1
+fi
+[ "$(cat "$TMP/wait.rc")" = 0 ] || { echo "FAIL: wait world rejected" >&2; cat "$TMP/wait.log" >&2; exit 1; }
+
+echo "PASS: CUDA lint + test-step freshness (red/green/new-branch/control/test-red/color/examples-red/examples-green), cargo lock (skip/wait)"
