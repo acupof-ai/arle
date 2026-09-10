@@ -927,16 +927,20 @@ mod tests {
         // Env is process-global; infer-cuda has no other env-mutating tests, so
         // no serialization is needed today. Restore on exit.
         let saved = std::env::var("INFER_TP_SIZE").ok();
+        // SAFETY: single-threaded test; no other infer-cuda test mutates env, restored below.
         unsafe {
             std::env::set_var("INFER_TP_SIZE", "1");
         }
         let w1 = default_t1_budget_per_rank();
+        // SAFETY: see above.
         unsafe {
             std::env::set_var("INFER_TP_SIZE", "2");
         }
         let w2 = default_t1_budget_per_rank();
         match saved {
+            // SAFETY: restore only, same single-threaded test.
             Some(v) => unsafe { std::env::set_var("INFER_TP_SIZE", v) },
+            // SAFETY: restore only, same single-threaded test.
             None => unsafe { std::env::remove_var("INFER_TP_SIZE") },
         }
         assert!(w1 > 0, "world=1 budget must be non-zero");
