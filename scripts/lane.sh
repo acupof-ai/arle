@@ -94,6 +94,15 @@ pr)
         git -C "$path" rebase main || {
             echo "lane: rebase stopped with conflicts in $path — resolve, then rerun" >&2; exit 2; }
     fi
+    # Pre-PR rules; the body file is checked here and sent to gh below.
+    precheck_body="$(mktemp -t arle-pr-body-XXXXXX)"
+    trap 'rm -f "$precheck_body"' EXIT
+    git -C "$path" log main..HEAD --pretty='- %s' > "$precheck_body"
+    [ -n "${ARLE_PR_BODY:-}" ] && printf '%s\n' "$ARLE_PR_BODY" > "$precheck_body"
+    [ -n "${ARLE_PR_BODY_FILE:-}" ] && cp "$ARLE_PR_BODY_FILE" "$precheck_body"
+    python3 "$ROOT/scripts/lane_pr_precheck.py" --repo "$path" --pr-body "$precheck_body" || {
+        echo "lane: pre-PR checks failed in $path; fix the listed items or pass an updated body via ARLE_PR_BODY_FILE" >&2
+        exit 2; }
     git -C "$path" push -u --force-with-lease origin "lane/$name"
     # A push can look successful and not take: the hook passing says nothing
     # about bytes reaching the remote (a kill between hook and upload leaves
@@ -104,7 +113,7 @@ pr)
     title="${3:-$(git -C "$path" log -1 --pretty=%s)}"
     gh pr create --repo "$(git -C "$ROOT" remote get-url origin | sed 's#.*[:/]\([^/]*/[^/]*\)\.git#\1#')" \
         --base main --head "lane/$name" --title "$title" \
-        --body "$(git -C "$path" log main..HEAD --pretty='- %s')"
+        --body-file "$precheck_body"
     ;;
 list)
     git -C "$ROOT" worktree list
