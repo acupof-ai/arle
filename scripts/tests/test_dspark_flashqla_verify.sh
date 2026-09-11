@@ -18,8 +18,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/bin" "$TMP/tools"
 
-# Mock arle: on `serve ... --port P`, print the single-process marker then run
-# an HTTP server with GLOBAL spec counters: POST adds 100 drafted / 13 accepted.
+# Mock arle: on `serve ... --port P`, record whether ARLE_CUDA_PROFILE is in
+# the environment (the test asserts only probe serves have it), print the
+# single-process marker, then run a global-counter stats server.
 cat > "$TMP/bin/arle" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = serve ]; then
@@ -27,6 +28,9 @@ if [ "${1:-}" = serve ]; then
   while [ $# -gt 0 ]; do
     if [ "$1" = "--port" ]; then port="$2"; shift 2; else shift; fi
   done
+  if [ -n "${ARLE_DSV_SERVE_ENV_LOG:-}" ]; then
+    echo "port=$port profile=${ARLE_CUDA_PROFILE:-0}" >> "$ARLE_DSV_SERVE_ENV_LOG"
+  fi
   echo "[multiproc-coord] world_size=1; serving single-process (no workers)"
   exec python3 - "$port" <<'PY'
 import sys, threading
@@ -121,6 +125,9 @@ chmod +x "$TMP/tools/"*.py
 
 export ACCEPT_INVOC_LOG="$TMP/accept-invocations.log"
 : > "$ACCEPT_INVOC_LOG"
+# The mock arle appends one line per serve; port alone identifies the probe.
+export ARLE_DSV_SERVE_ENV_LOG="$TMP/serve-env.log"
+: > "$ARLE_DSV_SERVE_ENV_LOG"
 
 common_env() {  # $1 = lever script
     printf '%s ' \
@@ -164,6 +171,14 @@ grep -qE '^base\t1\taccept-c8\t104/800\tPASS' "$OUT1/results.tsv" \
 # Exactly one tool invocation per c with the right --concurrency.
 [ "$(grep -c '^concurrency=8 ' "$ACCEPT_INVOC_LOG")" = 2 ] \
     || { echo "FAIL: expected one c=8 acceptance call per arm" >&2; cat "$ACCEPT_INVOC_LOG" >&2; exit 1; }
+# Measured serves (ports < 18600) must be profile-FREE; only probe serves
+# (>=18600) may carry ARLE_CUDA_PROFILE=1.
+measured_profiled="$(awk -F'[= ]' '$2<18600 && $4==1{c++} END{print c+0}' "$ARLE_DSV_SERVE_ENV_LOG")"
+probe_unprofiled="$(awk -F'[= ]' '$2>=18600 && $4==0{c++} END{print c+0}' "$ARLE_DSV_SERVE_ENV_LOG")"
+[ "$measured_profiled" = 0 ] || { echo "FAIL: a measured serve had ARLE_CUDA_PROFILE set (TTFT/acceptance contamination)" >&2; cat "$ARLE_DSV_SERVE_ENV_LOG" >&2; exit 1; }
+[ "$probe_unprofiled" = 0 ] || { echo "FAIL: probe serve missing ARLE_CUDA_PROFILE" >&2; cat "$ARLE_DSV_SERVE_ENV_LOG" >&2; exit 1; }
+nprobe="$(awk -F'[= ]' '$2>=18600{c++} END{print c+0}' "$ARLE_DSV_SERVE_ENV_LOG")"
+[ "$nprobe" = 2 ] || { echo "FAIL: expected 2 probe serves (one per arm), got $nprobe" >&2; cat "$ARLE_DSV_SERVE_ENV_LOG" >&2; exit 1; }
 grep -q '| base | 1 | needle |' "$OUT1/results.md" \
     || { echo "FAIL: markdown table missing" >&2; exit 1; }
 

@@ -74,12 +74,10 @@ fi
 EXTRA=( ${EXTRA_SERVE_FLAGS:-} )
 # #300 fallback A/B: GDR_CHUNKED=0 appends `--qwen35-gdr-chunked false` to BOTH
 # arms (cli/src/args.rs:829-830 — the only switch; there is no env var). The
-# effect is verified from /v1/stats op_timing, not assumed.
+# effect is verified from a dedicated profile-enabled PROBE serve, never from
+# the measured serves.
 GDR_FLAG=()
 case "${GDR_CHUNKED:-}" in 0|false|no) GDR_FLAG=(--qwen35-gdr-chunked false) ;; esac
-# ARLE_CUDA_PROFILE=1 makes every serve report per-op timings on /v1/stats,
-# which is how the GDR path (gdr_fq vs gdr_recurrent) is verified.
-export ARLE_CUDA_PROFILE=1
 
 NAME="dspark-flashqla-verify-$(date +%Y%m%d%H%M%S)"
 prereg() {  # $1 = start|close $2 = arm [rest = done fields]
@@ -263,12 +261,54 @@ PY
     if [ "$r1" != FAIL ]; then row "$arm" "$tp" accept-c1 "$r1" PASS "$logdir/accept-c1.json"; else row "$arm" "$tp" accept-c1 "-" FAIL "$logdir/accept-c1.log"; fi
     if [ "$r8" != FAIL ]; then row "$arm" "$tp" accept-c8 "$r8" PASS "$logdir/accept-c8.json"; else row "$arm" "$tp" accept-c8 "-" FAIL "$logdir/accept-c8.log"; fi
 
-    # GDR path effect check from /v1/stats op_timing (ARLE_CUDA_PROFILE=1):
-    # chunked FlashQLA logs "linear/gdr_fq", the varlen fallback logs
-    # "linear/gdr_recurrent". GDR_CHUNKED=0 must force gdr_fq count to 0, so
-    # a misspelled switch can't pass as a silent no-op.
+    kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true
+    trap - RETURN
+
+    # GDR path effect check on a DEDICATED profile-enabled probe serve. The
+    # measured serves above stay profile-free: ARLE_CUDA_PROFILE=1 makes
+    # profile_op build two CUDA events + synchronize after every op, which
+    # changes TTFT and batch timing, so it can never wrap the A/B serves.
+    gdr_probe "$arm" "$bin" "$tp" "$gpus"
+}
+
+# Short standalone serve with ARLE_CUDA_PROFILE=1 that serves one long-prompt
+# request (exercises a multi-row GDN prefill advance) then reads the actual
+# linear-attention kernel from /v1/stats op_timing: "linear/gdr_fq" (chunked
+# FlashQLA) vs "linear/gdr_recurrent" (varlen fallback).
+gdr_probe() {  # $1=arm $2=bin $3=tp $4=gpu-csv
+    local arm="$1" bin="$2" tp="$3" gpus="$4"
+    local pflags=(--spec-type dspark --mtp-draft-model "$DRAFT_MODEL"
+        --tensor-parallel-size "$tp" ${GDR_FLAG[@]+"${GDR_FLAG[@]}"} ${EXTRA[@]+"${EXTRA[@]}"})
+    local logdir="$OUT/logs/${arm}-tp${tp}"; local pport=$((18600 + RANDOM % 150))
+    CUDA_VISIBLE_DEVICES="$gpus" ARLE_CUDA_PROFILE=1 \
+        RUST_LOG=info "$bin" serve --backend cuda --model-path "$MODEL" --port "$pport" \
+        "${pflags[@]}" >"$logdir/probe.log" 2>&1 &
+    local pid=$!
+    if ! serve_up "$pport"; then
+        row "$arm" "$tp" gdr-path "-" FAIL "probe serve never ready $logdir/probe.log"
+        kill "$pid" 2>/dev/null || true; return 0
+    fi
+    python3 - "$pport" "$LONG_PROMPTS_JSONL" <<'PY' >"$logdir/probe-response.json" 2>/dev/null
+import json, sys, urllib.request
+port, prompts_file = sys.argv[1], sys.argv[2]
+prompt = "probe"
+try:
+    for line in open(prompts_file):
+        if line.strip():
+            v = json.loads(line)
+            prompt = (v.get("text") or v.get("prompt") or v.get("input") or "probe")[:6000]
+            break
+except OSError:
+    pass
+body = json.dumps({"model": "default",
+                   "messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": 8, "temperature": 0}).encode()
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                             data=body, headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=120).read()
+PY
     local gdr_path
-    gdr_path="$(python3 - "$bport" <<'PY'
+    gdr_path="$(python3 - "$pport" <<'PY'
 import json, sys, urllib.request
 with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/v1/stats", timeout=10) as r:
     ops = json.load(r).get("op_timing", {}).get("ops", [])
@@ -280,16 +320,14 @@ PY
     if [ "${#GDR_FLAG[@]}" -gt 0 ]; then
         local fqcnt="${gdr_path#gdr_fq=}"; fqcnt="${fqcnt%% *}"
         if [ "$fqcnt" = 0 ]; then
-            row "$arm" "$tp" gdr-path "$gdr_path (chunked forced off)" PASS "$logdir/serve.log"
+            row "$arm" "$tp" gdr-path "$gdr_path (chunked forced off)" PASS "$logdir/probe.log"
         else
-            row "$arm" "$tp" gdr-path "$gdr_path (expected gdr_fq=0)" FAIL "$logdir/serve.log"
+            row "$arm" "$tp" gdr-path "$gdr_path (expected gdr_fq=0)" FAIL "$logdir/probe.log"
         fi
     else
-        row "$arm" "$tp" gdr-path "$gdr_path" INFO "$logdir/serve.log"
+        row "$arm" "$tp" gdr-path "$gdr_path" INFO "$logdir/probe.log"
     fi
-
-    kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true
-    trap - RETURN
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
 }
 
 CORRECT_FAIL=0
