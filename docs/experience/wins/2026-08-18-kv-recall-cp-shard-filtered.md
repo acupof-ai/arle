@@ -86,3 +86,9 @@ The recall algorithm's rank-local independence (each rank scores/evicts/
 prefetches its own pages) is the right decomposition for block-cyclic
 sharding — no cross-rank coordination needed, no collective schedule
 divergence.
+
+## Correction — 2026-09-11
+
+`ShardSpec::global_page` (the inverse of `local_index`) had zero tree-wide
+callers and was deleted in #356. The rank-local recall behavior described
+above is driven by `local_index`, which remains.

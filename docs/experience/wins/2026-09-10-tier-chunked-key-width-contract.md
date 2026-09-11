@@ -68,3 +68,9 @@ mechanical facts.
 
 3 files, +27/-8. kv-native-sys 7/7, infer-seam 8/8, infer-kvspace 12/12
 green; Mac CUDA clippy gate exit 0.
+
+## Correction — 2026-09-11
+
+The non-chunked `TIER_KEY_BITS` (56) constant had zero references after the
+split and was deleted in #356; `TIER_CHUNKED_KEY_BITS` (40) is the single
+surviving constant. The 56/40 distinction is documented on it.

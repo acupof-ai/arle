@@ -44,3 +44,10 @@ adds the missing Rubricator and the test gate.
 
 A rubric induction that rejects empty/malformed output is a retry, not a
 silent default — the parse never returns a partial rubric.
+
+## Correction — 2026-09-11
+
+`Rubricator::induce_prompt` had zero callers and was deleted in #356;
+`Rubricator` + `parse_induction` are retained as `#[cfg(test)]` (used only
+by the three induction parser tests). The training binary never emits
+induction prompts.

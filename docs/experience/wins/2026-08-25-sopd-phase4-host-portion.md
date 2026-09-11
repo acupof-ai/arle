@@ -43,3 +43,10 @@ A default-no-op seam method is the migration seam for graph invalidation:
 backends without a captured decode graph keep the default, and the CUDA
 override lands independently. A bounded sync channel is the simplest
 backpressure-correct trajectory pipe.
+
+## Correction — 2026-09-11
+
+`TrajectoryChannel`/`TrajectoryEmitter` were scaffolding only: 94f8eabb3
+added the channel plus unit tests, but no producer or consumer was ever
+wired to the agent or OPD loop. S52 deleted both in #356. The C1 graph
+invalidation half of this tranche is unaffected.

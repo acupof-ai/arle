@@ -41,3 +41,12 @@ The weight-requant primitive itself is cuda-kernels (TurboQuant/Marlin/Q4_K)
 A cadence controller is pure logic (step counter + threshold); the snapshot
 is the only stateful piece, and it composes with the existing EMA/adapter
 snapshot rather than duplicating it.
+
+## Correction — 2026-09-11
+
+S52 found `ConsolidationCadence` and `BaseWeightSnapshot` had zero callers:
+the only references after 2c36e25a7 (the introducing commit) were their own
+unit tests. The OPD loop never wired either — the tranche shipped host
+primitives for a phase whose GPU-side requant primitive was out of scope,
+and the wiring never followed. Deleted in #356; no regression because there
+was no shipped caller to lose.
