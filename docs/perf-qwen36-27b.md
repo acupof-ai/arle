@@ -1133,7 +1133,7 @@ hypothesis that "accept halves at concurrency" is already withdrawn
 
 ## 3. Speculative decode — the DSpark tick
 
-`ARLE_DSPARK_PHASE=1`, 2026-08-07, c=16, short prompts, 293 ticks,
+2026-08-07, c=16, short prompts, 293 ticks (captured under the DSpark phase-timing probe, since removed),
 mean 11.0 rows/tick.
 
 The tick is sequential, so position and length are both to scale:

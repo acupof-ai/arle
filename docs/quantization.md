@@ -28,7 +28,6 @@ with concrete evidence.
 | KV cache | TurboQuant TQ4 | deferred (CUDA) | `--kv-cache-dtype tq4` (the clap enum accepts `auto\|bf16\|int8\|fp8\|tq4` — there is no `tq2`/`tq3`, `args.rs:927`) | No runtime arm: engine construction bails with an explicit-deferral message (`infer-cuda/src/executor.rs:100`). |
 | **Weights** | DenseBF16 | production | default | No quantization. |
 | Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4_gemv` + Marlin W4 prefill. |
-| Weights | MarlinW4A8 | production (CUDA), Tier-1 | env `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` for the prefill-graph win path (–92.5% TTFT p50). |
 | Weights | W8A16 (per-group INT8) | production (CUDA) | safetensors metadata | GEMV + GEMM path. |
 | Weights | W2A16 (per-group packed INT2) | experimental (CUDA) | safetensors metadata | Enum variant `WeightFormat::W2A16` exists; no load or kernel scaffolding is wired; not gate-validated. |
 | Weights | GGUF Q3_K / Q4_K / Q5_K / Q6_K | production (CUDA & Metal) | `.gguf` extension | Packed superblock kernels in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`. |
@@ -111,7 +110,6 @@ safetensors load runs in the CUDA weight loader (`crates/infer-cuda/src/loader.r
 | `DenseBf16` | 16 | n/a | `cublasLt` / cublasGemmEx | production |
 | `W8A16` | 8 | per-group BF16 | `gemv_w8a16` | production |
 | `W4A16` | 4 packed | per-group BF16 | `w4_gemv_kernel` + Marlin W4 prefill | production |
-| `MarlinW4A8` | 4 packed + dyn INT8 act | per-group BF16 | Marlin W4 + INT8 act prefill | production, **Tier-1 wins via prefill-graph capture** |
 | `W2A16` | 2 packed | per-group BF16 | none (enum variant only) | experimental |
 | `GgufQ3K` | 3 packed (superblock) | embedded | `gguf_q3k_gemv` | production (CUDA + Metal) |
 | `GgufQ4K` | 4 packed (superblock) | embedded | `q4k_gemv_kernel` + packed fast path | production (CUDA + Metal) |
@@ -119,23 +117,6 @@ safetensors load runs in the CUDA weight loader (`crates/infer-cuda/src/loader.r
 | `GgufQ6K` | 6 packed (superblock) | embedded | `gguf_q6k_gemv` | production (CUDA + Metal) |
 | `Dsv4Fp8BlockScaled` | 8 (E4M3) | per-block FP8 E8M0 | DSv4-specific | in progress (DSv4 dependency) |
 | `Dsv4Fp4BlockScaled` | 4 packed (E2M1) | per-block FP8 E8M0 | DSv4-specific | in progress (DSv4 dependency) |
-
-### 2.1 W4-hybrid prefill CUDA Graph capture — Tier 1 wins detail
-
-Opt-in via:
-```bash
-INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1
-```
-
-Path B.2 bucketing fix (`a56b7a9` / `c44788f`) delivers on matched
-4k/c=4 60s on Qwen3.5 paged prefill:
-- engine TTFT p50: 2000 ms → 150 ms (**–92.5%**)
-- 7 unique capture keys, 98.5% LRU reuse
-- +632% throughput, closes the +76.6% SGLang gap
-
-Default behavior unchanged when env unset.
-
----
 
 ### 1.5 Metal INT8 (MLX affine groups)
 
@@ -168,8 +149,7 @@ Default behavior unchanged when env unset.
 
 # Weight quantization
 # Format is autodetected from safetensors metadata. No CLI flag needed.
-# GGUF detected from .gguf extension. MarlinW4A8 prefill-graph opt-in:
-INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1
+# GGUF detected from .gguf extension.
 ```
 
 Source: the `--kv-cache-dtype` CLI parser in `crates/cli`, carried through

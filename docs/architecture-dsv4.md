@@ -72,27 +72,27 @@ RoPE / indexer) + `mla_attention_fwd` (the attention kernel).
  fusion: `run_fused_wqkv_prefill` (`attention.rs:5531`), `prefill_proj_deepgemm`
  (`attention.rs:5376`).
 - **RoPE (partial dims + Hadamard)**: `dsv4_prepare_qk_cuda` (`attention.rs:9220`;
- kernel `dsv4_prepare_qk_fused_kernel`, `csrc/misc/dsv4_attention.cu:274`,
+ kernel `dsv4_prepare_qk_fused_kernel`, `csrc/attention/dsv4_prep.cu:95`,
  hand-rolled).
 - **DSA indexer** (sparse key selection, mode-gated): see §4.
 - **Write KV (bf16 pack)**: `arle_flashmla_csa_pack_kv` (`attention.rs:6358`;
- hand-rolled `csrc/misc/arle_flashmla_csa_prep.cu`) packs one contiguous bf16
+ hand-rolled `csrc/attention/arle_flashmla_csa_prep.cu`) packs one contiguous bf16
  pool `[SW ring | current-chunk K | compressed pool]`.
 - **Build sparse indices** (per mode): `arle_flashmla_{chain_verify,csa,hca}_build_indices`
  (`attention.rs:6406/6438/6478`, hand-rolled same file).
 - **Prefill attention kernel** = `arle_flashmla_sm90_sparse_prefill_fwd`
- (`attention.rs:6620`; shim `csrc/misc/arle_flashmla_shim.cu:38`) →
+ (`attention.rs:6620`; shim `csrc/attention/arle_flashmla_shim.cu:37`) →
  **vendored FlashMLA `sm90::run_fwd_kernel`** (`vendor/flashmla/csrc/sm90/prefill/sparse/fwd.cu`,
  sparse varlen prefill, B_H=64 / B_TOPK=64).
 - **Tail**: TP repack/out-slice (`dsv4_tp_q_repack_cuda` / `dsv4_tp_out_slice_cuda`),
  output inverse-RoPE (`arle_dsv4_output_inverse_rope_batch_*`), SW ring update
- (`dsv4_update_window_cache_cuda`, `csrc/misc/dsv4_attention.cu:863`).
+ (`dsv4_update_window_cache_cuda`, `csrc/attention/dsv4_swa.cu:75`).
 - **O-LoRA all-reduce**: `tp.all_reduce_sum` (`dsv4.rs:4909`, NCCL, single-GPU no-op).
 
 ### 1.3 MoE half
 - **GLM dense layer** (only `per_layer_dense_mlp[i]`): `dsv4_dense_mlp_forward`
  (`dsv4.rs:6228`) — bf16 SwiGLU FFN, `dsv4_linear` gate/up → `ops::silu_mul`
- (`csrc/misc/elementwise_basic.cu:86`) → `dsv4_linear` down. (DSv4 is MoE on
+ (`csrc/elementwise/elementwise_basic.cu:40`) → `dsv4_linear` down. (DSv4 is MoE on
  every layer; this is GLM-only.)
 - **Routed MoE**: router GEMM (`gemm_batch(&layer.gate)`) → `dsv4_route`
  (`moe.rs:2602`; kernel `dsv4_route_kernel`, `csrc/moe/dsv4_route.cu:329`,
@@ -135,13 +135,13 @@ MODEL1 (`w_kc/w_vc/o_proj` all `None`) → `mla_attention_decode_graph`
 3. **Build decode indices**: `dsv4_flashmla_decode_build_indices_start_pos_ptr`
  (`attention.rs:6875`; kernel `csrc/attention/dsv4_flashmla_decode_build_indices.cu:186`).
 4. **Decode attention kernel** = `arle_flashmla_sm90_sparse_decode_fwd`
- (`attention.rs:7016`; shim `csrc/misc/arle_flashmla_decode_shim.cu:209`) →
+ (`attention.rs:7016`; shim `csrc/attention/arle_flashmla_decode_shim.cu:204`) →
  **vendored FlashMLA `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`
  + `run_flash_mla_combine_kernel`** (SM90 sparse-FP8 split-KV decode).
 
-Eager fallback (FlashMLA decode off): hand-rolled fused MLA cores
-`dsv4_swa_attention_start_pos_ptr_cuda` (SW, `csrc/misc/dsv4_attention.cu:751`) /
-`dsv4_hybrid_attention_start_pos_ptr_cuda` (CSA/HCA, `.cu:1765`).
+FlashMLA covers all four modes (SWA/CSA/HCA/DSA) for both prefill and
+decode; the legacy hand-rolled eager BF16 MLA cores were removed (the kernel
+delete is tracked in commit `bfc57e32e`).
 
 MoE half at decode — **default transport is `allreduce`** (`ARLE_DSV4_MOE_TRANSPORT`
 unset ⇒ local routed experts + per-layer TP all-reduce, `dsv4.rs:5308`); DeepEP-LL
@@ -472,7 +472,7 @@ counters are recomputed by `truncate_decode_len` + `flashmla_truncate_slot`.
 non-frozen and writes slot KV — selftest only. **Off by default**:
 `spec_decode_on = mtp_draft_tokens.is_some() || dspark_on`;
 `--spec-type` defaults `None`; `--spec-type mtp` defaults draft tokens to 2;
-CUDA-only. Adaptive skip via `ARLE_DSV4_MTP_ADAPTIVE` (B=1 only).
+CUDA-only. The B=1 adaptive-MTP skip and its `--mtp-adaptive` flag were removed; MTP runs whenever `spec_decode_on` is set.
 
 ---
 
@@ -601,7 +601,7 @@ Priority follows measured TP=4 B=4 wall-clock/kernels.
 | FlashMLA decode | `try_flashmla_decode_attention`, `sparse_decode_fwd_batched` | `attention.rs` |
 | FlashMLA prefill | `try_flashmla_prefill_attention` | `attention.rs` |
 | FP8 KV pack | `flashmla_pack_*`, `dsv4_fp8_kv_pack.cu` | `attention.rs`, `csrc/attention/` |
-| DSA indexer | `csa_select`, `csa_select_official`, `dsv4_dsa_official.cu` | `attention.rs`, `csrc/misc/` |
+| DSA indexer | `csa_select`, `csa_select_official`, `dsv4_dsa_official.cu` | `attention.rs`, `csrc/attention/` |
 | Paged MQA logits | `dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda` | `deepgemm_native.cu` |
 | MoE routing | `dsv4_route`, `dsv4_route.cu` | `moe.rs`, `csrc/moe/` |
 | Grouped GEMM | `deepgemm_grouped_experts*`, `sm90_fp8_gemm_1d2d_impl` | `moe.rs`, `vendor/deepgemm/` |

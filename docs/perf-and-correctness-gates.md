@@ -60,7 +60,7 @@ Require:
 Run at least:
 
 - targeted Rust tests
-- `tests/test_openai_api.py` when affected
+- `tests/python/test_openai_api.py` when affected
 - smoke validation if unit tests are not enough
 
 ### Scheduler changes
