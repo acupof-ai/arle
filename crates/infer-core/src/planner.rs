@@ -436,7 +436,7 @@ impl Engine {
         }
     }
 
-    pub(crate) fn plan_new_pages_needed(&self, plan: &ForwardPlan) -> usize {
+    fn plan_new_pages_needed(&self, plan: &ForwardPlan) -> usize {
         let prefill_pages = plan
             .prefill_rows
             .iter()

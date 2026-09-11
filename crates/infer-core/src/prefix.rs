@@ -91,7 +91,7 @@ impl Engine {
         .min(blocks.len())
     }
 
-    pub(crate) fn executor_release_prefix_pages(&mut self, pages: &[u32]) {
+    fn executor_release_prefix_pages(&mut self, pages: &[u32]) {
         if let Some(reuse) = self.executor.prefix_reuse() {
             reuse.release_prefix_pages(pages);
         }
@@ -1002,7 +1002,7 @@ impl Engine {
     /// Forward tier keys invalidated by radix mutations (sever, revive,
     /// promote) to the backend store. Called after every mutation batch so no
     /// path can leak a store entry.
-    pub(crate) fn drain_dropped_tier_keys(&mut self) {
+    fn drain_dropped_tier_keys(&mut self) {
         let keys = self.radix.take_dropped_tier_keys();
         if !keys.is_empty()
             && let Some(tier) = self.executor.kv_page_tier()
