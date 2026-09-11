@@ -423,9 +423,8 @@ mod real {
         (strict, cutoff)
     }
 
-    fn check_indexer(ctx: &DeviceContext, negative: bool) -> Result<bool> {
-        let mut all_pass = true;
-
+    // Returns (fused_q_ok, topk_ok) so each band is its own gate family.
+    fn check_indexer(ctx: &DeviceContext, negative: bool) -> Result<(bool, bool)> {
         // (1) Fused Q indexer: INDEX_BATCH tokens × INDEX_HEADS rows.
         let works = INDEX_BATCH * INDEX_HEADS;
         let mut rng = Rng::new(SEED ^ 0x1de5);
@@ -434,8 +433,14 @@ mod real {
             .collect();
         let positions: Vec<i32> = (0..INDEX_BATCH as i32).collect();
         let freqs = build_freqs(&positions);
-        let weights = vec![bf(1.0); works];
-        let (want_bytes, want_scales) = fused_q_indexer_ref(&q, &freqs, &positions, INDEX_HEADS);
+        // Non-unit weights and weight_scale match production's per-row multiply.
+        const WEIGHT_SCALE: f32 = 1.0 / 1024.0;
+        let weights: Vec<bf16> = (0..works).map(|_| bf(rng.normal() * 0.5)).collect();
+        let (want_bytes, mut want_scales) =
+            fused_q_indexer_ref(&q, &freqs, &positions, INDEX_HEADS);
+        if negative {
+            want_scales[0] *= 2.0;
+        }
 
         let q_d = ctx.stream.clone_htod(&q)?;
         let mut q_fp8_d = ctx.stream.alloc_zeros::<u8>(works * 128)?;
@@ -455,7 +460,7 @@ mod real {
             fp,
             wp,
             op,
-            1.0,
+            WEIGHT_SCALE,
             frp,
             pp,
             INDEX_BATCH as i32,
@@ -463,14 +468,25 @@ mod real {
         )?;
         ctx.sync()?;
         let got_bytes = ctx.stream.clone_dtoh(&q_fp8_d)?;
-        let got_scales = ctx.stream.clone_dtoh(&wout_d)?;
+        let got_weighted = ctx.stream.clone_dtoh(&wout_d)?;
 
+        // Recover the pure per-row quant scale; zero-weight rows cannot recover.
         let mut scale_worst = 0f32;
+        let mut scale_rows = 0usize;
+        let mut weighted_worst = 0f32;
         let mut violators = 0usize;
         for r in 0..works {
-            let scale = got_scales[r];
             let want_scale = want_scales[r];
+            let w = weights[r].to_f32();
+            let want_weighted = w * WEIGHT_SCALE * want_scale;
+            weighted_worst = weighted_worst
+                .max((got_weighted[r] - want_weighted).abs() / want_weighted.abs().max(1e-12));
+            if w == 0.0 {
+                continue;
+            }
+            let scale = got_weighted[r] / (w * WEIGHT_SCALE);
             scale_worst = scale_worst.max((scale - want_scale).abs() / want_scale.abs().max(1e-8));
+            scale_rows += 1;
             for i in 0..128 {
                 let got_v = e4m3_decode(got_bytes[r * 128 + i]) * scale;
                 let want_v = e4m3_decode(want_bytes[r * 128 + i]) * want_scale;
@@ -480,12 +496,15 @@ mod real {
                 }
             }
         }
-        let fq_pass = scale_worst < SCALE_REL_MAX && violators == 0;
+        let fq_pass =
+            scale_worst < SCALE_REL_MAX && weighted_worst < SCALE_REL_MAX && violators == 0;
         eprintln!(
-            "[indexer fused_q rows={works}] scale_rel_worst={scale_worst:.2e} violators={violators} {}",
+            "[indexer fused_q rows={works}] scale_rel_worst={scale_worst:.2e} weighted_rel_worst={weighted_worst:.2e} \
+             violators={violators} ({} scale rows) {}",
+            scale_rows,
             if fq_pass { "PASS" } else { "FAIL" }
         );
-        all_pass &= fq_pass;
+        let mut topk_pass = true;
 
         // (2) Radix top-k + paged transform over score rows.
         for &seq in INDEX_SEQS {
@@ -607,10 +626,10 @@ mod real {
                 "[indexer topk seq={seq} k={INDEX_TOPK} B={INDEX_BATCH}] {}",
                 if geom_pass { "PASS" } else { "FAIL" }
             );
-            all_pass &= geom_pass;
+            topk_pass &= geom_pass;
         }
 
-        Ok(all_pass)
+        Ok((fq_pass, topk_pass))
     }
 
     pub(super) fn run(negative: bool) -> Result<()> {
@@ -626,11 +645,12 @@ mod real {
         for &kv_len in ATTN_KV_LENS {
             attn_ok &= check_attention_geom(&ctx, kv_len, negative)?;
         }
-        let idx_ok = check_indexer(&ctx, negative)?;
+        let (fq_ok, topk_ok) = check_indexer(&ctx, negative)?;
 
         let mut families = Families::new();
         families.record("attention", !attn_ok);
-        families.record("indexer", !idx_ok);
+        families.record("indexer-fused-q", !fq_ok);
+        families.record("indexer-topk", !topk_ok);
         families.finish("dspark-dsa-parity", negative)
     }
 }
