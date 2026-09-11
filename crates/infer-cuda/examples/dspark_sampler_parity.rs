@@ -342,8 +342,11 @@ mod real {
                 let mut first_positive = vec![0usize; rows];
                 for slot in first_positive.iter_mut() {
                     let row = build_filter_row(&mut rng, vocab, name);
+                    // Reference over the kernel's actual bf16 inputs.
+                    let row_dev: Vec<f32> =
+                        row.iter().map(|&v| bf16::from_f32(v).to_f32()).collect();
                     let pref = f64_filter(
-                        &row,
+                        &row_dev,
                         f.inv_temperature as f64,
                         f.top_k as i64,
                         f.top_p as f64,
@@ -356,7 +359,7 @@ mod real {
                     uniforms.push(((lo + lo + pref[w0]) * 0.5).clamp(1e-6, 0.999_999) as f32);
                     *slot = w0;
                     refs.push(pref);
-                    logits.extend(row.iter().map(|v| bf16::from_f32(*v)));
+                    logits.extend(row_dev.iter().map(|&v| bf16::from_f32(v)));
                 }
 
                 // ── filter_probs batch ──
