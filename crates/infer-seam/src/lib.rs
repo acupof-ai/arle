@@ -63,10 +63,6 @@ pub enum PollResult {
     NotReady(Box<dyn std::any::Any + Send>),
 }
 
-/// Bits of a tier key below the backend store's namespace byte; content keys
-/// that never pass through a chunk packer may use this full width.
-pub const TIER_KEY_BITS: u32 = 56;
-
 /// Bits of a tier key that goes through the store's chunk packer
 /// (`kv_native_sys::chunk_sub`): 16 of the 56 sub-key bits carry the chunk
 /// index, so a chunked key must fit 40. Content keys are masked to this
@@ -733,7 +729,7 @@ pub struct StepBudget {
 
 impl StepBudget {
     /// Unbounded budget — the server-style "use all the hardware" default.
-    pub const UNBOUNDED: StepBudget = StepBudget {
+    const UNBOUNDED: StepBudget = StepBudget {
         max_tokens: usize::MAX,
         max_micros: u64::MAX,
     };
