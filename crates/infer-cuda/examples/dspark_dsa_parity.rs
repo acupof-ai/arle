@@ -434,7 +434,8 @@ mod real {
             .collect();
         let positions: Vec<i32> = (0..INDEX_BATCH as i32).collect();
         let freqs = build_freqs(&positions);
-        let weights = vec![1.0f32; works];
+        // weight is BF16: the kernel reads bf16_t and production passes bf16 HiddenStates; f32 1.0 bytes re-read as bf16 denormal ~0.
+        let weights = vec![bf16::from_f32(1.0); works];
         let (want_bytes, want_scales) = fused_q_indexer_ref(&q, &freqs, &positions, INDEX_HEADS);
 
         let q_d = ctx.stream.clone_htod(&q)?;
