@@ -671,7 +671,11 @@ where
 
 #[cfg(not(feature = "no-cuda"))]
 fn concat_sources(dtype: TapeDtype) -> String {
-    let mut src = dtype.nvrtc_prelude().to_string();
+    let prelude = match dtype {
+        TapeDtype::F32 => "using T = float;\n",
+        TapeDtype::Bf16 => "#include <cuda_bf16.h>\nusing T = __nv_bfloat16;\n",
+    };
+    let mut src = prelude.to_string();
     for (_, _, source) in KERNEL_SOURCES {
         src.push('\n');
         src.push_str(source);
