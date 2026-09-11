@@ -25,7 +25,7 @@ use crate::{DeepSeekConfigError, Result};
 
 /// `rope_parameters` sub-object: `{"rope_theta": 8e6, "rope_type": "default"}`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct GlmRopeParameters {
+pub(crate) struct GlmRopeParameters {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
     #[serde(default, alias = "type")]
@@ -75,7 +75,7 @@ pub struct GlmMoeDsaConfig {
     #[serde(default)]
     pub rope_interleave: bool,
     #[serde(default)]
-    pub rope_parameters: Option<GlmRopeParameters>,
+    pub(crate) rope_parameters: Option<GlmRopeParameters>,
     #[serde(default)]
     pub max_position_embeddings: usize,
 
@@ -169,21 +169,21 @@ impl GlmMoeDsaConfig {
         Ok(())
     }
 
-    pub fn is_sparse_layer(&self, layer_idx: usize) -> bool {
+    pub(crate) fn is_sparse_layer(&self, layer_idx: usize) -> bool {
         match self.mlp_layer_types.get(layer_idx) {
             Some(kind) => kind == "sparse",
             None => layer_idx >= self.first_k_dense_replace,
         }
     }
 
-    pub fn is_full_indexer_layer(&self, layer_idx: usize) -> bool {
+    pub(crate) fn is_full_indexer_layer(&self, layer_idx: usize) -> bool {
         match self.indexer_types.get(layer_idx) {
             Some(kind) => kind == "full",
             None => self.index_topk_freq <= 1 || layer_idx.is_multiple_of(self.index_topk_freq),
         }
     }
 
-    pub fn rope_theta(&self) -> f64 {
+    pub(crate) fn rope_theta(&self) -> f64 {
         self.rope_parameters
             .as_ref()
             .map(|p| p.rope_theta)
