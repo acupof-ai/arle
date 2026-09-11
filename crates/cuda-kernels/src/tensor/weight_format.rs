@@ -292,7 +292,7 @@ impl Dsv4Fp8DeepGemmWeightCache {
         Ok(cache)
     }
 
-    pub fn fill_from_dsv4_weight(
+    pub(crate) fn fill_from_dsv4_weight(
         &mut self,
         ctx: &DeviceContext,
         weight: &DeviceMatrix,
@@ -307,7 +307,7 @@ impl Dsv4Fp8DeepGemmWeightCache {
         )
     }
 
-    pub fn fill_from_dsv4_weight_row_range(
+    pub(crate) fn fill_from_dsv4_weight_row_range(
         &mut self,
         ctx: &DeviceContext,
         weight: &DeviceMatrix,
@@ -326,7 +326,7 @@ impl Dsv4Fp8DeepGemmWeightCache {
         )
     }
 
-    pub fn fill_from_fp8_block_scaled_weight(
+    pub(crate) fn fill_from_fp8_block_scaled_weight(
         &mut self,
         ctx: &DeviceContext,
         weight: &DeviceMatrix,
