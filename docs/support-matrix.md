@@ -148,7 +148,6 @@ below is the one-glance view — for any change, edit
 | FP8 E4M3 KV cache (CUDA) | opt-in | `--kv-cache-dtype fp8`; per-(token, head) K and V scales, same decode kernel as INT8. |
 | TurboQuant KV TQ4 (CUDA) | deferred | `--kv-cache-dtype tq4`; accepted by the CLI, bails loud at engine construction (`infer-cuda/src/executor.rs:100`). |
 | Weights — W4A16 / W8A16 / W2A16 | production / experimental (W2) | Native GEMV + Marlin W4 prefill; safetensors auto-detect. |
-| Weights — MarlinW4A8 prefill-graph | production, **Tier-1 wins** | `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` → engine TTFT p50 –92.5%, +632% throughput (`a56b7a9`/`c44788f`). |
 | Weights — GGUF Q3/Q4/Q5/Q6_K | production (CUDA & Metal) | Packed superblock kernels; `.gguf` auto-detect. |
 | Weights — DSv4 FP8/FP4 block-scaled | in progress | `Dsv4Fp8BlockScaled` / `Dsv4Fp4BlockScaled`; pending CUDA V4 attention/MoE/MTP kernels. |
 | Weights — NVFP4 (Fp4E2M1Group) | production (CUDA) | compressed-tensors `U8` packed FP4 + FP8 per-group scales + F32 global/input scales; auto-detect. **One serving path**: Marlin `kFE2M1f` below the DeepGEMM prefill floor, and above it the same layout widened to E4M3 in scratch for DeepGEMM's native FP8 MMA (84 → 265 TFLOPS effective). `repack_for_marlin_fp4` releases the pre-repack bytes itself. Requires sm_80+, `group_size = 16`, `K % 64`, `N % 64` — anything else fails at load with the reason; there is no fallback arm. |
