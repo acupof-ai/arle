@@ -30,7 +30,7 @@ mod dsv4;
 #[cfg(feature = "cuda")]
 mod executor;
 #[cfg(feature = "cuda")]
-pub mod graph;
+pub(crate) mod graph;
 // Shared paged-KV host math: page table -> byte-offset / physical-row
 // translation. Two consumers — the DSv4 FlashMLA arena (packed MLA latent
 // pool; FlashMLA's FFI calls a page a "block") and the Qwen quant-KV store
@@ -141,15 +141,15 @@ pub fn print_dsv4_stage_profile(tag: &str, timed_tokens: usize, timed_wall_ms: f
 
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
 // variant is feature-gated.
-pub mod tp;
+pub(crate) mod tp;
 
 // Not cuda-gated: pure-CPU per-rank weight-shard byte slicing; the device upload
 // that consumes it stays in `loader`.
-pub mod shard_slice;
+pub(crate) mod shard_slice;
 
 // Not cuda-gated: Qwen35Config → infer_moe::MoeConfig bridge + per-rank expert
 // split arithmetic.
-pub mod moe_config;
+pub(crate) mod moe_config;
 
 // Not cuda-gated: the host route→assignment flattening is CPU-tested; the device
 // `moe_forward_into` lives in the inner `cuda`-gated module.

@@ -13,7 +13,7 @@ use log::debug;
 
 /// The first [`Self::run_or_capture`] call captures the kernel closure into a
 /// graph and launches it; every later call launches the captured graph only.
-pub struct CudaGraphState {
+pub(crate) struct CudaGraphState {
     /// Compute stream the graph is captured on and replayed to (`end_capture`
     /// needs `&Arc<CudaStream>`, so the `Arc` is held here).
     stream: Arc<CudaStream>,
@@ -44,7 +44,7 @@ unsafe impl Send for CudaGraphState {}
 
 impl CudaGraphState {
     #[must_use]
-    pub fn new(stream: Arc<CudaStream>) -> Self {
+    pub(crate) fn new(stream: Arc<CudaStream>) -> Self {
         Self {
             stream,
             graph: None,
@@ -63,13 +63,13 @@ impl CudaGraphState {
     /// falls back to eager, so the failure mode is perf-neutral plus one hard
     /// error line. Opt out only with a measurement showing the allocations are
     /// unavoidable for that path.
-    pub fn allow_alloc_nodes(mut self) -> Self {
+    pub(crate) fn allow_alloc_nodes(mut self) -> Self {
         self.allow_alloc_nodes = true;
         self
     }
 
     #[must_use]
-    pub fn is_captured(&self) -> bool {
+    pub(crate) fn is_captured(&self) -> bool {
         self.graph.is_some()
     }
 
@@ -77,7 +77,7 @@ impl CudaGraphState {
     /// run is still armed) rather than replay/capture. Lets callers count
     /// replays precisely for the reuse-evidence probe.
     #[must_use]
-    pub fn is_armed_warm(&self) -> bool {
+    pub(crate) fn is_armed_warm(&self) -> bool {
         self.warm_remaining > 0
     }
 
@@ -86,7 +86,7 @@ impl CudaGraphState {
     ///
     /// # Errors
     /// Propagates `begin_capture` / `end_capture` / `launch` driver errors.
-    pub fn run_or_capture<F>(&mut self, kernels: F) -> Result<()>
+    pub(crate) fn run_or_capture<F>(&mut self, kernels: F) -> Result<()>
     where
         F: FnOnce() -> Result<()>,
     {
@@ -172,21 +172,6 @@ impl CudaGraphState {
             graph
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph first launch failed: {e}"))?;
-        }
-        Ok(())
-    }
-
-    /// Pre-upload the captured graph so the first replay skips setup overhead.
-    ///
-    /// No-op when nothing has been captured yet.
-    ///
-    /// # Errors
-    /// Propagates the `upload` driver error.
-    pub fn upload(&self) -> Result<()> {
-        if let Some(graph) = &self.graph {
-            graph
-                .upload()
-                .map_err(|e| anyhow::anyhow!("CUDA Graph upload failed: {e}"))?;
         }
         Ok(())
     }
