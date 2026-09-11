@@ -3,15 +3,13 @@ use thiserror::Error;
 pub mod glm;
 pub mod v4;
 
-pub use glm::{GlmMoeDsaConfig, GlmRopeParameters};
+pub use glm::GlmMoeDsaConfig;
 
 pub use v4::{
     DeepSeekV4AttentionLayerPlan, DeepSeekV4AttentionMode, DeepSeekV4AttentionTensorNames,
-    DeepSeekV4CompressorShape, DeepSeekV4CompressorTensorNames, DeepSeekV4Config,
-    DeepSeekV4ExpertTensorNames, DeepSeekV4HyperConnectionTensorNames, DeepSeekV4IndexerShape,
-    DeepSeekV4IndexerTensorNames, DeepSeekV4LayerTensorNames, DeepSeekV4MoeRoute,
-    DeepSeekV4MoeRoutingKind, DeepSeekV4MoeTensorNames, DeepSeekV4MtpTensorNames,
-    DeepSeekV4RopeParameters, DeepSeekV4TensorNames, TensorDialect, indexer_stride,
+    DeepSeekV4CompressorTensorNames, DeepSeekV4Config, DeepSeekV4ExpertTensorNames,
+    DeepSeekV4HyperConnectionTensorNames, DeepSeekV4IndexerTensorNames, DeepSeekV4MoeRoutingKind,
+    DeepSeekV4MoeTensorNames, DeepSeekV4RopeParameters, TensorDialect, indexer_stride,
 };
 
 #[derive(Debug, Error)]

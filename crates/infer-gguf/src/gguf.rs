@@ -57,7 +57,7 @@ pub enum GgmlType {
 }
 
 impl GgmlType {
-    pub fn from_id(id: u32) -> Result<Self> {
+    pub(crate) fn from_id(id: u32) -> Result<Self> {
         Ok(match id {
             0 => Self::F32,
             1 => Self::F16,
@@ -125,7 +125,7 @@ impl GgmlType {
     /// static_asserts (q8_0 l.246, q2_K l.299, q4_K l.328, q5_K l.346,
     /// q6_K l.358, iq2_xxs l.375, q3_K l.311, q8_1 l.259, q8_K l.366).
     /// `None` = layout not pinned here; tensor_data refuses to slice it.
-    pub fn type_size(self) -> Option<usize> {
+    pub(crate) fn type_size(self) -> Option<usize> {
         Some(match self {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 | Self::I16 => 2,
@@ -161,7 +161,7 @@ impl GgmlType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum GgufValue {
+pub(crate) enum GgufValue {
     U8(u8),
     I8(i8),
     U16(u16),
@@ -192,7 +192,7 @@ impl GgufValue {
         }
     }
 
-    pub fn as_f32(&self) -> Option<f32> {
+    pub(crate) fn as_f32(&self) -> Option<f32> {
         match *self {
             Self::F32(v) => Some(v),
             Self::F64(v) => Some(v as f32),
@@ -386,7 +386,7 @@ impl GgufFile {
         })
     }
 
-    pub fn get(&self, key: &str) -> Option<&GgufValue> {
+    pub(crate) fn get(&self, key: &str) -> Option<&GgufValue> {
         self.metadata.get(key)
     }
 
@@ -402,7 +402,7 @@ impl GgufFile {
         self.get(key).and_then(GgufValue::as_f32)
     }
 
-    pub fn get_bool(&self, key: &str) -> Option<bool> {
+    pub(crate) fn get_bool(&self, key: &str) -> Option<bool> {
         self.get(key).and_then(GgufValue::as_bool)
     }
 
@@ -412,7 +412,7 @@ impl GgufFile {
 
     /// Scalar or first-of-array f32 (llama.cpp `get_key_or_arr` shape for
     /// per-layer keys like `swiglu_clamp_exp`).
-    pub fn get_f32_scalar_or_first(&self, key: &str) -> Option<f32> {
+    pub(crate) fn get_f32_scalar_or_first(&self, key: &str) -> Option<f32> {
         match self.get(key)? {
             GgufValue::Array(items) => items.first().and_then(GgufValue::as_f32),
             v => v.as_f32(),

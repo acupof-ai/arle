@@ -17,27 +17,27 @@ use crate::repl::format_iso8601_utc_secs;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AgentTrajectoryRecord {
-    pub schema_version: i32,
-    pub ts: String,
-    pub turn_id: String,
-    pub model_id: String,
-    pub backend: String,
-    pub user_input: String,
-    pub messages: Vec<TrajectoryMessage>,
-    pub sub_turns: Vec<SubTurnRecord>,
+    pub(crate) schema_version: i32,
+    pub(crate) ts: String,
+    pub(crate) turn_id: String,
+    pub(crate) model_id: String,
+    pub(crate) backend: String,
+    pub(crate) user_input: String,
+    pub(crate) messages: Vec<TrajectoryMessage>,
+    pub(crate) sub_turns: Vec<SubTurnRecord>,
     /// `Some` only when the agent loop tracked every component (prompt + each
     /// sub-turn response + each tool result); `None` otherwise.
-    pub tokens: Option<TokensRecord>,
-    pub result: TrajectoryResult,
+    pub(crate) tokens: Option<TokensRecord>,
+    pub(crate) result: TrajectoryResult,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct TrajectoryResult {
-    pub text: String,
-    pub terminal_state: TerminalState,
-    pub total_prompt_tokens: u64,
-    pub total_completion_tokens: u64,
-    pub wall_secs: f64,
+    pub(crate) text: String,
+    pub(crate) terminal_state: TerminalState,
+    pub(crate) total_prompt_tokens: u64,
+    pub(crate) total_completion_tokens: u64,
+    pub(crate) wall_secs: f64,
 }
 
 pub(crate) struct TraceWriter {

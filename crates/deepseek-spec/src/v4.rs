@@ -521,7 +521,7 @@ pub fn indexer_stride(compress_ratio: usize) -> usize {
 }
 
 impl DeepSeekV4AttentionMode {
-    pub fn from_compress_ratio(compress_ratio: usize) -> Self {
+    pub(crate) fn from_compress_ratio(compress_ratio: usize) -> Self {
         match compress_ratio {
             0 => Self::SlidingWindow,
             1..=15 => Self::CompressedSparse,

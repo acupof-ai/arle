@@ -34,7 +34,7 @@ fn req_f32(g: &GgufFile, suffix: &str) -> Result<f32> {
 
 /// Per-layer compress ratios from `blk.%d.attn_compress_ape` ne[1]
 /// (llama-memory-deepseek4.cpp:61-63); 0 = sliding-window layer.
-pub fn compress_ratios_from_tensors(g: &GgufFile, num_layers: usize) -> Vec<usize> {
+pub(crate) fn compress_ratios_from_tensors(g: &GgufFile, num_layers: usize) -> Vec<usize> {
     (0..num_layers)
         .map(|i| {
             g.tensor(&format!("blk.{i}.attn_compress_ape"))
@@ -45,7 +45,7 @@ pub fn compress_ratios_from_tensors(g: &GgufFile, num_layers: usize) -> Vec<usiz
 }
 
 /// Leading run of hash-routed layers = `blk.%d.ffn_gate_tid2eid` presence.
-pub fn num_hash_layers_from_tensors(g: &GgufFile, num_layers: usize) -> usize {
+pub(crate) fn num_hash_layers_from_tensors(g: &GgufFile, num_layers: usize) -> usize {
     (0..num_layers)
         .take_while(|i| g.tensor(&format!("blk.{i}.ffn_gate_tid2eid")).is_some())
         .count()

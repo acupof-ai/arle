@@ -136,10 +136,6 @@ impl GgufTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }
-
-    pub fn id_to_token(&self, id: u32) -> Option<String> {
-        self.inner.id_to_token(id)
-    }
 }
 
 fn str_array(g: &GgufFile, key: &str) -> Result<Vec<String>> {
