@@ -137,8 +137,9 @@ mod real {
     }
 
     /// f64 host oracle for the whole single-rank routing pipeline.
-    /// `logits`/`bias` are `[num_tokens, N_EXPERTS]`; BF16-rounded inputs are
-    /// passed in so the oracle and kernel see identical values.
+    /// `logits` is `[num_tokens, N_EXPERTS]`; `bias` is the single shared
+    /// `[N_EXPERTS]` noaux table the kernel reads by expert for every token.
+    /// BF16-rounded inputs are passed in so oracle and kernel see identical values.
     #[derive(Clone)]
     struct Oracle {
         /// Global expert per route, `[num_tokens * TOPK]`.
@@ -187,8 +188,7 @@ mod real {
             } else {
                 // Masked top-k over `score + bias` (lower index wins ties).
                 // Track the k-th pick's margin over the best remaining expert.
-                let combined: Vec<f64> =
-                    (0..N_EXPERTS).map(|e| scores[e] + bias[base + e]).collect();
+                let combined: Vec<f64> = (0..N_EXPERTS).map(|e| scores[e] + bias[e]).collect();
                 let mut chosen = vec![0usize; TOPK];
                 let mut order: Vec<usize> = (0..N_EXPERTS).collect();
                 // Stable sort by (-combined, index): ties resolve to lower e.
@@ -380,66 +380,69 @@ mod real {
             })
             .collect();
 
-        // Build bf16 logits + bias, retaining f64 values for the oracle.
+        // Build bf16 logits [num_tokens, N_EXPERTS] and the single shared
+        // [N_EXPERTS] noaux bias table the kernel reads (dsv4_route.cu),
+        // retaining f64 values for the oracle.
         let mut logits_f64 = vec![0.0f64; num_tokens * N_EXPERTS];
-        let mut bias_f64 = vec![0.0f64; num_tokens * N_EXPERTS];
+        let mut bias_table = vec![0.0f64; N_EXPERTS];
         let mut logits_bf16 = Vec::with_capacity(num_tokens * N_EXPERTS);
-        let mut bias_bf16 = Vec::with_capacity(num_tokens * N_EXPERTS);
         for t in 0..num_tokens {
             for e in 0..N_EXPERTS {
                 // Logits in [-1,1]: sqrtsoftplus there spans ~0.55..0.97.
                 let l = rng.unit().mul_add(2.0, -1.0);
                 logits_f64[t * N_EXPERTS + e] = f64::from(bf16::from_f32(l as f32));
-                bias_f64[t * N_EXPERTS + e] = 0.0;
             }
             if mode != Mode::Hash {
-                // Both learned-bias regimes feed a noaux correction; the regime
-                // changes its scale relative to the score spread.
-                let raw_bias: Vec<f32> = (0..N_EXPERTS).map(|_| rng.normal() as f32).collect();
-                match mode {
-                    Mode::LearnedBias => {
-                        // Coarse bias dominates the <=0.42 score swing; experts
-                        // 0 and 1 share BOTH bias and logit (exact combined tie):
-                        // round 1 must take 0 (lower), round 2 takes 1. Integer
-                        // picks are then stable regardless of fast math.
-                        let top_bias = (N_EXPERTS - 1) as f32;
-                        for e in 0..N_EXPERTS {
-                            bias_f64[t * N_EXPERTS + e] = f64::from(bf16::from_f32(if e <= 1 {
-                                top_bias
-                            } else {
-                                (N_EXPERTS - e) as f32
-                            }));
+                // The noaux correction is one table shared across all tokens;
+                // the two regimes change its scale relative to the score spread.
+                if t == 0 {
+                    match mode {
+                        Mode::LearnedBias => {
+                            // Coarse bias dominates the <=0.42 score swing; experts
+                            // 0 and 1 share BOTH bias and logit (exact combined tie):
+                            // round 1 must take 0 (lower), round 2 takes 1. Integer
+                            // picks are then stable regardless of fast math.
+                            let top_bias = (N_EXPERTS - 1) as f32;
+                            for (e, b) in bias_table.iter_mut().enumerate() {
+                                *b = f64::from(bf16::from_f32(if e <= 1 {
+                                    top_bias
+                                } else {
+                                    (N_EXPERTS - e) as f32
+                                }));
+                            }
                         }
-                        logits_f64[t * N_EXPERTS] = 0.0;
-                        logits_f64[t * N_EXPERTS + 1] = 0.0;
-                    }
-                    Mode::ScoreDecides => {
-                        // Bias ~ N(0, 0.03): same order as the score spread, so
-                        // the sqrtsoftplus term decides most picks. A kernel
-                        // ignoring or mis-scaling the score can't pass this.
-                        for e in 0..N_EXPERTS {
-                            bias_f64[t * N_EXPERTS + e] =
-                                f64::from(bf16::from_f32(raw_bias[e] * 0.03));
+                        Mode::ScoreDecides => {
+                            // Bias ~ N(0, 0.03): same order as the score spread, so
+                            // the sqrtsoftplus term decides most picks. A kernel
+                            // ignoring or mis-scaling the score can't pass this.
+                            for b in bias_table.iter_mut() {
+                                *b = f64::from(bf16::from_f32((rng.normal() * 0.03) as f32));
+                            }
                         }
+                        Mode::Hash => {}
                     }
-                    Mode::Hash => {}
+                }
+                if mode == Mode::LearnedBias {
+                    logits_f64[t * N_EXPERTS] = 0.0;
+                    logits_f64[t * N_EXPERTS + 1] = 0.0;
                 }
             }
             for v in &logits_f64[t * N_EXPERTS..(t + 1) * N_EXPERTS] {
                 logits_bf16.push(bf16::from_f32(*v as f32));
             }
-            for v in &bias_f64[t * N_EXPERTS..(t + 1) * N_EXPERTS] {
-                bias_bf16.push(bf16::from_f32(*v as f32));
-            }
         }
+        let bias_bf16: Vec<bf16> = bias_table
+            .iter()
+            .map(|&v| bf16::from_f32(v as f32))
+            .collect();
 
-        let orc = host_oracle(mode, &logits_f64, &bias_f64, &hash_eid, num_tokens, ep);
+        let orc = host_oracle(mode, &logits_f64, &bias_table, &hash_eid, num_tokens, ep);
 
         // ---- device route ----
         let logits_d = ctx.stream.clone_htod(&logits_bf16)?;
         let indices_d = ctx.stream.alloc_zeros::<i32>(total_routes)?;
         let weights_d = ctx.stream.alloc_zeros::<f32>(total_routes)?;
-        // Bias is uploaded for both learned-bias regimes; hash gets neither.
+        // One shared N_EXPERTS table for both learned-bias regimes; hash gets none.
         let learned = mode != Mode::Hash;
         let bias_d = if learned {
             Some(ctx.stream.clone_htod(&bias_bf16)?)
@@ -521,8 +524,10 @@ mod real {
         let got_aligned_total = ctx.stream.clone_dtoh(&aligned_total_d)?;
 
         // ---- pack ----
+        // Pack kernel writes at device offsets with no bound: size from the larger of device/oracle totals so a routing regression fails numerically, not with ILLEGAL_ADDRESS.
         let n_local = orc.total as usize;
-        let cap = n_local.max(1);
+        let dev_total = got_total[0].max(0) as usize;
+        let cap = dev_total.max(n_local).max(1);
         // Input hidden is not used by the combine math (scatter reads
         // expert_out, not packed_hidden); a constant row is enough to exercise
         // the pack copy path.
@@ -532,8 +537,7 @@ mod real {
         let packed_hidden_d = ctx.stream.alloc_zeros::<bf16>(cap * HIDDEN)?;
         let packed_slot_d = ctx.stream.alloc_zeros::<i32>(cap)?;
         let packed_weight_d = ctx.stream.alloc_zeros::<f32>(cap)?;
-        // SAFETY: shapes match the single-rank [0,ep) window; pack buffers are
-        // sized `cap` rows × HIDDEN, cursors/offsets `ep`.
+        // SAFETY: pack writes at most dev_total rows into the `cap`-sized buffers.
         unsafe {
             moe::dsv4_pack_local_experts_with_slots(
                 cache_ptr(&hidden_d, ctx),
@@ -557,9 +561,13 @@ mod real {
         let got_packed_weight = ctx.stream.clone_dtoh(&packed_weight_d)?;
 
         // ---- fill m-indices ----
-        let row_capacity = orc.aligned_total as usize;
+        // The kernel guards every write at dst < row_capacity; size from the
+        // larger of device/oracle aligned totals so a device overflow is
+        // observed as a totals mismatch, not a clipped write.
+        let dev_aligned = got_aligned_total[0].max(0) as usize;
+        let row_capacity = dev_aligned.max(orc.aligned_total as usize).max(1);
         let m_indices_d = ctx.stream.alloc_zeros::<i32>(row_capacity)?;
-        // SAFETY: m_indices has aligned_total rows; counts/offsets are `ep`.
+        // SAFETY: m_indices has row_capacity rows and the kernel guards against it.
         unsafe {
             moe::dsv4_fill_m_indices_from_counts(
                 cache_ptr(&counts_d, ctx),
