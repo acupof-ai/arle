@@ -1,0 +1,54 @@
+# Real-CUDA build blind spot: no-cuda lint cannot see `cfg(not(no-cuda))` callers
+
+## Context
+
+Two merged visibility refactors — `7683dc256` (autograd op/tensor narrowing)
+and its sibling deletions — passed the Mac pre-push lint and CI Lint mirror,
+but left the real-CUDA build (`--features cuda,nccl` without `no-cuda`) unable
+to compile. Nothing on a Mac compiles that feature set (no nvcc), so the
+breakage shipped. A pod `cargo check --workspace --features cuda,nccl
+--all-targets` found three stacked faults:
+
+1. **E0599 — deleted method with a live in-crate caller.**
+   `TapeDtype::nvrtc_prelude` was deleted as a zero-caller item, but
+   `backend_cuda/kernels.rs:674` `concat_sources` still called it under
+   `#[cfg(not(feature = "no-cuda"))]`. The no-cuda lint compiles out that whole
+   function, so the call site was invisible. Fix: inline the two-arm dtype
+   prelude at `concat_sources`.
+2. **E0603 ×84 — visibility narrowed past sibling modules.**
+   `F32Operand` / `Bf16Operand` were narrowed `pub(super)` → private inside
+   `backend_cuda/handle.rs`, but sibling modules of `backend_cuda`
+   (`elementwise.rs`, `matmul.rs`, …) name their return types. Fix:
+   `pub(in crate::backend_cuda)`, which is the actual scope.
+3. **E0283 ×4 — untyped `Iterator::product` inside `assert_eq!`.**
+   `test_cuda_lazy_ops.rs:755,1988` compared against
+   `shape.iter().product()`; `assert_eq!` supplies no expected type, so the
+   product type parameter was ambiguous under the real build. Direct
+   `let x: usize = …` sites annotated already. Fix: `.<product::<usize>()`.
+
+## Root cause
+
+The Mac/CI lint command is `cargo clippy … --features cuda,no-cuda`: the
+`no-cuda` feature compiles out the actual CUDA code (`#[cfg(not(feature =
+"no-cuda"))]`), while still gating the crate as "cuda". It validates feature
+plumbing and backend-isolation cfgs, but never the kernels, handle methods, or
+cuda-gated tests. A refactor that deletes or hides an item whose only users are
+real-CUDA callers sails through. The "zero callers" audit in `7683dc256` was
+done under that same feature set, so it found no callers for an item that had
+one.
+
+## Fix
+
+- Restore the callers' visibility / inline the deleted prelude / annotate the
+  two test expressions (hotfix lane `hotfix-cuda-real-check`, 3 commits).
+- Verification: pod `cargo check --workspace --features cuda,nccl --all-targets`
+  with no `no-cuda` — `CUDA_CHECK_EXIT=0`.
+
+## Rule
+
+For any crate whose CUDA code is `#[cfg(not(feature = "no-cuda"))]`, the
+no-cuda lint is necessary but not sufficient: it proves the stub/feature surface
+compiles, not that the CUDA code does. Every change that deletes, hides, or
+renames an item in those crates needs a real-CUDA `cargo check --features
+cuda,nccl` (pod, no `no-cuda`) before merge, and a "zero callers" deletion claim
+must grep the `cfg(not(no-cuda))` code, not just the no-cuda-compiled tree.
