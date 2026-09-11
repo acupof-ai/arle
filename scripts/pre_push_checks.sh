@@ -227,6 +227,7 @@ run_fast() { printf '%s\n' "$*" > "${FAST_STEP}" 2>/dev/null || true; run "$@"; 
 run_fast_checks() {
     run_fast python3 scripts/check_repo_hygiene.py
     run_fast python3 scripts/check_repo_hygiene.py --selftest
+    run_fast python3 scripts/lane_pr_precheck.py --selftest
     run_fast cargo fmt --all -- --check
     if [[ "${SKIP_SHELL_TESTS}" == "1" ]]; then
         return 0

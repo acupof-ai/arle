@@ -20,7 +20,8 @@ cp "$ROOT/scripts/pre_push_checks.sh" "$FIX/scripts/pre_push_checks.sh"
 for t in $(sed -n '/for test in \\/,/; do/p' "$FIX/scripts/pre_push_checks.sh" | grep -o 'test_[a-z_]*\.sh'); do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$FIX/scripts/tests/$t"
 done
-printf 'print("fixture hygiene ok")\n' > "$FIX/scripts/check_repo_hygiene.py"
+printf "print(\"fixture hygiene ok\")\n" > "$FIX/scripts/check_repo_hygiene.py"
+printf "print(\"fixture precheck ok\")\n" > "$FIX/scripts/lane_pr_precheck.py"
 git -C "$FIX" init -q
 git -C "$FIX" config user.email t@e; git -C "$FIX" config user.name t
 git -C "$FIX" add -A && git -C "$FIX" commit -qm base
