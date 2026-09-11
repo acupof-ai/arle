@@ -36,7 +36,7 @@ const BROADCAST_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Transport seam for length-prefixed JSON [`RelayEnvelope`]s between coordinator
 /// and worker ranks. Only impl today is [`TcpChannel`]; the trait exists so a
 /// shm ring can plug in later without touching the loops.
-pub trait RelayChannel: Send {
+pub(crate) trait RelayChannel: Send {
     fn send(&mut self, envelope: &RelayEnvelope) -> Result<()>;
     /// Read one envelope; `Ok(None)` on clean peer EOF.
     fn recv(&mut self) -> Result<Option<RelayEnvelope>>;
@@ -57,7 +57,7 @@ pub trait RelayChannel: Send {
     }
 }
 
-pub struct TcpChannel(TcpStream);
+struct TcpChannel(TcpStream);
 
 impl TcpChannel {
     #[must_use]
@@ -95,7 +95,7 @@ impl RelayChannel for TcpChannel {
 
 /// Free-port picker. Binds 127.0.0.1:0, reads the assigned port, drops the
 /// listener. Caller races to use the port (negligible window on single host).
-pub(crate) fn pick_free_port() -> Result<u16> {
+fn pick_free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").context("relay port reservation")?;
     let port = listener.local_addr().context("relay port read")?.port();
     drop(listener);
@@ -104,10 +104,10 @@ pub(crate) fn pick_free_port() -> Result<u16> {
 
 /// In-process LocalChannel: coordinator→engine direction (send only).
 /// The SyncSender is Clone so the relay driver can hand copies to spawned threads.
-pub struct LocalChannelSend(pub(crate) std::sync::mpsc::SyncSender<RelayEnvelope>);
+struct LocalChannelSend(pub(crate) std::sync::mpsc::SyncSender<RelayEnvelope>);
 
 /// In-process LocalChannel: engine←coordinator OR coordinator←engine (recv only).
-pub struct LocalChannelRecv(std::sync::mpsc::Receiver<RelayEnvelope>);
+pub(crate) struct LocalChannelRecv(std::sync::mpsc::Receiver<RelayEnvelope>);
 
 impl RelayChannel for LocalChannelSend {
     fn send(&mut self, e: &RelayEnvelope) -> Result<()> {
@@ -149,7 +149,7 @@ impl RelayChannel for LocalChannelRecv {
 /// - `coord_recv`: coordinator ← engine (receive Completion/StatsResponse)
 /// - `engine_recv`: engine ← coordinator (receive TickAdmissions/StatsQuery)
 /// - `engine_tx`: engine → coordinator (send Completion/StatsResponse; Clone-able)
-pub(crate) fn local_relay_pair() -> (
+fn local_relay_pair() -> (
     LocalChannelSend,
     LocalChannelRecv,
     LocalChannelRecv,
@@ -291,7 +291,7 @@ pub struct WireStats {
 impl WireStats {
     /// Reconstruct the per-tick counters; request-boundary operator stats remain
     /// in the wire payload for `/v1/stats` only.
-    pub fn into_counter_snapshot(self) -> crate::CounterSnapshot {
+    pub(crate) fn into_counter_snapshot(self) -> crate::CounterSnapshot {
         crate::CounterSnapshot {
             active_requests: self.active_requests,
             queue_depth: self.queue_depth,
@@ -385,7 +385,7 @@ impl WireStats {
         }
     }
 
-    pub fn from_counters(
+    pub(crate) fn from_counters(
         c: &crate::CounterSnapshot,
         build_identity: crate::BuildIdentity,
         operator_dispatch: infer_seam::OperatorDispatchStats,
@@ -666,7 +666,7 @@ pub struct RelayCompletionDelta {
 
 impl RelayCompletionDelta {
     #[must_use]
-    pub fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.finish || self.error.is_some()
     }
 }
@@ -771,7 +771,7 @@ impl WireRequest {
 /// Reader threads record each rank's acks; the coordinator lockstep loop reads
 /// [`Self::min_acked`] to cap unacked ticks at a fixed window.
 #[derive(Debug)]
-pub(crate) struct TickAckLedger {
+struct TickAckLedger {
     /// `(rank, acked tick count)` per connected rank; the count is
     /// `last_acked_seq + 1`, so 0 means "never acked".
     per_rank: Vec<(usize, AtomicU64)>,
@@ -793,12 +793,12 @@ impl TickAckLedger {
         }
     }
 
-    pub fn mark_dead(&self) {
+    fn mark_dead(&self) {
         self.dead_ranks.fetch_add(1, Ordering::AcqRel);
     }
 
     #[must_use]
-    pub fn any_dead(&self) -> bool {
+    pub(crate) fn any_dead(&self) -> bool {
         self.dead_ranks.load(Ordering::Acquire) > 0
     }
 
@@ -815,7 +815,7 @@ impl TickAckLedger {
     /// Number of ticks fully acked by ALL ranks (min over per-rank acked
     /// counts). A rank that never acked holds this at 0.
     #[must_use]
-    pub fn min_acked(&self) -> u64 {
+    pub(crate) fn min_acked(&self) -> u64 {
         self.per_rank
             .iter()
             .map(|(_, count)| count.load(Ordering::Acquire))
@@ -850,8 +850,8 @@ struct StatsAwaiter {
 /// children can connect, then calls `accept(world_size, timeout)` to finalize a
 /// [`RelayCoordinator`].
 pub struct PendingRelayCoordinator {
-    port: u16,
-    listener: TcpListener,
+    pub port: u16,
+    pub listener: TcpListener,
 }
 
 impl PendingRelayCoordinator {
@@ -860,7 +860,7 @@ impl PendingRelayCoordinator {
         self.port
     }
 
-    fn accept_n(
+    pub fn accept_n(
         self,
         world_size: usize,
         expected: usize,
@@ -1027,7 +1027,7 @@ impl RelayCoordinator {
     /// Returns the relay + the engine-side channels:
     /// - `engine_recv`: engine reads from this (TickAdmissions / StatsQuery from coordinator)
     /// - `engine_tx`: engine writes to this (Completion / StatsResponse to coordinator)
-    pub fn new_local() -> (
+    pub(crate) fn new_local() -> (
         Self,
         LocalChannelRecv,
         std::sync::mpsc::SyncSender<RelayEnvelope>,
@@ -1088,7 +1088,7 @@ impl RelayCoordinator {
     /// lockstep loop caps `seq` at `min_acked_ticks() + window` so the tick
     /// stream paces to engine speed instead of flooding the worker FIFOs.
     #[must_use]
-    pub fn min_acked_ticks(&self) -> u64 {
+    pub(crate) fn min_acked_ticks(&self) -> u64 {
         self.tick_acks.min_acked()
     }
 
@@ -1097,7 +1097,7 @@ impl RelayCoordinator {
     /// on it would wedge the coordinator; instead the wait returns and the
     /// next broadcast surfaces the dead socket (-> `fail_all`).
     #[must_use]
-    pub fn any_worker_dead(&self) -> bool {
+    pub(crate) fn any_worker_dead(&self) -> bool {
         self.tick_acks.any_dead()
     }
 
@@ -1105,7 +1105,7 @@ impl RelayCoordinator {
     /// (un)register sinks directly, without contending for the `RelayCoordinator`
     /// mutex the lockstep loop holds across its blocking broadcast.
     #[must_use]
-    pub fn completion_sinks(&self) -> CompletionSinks {
+    pub(crate) fn completion_sinks(&self) -> CompletionSinks {
         CompletionSinks {
             inner: Arc::clone(&self.completion_sinks),
         }
@@ -1125,7 +1125,7 @@ impl RelayCoordinator {
 
     /// Register a oneshot that will receive the stats response for `request_id`.
     /// Must be called BEFORE `send_stats_query` to avoid a race.
-    pub fn register_stats_awaiter(
+    pub(crate) fn register_stats_awaiter(
         &self,
         request_id: u64,
     ) -> tokio::sync::mpsc::UnboundedReceiver<WireStats> {
@@ -1139,7 +1139,7 @@ impl RelayCoordinator {
 
     /// Drop a stats awaiter registered by [`Self::register_stats_awaiter`] when
     /// the query send fails — otherwise the never-answered entry leaks.
-    pub fn unregister_stats_awaiter(&self, request_id: u64) {
+    pub(crate) fn unregister_stats_awaiter(&self, request_id: u64) {
         self.stats_sinks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1149,7 +1149,7 @@ impl RelayCoordinator {
     /// Broadcast a stats query to ALL connected ranks. Each rank replies with a
     /// [`RelayEnvelope::StatsResponse`]; the coordinator collects `worker_count`
     /// responses and aggregates them (see [`aggregate_wire_stats`]).
-    pub fn send_stats_query(&mut self, request_id: u64) -> Result<()> {
+    pub(crate) fn send_stats_query(&mut self, request_id: u64) -> Result<()> {
         for worker in self.workers.values_mut() {
             worker.send(&RelayEnvelope::StatsQuery { request_id })?;
         }
@@ -1161,7 +1161,7 @@ impl RelayCoordinator {
 /// HTTP path can (un)register without taking the `RelayCoordinator` mutex the
 /// lockstep loop holds across its blocking broadcast. Reader threads use the same `Arc`.
 #[derive(Clone)]
-pub struct CompletionSinks {
+pub(crate) struct CompletionSinks {
     inner: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>>,
 }
 
@@ -1185,7 +1185,7 @@ impl CompletionSinks {
 
     /// Remove a per-request sink (idempotent). Called from the HTTP path's RAII
     /// guard on completion OR cancellation.
-    pub fn unregister(&self, request_id: u64) {
+    pub(crate) fn unregister(&self, request_id: u64) {
         let mut sinks = self
             .inner
             .lock()
@@ -1195,7 +1195,7 @@ impl CompletionSinks {
 
     /// Fail every registered sink with a terminal error delta and clear the
     /// registry, so awaiting handlers return an error when the worker group dies.
-    pub fn fail_all(&self, message: &str) {
+    pub(crate) fn fail_all(&self, message: &str) {
         let mut sinks = self
             .inner
             .lock()

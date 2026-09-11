@@ -53,7 +53,7 @@ pub use coordinator::{
 };
 
 /// In-process channel for multimodal requests from coordinator → relay driver.
-pub struct LocalMultimodalRequest {
+pub(crate) struct LocalMultimodalRequest {
     pub prompt_tokens: Vec<u32>,
     pub images: Vec<infer_plan::MultimodalImage>,
     pub max_tokens: usize,
@@ -61,8 +61,8 @@ pub struct LocalMultimodalRequest {
     pub response_tx: tokio::sync::oneshot::Sender<multiproc_relay::RelayCompletionDelta>,
 }
 
-pub type LocalMultimodalTx = std::sync::mpsc::SyncSender<LocalMultimodalRequest>;
-pub(crate) type LocalMultimodalRx = std::sync::mpsc::Receiver<LocalMultimodalRequest>;
+pub(crate) type LocalMultimodalTx = std::sync::mpsc::SyncSender<LocalMultimodalRequest>;
+type LocalMultimodalRx = std::sync::mpsc::Receiver<LocalMultimodalRequest>;
 pub use multiproc_relay::{
     RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker, WireStats,
 };
@@ -123,7 +123,7 @@ fn product_binary_sha256() -> Result<String> {
 /// Entry queue for live requests: over-capacity submits block until a slot
 /// frees, instead of failing "server is busy". `shutdown` wakes every waiter
 /// so ServeHandle drop can never strand a queued submit.
-pub(crate) struct LiveRequestGate {
+struct LiveRequestGate {
     state: Mutex<GateState>,
     free: Condvar,
 }
@@ -255,7 +255,7 @@ impl Default for ServeShutdown {
 /// which that request's [`CompletedRequest`] will arrive. Collect via [`RequestTicket::collect`].
 pub struct RequestTicket {
     handle: RequestHandle,
-    completion_rx: Receiver<CompletedRequest>,
+    pub completion_rx: Receiver<CompletedRequest>,
     live_gate: Arc<LiveRequestGate>,
 }
 
@@ -422,7 +422,7 @@ impl ServeHandle {
         Ok((ticket, stream_rx))
     }
 
-    pub fn submit_streaming_constrained(
+    fn submit_streaming_constrained(
         &self,
         prompt: Vec<u32>,
         max_tokens: usize,
@@ -505,7 +505,7 @@ impl ServeHandle {
 
     /// Materialize operator dispatch counters + backend artifact identity in one
     /// engine-thread round-trip, only at a stats request boundary.
-    pub fn operator_stats(
+    fn operator_stats(
         &self,
     ) -> Result<(
         infer_seam::OperatorDispatchStats,

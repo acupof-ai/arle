@@ -42,7 +42,7 @@ enum ChatTemplate {
 /// one per orphaned byte, so a 4-byte emoji arrives as two of them. Holds the
 /// tokens carrying an incomplete tail until the bytes that finish it arrive.
 #[derive(Default)]
-pub struct IncrementalDetokenizer {
+pub(crate) struct IncrementalDetokenizer {
     pending: Vec<u32>,
 }
 
@@ -179,7 +179,7 @@ impl OpenAiTokenizer {
 
     /// Vocabulary indexed by token id, for grammar-compiler construction.
     /// Holes (ids the vocab map skips) come back empty.
-    pub fn vocab_by_id(&self) -> Vec<String> {
+    pub(crate) fn vocab_by_id(&self) -> Vec<String> {
         let map = self.inner.get_vocab(true);
         let mut out =
             vec![String::new(); map.values().copied().max().map_or(0, |m| m as usize + 1)];
@@ -212,14 +212,14 @@ impl OpenAiTokenizer {
     /// (looping, bare `</think>` leaks) when forced non-thinking. Jinja/ChatML
     /// stay thinking-off (unchanged default behavior).
     #[must_use]
-    pub fn defaults_thinking_on(&self) -> bool {
+    pub(crate) fn defaults_thinking_on(&self) -> bool {
         matches!(self.template, ChatTemplate::BuiltinDeepseekV4)
     }
 
     /// Think-start and think-end token IDs for reasoning models. `None` for
     /// non-reasoning templates.
     #[must_use]
-    pub fn think_token_ids(&self) -> Option<(u32, u32)> {
+    pub(crate) fn think_token_ids(&self) -> Option<(u32, u32)> {
         match self.template {
             ChatTemplate::BuiltinDeepseekV4 => Some((128821, 128822)),
             _ => {
@@ -238,7 +238,7 @@ impl OpenAiTokenizer {
     /// the thinking / reasoning-effort switches into whichever renderer the
     /// checkpoint resolved to. Tool-less, thinking-off calls render
     /// byte-identically to the legacy [`Self::render_chat`].
-    pub fn render_chat_full(
+    pub(crate) fn render_chat_full(
         &self,
         messages: &[ChatMessage],
         chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -554,7 +554,7 @@ fn strip_generation_markers(source: &str) -> String {
 }
 
 /// non-`Clone` minijinja environment.
-pub(crate) fn render_jinja(
+fn render_jinja(
     source: &str,
     bos_token: &str,
     eos_token: &str,

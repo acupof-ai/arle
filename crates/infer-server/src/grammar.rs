@@ -45,7 +45,7 @@ impl ResponseFormat {
 }
 
 /// Compiles and caches grammars for one model's vocabulary.
-pub struct GrammarCache {
+pub(crate) struct GrammarCache {
     compiler: Mutex<GrammarCompiler>,
     vocab_size: usize,
     compiled: Mutex<Vec<(String, Arc<CompiledGrammar>)>>,

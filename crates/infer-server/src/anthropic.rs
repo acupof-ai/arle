@@ -481,7 +481,7 @@ impl MessagesResponse {
     }
 }
 
-pub(crate) fn mint_tool_use_id() -> String {
+fn mint_tool_use_id() -> String {
     format!("toolu_{}", uuid::Uuid::new_v4().simple())
 }
 
@@ -489,7 +489,7 @@ pub(crate) fn mint_tool_use_id() -> String {
 /// non-object arguments are preserved under `{"_raw": …}`. The single
 /// normalization for BOTH response paths (non-streaming via
 /// [`arguments_to_input`], streaming via [`StreamEncoder::tool_use`]).
-pub(crate) fn input_from_value(value: &Value) -> Value {
+fn input_from_value(value: &Value) -> Value {
     if value.is_object() {
         value.clone()
     } else {
@@ -499,7 +499,7 @@ pub(crate) fn input_from_value(value: &Value) -> Value {
 
 /// Parse an OpenAI arguments-JSON string into the Anthropic `input` object;
 /// unparseable arguments are preserved under `{"_raw": …}`.
-pub(crate) fn arguments_to_input(raw: &str) -> Value {
+fn arguments_to_input(raw: &str) -> Value {
     serde_json::from_str::<Value>(raw)
         .map_or_else(|_| json!({ "_raw": raw }), |value| input_from_value(&value))
 }
