@@ -12,7 +12,7 @@ pub(super) fn check_cuda_ffi(status: CUresult, label: &'static str) -> Result<()
 }
 
 #[cfg(not(feature = "no-cuda"))]
-enum F32Operand<'a> {
+pub(in crate::backend_cuda) enum F32Operand<'a> {
     Borrowed(&'a CudaSlice<f32>),
     Imported(CudaSlice<f32>),
 }
@@ -28,7 +28,7 @@ impl F32Operand<'_> {
 }
 
 #[cfg(not(feature = "no-cuda"))]
-enum Bf16Operand<'a> {
+pub(in crate::backend_cuda) enum Bf16Operand<'a> {
     Borrowed(&'a CudaSlice<u16>),
     Quantized(CudaSlice<u16>),
 }
