@@ -1,10 +1,9 @@
 //! CUDA device context, pipeline fences, and allocation tracing.
 
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{
-    CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtrMut, DeviceRepr, DriverError,
-    PinnedHostSlice,
-};
+use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DeviceRepr, DriverError};
+#[cfg(test)]
+use cudarc::driver::{DevicePtrMut, PinnedHostSlice};
 use std::any::type_name;
 use std::collections::BTreeMap;
 use std::panic::Location;
@@ -510,7 +509,8 @@ impl DeviceContext {
     /// `dst` must stay allocated and must not be read, written, or freed by
     /// another stream until that stream waits on the returned fence. `src` must
     /// be pinned so the async H2D copy has a stable host address.
-    pub unsafe fn memcpy_pinned_htod_on_copy_stream<T, Dst>(
+    #[cfg(test)]
+    pub(crate) unsafe fn memcpy_pinned_htod_on_copy_stream<T, Dst>(
         &self,
         src: &PinnedHostSlice<T>,
         dst: &mut Dst,
