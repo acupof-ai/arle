@@ -1,11 +1,4 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KVCacheDtype {
-    #[default]
-    BF16,
-    INT8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KVFormat {
     #[default]
     BF16,
@@ -34,7 +27,7 @@ impl KVFormat {
         }
     }
 
-    pub fn bytes_per_element(self) -> usize {
+    pub(crate) fn bytes_per_element(self) -> usize {
         match self {
             Self::BF16 => 2,
             Self::FP8E4M3 | Self::INT8 => 1,
@@ -50,18 +43,18 @@ impl KVFormat {
     /// `Some(record bytes)` for the packed single-plane record format,
     /// `None` for every per-head format. Sizing paths use this to bypass
     /// `kv_dim`-based math for packed records.
-    pub fn packed_record_bytes_per_token(self) -> Option<usize> {
+    pub(crate) fn packed_record_bytes_per_token(self) -> Option<usize> {
         match self {
             Self::PackedBytes { bytes_per_token } => Some(bytes_per_token),
             _ => None,
         }
     }
 
-    pub fn has_scales(self) -> bool {
+    pub(crate) fn has_scales(self) -> bool {
         matches!(self, Self::FP8E4M3 | Self::INT8)
     }
 
-    pub fn needs_work_buffer(self) -> bool {
+    pub(crate) fn needs_work_buffer(self) -> bool {
         // PackedBytes records are written directly by their producer — no
         // bf16 staging buffer (the FlashMLA pack path writes the packed
         // record in one shot).

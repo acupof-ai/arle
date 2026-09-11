@@ -17,7 +17,7 @@ use log::info;
 
 use super::tensor::DeviceContext;
 use crate::kv_quant::paged_attention_quantized_fa3_workspace_bytes;
-use crate::kv_types::{KVCacheDtype, KVFormat};
+use crate::kv_types::KVFormat;
 
 /// Logical-page marker for a page that has been **evict-dropped** out of HBM
 /// under the write-through tiered KV model ([`TokenKVPool::evict_slot_page`]).
@@ -98,8 +98,6 @@ pub struct TokenKVPool {
     page_ref_count: Vec<u32>,
 
     pub format: KVFormat,
-    /// Legacy compat — maps to format.
-    pub dtype: KVCacheDtype,
     pub num_layers: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -329,34 +327,6 @@ impl TokenKVPool {
         self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
     }
 
-    ///
-    /// `budget_bytes` controls how much GPU memory to allocate for the pool.
-    /// `max_total_tokens` is derived from the budget: all memory is allocated
-    /// up-front at construction time.
-    pub fn new(
-        ctx: &DeviceContext,
-        num_layers: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        num_slots: usize,
-        budget_bytes: usize,
-        dtype: KVCacheDtype,
-    ) -> Result<Self> {
-        let format = match dtype {
-            KVCacheDtype::BF16 => KVFormat::BF16,
-            KVCacheDtype::INT8 => KVFormat::INT8,
-        };
-        Self::with_format(
-            ctx,
-            num_layers,
-            num_kv_heads,
-            head_dim,
-            num_slots,
-            budget_bytes,
-            format,
-        )
-    }
-
     pub fn with_format(
         ctx: &DeviceContext,
         num_layers: usize,
@@ -496,14 +466,6 @@ impl TokenKVPool {
                 (None, 0)
             };
 
-        // Legacy dtype mapping. PackedBytes carries no per-head quant
-        // dispatch — BF16 is the inert legacy mapping (the FlashMLA
-        // consumer reads the packed record directly, never this field).
-        let dtype = match format {
-            KVFormat::BF16 | KVFormat::PackedBytes { .. } => KVCacheDtype::BF16,
-            KVFormat::FP8E4M3 | KVFormat::INT8 => KVCacheDtype::INT8,
-        };
-
         Ok(Self {
             k_data,
             v_data,
@@ -520,7 +482,6 @@ impl TokenKVPool {
             page_attach_count,
             page_ref_count,
             format,
-            dtype,
             num_layers,
             num_kv_heads,
             head_dim,
