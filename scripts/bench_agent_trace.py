@@ -11,11 +11,6 @@ This is the P1-and-beyond scoreboard for the Tiered KV Cache project:
 the exit gate for P1 is ">= 70% cross-session prefix hit rate" and this
 script provides the observable trace that measures it.
 
-NOTE: the existing `scripts/bench_agent.py` drives the Rust *binary* via
-stdin and greps logs — a different workload shape. This replayer is
-HTTP + async + trace-driven and lives under a different name to avoid
-overwriting that script.
-
 Usage:
   # Against the infer HTTP server, default trace, default label:
   python3 scripts/bench_agent_trace.py --server http://localhost:8000
@@ -748,7 +743,6 @@ async def _stream_one_turn(
         # Retry loop: each iteration is a fresh stream attempt.
         # On 503: backoff + retry. On 200: process body inline + break.
         # On other non-200: return error immediately.
-        completed_normally = False
         while True:
             async with client.stream(
                 "POST",

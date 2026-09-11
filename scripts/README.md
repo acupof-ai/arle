@@ -16,7 +16,6 @@ directory unless noted.
 | `bench_local_metal_supplement.sh` | Supplemental Metal benchmark shapes. |
 | `bench_mlx_http_decode.py` | MLX HTTP decode benchmark. |
 | `bench_multitenant_burst.py` | Multi-tenant burst throughput benchmark. |
-| `bench_agent.py` | Local agent end-to-end benchmark. |
 | `bench_agent_trace.py` | Agent trace-driven benchmark. |
 | `bench_long_agent.py` | Long-horizon agent benchmark. |
 | `bench_sglang_longctx.sh` | SGLang long-context baseline runner. |
@@ -104,8 +103,6 @@ directory unless noted.
 | `tbench_full.sh` | Terminal-Bench full run. |
 | `tbench_opd_loop.sh` | Terminal-Bench OPD loop. |
 | `tb_exclude_security.sh` | Terminal-Bench security exclusion. |
-| `terminal_bench_eval.sh` | Terminal-Bench evaluation. |
-| `terminal_bench_serve.sh` | Terminal-Bench serve setup. |
 | `terminus_to_records.py` | Convert Terminus output to records. |
 | `train_and_chat.sh` | Quick train+chat smoke test. |
 

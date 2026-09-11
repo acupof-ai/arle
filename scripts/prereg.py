@@ -9,8 +9,8 @@ because of it. Collapsing them is how a measurement becomes a conclusion
 without anyone deciding it should.
 
     scripts/prereg.py start --name c1-mtp-batch \
-        --cmd "scripts/bench_agent.py --concurrency 16" \
-        --hypothesis "batched MTP verify moves ms/committed-token at c=16"
+        --cmd "scripts/bench_multiturn_ttft.py --turns 12" \
+        --hypothesis "batched MTP verify moves per-turn TTFT at 12 turns"
     scripts/prereg.py done --name c1-mtp-batch --status ok \
         --result "6.20 -> 4.31 ms" --finding "..." --decision "..."
 
