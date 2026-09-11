@@ -54,6 +54,8 @@
 //! are owned by [`crate::model_qwen35::VulkanQwen35Model`] and advanced in place
 //! here, matching the reference's owned-state contract.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::{Context, Result, anyhow, bail};
 
 use qwen35_spec::{LayerType, Qwen35Config};
@@ -1378,11 +1380,18 @@ fn record_full_attention<'a>(
 /// The cap-flush branch is numerically transparent — the `hid` hand-off is
 /// fence-ordered by the reopening `begin()` — so lowering this stays a pure
 /// TDR/latency safety valve (more submits, smaller command buffers) with no
-/// effect on output if a setter is wired later.
-const SUBMIT_DISPATCH_CAP: usize = usize::MAX;
+/// effect on output. `set_submit_cap` overrides the default before a run.
+const DEFAULT_SUBMIT_DISPATCH_CAP: usize = usize::MAX;
+static SUBMIT_DISPATCH_CAP: AtomicUsize = AtomicUsize::new(DEFAULT_SUBMIT_DISPATCH_CAP);
+
+/// Lower the per-command-buffer dispatch cap (TDR/latency safety valve). Set
+/// once before building the engine; lower values force more, smaller submits.
+pub fn set_submit_cap(cap: usize) {
+    SUBMIT_DISPATCH_CAP.store(cap.max(1), Ordering::Relaxed);
+}
 
 fn submit_dispatch_cap() -> usize {
-    SUBMIT_DISPATCH_CAP
+    SUBMIT_DISPATCH_CAP.load(Ordering::Relaxed)
 }
 
 /// Record (NO begin/submit) the WHOLE linear (gated-delta) attention block
