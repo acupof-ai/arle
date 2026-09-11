@@ -33,25 +33,33 @@ pub enum XGrammarError {
 
 pub type Result<T> = std::result::Result<T, XGrammarError>;
 
+#[cfg(feature = "real")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
-pub enum VocabType {
+pub(crate) enum VocabType {
     Raw = 0,
-    ByteFallback = 1,
-    ByteLevel = 2,
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "real"), derive(Default))]
 pub struct CompilerConfig {
-    pub vocab_type: VocabType,
-    pub vocab_size: Option<usize>,
-    pub stop_token_ids: Vec<i32>,
-    pub add_prefix_space: bool,
-    pub max_threads: i32,
-    pub cache_enabled: bool,
-    pub max_memory_bytes: i64,
+    #[cfg(feature = "real")]
+    pub(crate) vocab_type: VocabType,
+    #[cfg(feature = "real")]
+    pub(crate) vocab_size: Option<usize>,
+    #[cfg(feature = "real")]
+    pub(crate) stop_token_ids: Vec<i32>,
+    #[cfg(feature = "real")]
+    pub(crate) add_prefix_space: bool,
+    #[cfg(feature = "real")]
+    pub(crate) max_threads: i32,
+    #[cfg(feature = "real")]
+    pub(crate) cache_enabled: bool,
+    #[cfg(feature = "real")]
+    pub(crate) max_memory_bytes: i64,
 }
 
+#[cfg(feature = "real")]
 impl Default for CompilerConfig {
     fn default() -> Self {
         Self {
@@ -67,12 +75,17 @@ impl Default for CompilerConfig {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "real"), derive(Default))]
 pub struct MatcherConfig {
-    pub override_stop_tokens: Vec<i32>,
-    pub terminate_without_stop_token: bool,
-    pub max_rollback_tokens: i32,
+    #[cfg(feature = "real")]
+    pub(crate) override_stop_tokens: Vec<i32>,
+    #[cfg(feature = "real")]
+    pub(crate) terminate_without_stop_token: bool,
+    #[cfg(feature = "real")]
+    pub(crate) max_rollback_tokens: i32,
 }
 
+#[cfg(feature = "real")]
 impl Default for MatcherConfig {
     fn default() -> Self {
         Self {
@@ -270,6 +283,7 @@ impl Drop for GrammarCompiler {
 pub struct CompiledGrammar {
     #[cfg(feature = "real")]
     inner: NonNull<ffi::ArleXGrammarCompiledGrammar>,
+    #[cfg(feature = "real")]
     vocab_size: usize,
 }
 
@@ -289,7 +303,8 @@ impl CompiledGrammar {
         })
     }
 
-    pub fn vocab_size(&self) -> usize {
+    #[cfg(feature = "real")]
+    pub(crate) fn vocab_size(&self) -> usize {
         self.vocab_size
     }
 }
@@ -306,6 +321,7 @@ impl Drop for CompiledGrammar {
 pub struct GrammarMatcher {
     #[cfg(feature = "real")]
     inner: NonNull<ffi::ArleXGrammarMatcher>,
+    #[cfg(feature = "real")]
     vocab_size: usize,
     _not_sync: PhantomData<*mut ()>,
 }
@@ -350,13 +366,6 @@ impl GrammarMatcher {
     }
 
     pub fn fill_next_token_bitmask(&mut self, bitmask: &mut [u32]) -> Result<bool> {
-        let need = bitmask_size(self.vocab_size)?;
-        if bitmask.len() < need {
-            return Err(XGrammarError::BitmaskTooSmall {
-                got: bitmask.len(),
-                need,
-            });
-        }
         #[cfg(not(feature = "real"))]
         {
             let _ = bitmask;
@@ -364,6 +373,13 @@ impl GrammarMatcher {
         }
         #[cfg(feature = "real")]
         {
+            let need = bitmask_size(self.vocab_size)?;
+            if bitmask.len() < need {
+                return Err(XGrammarError::BitmaskTooSmall {
+                    got: bitmask.len(),
+                    need,
+                });
+            }
             let mut need_apply = 0_u8;
             let mut error = ptr::null_mut();
             // SAFETY: `inner` is live; bitmask points to at least `need` u32 values.
