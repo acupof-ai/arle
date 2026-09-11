@@ -799,7 +799,7 @@ inputs = ["q", "k", "v", "g", "beta", "gdr_state"]
 outputs = ["y", "gdr_state_out", "innovation_tape"]
 reference = "metal.qwen35.gated_delta_step_kernel"
 correctness_gate = "crates/mlx-sys/tests/kernel_parity.rs"
-gate_gap = "Qwen3.6-35B-A3B-4bit GDR geometry Hk=16 Hv=32 Dk=Dv=128, T in {1,16} (decode + prefill verify chunk), bf16 q/k/v, f32 g/beta/state, y/state/tape each compared vs an f64 host oracle with a k-spike and a v-spike negative control; gaps: synthetic random activations (not checkpoint), B=1 only, no conv1d coupling"
+gate_gap = "Qwen3.6-35B-A3B-4bit GDR geometry Hk=16 Hv=32 Dk=Dv=128, T in {1,16} (decode + prefill verify chunk), B in {1,4} (B=4 pins the B*Hv z-grid; production Metal pins batch_size=1 at every FFI entry and the executor calls step_session per slot), bf16 q/k/v, f32 g/beta/state, y/state/tape each compared vs an f64 host oracle with a k-spike and a v-spike negative control; gaps: synthetic random activations (not checkpoint), no conv1d coupling"
 
 [[implementation]]
 id = "metal.qwen35.gated_delta_step_kernel"
@@ -847,7 +847,7 @@ inputs = ["queries", "keys", "values"]
 outputs = ["attn_out"]
 reference = "metal.qwen35.batched_sdpa_2pass"
 correctness_gate = "crates/mlx-sys/tests/kernel_parity.rs"
-gate_gap = "full-attention verify-batch geometry Hq=16 Hk=2 D=256 q_len=16 GQA 8, N in {64,128,192} (past 128 exercises the partials strided loop), output vs f64 softmax with the kernel's packed-chunk causal mask, value-spike negative control; gaps: synthetic inputs, B=1, N capped at 192 (production prefill N is much larger)"
+gate_gap = "full-attention geometry Hq=16 Hk=2 D=256 q_len=16 GQA 8, B in {1,4}, N in {16,100,129,1000,4113} (arbitrary cache_pos+S; N<128 leaves partial blocks empty), plus K/V rounded through the production 8-bit/group-128 KV quantizer then dequantized, output vs f64 softmax with packed-chunk causal mask, value-spike negative control; gap: synthetic inputs; production FFI entries pin batch_size=1 so B=4 is kernel-address coverage"
 
 [[implementation]]
 id = "metal.qwen35.batched_sdpa_2pass"
@@ -867,7 +867,7 @@ inputs = ["activation", "int4_packed_weight", "group_scales", "group_biases"]
 outputs = ["projection"]
 reference = "metal.qwen35.verify_qmm_mma2big"
 correctness_gate = "crates/mlx-sys/tests/kernel_parity.rs"
-gate_gap = "M=16 K=2048 bits=4 affine, N in {512,2048}, group_size in {32,64,128} (64 is the checkpoint group), output vs f64 dequant matmul nib*scale+bias, per-group-size scale-spike negative control; gaps: synthetic weights/activations, affine mode only (mxfp4 mode=1 routes to stock MLX quantized_matmul), no MoE grouped path"
+gate_gap = "M=16 K=2048 bits=4 affine, N in {512,2048}, group_size in {32,64,128} (64 is the checkpoint group), scales/biases BF16 (checkpoint safetensors dtype), output vs f64 dequant matmul nib*scale+bias with bf16-rounded scale/bias, per-group-size scale-spike negative control; gaps: synthetic weights/activations, affine mode only (mxfp4 mode=1 routes to stock MLX quantized_matmul), no MoE grouped path"
 
 [[implementation]]
 id = "metal.qwen35.verify_qmm_mma2big"

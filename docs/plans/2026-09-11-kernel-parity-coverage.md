@@ -160,32 +160,42 @@ aborts).
 | Kernel | Computes | Default-path caller | Geometry in gate |
 |---|---|---|---|
 | `tape_replay` (bridge) | GDR rollback: `state = g*state + k·δ_tape`, replay of recorded innovation tape when sampled draft tokens are rejected | GDR tape-mode rollback in the compiled forward (record enabled during draft; replay via `mlx_tape_replay`) | B=1, T=16, Hk=16, Hv=32, Dk=Dv=128, f32 state |
-| `gated_delta_step` (model TU) | GDR linear-attention recurrent step: decay state by g, `δ=β(v−state·k)`, `state+=kδ`, `y=state·q` | 32 of 40 Qwen3.6 layers (`linear_attention`); both decode S=1 and prefill S=16+ | B=1, T∈{1,16}, Hk=16 Hv=32 Dk=Dv=128, bf16 q/k/v, f32 g/β/state |
-| `gated_delta_step_tape` (model TU) | Same kernel plus the bf16 innovation tape output | Same layers with tape recording on (draft verification) | T=16, tape checked against bf16-rounded f64 oracle |
-| `batched_sdpa_2pass_partials` + `batched_sdpa_2pass_reduce` (bridge) | 2-pass causal SDPA fixed at 16 queries: 128 partial softmax blocks + online reduction | 8 `full_attention` layers, only on the verify batch (`is_verify && B==1 && seq_len==16`, head_dim 256, GQA 8) | Hq=16 Hk=2 D=256, q_len=16, N∈{64,128,192} |
-| `verify_qmm_mma2big_*` (bridge, one source, group_size 32/64/128) | Fixed-M=16 simdgroup-matrix 4-bit affine quantized matmul: `y = x·(nib·scale+bias)ᵀ` | `QWeight::apply(prefer_verify_m16)` for every attention projection on the verify batch; group 64 is the checkpoint quantization | M=16, K=2048, N∈{512,2048}, bits=4 affine, all 3 group sizes |
+| `gated_delta_step` (model TU) | GDR linear-attention recurrent step: decay state by g, `δ=β(v−state·k)`, `state+=kδ`, `y=state·q` | 32 of 40 Qwen3.6 layers (`linear_attention`); both decode S=1 and prefill S=16+ | B∈{1,4}, T∈{1,16}, Hk=16 Hv=32 Dk=Dv=128, bf16 q/k/v, f32 g/β/state |
+| `gated_delta_step_tape` (model TU) | Same kernel plus the bf16 innovation tape output | Same layers with tape recording on (draft verification) | B=1, T=16, tape checked against bf16-rounded f64 oracle |
+| `batched_sdpa_2pass_partials` + `batched_sdpa_2pass_reduce` (bridge) | 2-pass causal SDPA fixed at 16 queries: 128 partial softmax blocks + online reduction | 8 `full_attention` layers, only on the verify batch (`is_verify && seq_len==16`, head_dim 256, GQA 8); cached int8 KV is dequantized to bf16 before the same call | B∈{1,4}, Hq=16 Hk=2 D=256, q_len=16, N∈{16,100,129,1000,4113}, one int8-KV (8-bit/group-128) dequant case |
+| `verify_qmm_mma2big_*` (bridge, one source, group_size 32/64/128) | Fixed-M=16 simdgroup-matrix 4-bit affine quantized matmul: `y = x·(nib·scale+bias)ᵀ` | `QWeight::apply(prefer_verify_m16)` for every attention projection on the verify batch; group 64 is the checkpoint quantization | M=16, K=2048, N∈{512,2048}, bits=4 affine, **BF16 scales/biases (checkpoint dtype)**, all 3 group sizes |
 
 Gate structure (`cargo test -p mlx-sys --release`, also a metal-ci lane):
 - `gated_delta_step_parity` — y and final state vs f64 oracle, T=1 and T=16.
+- `gated_delta_batched_rows` — B=4 with an independent state per row, pins
+  the kernel's `B*Hv` z-grid addressing.
 - `gated_delta_innovation_tape` — recorded tape vs bf16-rounded oracle.
 - `tape_replay_reconstructs_state` — replay kernel vs an f64 replay oracle
   consuming the same bf16 tape.
 - `batched_sdpa_2pass_causal` — output vs f64 softmax with the kernel's
-  packed-chunk mask (`n ≤ N−16+qi`).
+  packed-chunk mask (`n ≤ N−16+qi`) at N 16/100/129/1000/4113, B=1 and B=4,
+  including K/V rounded through the production 8-bit KV quantizer.
 - `verify_qmm_mma2big_group_sizes` — output vs f64 dequant matmul,
   group_size 32/64/128.
 - `negative_controls` — one corruption per family (k spike, v spike, tape
   byte flip, value spike, scale spike), each asserted to clear the clean
   error by >10×; measured clean error is ~1e-2 (relative RMS) and corrupt
-  error 0.2–34 for every family.
+  error 2.3–342 for every family.
 
-Gate gaps: synthetic random inputs rather than real checkpoint activations;
-B=1 only (the kernel serves the single-stream verify/decode shape); SDPA
-N capped at 192 (a prefill verify batch has N≫192, but the kernel's block
-loop is uniform past 128); QMM covers bits=4 affine only — mxfp4 mode=1
-deliberately routes to stock MLX; the model forward itself stays behind the
-needle gate (these tests exercise the kernels at the op boundary, not a
-full step).
+Tolerances are ~3× the measured clean error. The f32 state bound is 3e-6 at
+both T=1 and T=16: the kernel keeps state in f32, so the only error source
+is bf16 input rounding and it does not accumulate with T. The tape bound
+(1.2e-2) reflects the kernel's bf16 store of the innovation itself.
+
+Gate gaps: synthetic random inputs rather than real checkpoint activations.
+Production Metal never runs either kernel with B>1 — every compiled-model
+FFI entry pins `current_batch_size = 1` (e.g. `qwen35_compiled_step_session`,
+`qwen35_compiled_verify_block_summary`; DFlash batched decode loops slots in
+`MetalExecutor` and calls step_session per row) — so B=4 is a kernel
+addressing guard, not a production shape. QMM covers bits=4 affine only —
+mxfp4 mode=1 deliberately routes to stock MLX; the model forward itself
+stays behind the needle gate (these tests exercise the kernels at the op
+boundary, not a full step).
 
 ## DEAD production-shaped wrappers / AOT rows (resolved in kernel-parity-s11)
 

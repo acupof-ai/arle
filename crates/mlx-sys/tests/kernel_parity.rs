@@ -3,18 +3,19 @@
 //! Every custom `fast::metal_kernel` family is compared against an f64 host
 //! oracle at Qwen3.6-35B-A3B-4bit geometry (GDR: Hk=16 Hv=32 Dk=Dv=128;
 //! full attention: Hq=16 Hk=2 D=256; 4-bit QMM group_size=64, K=2048).
-//! Kernel inputs are bf16 on the production path; the oracle quantizes every
-//! input through bf16 first so the residual measures kernel arithmetic, not
-//! input cast error. The `negative_controls` test perturbs each family and
-//! asserts the corruption is detected.
+//! Kernel inputs are bf16 on the production path, including the checkpoint's
+//! per-group QMM scales/biases (BF16 in the safetensors); the oracle rounds
+//! every input through bf16 first so the residual measures kernel
+//! arithmetic, not input cast error. The `negative_controls` test perturbs
+//! each family and asserts the corruption is detected.
 #![cfg(target_os = "macos")]
 
 use std::ptr;
 
 use mlx_sys::{
     MLX_BFLOAT16, MLX_FLOAT32, MLX_UINT32, mlx_array_export_bytes, mlx_array_free,
-    mlx_array_from_data, mlx_batched_sdpa_2pass, mlx_eval, mlx_guard, mlx_qwen35_gated_delta_step,
-    mlx_tape_replay, mlx_verify_quantized_matmul,
+    mlx_array_from_data, mlx_batched_sdpa_2pass, mlx_dequantize, mlx_eval, mlx_guard, mlx_quantize,
+    mlx_qwen35_gated_delta_step, mlx_tape_replay, mlx_verify_quantized_matmul,
 };
 
 // Canonical GDR geometry (linear_* in Qwen3.6-35B-A3B-4bit config.json).
@@ -27,6 +28,8 @@ const HQ: usize = 16;
 const HKA: usize = 2;
 const DA: usize = 256;
 const Q_LEN: usize = 16;
+// int8 KV group for head_dim 256 (kv_int8_group_size in the model TU).
+const KV_GROUP: i32 = 128;
 
 struct Arr(*mut mlx_sys::mlx_array);
 impl Drop for Arr {
@@ -68,16 +71,19 @@ fn arr_f32(data: &[f32], shape: &[i32]) -> Arr {
 }
 fn arr_bf16(data: &[f32], shape: &[i32]) -> (Arr, Vec<u16>) {
     let bits: Vec<u16> = data.iter().map(|x| f32_to_bf16(*x)).collect();
+    let a = arr_bf16_from_bits(&bits, shape);
+    (a, bits)
+}
+fn arr_bf16_from_bits(bits: &[u16], shape: &[i32]) -> Arr {
     // SAFETY: live bf16 buffer + valid shape; the bridge copies the bytes.
-    let a = unsafe {
+    unsafe {
         Arr(mlx_array_from_data(
             bits.as_ptr().cast(),
             shape.as_ptr(),
             shape.len() as i32,
             MLX_BFLOAT16,
         ))
-    };
-    (a, bits)
+    }
 }
 fn arr_u32(data: &[u32], shape: &[i32]) -> Arr {
     // SAFETY: live u32 buffer + valid shape; the bridge copies the bytes.
@@ -106,7 +112,10 @@ fn read_bf16(a: &Arr, n: usize) -> Vec<f32> {
     // SAFETY: buffer is n*2 bytes; the bridge writes at most that.
     let copied = unsafe { mlx_array_export_bytes(a.0, bytes.as_mut_ptr().cast(), n * 2) };
     assert_eq!(copied, n * 2);
-    (0..n)
+    bytes_to_bf16(&bytes)
+}
+fn bytes_to_bf16(bytes: &[u8]) -> Vec<f32> {
+    (0..bytes.len() / 2)
         .map(|i| bf16_to_f32(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])))
         .collect()
 }
@@ -267,7 +276,10 @@ fn run_gated(x: &GdrInputs, b: usize, t: usize, record_tape: bool) -> GdrOut {
 #[test]
 fn gated_delta_step_parity() {
     let _g = mlx_guard();
-    for (t, y_tol, s_tol) in [(1usize, 0.02, 5e-4), (16, 0.05, 2e-2)] {
+    // Bounds are ~3x the measured clean error. State error stays ~1e-6
+    // relative-RMS at both T values: every accumulator in the kernel is
+    // f32 and only the bf16 inputs round, so it does not grow with T.
+    for &t in &[1usize, 16] {
         let b = 1;
         let x = make_gdr_inputs(b, t, 0x9e37_79b9_7f4a_7c15);
         let (_, qb) = arr_bf16(&x.q, &[]);
@@ -279,10 +291,33 @@ fn gated_delta_step_parity() {
         eval(&out.state);
         let ey = err_ratio(&read_bf16(&out.y, b * t * HV * DV), &want_y);
         let es = err_ratio(&read_f32(&out.state, b * HV * DV * DK), &want_s);
-        println!("gated_delta T={t}: y err {ey:.3e} (<{y_tol}), state err {es:.3e} (<{s_tol})");
-        assert!(ey < y_tol, "gated_delta y T={t}: {ey} >= {y_tol}");
-        assert!(es < s_tol, "gated_delta state T={t}: {es} >= {s_tol}");
+        println!("gated_delta B={b} T={t}: y err {ey:.3e}, state err {es:.3e}");
+        assert!(ey < 0.03, "gated_delta y B={b} T={t}: {ey}");
+        assert!(es < 3e-6, "gated_delta state B={b} T={t}: {es}");
     }
+}
+
+#[test]
+fn gated_delta_batched_rows() {
+    let _g = mlx_guard();
+    // Batched B>1 never reaches this kernel on the production Metal path
+    // (every FFI entry pins batch_size=1 and the executor calls step_session
+    // per slot), but the kernel's z-grid is B*Hv: pin the cross-row
+    // addressing with B=4 and an independent state per row.
+    let (b, t) = (4, 4);
+    let x = make_gdr_inputs(b, t, 0x4b61_7463_6800_0004);
+    let (_, qb) = arr_bf16(&x.q, &[]);
+    let (_, kb) = arr_bf16(&x.k, &[]);
+    let (_, vb) = arr_bf16(&x.v, &[]);
+    let (want_y, want_s, _) = gated_delta_oracle(&qb, &kb, &vb, &x.g, &x.beta, &x.state, b, t);
+    let out = run_gated(&x, b, t, false);
+    eval(&out.y);
+    eval(&out.state);
+    let ey = err_ratio(&read_bf16(&out.y, b * t * HV * DV), &want_y);
+    let es = err_ratio(&read_f32(&out.state, b * HV * DV * DK), &want_s);
+    println!("gated_delta B={b} T={t}: y err {ey:.3e}, state err {es:.3e}");
+    assert!(ey < 0.03, "gated_delta y B={b}: {ey}");
+    assert!(es < 3e-6, "gated_delta state B={b}: {es}");
 }
 
 #[test]
@@ -297,8 +332,8 @@ fn gated_delta_innovation_tape() {
     let out = run_gated(&x, b, t, true);
     let tape = out.tape.as_ref().unwrap();
     eval(tape);
-    // Kernel stores bf16-rounded delta; compare to the same rounding of the
-    // f64 oracle.
+    // The kernel stores the delta as bf16; compare to the same rounding of
+    // the f64 oracle. That rounding is the error mechanism and the bound.
     let got = read_bf16(tape, b * t * HV * DV);
     let want: Vec<f64> = want_f64
         .iter()
@@ -306,7 +341,7 @@ fn gated_delta_innovation_tape() {
         .collect();
     let e = err_ratio(&got, &want);
     println!("gated_delta tape err {e:.3e}");
-    assert!(e < 0.02, "tape parity: {e}");
+    assert!(e < 0.012, "tape parity: {e}");
 }
 
 #[test]
@@ -333,86 +368,198 @@ fn tape_replay_reconstructs_state() {
     eval(&replay);
     let e = err_ratio(&read_f32(&replay, b * HV * DV * DK), &want);
     println!("tape_replay state err {e:.3e}");
-    assert!(e < 1e-5, "tape_replay state: {e}");
+    assert!(e < 2.5e-6, "tape_replay state: {e}");
 }
 
 // ---- 2-pass batched SDPA f64 oracle --------------------------------------
 // queries [B,Hq,16,D], keys/values [B,Hk,N,D]. The kernel's mask lets query
 // row qi attend key n when n <= N-16+qi (causal packed chunk).
-fn sdpa_oracle(q: &[u16], k: &[u16], v: &[u16], n: usize, scale: f64) -> Vec<f64> {
-    let qi = |h, row, d| bf16_to_f32(q[(h * Q_LEN + row) * DA + d]) as f64;
-    let ki = |h, key, d| bf16_to_f32(k[(h * n + key) * DA + d]) as f64;
-    let vi = |h, key, d| bf16_to_f32(v[(h * n + key) * DA + d]) as f64;
-    let mut out = vec![0f64; HQ * Q_LEN * DA];
-    for h in 0..HQ {
-        let hk = h / (HQ / HKA);
-        for row in 0..Q_LEN {
-            let last = n - Q_LEN + row;
-            let scores: Vec<f64> = (0..=last)
-                .map(|key| (0..DA).map(|d| qi(h, row, d) * ki(hk, key, d)).sum::<f64>() * scale)
-                .collect();
-            let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let ex: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
-            let z: f64 = ex.iter().sum();
-            for d in 0..DA {
-                let acc: f64 = (0..=last).map(|key| ex[key] * vi(hk, key, d)).sum();
-                out[(h * Q_LEN + row) * DA + d] = acc / z;
+fn sdpa_oracle(q: &[u16], k: &[u16], v: &[u16], b: usize, n: usize, scale: f64) -> Vec<f64> {
+    let qi = |b0, h, row, d| bf16_to_f32(q[((b0 * HQ + h) * Q_LEN + row) * DA + d]) as f64;
+    let ki = |b0, h, key, d| bf16_to_f32(k[((b0 * HKA + h) * n + key) * DA + d]) as f64;
+    let vi = |b0, h, key, d| bf16_to_f32(v[((b0 * HKA + h) * n + key) * DA + d]) as f64;
+    let mut out = vec![0f64; b * HQ * Q_LEN * DA];
+    for b0 in 0..b {
+        for h in 0..HQ {
+            let hk = h / (HQ / HKA);
+            for row in 0..Q_LEN {
+                let last = n - Q_LEN + row;
+                let scores: Vec<f64> = (0..=last)
+                    .map(|key| {
+                        (0..DA)
+                            .map(|d| qi(b0, h, row, d) * ki(b0, hk, key, d))
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let ex: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let z: f64 = ex.iter().sum();
+                for d in 0..DA {
+                    let acc: f64 = (0..=last).map(|key| ex[key] * vi(b0, hk, key, d)).sum();
+                    out[((b0 * HQ + h) * Q_LEN + row) * DA + d] = acc / z;
+                }
             }
         }
     }
     out
 }
 
-fn run_sdpa(n: usize, corrupt_v: bool) -> (Vec<f32>, Vec<f64>) {
-    let mut r = Rng(0x51ab_5eed_5000_0001);
-    let q: Vec<f32> = (0..HQ * Q_LEN * DA).map(|_| r.next() * 0.2).collect();
-    let mut k: Vec<f32> = (0..HKA * n * DA).map(|_| r.next() * 0.2).collect();
-    let mut v: Vec<f32> = (0..HKA * n * DA).map(|_| r.next() * 0.2).collect();
-    if corrupt_v {
-        // Every query row attends key 0 (last >= 0), so a key-0 value spike
-        // changes the whole output.
-        v[0] += 4.0;
-        k[0] += 0.0;
+// Round k/v through the production int8 KV path: MLX affine quantize
+// (bits=8, group 128 on head_dim 256) then dequantize back to bf16. The
+// model feeds exactly these dequantized arrays to batched_sdpa_2pass_cpp.
+fn int8_kv_roundtrip(k: Arr, v: Arr, b: usize, n: usize) -> (Arr, Arr, Vec<u16>, Vec<u16>) {
+    let (mut kq, mut ks, mut kb) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+    let (mut vq, mut vs, mut vb) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+    // SAFETY: bf16 [B,H,N,256] inputs; last axis 256 % group 128 == 0.
+    unsafe {
+        mlx_quantize(k.0, KV_GROUP, 8, &mut kq, &mut ks, &mut kb);
+        mlx_quantize(v.0, KV_GROUP, 8, &mut vq, &mut vs, &mut vb);
     }
-    let (qa, qb) = arr_bf16(&q, &[1, HQ as i32, Q_LEN as i32, DA as i32]);
-    let (ka, kb) = arr_bf16(&k, &[1, HKA as i32, n as i32, DA as i32]);
-    let (va, vb) = arr_bf16(&v, &[1, HKA as i32, n as i32, DA as i32]);
-    let want = sdpa_oracle(&qb, &kb, &vb, n, 1.0 / (DA as f64).sqrt());
+    assert!(!kq.is_null() && !vq.is_null());
+    // Keep the quantize triples alive for the dequantize calls and free them
+    // when the function returns.
+    let (kq_a, ks_a, kb_a) = (Arr(kq), Arr(ks), Arr(kb));
+    let (vq_a, vs_a, vb_a) = (Arr(vq), Arr(vs), Arr(vb));
+    // SAFETY: both triples came from the matching quantize calls above.
+    let (kd, vd) = unsafe {
+        (
+            Arr(mlx_dequantize(kq_a.0, ks_a.0, kb_a.0, KV_GROUP, 8, 0)),
+            Arr(mlx_dequantize(vq_a.0, vs_a.0, vb_a.0, KV_GROUP, 8, 0)),
+        )
+    };
+    assert!(!kd.0.is_null() && !vd.0.is_null());
+    eval(&kd);
+    eval(&vd);
+    let kout = read_bf16(&kd, b * HKA * n * DA);
+    let vout = read_bf16(&vd, b * HKA * n * DA);
+    let kbits: Vec<u16> = kout.iter().map(|z| f32_to_bf16(*z)).collect();
+    let vbits: Vec<u16> = vout.iter().map(|z| f32_to_bf16(*z)).collect();
+    (kd, vd, kbits, vbits)
+}
+
+struct SdpaCase {
+    b: usize,
+    n: usize,
+    int8_kv: bool,
+}
+fn run_sdpa(case: &SdpaCase, seed: u64, corrupt_v: bool) -> (Vec<f32>, Vec<f64>) {
+    let (b, n) = (case.b, case.n);
+    let mut r = Rng(seed);
+    let q: Vec<f32> = (0..b * HQ * Q_LEN * DA).map(|_| r.next() * 0.2).collect();
+    let k: Vec<f32> = (0..b * HKA * n * DA).map(|_| r.next() * 0.2).collect();
+    let mut v: Vec<f32> = (0..b * HKA * n * DA).map(|_| r.next() * 0.2).collect();
+    let (qa, qb) = arr_bf16(&q, &[b as i32, HQ as i32, Q_LEN as i32, DA as i32]);
+
+    let (ka, va, kb, vb) = if case.int8_kv {
+        let (ka0, _) = arr_bf16(&k, &[b as i32, HKA as i32, n as i32, DA as i32]);
+        let (va0, _) = arr_bf16(&v, &[b as i32, HKA as i32, n as i32, DA as i32]);
+        let (kda, vda, kout, vout) = int8_kv_roundtrip(ka0, va0, b, n);
+        (kda, vda, kout, vout)
+    } else {
+        let (ka, kb) = arr_bf16(&k, &[b as i32, HKA as i32, n as i32, DA as i32]);
+        let (va, vb) = arr_bf16(&v, &[b as i32, HKA as i32, n as i32, DA as i32]);
+        (ka, va, kb, vb)
+    };
+
+    if corrupt_v {
+        // Every query row attends key 0 (last >= 0); spike key-0's value.
+        v[0] += 4.0;
+    }
+    let v_for_kernel: Option<Arr> = if corrupt_v {
+        let (vx, _) = arr_bf16(&v, &[b as i32, HKA as i32, n as i32, DA as i32]);
+        Some(vx)
+    } else {
+        None
+    };
+    let v_handle = v_for_kernel.as_ref().unwrap_or(&va);
+
+    let want = sdpa_oracle(&qb, &kb, &vb, b, n, 1.0 / (DA as f64).sqrt());
     // SAFETY: handles match the kernel's [B,H,S,D] bf16 contract.
     let out = unsafe {
         Arr(mlx_batched_sdpa_2pass(
             qa.0,
             ka.0,
-            va.0,
+            v_handle.0,
             1.0 / (DA as f32).sqrt(),
             (HQ / HKA) as i32,
         ))
     };
     assert!(!out.0.is_null());
     eval(&out);
-    (read_bf16(&out, HQ * Q_LEN * DA), want)
+    (read_bf16(&out, b * HQ * Q_LEN * DA), want)
 }
 
 #[test]
 fn batched_sdpa_2pass_causal() {
     let _g = mlx_guard();
-    // N>128 exercises the partials kernel's strided `n += blocks` loop.
-    for n in [64, 128, 192] {
-        let (got, want) = run_sdpa(n, false);
+    // Production N = cache_pos + S is arbitrary: unaligned N (<128 leaves
+    // most of the 128 partial blocks empty), long N (multiple block rounds),
+    // and B=4 batched verify. One case runs K/V through the int8 KV
+    // quantize/dequantize path the model uses for cached int8 attention.
+    let cases = [
+        SdpaCase {
+            b: 1,
+            n: 16,
+            int8_kv: false,
+        },
+        SdpaCase {
+            b: 1,
+            n: 100,
+            int8_kv: false,
+        },
+        SdpaCase {
+            b: 1,
+            n: 129,
+            int8_kv: false,
+        },
+        SdpaCase {
+            b: 1,
+            n: 1000,
+            int8_kv: false,
+        },
+        SdpaCase {
+            b: 1,
+            n: 4113,
+            int8_kv: false,
+        },
+        SdpaCase {
+            b: 4,
+            n: 1000,
+            int8_kv: false,
+        },
+        SdpaCase {
+            b: 1,
+            n: 1000,
+            int8_kv: true,
+        },
+    ];
+    for (i, case) in cases.iter().enumerate() {
+        let (got, want) = run_sdpa(case, 0x51ab_5eed_5000_0001 + i as u64, false);
         let e = err_ratio(&got, &want);
-        println!("sdpa_2pass N={n}: err {e:.3e}");
-        assert!(e < 0.05, "sdpa_2pass N={n}: {e}");
+        println!(
+            "sdpa_2pass B={} N={} int8_kv={}: err {e:.3e}",
+            case.b, case.n, case.int8_kv
+        );
+        // Bound ~3x the measured clean error across the long/quantized cases.
+        assert!(
+            e < 0.04,
+            "sdpa_2pass {:?}: {e}",
+            (case.b, case.n, case.int8_kv)
+        );
     }
 }
 
 // ---- fixed-M=16 4-bit quantized matmul f64 oracle ------------------------
 // w packed [N, K/8] u32, nibble k occupies bits (k%8)*4; dequant =
 // nib*scale+bias per group of group_size along K. y = x @ dequant(w)^T.
+// scales/biases are bf16, matching the checkpoint's BF16 quantization
+// tensors; the oracle receives their bf16-rounded values.
 fn qmm_oracle(
     x: &[u16],
     packed: &[u32],
-    scales: &[f32],
-    biases: &[f32],
+    scales: &[u16],
+    biases: &[u16],
     k: usize,
     n: usize,
     gs: usize,
@@ -424,7 +571,8 @@ fn qmm_oracle(
             let mut acc = 0f64;
             for kk in 0..k {
                 let nib = f64::from((packed[j * (k / 8) + kk / 8] >> ((kk % 8) * 4)) & 0xF);
-                let w = nib * scales[j * kg + kk / gs] as f64 + biases[j * kg + kk / gs] as f64;
+                let w = nib * bf16_to_f32(scales[j * kg + kk / gs]) as f64
+                    + bf16_to_f32(biases[j * kg + kk / gs]) as f64;
                 acc += bf16_to_f32(x[i * k + kk]) as f64 * w;
             }
             out[i * n + j] = acc;
@@ -453,10 +601,11 @@ fn run_qmm(gs: usize, n: usize, corrupt_scale: bool) -> (Vec<f32>, Vec<f64>) {
     }
     let (xa, xb) = arr_bf16(&xf, &[16, K as i32]);
     let wa = arr_u32(&packed, &[n as i32, (K / 8) as i32]);
-    let sa = arr_f32(&scales, &[n as i32, kg as i32]);
-    let ba = arr_f32(&biases, &[n as i32, kg as i32]);
-    let want = qmm_oracle(&xb, &packed, &scales, &biases, K, n, gs);
-    // SAFETY: M=16 x, packed [N,K/8] u32, per-group f32 scale/bias shapes.
+    // Production dtype: checkpoint scales/biases are BF16.
+    let (sa, sb) = arr_bf16(&scales, &[n as i32, kg as i32]);
+    let (ba, bb) = arr_bf16(&biases, &[n as i32, kg as i32]);
+    let want = qmm_oracle(&xb, &packed, &sb, &bb, K, n, gs);
+    // SAFETY: M=16 x, packed [N,K/8] u32, per-group bf16 scale/bias shapes.
     let out = unsafe {
         Arr(mlx_verify_quantized_matmul(
             xa.0, wa.0, sa.0, ba.0, gs as i32, 4,
@@ -474,7 +623,7 @@ fn verify_qmm_mma2big_group_sizes() {
         let (got, want) = run_qmm(gs, n, false);
         let e = err_ratio(&got, &want);
         println!("verify_qmm gs={gs} N={n}: err {e:.3e}");
-        assert!(e < 0.05, "verify_qmm gs={gs}: {e}");
+        assert!(e < 0.04, "verify_qmm gs={gs}: {e}");
     }
 }
 
@@ -537,19 +686,17 @@ fn negative_controls() {
             mlx_array_export_bytes(tape.0, bytes.as_mut_ptr().cast(), bytes.len());
         }
         bytes[1] ^= 0xFF;
-        let bad_tape = arr_bf16_from_bytes(&bytes, &[b as i32, t as i32, HV as i32, DV as i32]);
+        let bad_tape = arr_bf16_from_bits(
+            &bytes_to_bits(&bytes),
+            &[b as i32, t as i32, HV as i32, DV as i32],
+        );
         let (ka, kb) = arr_bf16(&x.k, &[b as i32, t as i32, HK as i32, DK as i32]);
         let ga = arr_f32(&x.g, &[b as i32, t as i32, HV as i32]);
         let sa = arr_f32(&x.state, &[b as i32, HV as i32, DV as i32, DK as i32]);
         // Oracle consumes the un-corrupted bf16 tape.
-        let good_bytes = {
-            let mut g = bytes.clone();
-            g[1] ^= 0xFF;
-            g
-        };
-        let good_bits: Vec<u16> = (0..b * t * HV * DV)
-            .map(|i| u16::from_le_bytes([good_bytes[2 * i], good_bytes[2 * i + 1]]))
-            .collect();
+        let mut good_bytes = bytes.clone();
+        good_bytes[1] ^= 0xFF;
+        let good_bits = bytes_to_bits(&good_bytes);
         let want = replay_oracle(&good_bits, &kb, &x.g, &x.state, b, t);
         // SAFETY: corrupted-but-valid bf16 tape and matching k/g/state handles.
         let replay = unsafe { Arr(mlx_tape_replay(bad_tape.0, ka.0, ga.0, sa.0, t as i32)) };
@@ -558,10 +705,15 @@ fn negative_controls() {
         println!("neg replay: {e:.3e}");
         assert!(e > 0.1, "replay corruption not detected: {e}");
     }
-    // 2-pass SDPA: value spike attended by every query row.
+    // 2-pass SDPA: value spike attended by every query row (B=1, N=1000).
     {
-        let (clean, wclean) = run_sdpa(128, false);
-        let (bad, _) = run_sdpa(128, true);
+        let case = SdpaCase {
+            b: 1,
+            n: 1000,
+            int8_kv: false,
+        };
+        let (clean, wclean) = run_sdpa(&case, 0x51ab_5eed_5000_0099, false);
+        let (bad, _) = run_sdpa(&case, 0x51ab_5eed_5000_0099, true);
         let ec = err_ratio(&clean, &wclean);
         let eb = err_ratio(&bad, &wclean);
         println!("neg sdpa: clean {ec:.3e} corrupt {eb:.3e}");
@@ -584,14 +736,8 @@ fn negative_controls() {
     }
 }
 
-fn arr_bf16_from_bytes(bytes: &[u8], shape: &[i32]) -> Arr {
-    // SAFETY: live bf16 byte buffer + valid shape; the bridge copies.
-    unsafe {
-        Arr(mlx_array_from_data(
-            bytes.as_ptr().cast(),
-            shape.as_ptr(),
-            shape.len() as i32,
-            MLX_BFLOAT16,
-        ))
-    }
+fn bytes_to_bits(bytes: &[u8]) -> Vec<u16> {
+    (0..bytes.len() / 2)
+        .map(|i| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))
+        .collect()
 }

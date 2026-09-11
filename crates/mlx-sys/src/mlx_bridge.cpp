@@ -830,6 +830,19 @@ mlx_array* mlx_dequantize(mlx_array* w, mlx_array* scales, mlx_array* biases,
         group_size, bits, quant_mode_str(mode))));
 }
 
+// Affine per-group quantization used for the Metal int8 KV cache; returns
+// {packed, scales, biases} through caller-provided out slots.
+void mlx_quantize(mlx_array* w, int32_t group_size, int32_t bits,
+                  mlx_array** out_w, mlx_array** out_scales, mlx_array** out_biases) {
+    MLX_TRY_VOID([&]() {
+        auto result = quantize(
+            *to_arr(w), group_size, bits, /*mode=*/"affine");
+        *out_w = from_arr(std::move(result[0]));
+        *out_scales = from_arr(std::move(result[1]));
+        *out_biases = from_arr(std::move(result[2]));
+    }());
+}
+
 mlx_array* mlx_fast_rms_norm(mlx_array* x, mlx_array* weight, float eps) {
     MLX_TRY_RETURN([&]() {
         if (weight == nullptr) {
