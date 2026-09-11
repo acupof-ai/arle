@@ -333,7 +333,7 @@ impl<'a> InProcessTeacher<'a> {
     /// adapter ids. The OPD step rejects teacher params with `requires_grad=true`,
     /// so the EMA teacher must expose only its own frozen params (base + EMA
     /// adapter), excluding the student adapter.
-    pub fn with_parameter_ids(model: &'a Qwen35Model, parameter_ids: Vec<TensorId>) -> Self {
+    pub(crate) fn with_parameter_ids(model: &'a Qwen35Model, parameter_ids: Vec<TensorId>) -> Self {
         Self {
             model,
             parameter_ids,

@@ -68,7 +68,7 @@ pub(crate) fn max_update_seq() -> usize {
 /// Measured on 27B/H20 (wins 2026-08-22): rank 65,536 runs 16,384 with the peak
 /// flat and the step −11%; rank 131,072 runs 8,192 (−15%) and OOMs at 16,384.
 /// Both sit on `chunk * rank_seq <= 2^30`, capped at 16,384 (untested above).
-pub fn opd_seq_chunk_for(rank_seq: usize) -> usize {
+pub(crate) fn opd_seq_chunk_for(rank_seq: usize) -> usize {
     const CAP: usize = 16384;
     const FLOOR: usize = 4096;
     const BUDGET: usize = 1 << 30;

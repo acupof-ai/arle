@@ -293,7 +293,6 @@ pub struct RubricOpdConfig {
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Default)]
 pub struct RoundReport {
-    pub round: usize,
     pub prompts: usize,
     pub accepted: usize,
     pub distinct_accepted: usize,
@@ -325,10 +324,7 @@ where
 {
     let mut reports = Vec::with_capacity(cfg.rounds);
     for round in 0..cfg.rounds {
-        let mut rep = RoundReport {
-            round,
-            ..Default::default()
-        };
+        let mut rep = RoundReport::default();
         let mut loss_sum = 0.0f32;
         let debug = std::env::var("ARLE_RUBRIC_DEBUG").is_ok();
 

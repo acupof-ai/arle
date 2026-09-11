@@ -6,7 +6,7 @@ impl Qwen35Layer {
     /// This layer's trainable param ids — fed to `checkpoint_sequential`'s
     /// `layer_params` so each group's saved inputs carry every layer's params
     /// (that's how `requires_grad` is true and param grads come back).
-    pub(super) fn checkpoint_param_ids(
+    pub(crate) fn checkpoint_param_ids(
         &self,
         skip_experts: bool,
         store: &TensorStore,
@@ -154,7 +154,7 @@ impl Qwen35Layer {
     /// K/V (prefix + this chunk) for the gen-segment pass. The caller passes a
     /// DISABLED tape.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_capture_prefix(
+    pub(crate) fn forward_capture_prefix(
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
@@ -243,7 +243,7 @@ impl Qwen35Layer {
     /// this layer's captured prefix. RMSNorm + MLP are position-local, so the gen
     /// residual stream is exact given the seeded attention.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_gen_segment(
+    pub(crate) fn forward_gen_segment(
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
@@ -323,7 +323,7 @@ impl Qwen35Layer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_profiled(
+    pub(crate) fn forward_profiled(
         &self,
         layer_index: usize,
         x: TensorId,
@@ -448,7 +448,7 @@ impl Qwen35Layer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_moe_routes(
+    pub(crate) fn forward_moe_routes(
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
@@ -514,7 +514,7 @@ impl Qwen35Layer {
         Ok(add_consuming_rhs(x, mlp_out, store, tape)?)
     }
 
-    pub(super) fn forward_with_kv_cache(
+    pub(crate) fn forward_with_kv_cache(
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
@@ -583,7 +583,7 @@ impl Qwen35Layer {
         Ok(add_consuming_rhs(x, mlp_out, store, tape)?)
     }
 
-    pub(super) fn forward_with_kv_cache_profiled(
+    pub(crate) fn forward_with_kv_cache_profiled(
         &self,
         x: TensorId,
         cfg: &Qwen35Config,

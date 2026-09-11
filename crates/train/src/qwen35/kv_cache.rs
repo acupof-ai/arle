@@ -16,7 +16,7 @@ impl Qwen35KvCache {
         }
     }
 
-    pub fn extend_tensor_ids(&self, keep: &mut HashSet<TensorId>) {
+    pub(crate) fn extend_tensor_ids(&self, keep: &mut HashSet<TensorId>) {
         for layer in &self.layers {
             if let Some(k) = layer.k {
                 keep.insert(k);
@@ -30,7 +30,7 @@ impl Qwen35KvCache {
 
 impl Qwen35Layer {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_with_kv_cache(
+    pub(crate) fn forward_full_attention_with_kv_cache(
         &self,
         h: TensorId,
         attn: &Qwen35FullAttention,
@@ -177,7 +177,7 @@ impl Qwen35Layer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_with_kv_cache_profiled(
+    pub(crate) fn forward_full_attention_with_kv_cache_profiled(
         &self,
         h: TensorId,
         attn: &Qwen35FullAttention,
@@ -375,7 +375,7 @@ impl Qwen35Layer {
     }
 }
 
-pub(super) fn append_cached_kv(
+fn append_cached_kv(
     cached: Option<TensorId>,
     next: TensorId,
     max_seq_len: usize,
@@ -440,7 +440,7 @@ pub(super) fn append_cached_kv(
     Ok(cached)
 }
 
-pub(super) fn causal_sdpa_decode_gqa_cached(
+fn causal_sdpa_decode_gqa_cached(
     q: TensorId,
     k_cache: TensorId,
     v_cache: TensorId,
@@ -687,7 +687,7 @@ pub(super) fn qwen_decode_prepare_kv(
     Ok((k, v))
 }
 
-pub(super) fn select_cache_rows(
+pub(crate) fn select_cache_rows(
     cache: TensorId,
     position_ids: &[usize],
     store: &mut TensorStore,

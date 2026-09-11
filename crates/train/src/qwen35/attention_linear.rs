@@ -1,7 +1,7 @@
 use super::*;
 
 impl Qwen35Layer {
-    pub(super) fn forward_linear_attention(
+    pub(crate) fn forward_linear_attention(
         &self,
         h: TensorId,
         attn: &Qwen35LinearAttention,
@@ -70,7 +70,7 @@ impl Qwen35Layer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_linear_attention_capture_prefix_state(
+    pub(crate) fn forward_linear_attention_capture_prefix_state(
         &self,
         h_prefix: TensorId,
         attn: &Qwen35LinearAttention,
@@ -127,7 +127,7 @@ impl Qwen35Layer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_linear_attention_gen_segment(
+    pub(crate) fn forward_linear_attention_gen_segment(
         &self,
         h_gen: TensorId,
         attn: &Qwen35LinearAttention,
@@ -161,7 +161,7 @@ impl Qwen35Layer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_linear_attention_profiled(
+    pub(crate) fn forward_linear_attention_profiled(
         &self,
         layer_index: usize,
         h: TensorId,

@@ -4,7 +4,7 @@ use autograd::{Result, SafetensorsRegistry, Tape, TensorId, TensorStore};
 
 use crate::qwen35::{Qwen35Model, qwen35_to_autograd};
 
-pub fn save_materialized_registry(
+pub(crate) fn save_materialized_registry(
     model: &Qwen35Model,
     store: &mut TensorStore,
     _tape: &mut Tape,

@@ -31,7 +31,7 @@ impl TpContext {
     }
 }
 
-pub fn maybe_all_reduce(
+pub(crate) fn maybe_all_reduce(
     x: TensorId,
     tp: TpContext,
     store: &mut TensorStore,

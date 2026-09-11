@@ -159,7 +159,7 @@ impl Qwen35Model {
     }
 
     #[doc(hidden)]
-    pub fn new_with_lora_targets_and_tp_layer_start(
+    fn new_with_lora_targets_and_tp_layer_start(
         cfg: &Qwen35Config,
         lora: LoraConfig,
         target_set: LoraTargetSet,
@@ -190,7 +190,7 @@ impl Qwen35Model {
         Self::new_lora_from_base_layer_start(base, lora, target_set, None, store)
     }
 
-    pub fn new_lora_from_base_layer_start(
+    fn new_lora_from_base_layer_start(
         base: &Qwen35Model,
         lora: LoraConfig,
         target_set: LoraTargetSet,
@@ -224,7 +224,7 @@ impl Qwen35Model {
         Ok(model)
     }
 
-    pub(super) fn new_internal(
+    pub(crate) fn new_internal(
         cfg: &Qwen35Config,
         lora: Option<LoraConfig>,
         lora_target_set: LoraTargetSet,

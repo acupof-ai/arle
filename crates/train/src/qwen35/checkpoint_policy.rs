@@ -2,7 +2,7 @@ use super::*;
 
 /// The one config→params mapping — every linear-attention call site and the
 /// checkpoint gate's ctx-bytes model must agree field-for-field.
-pub(super) fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> LinearAttentionParams {
+pub(crate) fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> LinearAttentionParams {
     LinearAttentionParams {
         batch,
         seq_len,
@@ -19,7 +19,7 @@ pub(super) fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> Lin
 /// checkpointed forward, since `linear_attention_core` runs the full sequence in one
 /// call while MLP and full attention chunk. UNDER-models the measured 27B slope
 /// (211712 vs 231424 B/token, −9%); `log_ckpt_peak` exists to name that drift.
-pub(super) fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usize {
+fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usize {
     let p = la_params(cfg, batch, seq_len);
     // x and h: the residual stream is the layer's, not the kernel's.
     let residual = 2 * cfg.hidden_size;
@@ -31,7 +31,7 @@ pub(super) fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usi
 /// Peak device bytes a single FULL-attention layer holds. `repeat_kv`
 /// materializes k/v at the full sequence × local attention heads; everything
 /// downstream is chunk-bounded.
-pub(super) fn full_attn_layer_peak_bytes(
+fn full_attn_layer_peak_bytes(
     cfg: &Qwen35Config,
     tp: TpContext,
     batch: usize,
@@ -68,7 +68,7 @@ impl Qwen35Model {
     /// (checkpoint). `ARLE_FORCE_CHECKPOINT` engages unconditionally — the
     /// CUDA finite-diff gate needs the checkpoint path at tiny shapes the
     /// estimate would decline.
-    pub(super) fn should_checkpoint(
+    pub(crate) fn should_checkpoint(
         &self,
         batch: usize,
         seq_len: usize,
@@ -110,7 +110,7 @@ impl Qwen35Model {
     /// host offload per K layers, but a group's forward holds all K layers' live
     /// activations until it saves — K× the per-layer peak, which OOMs at long
     /// seq. The frozen/LoRA boundary still forces a split.
-    pub(super) fn checkpoint_layers<PF, FF>(
+    pub(crate) fn checkpoint_layers<PF, FF>(
         &self,
         hidden: TensorId,
         batch: usize,
@@ -158,7 +158,7 @@ impl Qwen35Model {
     /// H20 points on hand (seq 65536 → 66987 MiB, 131072 → 81451 MiB) are two
     /// unknowns in two equations and cannot validate anything, and no constant
     /// here was fitted to close a gap. `drift` is the output that matters.
-    pub(super) fn log_ckpt_peak(
+    fn log_ckpt_peak(
         &self,
         batch: usize,
         seq_len: usize,

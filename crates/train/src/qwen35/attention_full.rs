@@ -6,7 +6,7 @@ impl Qwen35Layer {
     /// `q_start` = absolute row of the chunk's first token, so the causal
     /// mask lets Q[i] attend to K/V[0 .. q_start+i+1].
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_with_kv(
+    pub(crate) fn forward_full_attention_with_kv(
         &self,
         h: TensorId,
         attn: &Qwen35FullAttention,
@@ -80,7 +80,7 @@ impl Qwen35Layer {
         Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
-    pub(super) fn forward_full_attention(
+    pub(crate) fn forward_full_attention(
         &self,
         h: TensorId,
         attn: &Qwen35FullAttention,
@@ -250,7 +250,7 @@ impl Qwen35Layer {
     /// projection f32 outputs (and their LoRA deltas) to the chunk row count
     /// instead of the full sequence — the 131K forward-OOM site.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_chunked(
+    fn forward_full_attention_chunked(
         &self,
         h: TensorId,
         attn: &Qwen35FullAttention,
@@ -422,7 +422,7 @@ impl Qwen35Layer {
     /// Off-tape (caller passes a disabled tape). Only K/V — the prompt's Q is
     /// never queried by the gen segment.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_capture_prefix_kv(
+    pub(crate) fn forward_full_attention_capture_prefix_kv(
         &self,
         h_prefix: TensorId,
         attn: &Qwen35FullAttention,
@@ -476,7 +476,7 @@ impl Qwen35Layer {
     /// K/V along the seq axis — grad flows into k_gen/v_gen only — and runs
     /// cached SDPA with `q_start = gen_start`.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_gen_segment(
+    pub(crate) fn forward_full_attention_gen_segment(
         &self,
         h_gen: TensorId,
         attn: &Qwen35FullAttention,
@@ -596,7 +596,7 @@ impl Qwen35Layer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_full_attention_profiled(
+    pub(crate) fn forward_full_attention_profiled(
         &self,
         layer_index: usize,
         h: TensorId,

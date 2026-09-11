@@ -2,7 +2,7 @@ use super::*;
 
 impl Qwen35Layer {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_mlp(
+    pub(crate) fn forward_mlp(
         &self,
         h: TensorId,
         cfg: &Qwen35Config,
@@ -150,7 +150,7 @@ impl Qwen35Layer {
     }
 }
 
-pub(super) fn build_qwen35_grouped_routes(routes: &MoeTopK) -> Result<Vec<MoeGroupedRoute>> {
+fn build_qwen35_grouped_routes(routes: &MoeTopK) -> Result<Vec<MoeGroupedRoute>> {
     if routes.indices.len() != routes.tokens * routes.top_k {
         return Err(AutogradError::InvalidIndicesLen {
             expected: routes.tokens * routes.top_k,
@@ -184,7 +184,7 @@ pub(super) fn build_qwen35_grouped_routes(routes: &MoeTopK) -> Result<Vec<MoeGro
     Ok(grouped)
 }
 
-pub(super) fn validate_qwen35_moe_route_signature(
+fn validate_qwen35_moe_route_signature(
     route: &Qwen35MoeRouteSignature,
     layer: usize,
     tokens: usize,
@@ -220,7 +220,7 @@ pub(super) fn validate_qwen35_moe_route_signature(
     Ok(())
 }
 
-pub(super) fn qwen35_grouped_linear_experts(
+fn qwen35_grouped_linear_experts(
     experts: &[Qwen35SparseExpert],
     select: impl Fn(&Qwen35SparseExpert) -> &LinearWithLora,
 ) -> Vec<MoeGroupedLinearExpert> {

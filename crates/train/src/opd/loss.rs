@@ -16,7 +16,7 @@ use super::{
     validation::validate_gkd_lambda,
 };
 
-pub(super) fn kl_distill_loss_for_config(
+pub(crate) fn kl_distill_loss_for_config(
     student_logits: TensorId,
     teacher_logits: TensorId,
     num_positions: usize,
@@ -76,7 +76,7 @@ pub(super) fn kl_distill_loss_for_config(
     }
 }
 
-pub(super) fn next_token_sft_loss_from_logits(
+pub(crate) fn next_token_sft_loss_from_logits(
     student_logits: TensorId,
     logits_seq_len: usize,
     start_position: usize,
@@ -249,7 +249,7 @@ fn corpus_truth_sft_loss(
     )
 }
 
-pub(super) fn gkd_sft_loss(
+pub(crate) fn gkd_sft_loss(
     config: GkdLossConfig<'_>,
     student: &Qwen35Model,
     prompt_ids: &[u32],
@@ -281,7 +281,7 @@ pub(super) fn gkd_sft_loss(
     }
 }
 
-pub(super) fn mix_gkd_losses(
+pub(crate) fn mix_gkd_losses(
     kl_loss: TensorId,
     sft_loss: TensorId,
     gkd_lambda: f32,

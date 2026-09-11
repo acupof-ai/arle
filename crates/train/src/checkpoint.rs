@@ -6,7 +6,7 @@ use std::path::Path;
 /// stays rsync-safe. Refuses to overwrite a non-symlink at `latest`.
 /// Atomic via `.latest.tmp` + `rename` (no missing-`latest` window).
 #[cfg(unix)]
-pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<()> {
+pub(crate) fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<()> {
     use std::os::unix::fs::symlink;
 
     if target_basename.contains('/') || target_basename.contains('\\') {
@@ -48,6 +48,6 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
 }
 
 #[cfg(not(unix))]
-pub fn write_latest_symlink(_parent: &Path, _target_basename: &str) -> io::Result<()> {
+pub(crate) fn write_latest_symlink(_parent: &Path, _target_basename: &str) -> io::Result<()> {
     Ok(())
 }

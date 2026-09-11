@@ -9,7 +9,7 @@ impl Qwen35Model {
         self.lm_head
     }
 
-    pub(super) fn share_base_parameters_from(&mut self, base: &Qwen35Model) -> Result<()> {
+    pub(crate) fn share_base_parameters_from(&mut self, base: &Qwen35Model) -> Result<()> {
         if self.layers.len() != base.layers.len() {
             return Err(Qwen35Error::InvalidConfig(
                 "cannot share Qwen3.5 base weights across mismatched layer counts",
@@ -78,7 +78,7 @@ impl Qwen35Model {
         self.adapter_names.clone()
     }
 
-    pub fn materialized_param_name_map(
+    pub(crate) fn materialized_param_name_map(
         &self,
         store: &mut TensorStore,
     ) -> Result<HashMap<&'static str, TensorId>> {
@@ -162,7 +162,7 @@ impl Qwen35Model {
     }
 }
 
-pub(super) fn register_linear(
+pub(crate) fn register_linear(
     param_names: &mut HashMap<&'static str, TensorId>,
     adapter_names: &mut HashMap<&'static str, TensorId>,
     register_named: &mut impl FnMut(&mut HashMap<&'static str, TensorId>, &'static str, TensorId),
@@ -176,7 +176,7 @@ pub(super) fn register_linear(
     }
 }
 
-pub(super) fn linear_with_base_init(
+pub(crate) fn linear_with_base_init(
     base_name: &'static str,
     in_features: usize,
     out_features: usize,
@@ -206,7 +206,7 @@ pub(super) fn linear_with_base_init(
     }
 }
 
-pub(super) fn new_sparse_mlp(
+pub(crate) fn new_sparse_mlp(
     names: &Qwen35MoeTensorNames,
     cfg: &Qwen35Config,
     tp: TpContext,
@@ -321,7 +321,7 @@ pub(super) fn new_sparse_mlp(
     })
 }
 
-pub(super) fn share_base_attention(
+fn share_base_attention(
     attention: &mut Qwen35Attention,
     base_attention: &Qwen35Attention,
 ) -> Result<()> {
@@ -358,7 +358,7 @@ pub(super) fn share_base_attention(
     }
 }
 
-pub(super) fn share_base_mlp(mlp: &mut Qwen35Mlp, base_mlp: &Qwen35Mlp) -> Result<()> {
+fn share_base_mlp(mlp: &mut Qwen35Mlp, base_mlp: &Qwen35Mlp) -> Result<()> {
     match (mlp, base_mlp) {
         (Qwen35Mlp::Dense(mlp), Qwen35Mlp::Dense(base_mlp)) => {
             mlp.gate_proj
@@ -403,7 +403,7 @@ pub(super) fn share_base_mlp(mlp: &mut Qwen35Mlp, base_mlp: &Qwen35Mlp) -> Resul
     }
 }
 
-pub(super) fn lora_for_layer(
+pub(crate) fn lora_for_layer(
     lora: Option<LoraConfig>,
     lora_layer_start: Option<usize>,
     layer_idx: usize,
@@ -415,7 +415,7 @@ pub(super) fn lora_for_layer(
     }
 }
 
-pub(super) fn lora_for_name(
+pub(crate) fn lora_for_name(
     lora: Option<LoraConfig>,
     target_set: LoraTargetSet,
     base_name: &str,
@@ -423,12 +423,12 @@ pub(super) fn lora_for_name(
     lora.filter(|_| target_set.includes(base_name))
 }
 
-pub(super) fn collect_linear_ids(linear: &LinearWithLora, ids: &mut Vec<TensorId>) {
+pub(crate) fn collect_linear_ids(linear: &LinearWithLora, ids: &mut Vec<TensorId>) {
     ids.extend(linear.parameter_name_map().values().copied());
     ids.extend(linear.adapter_ordered().into_iter().map(|(_, id)| id));
 }
 
-pub(super) fn collect_mlp_ids(mlp: &Qwen35Mlp, skip_experts: bool, ids: &mut Vec<TensorId>) {
+pub(crate) fn collect_mlp_ids(mlp: &Qwen35Mlp, skip_experts: bool, ids: &mut Vec<TensorId>) {
     match mlp {
         Qwen35Mlp::Dense(dense) => {
             collect_linear_ids(&dense.gate_proj, ids);
@@ -452,7 +452,7 @@ pub(super) fn collect_mlp_ids(mlp: &Qwen35Mlp, skip_experts: bool, ids: &mut Vec
     }
 }
 
-pub(super) fn register_mlp(
+pub(crate) fn register_mlp(
     param_names: &mut HashMap<&'static str, TensorId>,
     adapter_names: &mut HashMap<&'static str, TensorId>,
     register_named: &mut impl FnMut(&mut HashMap<&'static str, TensorId>, &'static str, TensorId),
@@ -514,7 +514,7 @@ pub(super) fn register_mlp(
     }
 }
 
-pub(super) fn insert_materialized_linear(
+fn insert_materialized_linear(
     map: &mut HashMap<&'static str, TensorId>,
     linear: &LinearWithLora,
     store: &mut TensorStore,
@@ -527,7 +527,7 @@ pub(super) fn insert_materialized_linear(
     Ok(())
 }
 
-pub(super) fn insert_materialized_mlp_params(
+fn insert_materialized_mlp_params(
     map: &mut HashMap<&'static str, TensorId>,
     mlp: &Qwen35Mlp,
     store: &mut TensorStore,
@@ -554,7 +554,7 @@ pub(super) fn insert_materialized_mlp_params(
     Ok(())
 }
 
-pub(super) fn normal_parameter(
+pub(crate) fn normal_parameter(
     name: &'static str,
     shape: &[usize],
     std: f32,
@@ -577,7 +577,7 @@ pub(super) fn normal_parameter(
     Ok(store.alloc(Tensor::new(data, shape.to_vec(), requires_grad)?))
 }
 
-pub(super) fn normal_or_unmaterialized_parameter(
+pub(crate) fn normal_or_unmaterialized_parameter(
     name: &'static str,
     shape: &[usize],
     std: f32,
@@ -593,7 +593,7 @@ pub(super) fn normal_or_unmaterialized_parameter(
     }
 }
 
-pub(super) fn ones_parameter(
+fn ones_parameter(
     name: &'static str,
     shape: &[usize],
     requires_grad: bool,
@@ -607,7 +607,7 @@ pub(super) fn ones_parameter(
     )?))
 }
 
-pub(super) fn ones_or_unmaterialized_parameter(
+pub(crate) fn ones_or_unmaterialized_parameter(
     name: &'static str,
     shape: &[usize],
     requires_grad: bool,

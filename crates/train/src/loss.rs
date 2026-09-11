@@ -172,7 +172,7 @@ pub fn kl_distill_loss_chunked(
     }
 }
 
-pub fn generalized_beta_jsd_loss(
+pub(crate) fn generalized_beta_jsd_loss(
     student_logits: TensorId,
     teacher_logits: TensorId,
     num_positions: usize,
@@ -216,7 +216,7 @@ pub fn generalized_beta_jsd_loss(
     )
 }
 
-pub fn generalized_beta_jsd_loss_chunked(
+pub(crate) fn generalized_beta_jsd_loss_chunked(
     student_logits: TensorId,
     teacher_logits: TensorId,
     num_positions: usize,

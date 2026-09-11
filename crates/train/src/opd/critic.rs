@@ -22,7 +22,7 @@ use super::{
 /// trajectory-terminal). Returns `(advantages, returns)`,
 /// `returns = advantages + values` (the MSE target for the critic).
 /// γ=discount, λ=GAE trace.
-pub fn skip_obs_gae(
+pub(crate) fn skip_obs_gae(
     values: &[f32],
     terminal_reward: f32,
     gamma: f32,
@@ -172,7 +172,7 @@ impl ValueCritic {
     /// Skip-Obs GAE advantages + MSE-target returns for one trajectory, from the
     /// current (detached) critic values. `advantages`/`returns` are empty when
     /// the trajectory has no LLM tokens (caller skips it).
-    pub fn advantages(
+    pub(crate) fn advantages(
         &self,
         student: &Qwen35Model,
         prompt_ids: &[u32],

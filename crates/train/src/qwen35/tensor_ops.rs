@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn qwen35_rmsnorm(
+pub(crate) fn qwen35_rmsnorm(
     x: TensorId,
     weight: TensorId,
     eps: f32,
@@ -28,7 +28,7 @@ pub(super) fn qwen35_rmsnorm(
     Ok(rmsnorm(x, offset_weight, eps, store, tape)?)
 }
 
-pub(super) fn validate_sequence_window(
+pub(crate) fn validate_sequence_window(
     input_ids: &[u32],
     position_ids: &[u32],
     window: SequenceWindow,
@@ -97,7 +97,7 @@ pub(super) fn linear_forward(
     Ok(reshape(projected, &output_shape, store, tape)?)
 }
 
-pub(super) fn broadcast_to_shape(
+pub(crate) fn broadcast_to_shape(
     x: TensorId,
     shape: &[usize],
     store: &mut TensorStore,
@@ -115,7 +115,7 @@ pub(crate) fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
 }
 
-pub(super) fn copy_frozen_tensor_map(
+pub(crate) fn copy_frozen_tensor_map(
     source: &HashMap<&'static str, TensorId>,
     target: &HashMap<&'static str, TensorId>,
     store: &mut TensorStore,
@@ -127,7 +127,7 @@ pub(super) fn copy_frozen_tensor_map(
     }
 }
 
-pub(super) fn copy_frozen_tensor(
+pub(crate) fn copy_frozen_tensor(
     source_id: TensorId,
     target_id: TensorId,
     store: &mut TensorStore,
@@ -141,7 +141,7 @@ pub(super) fn copy_frozen_tensor(
     store.tensors[target_id] = Some(replacement);
 }
 
-pub(super) fn split_heads(
+pub(crate) fn split_heads(
     x: TensorId,
     batch: usize,
     seq_len: usize,
@@ -154,7 +154,7 @@ pub(super) fn split_heads(
     Ok(transpose(x, 1, 2, store, tape)?)
 }
 
-pub(super) fn merge_heads(
+pub(crate) fn merge_heads(
     x: TensorId,
     batch: usize,
     seq_len: usize,
@@ -172,7 +172,7 @@ pub(super) fn merge_heads(
     )?)
 }
 
-pub(super) fn build_rope_cache(
+pub(crate) fn build_rope_cache(
     cfg: &Qwen35Config,
     store: &mut TensorStore,
 ) -> Result<(TensorId, TensorId)> {

@@ -246,7 +246,7 @@ pub enum WritebackLoss<'a> {
     },
 }
 
-pub(super) struct GenSegment {
+pub(crate) struct GenSegment {
     pub(super) prompt_prefix: Vec<u32>,
     pub(super) gen_ids: Vec<u32>,
     pub(super) prompt_positions: Vec<u32>,

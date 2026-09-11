@@ -1,7 +1,7 @@
 use super::*;
 
 impl Qwen35Model {
-    pub(super) fn detach_before_lora_layer(
+    pub(crate) fn detach_before_lora_layer(
         &self,
         hidden: TensorId,
         layer_index: usize,
@@ -36,7 +36,7 @@ impl Qwen35Model {
         self.forward_batch_tokens_with_positions(input_ids, &position_ids, batch, store, tape)
     }
 
-    pub fn forward_batch_tokens_with_positions(
+    fn forward_batch_tokens_with_positions(
         &self,
         input_ids: &[usize],
         position_ids: &[usize],
@@ -53,7 +53,7 @@ impl Qwen35Model {
     /// positions `0..seq_len` per row. The logits path (`forward_batch_tokens`) is
     /// this plus `lm_head`; callers that project only a few masked positions (fused
     /// chunked CE) take the hidden and skip the full `[batch, seq_len, vocab]` tile.
-    pub fn forward_batch_hidden(
+    pub(crate) fn forward_batch_hidden(
         &self,
         input_ids: &[usize],
         batch: usize,
@@ -114,7 +114,7 @@ impl Qwen35Model {
         self.forward_batch_indices(store, tape, &token_indices, &positions, batch)
     }
 
-    pub(super) fn forward_batch_indices(
+    fn forward_batch_indices(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -133,7 +133,7 @@ impl Qwen35Model {
         linear_forward(hidden, self.lm_head, store, tape)
     }
 
-    pub(super) fn forward_batch_indices_profiled(
+    pub(crate) fn forward_batch_indices_profiled(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -257,7 +257,7 @@ impl Qwen35Model {
         Ok((logits, profile))
     }
 
-    pub(super) fn forward_batch_hidden_indices(
+    fn forward_batch_hidden_indices(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -283,7 +283,7 @@ impl Qwen35Model {
     /// linear-attention scratch (~3 GB/layer) until cleanup_after_backward.
     /// `retain_set` lists tensor IDs that must survive the per-layer pruning
     /// (e.g. student params, LoRA adapters, optimizer state).
-    pub fn forward_hidden_freeing_intermediates(
+    pub(crate) fn forward_hidden_freeing_intermediates(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -513,7 +513,7 @@ impl Qwen35Model {
         self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1, cp)
     }
 
-    pub fn logits_from_hidden_window(
+    pub(crate) fn logits_from_hidden_window(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,

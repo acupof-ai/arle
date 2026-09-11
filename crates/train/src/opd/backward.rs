@@ -22,7 +22,7 @@ use super::{
 };
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn backward_chunked_kl<T: TeacherForward + ?Sized>(
+pub(crate) fn backward_chunked_kl<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
     rollout: &[u32],
@@ -279,7 +279,7 @@ fn backward_weighted_window_loss(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
+pub(crate) fn backward_windowed_gkd<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
     prompt_ids: &[u32],

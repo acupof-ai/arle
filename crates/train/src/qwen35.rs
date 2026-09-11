@@ -270,7 +270,7 @@ pub struct Qwen35Model {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Qwen35InitMode {
+pub(crate) enum Qwen35InitMode {
     ScratchTrain,
     LoraOrFrozen { materialize_frozen_base: bool },
 }

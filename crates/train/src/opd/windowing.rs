@@ -4,7 +4,7 @@ use crate::qwen35::SequenceWindow;
 
 use super::{OpdError, OpdKlMask, Result};
 
-pub(super) fn sequence_windows(
+pub(crate) fn sequence_windows(
     total_positions: usize,
     window_size: usize,
 ) -> Result<Vec<SequenceWindow>> {
@@ -33,7 +33,7 @@ pub(super) fn sequence_windows(
     Ok(windows)
 }
 
-pub(super) fn sequence_windows_for_range(
+pub(crate) fn sequence_windows_for_range(
     range: KlLogitRange,
     window_size: usize,
 ) -> Result<Vec<SequenceWindow>> {
@@ -49,7 +49,7 @@ pub(super) fn sequence_windows_for_range(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct KlLogitRange {
+pub(crate) struct KlLogitRange {
     pub(super) start: usize,
     pub(super) end: usize,
 }
@@ -60,7 +60,7 @@ impl KlLogitRange {
     }
 }
 
-pub(super) fn kl_logit_range(
+pub(crate) fn kl_logit_range(
     mask: OpdKlMask,
     prompt_len: usize,
     sequence_len: usize,
@@ -98,7 +98,7 @@ pub(super) fn kl_logit_range(
     }
 }
 
-pub(super) fn slice_logits_for_kl(
+pub(crate) fn slice_logits_for_kl(
     logits: TensorId,
     range: KlLogitRange,
     vocab: usize,
@@ -115,7 +115,7 @@ pub(super) fn slice_logits_for_kl(
 /// tokens leave gaps, so consecutive `p`s form runs; scoring one run's logit tile
 /// at a time keeps tool-token positions out of the loss (mirroring the masked-CE
 /// path) while bounding each `[1, window, vocab]` tile to `window_size` rows.
-pub(super) fn masked_gkd_windows(
+pub(crate) fn masked_gkd_windows(
     masked_positions: &[usize],
     window_size: usize,
 ) -> Vec<SequenceWindow> {
