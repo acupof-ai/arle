@@ -3,56 +3,6 @@ use serde::{Deserialize, Serialize};
 
 pub use infer_plan::SamplingParams;
 
-#[cfg(feature = "cuda")]
-use cuda_kernels::prelude::{DeviceContext, DeviceVec};
-#[cfg(feature = "cuda")]
-use cudarc::driver::DevicePtr;
-
-/// Raw `[seq_len, vocab]` logits produced by the CUDA OPD-teacher forward,
-/// carried back to `train` without sampling.
-///
-/// `logits` is a row-major `[seq_len, vocab]` device buffer; `device` is the
-/// model's context, needed to sync / consume the buffer (D2H or a D2D import
-/// into the train backend).
-#[cfg(feature = "cuda")]
-pub struct RawLogits {
-    pub logits: DeviceVec,
-    pub shape: [usize; 2],
-    pub device: DeviceContext,
-}
-
-#[cfg(feature = "cuda")]
-impl RawLogits {
-    #[must_use]
-    pub fn seq_len(&self) -> usize {
-        self.shape[0]
-    }
-
-    #[must_use]
-    pub fn vocab_size(&self) -> usize {
-        self.shape[1]
-    }
-
-    pub fn to_host_f32(&self) -> Result<Vec<f32>> {
-        self.logits.to_host(&self.device)
-    }
-
-    /// Run `f` with the raw device pointer (`u64`) of the logits buffer, e.g. for
-    /// a D2D import into the train backend. The pointer is valid only for the
-    /// duration of `f`.
-    pub fn with_logits_device_ptr<T>(&self, f: impl FnOnce(u64) -> T) -> T {
-        let (ptr, _guard) = self.logits.data.device_ptr(&self.device.stream);
-        f(ptr)
-    }
-}
-
-// SAFETY: `RawLogits` owns a CUDA allocation plus the context needed to consume
-// it. It is produced on the engine thread and handed to a single OPD-teacher
-// caller; callers must not share the contained mutable device allocation across
-// threads.
-#[cfg(feature = "cuda")]
-unsafe impl Send for RawLogits {}
-
 /// A single completion request.
 #[derive(Debug)]
 pub struct CompletionRequest {

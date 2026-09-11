@@ -34,15 +34,8 @@ tokio = { version = "1", features = [
 ] }
 
 infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }
-# CUDA-only: `RawLogits` carries a `cuda_kernels` device buffer/context and reads
-# its raw device pointer via the `cudarc` `DevicePtr` trait for the OPD-teacher
-# raw-logits surface. Both engage only under `--features cuda`.
+# CUDA-only: kernel build-id/capability constants reported at engine startup.
 cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = true }
-cudarc = { version = "0.19", features = [
-    "cuda-version-from-build-system",
-    "cublas",
-    "f16",
-], optional = true }
 # CUDA-only: `--lora-adapters` safetensors -> StudentLoraUpdate loading
 # (`student_lora.rs`); host-only decode, no device code.
 safetensors = { workspace = true, optional = true }
@@ -51,14 +44,12 @@ half = { version = "2", optional = true }
 [features]
 # No backend defaulted, mirroring the legacy `infer` crate.
 default = []
-# CUDA backend (structurally wired; the real forward is Phase-0 / lead-owned).
-# Pulls `cuda-kernels` + `cudarc` for the OPD-teacher `RawLogits` device surface.
+# CUDA backend. Pulls `cuda-kernels` for kernel build-id/capability reporting.
 cuda = [
     "dep:infer-cuda",
     "infer-cuda/cuda",
     "dep:cuda-kernels",
     "cuda-kernels/cuda",
-    "dep:cudarc",
     "dep:safetensors",
     "dep:half",
 ]

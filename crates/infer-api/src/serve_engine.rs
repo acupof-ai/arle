@@ -6,10 +6,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use infer_core::CompletedRequest;
-// CUDA-gated OPD methods call `BackendExecutor` methods on the concrete
-// `CudaExecutor` (not a trait object), so the trait must be in scope there.
-#[cfg(feature = "cuda")]
-use infer_seam::BackendExecutor;
 use infer_server::{OpenAiTokenizer, ServeHandle, StreamItem};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -321,19 +317,10 @@ impl ServeInferenceEngine {
     }
 }
 
-/// OPD-teacher raw-logits surface (CUDA only).
-///
-/// `forward_token_logits` runs the full `[seq_len, vocab]` teacher forward on the
-/// engine-thread-owned [`CudaExecutor`] (no sampling) via the [`ServeHandle`]
-/// out-of-band control channel, then returns the device logits as [`RawLogits`].
-/// The closure builds `RawLogits` on the engine thread so the device buffer +
-/// context cross back to the caller as a single `Send` value.
-#[cfg(feature = "cuda")]
 impl ServeInferenceEngine {
-    /// Downcast the engine-thread executor to the CUDA concrete type for
-    /// OPD control-surface methods. Runs on the engine thread, so the
-    /// downcast cannot race a backend swap.
-    fn with_cuda_executor<R>(
+    /// Downcast the engine-thread executor to the CUDA concrete type.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn with_cuda_executor<R>(
         &self,
         f: impl FnOnce(&mut infer_cuda::CudaExecutor) -> Result<R> + Send + 'static,
     ) -> Result<R>
@@ -349,105 +336,16 @@ impl ServeInferenceEngine {
         })?
     }
 
-    pub fn forward_token_logits(
+    /// Run on the engine-thread [`infer_core::Engine`]; an extension downcasts the CUDA executor and invalidates the prefix cache inside one closure.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn with_cuda_engine<R>(
         &self,
-        input_ids: &[u32],
-        positions: &[u32],
-    ) -> Result<crate::types::RawLogits> {
-        let input_ids = input_ids.to_vec();
-        let positions = positions.to_vec();
-        self.with_cuda_executor(move |executor| {
-            let (logits, shape, device) = executor.forward_token_logits(&input_ids, &positions)?;
-            Ok(crate::types::RawLogits {
-                logits,
-                shape,
-                device,
-            })
-        })
-    }
-
-    /// Trunk taps + final hidden states for offline DSpark draft training.
-    /// Runs on the engine thread like `forward_token_logits`; the results are
-    /// host `Vec<f32>`, so nothing device-bound crosses back.
-    pub fn forward_training_taps(
-        &self,
-        input_ids: &[u32],
-        target_layer_ids: &[i64],
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let input_ids = input_ids.to_vec();
-        let target_layer_ids = target_layer_ids.to_vec();
-        self.with_cuda_executor(move |executor| {
-            executor.forward_training_taps(&input_ids, &target_layer_ids)
-        })
-    }
-
-    /// Fold a fresh student LoRA update into the resident projection weights
-    /// (OPD per-step re-merge), then drop the now-stale prefix cache. Runs both
-    /// on the engine-thread-owned [`Engine`] via the [`ServeHandle`] out-of-band
-    /// control channel, so the resident weight mutation never races an in-flight
-    /// forward step.
-    ///
-    /// The re-merge changes resident weights, so cached hidden/KV values are now
-    /// prior-epoch values; serving a post-merge request from that cache is a
-    /// silent correctness bug. Both steps run in **one** control closure so no
-    /// scheduler step can interleave between the weight change and the cache
-    /// drop.
-    pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
-        self.serve.run_on_engine(move |engine| {
-            {
-                let executor = engine
-                    .executor_mut()
-                    .as_any_mut()
-                    .downcast_mut::<infer_cuda::CudaExecutor>()
-                    .ok_or_else(|| anyhow::anyhow!("engine backend is not cuda"))?;
-                executor.remerge_student_lora(update)?;
-                // The captured decode graph baked the old weight pointers; drop it
-                // so the next step re-captures against the merged weights (#97 C1).
-                executor.invalidate_decode_graph();
-            }
-            engine.invalidate_prefix_cache();
-            Ok(())
-        })?
-    }
-
-    /// The NVFP4 twin of [`Self::frozen_base_fp8_pointers`].
-    pub fn frozen_base_fp4_pointers(&self) -> Result<Vec<infer_cuda::SharedFp4BaseProjection>> {
-        self.with_cuda_executor(|executor| executor.frozen_base_fp4_pointers())
-    }
-
-    /// Read-only borrow of resident FP8 block-scaled base projection pointers
-    /// for train-infer weight sharing (`--share-frozen-base`). Runs on the
-    /// engine thread via the control seam (exclusive `&mut E`) and returns the
-    /// pointer table — raw `u64` device pointers + dims, all `Send`. The borrow
-    /// is read-only; resident weights are not mutated, so no prefix-cache drop.
-    pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
-        self.with_cuda_executor(|executor| executor.frozen_base_fp8_pointers())
-    }
-
-    /// Non-owning views of every resident dense-BF16 base projection's device
-    /// pointer, for refreshing the train student's frozen base AFTER a LoRA
-    /// re-merge.
-    pub fn frozen_base_bf16_pointers(&self) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
-        self.with_cuda_executor(|executor| executor.frozen_base_bf16_pointers())
-    }
-
-    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot, then
-    /// drop the now-stale prefix cache. Runs on the engine thread via the
-    /// control seam so the resident weight mutation never races an in-flight
-    /// forward step.
-    pub fn update_dspark_markov_weights(&self, w1: Vec<f32>, w2: Vec<f32>) -> Result<()> {
-        self.serve.run_on_engine(move |engine| {
-            {
-                let executor = engine
-                    .executor_mut()
-                    .as_any_mut()
-                    .downcast_mut::<infer_cuda::CudaExecutor>()
-                    .ok_or_else(|| anyhow::anyhow!("engine backend is not cuda"))?;
-                executor.update_dspark_markov_weights(&w1, &w2)?;
-            }
-            engine.invalidate_prefix_cache();
-            Ok(())
-        })?
+        f: impl FnOnce(&mut infer_core::Engine) -> Result<R> + Send + 'static,
+    ) -> Result<R>
+    where
+        R: Send + 'static,
+    {
+        self.serve.run_on_engine(f)?
     }
 }
 

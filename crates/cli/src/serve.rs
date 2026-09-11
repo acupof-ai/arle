@@ -186,6 +186,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
     let on_engine_loaded: Option<
         Box<dyn Fn(&std::sync::Arc<LoadedInferenceEngine>) -> anyhow::Result<()> + Send + Sync>,
     > = {
+        use train::cuda_opd_ext::CudaInferenceEngineExt;
         let init = config.options.spec.dspark_markov_init.clone();
         let is_dspark = config.options.spec.spec_type == ServeSpecType::Dspark;
         if init.is_some() && !is_dspark {

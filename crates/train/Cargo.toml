@@ -16,11 +16,19 @@ autobins = false
 default = []
 no-cuda = ["autograd/no-cuda", "infer-api?/no-cuda"]
 metal = ["autograd/metal"]
-cuda = ["autograd/cuda", "dep:infer-api", "infer-api/cuda", "dep:infer-util"]
+cuda = [
+    "autograd/cuda",
+    "dep:infer-api",
+    "infer-api/cuda",
+    "dep:infer-util",
+    "dep:infer-cuda",
+    "dep:cuda-kernels",
+    "dep:cudarc",
+]
 # DSv4-Flash teacher needs TP (nccl) + DeepEP MoE dispatch; forwarded to
 # infer-api -> infer-cuda. Opt-in: only the in-process DSv4-teacher OPD path
 # (Flash teacher -> dense student) pulls these; dense-only OPD ignores them.
-nccl = ["cuda", "autograd/nccl", "dep:cuda-kernels", "cuda-kernels/nccl", "infer-api/nccl"]
+nccl = ["cuda", "autograd/nccl", "cuda-kernels/nccl", "infer-api/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
 
 [dependencies]
@@ -40,15 +48,19 @@ chat = { path = "../chat" }
 # train read parallelism coordinates from.
 infer-topo = { path = "../infer-topo" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
+# Names CudaExecutor + OPD types (StudentLoraUpdate, Shared* projections) in cuda_opd_ext.
+infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }
 # HF id -> local cache dir resolution for the CUDA backend builder registered by
 # `teacher_infer::register_cuda_backend` (mirrors the `arle` binary's builder).
 infer-util = { path = "../infer-util", optional = true }
 infer-plan = { path = "../infer-plan" }
+infer-seam = { path = "../infer-seam" }
 # cc-convert reuses the REAL /v1/messages -> ChatCompletionRequest mapping
 # (host-only crate; no device code), so converted records can't drift from the
 # served prompt format.
 infer-server = { path = "../infer-server" }
 cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = true }
+cudarc = { version = "0.19", optional = true }
 # Non-test use: sandbox run_captured writes subprocess output to a temp file
 # (avoids the wait_with_output pipe-hold hang when a tool command backgrounds a
 # process). Also used by tests.

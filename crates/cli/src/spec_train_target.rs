@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::args::TrainSpecDraftArgs;
+use train::cuda_opd_ext::CudaInferenceEngineExt;
 
 /// The serving engine as the trainer's trunk. One prefill per sample on a
 /// private transient slot, so the serving slots are untouched.

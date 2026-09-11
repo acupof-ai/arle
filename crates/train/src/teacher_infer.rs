@@ -4,6 +4,8 @@
 //! path can stay on the same backend without a host materialization.
 
 #[cfg(feature = "cuda")]
+use crate::cuda_opd_ext::CudaInferenceEngineExt;
+#[cfg(feature = "cuda")]
 use std::sync::Arc;
 use std::{
     io::Read,

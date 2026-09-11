@@ -9,6 +9,7 @@ use {
         path::{Path, PathBuf},
         time::Instant,
     },
+    train::cuda_opd_ext::CudaInferenceEngineExt,
 };
 
 /// Install the `--rollout-engine` selection (CUDA only; inert on CPU, which has

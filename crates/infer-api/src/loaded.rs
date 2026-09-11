@@ -621,38 +621,28 @@ impl LoadedInferenceEngine {
         &self.backend
     }
 
-    /// OPD-teacher raw-logits forward: run the full `[seq_len, vocab]` teacher
-    /// forward over `(input_ids, positions)` (no sampling) and return the
-    /// device logits. CUDA-only; the downcast inside `ServeInferenceEngine`
-    /// rejects any other executor.
+    /// Downcast the engine-thread CUDA executor for an extension crate (train).
     #[cfg(feature = "cuda")]
-    pub fn forward_token_logits(
+    pub fn with_cuda_executor<R>(
         &self,
-        input_ids: &[u32],
-        positions: &[u32],
-    ) -> Result<crate::types::RawLogits> {
-        self.engine.forward_token_logits(input_ids, positions)
+        f: impl FnOnce(&mut infer_cuda::CudaExecutor) -> anyhow::Result<R> + Send + 'static,
+    ) -> anyhow::Result<R>
+    where
+        R: Send + 'static,
+    {
+        self.engine.with_cuda_executor(f)
     }
 
-    /// Trunk taps at `target_layer_ids` (`[seq, taps·hidden]`) and the
-    /// final-normed hidden states (`[seq, hidden]`), host f32 — what
-    /// `spec_train::trainer::Target` needs per sample. CUDA-only.
+    /// Run on the engine-thread engine; an extension downcasts the CUDA executor inside the same closure as prefix-cache invalidation.
     #[cfg(feature = "cuda")]
-    pub fn forward_training_taps(
+    pub fn with_cuda_engine<R>(
         &self,
-        input_ids: &[u32],
-        target_layer_ids: &[i64],
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        self.engine
-            .forward_training_taps(input_ids, target_layer_ids)
-    }
-
-    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
-    /// Called by the train sidecar after each acceptance-weighted step.
-    #[cfg(feature = "cuda")]
-    pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> Result<()> {
-        self.engine
-            .update_dspark_markov_weights(w1.to_vec(), w2.to_vec())
+        f: impl FnOnce(&mut infer_core::Engine) -> anyhow::Result<R> + Send + 'static,
+    ) -> anyhow::Result<R>
+    where
+        R: Send + 'static,
+    {
+        self.engine.with_cuda_engine(f)
     }
 
     /// Programmatic token-id generation over the serving scheduler/KV path.
@@ -736,50 +726,6 @@ impl LoadedInferenceEngine {
     /// next rollout. A no-op on backends without a droppable pool.
     pub fn ensure_kv_pool(&self) -> Result<()> {
         self.engine.ensure_kv_pool()
-    }
-
-    /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
-    /// projection weights (OPD per-step re-merge). CUDA-only: the downcast
-    /// inside `ServeInferenceEngine` rejects any other executor.
-    ///
-    /// The CUDA forward path implements the merge (see
-    /// [`infer_cuda::CudaExecutor::remerge_student_lora`] +
-    /// `infer_cuda::qwen35::Qwen35Model::remerge_student_lora`): resident
-    /// `DeviceMatrix` weights are re-merged in place from a pristine
-    /// base-weight cache, and the next forward picks them up. The executor
-    /// lives on the [`infer_server::ServeHandle`] engine thread; this routes
-    /// the merge through the out-of-band `run_on_executor` control seam (the
-    /// same seam the raw-logits forward + weight offload/reload use), so it
-    /// runs between scheduler steps with exclusive `&mut E` access. Takes
-    /// `&self` (interior mutability via the control channel) so the train OPD
-    /// loop can call it on a shared `MutexGuard` binding.
-    #[cfg(feature = "cuda")]
-    pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
-        self.engine.remerge_student_lora(update)
-    }
-
-    /// Read-only borrow of resident FP8 block-scaled base projection
-    /// pointers for train-infer weight sharing (`--share-frozen-base`).
-    /// CUDA-only: only the Qwen3.5/3.6 hybrid student carries shareable FP8
-    /// base weights. Returns the pointer table (raw device `u64`s + dims);
-    /// the train loader imports a NON-OWNING view over these instead of
-    /// allocating its own copy of the shared frozen base.
-    #[cfg(feature = "cuda")]
-    pub fn frozen_base_fp4_pointers(&self) -> Result<Vec<infer_cuda::SharedFp4BaseProjection>> {
-        self.engine.frozen_base_fp4_pointers()
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
-        self.engine.frozen_base_fp8_pointers()
-    }
-
-    /// Non-owning views of every resident dense-BF16 base projection's
-    /// device pointer, for refreshing the train student's frozen base AFTER
-    /// a LoRA re-merge.
-    #[cfg(feature = "cuda")]
-    pub fn frozen_base_bf16_pointers(&self) -> Result<Vec<infer_cuda::SharedBf16BaseProjection>> {
-        self.engine.frozen_base_bf16_pointers()
     }
 
     /// OpenAI-compat HTTP router over this ALREADY-loaded engine's
