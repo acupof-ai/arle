@@ -6,15 +6,22 @@ Measures the mean DSpark draft acceptance rate by polling the existing
 before and after a measurement window. Connects to an already-running
 server like `bench_throughput.py` — no serve spawning or log parsing.
 
+The /v1/stats counters are server-global, so the before/after snapshot MUST
+bracket the whole client group: `--concurrency N` runs N clients in a thread
+pool inside this one process with a single snapshot pair. Running N separate
+processes would sum N overlapping global deltas and overcount the drafts.
+
 Usage:
   # Start serve (separate terminal), then:
   python3 scripts/bench_dspark_accept.py --port 8000 --measure-requests 50
+  python3 scripts/bench_dspark_accept.py --port 8000 --concurrency 8
 """
 
 import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 try:
@@ -50,33 +57,44 @@ def get_stats(client: httpx.Client) -> dict:
     return spec_decode(r.json())
 
 
-def send_requests(client: httpx.Client, n: int, max_tokens: int) -> None:
-    """Send n chat completion requests to populate the measurement window."""
-    for i in range(n):
-        prompt = PROMPTS[i % len(PROMPTS)]
-        try:
-            client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "default",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.0,
-                },
-                timeout=120.0,
-            )
-        except Exception as e:
-            print(f"  request {i} failed: {e}", file=sys.stderr)
+def send_requests(base_url: str, n: int, max_tokens: int) -> None:
+    """Send n chat completion requests (one client thread) to fill the window."""
+    with httpx.Client(base_url=base_url, timeout=30.0) as client:
+        for i in range(n):
+            prompt = PROMPTS[i % len(PROMPTS)]
+            try:
+                client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "default",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                        "temperature": 0.0,
+                    },
+                    timeout=120.0,
+                )
+            except Exception as e:
+                print(f"  request {i} failed: {e}", file=sys.stderr)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DSpark acceptance-rate benchmark")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--measure-requests", type=int, default=50)
+    parser.add_argument(
+        "--measure-requests", type=int, default=50, help="requests per client"
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="concurrent clients in one process, one stats pair",
+    )
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--output", default=None, help="JSON output file")
     args = parser.parse_args()
+    if args.concurrency < 1:
+        sys.exit("--concurrency must be >= 1")
 
     base_url = f"http://{args.host}:{args.port}"
     with httpx.Client(base_url=base_url, timeout=30.0) as client:
@@ -90,16 +108,24 @@ def main() -> None:
         else:
             sys.exit("Server not reachable")
 
-        # Baseline counters (before measurement window).
+        # ONE baseline counter snapshot before the whole client group.
         before = get_stats(client)
         if not before.get("available", False):
             sys.exit("spec_decode stats not available — is --spec-type dspark enabled?")
 
-        # Measurement window.
-        send_requests(client, args.measure_requests, args.max_tokens)
+        # Measurement window: N concurrent clients in-process.
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            list(
+                pool.map(
+                    lambda _: send_requests(
+                        base_url, args.measure_requests, args.max_tokens
+                    ),
+                    range(args.concurrency),
+                )
+            )
         time.sleep(2.0)  # let in-flight requests settle
 
-        # Post counters.
+        # ONE post counter snapshot for the whole group.
         after = get_stats(client)
 
     drafted = after["drafted"] - before["drafted"]
@@ -111,10 +137,11 @@ def main() -> None:
         "accepted": accepted,
         "accept_rate": rate,
         "measure_requests": args.measure_requests,
+        "concurrency": args.concurrency,
         "before": before,
         "after": after,
     }
-    print(f"Acceptance rate: {rate:.4f} ({accepted}/{drafted})")
+    print(f"Acceptance rate (c={args.concurrency}): {rate:.4f} ({accepted}/{drafted})")
 
     if args.output:
         Path(args.output).write_text(json.dumps(result, indent=2))

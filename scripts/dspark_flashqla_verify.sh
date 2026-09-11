@@ -28,6 +28,8 @@
 #   BENCH_SECONDS        seconds per prefill cell (default 60)
 #   ACCEPT_REQUESTS      requests per acceptance client (default 30)
 #   EXTRA_SERVE_FLAGS    extra flags for every serve (both arms)
+#   GDR_CHUNKED=0        #300 fallback A/B: pass --qwen35-gdr-chunked false to
+#                        both arms and verify from /v1/stats that gdr_fq=0
 #
 # Test seams (shell test only):
 #   ARLE_DSV_BIN_BASE / ARLE_DSV_BIN_TREAT  skip git+build, use these binaries
@@ -68,9 +70,16 @@ if [ "${ARLE_DSV_SKIP_PREREG:-0}" != 1 ]; then
     : "${MODEL:?MODEL (trunk checkpoint dir) required}"
     : "${DRAFT_MODEL:?DRAFT_MODEL (DSpark draft head dir) required}"
 fi
-SPEC_FLAGS=(--spec-type dspark --mtp-draft-model "$DRAFT_MODEL")
 # shellcheck disable=SC2206  # intentional word-split of caller passthrough
 EXTRA=( ${EXTRA_SERVE_FLAGS:-} )
+# #300 fallback A/B: GDR_CHUNKED=0 appends `--qwen35-gdr-chunked false` to BOTH
+# arms (cli/src/args.rs:829-830 — the only switch; there is no env var). The
+# effect is verified from /v1/stats op_timing, not assumed.
+GDR_FLAG=()
+case "${GDR_CHUNKED:-}" in 0|false|no) GDR_FLAG=(--qwen35-gdr-chunked false) ;; esac
+# ARLE_CUDA_PROFILE=1 makes every serve report per-op timings on /v1/stats,
+# which is how the GDR path (gdr_fq vs gdr_recurrent) is verified.
+export ARLE_CUDA_PROFILE=1
 
 NAME="dspark-flashqla-verify-$(date +%Y%m%d%H%M%S)"
 prereg() {  # $1 = start|close $2 = arm [rest = done fields]
@@ -160,18 +169,24 @@ run_arm_tp() {  # $1=arm $2=bin $3=tp $4=gpu-csv $5=baseline-log-or-""
     local port=$((18300 + RANDOM % 200))
     local logdir="$OUT/logs/${arm}-tp${tp}"; mkdir -p "$logdir"
     local label="dsv-${arm}-tp${tp}"
-    # pod convention: CUDA_VISIBLE_DEVICES=physical, INFER_CUDA_DEVICES=0..tp-1.
-    local logical=""; local i=0
-    while [ "$i" -lt "$tp" ]; do logical="${logical:+$logical,}$i"; i=$((i+1)); done
+
+    # Production TP launch is the CLI flag --tensor-parallel-size N
+    # (scripts/serve_dsv4_tp4.sh; crates/cli/src/args.rs:741). The multiproc
+    # coordinator spawns N workers and sets INFER_TP_SIZE per rank itself
+    # (serve_multiproc.rs); CUDA_VISIBLE_DEVICES remaps the physical claim to
+    # logical 0..N-1. attn_tp = N (CP/DP default 1).
+    local tp_flag=(--tensor-parallel-size "$tp")
+    local serve_flags=(--spec-type dspark --mtp-draft-model "$DRAFT_MODEL" "${tp_flag[@]}"
+        ${GDR_FLAG[@]+"${GDR_FLAG[@]}"} ${EXTRA[@]+"${EXTRA[@]}"})
 
     # (a) correctness: lever boots and tears down its own serve.
     local lever_rc=0 base_env=()
     [ -z "$baseline" ] || base_env=(BASELINE_LOG="$baseline")
-    env CUDA_VISIBLE_DEVICES="$gpus" INFER_CUDA_DEVICES="$logical" INFER_TP_SIZE="$tp" PORT="$port" \
+    env CUDA_VISIBLE_DEVICES="$gpus" PORT="$port" \
         MODEL="$MODEL" GATE_PROFILE=generic BIN="$bin" \
         LEVER_GATE_SKIP_TEMP=1 LEVER_GATE_ALLOW_NO_BASELINE=1 \
         OUT="$logdir/needle.log" STATS_OUT="$logdir/stats.json" \
-        SERVE_FLAGS="--spec-type dspark --mtp-draft-model $DRAFT_MODEL ${EXTRA[*]:-}" \
+        SERVE_FLAGS="${serve_flags[*]}" \
         ${base_env[@]+"${base_env[@]}"} bash "$LEVER" "$label" >"$logdir/lever.log" 2>&1 || lever_rc=$?
     if [ "$lever_rc" -eq 0 ]; then
         row "$arm" "$tp" needle "ladder x3 + concurrent" PASS "$logdir/needle.log"
@@ -181,16 +196,35 @@ run_arm_tp() {  # $1=arm $2=bin $3=tp $4=gpu-csv $5=baseline-log-or-""
 
     # Bench serve on a second port (lever's serve is gone by now).
     local bport=$((port + 1)) serve_pid
-    CUDA_VISIBLE_DEVICES="$gpus" INFER_CUDA_DEVICES="$logical" INFER_TP_SIZE="$tp" \
+    CUDA_VISIBLE_DEVICES="$gpus" \
         RUST_LOG=info "$bin" serve --backend cuda --model-path "$MODEL" --port "$bport" \
-        "${SPEC_FLAGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"} >"$logdir/serve.log" 2>&1 &
+        "${serve_flags[@]}" >"$logdir/serve.log" 2>&1 &
     serve_pid=$!
     trap 'kill "$serve_pid" 2>/dev/null || true' RETURN
     if ! serve_up "$bport"; then
-        row "$arm" "$tp" prefill "-" FAIL "bench serve never ready $logdir/serve.log"
+        row "$arm" "$tp" launch "-" FAIL "bench serve never ready $logdir/serve.log"
+        row "$arm" "$tp" prefill "-" FAIL "serve down"
         row "$arm" "$tp" accept-c1 "-" FAIL "serve down"
         row "$arm" "$tp" accept-c8 "-" FAIL "serve down"
         kill "$serve_pid" 2>/dev/null || true
+        return 0
+    fi
+
+    # Confirm the serve actually came up at the requested TP — a silent
+    # fallback to single-process would invalidate every measurement in the cell.
+    # Coordinator logs "all N worker engines ready"; tp=1 is single-process.
+    local obs_tp=""
+    if [ "$tp" -gt 1 ]; then
+        obs_tp="$(grep -oE 'all [0-9]+ worker engines ready' "$logdir/serve.log" | head -1 | grep -oE '[0-9]+' || true)"
+    else
+        grep -q 'serving single-process' "$logdir/serve.log" && obs_tp=1
+    fi
+    if [ "$obs_tp" = "$tp" ]; then
+        row "$arm" "$tp" launch "observed workers=$obs_tp (attn_tp=$tp)" PASS "$logdir/serve.log"
+    else
+        row "$arm" "$tp" launch "expected tp=$tp observed=${obs_tp:-none}" FAIL "$logdir/serve.log"
+        kill "$serve_pid" 2>/dev/null || true
+        trap - RETURN
         return 0
     fi
 
@@ -207,31 +241,52 @@ run_arm_tp() {  # $1=arm $2=bin $3=tp $4=gpu-csv $5=baseline-log-or-""
         row "$arm" "$tp" prefill "-" FAIL "$logdir/throughput.log"
     fi
 
-    # (c) acceptance, existing bench_dspark_accept.py measurement.
+    # (c) acceptance, existing bench_dspark_accept.py measurement. One process
+    # per c with a thread pool and a SINGLE global stats pair (the tool's
+    # counters are server-global; separate processes would overcount).
     accept_run() {  # $1=c (1|8)
-        local c="$1" pids=() outs=()
-        for i in $(seq 1 "$c"); do
-            local o="$logdir/accept-c${c}-$i.json"; outs+=("$o")
-            python3 "$TOOLS/bench_dspark_accept.py" --port "$bport" \
-                --measure-requests "$ACCEPT_REQUESTS" --max-tokens 64 \
-                --output "$o" >>"$logdir/accept-c${c}.log" 2>&1 &
-            pids+=($!)
-        done
-        local fail=0; for p in "${pids[@]}"; do wait "$p" || fail=1; done
-        if [ "$fail" -ne 0 ]; then echo "FAIL"; return; fi
-        python3 - "${outs[@]}" <<'PY'
+        local c="$1"
+        local o="$logdir/accept-c${c}.json"
+        if python3 "$TOOLS/bench_dspark_accept.py" --port "$bport" \
+            --concurrency "$c" --measure-requests "$ACCEPT_REQUESTS" --max-tokens 64 \
+            --output "$o" >"$logdir/accept-c${c}.log" 2>&1; then
+            python3 - "$o" <<'PY'
 import json, sys
-d=a=0
-for f in sys.argv[1:]:
-    r=json.load(open(f)); d+=r["drafted"]; a+=r["accepted"]
-print(f"{a}/{d}")
+r = json.load(open(sys.argv[1]))
+print(f"{r['accepted']}/{r['drafted']}")
 PY
+        else echo FAIL; fi
     }
     local r1 r8
-    r1="$(accept_run 1)" || r1=FAIL
-    r8="$(accept_run 8)" || r8=FAIL
-    if [ "$r1" != FAIL ]; then row "$arm" "$tp" accept-c1 "$r1" PASS "$logdir"; else row "$arm" "$tp" accept-c1 "-" FAIL "$logdir/accept-c1.log"; fi
-    if [ "$r8" != FAIL ]; then row "$arm" "$tp" accept-c8 "$r8" PASS "$logdir"; else row "$arm" "$tp" accept-c8 "-" FAIL "$logdir/accept-c8.log"; fi
+    r1="$(accept_run 1)"
+    r8="$(accept_run 8)"
+    if [ "$r1" != FAIL ]; then row "$arm" "$tp" accept-c1 "$r1" PASS "$logdir/accept-c1.json"; else row "$arm" "$tp" accept-c1 "-" FAIL "$logdir/accept-c1.log"; fi
+    if [ "$r8" != FAIL ]; then row "$arm" "$tp" accept-c8 "$r8" PASS "$logdir/accept-c8.json"; else row "$arm" "$tp" accept-c8 "-" FAIL "$logdir/accept-c8.log"; fi
+
+    # GDR path effect check from /v1/stats op_timing (ARLE_CUDA_PROFILE=1):
+    # chunked FlashQLA logs "linear/gdr_fq", the varlen fallback logs
+    # "linear/gdr_recurrent". GDR_CHUNKED=0 must force gdr_fq count to 0, so
+    # a misspelled switch can't pass as a silent no-op.
+    local gdr_path
+    gdr_path="$(python3 - "$bport" <<'PY'
+import json, sys, urllib.request
+with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/v1/stats", timeout=10) as r:
+    ops = json.load(r).get("op_timing", {}).get("ops", [])
+fq = sum(o.get("count", 0) for o in ops if o.get("name") == "linear/gdr_fq")
+rec = sum(o.get("count", 0) for o in ops if o.get("name") == "linear/gdr_recurrent")
+print(f"gdr_fq={fq} gdr_recurrent={rec}")
+PY
+)"
+    if [ "${#GDR_FLAG[@]}" -gt 0 ]; then
+        local fqcnt="${gdr_path#gdr_fq=}"; fqcnt="${fqcnt%% *}"
+        if [ "$fqcnt" = 0 ]; then
+            row "$arm" "$tp" gdr-path "$gdr_path (chunked forced off)" PASS "$logdir/serve.log"
+        else
+            row "$arm" "$tp" gdr-path "$gdr_path (expected gdr_fq=0)" FAIL "$logdir/serve.log"
+        fi
+    else
+        row "$arm" "$tp" gdr-path "$gdr_path" INFO "$logdir/serve.log"
+    fi
 
     kill "$serve_pid" 2>/dev/null || true; wait "$serve_pid" 2>/dev/null || true
     trap - RETURN
@@ -253,7 +308,7 @@ for tp in $TPS; do
     run_arm_tp treatment "$BIN_TREAT" "$tp" "$csv" "$baseline"
 
     release_set "$csv" "$op"
-    if awk -F'\t' -v tp="$tp" 'NR>1 && $2==tp && $3=="needle" && $5=="FAIL"{bad=1} END{exit !bad}' "$TSV"; then
+    if awk -F'\t' -v tp="$tp" 'NR>1 && $2==tp && ($3=="needle" || $3=="launch" || $3=="gdr-path") && $5=="FAIL"{bad=1} END{exit !bad}' "$TSV"; then
         CORRECT_FAIL=1
     fi
 done
