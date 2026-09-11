@@ -1,9 +1,12 @@
-# Dead-code allow sweep (infer-cuda + cuda-kernels) — pending-remote
+# Dead-code allow sweep (infer-cuda + cuda-kernels)
 
-Date: 2026-09-11. Lane `simplify-dead-code-allows`.
+Date: 2026-09-11. Lane `simplify-dead-code-allows`. PR #303.
 
-Status: **pending-remote** — Mac compile/clippy only; no GPU run. This is a
-net deletion with no intended behavior change; GPU validation is deferred.
+Status: **Shipped.** This is a net deletion with no intended behaviour
+change: the only deleted items were ones the compiler proved unreferenced
+in the full cuda feature set, and the gate for that claim is
+`clippy -D warnings`, not a GPU run. There is no runtime path to validate
+remotely.
 
 ## Context
 
@@ -60,7 +63,10 @@ is often a GPU-pointer-owned buffer — keep it for Drop, don't delete it.
   -D warnings`: clean.
 - `cargo check -p arle --features cpu,no-cuda,cli`: clean.
 
-## Pending
+## Verdict
 
-A GPU build + one DSv4/MoE serve smoke to confirm the deletions were truly
-unwired (especially `load_dsv4_block_scaled_bf16_copy` and `reset`).
+Net deletion; the gate is `clippy -D warnings` under the CI Lint mirror
+(clean in CI on #303) plus the three host commands above. A deleted
+plain-allow is, by construction, an item no compiled feature set reads —
+there is no serving path whose behaviour could change, so no GPU run is
+owed. Shipped.

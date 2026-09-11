@@ -89,8 +89,10 @@ is actually engaging before treating any number as this gate.
 
 A/B (compare per-chain **verify argmax / accept counts**, not just committed
 tokens):
-1. Baseline separation: `ARLE_QWEN35_GDR_CHUNKED=0`, c=8 — verify uses the
-   non-chunked recurrent kernel; isolates FlashQLA-vs-varlen as the variable.
+1. Baseline separation: serve with `--qwen35-gdr-chunked false`, c=8 —
+   verify uses the non-chunked recurrent kernel; isolates
+   FlashQLA-vs-varlen as the variable. (There is no env var for this
+   switch; `ARLE_QWEN35_GDR_CHUNKED` never existed — only the CLI flag.)
 2. This fix with chunked on (default), c=8 — expected acceptance back to the
    c=1 order of magnitude (~10%+), and verify argmax for in-block draft rows
    matching across the one-chain-vs-multi-chain runs.
