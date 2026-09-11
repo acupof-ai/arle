@@ -29,6 +29,7 @@
 mod common;
 
 use infer_gguf::dequant::{dequantize_row_q4_k, dequantize_row_q8_0};
+use infer_gguf::gguf::GgmlType;
 use vulkan_kernels::{
     BLOCK_Q4_K_BYTES, BLOCK_Q8_0_BYTES, BLOCK_Q8_1_BYTES, gemv_dispatch, gemv_params,
     q4_k_gemv_with_params, q8_0_gemv_with_params, q8_1_quantize, q8_1_quantize_dispatch,
@@ -250,7 +251,7 @@ fn quantized_gemv_executes_on_device() {
     let x: Vec<f32> = (0..ncols).map(|_| rng.next_unit_f32()).collect();
 
     // ---- Q4_K case --------------------------------------------------------
-    let q4k_row = vulkan_kernels::q4_k_row_bytes(ncols).expect("q4_k row bytes");
+    let q4k_row = GgmlType::Q4K.row_bytes(ncols).expect("q4_k row bytes");
     assert_eq!(q4k_row, BLOCK_Q4_K_BYTES); // 256 cols => 1 block
     let mut q4k_weights = Vec::with_capacity(nrows * q4k_row);
     for _ in 0..nrows {
@@ -275,7 +276,7 @@ fn quantized_gemv_executes_on_device() {
     );
 
     // ---- Q8_0 case --------------------------------------------------------
-    let q8_0_row = vulkan_kernels::q8_0_row_bytes(ncols).expect("q8_0 row bytes");
+    let q8_0_row = GgmlType::Q8_0.row_bytes(ncols).expect("q8_0 row bytes");
     assert_eq!(q8_0_row, (ncols / 32) * BLOCK_Q8_0_BYTES);
     let mut q8_0_weights = Vec::with_capacity(nrows * q8_0_row);
     for _ in 0..nrows {
