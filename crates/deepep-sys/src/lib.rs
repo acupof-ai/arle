@@ -433,7 +433,7 @@ impl Buffer {
 
     pub fn sync(&mut self, peers: &[([u8; IPC_HANDLE_BYTES], u32)]) -> Result<()> {
         let world_size = peers.len();
-        if world_size < 2 || world_size > 8 {
+        if !(2..=8).contains(&world_size) {
             bail!(DeepEpError::BadArgs(format!(
                 "world_size must be in [2, 8], got {world_size}"
             )));
