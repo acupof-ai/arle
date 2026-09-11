@@ -270,17 +270,19 @@ mod real {
         }
         out.push(("flat", flat));
 
-        // One hot band, remainder sparse, rest empty.
+        // Hot band plus 48-row non-hot bands, trailing bands empty.
+        // 8*48 = 384 = SWEEP_TOKENS-M_CAP fits in g-1 bands; an 8-row take overflowed hot[g].
         let mut hot = vec![0usize; g];
         hot[0] = M_CAP;
         let mut left = SWEEP_TOKENS - M_CAP;
         let mut i = 1;
-        while left > 0 {
-            let take = left.min(8).min(M_CAP);
+        while left > 0 && i < g {
+            let take = left.min(48).min(M_CAP);
             hot[i] = take;
             left -= take;
             i += 1;
         }
+        assert_eq!(left, 0, "one-hot distribution infeasible at g={g}");
         out.push(("one-hot", hot));
 
         // Full/singleton alternating, trailing empties.
