@@ -67,11 +67,11 @@ pub(crate) fn backward_chunked_kl<T: TeacherForward + ?Sized>(
     // In `Student` mode the teacher stays resident, so this is skipped.
     //
     // Fence the train backend first. The reload re-allocates the teacher's
-    // weight buffers (incl. the W4A8 Marlin packed side buffers) from the
+    // weight buffers (incl. the NVFP4 Fp4Marlin packed side buffers) from the
     // shared async pool on the infer scheduler thread; without this barrier
     // the previous step's still-draining train pool ops race those allocs
-    // (event tracking is disabled) and the reloaded Marlin side buffer is
-    // dropped → "missing W4A8 Marlin-packed side buffer".
+    // (event tracking is disabled) and a reloaded Marlin side buffer is
+    // dropped → a missing-Marlin-side-buffer load error.
     if engine_offload.offloads_teacher() {
         store
             .backend()
@@ -221,8 +221,8 @@ pub(crate) fn backward_chunked_kl<T: TeacherForward + ?Sized>(
     // the offload window strictly inside the backward and leaves both engines
     // resident for whatever the caller does next — the inter-step KL eval and
     // checkpoint save both run a teacher/student forward, which would hit an
-    // offloaded (placeholder) weight and fail (W4A8 "missing Marlin-packed
-    // side buffer"). Reload is idempotent, so the next step's pre-rollout /
+    // offloaded (placeholder) weight and fail with a missing-Marlin-side-buffer
+    // load error (NVFP4 Fp4Marlin). Reload is idempotent, so the next step's pre-rollout /
     // pre-scoring reloads become no-ops. Fence the train backend first so the
     // backward's pool ops are ordered ahead of the reload's allocations.
     if engine_offload.is_enabled() {

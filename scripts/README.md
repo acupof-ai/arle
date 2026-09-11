@@ -30,26 +30,21 @@ directory unless noted.
 |---|---|
 | `convert.py` | Shared checkpoint conversion IO (load_all_tensors, save_checkpoint, copy_config_files). Used by the conversion scripts below. |
 | `convert_gptq_to_w4a16.py` | Convert a local GPTQ v1 directory to ARLE W4A16; download first with `hf download REPO --local-dir DIR`. |
-| `convert_gptq_w4a16_to_w4a8_marlin.py` | Convert W4A16 to hybrid W4A8 Marlin format. |
 | `convert_dspark_speculators.py` | Convert DSpark speculator checkpoints. |
 | `gguf_to_safetensors.py` | Convert GGUF to safetensors format. |
-| `merge_w4_hybrid_checkpoint.py` | Merge hybrid W4A16/W4A8 checkpoint shards. |
 | `setup_qwen3_yarn_config.py` | Set up YaRN RoPE config for Qwen models. |
 
 ## Quantization
 
 | Script | Purpose |
 |---|---|
-| `quantize.py` | Unified quantization entry: `--format fp8\|w8a16\|w4a8-marlin`. Wraps the per-format scripts below. |
+| `quantize.py` | Unified quantization entry: `--format fp8\|w8a16`. Wraps the per-format scripts below. |
 | `fp8_block_cast.py` | BF16 → DeepSeek-style FP8 block-scaled (128×128). |
 | `w8a16_quant.py` | BF16 → W8A16 per-group signed INT8. |
-| `quantize_qwen3_w4a8.py` | Quantize Qwen to W4A8 (pack_w4a8 + Marlin). |
 | `qwen35_tq4_dense_parity.py` | Verify Qwen3.5 TQ4 dense parity. |
 | `qwen36_dense_to_nvfp4.py` | Convert Qwen3.6 dense to NVFP4 format. |
 | `requant_dspark_mxfp4_to_fp8.py` | Re-quantize DSpark MXFP4 to FP8. |
 | `marlin_repack.py` | GPTQ int32 → Marlin tile layout repack. |
-| `verify_gptq_w4a8_repack_quality.py` | Verify W4A8 repack quality vs baseline. |
-| `diag_w4a8_pack_roundtrip.py` | W4A8 pack round-trip diagnostic. |
 
 ## Correctness Gates
 

@@ -2893,12 +2893,7 @@ fn main() {
         if let Some(split_compile) = nvcc_split_compile.as_deref() {
             nvcc_args.push(format!("--split-compile={split_compile}"));
         }
-        if legacy_volta_build
-            && matches!(
-                stem,
-                "marlin_kernel" | "marlin_repack" | "marlin_w4a8_kernel" | "marlin_gemm"
-            )
-        {
+        if legacy_volta_build && matches!(stem, "marlin_kernel" | "marlin_repack" | "marlin_gemm") {
             nvcc_args.push("-DARLE_DISABLE_MARLIN_SM70=1".to_string());
         }
         // FlashMLA (sparse prefill/decode) and FA3 hopper kernels use

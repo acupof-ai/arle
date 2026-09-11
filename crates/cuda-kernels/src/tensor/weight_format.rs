@@ -20,8 +20,6 @@ pub enum WeightFormat {
     W8A16,
     /// Uniform per-group packed INT4 weights with BF16 scales.
     W4A16,
-    /// Marlin W4 weights with dynamic INT8 activations.
-    MarlinW4A8,
     /// Uniform per-group packed INT2 weights with BF16 scales.
     W2A16,
     /// GGUF Q3_K packed superblocks, scales embedded in each 256-wide block.
@@ -60,26 +58,6 @@ impl WeightFormat {
                 ensure!(
                     cols.is_multiple_of(group_size),
                     "{self} requires cols % group_size == 0, got cols={cols}, group_size={group_size}"
-                );
-                Ok(())
-            }
-            Self::MarlinW4A8 => {
-                ensure!(group_size > 0, "{self} requires group_size > 0");
-                ensure!(
-                    group_size == 128,
-                    "{self} currently requires group_size=128, got {group_size}"
-                );
-                ensure!(
-                    cols.is_multiple_of(group_size),
-                    "{self} requires cols % group_size == 0, got cols={cols}, group_size={group_size}"
-                );
-                ensure!(
-                    cols.is_multiple_of(128),
-                    "{self} requires cols % 128 == 0, got {cols}"
-                );
-                ensure!(
-                    rows.is_multiple_of(256),
-                    "{self} requires rows % 256 == 0, got {rows}"
                 );
                 Ok(())
             }
@@ -125,7 +103,6 @@ impl std::fmt::Display for WeightFormat {
             Self::DenseBf16 => f.write_str("dense_bf16"),
             Self::W8A16 => f.write_str("w8a16"),
             Self::W4A16 => f.write_str("w4a16"),
-            Self::MarlinW4A8 => f.write_str("marlin_w4a8"),
             Self::W2A16 => f.write_str("w2a16"),
             Self::GgufQ3K => f.write_str("gguf_q3_k"),
             Self::GgufQ4K => f.write_str("gguf_q4_k"),

@@ -7,7 +7,6 @@ Each quantizer implements `quantize(weight) -> {suffix: tensor}`,
 Usage:
   python scripts/quantize.py --format fp8 --bf16 <dir> --ref <fp8-ref> --out <dir>
   python scripts/quantize.py --format w8a16 --bf16 <dir> [--ref <w8a16-ref>] --out <dir>
-  python scripts/quantize.py --format w4a8-marlin --src <dir> --dst <dir>
 """
 
 from __future__ import annotations
@@ -316,146 +315,12 @@ class W8A16Quantizer(Quantizer):
 
 
 # ---------------------------------------------------------------------------
-# W4A8 Marlin (pack_w4a8) — canonical implementation from quantize_qwen3_w4a8.py
-# ---------------------------------------------------------------------------
-
-W4A8_GROUP = 128
-
-
-def _get_perms(groupsize: int, k: int):
-    import numpy as np
-
-    perm = []
-    for i in range(32):
-        perm1 = []
-        col = i // 4
-        for block in [0, 1]:
-            for row in [4 * (i % 4) + j for j in range(4)]:
-                perm1.append(16 * row + col + 8 * block)
-        for j in range(4):
-            perm.extend([p + 256 * j for p in perm1])
-    perm = np.array(perm)
-    interleave = (
-        np.array([4, 0, 5, 1, 6, 2, 7, 3])
-        if groupsize == k
-        else np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    )
-    perm = perm.reshape((-1, 8))[:, interleave].ravel()
-    scale_perm = []
-    for i in range(8):
-        scale_perm.extend([i + 8 * j for j in range(8)])
-    scale_perm_single = []
-    for i in range(4):
-        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-    return torch.from_numpy(perm), scale_perm, scale_perm_single
-
-
-def pack_w4a8(
-    weight: torch.Tensor,
-    groupsize: int = W4A8_GROUP,
-    gptq_scales: torch.Tensor | None = None,
-):
-    """Pack BF16/FP16 weight to ARLE W4A8 Marlin format.
-
-    Returns (qweight int32, s_channel float32 [1, out], s_group float16 [in/gs, out]).
-    """
-    import numpy as np
-
-    weight = weight.to(dtype=torch.float16, device="cpu").contiguous()
-    n, k = weight.shape
-    if k % 128 != 0 or n % 256 != 0 or k % groupsize != 0:
-        raise ValueError(f"unsupported W4A8 shape [{n}, {k}] groupsize={groupsize}")
-
-    perm, scale_perm, scale_perm_single = _get_perms(groupsize, k)
-
-    ref = weight.t().contiguous()
-    s_channel = ref.t().abs().amax(dim=-1, keepdim=True).div(127.0).to(torch.float32)
-    s_channel = torch.where(s_channel == 0, torch.ones_like(s_channel), s_channel)
-    s_channel = s_channel.reshape(1, n)
-
-    if gptq_scales is not None:
-        s = gptq_scales.t().to(torch.float16).contiguous()
-        if s.shape != (k // groupsize, n):
-            raise ValueError(
-                f"gptq_scales shape after transpose {tuple(s.shape)} "
-                f"!= expected ({k // groupsize}, {n})"
-            )
-        max_s = 16.0 * s_channel.to(torch.float16).reshape(1, n)
-        s = torch.minimum(s, max_s)
-    else:
-        reshaped = ref.reshape(k // groupsize, groupsize, n)
-        s = reshaped.abs().amax(dim=1).clamp_min(1e-6).div(7.0).to(torch.float16)
-
-    w = ref.reshape((-1, groupsize, n)).permute(1, 0, 2).reshape((groupsize, -1))
-    s_work = s.reshape((1, -1))
-    w = torch.round(w / s_work).to(torch.int32)
-    w += 8
-    w = torch.clamp(w, 0, 15)
-
-    s_group = (s_work.reshape(-1, n) / s_channel).to(torch.float16)
-    w = w.reshape((groupsize, -1, n)).permute(1, 0, 2).reshape((k, n)).contiguous()
-    s_group = s_group.reshape((-1, len(scale_perm)))[:, scale_perm]
-    s_group = s_group.reshape((-1, n)).contiguous()
-    s_channel = s_channel.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
-    s_channel = s_channel.reshape((-1, n)).contiguous()
-
-    tile = 16
-    w = w.reshape((k // tile, tile, n // tile, tile))
-    w = w.permute((0, 2, 1, 3)).reshape((k // tile, n * tile))
-    res = w.reshape((-1, perm.numel()))[:, perm].reshape(w.shape)
-    res_np = res.cpu().numpy().astype(np.uint32)
-    q = np.zeros((res_np.shape[0], res_np.shape[1] // 8), dtype=np.uint32)
-    for i in range(8):
-        q |= res_np[:, i::8] << (4 * i)
-    qweight = torch.from_numpy(q.astype(np.int32))
-    return qweight, s_channel.contiguous(), s_group.contiguous()
-
-
-def is_w4a8_quantizable(name: str, tensor: torch.Tensor) -> bool:
-    if tensor.ndim != 2 or not name.endswith(".weight"):
-        return False
-    if name.endswith("embed_tokens.weight") or name.endswith("lm_head.weight"):
-        return False
-    out_features, in_features = tensor.shape
-    return in_features % 128 == 0 and out_features % 256 == 0
-
-
-class W4A8MarlinQuantizer(Quantizer):
-    name = "w4a8-marlin"
-
-    def can_quantize(self, weight: torch.Tensor) -> bool:
-        return weight.dim() == 2 and weight.shape[0] % 256 == 0 and weight.shape[1] % 128 == 0
-
-    def quantize(self, weight: torch.Tensor) -> dict[str, torch.Tensor]:
-        qweight, s_channel, s_group = pack_w4a8(weight)
-        return {
-            ".marlin_w4a8_qweight": qweight,
-            ".marlin_w4a8_s_channel": s_channel,
-            ".marlin_w4a8_s_group": s_group,
-        }
-
-    def scope_names(
-        self, weight_map: dict[str, str], ref_dir: Path | None
-    ) -> set[str]:
-        return {
-            k for k in weight_map
-            if k.endswith(".weight")
-            and not k.endswith("embed_tokens.weight")
-            and not k.endswith("lm_head.weight")
-        }
-
-    def quant_config(self) -> dict:
-        return {"quant_type": "marlin_w4a8", "group_size": W4A8_GROUP}
-
-
-# ---------------------------------------------------------------------------
 # Registry + CLI
 # ---------------------------------------------------------------------------
 
 QUANTIZERS: dict[str, type[Quantizer]] = {
     "fp8": FP8BlockCastQuantizer,
     "w8a16": W8A16Quantizer,
-    "w4a8-marlin": W4A8MarlinQuantizer,
 }
 
 
@@ -466,10 +331,8 @@ def main() -> None:
     ap.add_argument("--selfcheck", action="store_true")
     # Generic checkpoint args
     ap.add_argument("--bf16", help="source BF16 checkpoint dir (fp8, w8a16)")
-    ap.add_argument("--src", help="source checkpoint dir (w4a8-marlin)")
     ap.add_argument("--ref", help="reference quantized checkpoint (fp8, w8a16 scope)")
     ap.add_argument("--out", help="output dir (fp8, w8a16)")
-    ap.add_argument("--dst", help="output dir (w4a8-marlin)")
     ap.add_argument("--group-size", type=int, default=128)
     args = ap.parse_args()
 
@@ -483,8 +346,8 @@ def main() -> None:
         quantizer.selfcheck()
         return
 
-    src = args.bf16 or args.src
-    out = args.out or args.dst
+    src = args.bf16
+    out = args.out
     if not (src and out):
         ap.error(f"--format {args.format} requires source + output args")
 
