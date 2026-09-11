@@ -86,7 +86,7 @@ struct PartialProj {
 /// [`StudentLoraUpdate`] the resident re-merge consumes. `rank` is read from
 /// the tensor shapes (`lora_A` rows); `alpha` comes from the caller
 /// (`--lora-alpha`) because the adapter file carries matrices only.
-pub fn load_student_lora_update(path: &Path, alpha: f32) -> Result<StudentLoraUpdate> {
+pub(crate) fn load_student_lora_update(path: &Path, alpha: f32) -> Result<StudentLoraUpdate> {
     // Accept either the `.safetensors` file directly or a PEFT adapter DIR
     // (`--save-lora-adapters` emits `<dir>/adapter_model.safetensors`), matching
     // the train-side resume loader so a saved adapter loads back into the serve.

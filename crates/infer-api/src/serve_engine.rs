@@ -21,7 +21,7 @@ use crate::types::{
 /// Adapter over one running [`ServeHandle`] + its tokenizer, generic over the
 /// executor / KV pool so the same wiring serves every backend. The shared body
 /// behind each [`crate::LoadedInferenceEngine`] variant's impl.
-pub struct ServeInferenceEngine {
+pub(crate) struct ServeInferenceEngine {
     model_id: String,
     tokenizer: OpenAiTokenizer,
     serve: Arc<ServeHandle>,
@@ -98,6 +98,7 @@ impl ServeInferenceEngine {
     /// scheduler. This is the programmatic OPD rollout surface: unlike
     /// `forward_token_logits`, it keeps one request alive in infer-core, so the
     /// backend uses its normal KV-cache incremental decode path.
+    #[cfg(feature = "cuda")]
     pub fn generate_token_ids(
         &self,
         prompt_token_ids: &[u32],

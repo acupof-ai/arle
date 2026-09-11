@@ -66,8 +66,8 @@ pub use loaded::build_cuda_engine;
 #[cfg(feature = "cuda")]
 pub use loaded::cuda_model_takes_multiproc_serve;
 pub use loaded::{
-    BackendBuilderFn, BackendCapabilities, EngineLoadConfig, KvCacheDtype, KvTierBudget,
-    default_backend, is_backend_registered, register_backend,
+    BackendCapabilities, EngineLoadConfig, KvCacheDtype, KvTierBudget, default_backend,
+    is_backend_registered, register_backend,
 };
 #[cfg(feature = "cuda")]
 pub use serve::serve_coordinator_http_dp;
@@ -77,7 +77,7 @@ pub use serve::{
     validate_kv_ssd_config,
 };
 pub use serve::{ServeThread, serve_router_on_thread};
-pub use serve_engine::{ServeInferenceEngine, model_id_from_path};
+pub use serve_engine::model_id_from_path;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
 // the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
 // the `infer-api` surface without depending on `infer-server` directly (mirrors
@@ -99,11 +99,11 @@ pub use infer_cuda::{
 #[cfg(feature = "nccl")]
 pub use infer_cuda::{mint_nccl_unique_id_hex, nccl_unique_id_from_env};
 #[cfg(feature = "cuda")]
-pub use student_lora::{LoraHalf, load_student_lora_update, parse_student_adapter_name};
+pub use student_lora::{LoraHalf, parse_student_adapter_name};
 #[cfg(feature = "cuda")]
 pub use types::RawLogits;
 pub use types::{
     ChatPromptImage, ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
-    CompletionStreamError, EngineTelemetry, FinishReason, InferenceEngine, MultimodalChatRequest,
-    SamplingParams, TokenUsage,
+    CompletionStreamError, FinishReason, InferenceEngine, MultimodalChatRequest, SamplingParams,
+    TokenUsage,
 };
