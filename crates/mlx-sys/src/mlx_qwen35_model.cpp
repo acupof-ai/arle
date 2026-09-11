@@ -264,6 +264,64 @@ auto& gated_delta_tape_kernel() {
     return kernel;
 }
 
+// Shared dispatch for the production GDR recurrent kernels. Callers pass
+// arrays already materialized to the kernel contract: q/k/v bf16, g/beta
+// f32, state f32, all contiguous. Returns {y, state_out} and, when
+// record_tape is set, the innovation tape as the third element.
+std::vector<array> run_gated_delta_step(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& g,
+    const array& beta,
+    const array& state_in,
+    int threadgroup_y,
+    bool record_tape) {
+    int B = q.shape(0);
+    int T = q.shape(1);
+    int Hk = q.shape(2);
+    int Dk = q.shape(3);
+    int Hv = v.shape(2);
+    int Dv = v.shape(3);
+
+    std::vector<array> inputs = {q, k, v, g, beta, state_in, array(T)};
+    std::vector<Shape> out_shapes = {{B, T, Hv, Dv}, state_in.shape()};
+    std::vector<Dtype> out_dtypes = {bfloat16, float32};
+    std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+        {"Dk", fast::TemplateArg(Dk)},
+        {"Dv", fast::TemplateArg(Dv)},
+        {"Hk", fast::TemplateArg(Hk)},
+        {"Hv", fast::TemplateArg(Hv)},
+        {"InT", fast::TemplateArg(bfloat16)},
+        {"StT", fast::TemplateArg(float32)},
+    };
+
+    if (record_tape) {
+        out_shapes.push_back({B, T, Hv, Dv});
+        out_dtypes.push_back(bfloat16);
+        return gated_delta_tape_kernel()(
+            inputs,
+            out_shapes,
+            out_dtypes,
+            std::make_tuple(32, Dv, B * Hv),
+            std::make_tuple(32, threadgroup_y, 1),
+            tmpl,
+            std::nullopt,
+            false,
+            {});
+    }
+    return gated_delta_kernel()(
+        inputs,
+        out_shapes,
+        out_dtypes,
+        std::make_tuple(32, Dv, B * Hv),
+        std::make_tuple(32, threadgroup_y, 1),
+        tmpl,
+        std::nullopt,
+        false,
+        {});
+}
+
 // Compiled compute_g: g = exp(neg_exp_a * softplus(a + dt_bias))
 // `neg_exp_a = -exp(A_log.f32)` is precomputed once at load time.
 // Matches mlx_lm's runtime math while saving one per-step exp per layer.
@@ -952,57 +1010,19 @@ struct Qwen35CompiledModel {
             auto g_kernel = contiguous(reshape(g, {B, S, hv}));
             auto beta_kernel = contiguous(reshape(beta, {B, S, hv}));
             int threadgroup_y = qwen35_cpp_gdr_threadgroup_y(S);
-            std::vector<array> inputs = {
-                q_kernel, k_kernel, v_kernel, g_kernel, beta_kernel, gdr_state_in, gdr_t_arr
-            };
-            std::vector<Shape> out_shapes = {{B, S, hv, dv}, gdr_state_in.shape()};
-            std::vector<Dtype> out_dtypes = {bfloat16, float32};
-            std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
-                {"Dk", fast::TemplateArg(dk)},
-                {"Dv", fast::TemplateArg(dv)},
-                {"Hk", fast::TemplateArg(hk)},
-                {"Hv", fast::TemplateArg(hv)},
-                {"InT", fast::TemplateArg(bfloat16)},
-                {"StT", fast::TemplateArg(float32)},
-            };
-
+            auto result = run_gated_delta_step(
+                q_kernel, k_kernel, v_kernel, g_kernel, beta_kernel,
+                gdr_state_in, threadgroup_y, ctx.record_tapes);
+            y = std::move(result[0]);
+            gdr_state_out = std::move(result[1]);
             if (ctx.record_tapes) {
-                // Tape-recording variant: same computation + records innovation_tape
-                std::vector<Shape> tape_out_shapes = {{B, S, hv, dv}, gdr_state_in.shape(), {B, S, hv, dv}};
-                std::vector<Dtype> tape_out_dtypes = {bfloat16, float32, bfloat16};
-                auto result = gated_delta_tape_kernel()(
-                    inputs,
-                    tape_out_shapes,
-                    tape_out_dtypes,
-                    std::make_tuple(32, dv, B * hv),
-                    std::make_tuple(32, threadgroup_y, 1),
-                    tmpl,
-                    std::nullopt,
-                    false,
-                    {});
-                y = std::move(result[0]);
-                gdr_state_out = std::move(result[1]);
-                // Record tape for rollback. tape_replay accepts bf16 or f32 g;
-                // k and tape must be bf16 (kernel dtype gate).
+                // tape_replay accepts bf16 or f32 g; k and tape are bf16.
                 artifacts->gdr_tapes.push_back({
                     std::move(result[2]),            // innovation_tape (bf16 from kernel)
                     k_kernel,                        // k
                     g_kernel,                        // g (f32 from compiled_compute_g_beta)
                     contiguous(qkv),                 // qkv for conv rebuild
                 });
-            } else {
-                auto result = gated_delta_kernel()(
-                    inputs,
-                    out_shapes,
-                    out_dtypes,
-                    std::make_tuple(32, dv, B * hv),
-                    std::make_tuple(32, threadgroup_y, 1),
-                    tmpl,
-                    std::nullopt,
-                    false,
-                    {});
-                y = std::move(result[0]);
-                gdr_state_out = std::move(result[1]);
             }
             if (keep_intermediates) {
                 auto& intermediates = artifacts->intermediates;
@@ -2174,6 +2194,67 @@ int32_t qwen35_get_captured_hidden(void* model, int32_t idx, mlx_array** out) {
         mlx_set_error(e.what());
         return -1;
     }
+}
+
+// Op boundary for the production GDR recurrent kernels
+// (gated_delta_step / gated_delta_step_tape). The forward itself stays behind
+// the model gate; parity tests drive this entry at canonical geometry.
+// Inputs must already match the production kernel contract: q/k/v bf16
+// [B,T,Hk,Dk]/[B,T,Hv,Dv], g/beta f32 [B,T,Hv], state f32 [B,Hv,Dv,Dk].
+// Outputs: y bf16 [B,T,Hv,Dv], state f32, and (tape mode) tape bf16.
+void mlx_qwen35_gated_delta_step(
+    mlx_array* q, mlx_array* k, mlx_array* v,
+    mlx_array* g, mlx_array* beta, mlx_array* state_in,
+    int32_t record_tape,
+    mlx_array** out_y, mlx_array** out_state, mlx_array** out_tape) {
+    MLX_TRY_VOID([&]() {
+        auto q_c = contiguous(*to_arr(q));
+        auto k_c = contiguous(*to_arr(k));
+        auto v_c = contiguous(*to_arr(v));
+        auto g_c = contiguous(*to_arr(g));
+        auto beta_c = contiguous(*to_arr(beta));
+        auto state_c = contiguous(*to_arr(state_in));
+
+        require_rank(q_c, 4, "q");
+        require_rank(k_c, 4, "k");
+        require_rank(v_c, 4, "v");
+        require_rank(g_c, 3, "g");
+        require_rank(beta_c, 3, "beta");
+        require_rank(state_c, 4, "state_in");
+        require_dtype(q_c, bfloat16, "q");
+        require_dtype(k_c, bfloat16, "k");
+        require_dtype(v_c, bfloat16, "v");
+        require_dtype(g_c, float32, "g");
+        require_dtype(beta_c, float32, "beta");
+        require_dtype(state_c, float32, "state_in");
+
+        int B = q_c.shape(0);
+        int T = q_c.shape(1);
+        int Hk = q_c.shape(2);
+        int Dk = q_c.shape(3);
+        int Hv = v_c.shape(2);
+        int Dv = v_c.shape(3);
+        if (k_c.shape(0) != B || k_c.shape(1) != T || k_c.shape(2) != Hk ||
+            k_c.shape(3) != Dk ||
+            v_c.shape(0) != B || v_c.shape(1) != T ||
+            g_c.shape(0) != B || g_c.shape(1) != T || g_c.shape(2) != Hv ||
+            beta_c.shape(0) != B || beta_c.shape(1) != T || beta_c.shape(2) != Hv ||
+            state_c.shape(0) != B || state_c.shape(1) != Hv ||
+            state_c.shape(2) != Dv || state_c.shape(3) != Dk) {
+            throw std::invalid_argument("mlx_qwen35_gated_delta_step shape mismatch");
+        }
+        if (Dk < 32 || (Dk % 32) != 0 || (Hv % Hk) != 0) {
+            throw std::invalid_argument(
+                "mlx_qwen35_gated_delta_step requires Dk%32==0 and Hv%Hk==0");
+        }
+
+        auto result = run_gated_delta_step(
+            q_c, k_c, v_c, g_c, beta_c, state_c,
+            (Dv + 31) / 32, record_tape != 0);
+        *out_y = from_arr(std::move(result[0]));
+        *out_state = from_arr(std::move(result[1]));
+        *out_tape = record_tape != 0 ? from_arr(std::move(result[2])) : nullptr;
+    }());
 }
 
 } // extern "C"

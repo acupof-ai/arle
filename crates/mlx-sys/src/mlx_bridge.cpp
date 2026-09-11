@@ -8,18 +8,6 @@
 
 namespace {
 
-void require_rank(const array& arr, int expected, const char* name) {
-    if (arr.ndim() != expected) {
-        throw std::invalid_argument(std::string(name) + " must have rank " + std::to_string(expected));
-    }
-}
-
-void require_dtype(const array& arr, Dtype expected, const char* name) {
-    if (arr.dtype() != expected) {
-        throw std::invalid_argument(std::string(name) + " has an unexpected dtype");
-    }
-}
-
 auto& tape_replay_kernel() {
     static auto kernel = fast::metal_kernel(
         "tape_replay",
@@ -915,6 +903,32 @@ mlx_array* mlx_tape_replay(
             {});
 
         return from_arr(std::move(result[0]));
+    }());
+}
+
+// Op boundary for the fixed-M=16 2-pass SDPA specialization.
+mlx_array* mlx_batched_sdpa_2pass(
+    mlx_array* queries, mlx_array* keys, mlx_array* values,
+    float scale, int32_t gqa_factor) {
+    MLX_TRY_RETURN(from_arr(batched_sdpa_2pass_cpp(
+        *to_arr(queries), *to_arr(keys), *to_arr(values), scale, gqa_factor)));
+}
+
+// Op boundary for the hand-written mma2big quantized matmul verification
+// kernels (group_size 32/64/128). Falls back to stock MLX quantized_matmul
+// when the M=16/K,N%32 eligibility is not met.
+mlx_array* mlx_verify_quantized_matmul(
+    mlx_array* x, mlx_array* w, mlx_array* scales, mlx_array* biases,
+    int32_t group_size, int32_t bits) {
+    MLX_TRY_RETURN([&]() -> mlx_array* {
+        // verify_quantized_matmul_cpp requires a concrete biases array;
+        // substitute a zero bias (the 4-bit production path always has one,
+        // and 0 changes nothing when a caller passes null).
+        array zero_bias = zeros_like(*to_arr(scales));
+        const array& bias_ref = biases == nullptr ? zero_bias : *to_arr(biases);
+        return from_arr(verify_quantized_matmul_cpp(
+            *to_arr(x), *to_arr(w), *to_arr(scales), bias_ref,
+            group_size, bits));
     }());
 }
 
