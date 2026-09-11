@@ -1767,63 +1767,6 @@ impl DeviceMatrix {
             tq_bits: 0,
         })
     }
-
-    pub fn slice_rows(
-        ctx: &DeviceContext,
-        src: &DeviceMatrix,
-        row_start: usize,
-        row_end: usize,
-    ) -> Result<Self> {
-        assert!(
-            row_start < row_end && row_end <= src.rows,
-            "slice_rows: invalid range [{}..{}) for matrix with {} rows",
-            row_start,
-            row_end,
-            src.rows,
-        );
-        let out_rows = row_end - row_start;
-        let n = out_rows * src.cols;
-        let offset = row_start * src.cols;
-        let mut dst: CudaSlice<bf16> = ctx
-            .stream
-            .alloc_zeros(n)
-            .map_err(|e| anyhow!("slice_rows alloc failed: {e}"))?;
-        ctx.stream
-            .memcpy_dtod(&src.data.slice(offset..offset + n), &mut dst)
-            .map_err(|e| anyhow!("slice_rows D2D copy failed: {e}"))?;
-        Ok(Self {
-            data: dst,
-            rows: out_rows,
-            cols: src.cols,
-            weight_format: WeightFormat::DenseBf16,
-            qweight: None,
-            qweight_u8: None,
-            pristine_fp8: None,
-            qscales: None,
-            qscale_fp8: None,
-            scale_f32: None,
-            scale2_f32: None,
-            quant_scale_rows: 0,
-            quant_scale_cols: 0,
-            quant_block_m: 0,
-            quant_block_k: 0,
-            dsv4_scales: None,
-            dsv4_scale_rows: 0,
-            dsv4_scale_cols: 0,
-            group_size: 0,
-            retired_marlin: None,
-            marlin_packed: None,
-            marlin_scales: None,
-            fp4_deepgemm_sfb: None,
-            fp4_marlin_scale_lift_inv: 1.0,
-            fp8_deepgemm_prefill: false,
-            tq_packed: None,
-            tq_scales: None,
-            tq_signs: None,
-            tq_centroids: None,
-            tq_bits: 0,
-        })
-    }
 }
 
 impl From<&DeviceMatrix> for infer_quant::WeightLayoutQuery {

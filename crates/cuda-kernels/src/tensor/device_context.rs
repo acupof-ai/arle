@@ -142,13 +142,15 @@ pub struct CudaPipelineFence {
 }
 
 impl CudaPipelineFence {
+    #[cfg(test)]
     #[must_use]
-    pub fn device_ordinal(&self) -> u32 {
+    pub(crate) fn device_ordinal(&self) -> u32 {
         self.device_ordinal
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn producer(&self) -> CudaPipelineStreamKind {
+    pub(crate) fn producer(&self) -> CudaPipelineStreamKind {
         self.producer
     }
 
