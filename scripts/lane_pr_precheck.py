@@ -7,6 +7,9 @@
 2. Added code comments carry no PR number (#123) and no 7+ hex SHA.
 3. No added line contains a machine-local home/container/data/mount/pod path.
 4. An examples/ or benches/ change needs a BUILD_EXIT=0 line in the PR body.
+5. Rust changed in a no-cuda-gated crate, or anything under
+   crates/cuda-kernels/, needs a CUDA_CHECK_EXIT=0 line from a pod
+   `cargo check --features cuda,nccl` run without no-cuda.
 """
 
 from __future__ import annotations
@@ -34,6 +37,12 @@ ABS_PATH = re.compile(
     r"(?<![\w./-])(" + "|".join(["/" + s for s in ("Users/", "root/", "data0", "mnt/", "host/")]) + r")"
 )
 BUILD_EXIT_OK = re.compile(r"^BUILD_EXIT=0\s*$", re.MULTILINE)
+CUDA_CHECK_EXIT_OK = re.compile(r"^CUDA_CHECK_EXIT=0\s*$", re.MULTILINE)
+CRATE_RUST_PATH = re.compile(r"^crates/([^/]+)/.*\.rs$")
+ROOT_RUST_PATH = re.compile(r"^src/.*\.rs$")
+CUDA_KERNELS_PATH = re.compile(r"^crates/cuda-kernels/")
+# A crate's [features] table declaring no-cuda, e.g. `no-cuda = ["..."]`.
+NO_CUDA_FEATURE = re.compile(r"(?m)^\s*no-cuda\s*=")
 
 # Only code-file comments count: `//`/`///` for C-family sources, `#` for
 # hash-comment sources. Markdown headings and C preprocessor lines are not
@@ -107,6 +116,43 @@ def check_abs_paths(added: dict[str, list[str]]) -> list[str]:
     ]
 
 
+def changed_files(repo: Path, base: str) -> list[str]:
+    return [p for p in git(["diff", "--name-only", f"{base}...HEAD"], repo).splitlines() if p]
+
+
+def crate_has_no_cuda(repo: Path, crate: str) -> bool:
+    manifest = repo / "crates" / crate / "Cargo.toml"
+    try:
+        return bool(NO_CUDA_FEATURE.search(manifest.read_text()))
+    except OSError:
+        return False
+
+
+def root_has_no_cuda(repo: Path) -> bool:
+    try:
+        return bool(NO_CUDA_FEATURE.search((repo / "Cargo.toml").read_text()))
+    except OSError:
+        return False
+
+
+def check_cuda_check_exit(repo: Path, base: str, changed: list[str], pr_body: str) -> list[str]:
+    if CUDA_CHECK_EXIT_OK.search(pr_body):
+        return []
+    needs = any(CUDA_KERNELS_PATH.match(p) for p in changed)
+    if not needs:
+        crates = {m.group(1) for p in changed if (m := CRATE_RUST_PATH.match(p))}
+        needs = any(crate_has_no_cuda(repo, c) for c in crates)
+    if not needs and any(ROOT_RUST_PATH.match(p) for p in changed):
+        needs = root_has_no_cuda(repo)
+    if not needs:
+        return []
+    return [
+        "cuda-check: diff touches Rust in a no-cuda-gated crate (or crates/cuda-kernels/); "
+        "run a pod `cargo check --features cuda,nccl` WITHOUT no-cuda and put a "
+        "CUDA_CHECK_EXIT=0 line in the PR body"
+    ]
+
+
 def check_build_exit(added: dict[str, list[str]], pr_body: str) -> list[str]:
     if not any(EXAMPLE_OR_BENCH_PATH.match(p) for p in added) or BUILD_EXIT_OK.search(pr_body):
         return []
@@ -116,10 +162,12 @@ def check_build_exit(added: dict[str, list[str]], pr_body: str) -> list[str]:
 def run(repo: Path, pr_body: str) -> list[str]:
     base = git(["merge-base", "origin/main", "HEAD"], repo).strip()
     added = added_lines(repo, base)
+    changed = changed_files(repo, base)
     failures = check_bench_exemption(repo, base, any(EXPERIENCE_ENTRY.match(p) for p in added))
     failures += check_comments(added)
     failures += check_abs_paths(added)
     failures += check_build_exit(added, pr_body)
+    failures += check_cuda_check_exit(repo, base, changed, pr_body)
     return failures
 
 
@@ -168,6 +216,68 @@ def selftest() -> int:
         ("history entry", {HISTORY_FIXTURE: "# Title\n\nSuperseded by #123 (abcdef12).\n"}, BARE_BODY, "", None),
         ("abs path", {RUNTIME_FIXTURE: f'pub const L: &str = "{_root}x";\n'}, EXEMPT_BODY, "", "abs-path"),
         ("build-exit", {EXAMPLE_FIXTURE: "fn main() {}\n"}, EXEMPT_BODY, "", "build-exit"),
+        (
+            "cuda-check missing",
+            {
+                "crates/x/src/lib.rs": "pub fn x() {}\n",
+                "crates/x/Cargo.toml": "[features]\nno-cuda = []\n",
+            },
+            EXEMPT_BODY,
+            "",
+            "cuda-check",
+        ),
+        (
+            "cuda-check present",
+            {
+                "crates/x/src/lib.rs": "pub fn x() {}\n",
+                "crates/x/Cargo.toml": "[features]\nno-cuda = []\n",
+            },
+            EXEMPT_BODY,
+            "CUDA_CHECK_EXIT=0\n",
+            None,
+        ),
+        (
+            "cuda-check non-gated crate passes",
+            {"crates/x/src/lib.rs": "pub fn x() {}\n",
+             "crates/x/Cargo.toml": "[features]\ncuda = []\n"},
+            EXEMPT_BODY,
+            "",
+            None,
+        ),
+        (
+            "cuda-check cuda-kernels path",
+            {"crates/cuda-kernels/csrc/x.cu": "// x\n"},
+            EXEMPT_BODY,
+            "",
+            "cuda-check",
+        ),
+        (
+            "cuda-check root crate missing",
+            {
+                "src/main.rs": "fn main() {}\n",
+                "Cargo.toml": "[features]\nno-cuda = [\"cli/no-cuda\"]\n",
+            },
+            EXEMPT_BODY,
+            "",
+            "cuda-check",
+        ),
+        (
+            "cuda-check root crate present",
+            {
+                "src/main.rs": "fn main() {}\n",
+                "Cargo.toml": "[features]\nno-cuda = [\"cli/no-cuda\"]\n",
+            },
+            EXEMPT_BODY,
+            "CUDA_CHECK_EXIT=0\n",
+            None,
+        ),
+        (
+            "cuda-check root crate without feature passes",
+            {"src/main.rs": "fn main() {}\n", "Cargo.toml": "[features]\ncuda = []\n"},
+            EXEMPT_BODY,
+            "",
+            None,
+        ),
     ]
     failures = []
     for name, files, body, pr_body, expected in cases:
