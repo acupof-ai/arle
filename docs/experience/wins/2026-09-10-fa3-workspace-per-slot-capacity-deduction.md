@@ -53,13 +53,50 @@ fixed reserve deducted before the solve. Match the deduction shape to the
 allocation's scaling, and keep the byte formula in one place (the kernel FFI),
 not duplicated into the solve.
 
+## Remote validation command (1×H20)
+
+The config from the task: `Qwen3.8-27B-NVFP4`, 32K length, 256 slots.
+Copy the checkpoint onto the container's local NVMe and serve from that
+path.
+
+```bash
+arle serve --backend cuda \
+  --model-path <model-dir>/Qwen3.8-27B-NVFP4 \
+  --max-total-tokens 32768 \
+  --max-running-requests 256
+```
+
+`max_seq_len` is `max_total_tokens`; requested slots is
+`max_running_requests` (`crates/infer-cuda/src/executor/qwen35.rs:619`,
+`kv_budget_plan`). The FA3 workspace term is non-zero only for an
+INT8/FP8-E4M3 pool; Qwen3.8-27B-NVFP4 serves FP8 KV, so leave
+`--kv-cache-dtype` at its default.
+
+Success is one of two outcomes printed at boot
+(`crates/infer-cuda/src/qwen35_forward.rs`):
+
+1. clamps — a WARN containing
+   `Qwen3.5 KV budget: requested 256 slots × ~NMB/slot (recurrent NMB +
+   FA3 attn workspace NMB) exceeds the cross-rank-min joint-affordable …
+   clamping num_slots to AFF`, with the preceding INFO line
+   `Qwen3.5 KV budget: free …MB, per_slot …MB … + FA3 attn workspace
+   <nonzero>MB/slot`; the server then serves with AFF < 256 slots; or
+2. refuses — the startup error
+   `Qwen3.5 KV budget rejected startup: post-weights free VRAM affords 0
+   slots at max_seq_len 32768 (per_slot ~NMB, recurrent NMB + FA3 attn
+   workspace NMB, exceeds …)`.
+
+Either outcome names the workspace; a boot that proceeds with 256 slots
+and OOMs mid-serve means the deduction did not engage.
+
 ## Net
 
-No GPU on this box: the boot/refusal outcome on the 27B config is
-pending-remote. Local gates: `cargo test -p infer-model` 15/15 (incl.
+Local gates: `cargo test -p infer-model` 15/15 (incl.
 `kv_slot_budget_charges_fa3_workspace_per_slot`, which proves a 2 KB/slot
 workspace sheds the solved slot count 60 → 50); Mac CUDA clippy gate exit 0;
-`check_repo_hygiene.py` green; `cargo fmt --check` clean.
+`check_repo_hygiene.py` green; `cargo fmt --check` clean. The 27B/32K boot
+outcome runs on an H20 with the command above; no result has been recorded
+yet.
 
 `git diff --stat`: +82/−26 = +56 net across 2 files (infer-model +68 with 1 new
 test, qwen35_forward.rs +40 — the workspace computation, log itemization, and
