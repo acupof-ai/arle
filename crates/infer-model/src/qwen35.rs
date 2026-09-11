@@ -144,7 +144,7 @@ pub fn per_slot_kv_bytes(cfg: &Qwen35Config, shard: LocalShard) -> (usize, usize
 /// sequence — the device router (no host sync + D2H) and `R = top_k` below the
 /// DeepGEMM floor, whose JIT is not capture-safe. `min_routes` is the runtime
 /// flag's value, read in `infer-cuda` and passed as a host number.
-pub fn moe_decode_graph_capturable(cfg: &MoeConfig, min_routes: usize) -> bool {
+fn moe_decode_graph_capturable(cfg: &MoeConfig, min_routes: usize) -> bool {
     cfg.device_route_eligible() && cfg.top_k < min_routes
 }
 
