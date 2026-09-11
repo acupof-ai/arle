@@ -348,7 +348,7 @@ pub fn detect_quant_format(
     Ok(Some(view))
 }
 
-pub fn validate_scale_shapes(
+fn validate_scale_shapes(
     view: &QuantTensorView,
     tensors: &BTreeMap<String, TensorHeader>,
 ) -> Result<()> {
