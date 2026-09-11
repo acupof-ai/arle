@@ -16,6 +16,19 @@ decomposition, or a verdict. Not needed for routine edits.
   pool + scheduler clamp + KV format + graph capture) is **unattributable**.
 - **Root-cause hypotheses get verify-or-reject too** — not just fixes. Wrong root
   cause → every sub-experiment wasted.
+- **A parity gate must use the geometry and the lane of the model actually served.**
+  Taking shapes, switches, or head dims from another model, a fallback arm, or a
+  test fixture makes the gate prove the wrong thing, often as a silent no-op.
+  Check: read the `config.json` of the served checkpoint (prefer the checkpoint
+  on the host; cite model name + the field you read), run the *default* lane not
+  its fallback, and verify the kill switch exists by name in the build before
+  trusting it. Recurred in one review cycle: DSv4 hidden/intermediate copied
+  from DeepSeek-V3's 7168/20480; the Qwen DSpark ring cap taken from DSv4's
+  window 128 / block 5 (#331); Qwen3.6-27B full-attention head_dim used as the
+  GDR linear-attention dim 128 (#333); an hd128 unit-test struct read as model
+  geometry (#330); a gate covering the fallback lane instead of the default
+  (#335); and a gate switched on `ARLE_QWEN35_GDR_CHUNKED`, a name that no
+  longer existed, so the gate did nothing (#300/#334).
 - **80% SOLID is not enough.** Dig to 95%+, or explicitly declare "deferred,
   accepting the uncertainty". No silent pass.
 - **Wall-clock / per-request framing is ground truth.** A narrow-window X% share
