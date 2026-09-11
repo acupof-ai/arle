@@ -1,6 +1,6 @@
 # Architecture: stage boundaries the compiler enforces
 
-Date: 2026-09-09 · Status: Active — phase exit through Step 2 (CHANGELOG 2026-09-10; four crates above the device line, #255/#256/#258/#259/#260/#262); Step 3a (executor dispersion into infer-plan/infer-model) landed #268/#271/#273/#274/#277/#280/#293, Step 3b (dispersal, infer-protocol/infer-model target) not started · Owner: ckl
+Date: 2026-09-09 · Status: Active — phase exit through Step 2 (CHANGELOG 2026-09-10; four crates above the device line, #255/#256/#258/#259/#260/#262); Step 3a (executor dispersion into infer-plan/infer-model) landed #268/#271/#273/#274/#277/#280/#293; Step 3b (model host halves → infer-model) Done with an immovable tail — `infer-model` exists and holds the geometry/budget/routing arithmetic (#273/#295, a4e006fec), the two blockers (`PrefillGeometry`, `DecodeDispatch`) landed in `infer-plan`, and what remains in the infer-cuda model modules is the fused host-arithmetic+`&mut`-device set Step 3a proved cannot cross a crate boundary; `infer-protocol` stays unbuilt per §10. The residual CPU-testable kernel-selection item (§3.1's 17 dispatch matches) was centralized into `infer_quant::plan_weight_layout` by #263 and moves with the weight axis (Step 5) · Owner: ckl
 
 ## What this document decides
 
@@ -323,7 +323,7 @@ Request axis, per step:
 infer-protocol   protocol, tokenizer, sampling parameters          no cuda
 infer-plan       request scheduling → ForwardPlan                  no cuda    exists
 infer-kvspace    capacity + content index + layout description     no cuda    new
-infer-model      model → op sequence → kernel selection            no cuda    new
+infer-model      model → op sequence → kernel selection            no cuda    exists (Step 3b, device tail stays)
                  → DeviceBatch                                                new type
 ───────────── above this line, cargo tree contains no cuda-kernels ─────────────
 infer-cuda::device_sched   streams, graph capture, collective placement   new module
@@ -505,9 +505,43 @@ The blocks move one at a time, cheapest first, one pull request each:
 
 Gate: no-cuda build of each destination crate; needle gate ×3.
 
-### Step 3b — `infer-model`
+### Step 3b — `infer-model` — Done, with an immovable tail
 
-The model modules' host halves — `qwen35_forward.rs`, `qwen35_decode.rs`,
+**Status (2026-09-12).** The move this step was scoped around has landed
+incrementally. `infer-model` exists (`qwen35.rs`, `dspark.rs`) with the exact
+charter below: pure config/per-rank arithmetic, zero `cuda-kernels` in
+`cargo tree`, gated in CI. The host geometry/budget/head-count/bytes/
+capturable computations left the model modules in #273 ("extract host
+geometry into infer-model"), #295, and `a4e006fec`; `infer-cuda` now depends
+on `infer-model` and delegates to it from `qwen35_forward.rs` /
+`qwen35/dspark.rs`. The two types this step said it was blocked on exist:
+
+- stage-2 host geometry descriptor → `infer_plan::geometry::PrefillGeometry`
+  (consumed at `executor/qwen35.rs::build_prefill_geometry`);
+- stage-4 settled-shape descriptor → `infer_plan::spec::DecodeDispatch`
+  (`PlainSingle { capturable }` / `PlainBatch` / …, from pure `decide_decode`).
+
+**The tail is the device half, not un-moved host arithmetic.** The four model
+modules still physically live in `infer-cuda`
+(`qwen35_forward.rs`, `qwen35_decode.rs`, `qwen35_spec.rs`,
+`qwen35/dspark.rs`), but what remains in them is `impl Qwen35CudaExecutor`
+methods that hold `DeviceMatrix` / `DeviceContext` / `stream` and compute host
+arithmetic and upload/launch in one body. This is exactly the fused set Step
+3a measured as immovable: roughly 40% of each function gathers `&mut`
+references to types that own device resources, and those references do not
+cross a crate boundary. Forcing them across by parameterizing the `&mut`
+device refs through a host enum would violate backend isolation, so the tail
+stays.
+
+**One residual CPU-testable item moved to Step 5.** §3.1's "17 dispatch
+matches … fully CPU-testable today and not tested" kernel-selection logic was
+centralized into `infer_quant::plan_weight_layout` (#263); the CUDA loaders
+now only execute `plan.transform`. That decision sits on the weight axis, so
+it is tracked under Step 5 (with a CPU table gate over its dispatch matrix),
+not here. `infer-protocol` is unbuilt by design (§10: no evidence of a
+boundary).
+
+<s>The model modules' host halves — `qwen35_forward.rs`, `qwen35_decode.rs`,
 `qwen35_spec.rs`, `qwen35/dspark.rs`, about 4,000 lines — split by §3.2's four
 stages. This is where the stages actually are, and it is the real work.
 
@@ -516,7 +550,7 @@ descriptor and a settled-shape descriptor there is nothing for stages 2 and 4
 to produce, and the split would cut through the middle of every function that
 computes host arithmetic and uploads it in the same breath.
 
-Gate: no-cuda build; needle gate ×3 against the baseline envelope.
+Gate: no-cuda build; needle gate ×3 against the baseline envelope.</s>
 
 ### Step 4 — `device_sched`
 
