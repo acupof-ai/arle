@@ -380,20 +380,36 @@ fallback = ""
 
 [[semantic]]
 id = "dsv4.olora_o_proj"
-kind = "primitive"
+kind = "composite"
 inputs = ["local_attn"]
-outputs = ["latent"]
-reference = "cuda.dsv4.wo_a_dense_cublas"
-correctness_gate = "none"
-gate_gap = "dense-BF16 low-rank wo_a (o_groups 8, o_lora_rank 1024) is a plain cuBLAS gemm (vendor-trusted, no custom kernel to gate); the FP8 grouped wo_a path runs DeepGEMM and is exercised by the prefill probe, not an f64 parity gate"
+outputs = ["residual_hidden"]
+reference = "cuda.dsv4.wo_a_fp8_grouped"
+correctness_gate = "crates/infer-cuda/examples/dsv4_tp_oproj_parity.rs"
+gate_gap = "the full TP attention-output chain is gated vs one f64 oracle in dsv4_tp_oproj_parity at DSv4-Flash geometry (64 heads x head_dim 512 = 32768, hidden 4096, o_groups 8, o_lora_rank 1024; checkpoint wo_a [8192,4096] E4M3 + [64,32] E8M0, wo_b [4096,8192] + [32,64]), TP in {1,2,4,8}, decode S=1/8 and one S=32 prefill chunk, every output column: (1) dsv4_tp_out_slice head-block copy BIT-EXACT; (2) BOTH o-proj lanes — the H20 DEFAULT DeepGEMM path (dsv4_fused_wqkv_decode_enabled=has_deepgemm_native default on, attention.rs:892-897; g>1 dsv4_oproj_group_gather -> dsv4_deepgemm_pack_quantize_bf16_to_fp8 + dsv4_deepgemm_fp8_gemm_nt with the per-group Dsv4Fp8DeepGemmWeightCache -> scatter, attention.rs:5290-5299 decode/:5349-5368 prefill; g==1 contiguous :5300/:5335; wo_b DeepGEMM :5393-5429) and the scalar fallback for non-sm90/failed preflight (g>1 dsv4_fp8_route_gemv_batch strided route t*g+lg, g==1 dsv4_fp8_gemv_batch; wo_b dsv4_fp8_gemv_batch), the DeepGEMM oracle prequantizes activations per 128 block like the pack kernel; (3) Row{1}-sharded wo_b partials host-summed across ranks (NCCL not in the gate). Per-lane teeth: shifted head slice (TP>1), DeepGEMM gather offset (g>1), DeepGEMM cache->group mis-map, scalar route-table off-by-one, dropped rank (TP>1), corrupted wo_b scale per lane. Not covered: NCCL itself, real-checkpoint tensors (synthetic N(0,0.25) with planted E8M0 block scales), and the dense-BF16 wo_a re-serialization lane (per-group cuBLAS + gather/scatter, vendor-trusted); GPU run pod-only"
 
 [[implementation]]
 id = "cuda.dsv4.wo_a_dense_cublas"
 semantic = "dsv4.olora_o_proj"
 provider = "cublas"
 source = "crates/infer-cuda/src/attention.rs"
-legality = "dense-BF16 low-rank wo_a (o_groups 8, o_lora_rank 1024; TP<o_groups owns >1 output group)"
+legality = "dense-BF16 low-rank wo_a (o_groups 8, o_lora_rank 1024; TP<o_groups owns >1 output group); per-group gather -> cuBLAS gemm -> scatter, vendor-trusted"
 fallback = ""
+
+[[implementation]]
+id = "cuda.dsv4.wo_a_fp8_deepgemm"
+semantic = "dsv4.olora_o_proj"
+provider = "arle+deepgemm"
+source = "crates/infer-cuda/src/attention.rs"
+legality = "H20 DEFAULT: FP8 block-scaled wo_a with has_deepgemm_native() preflight passing; g=o_groups/tp local groups; g>1 per-group gather -> activation pack-quantize -> dense DeepGEMM with resident caches -> scatter (decode attention.rs:5040, prefill :5186), g==1 contiguous decode_proj_deepgemm/prefill_proj_deepgemm; wo_b takes wo_b_deepgemm; then the TP all-reduce-sum"
+fallback = "cuda.dsv4.wo_a_fp8_grouped (non-sm90 / no native DeepGEMM)"
+
+[[implementation]]
+id = "cuda.dsv4.wo_a_fp8_grouped"
+semantic = "dsv4.olora_o_proj"
+provider = "arle"
+source = "crates/infer-cuda/src/attention.rs"
+legality = "FP8 block-scaled wo_a WITHOUT native DeepGEMM (non-sm90 hosts, failed preflight): g>1 dsv4_fp8_route_gemv_batch over the strided [token,group,Wg] local vector, g==1 dsv4_fp8_gemv_batch; followed by the Row{1}-sharded FP8 wo_b GEMV and the TP all-reduce-sum"
+fallback = "cuda.dsv4.wo_a_dense_cublas (dense-BF16 re-serialization)"
 
 [[semantic]]
 id = "qwen35.linear_attention"

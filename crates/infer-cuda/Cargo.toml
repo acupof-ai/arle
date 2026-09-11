@@ -105,3 +105,8 @@ required-features = ["cuda"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "dsv4_tp_oproj_parity"
+path = "examples/dsv4_tp_oproj_parity.rs"
+required-features = ["cuda"]
