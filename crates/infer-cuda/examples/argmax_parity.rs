@@ -49,7 +49,9 @@ mod real {
     // Covers: <2048 elems (one bf16x2 pass), 2048 boundary, odd tail,
     // production-scale vocab.
     const VOCABS: &[usize] = &[7, 128, 1023, 2048, 2049, 100_000, 151_936];
-    const BATCHES: &[usize] = &[1, 8];
+    // Odd vocab runs B=1 only: the batch kernel's bf16x2 row load needs a 4-byte-aligned row start; production vocabs are even.
+    const BATCHES_EVEN: &[usize] = &[1, 8];
+    const BATCHES_ODD: &[usize] = &[1];
     const SEED: u64 = 0x2545_f491_4f6c_dd1d;
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -142,7 +144,13 @@ mod real {
         let mut batch_fail = false;
         let mut singular_fail = false;
         for &vocab in VOCABS {
-            for &batch in BATCHES {
+            // Odd vocab → B=1 only; see BATCHES_ODD.
+            let batches: &[usize] = if vocab % 2 == 0 {
+                BATCHES_EVEN
+            } else {
+                BATCHES_ODD
+            };
+            for &batch in batches {
                 let mut rng = Rng::new(SEED ^ ((vocab as u64) << 20) ^ ((batch as u64) << 8));
                 let kinds = kinds_for(batch, vocab);
                 let mut rows_f32 = Vec::with_capacity(batch);
