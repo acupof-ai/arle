@@ -61,7 +61,7 @@ unit test vs ref · **—** = no gate.
 | `arle_fa3_fwd_hd256_bf16_cuda` (vendored FA3) | **HOT** H20 | **P** `fa3_hd256_shim_parity` (decode split-KV/PackGQA/combine + varlen prefill, #323) | GPU run pending |
 | `arle_fa3_fwd_hd256_quant_cuda` (FP8/INT8 paged split-KV) | HOT under quant pool | **P** same `fa3_hd256_shim_parity` (production 1-byte FP8/INT8 pools, incl qlen 256/kv 65537, #323) | GPU run pending |
 | `paged_attention_v1` TileLang AOT (25-row resolve) | HOT sm80 / fallback on H20 | **—** (no test/example launches any AOT paged row) | AOT table has hd256 (q8/16/24 kv1/2/4) + one hd64 row, no hd128 — investigated 2026-09-11: hd128 is unreachable in serving (all CUDA targets hd256; see geometry-mismatch note), no row needed |
-| `arle_fa2_sm70_attention_cuda` | COLD (V100) | **U** (`fa2_sm70_matches_host_reference`, dense seq4 q2/kv1 hd256) | tiny dense only; no paged/decode-batch |
+| `arle_fa2_sm70_attention_cuda` | COLD (V100) | **P** (`fa2_sm70_parity.rs`, pending-remote V100) | reachable only via the MTP spec head's contiguous-cache forward; see sm70 note below |
 | FlashMLA sparse decode/prefill shims (`arle_flashmla_sm90_sparse_{decode,prefill}_fwd`, `get_meta`,`sched_meta`) | **HOT** DSv4 | **P** `flashmla_sparse_decode_parity` (CSA, #320) + `flashmla_hca_decode_parity` (HCA, #324), B=8/boundary positions vs host | GPU run pending |
 | FlashMLA CSA/HCA chain-verify build_indices, csa_pack_kv | WARM DSv4 | **—** direct; E2E | prefill chain-verify path not in the sparse-decode gates |
 | CP ring (`ring_block_fwd_merge{,_fa3}`, `ring_prefill_*`, `cross_cp_merge`) | COLD (attn_cp≥2) | **U+P** (`device_ring_two_blocks…_gqa_hd128`, q4/kv2; host softmax) + multi-GPU train transport examples | best-covered attention family; CP production heads not the tiny test shape |
@@ -120,10 +120,11 @@ yet (header status).
 | 8 | FP8 paged-KV quantize | HOT under the production FP8 dtype | GPU unit `fp8_paged_kv_quantize_roundtrip_discontinuous_pages` in `crates/cuda-kernels/src/ffi/gemm_tests.rs` (e4m3 over discontinuous pages) | #310. INT8 keeps its older round-trip in the same file. |
 | 9 | DSpark draft attention + DSA indexer family | the Qwen3.8 drafter | DSA indexer + DSv4-Flash draft attention: `crates/infer-cuda/examples/dspark_dsa_parity.rs` (#313); the Qwen3.8 ring-varlen drafter attention, single + c≥2 batched: `crates/infer-cuda/examples/dspark_draft_attn_parity.rs` (#331) | #313, #331 |
 | 10 | DSpark sampling accept/filter/draft kernels | WARM spec decode | `crates/infer-cuda/examples/dspark_sampler_parity.rs` (filter/sample/chain-accept vs f64) | #312 |
+| 11 | FA2 sm70 (`arle_fa2_sm70_attention_cuda`, V100 sm<80) | MTP spec-head contiguous-cache attention (NOT regular serving decode; see geometry note) | `crates/infer-cuda/examples/fa2_sm70_parity.rs` (GQA 8/2 + 24/4 hd256, hd128 contract, B=1/B=8, decode + causal chunked prefill off 16/64 tiles, kv 4096; f64 SDPA, per-family negative control) | #336. GPU run pending V100. |
 
 ### Geometry mismatches (gate exists, production shape in question)
 
-Status per item; two remain **Open**.
+Status per item; one remains **Open**.
 
 - **attn_tp≥2 GDN — closed in code, GPU run pending.** Chunked FlashQLA is now
   selected at every supported shard: (8,24) attn_tp=2 and (4,12) attn_tp=4
@@ -145,9 +146,7 @@ Status per item; two remain **Open**.
   arguments, not a model fixture. The sm80-89 1-byte fallback for every
   reachable config is gated by
   `crates/infer-cuda/examples/paged_quant_attn_parity.rs` (#330).
-- **FA2 sm70 gate — Open.** The host gate is dense seq4/q2-kv1/hd256 only
-  (`fa2_sm70_matches_host_reference`); production V100 paged decode and larger
-  batches remain uncovered. Tracked as the last audit gap for that backend.
+- **FA2 sm70 gate — Gated (GPU run pending, V100).** The dense seq4/q2-kv1/hd256 host gate (`fa2_sm70_matches_host_reference`) is superseded by `crates/infer-cuda/examples/fa2_sm70_parity.rs` (#336). Reachability, full-tree: the kernel is contiguous-cache only (grid `(q_heads, ceil(seq/16))`, no batch or page-table axis) and its only callers are the MTP spec head's `full_attention_into` — single `qwen35_spec.rs:77` and the B>1 per-row loop `:316` (decoder qwen35_attention.rs:201 decode / :281 prefill). Regular serving prefill/decode uses `full_attention_paged`, whose sm<80 fallback is `paged_attention_v1_raw` (qwen35_attention.rs:961), so there is no paged sm70 shape and no non-identity page table to gate. The example covers GQA 8/2 and 24/4 at hd256 plus the non-production hd128 contract, B=1/B=8, decode and causal chunked prefill off the 16/64 tiles through kv_len 4096.
 - **DSv4 TP/EP sharding o-projection — Open.** `dsv4_parity` runs TP=8 but
   gates only the first prefill token; the decode-band TP Q-repack is bit-exact
   gated at TP=2/4/8 by `crates/infer-cuda/examples/dsv4_decode_moe_parity.rs`,
