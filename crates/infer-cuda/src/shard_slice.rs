@@ -9,7 +9,7 @@ use anyhow::{Result, ensure};
 use infer_topo::ShardingSpec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardedBytes {
+pub(crate) struct ShardedBytes {
     pub bytes: Vec<u8>,
     pub rows: usize,
     pub cols: usize,
@@ -21,7 +21,7 @@ pub struct ShardedBytes {
 /// # Errors
 /// Errors if `spec.total != rows`, the shard range exceeds `rows`, or the byte
 /// buffer length is inconsistent with `rows * cols * elem_size`.
-pub fn shard_column_parallel(
+pub(crate) fn shard_column_parallel(
     bytes: &[u8],
     rows: usize,
     cols: usize,
@@ -55,7 +55,7 @@ pub fn shard_column_parallel(
 /// # Errors
 /// Errors if `spec.total != cols`, the shard range exceeds `cols`, or the byte
 /// buffer length is inconsistent with `rows * cols * elem_size`.
-pub fn shard_row_parallel(
+pub(crate) fn shard_row_parallel(
     bytes: &[u8],
     rows: usize,
     cols: usize,
@@ -97,7 +97,7 @@ pub fn shard_row_parallel(
 /// the fused output dim would cut across the block boundaries, so each block
 /// is sharded independently on whole-head boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeadBlock {
+pub(crate) struct HeadBlock {
     /// Number of whole heads in this block (must divide the TP world size).
     pub heads: usize,
     /// Rows contributed by each head (e.g. `key_head_dim`, or `2*head_dim` for
@@ -119,7 +119,7 @@ impl HeadBlock {
 /// Errors if any block's `heads` is not divisible by the world size, the block
 /// rows don't sum to the buffer's row count, or the buffer length is
 /// inconsistent with `rows * cols * elem_size`.
-pub fn shard_head_blocks_column_parallel(
+pub(crate) fn shard_head_blocks_column_parallel(
     bytes: &[u8],
     cols: usize,
     elem_size: usize,
@@ -167,7 +167,7 @@ pub fn shard_head_blocks_column_parallel(
 /// Errors if `expert_idx >= num_experts`, the row range exceeds
 /// `stacked_rows`, or the buffer length is inconsistent with
 /// `num_experts * stacked_rows * cols * elem_size`.
-pub fn slice_stacked_expert(
+pub(crate) fn slice_stacked_expert(
     bytes: &[u8],
     num_experts: usize,
     stacked_rows: usize,
