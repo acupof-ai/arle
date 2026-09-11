@@ -606,6 +606,10 @@ size_t mlx_array_nbytes(mlx_array* a) {
     MLX_TRY_RETURN_VALUE(0, to_arr(a)->nbytes());
 }
 
+int mlx_array_is_available(mlx_array* a) {
+    MLX_TRY_RETURN_VALUE(0, to_arr(a)->is_available() ? 1 : 0);
+}
+
 size_t mlx_array_export_bytes(mlx_array* a, void* out, size_t out_len) {
     MLX_TRY_RETURN_VALUE(0, [&]() -> size_t {
         if (a == nullptr) {

@@ -96,23 +96,30 @@ impl Backend for MetalBackend {
             DeviceHandle::Metal(handle) => {
                 let _guard = mlx_guard();
 
-                // Safety: the raw MLX array pointer is owned by `handle` for the
-                // duration of this borrow, the caller is responsible for having
-                // evaluated the array before readback, and the destination host
-                // buffer is freshly allocated for this copy.
+                // The trait-default device fallbacks (matmul_bt, slice write,
+                // accumulate, …) reach readback with lazy, never-evaluated
+                // nodes; `data<float>()` on an unrealized MLX array
+                // dereferences its null buffer. Realize when needed; skip the
+                // eval boundary for already-realized arrays (the batched
+                // pre-backward flush path) so eval_count accounting is
+                // unchanged.
+                // SAFETY: handle borrowed and live for the call; mlx_guard held.
                 let host = unsafe {
                     let array = handle.as_ptr();
-                    let size = mlx_array_size(array);
-                    let data_ptr = mlx_array_data_float32(array);
-                    if data_ptr.is_null() {
-                        return Err(AutogradError::TapeInvariant(
-                            "mlx_array_data_float32 returned null",
-                        ));
+                    if mlx_sys::mlx_array_is_available(array) == 0 {
+                        eval_and_readback(array)?
+                    } else {
+                        let size = mlx_array_size(array);
+                        let data_ptr = mlx_array_data_float32(array);
+                        if data_ptr.is_null() {
+                            return Err(AutogradError::TapeInvariant(
+                                "mlx_array_data_float32 returned null",
+                            ));
+                        }
+                        let mut out = vec![0.0f32; size];
+                        std::ptr::copy_nonoverlapping(data_ptr, out.as_mut_ptr(), size);
+                        out
                     }
-
-                    let mut out = vec![0.0f32; size];
-                    std::ptr::copy_nonoverlapping(data_ptr, out.as_mut_ptr(), size);
-                    out
                 };
 
                 Ok(host)

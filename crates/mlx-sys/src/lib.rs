@@ -73,6 +73,8 @@ unsafe extern "C" {
     pub fn mlx_array_data_int32(a: *mut mlx_array) -> *const i32;
     pub fn mlx_array_size(a: *mut mlx_array) -> usize;
     pub fn mlx_array_nbytes(a: *mut mlx_array) -> usize;
+    /// Nonzero once the array's data buffer is safe to read (MLX Status::available).
+    pub fn mlx_array_is_available(a: *mut mlx_array) -> i32;
     pub fn mlx_array_export_bytes(
         a: *mut mlx_array,
         out: *mut std::ffi::c_void,
