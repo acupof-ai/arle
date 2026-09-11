@@ -19,7 +19,7 @@ pub enum Device {
     Cuda,
 }
 
-pub type CausalSdpaHostGradTriplet = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
+pub(crate) type CausalSdpaHostGradTriplet = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
 
 pub use cuda_kernels::ring_attention::RingBlockDims;
 
@@ -35,7 +35,7 @@ pub struct CausalSdpaDeviceBackwardArgs<'a> {
     pub need_grad_v: bool,
 }
 
-pub type CausalSdpaDeviceGradTriplet = (
+pub(crate) type CausalSdpaDeviceGradTriplet = (
     Option<DeviceHandle>,
     Option<DeviceHandle>,
     Option<DeviceHandle>,
@@ -132,7 +132,7 @@ impl CudaStorage {
     /// sole owner, so an in-place mutation cannot corrupt a sibling that shares
     /// the same `Arc` (grads fan out by refcount clone, not deep copy — see
     /// `clone_tensor`). Used to gate in-place gradient accumulation.
-    pub(crate) fn strong_count(&self) -> usize {
+    fn strong_count(&self) -> usize {
         Arc::strong_count(&self.inner)
     }
 }
@@ -547,7 +547,7 @@ impl DeviceHandle {
     /// `clone_tensor`) so in-place would corrupt it. `None` for handles with no
     /// meaningful single-owner semantics here (CPU/Metal/bf16/fp8), which the
     /// caller treats as "not provably unique" → allocating fallback.
-    pub fn device_buffer_strong_count(&self) -> Option<usize> {
+    pub(crate) fn device_buffer_strong_count(&self) -> Option<usize> {
         match self {
             #[cfg(feature = "cuda")]
             DeviceHandle::Cuda(storage) => Some(storage.strong_count()),

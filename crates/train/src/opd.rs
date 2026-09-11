@@ -40,7 +40,7 @@ mod windowing;
 #[path = "opd/writeback.rs"]
 mod writeback;
 
-pub use critic::{ValueCritic, skip_obs_gae};
+pub use critic::ValueCritic;
 pub use rollout::student_rollout_only;
 pub use step::{OpdStepInputs, opd_step, opd_step_with_teacher};
 pub use writeback::{
@@ -215,7 +215,7 @@ fn record_profile(
     }
 }
 
-pub(crate) fn step_trace_enabled() -> bool {
+fn step_trace_enabled() -> bool {
     match std::env::var("ARLE_OPD_STEP_TRACE") {
         Ok(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
         Err(_) => false,

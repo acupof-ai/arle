@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn linear_attention_debug_timing_enabled() -> bool {
+fn linear_attention_debug_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
@@ -12,12 +12,12 @@ pub(super) fn linear_attention_debug_timing_enabled() -> bool {
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn linear_attention_debug_stage_start() -> Option<std::time::Instant> {
+fn linear_attention_debug_stage_start() -> Option<std::time::Instant> {
     linear_attention_debug_timing_enabled().then(std::time::Instant::now)
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn linear_attention_debug_stage_done(
+fn linear_attention_debug_stage_done(
     backend: &CudaBackend,
     label: &'static str,
     started: Option<std::time::Instant>,
@@ -42,12 +42,12 @@ pub(super) fn linear_attention_debug_stage_done(
 /// batch>1 rides per-row dispatch because the chunked kernels' chunk_state
 /// carries no batch stride.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_la_device_supported(p: LinearAttentionDeviceParams) -> bool {
+pub(crate) fn cuda_la_device_supported(p: LinearAttentionDeviceParams) -> bool {
     p.key_dim == 128 && p.value_dim == 128 && p.conv_kernel > 0 && p.conv_kernel <= 5 && p.batch > 0
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_linear_attention_forward_device(
+pub(crate) fn cuda_linear_attention_forward_device(
     backend: &CudaBackend,
     args: LinearAttentionDeviceForwardArgs<'_>,
 ) -> Result<Option<LinearAttentionDeviceForwardResult>> {
@@ -109,7 +109,7 @@ pub(super) fn cuda_linear_attention_forward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_linear_attention_boundary_device(
+pub(crate) fn cuda_linear_attention_boundary_device(
     backend: &CudaBackend,
     args: LinearAttentionDeviceBoundaryArgs<'_>,
 ) -> Result<Option<DeviceHandle>> {
@@ -151,7 +151,7 @@ pub(super) fn cuda_linear_attention_boundary_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_linear_attention_boundary_device_row(
+fn cuda_linear_attention_boundary_device_row(
     backend: &CudaBackend,
     args: LinearAttentionDeviceBoundaryArgs<'_>,
 ) -> Result<DeviceHandle> {
@@ -302,7 +302,7 @@ pub(super) fn cuda_linear_attention_boundary_device_row(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_linear_attention_forward_device_row(
+fn cuda_linear_attention_forward_device_row(
     backend: &CudaBackend,
     args: LinearAttentionDeviceForwardArgs<'_>,
 ) -> Result<LinearAttentionDeviceForwardResult> {

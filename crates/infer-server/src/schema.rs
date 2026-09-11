@@ -228,7 +228,7 @@ impl CompletionRequest {
     }
 
     #[must_use]
-    pub fn sampling_params(&self) -> SamplingParams {
+    pub(crate) fn sampling_params(&self) -> SamplingParams {
         sampling_params(
             self.max_tokens,
             self.temperature,
@@ -345,7 +345,7 @@ impl ChatCompletionRequest {
     }
 
     #[must_use]
-    pub fn sampling_params(&self) -> SamplingParams {
+    pub(crate) fn sampling_params(&self) -> SamplingParams {
         sampling_params(
             self.max_tokens,
             self.temperature,
@@ -385,7 +385,7 @@ impl ChatCompletionRequest {
     /// Absent or anything but `"none"` maps to `Auto`; only `"none"` suppresses
     /// tool emission (tool-forcing wire values are accepted but not wired to
     /// the renderer).
-    pub(crate) fn tool_choice_mode(&self) -> chat::ToolChoiceMode {
+    fn tool_choice_mode(&self) -> chat::ToolChoiceMode {
         use chat::ToolChoiceMode;
         match self.tool_choice.as_ref() {
             Some(serde_json::Value::String(choice)) if choice == "none" => ToolChoiceMode::None,
@@ -470,7 +470,7 @@ impl ChatContent {
     }
 
     #[must_use]
-    pub(crate) fn to_template_value(&self) -> serde_json::Value {
+    fn to_template_value(&self) -> serde_json::Value {
         match self {
             Self::Text(text) => serde_json::Value::String(text.clone()),
             Self::Parts(parts) => serde_json::Value::Array(
@@ -563,7 +563,7 @@ fn validate_common(
 
 /// Cap on requested logprobs alternatives (OpenAI allows up to 5 on
 /// completions / 20 on chat; the capture is host-side O(vocab·n) per token).
-pub(crate) const MAX_LOGPROBS: u32 = 8;
+const MAX_LOGPROBS: u32 = 8;
 
 #[allow(clippy::too_many_arguments)]
 fn sampling_params(
@@ -612,7 +612,7 @@ fn sampling_params(
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CompletionResponse {
+pub(crate) struct CompletionResponse {
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -659,13 +659,13 @@ impl CompletionResponse {
 /// `GET /v1/models` response — the OpenAI model-list shape. The server serves a
 /// single loaded model, so `data` always has one card.
 #[derive(Debug, Clone, Serialize)]
-pub struct ModelsResponse {
+pub(crate) struct ModelsResponse {
     pub object: &'static str,
     pub data: Vec<ModelCard>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ModelCard {
+pub(crate) struct ModelCard {
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -845,7 +845,7 @@ impl StatsResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SchedulerStats {
+pub(crate) struct SchedulerStats {
     pub active_requests: usize,
     pub queue_depth: usize,
     pub kv_free_pages: usize,
@@ -854,7 +854,7 @@ pub struct SchedulerStats {
 /// Engine throughput counters (monotonic since engine start), for QPS/TPS
 /// computation by polling clients.
 #[derive(Debug, Clone, Serialize)]
-pub struct ThroughputStatsResponse {
+pub(crate) struct ThroughputStatsResponse {
     pub steps: u64,
     pub prefill_tokens: u64,
     pub generated_tokens: u64,
@@ -892,7 +892,7 @@ pub struct StepPhaseStatsResponse {
 /// KV host-demoted counters. All zero until a backend with a tier
 /// store is configured (`available` keys off observed tier activity).
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct KvTierStatsResponse {
+pub(crate) struct KvTierStatsResponse {
     pub available: bool,
     pub demoted_pages: u64,
     pub promoted_pages: u64,
@@ -905,7 +905,7 @@ pub struct KvTierStatsResponse {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct KvSystemMetricsResponse {
+pub(crate) struct KvSystemMetricsResponse {
     pub resident_pages: usize,
     pub resident_evictable_pages: usize,
     pub host_demoted_pages: usize,
@@ -935,7 +935,7 @@ pub struct KvSystemMetricsResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct PrefixCacheStatsResponse {
+pub(crate) struct PrefixCacheStatsResponse {
     pub lookups: u64,
     pub hits: u64,
     pub hit_rate: Option<f64>,
@@ -948,7 +948,7 @@ pub struct PrefixCacheStatsResponse {
 /// Cumulative speculative-decode counters (MTP or DSpark). All zero (and
 /// `available: false`) until a verified draft chain commits.
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct SpecDecodeStatsResponse {
+pub(crate) struct SpecDecodeStatsResponse {
     pub available: bool,
     pub chains: u64,
     pub drafted: u64,
@@ -959,7 +959,7 @@ pub struct SpecDecodeStatsResponse {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct SsdRecallStats {
+pub(crate) struct SsdRecallStats {
     pub available: bool,
     pub lookups: u64,
     pub hits: u64,
@@ -976,7 +976,7 @@ fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CompletionChoice {
+pub(crate) struct CompletionChoice {
     pub text: String,
     pub index: usize,
     /// OpenAI completions logprobs object (`tokens` / `token_logprobs` /
@@ -993,7 +993,7 @@ pub struct CompletionChoice {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ChatCompletionResponse {
+pub(crate) struct ChatCompletionResponse {
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -1052,7 +1052,7 @@ impl ChatCompletionResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ChatChoice {
+pub(crate) struct ChatChoice {
     pub index: usize,
     pub message: AssistantMessage,
     /// OpenAI chat logprobs object (`content` entries), present when the
@@ -1062,7 +1062,7 @@ pub struct ChatChoice {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AssistantMessage {
+pub(crate) struct AssistantMessage {
     pub role: &'static str,
     pub content: String,
     /// Thinking-model reasoning lifted out of `content` (everything before
@@ -1077,7 +1077,7 @@ pub struct AssistantMessage {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ResponseToolCall {
+pub(crate) struct ResponseToolCall {
     pub id: String,
     #[serde(rename = "type")]
     pub call_type: &'static str,
@@ -1085,7 +1085,7 @@ pub struct ResponseToolCall {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ResponseFunctionCall {
+pub(crate) struct ResponseFunctionCall {
     pub name: String,
     /// JSON-encoded argument object (OpenAI wire shape is a string, not object).
     pub arguments: String,
@@ -1207,12 +1207,12 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct PromptTokensDetails {
+pub(crate) struct PromptTokensDetails {
     pub cached_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CompletionTokensDetails {
+pub(crate) struct CompletionTokensDetails {
     pub reasoning_tokens: usize,
 }
 

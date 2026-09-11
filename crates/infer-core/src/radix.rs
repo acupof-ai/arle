@@ -19,17 +19,17 @@ use std::collections::BTreeMap;
 use infer_seam::{PrefixBlock, ShardSpec, prefix_block_content_key};
 
 /// Host page id used as the prefix-cache block id.
-pub type BlockId = u32;
+pub(crate) type BlockId = u32;
 
 /// Matched-block marker for a block whose KV page lives on another CP shard.
 ///
 /// Never a real pool page id (`total_pages` is far below `u32::MAX`) and
 /// distinct from `infer_seam::EVICTED_PAGE`; every pool/backend touch filters
 /// it out first (see [`PrefixMatch::local_block_ids`]).
-pub const REPLICA_PAGE: BlockId = u32::MAX - 1;
+const REPLICA_PAGE: BlockId = u32::MAX - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrefixMatch {
+pub(crate) struct PrefixMatch {
     /// Number of prompt tokens covered by cached full blocks.
     pub matched_len: usize,
     /// Host page ids backing the matched prefix in prompt order.
@@ -57,7 +57,7 @@ impl PrefixMatch {
     /// attach (block `B` lives on shard `B % size`). An unsharded cache
     /// (`size <= 1`) returns the full list.
     #[must_use]
-    pub fn local_block_ids(&self, shard: ShardSpec) -> Vec<BlockId> {
+    pub(crate) fn local_block_ids(&self, shard: ShardSpec) -> Vec<BlockId> {
         if shard.size <= 1 {
             return self.block_ids.clone();
         }
@@ -75,7 +75,7 @@ impl PrefixMatch {
 /// Used only by the tier-enabled engine path; the resident-only
 /// [`PrefixMatch`] surface is unchanged for backends without a tier store.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TieredPrefixMatch {
+pub(crate) struct TieredPrefixMatch {
     /// Matched blocks in prompt order (resident and demoted interleaved).
     pub blocks: Vec<PrefixBlock>,
 }
@@ -181,14 +181,14 @@ impl RadixCache {
     /// (idempotent — the same coordinates on every call). `size <= 1` keeps
     /// the cache rank-local. Must be called before the first publish under
     /// 2D, so a block's owning shard is known while the tree grows.
-    pub fn set_cp_shard(&mut self, shard: ShardSpec) {
+    pub(crate) fn set_cp_shard(&mut self, shard: ShardSpec) {
         if self.cp_shard != shard {
             self.cp_shard = shard;
         }
     }
 
     #[must_use]
-    pub fn cp_shard(&self) -> ShardSpec {
+    pub(crate) fn cp_shard(&self) -> ShardSpec {
         self.cp_shard
     }
 
@@ -198,22 +198,22 @@ impl RadixCache {
     }
 
     #[must_use]
-    pub fn cached_page_count(&self) -> usize {
+    pub(crate) fn cached_page_count(&self) -> usize {
         self.page_to_node.len()
     }
 
     #[must_use]
-    pub fn demoted_block_count(&self) -> usize {
+    pub(crate) fn demoted_block_count(&self) -> usize {
         self.tier_to_node.len()
     }
 
     /// Drain the tier keys invalidated since the last call (severed or revived
     /// demoted nodes). The caller forwards them to the backend tier store.
-    pub fn take_dropped_tier_keys(&mut self) -> Vec<u64> {
+    pub(crate) fn take_dropped_tier_keys(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.dropped_tier_keys)
     }
 
-    pub fn longest_prefix_match(&mut self, tokens: &[u32]) -> PrefixMatch {
+    pub(crate) fn longest_prefix_match(&mut self, tokens: &[u32]) -> PrefixMatch {
         let matched = self.match_inner(tokens);
         if !matched.block_ids.is_empty() {
             for page_id in &matched.block_ids {
@@ -227,7 +227,7 @@ impl RadixCache {
     }
 
     #[must_use]
-    pub fn peek_longest_prefix_match(&self, tokens: &[u32]) -> PrefixMatch {
+    pub(crate) fn peek_longest_prefix_match(&self, tokens: &[u32]) -> PrefixMatch {
         self.match_inner(tokens)
     }
 
@@ -264,7 +264,7 @@ impl RadixCache {
     /// demoted nodes (contents in the backend host tier) so the engine can
     /// promote them into fresh pages instead of re-prefilling. Only used by
     /// the tier-enabled engine path.
-    pub fn tiered_longest_prefix_match(&mut self, tokens: &[u32]) -> TieredPrefixMatch {
+    pub(crate) fn tiered_longest_prefix_match(&mut self, tokens: &[u32]) -> TieredPrefixMatch {
         let mut node_idx = 0usize;
         let mut blocks = Vec::new();
         for block in tokens.chunks_exact(self.block_size) {
@@ -291,7 +291,7 @@ impl RadixCache {
     /// backend tier key its contents now live under. The node stays linked and
     /// matchable. Returns `false` (no state change) if `page` is not an
     /// idle cached block.
-    pub fn demote_block(&mut self, page: BlockId, tier_key: u64) -> bool {
+    pub(crate) fn demote_block(&mut self, page: BlockId, tier_key: u64) -> bool {
         let Some(&node_idx) = self.page_to_node.get(&page) else {
             return false;
         };
@@ -312,7 +312,7 @@ impl RadixCache {
     /// Restore a demoted block to device residency under a freshly promoted
     /// page. The tier key is consumed (the caller drops the store entry via
     /// the dropped-keys drain). Returns `false` if the key is unknown.
-    pub fn promote_block(&mut self, tier_key: u64, page: BlockId) -> bool {
+    pub(crate) fn promote_block(&mut self, tier_key: u64, page: BlockId) -> bool {
         let Some(&node_idx) = self.tier_to_node.get(&tier_key) else {
             return false;
         };
@@ -334,7 +334,7 @@ impl RadixCache {
     /// its parent as a new frontier node, so callers that need more pages should
     /// re-query after each accepted batch.
     #[must_use]
-    pub fn lru_evictable_pages(&self, limit: usize) -> Vec<BlockId> {
+    pub(crate) fn lru_evictable_pages(&self, limit: usize) -> Vec<BlockId> {
         if limit == 0 {
             return Vec::new();
         }
@@ -352,7 +352,7 @@ impl RadixCache {
     /// Peek the tier key of the least-recently-used demoted block whose
     /// subtree holds no resident pages (safe to sever for tier-store room).
     #[must_use]
-    pub fn lru_demoted_key(&self) -> Option<u64> {
+    pub(crate) fn lru_demoted_key(&self) -> Option<u64> {
         self.tier_to_node
             .iter()
             .map(|(&key, &idx)| (key, idx))
@@ -364,7 +364,7 @@ impl RadixCache {
     /// Sever a demoted block (and its demoted-only subtree) from the cache,
     /// pushing all invalidated tier keys to the dropped-keys drain. Returns
     /// `false` if the key is unknown or the subtree still holds resident pages.
-    pub fn drop_demoted(&mut self, tier_key: u64) -> bool {
+    pub(crate) fn drop_demoted(&mut self, tier_key: u64) -> bool {
         let Some(&node_idx) = self.tier_to_node.get(&tier_key) else {
             return false;
         };
@@ -378,7 +378,7 @@ impl RadixCache {
     /// Sever an idle resident block selected by page id, exactly like one
     /// `evict_lru` step. Demoted descendants are dropped via the tier-key
     /// drain. Returns `false` if `page` is not an idle cached block.
-    pub fn evict_page(&mut self, page: BlockId) -> bool {
+    pub(crate) fn evict_page(&mut self, page: BlockId) -> bool {
         let Some(&node_idx) = self.page_to_node.get(&page) else {
             return false;
         };
@@ -442,7 +442,7 @@ impl RadixCache {
     /// matching blocks are left in place and are not returned, so callers can
     /// retain only newly published pages. Replica nodes never enter
     /// `page_to_node` and never pin eviction.
-    pub fn insert_replicated(
+    pub(crate) fn insert_replicated(
         &mut self,
         tokens: &[u32],
         page_of: &dyn Fn(usize) -> Option<BlockId>,
@@ -511,7 +511,7 @@ impl RadixCache {
     }
 
     #[must_use]
-    pub fn content_key_of_page(&self, page: BlockId) -> Option<u64> {
+    pub(crate) fn content_key_of_page(&self, page: BlockId) -> Option<u64> {
         self.page_to_node
             .get(&page)
             .map(|&idx| self.nodes[idx].content_key)
@@ -521,7 +521,7 @@ impl RadixCache {
     /// process demoted it). Every earlier block of `tokens` must already be a
     /// node; the last block becomes a demoted node under `tier_key`, or is left
     /// alone when it is already resident or demoted.
-    pub fn adopt_demoted_block(&mut self, tokens: &[u32], tier_key: u64) -> bool {
+    pub(crate) fn adopt_demoted_block(&mut self, tokens: &[u32], tier_key: u64) -> bool {
         let blocks: Vec<&[u32]> = tokens.chunks_exact(self.block_size).collect();
         let Some((last, path)) = blocks.split_last() else {
             return false;
@@ -563,7 +563,7 @@ impl RadixCache {
         }
     }
 
-    pub fn retain_blocks(&mut self, pages: &[BlockId]) {
+    pub(crate) fn retain_blocks(&mut self, pages: &[BlockId]) {
         for page_id in pages {
             if let Some(&node_idx) = self.page_to_node.get(page_id) {
                 self.nodes[node_idx].ref_count = self.nodes[node_idx].ref_count.saturating_add(1);
@@ -573,7 +573,7 @@ impl RadixCache {
         }
     }
 
-    pub fn release_blocks(&mut self, pages: &[BlockId]) {
+    pub(crate) fn release_blocks(&mut self, pages: &[BlockId]) {
         for page_id in pages {
             if let Some(&node_idx) = self.page_to_node.get(page_id) {
                 self.nodes[node_idx].ref_count = self.nodes[node_idx].ref_count.saturating_sub(1);
@@ -588,7 +588,7 @@ impl RadixCache {
     /// Blocks with a nonzero active ref are never returned. Demoted-only
     /// subtrees under an evicted block are severed with it (their tier keys
     /// land in the dropped-keys drain).
-    pub fn evict_lru(&mut self, n_pages_needed: usize) -> Vec<BlockId> {
+    pub(crate) fn evict_lru(&mut self, n_pages_needed: usize) -> Vec<BlockId> {
         let mut evicted = Vec::new();
         while evicted.len() < n_pages_needed {
             let Some(node_idx) = self.least_recent_evictable_leaf() else {

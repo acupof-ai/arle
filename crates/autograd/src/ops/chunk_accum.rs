@@ -27,7 +27,7 @@ fn sole_owned_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHand
     Ok(handle.clone())
 }
 
-pub struct SeqAccum {
+pub(crate) struct SeqAccum {
     id: TensorId,
     shape: Vec<usize>,
     row_axis: usize,

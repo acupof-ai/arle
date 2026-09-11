@@ -2,7 +2,7 @@ use super::*;
 
 /// Applies the model-agnostic `TpContext` (`crate::tensor_parallel`) to this
 /// model's dimensions; only `Qwen35Config`-reading shard sizes live here.
-pub(super) trait Qwen35TpDims {
+pub(crate) trait Qwen35TpDims {
     fn validate(self, cfg: &Qwen35Config) -> Result<()>;
     fn local_attention_heads(self, cfg: &Qwen35Config) -> Result<usize>;
     fn local_key_value_heads(self, cfg: &Qwen35Config) -> Result<usize>;

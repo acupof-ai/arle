@@ -270,7 +270,7 @@ pub fn serve_http(
 }
 
 /// Multi-group DP variant: one relay per TP group, routed by a
-/// least-in-flight [`infer_server::DpCoordinator`].
+/// least-in-flight DP coordinator.
 #[cfg(feature = "cuda")]
 pub fn serve_coordinator_http_dp(
     model_path: &str,
@@ -293,7 +293,7 @@ pub fn serve_coordinator_http_dp(
     bind_and_serve(bind, port, router, model_path, shutdown)
 }
 
-pub fn bind_and_serve(
+fn bind_and_serve(
     bind: &str,
     port: u16,
     router: axum::Router,

@@ -95,7 +95,7 @@ impl W2sAuxModel {
 
     /// Pre-RL model parameter IDs (in-process only; infer teachers have no
     /// train-store params).
-    pub fn pre_rl_param_ids(&self) -> Vec<TensorId> {
+    fn pre_rl_param_ids(&self) -> Vec<TensorId> {
         match self {
             Self::InProcess { pre_rl, .. } => pre_rl.all_parameter_ids(),
             #[cfg(feature = "cuda")]
@@ -103,7 +103,7 @@ impl W2sAuxModel {
         }
     }
 
-    pub fn post_rl_param_ids(&self) -> Vec<TensorId> {
+    fn post_rl_param_ids(&self) -> Vec<TensorId> {
         match self {
             Self::InProcess { post_rl, .. } => post_rl.all_parameter_ids(),
             #[cfg(feature = "cuda")]
@@ -118,7 +118,7 @@ impl W2sAuxModel {
     /// difference to logits mixes coordinate systems and distorts the
     /// softmax. Both forwards run with the tape disabled — the aux models
     /// supply a constant distillation signal; no gradient flows into them.
-    pub fn forward_delta(
+    fn forward_delta(
         &self,
         input_ids: &[u32],
         positions: &[u32],

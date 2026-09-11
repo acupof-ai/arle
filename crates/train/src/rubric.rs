@@ -62,7 +62,7 @@ pub struct Verdict {
 
 impl Verdict {
     /// Never accepted — a judge timeout/garbage is neither a pass nor a fail-class.
-    pub fn parse_error() -> Self {
+    pub(crate) fn parse_error() -> Self {
         Self {
             passed: Vec::new(),
             accepted: false,
@@ -72,7 +72,7 @@ impl Verdict {
 }
 
 impl Rubric {
-    pub fn judge_prompt(&self, problem: &str, rollout: &str) -> String {
+    pub(crate) fn judge_prompt(&self, problem: &str, rollout: &str) -> String {
         let criteria = self
             .criteria
             .iter()
@@ -99,7 +99,7 @@ impl Rubric {
         )
     }
 
-    pub fn solve_prompt(&self, problem: &str) -> String {
+    pub(crate) fn solve_prompt(&self, problem: &str) -> String {
         let requirements = self
             .criteria
             .iter()
@@ -114,7 +114,7 @@ impl Rubric {
         )
     }
 
-    pub fn parse_verdict(&self, judge_output: &str) -> Verdict {
+    pub(crate) fn parse_verdict(&self, judge_output: &str) -> Verdict {
         let reject = Verdict {
             passed: Vec::new(),
             accepted: false,
@@ -300,7 +300,7 @@ fn unwrap_text_macro(s: &str) -> String {
     out
 }
 
-pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
+pub(crate) fn select_by_self_consistency(rollouts: &[String]) -> Selection {
     let answers: Vec<Option<String>> = rollouts
         .iter()
         .map(|r| {
@@ -388,53 +388,18 @@ pub fn bfcl_agentic_rubric() -> Rubric {
     }
 }
 
-/// Induces a prompt-specific rubric by contrasting teacher (strong) and
-/// student (weak) sample solutions. The judge generates the rubric; the
-/// caller parses it with [`Rubricator::parse_induction`].
-pub struct Rubricator;
+/// Test-only parser for judge-induced rubrics; induction prompts are not
+/// emitted by the training binary.
+#[cfg(test)]
+struct Rubricator;
 
+#[cfg(test)]
 impl Rubricator {
-    /// Render the rubric-induction prompt. `teacher_samples` are strong
-    /// solutions (the rubric should capture what makes them correct);
-    /// `student_samples` are weaker rollouts (the rubric should distinguish
-    /// them from the teacher).
-    #[must_use]
-    pub fn induce_prompt(
-        problem: &str,
-        teacher_samples: &[String],
-        student_samples: &[String],
-    ) -> String {
-        let teacher = teacher_samples
-            .iter()
-            .enumerate()
-            .map(|(i, s)| format!("### Teacher sample {}\n{s}\n", i + 1))
-            .collect::<String>();
-        let student = student_samples
-            .iter()
-            .enumerate()
-            .map(|(i, s)| format!("### Student sample {}\n{s}\n", i + 1))
-            .collect::<String>();
-        format!(
-            "You are a rubric designer. Given a PROBLEM and contrasting solution samples \
-             (teacher = strong, student = weaker), induce a grading rubric that separates \
-             the teacher solutions from the student ones.\n\n\
-             PROBLEM:\n{problem}\n\n\
-             TEACHER SAMPLES (strong):\n{teacher}\n\
-             STUDENT SAMPLES (weaker):\n{student}\n\
-             Design 2-4 criteria. Each criterion has a short snake_case key, a one-sentence \
-             description, and a kind: \"factual\" (correctness — ALL factual criteria must pass \
-             for acceptance) or \"process\" (quality — logged but not gating).\n\n\
-             On the FINAL line output ONLY a JSON object:\n\
-             {{\"task\": \"<short task name>\", \"criteria\": [{{\"key\": \"...\", \
-             \"description\": \"...\", \"kind\": \"factual\"|\"process\"}}]}}\n"
-        )
-    }
-
     /// Parse a rubric-induction judge output. Returns `None` on parse failure
     /// (never a partial rubric — a malformed induction is a retry, not a
     /// silent default).
     #[must_use]
-    pub fn parse_induction(output: &str) -> Option<Rubric> {
+    fn parse_induction(output: &str) -> Option<Rubric> {
         let obj = last_json_object(output)?;
         let value: serde_json::Value = serde_json::from_str(&obj).ok()?;
         let task = value.get("task")?.as_str()?.to_string();

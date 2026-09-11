@@ -7,7 +7,7 @@ use super::*;
 // contiguous already match its head-major cache view (`max_seq_len = kv`).
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_causal_sdpa_prefill_device(
+pub(crate) fn cuda_causal_sdpa_prefill_device(
     backend: &CudaBackend,
     q: &DeviceHandle,
     q_shape: &[usize],
@@ -88,7 +88,7 @@ pub(super) fn cuda_causal_sdpa_prefill_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_causal_sdpa_recompute_backward_device(
+pub(crate) fn cuda_causal_sdpa_recompute_backward_device(
     backend: &CudaBackend,
     args: CausalSdpaDeviceBackwardArgs<'_>,
 ) -> Result<CausalSdpaDeviceGradTriplet> {

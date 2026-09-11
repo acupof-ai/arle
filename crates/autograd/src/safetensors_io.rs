@@ -40,16 +40,16 @@ impl SafetensorsRegistry {
         self.map.keys().map(String::as_str)
     }
 
-    pub fn load_into(&mut self, store: &mut TensorStore, path: &Path) -> Result<()> {
-        self.load_into_impl(store, path, false)
-    }
-
-    /// Like [`load_into`], but fails if any tensor currently registered in
-    /// `self` is missing from the file — resume paths where a partial or
-    /// mismatched checkpoint must not silently hybridize with base-model
-    /// weights.
+    /// Fails if any tensor currently registered in `self` is missing from the
+    /// file — resume paths where a partial or mismatched checkpoint must not
+    /// silently hybridize with base-model weights.
     pub fn load_into_strict(&mut self, store: &mut TensorStore, path: &Path) -> Result<()> {
         self.load_into_impl(store, path, true)
+    }
+
+    #[cfg(test)]
+    fn load_into(&mut self, store: &mut TensorStore, path: &Path) -> Result<()> {
+        self.load_into_impl(store, path, false)
     }
 
     fn load_into_impl(&mut self, store: &mut TensorStore, path: &Path, strict: bool) -> Result<()> {
@@ -72,7 +72,7 @@ impl SafetensorsRegistry {
 
         // Strict mode: remember which registered names the file covered;
         // error on any missing after the loop. Unknown names still
-        // auto-register (same as non-strict).
+        // auto-register.
         let mut seen = if strict {
             Some(std::collections::HashSet::<String>::new())
         } else {

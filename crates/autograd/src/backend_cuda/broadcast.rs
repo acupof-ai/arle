@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_add_broadcast(
+pub(crate) fn cuda_add_broadcast(
     backend: &CudaBackend,
     a: &[f32],
     a_shape: &[usize],
@@ -93,7 +93,7 @@ pub(super) fn cuda_add_broadcast(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_add_broadcast_device(
+pub(crate) fn cuda_add_broadcast_device(
     backend: &CudaBackend,
     a: &DeviceHandle,
     a_shape: &[usize],
@@ -203,7 +203,7 @@ pub(super) fn cuda_add_broadcast_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_broadcast_expand_device(
+pub(crate) fn cuda_broadcast_expand_device(
     backend: &CudaBackend,
     src: &DeviceHandle,
     src_shape: &[usize],
@@ -303,7 +303,7 @@ pub(super) fn cuda_broadcast_expand_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_add_broadcast_backward_device(
+pub(crate) fn cuda_add_broadcast_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     a_shape: &[usize],

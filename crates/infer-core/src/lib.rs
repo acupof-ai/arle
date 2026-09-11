@@ -103,7 +103,7 @@ impl Default for SchedulerConfig {
 pub struct GrammarHook(pub std::sync::Arc<GrammarFn>);
 
 /// Committed token in, next-step bitmask out.
-pub type GrammarFn = dyn Fn(Option<u32>) -> Option<std::sync::Arc<[u32]>> + Send + Sync;
+type GrammarFn = dyn Fn(Option<u32>) -> Option<std::sync::Arc<[u32]>> + Send + Sync;
 
 impl std::fmt::Debug for GrammarHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -564,7 +564,7 @@ pub struct Engine {
 
 /// Per-token observer: invoked with `(handle, &token)` as each token is committed
 /// to its request. The seam a serving layer installs to stream tokens live.
-pub type TokenObserver = Box<dyn FnMut(RequestHandle, &SlotToken)>;
+type TokenObserver = Box<dyn FnMut(RequestHandle, &SlotToken)>;
 
 impl Engine {
     /// Create an engine with explicit scheduler config.

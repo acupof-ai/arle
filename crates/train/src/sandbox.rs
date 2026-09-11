@@ -245,7 +245,7 @@ fn git_in(workdir: &Path) -> Command {
     cmd
 }
 
-pub fn boot_workdir(
+pub(crate) fn boot_workdir(
     work_root: &Path,
     instance_id: &str,
     staged_tree: &Path,
@@ -414,14 +414,14 @@ pub fn assert_corpus_unreadable(paths: &[&Path], user: RolloutUser) -> Result<()
 
 /// Where the agent's HOME lives: beside the scored tree, never inside it, so
 /// CC's own config and history cannot read as an edit.
-pub fn agent_home(work_root: &Path, instance_id: &str) -> PathBuf {
+pub(crate) fn agent_home(work_root: &Path, instance_id: &str) -> PathBuf {
     work_root.join(".home").join(instance_id)
 }
 
 /// Drop a scored rollout's tree. A workdir that outlives its score is the next
 /// run's answer key: the 2026-08-23 agent diffed the previous run's copy of its
 /// own task to recover the fix.
-pub fn discard_workdir(work_root: &Path, instance_id: &str) {
+pub(crate) fn discard_workdir(work_root: &Path, instance_id: &str) {
     for dir in [
         work_root.join(instance_id),
         agent_home(work_root, instance_id),
@@ -434,7 +434,7 @@ pub fn discard_workdir(work_root: &Path, instance_id: &str) {
     }
 }
 
-pub fn diff_workdir(workdir: &Path) -> Result<String> {
+pub(crate) fn diff_workdir(workdir: &Path) -> Result<String> {
     let mut command = git_in(workdir);
     command.arg("diff");
     let output = plain_output(&mut command, "git diff")?;
@@ -477,7 +477,7 @@ pub(crate) fn workdir_pythonpath(workdir: &Path, extra: Option<&str>) -> String 
     parts.join(":")
 }
 
-pub fn score_workdir(
+pub(crate) fn score_workdir(
     workdir: &Path,
     test_patch: &str,
     fail_to_pass: &[String],
@@ -510,7 +510,7 @@ pub fn score_workdir(
 /// (base + test_patch, no agent edit). A pass means scoring would measure
 /// something other than the edit — a poisoned import path or a broken task.
 /// Runs on a throwaway copy so the agent's workdir stays untouched.
-pub fn control_arm_check(
+pub(crate) fn control_arm_check(
     workdir: &Path,
     test_patch: &str,
     fail_to_pass: &[String],

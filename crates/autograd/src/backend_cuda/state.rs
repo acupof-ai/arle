@@ -171,13 +171,14 @@ impl CudaBackend {
     /// # Errors
     /// Returns an error if the device attribute or version queries fail.
     #[cfg(not(feature = "no-cuda"))]
-    pub fn nvrtc_identity(&self) -> Result<NvrtcIdentity> {
+    pub(crate) fn nvrtc_identity(&self) -> Result<NvrtcIdentity> {
         self.kernels.nvrtc_identity(self.tape_dtype())
     }
 
     /// No-GPU stub — kernel identity is unavailable without a CUDA device.
     #[cfg(feature = "no-cuda")]
-    pub fn nvrtc_identity(&self) -> Result<NvrtcIdentity> {
+    #[allow(dead_code)]
+    pub(crate) fn nvrtc_identity(&self) -> Result<NvrtcIdentity> {
         todo!("GPU required: CudaBackend::nvrtc_identity is unavailable under feature no-cuda")
     }
 

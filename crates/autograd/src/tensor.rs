@@ -304,16 +304,6 @@ pub enum TapeDtype {
     Bf16,
 }
 
-impl TapeDtype {
-    /// NVRTC prelude injected ahead of the kernel sources to bind `T`.
-    pub fn nvrtc_prelude(self) -> &'static str {
-        match self {
-            TapeDtype::F32 => "using T = float;\n",
-            TapeDtype::Bf16 => "#include <cuda_bf16.h>\nusing T = __nv_bfloat16;\n",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct TensorStore {
     pub tensors: Vec<Option<Tensor>>,
@@ -872,7 +862,7 @@ impl TensorStore {
         Ok(freed)
     }
 
-    pub fn offload_checkpoint_to_host(&mut self, id: TensorId) -> Result<usize> {
+    pub(crate) fn offload_checkpoint_to_host(&mut self, id: TensorId) -> Result<usize> {
         let min_bytes = crate::runtime_flags::checkpoint_offload_min_bytes();
         let (size, bytes, handle) = {
             let tensor = self.tensor(id)?;
@@ -947,7 +937,7 @@ impl TensorStore {
     /// The slot becomes `Dirty::Host` with empty `data`, so any erroneous later
     /// access fails loud through the missing-data guards rather than reading
     /// stale memory. Returns bytes freed. No-op if already host-resident.
-    pub fn drop_device_residency(&mut self, id: TensorId) -> Result<usize> {
+    pub(crate) fn drop_device_residency(&mut self, id: TensorId) -> Result<usize> {
         self.discard_checkpoint_copy(id)?;
         let tensor = self.raw_tensor_mut(id)?;
         let freed = if tensor.device_handle.is_some() {
@@ -971,7 +961,7 @@ impl TensorStore {
 
     /// An op's output requires grad iff any input does. Freed inputs read as
     /// false, matching a checkpoint replay whose saved set is already reclaimed.
-    pub fn any_requires_grad(&self, ids: &[TensorId]) -> bool {
+    pub(crate) fn any_requires_grad(&self, ids: &[TensorId]) -> bool {
         ids.iter()
             .any(|&id| self.get(id).is_some_and(|tensor| tensor.requires_grad))
     }
@@ -1110,7 +1100,7 @@ impl TensorStore {
     /// owned clone. The host-residency version op-backward host fallbacks
     /// call instead of `tensor(x)?.clone()` — with the pre-backward host
     /// flush gone, host-only ops must be explicit about residency.
-    pub fn tensor_host(&mut self, id: TensorId) -> Result<Tensor> {
+    pub(crate) fn tensor_host(&mut self, id: TensorId) -> Result<Tensor> {
         self.ensure_host(id)?;
         Ok(self.tensor(id)?.clone())
     }

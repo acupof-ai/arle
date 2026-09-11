@@ -12,7 +12,7 @@ pub(super) fn check_cuda_ffi(status: CUresult, label: &'static str) -> Result<()
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) enum F32Operand<'a> {
+enum F32Operand<'a> {
     Borrowed(&'a CudaSlice<f32>),
     Imported(CudaSlice<f32>),
 }
@@ -28,7 +28,7 @@ impl F32Operand<'_> {
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) enum Bf16Operand<'a> {
+enum Bf16Operand<'a> {
     Borrowed(&'a CudaSlice<u16>),
     Quantized(CudaSlice<u16>),
 }
@@ -44,7 +44,7 @@ impl Bf16Operand<'_> {
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_row_len(len: usize, rows: usize) -> Result<usize> {
+fn cuda_row_len(len: usize, rows: usize) -> Result<usize> {
     if rows == 0 || !len.is_multiple_of(rows) {
         return Err(AutogradError::TapeInvariant(
             "linear_attention batched dispatch len not divisible by batch",
@@ -54,7 +54,7 @@ pub(super) fn cuda_row_len(len: usize, rows: usize) -> Result<usize> {
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_copy_range<T: DeviceRepr>(
+fn cuda_copy_range<T: DeviceRepr>(
     backend: &CudaBackend,
     src: &CudaSlice<T>,
     start: usize,
@@ -74,7 +74,7 @@ pub(super) fn cuda_copy_range<T: DeviceRepr>(
 /// does the outermost axis, so transpose `axis`→0, concat, transpose back
 /// (identity when axis==0). Used by `concat`.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_concat_axis(
+pub(crate) fn cuda_concat_axis(
     backend: &CudaBackend,
     parts: &[(&DeviceHandle, &[usize])],
     axis: usize,
@@ -95,7 +95,7 @@ pub(super) fn cuda_concat_axis(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_concat_parts<T: DeviceRepr>(
+fn cuda_concat_parts<T: DeviceRepr>(
     backend: &CudaBackend,
     parts: &[&CudaSlice<T>],
 ) -> Result<CudaSlice<T>> {
@@ -115,7 +115,7 @@ pub(super) fn cuda_concat_parts<T: DeviceRepr>(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_row_slice(
+pub(crate) fn cuda_row_slice(
     backend: &CudaBackend,
     src: &DeviceHandle,
     row: usize,
@@ -141,7 +141,7 @@ pub(super) fn cuda_row_slice(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_concat_rows(
+pub(crate) fn cuda_concat_rows(
     backend: &CudaBackend,
     rows: &[&DeviceHandle],
 ) -> Result<DeviceHandle> {
@@ -169,7 +169,7 @@ pub(super) fn cuda_concat_rows(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_readback_slice(
+pub(crate) fn cuda_readback_slice(
     backend: &CudaBackend,
     slice: &CudaSlice<f32>,
     len: usize,
@@ -214,7 +214,7 @@ pub(super) fn shape_size(shape: &[usize]) -> usize {
 /// pages that pending frees and a trim can return, which a fresh size class
 /// needs (observed: 1.6 GB transpose OOM at 131,072 with a reclaimable hoard).
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn alloc_zeros_retry<T>(
+pub(crate) fn alloc_zeros_retry<T>(
     backend: &CudaBackend,
     n: usize,
 ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::DriverError>
@@ -232,7 +232,7 @@ where
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_alloc_failed(op: &'static str, shape: Vec<usize>) -> AutogradError {
+pub(crate) fn cuda_alloc_failed(op: &'static str, shape: Vec<usize>) -> AutogradError {
     let bytes = shape_size(&shape).saturating_mul(std::mem::size_of::<f32>());
     AutogradError::CudaAllocFailed { op, shape, bytes }
 }
@@ -240,7 +240,7 @@ pub(super) fn cuda_alloc_failed(op: &'static str, shape: Vec<usize>) -> Autograd
 // Alloc failure: report driver code + live free/total to tell fragmentation
 // from a sticky async fault (fails with GB free).
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_alloc_failed_rich(
+pub(crate) fn cuda_alloc_failed_rich(
     backend: &CudaBackend,
     op: &'static str,
     bytes: usize,
@@ -253,12 +253,12 @@ pub(super) fn cuda_alloc_failed_rich(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn leak_err(msg: String) -> AutogradError {
+pub(crate) fn leak_err(msg: String) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(msg.into_boxed_str()))
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_download(
+pub(crate) fn cuda_download(
     backend: &CudaBackend,
     d_out: &cudarc::driver::CudaSlice<f32>,
     len: usize,
@@ -278,7 +278,7 @@ pub(super) fn cuda_download(
 impl CudaBackend {
     #[cfg(not(feature = "no-cuda"))]
     #[track_caller]
-    pub(super) fn upload_slice(&self, host: &[f32], shape: &[usize]) -> Result<CudaSlice<f32>> {
+    pub(crate) fn upload_slice(&self, host: &[f32], shape: &[usize]) -> Result<CudaSlice<f32>> {
         let size = shape_size(shape);
         if host.len() != size {
             return Err(AutogradError::DataLengthMismatch {
@@ -317,7 +317,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn cuda_storage_slice<'a>(
+    pub(crate) fn cuda_storage_slice<'a>(
         &self,
         storage: &'a CudaStorage,
     ) -> Result<&'a CudaSlice<f32>> {
@@ -334,7 +334,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn upload_bf16_bits_slice(
+    pub(crate) fn upload_bf16_bits_slice(
         &self,
         host: &[u16],
         shape: &[usize],
@@ -362,7 +362,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn cuda_bf16_storage_slice<'a>(
+    pub(crate) fn cuda_bf16_storage_slice<'a>(
         &self,
         storage: &'a CudaBf16Storage,
     ) -> Result<&'a CudaSlice<u16>> {
@@ -376,11 +376,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn upload_fp8_bytes_slice(
-        &self,
-        host: &[u8],
-        shape: &[usize],
-    ) -> Result<CudaSlice<u8>> {
+    fn upload_fp8_bytes_slice(&self, host: &[u8], shape: &[usize]) -> Result<CudaSlice<u8>> {
         let size = shape_size(shape);
         if host.len() != size {
             return Err(AutogradError::DataLengthMismatch {
@@ -404,7 +400,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn cuda_fp8_block_scaled_storage<'a>(
+    pub(crate) fn cuda_fp8_block_scaled_storage<'a>(
         &self,
         storage: &'a CudaFp8BlockScaledStorage,
     ) -> Result<Fp8BlockScaledView<'a>> {
@@ -426,7 +422,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn copy_bf16_device_ptr_to_local(
+    pub(crate) fn copy_bf16_device_ptr_to_local(
         &self,
         src_device_ptr: u64,
         src_stream: u64,
@@ -529,7 +525,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn f32_prefix(&self, buf: CudaSlice<f32>, len: usize) -> Result<CudaSlice<f32>> {
+    pub(crate) fn f32_prefix(&self, buf: CudaSlice<f32>, len: usize) -> Result<CudaSlice<f32>> {
         if buf.len() == len {
             return Ok(buf);
         }
@@ -544,7 +540,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn import_local_bf16_as_f32(
+    pub(crate) fn import_local_bf16_as_f32(
         &self,
         staging: &CudaSlice<u16>,
         len: usize,
@@ -575,7 +571,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn local_f32_as_bf16(
+    pub(crate) fn local_f32_as_bf16(
         &self,
         src: &CudaSlice<f32>,
         len: usize,
@@ -606,7 +602,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn cuda_slice<'a>(
+    pub(crate) fn cuda_slice<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
@@ -652,7 +648,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn cuda_bf16_slice<'a>(
+    pub(crate) fn cuda_bf16_slice<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
@@ -672,7 +668,7 @@ impl CudaBackend {
 
     /// f32 view of a handle: borrows f32 storage, imports (exact widen) bf16.
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn f32_operand<'a>(
+    pub(crate) fn f32_operand<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
@@ -691,7 +687,7 @@ impl CudaBackend {
     /// Like `f32_operand`, but under bf16 tape dtype an f32 handle is
     /// round-tripped through bf16 so backward reads the value forward saw.
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn f32_operand_tape_quantized<'a>(
+    pub(crate) fn f32_operand_tape_quantized<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
@@ -709,7 +705,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn bf16_operand<'a>(
+    pub(crate) fn bf16_operand<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
@@ -728,7 +724,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn validate_cuda_handle_kind(&self, handle: &DeviceHandle) -> Result<()> {
+    pub(crate) fn validate_cuda_handle_kind(&self, handle: &DeviceHandle) -> Result<()> {
         match handle {
             DeviceHandle::Cpu(_)
             | DeviceHandle::Cuda(_)
@@ -743,7 +739,7 @@ impl CudaBackend {
     }
 }
 
-pub(super) fn cuda_quantize_frozen_to_bf16(
+pub(crate) fn cuda_quantize_frozen_to_bf16(
     backend: &CudaBackend,
     handle: &DeviceHandle,
     shape: &[usize],
@@ -757,7 +753,7 @@ pub(super) fn cuda_quantize_frozen_to_bf16(
     Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(bits)))
 }
 
-pub(super) fn cuda_upload_fp8_block_scaled(
+pub(crate) fn cuda_upload_fp8_block_scaled(
     backend: &CudaBackend,
     weight: &[u8],
     scales: &[f32],
@@ -778,7 +774,7 @@ pub(super) fn cuda_upload_fp8_block_scaled(
     ))
 }
 
-pub(super) fn cuda_upload_fp4_e2m1_group(
+pub(crate) fn cuda_upload_fp4_e2m1_group(
     backend: &CudaBackend,
     weight: &[u8],
     scales: &[u8],
@@ -840,7 +836,7 @@ pub(super) fn cuda_upload_fp4_e2m1_group(
     ))
 }
 
-pub(super) fn cuda_import_bf16_device_ptr_as_f32(
+pub(crate) fn cuda_import_bf16_device_ptr_as_f32(
     backend: &CudaBackend,
     src_device_ptr: u64,
     src_stream: u64,
@@ -859,7 +855,7 @@ pub(super) fn cuda_import_bf16_device_ptr_as_f32(
     Ok(DeviceHandle::Cuda(CudaStorage::new(f32_slice)))
 }
 
-pub(super) fn cuda_import_fp8_block_scaled_device_ptr(
+pub(crate) fn cuda_import_fp8_block_scaled_device_ptr(
     backend: &CudaBackend,
     weight_device_ptr: u64,
     scale_device_ptr: u64,
@@ -928,7 +924,7 @@ pub(super) fn cuda_import_fp8_block_scaled_device_ptr(
     ))
 }
 
-pub(super) fn cuda_import_fp4_marlin_device_ptr(
+pub(crate) fn cuda_import_fp4_marlin_device_ptr(
     backend: &CudaBackend,
     weight_device_ptr: u64,
     scale_tail_device_ptr: u64,
@@ -997,7 +993,7 @@ pub(super) fn cuda_import_fp4_marlin_device_ptr(
     ))
 }
 
-pub(super) fn cuda_import_bf16_device_ptr(
+pub(crate) fn cuda_import_bf16_device_ptr(
     backend: &CudaBackend,
     device_ptr: u64,
     shape: &[usize],
@@ -1033,7 +1029,7 @@ pub(super) fn cuda_import_bf16_device_ptr(
     ))
 }
 
-pub(super) fn cuda_readback(backend: &CudaBackend, handle: &DeviceHandle) -> Result<Vec<f32>> {
+pub(crate) fn cuda_readback(backend: &CudaBackend, handle: &DeviceHandle) -> Result<Vec<f32>> {
     match handle {
         DeviceHandle::Cpu(data) => Ok(data.clone()),
         DeviceHandle::Cuda(storage) => {
@@ -1139,7 +1135,7 @@ pub(super) fn cuda_readback(backend: &CudaBackend, handle: &DeviceHandle) -> Res
     }
 }
 
-pub(super) fn cuda_readback_into(
+pub(crate) fn cuda_readback_into(
     backend: &CudaBackend,
     handle: &DeviceHandle,
     dst: &mut [f32],

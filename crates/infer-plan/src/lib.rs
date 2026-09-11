@@ -11,23 +11,21 @@ mod spec;
 
 pub use geometry::PrefillGeometry;
 pub use spec::{
-    DEFAULT_SPEC_DRAFT_DEPTH, DEFAULT_SPEC_DRAFT_TOPK, DecodeDispatch, DecodeKvClass, DecodeRoute,
-    DraftChain, DsparkDraftPlan, MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, MtpDraftRow,
-    SpecAcceptOutcome, SpecChain, SpecKind, SpecVerifySchedule, assign_row_offsets, decide_decode,
-    dspark_draft_plan, flatten_chains, greedy_seeded_indices, pages_covering,
-    qwen_spec_decode_compatible, route_decode, spec_accept_greedy, spec_accept_totals,
-    speculative_chain_fits,
+    DEFAULT_SPEC_DRAFT_DEPTH, DEFAULT_SPEC_DRAFT_TOPK, DecodeDispatch, DecodeKvClass, DraftChain,
+    MAX_SPEC_DRAFT_DEPTH, MAX_SPEC_VERIFY_ROWS, MtpDraftRow, SpecChain, SpecKind,
+    SpecVerifySchedule, assign_row_offsets, decide_decode, dspark_draft_plan, flatten_chains,
+    greedy_seeded_indices, pages_covering, qwen_spec_decode_compatible, spec_accept_greedy,
+    spec_accept_totals, speculative_chain_fits,
 };
 
 pub use diffusion::{
-    DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateError,
-    DiffusionGenerateOutput, DiffusionGenerateStats, DiffusionGenerationConfig,
-    DiffusionModelError, DiffusionStepTrace, MultimodalImage, MultimodalKind,
-    entropy_bound_acceptance_mask, generate_diffusion_with_cancel,
+    DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateOutput,
+    DiffusionGenerateStats, DiffusionGenerationConfig, DiffusionModelError, MultimodalImage,
+    MultimodalKind, generate_diffusion_with_cancel,
 };
 pub use sample::{
-    PenaltyHistory, argmax_logit, sample_token, sample_token_logprob,
-    sample_token_logprob_penalized, sample_token_penalized, sampled_top_logprobs,
+    PenaltyHistory, argmax_logit, sample_token, sample_token_logprob_penalized,
+    sample_token_penalized, sampled_top_logprobs,
 };
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]

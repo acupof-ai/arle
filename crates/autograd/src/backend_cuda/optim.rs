@@ -2,7 +2,7 @@ use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_adamw_step(
+pub(crate) fn cuda_adamw_step(
     backend: &CudaBackend,
     param: &DeviceHandle,
     m: &DeviceHandle,
@@ -77,7 +77,7 @@ pub(super) fn cuda_adamw_step(
 
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_adamw_step_device(
+pub(crate) fn cuda_adamw_step_device(
     backend: &CudaBackend,
     param: &DeviceHandle,
     m: &DeviceHandle,
@@ -148,7 +148,7 @@ pub(super) fn cuda_adamw_step_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_sum_squares(
+pub(crate) fn cuda_sum_squares(
     backend: &CudaBackend,
     x: &DeviceHandle,
     shape: &[usize],
@@ -197,7 +197,7 @@ pub(super) fn cuda_sum_squares(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_clip_grad_norm_device(
+pub(crate) fn cuda_clip_grad_norm_device(
     backend: &CudaBackend,
     grads: &[(DeviceHandle, Vec<usize>)],
     max_norm: f32,

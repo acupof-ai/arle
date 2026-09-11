@@ -61,7 +61,7 @@ impl Qwen35Model {
         )
     }
 
-    pub(super) fn forward_moe_routes_for_diagnostics(
+    fn forward_moe_routes_for_diagnostics(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,

@@ -4,7 +4,7 @@ use super::*;
 // `mul_scalar_f32`) so the nsys audit trail matches the autograd op name.
 // Returned handle is unevaluated — terminal `eval` is the caller's.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_mul_scalar_backward_device(
+pub(crate) fn cuda_mul_scalar_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     scale: f32,
@@ -39,7 +39,7 @@ pub(super) fn cuda_mul_scalar_backward_device(
 
 // Upstream is a rank-0 device scalar. Returned handle is unevaluated.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_mean_backward_device(
+pub(crate) fn cuda_mean_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     output_shape: &[usize],
@@ -84,7 +84,7 @@ pub(super) fn cuda_mean_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_sum_backward_device(
+pub(crate) fn cuda_sum_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     output_shape: &[usize],
@@ -124,7 +124,7 @@ pub(super) fn cuda_sum_backward_device(
 
 // Returned handle is unevaluated — terminal `eval` is the caller's.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_add_into_device(
+pub(crate) fn cuda_add_into_device(
     backend: &CudaBackend,
     dest: &DeviceHandle,
     src: &DeviceHandle,
@@ -183,7 +183,7 @@ pub(super) fn cuda_add_into_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_accumulate_into_device(
+pub(crate) fn cuda_accumulate_into_device(
     backend: &CudaBackend,
     dest: &DeviceHandle,
     src: &DeviceHandle,
@@ -237,7 +237,7 @@ pub(super) fn cuda_accumulate_into_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_unary_1d(
+pub(crate) fn cuda_unary_1d(
     backend: &CudaBackend,
     a: &[f32],
     kernel_name: &'static str,
@@ -263,7 +263,7 @@ pub(super) fn cuda_unary_1d(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_scalar_1d(
+pub(crate) fn cuda_scalar_1d(
     backend: &CudaBackend,
     a: &[f32],
     s: f32,
@@ -290,7 +290,7 @@ pub(super) fn cuda_scalar_1d(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_binary_1d(
+pub(crate) fn cuda_binary_1d(
     backend: &CudaBackend,
     a: &[f32],
     b: &[f32],
@@ -327,7 +327,7 @@ pub(super) fn cuda_binary_1d(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_unary_1d_device(
+pub(crate) fn cuda_unary_1d_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     shape: &[usize],
@@ -379,7 +379,7 @@ pub(super) fn cuda_unary_1d_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_scalar_1d_device(
+pub(crate) fn cuda_scalar_1d_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     s: f32,
@@ -432,7 +432,7 @@ pub(super) fn cuda_scalar_1d_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_binary_1d_device(
+pub(crate) fn cuda_binary_1d_device(
     backend: &CudaBackend,
     a: &DeviceHandle,
     b: &DeviceHandle,
@@ -490,7 +490,7 @@ pub(super) fn cuda_binary_1d_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_elementwise_backward_with_saved(
+fn cuda_elementwise_backward_with_saved(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     saved: &DeviceHandle,
@@ -548,7 +548,7 @@ pub(super) fn cuda_elementwise_backward_with_saved(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_silu_backward_device(
+pub(crate) fn cuda_silu_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     x: &DeviceHandle,
@@ -565,7 +565,7 @@ pub(super) fn cuda_silu_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_sigmoid_backward_device(
+pub(crate) fn cuda_sigmoid_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     y: &DeviceHandle,
@@ -582,7 +582,7 @@ pub(super) fn cuda_sigmoid_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_abs_backward_device(
+pub(crate) fn cuda_abs_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     x: &DeviceHandle,
@@ -599,7 +599,7 @@ pub(super) fn cuda_abs_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_mul_backward_device(
+pub(crate) fn cuda_mul_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     a: &DeviceHandle,

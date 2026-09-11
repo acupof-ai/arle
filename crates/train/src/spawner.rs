@@ -33,12 +33,12 @@ use serde::{Deserialize, Serialize};
 
 pub const LISTEN_ENV: &str = "ARLE_SPAWNER_LISTEN";
 
-pub const SOCKET_ENV: &str = "ARLE_SPAWNER_SOCKET";
+const SOCKET_ENV: &str = "ARLE_SPAWNER_SOCKET";
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SpawnRequest {
+pub(crate) struct SpawnRequest {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -51,7 +51,7 @@ pub struct SpawnRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SpawnResponse {
+pub(crate) struct SpawnResponse {
     pub stdout: Vec<u8>,
     /// Empty when `combined_timeout` (output folded into `stdout`).
     pub stderr: Vec<u8>,
@@ -227,7 +227,7 @@ fn kill_group(pgid: i32) {
 }
 
 #[derive(Clone, Debug)]
-pub struct SpawnClient {
+pub(crate) struct SpawnClient {
     socket: PathBuf,
 }
 

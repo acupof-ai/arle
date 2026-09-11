@@ -84,7 +84,7 @@ impl SharedFrozenBaseEntry {
 }
 
 /// `None`/empty = no sharing — every frozen FP8 base uploads its own copy.
-pub type SharedFrozenBaseTable<'a> = &'a [SharedFrozenBaseEntry];
+type SharedFrozenBaseTable<'a> = &'a [SharedFrozenBaseEntry];
 
 #[derive(Debug, Error)]
 pub enum LoaderError {

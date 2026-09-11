@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_rope(
+pub(crate) fn cuda_rope(
     backend: &CudaBackend,
     x: &[f32],
     x_shape: &[usize],
@@ -93,7 +93,7 @@ pub(super) fn cuda_rope(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_rope_device(
+pub(crate) fn cuda_rope_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     x_shape: &[usize],
@@ -215,7 +215,7 @@ pub(super) fn cuda_rope_device(
 // `neg_forward(sin) → cpu_rope_forward` chain. cos/sin upload fresh every
 // call (tiny: `[seq, head_dim/2]`).
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_rope_backward_device(
+pub(crate) fn cuda_rope_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     x_shape: &[usize],

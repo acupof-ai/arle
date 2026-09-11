@@ -47,8 +47,10 @@ pub mod tensor_parallel;
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
 pub use runtime_flags::{TrainRuntimeFlags, apply_runtime_flags};
+#[cfg(feature = "cuda")]
 #[path = "rubric.rs"]
 pub mod rubric;
+#[cfg(feature = "cuda")]
 #[path = "rubric_opd.rs"]
 pub mod rubric_opd;
 #[path = "sandbox.rs"]

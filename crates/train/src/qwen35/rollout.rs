@@ -57,7 +57,7 @@ impl Qwen35Model {
                 .all(|layer| matches!(layer.self_attn, Qwen35Attention::Full(_)))
     }
 
-    pub(super) fn ensure_rollout_cache_supported(&self) -> Result<()> {
+    fn ensure_rollout_cache_supported(&self) -> Result<()> {
         if self.tp.is_enabled() {
             return Err(Qwen35Error::InvalidConfig(
                 "rollout KV cache requires a non-tensor-parallel train model",
@@ -270,7 +270,7 @@ impl Qwen35Model {
         Ok((logits, profile))
     }
 
-    pub(super) fn forward_batch_indices_with_kv_cache(
+    fn forward_batch_indices_with_kv_cache(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -356,7 +356,7 @@ impl Qwen35Model {
         linear_forward(hidden, self.lm_head, store, tape)
     }
 
-    pub(super) fn forward_batch_indices_with_kv_cache_profiled(
+    fn forward_batch_indices_with_kv_cache_profiled(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -461,7 +461,7 @@ impl Qwen35Model {
     }
 }
 
-pub(super) fn embedding_device_f32_ids(
+fn embedding_device_f32_ids(
     table: TensorId,
     ids: TensorId,
     n_ids: usize,

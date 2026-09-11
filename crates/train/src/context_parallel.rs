@@ -121,7 +121,7 @@ impl CpContext {
     }
 
     /// Pad rows go at the tail, past every real row, so causal attention never reaches them.
-    pub fn padded_seq_len(self, seq_len: usize) -> usize {
+    pub(crate) fn padded_seq_len(self, seq_len: usize) -> usize {
         if self.size <= 1 {
             return seq_len;
         }
@@ -191,6 +191,6 @@ impl DpContext {
     }
 }
 
-pub fn global_inv_n(dp_group_sum: usize) -> Option<f32> {
+pub(crate) fn global_inv_n(dp_group_sum: usize) -> Option<f32> {
     (dp_group_sum > 0).then(|| 1.0 / dp_group_sum as f32)
 }

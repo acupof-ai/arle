@@ -20,7 +20,7 @@ pub(super) fn validate_token_ids(context: &str, tokens: &[u32], vocab: usize) ->
     Ok(())
 }
 
-pub(super) fn validate_forced_rollout(
+pub(crate) fn validate_forced_rollout(
     forced_rollout: &[u32],
     prompt_ids: &[u32],
     rollout_len: usize,
@@ -52,7 +52,7 @@ pub(super) fn validate_forced_rollout(
     validate_token_ids("forced_rollout", forced_rollout, vocab)
 }
 
-pub(super) fn validate_student_params(
+pub(crate) fn validate_student_params(
     student_params: &[TensorId],
     store: &TensorStore,
 ) -> Result<()> {
@@ -101,7 +101,7 @@ pub(super) fn validate_student_params(
     Ok(())
 }
 
-pub(super) fn validate_student_param_ownership(
+pub(crate) fn validate_student_param_ownership(
     student_params: &[TensorId],
     student_model_params: &[TensorId],
     teacher_params: &[TensorId],
@@ -130,7 +130,7 @@ pub(super) fn validate_student_param_ownership(
     Ok(())
 }
 
-pub(super) fn validate_teacher_params(
+pub(crate) fn validate_teacher_params(
     teacher_params: &[TensorId],
     store: &TensorStore,
 ) -> Result<()> {
@@ -163,7 +163,7 @@ pub(super) fn validate_teacher_params(
     Ok(())
 }
 
-pub(super) fn validate_loss_value(loss_value: f32) -> Result<()> {
+pub(crate) fn validate_loss_value(loss_value: f32) -> Result<()> {
     if loss_value.is_finite() {
         return Ok(());
     }
@@ -174,7 +174,7 @@ pub(super) fn validate_loss_value(loss_value: f32) -> Result<()> {
     )))
 }
 
-pub(super) fn validate_logits_shape(
+pub(crate) fn validate_logits_shape(
     stage: &str,
     shape: &[usize],
     seq_len: usize,
@@ -192,7 +192,7 @@ pub(super) fn validate_logits_shape(
     )))
 }
 
-pub(super) fn validate_step_config(cfg: &OpdStepConfig) -> Result<()> {
+pub(crate) fn validate_step_config(cfg: &OpdStepConfig) -> Result<()> {
     if cfg.grad_clip >= 0.0 && cfg.grad_clip.is_finite() {
         return Ok(());
     }
@@ -204,7 +204,7 @@ pub(super) fn validate_step_config(cfg: &OpdStepConfig) -> Result<()> {
     )))
 }
 
-pub(super) fn validate_gkd_lambda(gkd_lambda: f32) -> Result<()> {
+pub(crate) fn validate_gkd_lambda(gkd_lambda: f32) -> Result<()> {
     if (0.0..=1.0).contains(&gkd_lambda) && gkd_lambda.is_finite() {
         return Ok(());
     }
@@ -215,7 +215,7 @@ pub(super) fn validate_gkd_lambda(gkd_lambda: f32) -> Result<()> {
     )))
 }
 
-pub(super) fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
+pub(crate) fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
     validate_gkd_lambda(config.lambda)?;
     if !config.kl_temperature.is_finite() || config.kl_temperature <= 0.0 {
         return Err(OpdError::InvalidInput(format!(
@@ -278,7 +278,7 @@ pub(super) fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> 
     Ok(())
 }
 
-pub(super) fn validate_rollout_shape(
+pub(crate) fn validate_rollout_shape(
     prompt_len: usize,
     rollout_len: usize,
     vocab: usize,

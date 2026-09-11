@@ -235,7 +235,7 @@ enum CoordSubmission {
 }
 
 /// The coordinator's HTTP-facing state (lives behind `Arc` in the axum router).
-pub struct CoordinatorHandle {
+pub(crate) struct CoordinatorHandle {
     model: String,
     tokenizer: Mutex<OpenAiTokenizer>,
     max_thinking_tokens: usize,
@@ -270,7 +270,7 @@ pub struct CoordinatorHandle {
 impl CoordinatorHandle {
     /// Whether this group's lockstep loop has torn down. Requests routed to a
     /// dead group fail fast instead of hanging on a closed channel.
-    pub(crate) fn is_dead(&self) -> bool {
+    fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
     }
 
@@ -363,7 +363,7 @@ impl CoordinatorHandle {
 /// identical across groups, and per-group operations (sinks, submit_tx) are
 /// consistent within a single function call (the Deref coercion happens once
 /// at the call site, fixing the group for that call).
-pub struct DpCoordinator {
+pub(crate) struct DpCoordinator {
     groups: Vec<Arc<CoordinatorHandle>>,
     cached_stats: Arc<RwLock<Option<CounterSnapshot>>>,
 }
@@ -378,7 +378,7 @@ impl DpCoordinator {
 
     /// Latest stats snapshot from the background observer poll.
     /// `None` until the first poll completes (or when observe is disabled).
-    pub(crate) fn cached_stats(&self) -> Option<CounterSnapshot> {
+    fn cached_stats(&self) -> Option<CounterSnapshot> {
         self.cached_stats.read().ok()?.clone()
     }
 
@@ -393,7 +393,7 @@ impl DpCoordinator {
     /// Aggregate stats from every TP group into a deployment-level
     /// [`CounterSnapshot`]. Groups serve disjoint requests, so counters and
     /// gauges sum across groups.
-    pub(crate) async fn query_stats_all(&self, timeout: Duration) -> CounterSnapshot {
+    async fn query_stats_all(&self, timeout: Duration) -> CounterSnapshot {
         let groups = self.collect_wire_stats_all(timeout).await;
         crate::multiproc_relay::aggregate_wire_stats_dp(groups).into_counter_snapshot()
     }
@@ -481,7 +481,7 @@ fn count_reasoning_tokens(
 /// observe task — true for the engine-less multiproc coordinator, false for
 /// local relay (ServeHandle owns sampling).
 #[allow(private_interfaces)]
-pub fn coordinator_router(
+pub(crate) fn coordinator_router(
     relay: RelayCoordinator,
     tokenizer: OpenAiTokenizer,
     model: impl Into<String>,

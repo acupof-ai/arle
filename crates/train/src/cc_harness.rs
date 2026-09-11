@@ -157,7 +157,7 @@ impl RefillBudget {
     }
 }
 
-pub struct GroupAssembler {
+struct GroupAssembler {
     k: usize,
     pending: HashMap<String, Vec<ScoredSample>>,
 }

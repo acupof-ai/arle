@@ -507,7 +507,7 @@ fn student_rollout_only_with_keep(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-pub(super) fn rollout_phase(
+pub(crate) fn rollout_phase(
     student: &Qwen35Model,
     prompt_ids: &[u32],
     cfg: &OpdStepConfig,

@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_embedding(
+pub(crate) fn cuda_embedding(
     backend: &CudaBackend,
     weight: &[f32],
     vocab: usize,
@@ -56,7 +56,7 @@ pub(super) fn cuda_embedding(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_embedding_device(
+pub(crate) fn cuda_embedding_device(
     backend: &CudaBackend,
     table: &DeviceHandle,
     table_shape: &[usize],
@@ -179,7 +179,7 @@ pub(super) fn cuda_embedding_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_embedding_from_f32_ids_device(
+pub(crate) fn cuda_embedding_from_f32_ids_device(
     backend: &CudaBackend,
     table: &DeviceHandle,
     table_shape: &[usize],
@@ -298,7 +298,7 @@ pub(super) fn cuda_embedding_from_f32_ids_device(
 // Device-resident embedding backward; no `synchronize()` — terminal eval is
 // the caller's.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_embedding_backward_device(
+pub(crate) fn cuda_embedding_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     indices: &[i32],

@@ -7,7 +7,7 @@ use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HostSample {
+struct HostSample {
     pub cpu_pct: f32,
     pub ram_used_mb: u64,
     pub disk_used_pct: f32,
@@ -28,7 +28,7 @@ fn disk_used_pct(disks: &sysinfo::Disks) -> f32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StoredSample {
+pub(crate) struct StoredSample {
     pub ts_ms: u64,
     pub active_requests: u32,
     pub queue_depth: u32,
@@ -159,7 +159,7 @@ fn write_sample(dir: &std::path::Path, snap: &CounterSnapshot, host: HostSample)
 /// Spawn the background observe task. `snapshot` returns the current counter
 /// snapshot, or `None` to skip this tick (e.g. mutex poisoned). The flock
 /// singleton ensures only one writer per machine.
-pub fn spawn_observe_task<F>(mut snapshot: F)
+pub(crate) fn spawn_observe_task<F>(mut snapshot: F)
 where
     F: FnMut() -> Option<CounterSnapshot> + Send + 'static,
 {

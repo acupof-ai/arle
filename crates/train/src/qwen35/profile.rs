@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn trace_model_component(trace: bool, component: &'static str, duration: Duration) {
+pub(crate) fn trace_model_component(trace: bool, component: &'static str, duration: Duration) {
     if trace {
         println!(
             "qwen35_full_forward_trace scope=model component={} seconds={:.6}",
@@ -10,7 +10,7 @@ pub(super) fn trace_model_component(trace: bool, component: &'static str, durati
     }
 }
 
-pub(super) fn trace_forward_component(
+pub(crate) fn trace_forward_component(
     trace: bool,
     layer_index: usize,
     component: &'static str,
@@ -26,7 +26,7 @@ pub(super) fn trace_forward_component(
     }
 }
 
-pub(super) fn trace_attention_component(
+pub(crate) fn trace_attention_component(
     trace: bool,
     layer_index: usize,
     component: &'static str,

@@ -3,7 +3,7 @@ use super::*;
 // Sibling of `cuda_gather_last_dim` over a borrowed device slice; no
 // `synchronize()` — the caller owns the terminal eval.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_gather_last_dim_device(
+pub(crate) fn cuda_gather_last_dim_device(
     backend: &CudaBackend,
     src: &DeviceHandle,
     src_shape: &[usize],
@@ -68,7 +68,7 @@ pub(super) fn cuda_gather_last_dim_device(
 // Device-resident backward for gather_last_dim; no `synchronize()` —
 // terminal eval is the caller's.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_gather_last_dim_backward(
+pub(crate) fn cuda_gather_last_dim_backward(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     indices: &[i32],
@@ -133,7 +133,7 @@ pub(super) fn cuda_gather_last_dim_backward(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_gather_last_dim(
+pub(crate) fn cuda_gather_last_dim(
     backend: &CudaBackend,
     src: &[f32],
     src_shape: &[usize],
@@ -194,7 +194,7 @@ pub(super) fn cuda_gather_last_dim(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_scatter_add_rows(
+pub(crate) fn cuda_scatter_add_rows(
     backend: &CudaBackend,
     upstream: &[f32],
     prefix_rows: usize,

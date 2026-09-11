@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelFamily {
+enum KernelFamily {
     Forward,
     Backward,
     /// Fused SDPA fwd+bwd plus the KV-cache/slice layout kernels feeding it.
@@ -316,7 +316,7 @@ impl KernelCache {
         ))
     }
 
-    pub(super) fn function_for(
+    pub(crate) fn function_for(
         &self,
         name: &'static str,
         dtype: TapeDtype,
@@ -373,7 +373,7 @@ impl KernelCache {
 
     /// F32 always compiles at construction; Bf16 compiles here when the tape
     /// dtype is declared, instead of on the first hot-path `function_for` call.
-    pub(super) fn warm_dtype(&self, dtype: TapeDtype) -> Result<()> {
+    pub(crate) fn warm_dtype(&self, dtype: TapeDtype) -> Result<()> {
         match dtype {
             TapeDtype::F32 => Ok(()),
             TapeDtype::Bf16 => {
@@ -391,7 +391,7 @@ impl KernelCache {
         }
     }
 
-    pub(super) fn nvrtc_identity(&self, dtype: TapeDtype) -> Result<NvrtcIdentity> {
+    pub(crate) fn nvrtc_identity(&self, dtype: TapeDtype) -> Result<NvrtcIdentity> {
         #[cfg(feature = "no-cuda")]
         {
             let _ = dtype;
@@ -590,7 +590,7 @@ fn get_cubin(
     Ok(cubin)
 }
 
-pub(super) fn launch_rows<'a, F>(
+pub(crate) fn launch_rows<'a, F>(
     stream: &'a Arc<CudaStream>,
     func: &'a CudaFunction,
     rows: usize,
@@ -630,7 +630,7 @@ where
     }
 }
 
-pub(super) fn launch_1d<'a, F>(
+pub(crate) fn launch_1d<'a, F>(
     stream: &'a Arc<CudaStream>,
     func: &'a CudaFunction,
     n: usize,

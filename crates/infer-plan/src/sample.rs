@@ -37,7 +37,7 @@ fn splitmix64(mut x: u64) -> u64 {
 /// nothing to draw, so it is treated as "no constraint" rather than returning
 /// a token the grammar rejects.
 #[must_use]
-pub fn apply_grammar_bitmask(logits: &[f32], mask: &[u32]) -> Vec<f32> {
+fn apply_grammar_bitmask(logits: &[f32], mask: &[u32]) -> Vec<f32> {
     let allowed = |t: usize| mask.get(t / 32).is_some_and(|w| w >> (t % 32) & 1 == 1);
     if !(0..logits.len()).any(allowed) {
         return logits.to_vec();
@@ -125,7 +125,7 @@ fn apply_penalties(logits: &mut [f32], params: &SamplingParams, history: Penalty
 /// on-policy RL. `None` for greedy (a delta policy) and for the
 /// degenerate-distribution argmax fallback.
 #[must_use]
-pub fn sample_token_logprob(
+pub(crate) fn sample_token_logprob(
     logits: &[f32],
     params: &SamplingParams,
     position: u64,

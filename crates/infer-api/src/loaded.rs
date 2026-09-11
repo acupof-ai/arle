@@ -469,7 +469,7 @@ mod raw_logits_route;
 /// executor + KV pool, and spawns the serve handle. Backend selection is a
 /// runtime decision: the leaf binary registers one builder per backend, and
 /// [`LoadedInferenceEngine::load_with_config`] dispatches by name.
-pub type BackendBuilderFn = fn(
+pub(crate) type BackendBuilderFn = fn(
     model_path: &str,
     config: &EngineLoadConfig,
     shutdown: infer_server::ServeShutdown,
@@ -532,7 +532,7 @@ fn registry_entry(name: &str) -> Option<(BackendBuilderFn, BackendCapabilities)>
         .map(|e| (e.build, e.caps))
 }
 
-pub(crate) fn lookup_backend(name: &str) -> Option<BackendBuilderFn> {
+fn lookup_backend(name: &str) -> Option<BackendBuilderFn> {
     registry_entry(name).map(|(build, _caps)| build)
 }
 

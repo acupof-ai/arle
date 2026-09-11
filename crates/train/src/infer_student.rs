@@ -162,7 +162,7 @@ impl InferStudent {
 
     /// Generate `n` EOS-respecting completions of up to `max_new_tokens` each,
     /// for rubric-OPD rejection sampling. Returns generated tokens per sample.
-    pub fn generate_samples(
+    pub(crate) fn generate_samples(
         &self,
         prompt_ids: &[u32],
         max_new_tokens: usize,

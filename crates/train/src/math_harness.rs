@@ -47,7 +47,7 @@ pub fn load_tasks(path: &Path, limit: Option<usize>) -> Result<Vec<MathTask>> {
 }
 
 /// LAST `\boxed{...}` with brace nesting; None when absent or unbalanced.
-pub fn last_boxed(text: &str) -> Option<String> {
+fn last_boxed(text: &str) -> Option<String> {
     const TAG: &str = "\\boxed{";
     let open = text.rfind(TAG)?;
     let close = matching_brace(text, open + TAG.len() - 1)?;
