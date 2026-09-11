@@ -58,8 +58,7 @@ lists — there is no glob.
 6. **The Qwen3.5 step model is a separate C++ file** (`mlx_qwen35_model.cpp`),
    not a generic MLX composition. It exists because Qwen3.5 hybrid attention
    benefits from a fused C++ step path — keep this dedicated, don't fold it
-   into the generic Rust `rust_transformer_layer` fallback without a bench
-   snapshot.
+   into a generic MLX-op composition without a bench snapshot.
 7. **Specialized C++ helpers for Qwen3.5 sub-layers compose the C++ side
    of the bridge.** `mlx_qwen35_moe_block.cpp` is the canonical SparseMoE
    forward; `mlx_dflash_draft_model.cpp` is the canonical draft-model
@@ -76,7 +75,9 @@ lists — there is no glob.
    benchmarks/python OFF, `BUILD_SHARED_LIBS=OFF`, `CMAKE_CXX_STANDARD=17`.
 2. **cc** compiles all bridge translation units (`mlx_bridge.cpp`,
    `mlx_qwen35_model.cpp`, `mlx_qwen35_moe_block.cpp`,
-   `mlx_dflash_draft_model.cpp`, `mlx_metal_capture.mm`) as
+   `mlx_lfm2_model.cpp`, `mlx_lfm2_moe_block.cpp`,
+   `mlx_deepseek_ocr_model.cpp`, `mlx_dflash_draft_model.cpp`,
+   `mlx_metal_capture.mm`) as
    `libmlx_ffi.a` with `-std=c++17 -Wno-deprecated-copy
    -Wno-unused-parameter -Wno-sign-compare`.
 3. **Link order (strict):**
@@ -154,7 +155,8 @@ ops should land here, not as Rust compositions in `infer-metal`.
 ## State-mutating change — enumerate every buffer (事无巨细)
 
 Any change mutating MLX or
-bridge-cache state (DFlash draft KV, `BatchKVCache`, per-slot scratch, a rollback):
+bridge-cache state (the DFlash draft's batched `kv_caches` arrays, per-slot
+scratch, a rollback):
 **enumerate EVERY buffer it writes, prove each reverted / self-heals (with the
 exact precondition) / snapshotted** — never assume self-heal. Pre-allocate once
 and reuse (no per-step alloc on the encode path — `mx::async_eval` encodes on the
@@ -172,8 +174,7 @@ same-config-twice floor), not byte-identity to a reference run.
   (`feedback_mlx_metallib_must_be_colocated.md`).
 - **`mx::compile` needs cache-as-input for position-dependent graphs.** `item()` bakes scalars
   into the compiled graph; runtime `cache_pos` must enter as an active-prefix input tensor,
-  not as `(cache, position)` separately — else compile re-runs every step
-  (`feedback_mx_compile_cache_as_input.md`).
+  not as `(cache, position)` separately — else compile re-runs every step.
 - **`mx::async_eval` encodes on the *caller* thread.** No worker thread will steal the encode
   work — falsified multi-stream encode pipelining (5–13% Qwen3.6 regression). Don't propose
   encode-side pipelining (`feedback_mlx_async_eval_is_caller_thread.md`).

@@ -189,7 +189,7 @@ parity in another.
 | --- | --- | --- | --- | --- | --- |
 | Production serving target | Supported | Beta | No (smoke only) | No (experimental) | No (skeleton) |
 | Continuous batching scheduler | Yes (one `Engine<E,K>` in `infer-core`) | Same `Engine<E,K>`; target-only Qwen is single-row, loaded DFlash/NextN enables configurable multi-row/mixed plans | No | Seam impl (single-stream MVP) | Seam impl (skeleton) |
-| Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No | Host KV pool (DSv4 slot shape) | Host KV pool (bookkeeping) |
+| Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes — packed varlen per-slot MLX arrays in the executor (`mlx-sys`), host paging via `HostPagedKvPool` | No | Host KV pool (DSv4 slot shape) | Host KV pool (bookkeeping) |
 | Chunked prefill + decode-priority | Yes | Partial | No | No | No |
 | Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8; TQ4 accepted by the CLI but deferred), Qwen3.5/3.6 only — DSv4 MLA KV is already FP8-packed and rejects the flag | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
 | Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots; T2 local-SSD write-through) | No | No | No |

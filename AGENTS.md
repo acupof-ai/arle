@@ -171,7 +171,9 @@ archive the oldest zero-inbound-reference wins entries before the
 `check_repo_hygiene` cap blocks a push; drift-probe
 `git log --since='7 days ago' -- 'crates/infer-*/src'` against `docs/experience/`.
 
-**Code layout gotchas.** Flat modules, no `mod.rs` — `src/ops.rs` declares a
+**Code layout gotchas.** Flat modules, no `mod.rs` in runtime `src/`
+(test `common/` and `src/backends/mod.rs` are the exceptions) —
+`crates/autograd/src/ops.rs` declares a
 sibling `#[path = "ops/attention.rs"] mod attention;`. Weights are `&self`
 (immutable, pool-shared); per-request mutable state lives in the `State`
 associated type. Comments carry the non-obvious *why* in ≤1 line, in English,
