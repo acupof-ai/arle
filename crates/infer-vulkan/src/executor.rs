@@ -20,7 +20,7 @@ pub enum VulkanModelKind {
     Qwen36Moe,
 }
 
-pub fn classify_vulkan_architecture(
+pub(crate) fn classify_vulkan_architecture(
     architecture: &str,
     model_name: Option<&str>,
     expert_count: usize,
@@ -49,7 +49,7 @@ pub fn classify_vulkan_architecture(
     VulkanModelKind::Qwen3Dense
 }
 
-pub fn classify_vulkan_gguf(gguf: &infer_gguf::gguf::GgufFile) -> Result<VulkanModelKind> {
+pub(crate) fn classify_vulkan_gguf(gguf: &infer_gguf::gguf::GgufFile) -> Result<VulkanModelKind> {
     let architecture = gguf
         .get_str("general.architecture")
         .unwrap_or("qwen3")
@@ -109,7 +109,8 @@ impl VulkanExecutor {
     }
 
     #[must_use]
-    pub fn has_model(&self) -> bool {
+    #[cfg(all(test, feature = "vulkan"))]
+    pub(crate) fn has_model(&self) -> bool {
         #[cfg(feature = "vulkan")]
         {
             self.model.is_some()
@@ -123,9 +124,9 @@ impl VulkanExecutor {
     /// `(resident_tensor_count, resident_device_bytes)` for the loaded model, or
     /// `None` if no model is loaded. Lets a load smoke-test assert the weights
     /// actually landed on the device.
-    #[cfg(feature = "vulkan")]
+    #[cfg(all(test, feature = "vulkan"))]
     #[must_use]
-    pub fn resident_stats(&self) -> Option<(usize, u64)> {
+    pub(crate) fn resident_stats(&self) -> Option<(usize, u64)> {
         let model = self.model.as_ref()?;
         Some(match model {
             VulkanLoadedModel::Qwen35(m) => (m.resident_tensor_count(), m.resident_device_bytes()),

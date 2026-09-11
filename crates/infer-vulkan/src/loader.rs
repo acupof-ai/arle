@@ -20,7 +20,9 @@
 //!   "lookup" gathers + dequantizes a single row per token instead of
 //!   uploading the whole (~0.5–1 GB) table.
 
-use anyhow::{Result, bail, ensure};
+#[cfg(any(feature = "vulkan", test))]
+use anyhow::ensure;
+use anyhow::{Result, bail};
 
 use infer_gguf::gguf::{GgmlType, GgufFile, TensorInfo};
 
@@ -81,7 +83,8 @@ pub enum Qwen35TensorKind {
 
 impl Qwen35TensorKind {
     /// 3-D stacked routed-expert weight (`[in, inter, n_experts]`).
-    pub fn is_routed_expert(self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_routed_expert(self) -> bool {
         matches!(
             self,
             Self::FfnGateExps | Self::FfnUpExps | Self::FfnDownExps
@@ -99,7 +102,7 @@ pub struct Qwen35TensorRole {
 /// Map a GGUF tensor name to its role + layer. Fails loud on an unknown name so
 /// a schema surprise (new tensor, renamed weight) is caught at load, not
 /// silently dropped.
-pub fn classify_qwen35_tensor(name: &str) -> Result<Qwen35TensorRole> {
+pub(crate) fn classify_qwen35_tensor(name: &str) -> Result<Qwen35TensorRole> {
     use Qwen35TensorKind::*;
 
     let global = match name {
@@ -246,7 +249,8 @@ pub fn plan_model(gguf: &GgufFile, num_layers: usize) -> Result<ResidencyPlan> {
 /// type. Covers every type the qwen35moe K-quant GGUFs use; fails loud on an
 /// unsupported type (e.g. MXFP4) so the 122B's MXFP4 experts surface a clear
 /// "needs a dedicated path" error instead of silently producing garbage.
-pub fn dequant_row_f32(ty: GgmlType, data: &[u8], n: usize) -> Result<Vec<f32>> {
+#[cfg(any(feature = "vulkan", test))]
+pub(crate) fn dequant_row_f32(ty: GgmlType, data: &[u8], n: usize) -> Result<Vec<f32>> {
     use infer_gguf::dequant;
     match ty {
         GgmlType::F32 => dequant::dequantize_row_f32(data, n),
@@ -270,6 +274,7 @@ pub fn dequant_row_f32(ty: GgmlType, data: &[u8], n: usize) -> Result<Vec<f32>> 
 /// Kept on the host (not uploaded) because a forward only ever gathers the few
 /// rows for the current tokens — dequantizing one row is far cheaper than
 /// materializing the whole (~0.5–1 GB) table on device.
+#[cfg(any(feature = "vulkan", test))]
 pub struct HostEmbeddingTable {
     pub ggml_type: GgmlType,
     pub hidden: usize,
@@ -278,6 +283,7 @@ pub struct HostEmbeddingTable {
     data: Vec<u8>,
 }
 
+#[cfg(any(feature = "vulkan", test))]
 impl HostEmbeddingTable {
     pub fn new(ggml_type: GgmlType, hidden: usize, vocab: usize, data: Vec<u8>) -> Result<Self> {
         let row_bytes = ggml_type.row_bytes(hidden).ok_or_else(|| {
@@ -298,7 +304,8 @@ impl HostEmbeddingTable {
         })
     }
 
-    pub fn embed_row(&self, token: u32) -> Result<Vec<f32>> {
+    #[cfg(any(feature = "vulkan", test))]
+    pub(crate) fn embed_row(&self, token: u32) -> Result<Vec<f32>> {
         let t = token as usize;
         ensure!(t < self.vocab, "token id {t} >= vocab {}", self.vocab);
         let off = t * self.row_bytes;

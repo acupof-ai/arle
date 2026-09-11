@@ -131,7 +131,7 @@ impl Kernel {
         Self::Qwen35GatedDeltaNet,
     ];
 
-    pub const fn shader_name(self) -> &'static str {
+    pub(crate) const fn shader_name(self) -> &'static str {
         match self {
             Kernel::GemvQ4K => "mul_mat_vecq_q4_k",
             Kernel::GemvQ5K => "mul_mat_vecq_q5_k",
@@ -237,7 +237,7 @@ impl FlashAttentionSpec {
         Self::f32_f16_dims(head_dim, head_dim)
     }
 
-    pub const fn f32_f16_dims(hsk: u32, hsv: u32) -> Self {
+    const fn f32_f16_dims(hsk: u32, hsv: u32) -> Self {
         Self {
             specialization_u32: [
                 (0, 128),
@@ -1129,7 +1129,7 @@ mod real {
         )
     }
 
-    pub fn launch_with_params(
+    pub(crate) fn launch_with_params(
         kernel: Kernel,
         ctx: &vulkan_sys::VulkanContext,
         buffers: &[&vulkan_sys::DeviceBuffer<'_>],
@@ -1155,7 +1155,7 @@ mod real {
     /// `one_shot_submit` drain on this path. A persistent cache + a batch-record
     /// `CommandRecorder` is the real decode path; this keeps
     /// the proven single-shot launchers/tests working through the same builder.
-    pub fn launch_with_params_and_specialization(
+    pub(crate) fn launch_with_params_and_specialization(
         kernel: Kernel,
         ctx: &vulkan_sys::VulkanContext,
         buffers: &[&vulkan_sys::DeviceBuffer<'_>],
@@ -1195,7 +1195,7 @@ mod stub {
         Err(KernelError::NotCompiled)
     }
 
-    pub fn launch_with_params(
+    pub(crate) fn launch_with_params(
         _kernel: Kernel,
         _ctx: &vulkan_sys::VulkanContext,
         _buffers: &[&vulkan_sys::DeviceBuffer<'_>],

@@ -55,9 +55,12 @@
 //! fall back to `num_key_value_heads`. Both fallbacks are documented at the
 //! call site and keep `inner_size` consistent.
 
+#[cfg(feature = "vulkan")]
 use anyhow::{Result, anyhow, bail};
+#[cfg(feature = "vulkan")]
 use qwen35_spec::{LayerType, Qwen35Config};
 
+#[cfg(feature = "vulkan")]
 use infer_gguf::gguf::GgufFile;
 
 /// Build a [`Qwen35Config`] from an open qwen35 / qwen35moe GGUF.
@@ -66,7 +69,8 @@ use infer_gguf::gguf::GgufFile;
 /// the metadata-key prefix, scans per-layer tensors to derive `layer_types`,
 /// and populates every `Qwen35Config` field. The result is validated before
 /// return so a bad derivation fails at load, not mid-forward.
-pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
+#[cfg(feature = "vulkan")]
+pub(crate) fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
     let arch = gguf
         .get_str("general.architecture")
         .ok_or_else(|| anyhow!("GGUF missing general.architecture"))?
@@ -263,6 +267,7 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
 /// Derive per-layer [`LayerType`] by scanning tensors for `blk.N.*`:
 /// `ssm_conv1d.weight` ⇒ LinearAttention, `attn_q.weight` ⇒ FullAttention.
 /// Fails loud if a layer has neither (a schema surprise) or both (ambiguous).
+#[cfg(feature = "vulkan")]
 fn derive_layer_types(gguf: &GgufFile, num_layers: usize) -> Result<Vec<LayerType>> {
     (0..num_layers)
         .map(|i| {
