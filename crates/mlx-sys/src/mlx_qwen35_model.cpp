@@ -266,8 +266,10 @@ auto& gated_delta_tape_kernel() {
 
 // Shared dispatch for the production GDR recurrent kernels. Callers pass
 // arrays already materialized to the kernel contract: q/k/v bf16, g/beta
-// f32, state f32, all contiguous. Returns {y, state_out} and, when
-// record_tape is set, the innovation tape as the third element.
+// f32, state f32, all contiguous. `t_arr` is the scalar step-count input,
+// created once per forward and shared by every GDR layer (the forward makes
+// a single `array(S)`). Returns {y, state_out} and, when record_tape is
+// set, the innovation tape as the third element.
 std::vector<array> run_gated_delta_step(
     const array& q,
     const array& k,
@@ -275,6 +277,7 @@ std::vector<array> run_gated_delta_step(
     const array& g,
     const array& beta,
     const array& state_in,
+    const array& t_arr,
     int threadgroup_y,
     bool record_tape) {
     int B = q.shape(0);
@@ -284,7 +287,7 @@ std::vector<array> run_gated_delta_step(
     int Hv = v.shape(2);
     int Dv = v.shape(3);
 
-    std::vector<array> inputs = {q, k, v, g, beta, state_in, array(T)};
+    std::vector<array> inputs = {q, k, v, g, beta, state_in, t_arr};
     std::vector<Shape> out_shapes = {{B, T, Hv, Dv}, state_in.shape()};
     std::vector<Dtype> out_dtypes = {bfloat16, float32};
     std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
@@ -1012,7 +1015,7 @@ struct Qwen35CompiledModel {
             int threadgroup_y = qwen35_cpp_gdr_threadgroup_y(S);
             auto result = run_gated_delta_step(
                 q_kernel, k_kernel, v_kernel, g_kernel, beta_kernel,
-                gdr_state_in, threadgroup_y, ctx.record_tapes);
+                gdr_state_in, gdr_t_arr, threadgroup_y, ctx.record_tapes);
             y = std::move(result[0]);
             gdr_state_out = std::move(result[1]);
             if (ctx.record_tapes) {
@@ -2250,7 +2253,7 @@ void mlx_qwen35_gated_delta_step(
 
         auto result = run_gated_delta_step(
             q_c, k_c, v_c, g_c, beta_c, state_c,
-            (Dv + 31) / 32, record_tape != 0);
+            array(T), qwen35_cpp_gdr_threadgroup_y(T), record_tape != 0);
         *out_y = from_arr(std::move(result[0]));
         *out_state = from_arr(std::move(result[1]));
         *out_tape = record_tape != 0 ? from_arr(std::move(result[2])) : nullptr;
