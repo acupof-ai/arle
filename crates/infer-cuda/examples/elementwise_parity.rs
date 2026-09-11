@@ -25,13 +25,16 @@
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/elementwise_parity`
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -43,12 +46,14 @@ mod real {
 
 #[cfg(feature = "cuda")]
 mod real {
-    use anyhow::{Result, ensure};
+    use anyhow::Result;
     use cuda_kernels::prelude::DeviceContext;
     use cuda_kernels::tensor_ops::{
         embedding_batched, rms_norm, rms_norm_batched, silu_mul, silu_mul_fused, split_qkv, split2,
     };
     use half::bf16;
+
+    use super::parity_common::{Rng, compare as common_compare};
 
     const EPS: f64 = 1e-6;
     const BATCHES: &[usize] = &[1, 8];
@@ -102,53 +107,14 @@ mod real {
         }
     }
 
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn normal(&mut self) -> f32 {
-            let u1 = self.unit().max(1e-7);
-            let u2 = self.unit();
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
-    }
-
-    fn rel_l2(got: &[bf16], want: &[f64]) -> f64 {
-        let (mut num, mut den) = (0f64, 0f64);
-        for (g, r) in got.iter().zip(want) {
-            let d = f32::from(*g) as f64 - *r;
-            num += d * d;
-            den += r * r;
-        }
-        (num / den.max(1e-12)).sqrt()
-    }
-
     fn check(label: &str, got: &[bf16], want: &[f64], failed: &mut bool) {
-        let rel = rel_l2(got, want);
-        let mut max_excess = f32::NEG_INFINITY;
-        for (g, r) in got.iter().zip(want) {
-            let tol = ABS_FLOOR + ABS_SLOPE * *r as f32;
-            max_excess = max_excess.max((f32::from(*g) - *r as f32).abs() - tol);
-        }
-        let pass =
-            rel.is_finite() && rel <= REL_L2_MAX && max_excess.is_finite() && max_excess <= 0.0;
+        let gv: Vec<f64> = got.iter().map(|g| f32::from(*g) as f64).collect();
+        let v = common_compare(&gv, want, ABS_FLOOR as f64, ABS_SLOPE as f64);
+        let pass = v.is_ok(REL_L2_MAX);
         if !pass {
             *failed = true;
         }
-        eprintln!(
-            "[{label}] relL2={rel:.4e} maxExcess={max_excess:.4e} {}",
-            if pass { "PASS" } else { "FAIL" }
-        );
+        eprintln!("[{label}] {} {}", v.worst_line(), if pass { "PASS" } else { "FAIL" });
     }
 
     fn check_bitexact(label: &str, got: &[bf16], want: &[bf16], failed: &mut bool) {
@@ -526,33 +492,10 @@ mod real {
         probe_silu_split_embed(&ctx, negative, &mut fams)?;
         probe_embedding_production(&ctx, negative, &mut fams)?;
 
-        if negative {
-            let unfired = fams
-                .entries()
-                .into_iter()
-                .filter_map(|(n, fired)| (!fired).then_some(n))
-                .collect::<Vec<_>>();
-            ensure!(
-                unfired.is_empty(),
-                "elementwise_parity negative control did NOT fail family: {}",
-                unfired.join(", ")
-            );
-            eprintln!(
-                "[elementwise-parity] NEGATIVE CONTROL OK (all 11 comparator families failed as required)"
-            );
-            return Ok(());
+        let mut families = super::parity_common::Families::new();
+        for (name, fired) in fams.entries() {
+            families.record(name, fired);
         }
-        let failed = fams
-            .entries()
-            .into_iter()
-            .filter_map(|(n, fired)| fired.then_some(n))
-            .collect::<Vec<_>>();
-        ensure!(
-            failed.is_empty(),
-            "elementwise_parity FAILED families: {}",
-            failed.join(", ")
-        );
-        eprintln!("[elementwise-parity] ALL PASS");
-        Ok(())
+        families.finish("elementwise-parity", negative)
     }
 }

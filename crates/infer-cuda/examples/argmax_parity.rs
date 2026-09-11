@@ -18,13 +18,16 @@
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/argmax_parity`
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -36,37 +39,18 @@ mod real {
 
 #[cfg(feature = "cuda")]
 mod real {
-    use anyhow::{Result, ensure};
+    use anyhow::Result;
     use cuda_kernels::prelude::DeviceContext;
     use cuda_kernels::sampling::{argmax, argmax_batch};
     use half::bf16;
+
+    use super::parity_common::{Families, Rng};
 
     // Covers: <2048 elems (one bf16x2 pass), 2048 boundary, odd tail,
     // production-scale vocab.
     const VOCABS: &[usize] = &[7, 128, 1023, 2048, 2049, 100_000, 151_936];
     const BATCHES: &[usize] = &[1, 8];
     const SEED: u64 = 0x2545_f491_4f6c_dd1d;
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn normal(&mut self) -> f32 {
-            let u1 = self.unit().max(1e-7);
-            let u2 = self.unit();
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
-    }
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Kind {
@@ -228,25 +212,9 @@ mod real {
             }
         }
 
-        if negative {
-            ensure!(
-                batch_fail,
-                "argmax_parity negative control did NOT fail family: batch selector"
-            );
-            ensure!(
-                singular_fail,
-                "argmax_parity negative control did NOT fail family: singular selector"
-            );
-            eprintln!(
-                "[argmax-parity] NEGATIVE CONTROL OK (both selector families failed as required)"
-            );
-            return Ok(());
-        }
-        ensure!(
-            !batch_fail && !singular_fail,
-            "argmax_parity FAILED — see violations above"
-        );
-        eprintln!("[argmax-parity] ALL PASS");
-        Ok(())
+        let mut families = Families::new();
+        families.record("batch selector", batch_fail);
+        families.record("singular selector", singular_fail);
+        families.finish("argmax-parity", negative)
     }
 }
