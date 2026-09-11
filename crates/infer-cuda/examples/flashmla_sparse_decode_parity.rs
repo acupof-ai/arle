@@ -418,12 +418,7 @@ mod real {
         let neg_lse = lse_good > PASS_MAX_ABS_LSE;
         let bad_self_consistent = rel_bad <= PASS_MAX_REL_OUT && lse_bad <= PASS_MAX_ABS_LSE;
 
-        // Pack family: flip the E8M0 scale byte for NoPE tile 0 of the first
-        // written token. The scale region is at block_base + PAGE*(NoPE+RoPE
-        // bytes), then row*8 + tile. Bit5 flips the e8m0 exponent by +-32,
-        // i.e. scale x2^+-32 across the whole 64-lane tile, so the tile-relative
-        // metric must read ~1 (a NoPE data byte only perturbs one lane and can
-        // stay under the tile bound).
+        // Flip the first written token's tile-0 E8M0 scale byte so the whole-tile ratio must read ~1.
         let mut corrupt = pool_bytes.clone();
         let neg_phys = (0..used.len())
             .find(|&p| used[p])
@@ -529,8 +524,7 @@ mod real {
         tables: &[i32],
     ) -> (bool, f64, f32, String) {
         let _ = tables;
-        // Worst NoPE tile location (see hca gate): correct packs <= ~0.062;
-        // an addressing/scale bug reports ~0.5-1.5 with the exact tile named.
+        // Worst NoPE tile coordinates, printed so a wrong pack is attributable on the next GPU run.
         let mut worst = String::new();
         let mut max_rel_nope = 0f64;
         let mut max_abs_rope = 0f32;
@@ -549,16 +543,7 @@ mod real {
                 } else {
                     2f32.powi(i32::from(e8m0) - 127)
                 };
-                // FP8 block scaling quantizes the tile against ONE shared scale
-                // (scale = 2^ceil(log2(amax/448))), so the meaningful error is
-                // the tile max absolute error relative to the tile amax — not a
-                // per-element relative error, which diverges near a zero value
-                // (random data crosses zero inside a tile and would report ~1
-                // for a correct pack). Exhaustive E4M3 RN bound for the tile
-                // amax element is 16/272 = 0.0588; the oracle compares against
-                // the f32 source while the kernel quantizes its bf16 rounding,
-                // adding <=1 fp8 unit, so the binding bound is 17/273 ~= 0.0623.
-                // 32/448 = 0.0714 is unreachable (448 is an exact grid point).
+                // tile max-abs error / tile amax: FP8 shares one scale per 64-lane tile, so per-lane /|want| diverges near zero.
                 let mut tile_amax = 0f32;
                 let mut tile_max_err = 0f32;
                 for lane in 0..64usize {
