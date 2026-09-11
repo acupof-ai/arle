@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(feature = "metal")]
-pub struct MetalSlotState {
+pub(crate) struct MetalSlotState {
     pub(super) slot: usize,
     pub(super) slot_epoch: u64,
     /// Session position: number of tokens whose `step_session` has been issued.

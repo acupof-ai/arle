@@ -181,7 +181,7 @@ fn probe_pipeline_fast_path() {
     ONCE.call_once(|| eprintln!("[infer-metal] pipeline fast path LIVE (overlapped decode)"));
 }
 
-pub enum MetalInflight {
+enum MetalInflight {
     Ready(StepOutput),
     #[cfg(feature = "metal")]
     Sampled {

@@ -90,7 +90,7 @@ pub struct MetalWeightOnlyResourceRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct MetalSystemStatus {
+struct MetalSystemStatus {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
     pub recommended_max_working_set_bytes: Option<usize>,

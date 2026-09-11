@@ -34,7 +34,7 @@ pub fn default_t2_budget_bytes(root: &std::path::Path, ssd_fraction: f64) -> usi
 /// never trips the store's oversize refusal.
 const PAGE_CODEC_HEADROOM: usize = 64 << 10;
 
-pub struct MetalPageStore {
+pub(crate) struct MetalPageStore {
     pub(super) pages: HashMap<u32, MetalPageBlock>,
     pub(super) prefixes: HashMap<Vec<u64>, MetalPrefixSnapshot>,
     pub(super) next_logical_id: u64,
@@ -58,7 +58,7 @@ impl Default for MetalPageStore {
 }
 
 #[derive(Clone)]
-pub struct MetalPageBlock {
+pub(crate) struct MetalPageBlock {
     pub(super) logical_id: u64,
     pub(super) owner: Option<MetalPageOwner>,
     /// Engine prefix content key, known once the page's tokens are published
@@ -68,14 +68,14 @@ pub struct MetalPageBlock {
 }
 
 #[derive(Clone, Copy)]
-pub struct MetalPageOwner {
+pub(crate) struct MetalPageOwner {
     pub(super) slot: usize,
     pub(super) slot_epoch: u64,
     pub(super) page_idx: usize,
 }
 
 #[derive(Clone)]
-pub struct MetalPrefixSnapshot {
+pub(crate) struct MetalPrefixSnapshot {
     pub(super) cache_len: usize,
     pub(super) gdr_flat: Vec<mlx::MlxArray>,
 }
@@ -785,7 +785,7 @@ impl<'a> PayloadReader<'a> {
     }
 }
 
-pub fn expected_array_nbytes(shape: &[i32], dtype: mlx::Dtype) -> anyhow::Result<usize> {
+fn expected_array_nbytes(shape: &[i32], dtype: mlx::Dtype) -> anyhow::Result<usize> {
     let mut elements = 1usize;
     for dim in shape {
         anyhow::ensure!(*dim >= 0, "negative MLX array dimension {dim}");
@@ -798,7 +798,7 @@ pub fn expected_array_nbytes(shape: &[i32], dtype: mlx::Dtype) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("MLX array byte size overflows usize: {shape:?}"))
 }
 
-pub fn dtype_size(dtype: mlx::Dtype) -> usize {
+pub(crate) fn dtype_size(dtype: mlx::Dtype) -> usize {
     match dtype {
         mlx::Dtype::Bool | mlx::Dtype::Uint8 | mlx::Dtype::Int8 => 1,
         mlx::Dtype::Uint16 | mlx::Dtype::Int16 | mlx::Dtype::Float16 | mlx::Dtype::Bfloat16 => 2,

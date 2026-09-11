@@ -189,7 +189,7 @@ impl MetalDflashRuntime {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DflashCompatError(String);
+struct DflashCompatError(String);
 
 impl std::fmt::Display for DflashCompatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -258,7 +258,7 @@ fn check_compatibility(
 /// head's own hidden output. The two branch once for the fc-input/norm + layer
 /// step and share the KV/rollback/verify machinery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DraftKind {
+enum DraftKind {
     DFlashEagle,
     Qwen35Mtp,
 }
@@ -1662,7 +1662,7 @@ pub(crate) fn materialize_i32_tokens(tokens: &MlxArray) -> Result<Vec<i32>> {
     Ok(tokens_i32.as_slice_i32().to_vec())
 }
 
-pub(crate) fn materialize_f32(values: &MlxArray) -> Result<Vec<f32>> {
+fn materialize_f32(values: &MlxArray) -> Result<Vec<f32>> {
     let values_f32 = if values.dtype() == mlx::Dtype::Float32 {
         values.clone()
     } else {

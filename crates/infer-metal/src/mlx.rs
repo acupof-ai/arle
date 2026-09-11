@@ -7,7 +7,7 @@
 use std::ffi::CStr;
 use std::os::raw::c_void;
 
-pub fn check_mlx_error() -> anyhow::Result<()> {
+pub(crate) fn check_mlx_error() -> anyhow::Result<()> {
     // SAFETY: mlx_last_error returned a non-null NUL-terminated bridge-owned string, read here before any further FFI.
     unsafe {
         let ptr = mlx_sys::mlx_last_error();
@@ -103,7 +103,7 @@ impl Dtype {
     }
 }
 
-pub struct MlxArray(*mut mlx_sys::mlx_array);
+pub(crate) struct MlxArray(*mut mlx_sys::mlx_array);
 
 impl Drop for MlxArray {
     fn drop(&mut self) {
@@ -299,7 +299,7 @@ pub fn reshape(a: &MlxArray, shape: &[i32]) -> MlxArray {
     )
 }
 
-pub fn transpose_all(a: &MlxArray) -> MlxArray {
+pub(crate) fn transpose_all(a: &MlxArray) -> MlxArray {
     // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
     mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_transpose(a.0) }, "mlx_transpose")
 }
@@ -312,7 +312,7 @@ pub fn transpose_axes(a: &MlxArray, axes: &[i32]) -> MlxArray {
     )
 }
 
-pub fn as_dtype(a: &MlxArray, dtype: Dtype) -> MlxArray {
+pub(crate) fn as_dtype(a: &MlxArray, dtype: Dtype) -> MlxArray {
     mlx_array_from_raw_or_panic(
         // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe { mlx_sys::mlx_astype(a.0, dtype.to_raw()) },
@@ -362,7 +362,12 @@ pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxA
     )
 }
 
-pub fn slice_update(src: &MlxArray, update: &MlxArray, start: &[i32], stop: &[i32]) -> MlxArray {
+pub(crate) fn slice_update(
+    src: &MlxArray,
+    update: &MlxArray,
+    start: &[i32],
+    stop: &[i32],
+) -> MlxArray {
     assert_eq!(
         start.len(),
         stop.len(),
@@ -385,7 +390,7 @@ pub fn slice_update(src: &MlxArray, update: &MlxArray, start: &[i32], stop: &[i3
     )
 }
 
-pub fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
+pub(crate) fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
     let raw: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     mlx_array_from_raw_or_panic(
         // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
@@ -399,7 +404,7 @@ pub fn argmax(a: &MlxArray) -> MlxArray {
     mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_argmax(a.0, false) }, "mlx_argmax")
 }
 
-pub fn argmax_axis(a: &MlxArray, axis: i32) -> MlxArray {
+pub(crate) fn argmax_axis(a: &MlxArray, axis: i32) -> MlxArray {
     mlx_array_from_raw_or_panic(
         // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe { mlx_sys::mlx_argmax_axis(a.0, axis, false) },
@@ -431,7 +436,7 @@ pub fn dequantize(
     )
 }
 
-pub fn quantized_matmul(
+pub(crate) fn quantized_matmul(
     x: &MlxArray,
     weight: &MlxArray,
     scales: &MlxArray,
@@ -468,7 +473,7 @@ pub fn eval(arrays: &[&MlxArray]) {
     panic_if_mlx_error("mlx_eval");
 }
 
-pub fn async_eval(arrays: &[&MlxArray]) {
+pub(crate) fn async_eval(arrays: &[&MlxArray]) {
     let raw: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
     unsafe {
@@ -477,21 +482,21 @@ pub fn async_eval(arrays: &[&MlxArray]) {
     panic_if_mlx_error("mlx_async_eval");
 }
 
-pub fn set_wired_limit_bytes(limit: u64) -> u64 {
+pub(crate) fn set_wired_limit_bytes(limit: u64) -> u64 {
     // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
     let previous = unsafe { mlx_sys::mlx_set_wired_limit(limit as usize) as u64 };
     panic_if_mlx_error("mlx_set_wired_limit");
     previous
 }
 
-pub fn set_memory_limit_bytes(limit: u64) -> u64 {
+pub(crate) fn set_memory_limit_bytes(limit: u64) -> u64 {
     // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
     let previous = unsafe { mlx_sys::mlx_set_memory_limit(limit as usize) as u64 };
     panic_if_mlx_error("mlx_set_memory_limit");
     previous
 }
 
-pub fn set_cache_limit_bytes(limit: u64) -> u64 {
+pub(crate) fn set_cache_limit_bytes(limit: u64) -> u64 {
     // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
     let previous = unsafe { mlx_sys::mlx_set_cache_limit(limit as usize) as u64 };
     panic_if_mlx_error("mlx_set_cache_limit");
@@ -532,7 +537,9 @@ pub fn recommended_max_working_set_size_bytes() -> Option<usize> {
     usize::try_from(bytes).ok().filter(|bytes| *bytes > 0)
 }
 
-pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<String, MlxArray>> {
+pub(crate) fn load_safetensors(
+    path: &str,
+) -> anyhow::Result<std::collections::HashMap<String, MlxArray>> {
     let path = std::ffi::CString::new(path)?;
     let mut names: *mut *const i8 = std::ptr::null_mut();
     let mut arrays: *mut *mut mlx_sys::mlx_array = std::ptr::null_mut();
