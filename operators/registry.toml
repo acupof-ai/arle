@@ -251,7 +251,8 @@ kind = "composite"
 inputs = ["q", "k_cache", "v_cache", "start_pos"]
 outputs = ["attn_out"]
 reference = "cuda.qwen35.attn_nonpaged_prefill"
-correctness_gate = "vendor-trusted: scripts/lever_gate.sh"
+correctness_gate = "vendor-trusted: scripts/lever_gate.sh; crates/infer-cuda/examples/fa2_sm70_parity.rs"
+gate_gap = "sm<80 contiguous-cache kernel (MTP spec head forward: qwen35_spec.rs:77/316 via full_attention_into; no page-table ABI — serving paged prefill/decode uses paged_attention_v1 instead). fa2_sm70_parity pending-remote on V100: GQA 8/2 and 24/4 at hd256 + hd128 contract, B=1/B=8 independent caches, decode and causal chunked prefill off the 16/64 tiles (3/67,17/129,33/201,65/500,129/777,...) and kv_len 4096 (decode all columns; long prefill sampled across every Bc tile), f64 SDPA oracle, per-family negative control. Not covered: real checkpoint activations; the legacy unit test stays for dense seq4"
 
 [[implementation]]
 id = "cuda.qwen35.attn_fa2_sm70"
