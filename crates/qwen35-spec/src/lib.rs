@@ -689,7 +689,7 @@ impl Qwen35Config {
         Ok(())
     }
 
-    pub fn model_prefix(&self) -> &'static str {
+    pub(crate) fn model_prefix(&self) -> &'static str {
         "model.language_model"
     }
 
@@ -930,7 +930,10 @@ impl Qwen35Config {
         Ok(())
     }
 
-    pub fn load_stop_token_ids(model_dir: impl AsRef<Path>, fallback_eos: u32) -> Result<Vec<u32>> {
+    pub(crate) fn load_stop_token_ids(
+        model_dir: impl AsRef<Path>,
+        fallback_eos: u32,
+    ) -> Result<Vec<u32>> {
         let generation_config_path = model_dir.as_ref().join("generation_config.json");
         let ids = match fs::read_to_string(&generation_config_path) {
             Ok(content) => {
