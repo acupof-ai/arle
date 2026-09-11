@@ -64,9 +64,8 @@ mod real {
         0x517c_c1cc_9e37_79b9,
         0x2545_f491_4f6c_dd1d,
     ];
-    /// Boundary shapes the repack must decline: N not %64 with K aligned. The
-    /// source has to stay resident and the dequant→BF16 fallback carry alone.
-    const DECLINED_SHAPES: &[(&str, usize, usize)] = &[("declined n%64", 96, 5120)];
+    /// Shapes the layout planner must decline: N not %64 with K aligned.
+    const DECLINED_SHAPES: &[(&str, usize, usize)] = &[("planner declines n%64", 96, 5120)];
     // Marlin lane must not exceed the fallback lane's f32-anchored error by more
     // than this factor — both share the INT8 group-quant floor, so a correct
     // Marlin lane tracks the fallback closely. A blown ratio = wrong repack/perm.
@@ -343,10 +342,7 @@ mod real {
         Ok((!pass, deq_err))
     }
 
-    /// A shape the repack must decline: the source stays resident and the
-    /// dequant→BF16 fallback carries every M against the f32 reference alone.
-    /// The error band is the accepted shapes' own fallback floor, not a
-    /// magic constant: same lane, same band.
+    /// A declined shape: planner returns no Marlin transform; the dequant→BF16 fallback alone carries every M against the f32 reference.
     fn probe_declined(
         ctx: &DeviceContext,
         label: &str,
@@ -360,20 +356,24 @@ mod real {
         let w_host: Vec<f32> = (0..n * k).map(|_| rng.normal() * 0.1).collect();
         let (q, s) = per_group_int8(&w_host, n, k);
 
-        let mut weight = DeviceMatrix::from_quantized_int8(ctx, &q, &s, n, k, GROUP)?;
-        weight.repack_for_marlin_w8a16(ctx)?;
-        if weight.marlin_packed.is_some() {
+        let weight = DeviceMatrix::from_quantized_int8(ctx, &q, &s, n, k, GROUP)?;
+
+        // Query the same layout decision the loader makes.
+        let plan = infer_quant::plan_weight_layout(
+            &infer_quant::WeightLayoutQuery::from(&weight),
+            &infer_quant::DeviceCaps {
+                compute_capability: ctx.compute_capability(),
+            },
+            &infer_quant::LayoutPolicy::default(),
+        )?;
+        if plan.transform != infer_quant::RepackTransform::None {
             eprintln!(
-                "[{label} n={n} k={k} seed={seed:#x}] expected repack decline, \
-                 got a Marlin layout — shape is no longer a boundary"
+                "[{label} n={n} k={k} seed={seed:#x}] expected planner decline, \
+                 got transform {:?} — planner W8A16 N%64 boundary regressed",
+                plan.transform
             );
             return Ok(true);
         }
-        ensure!(
-            weight.qweight.is_some() && weight.qscales.is_some(),
-            "[{label}] repack declined but released the source — no route can serve this shape"
-        );
-
         let mut any_fail = false;
         for &m in M_SWEEP {
             let mut seed_m = shape_seed(seed, label, n, k);

@@ -98,9 +98,8 @@ mod real {
         0x2545_f491_4f6c_dd1d,
     ];
 
-    /// Boundary shapes the repack must decline: N not %64 with K aligned. The
-    /// source has to stay resident and the GEMV lane carry the shape alone.
-    const DECLINED_SHAPES: &[(&str, usize, usize)] = &[("declined n%64", 96, 5120)];
+    /// Shapes the layout planner must decline: N not %64 with K aligned.
+    const DECLINED_SHAPES: &[(&str, usize, usize)] = &[("planner declines n%64", 96, 5120)];
 
     /// The host reference costs `M_max * K` f64 FMAs per output column, so it is
     /// computed over a sampled column set instead of all N: two contiguous slabs
@@ -570,8 +569,7 @@ mod real {
         Ok((marlin_failed, gemv_failed))
     }
 
-    /// A shape the repack must decline: assert the source stays resident and
-    /// the GEMV lane carries every M against the f64 reference alone.
+    /// A declined shape: planner returns no Marlin transform; the scalar GEMV lane alone carries every M against the f64 reference.
     fn probe_declined(
         ctx: &DeviceContext,
         label: &str,
@@ -588,19 +586,24 @@ mod real {
 
         let (cols, reference) = build_reference(&qbytes, &scales, n, k, m_max, &x_bf16);
 
-        let mut weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
-        weight.repack_for_marlin_fp8(ctx)?;
-        if weight.marlin_packed.is_some() || weight.marlin_scales.is_some() {
+        let weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
+
+        // Query the same layout decision the loader makes.
+        let plan = infer_quant::plan_weight_layout(
+            &infer_quant::WeightLayoutQuery::from(&weight),
+            &infer_quant::DeviceCaps {
+                compute_capability: ctx.compute_capability(),
+            },
+            &infer_quant::LayoutPolicy::default(),
+        )?;
+        if plan.transform != infer_quant::RepackTransform::None {
             eprintln!(
-                "[{label} n={n} k={k} seed={seed:#x}] expected repack decline, \
-                 got a Marlin layout — shape is no longer a boundary"
+                "[{label} n={n} k={k} seed={seed:#x}] expected planner decline, \
+                 got transform {:?} — planner N%64 boundary regressed",
+                plan.transform
             );
             return Ok(true);
         }
-        ensure!(
-            weight.qweight_u8.is_some() && weight.scale_f32.is_some(),
-            "[{label}] repack declined but released the source — no route can serve this shape"
-        );
 
         let x = ctx.stream.clone_htod(&x_bf16)?;
         let mut any_fail = false;
@@ -614,7 +617,7 @@ mod real {
             any_fail |= !pass;
             eprintln!(
                 "[{label} m={m:>3} n={n} k={k} seed={seed:#x}] \
-                 declined gemv relL2={:.4e} max/rms={:.4e} mean(out/ref)={:.6} {}",
+                 declined-planner gemv relL2={:.4e} max/rms={:.4e} mean(out/ref)={:.6} {}",
                 gs.rel_l2,
                 gs.max_over_rms,
                 gs.mean_ratio,
