@@ -643,10 +643,6 @@ mlx_array* mlx_matmul(mlx_array* a, mlx_array* b) {
     MLX_TRY_RETURN(from_arr(matmul(*to_arr(a), *to_arr(b))));
 }
 
-mlx_array* mlx_exp(mlx_array* a) {
-    MLX_TRY_RETURN(from_arr(exp(*to_arr(a))));
-}
-
 mlx_array* mlx_negative(mlx_array* a) {
     MLX_TRY_RETURN(from_arr(negative(*to_arr(a))));
 }
@@ -661,14 +657,6 @@ mlx_array* mlx_reciprocal(mlx_array* a) {
 
 mlx_array* mlx_sigmoid(mlx_array* a) {
     MLX_TRY_RETURN(from_arr(sigmoid(*to_arr(a))));
-}
-
-mlx_array* mlx_tanh(mlx_array* a) {
-    MLX_TRY_RETURN(from_arr(tanh(*to_arr(a))));
-}
-
-mlx_array* mlx_erf(mlx_array* a) {
-    MLX_TRY_RETURN(from_arr(erf(*to_arr(a))));
 }
 
 mlx_array* mlx_reshape(mlx_array* a, const int32_t* shape, size_t ndim) {

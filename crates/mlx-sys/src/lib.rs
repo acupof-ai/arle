@@ -84,13 +84,10 @@ unsafe extern "C" {
     pub fn mlx_multiply(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_matmul(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
 
-    pub fn mlx_exp(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_negative(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_sqrt(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_reciprocal(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_sigmoid(a: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_tanh(a: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_erf(a: *mut mlx_array) -> *mut mlx_array;
 
     pub fn mlx_reshape(a: *mut mlx_array, shape: *const i32, ndim: usize) -> *mut mlx_array;
     pub fn mlx_transpose(a: *mut mlx_array) -> *mut mlx_array;
