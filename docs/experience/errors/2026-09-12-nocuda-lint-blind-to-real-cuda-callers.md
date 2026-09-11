@@ -44,6 +44,21 @@ one.
 - Verification: pod `cargo check --workspace --features cuda,nccl --all-targets`
   with no `no-cuda` — `CUDA_CHECK_EXIT=0`.
 
+## Second instance: feature-gated caller in the root crate (Vulkan)
+
+The same blind-spot class broke the Vulkan build the same day.
+`infer_vulkan::forward::set_submit_cap` (added in `ff84fd0b6`) was deleted as
+a zero-caller item in `9df269d1a` (#344, "gate test-only items with
+cfg(test)…"), which collapsed the `AtomicUsize` cap to a private `const`. Its
+only caller lives in the **root crate** at `src/backends/vulkan.rs:18`, behind
+the root `vulkan` feature. A per-crate `infer-vulkan` clippy never compiles
+the root crate, and the other feature sets don't compile `src/backends
+/vulkan.rs`, so the missing cross-crate symbol was invisible. Found by the
+feature-matrix sweep `cargo check --features vulkan,no-cuda` (E0425); fix
+restores the `AtomicUsize` and the `pub fn set_submit_cap`. Same rule: a
+"zero callers" deletion must grep the code that is compiled under every
+feature the item is visible to, including root-crate feature gates.
+
 ## Rule
 
 For any crate whose CUDA code is `#[cfg(not(feature = "no-cuda"))]`, the
