@@ -50,13 +50,16 @@
 //!   INFER_CUDA_DEVICE=<free-sm90-gpu> target/release/examples/deepgemm_grouped_prefill_parity --negative-control
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -70,7 +73,7 @@ mod real {
 
 #[cfg(feature = "cuda")]
 mod real {
-    use anyhow::{Result, ensure};
+    use anyhow::Result;
     use cuda_kernels::moe::{
         dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous, dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked,
     };
@@ -78,6 +81,8 @@ mod real {
     use cuda_kernels::tensor::RawDevicePtr;
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
+
+    use super::parity_common::{Families, Rng};
 
     const SEED: u64 = 0xdee9_6e44_2024_0911;
 
@@ -105,27 +110,13 @@ mod real {
     const OUT_ABS_SLOPE: f32 = 1.0e-1;
     const OUT_ABS_FLOOR: f32 = 2e-2;
 
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn uniform(&mut self, lo: f32, hi: f32) -> f32 {
-            lo + (hi - lo) * self.unit()
-        }
-        /// Random e4m3 byte that is never a NaN code.
-        fn fp8(&mut self) -> u8 {
-            (self.next_u64() as u8) & 0x7e
-        }
+    fn uniform(rng: &mut Rng, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * rng.unit()
+    }
+
+    /// Random e4m3 byte that is never a NaN code.
+    fn fp8(rng: &mut Rng) -> u8 {
+        (rng.next_u64() as u8) & 0x7e
     }
 
     fn e4m3_decode(b: u8) -> f32 {
@@ -177,8 +168,8 @@ mod real {
 
     fn build_band(rng: &mut Rng, valid: usize, k: usize, n: usize, zero_weights: bool) -> Band {
         let kb = k / BLOCK;
-        let a_q: Vec<u8> = (0..M_CAP * k).map(|_| rng.fp8()).collect();
-        let a_scale: Vec<f32> = (0..kb).map(|_| rng.uniform(0.03, 0.15)).collect();
+        let a_q: Vec<u8> = (0..M_CAP * k).map(|_| fp8(rng)).collect();
+        let a_scale: Vec<f32> = (0..kb).map(|_| uniform(rng, 0.03, 0.15)).collect();
         if zero_weights {
             return Band {
                 a_q,
@@ -190,8 +181,8 @@ mod real {
             };
         }
         let nb = n / BLOCK;
-        let b_q: Vec<u8> = (0..n * k).map(|_| rng.fp8()).collect();
-        let b_scale: Vec<f32> = (0..nb * kb).map(|_| rng.uniform(0.03, 0.15)).collect();
+        let b_q: Vec<u8> = (0..n * k).map(|_| fp8(rng)).collect();
+        let b_scale: Vec<f32> = (0..nb * kb).map(|_| uniform(rng, 0.03, 0.15)).collect();
         Band {
             a_q,
             a_scale,
@@ -636,29 +627,16 @@ mod real {
             if negative { " NEGATIVE-CONTROL" } else { "" }
         );
 
-        let mut masked_ok = true;
-        let mut contiguous_ok = true;
+        let mut masked_fail = false;
+        let mut contiguous_fail = false;
         for &(n, k, geom) in GEOMS {
-            masked_ok &= run_masked(&ctx, n, k, geom, negative)?;
-            contiguous_ok &= run_contiguous(&ctx, n, k, geom, negative)?;
+            masked_fail |= !run_masked(&ctx, n, k, geom, negative)?;
+            contiguous_fail |= !run_contiguous(&ctx, n, k, geom, negative)?;
         }
 
-        if negative {
-            ensure!(!masked_ok, "negative control did NOT fail the masked path");
-            ensure!(
-                !contiguous_ok,
-                "negative control did NOT fail the contiguous path"
-            );
-            eprintln!(
-                "[deepgemm-grouped-parity] NEGATIVE CONTROL OK (both paths failed as required)"
-            );
-            return Ok(());
-        }
-        ensure!(
-            masked_ok && contiguous_ok,
-            "deepgemm_grouped_prefill_parity FAILED — see violations above"
-        );
-        eprintln!("[deepgemm-grouped-parity] ALL PASS");
-        Ok(())
+        let mut families = Families::new();
+        families.record("masked path", masked_fail);
+        families.record("contiguous path", contiguous_fail);
+        families.finish("deepgemm-grouped-parity", negative)
     }
 }

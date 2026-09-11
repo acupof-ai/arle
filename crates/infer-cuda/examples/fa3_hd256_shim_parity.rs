@@ -64,29 +64,32 @@
 #[path = "support/attn_common.rs"]
 mod attn_common;
 
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
+
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
-    }
-    let mut negative: Option<Option<Family>> = None;
-    for arg in std::env::args().skip(1) {
-        if arg == "--negative-control" {
-            negative = Some(None);
-        } else if let Some(v) = arg.strip_prefix("--negative-control=") {
-            let sel = match v {
-                "bf16" => Family::Bf16,
-                "int8" => Family::Int8,
-                "fp8-dequant" => Family::Fp8Dequant,
-                "fp8-requant" => Family::Fp8Requant,
-                other => anyhow::bail!("unknown --negative-control family {other:?}"),
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => {
+            let sel = match cli.negative_value.as_deref() {
+                Some("bf16") => Family::Bf16,
+                Some("int8") => Family::Int8,
+                Some("fp8-dequant") => Family::Fp8Dequant,
+                Some("fp8-requant") => Family::Fp8Requant,
+                Some(other) => anyhow::bail!("unknown --negative-control family {other:?}"),
+                None => Family::Bf16,
             };
-            negative = Some(Some(sel));
-        } else {
-            anyhow::bail!("unknown argument {arg:?}");
+            // Bare flag corrupts every family; `=form` selects just that one.
+            let negative = if cli.negative {
+                Some((cli.negative_value.is_some()).then_some(sel))
+            } else {
+                None
+            };
+            real::run(negative)
         }
     }
-    real::run(negative)
 }
 
 /// Negative-control families are the four shim FORMS. The fp8 pool has two

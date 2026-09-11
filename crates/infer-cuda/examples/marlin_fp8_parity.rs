@@ -36,13 +36,16 @@
 //! prints NEGATIVE CONTROL OK and exits 0.
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -60,6 +63,8 @@ mod real {
     use cuda_kernels::tensor::DeviceMatrix;
     use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::bf16;
+
+    use super::parity_common::Rng;
 
     /// (label, N = output dim / weight rows, K = contraction / weight cols).
     ///
@@ -114,29 +119,6 @@ mod real {
     /// passes when BOTH lanes are broken; this catches that. The expected floor
     /// is the BF16 output rounding, rms 2^-9/sqrt(3) ≈ 1.1e-3.
     const MAX_REL_L2: f64 = 8e-3;
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            // xorshift64*
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn normal(&mut self) -> f32 {
-            // Box–Muller, one sample.
-            let u1 = self.unit().max(1e-7);
-            let u2 = self.unit();
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
-    }
 
     /// Round-half-to-even, matching the device `__nv_fp8_e4m3` conversion.
     fn rint_ne(x: f32) -> u8 {
@@ -328,6 +310,14 @@ mod real {
         /// Scalar GEMV lane (carries the declined-shape band alone).
         gemv_lane: bool,
     }
+    impl Families {
+        fn entries(self) -> [(&'static str, bool); 2] {
+            [
+                ("marlin lane", self.marlin_lane),
+                ("gemv lane", self.gemv_lane),
+            ]
+        }
+    }
 
     pub(super) fn run(negative: bool) -> Result<()> {
         let ctx = DeviceContext::new()?;
@@ -368,26 +358,11 @@ mod real {
             }
         }
 
-        if negative {
-            ensure!(
-                fams.marlin_lane,
-                "marlin_fp8_parity negative control did NOT fail family: marlin lane"
-            );
-            ensure!(
-                fams.gemv_lane,
-                "marlin_fp8_parity negative control did NOT fail family: gemv lane"
-            );
-            eprintln!(
-                "[marlin-fp8-parity] NEGATIVE CONTROL OK (both comparator families failed as required)"
-            );
-            return Ok(());
+        let mut families = super::parity_common::Families::new();
+        for (name, fired) in fams.entries() {
+            families.record(name, fired);
         }
-        ensure!(
-            !fams.marlin_lane && !fams.gemv_lane,
-            "marlin_fp8_parity FAILED — see violations above"
-        );
-        eprintln!("[marlin-fp8-parity] ALL PASS");
-        Ok(())
+        families.finish("marlin-fp8-parity", negative)
     }
 
     /// FNV-mix the fixed seed with the shape identity so every (seed, shape)

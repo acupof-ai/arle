@@ -43,13 +43,16 @@
 //! `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/moe_routing_parity`
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -61,7 +64,7 @@ mod real {
 
 #[cfg(feature = "cuda")]
 mod real {
-    use anyhow::{Result, ensure};
+    use anyhow::Result;
     use cuda_kernels::moe;
     use cuda_kernels::prelude::DeviceContext;
     use cuda_kernels::tensor::cache_ptr;
@@ -297,8 +300,10 @@ mod real {
         if negative {
             // Per-family teeth: one pipeline per mode (mid geometry), then six
             // one-sided sabotages, each of which only its own comparator must
-            // catch. The run prints NEGATIVE CONTROL OK and exits 0, like
-            // argmax/gdr parity — the teeth are asserted inside, not via status.
+            // catch. Only the six sabotaged families are asserted here; totals
+            // and m_indices share the offsets/counts comparators and get their
+            // teeth transitively, so this gate's negative control is not shaped
+            // as all-eight-must-fail and stays on its bespoke tail.
             for &mode in MODES {
                 let bundle = pipeline(&ctx, mode, 8, 64)?;
                 verify_negative_teeth(&bundle)?;
@@ -308,7 +313,8 @@ mod real {
         }
 
         const MAX_EXEMPT_FRACTION: f64 = 0.05;
-        let mut any_fail = false;
+        let mut fam_failed = [false; 8];
+        let mut exempt_overflow = false;
         for &mode in MODES {
             for &num_tokens in TOKEN_COUNTS {
                 for &ep in EXPERTS_PER_RANK {
@@ -321,12 +327,14 @@ mod real {
                     for f in Family::all() {
                         if !f.get(&fam) {
                             row_fail = true;
+                            fam_failed[f.idx()] = true;
                         }
                     }
                     if mode == Mode::ScoreDecides {
                         let frac = fam.near_tie_exemptions as f64 / num_tokens.max(1) as f64;
                         if frac > MAX_EXEMPT_FRACTION {
                             row_fail = true;
+                            exempt_overflow = true;
                             eprintln!(
                                 "[mode={mode:?} tokens={num_tokens} ep={ep}] FAIL near-tie {n_ex}/{n_tok} = {frac:.2}",
                                 n_ex = fam.near_tie_exemptions,
@@ -340,16 +348,18 @@ mod real {
                             b.n_local, fam.near_tie_exemptions, fam.combine_worst,
                         );
                     }
-                    any_fail |= row_fail;
                 }
             }
         }
-        ensure!(
-            !any_fail,
+        anyhow::ensure!(
+            !exempt_overflow,
             "moe_routing_parity FAILED — see violations above"
         );
-        eprintln!("[moe-routing-parity] ALL PASS");
-        Ok(())
+        let mut families = super::parity_common::Families::new();
+        for f in Family::all() {
+            families.record(f.name(), fam_failed[f.idx()]);
+        }
+        families.finish("moe-routing-parity", false)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -903,6 +913,32 @@ mod real {
                 "weights" => Family::Weights,
                 "combine" => Family::Combine,
                 other => panic!("unknown family {other}"),
+            }
+        }
+        /// Stable index into the per-run fail array, matching `all()`.
+        fn idx(self) -> usize {
+            match self {
+                Family::Route => 0,
+                Family::Counts => 1,
+                Family::Offsets => 2,
+                Family::Totals => 3,
+                Family::Pack => 4,
+                Family::MIndices => 5,
+                Family::Weights => 6,
+                Family::Combine => 7,
+            }
+        }
+        /// Human family name used in the shared aggregator.
+        fn name(self) -> &'static str {
+            match self {
+                Family::Route => "route",
+                Family::Counts => "counts",
+                Family::Offsets => "offsets",
+                Family::Totals => "totals",
+                Family::Pack => "pack",
+                Family::MIndices => "m_indices",
+                Family::Weights => "weights",
+                Family::Combine => "combine",
             }
         }
         fn get(&self, f: &Families) -> bool {

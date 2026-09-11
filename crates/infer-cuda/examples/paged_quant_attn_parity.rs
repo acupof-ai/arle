@@ -57,26 +57,22 @@
 mod attn_common;
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
-    }
-    let mut negative: Option<Option<Family>> = None;
-    for arg in std::env::args().skip(1) {
-        if arg == "--negative-control" {
-            negative = Some(None);
-        } else if let Some(v) = arg.strip_prefix("--negative-control=") {
-            let sel = match v {
-                "int8" => Family::Int8,
-                "fp8" => Family::Fp8,
-                other => anyhow::bail!("unknown --negative-control family {other:?}"),
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => {
+            // The two production pool dtypes are the two gate families.
+            let sel = match cli.negative_value.as_deref() {
+                None if cli.negative => None,
+                Some("int8") => Some(Family::Int8),
+                Some("fp8") => Some(Family::Fp8),
+                Some(other) => anyhow::bail!("unknown --negative-control family {other:?}"),
+                None => None,
             };
-            negative = Some(Some(sel));
-        } else {
-            anyhow::bail!("unknown argument {arg:?}");
+            let negative = if cli.negative { Some(sel) } else { None };
+            real::run(negative)
         }
     }
-    real::run(negative)
 }
 
 /// The two production pool dtypes are the two gate families.
@@ -85,6 +81,10 @@ enum Family {
     Int8,
     Fp8,
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
