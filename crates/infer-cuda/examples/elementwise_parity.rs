@@ -313,9 +313,12 @@ mod real {
                 ctx.sync()?;
                 let first_got = ctx.stream.clone_dtoh(&first_d)?;
                 let second_got = ctx.stream.clone_dtoh(&second_d)?;
-                let mut first_want: Vec<bf16> = fused[..rows * inter].to_vec();
+                // split2 gathers each row's first half per row, like second_want below.
+                let mut first_want = Vec::with_capacity(rows * inter);
                 let mut second_want = Vec::with_capacity(rows * inter);
                 for lane in 0..rows {
+                    first_want
+                        .extend_from_slice(&fused[lane * 2 * inter..lane * 2 * inter + inter]);
                     second_want.extend_from_slice(
                         &fused[lane * 2 * inter + inter..(lane + 1) * 2 * inter],
                     );
