@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// durable on power loss. Callers must flush the data the manifest references
 /// (e.g. [`KvMmapStore::flush`]) BEFORE calling this, so a crash never replays
 /// a manifest onto unflushed slots.
-pub fn write_file_atomic_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_file_atomic_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_file_atomic_impl(path, bytes, true)
 }
 
@@ -84,7 +84,7 @@ fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Resul
 /// called, so blocks allocate only for written pages (a 274 GB store with 10
 /// pages occupied costs ~23 MB on disk). Writes memcpy into the mapping; reads
 /// return `&[u8]` slices directly from the mapping (zero-copy).
-pub struct KvMmapStore {
+pub(crate) struct KvMmapStore {
     /// The file keeping the backing store alive (mmap pins it open).
     _file: std::fs::File,
     mapping: memmap2::MmapMut,
@@ -190,24 +190,24 @@ impl KvMmapStore {
         })
     }
 
-    pub fn num_slots(&self) -> u32 {
+    pub(crate) fn num_slots(&self) -> u32 {
         self.num_slots
     }
 
-    pub fn slot_bytes(&self) -> usize {
+    pub(crate) fn slot_bytes(&self) -> usize {
         self.slot_bytes
     }
 
-    pub fn alloc_slot(&mut self) -> Option<u32> {
+    pub(crate) fn alloc_slot(&mut self) -> Option<u32> {
         self.free_list.pop()
     }
 
-    pub fn available_slots(&self) -> usize {
+    pub(crate) fn available_slots(&self) -> usize {
         self.free_list.len()
     }
 
     /// Trailing bytes are left untouched; callers track the valid length.
-    pub fn write_slot(&mut self, slot: u32, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_slot(&mut self, slot: u32, data: &[u8]) -> io::Result<()> {
         assert!(
             data.len() <= self.slot_bytes,
             "write_slot: data len {} > slot_bytes {}",
@@ -220,7 +220,7 @@ impl KvMmapStore {
     }
 
     /// Zero-copy read: the returned slice borrows the mapping.
-    pub fn read_slot(&self, slot: u32) -> &[u8] {
+    pub(crate) fn read_slot(&self, slot: u32) -> &[u8] {
         assert!(
             (slot as usize) < self.num_slots as usize,
             "read_slot: slot {slot} >= num_slots {}",
@@ -233,11 +233,11 @@ impl KvMmapStore {
     /// Cost is proportional to dirty pages, not the sparse file's logical size.
     /// The durable recall tier calls this before persisting the manifest that
     /// names the slots — the data-before-manifest ordering barrier.
-    pub fn flush(&self) -> io::Result<()> {
+    pub(crate) fn flush(&self) -> io::Result<()> {
         self.mapping.flush()
     }
 
-    pub fn free_slot(&mut self, slot: u32) {
+    pub(crate) fn free_slot(&mut self, slot: u32) {
         if !self.free_list.contains(&slot) {
             self.free_list.push(slot);
         }

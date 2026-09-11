@@ -1361,7 +1361,7 @@ impl KvTierStore {
         )
     }
 
-    pub fn available_pages(&self) -> usize {
+    pub(crate) fn available_pages(&self) -> usize {
         let disk_available = self
             .disk
             .as_ref()
@@ -1423,15 +1423,6 @@ impl KvTierStore {
             host_demoted: self.host_read_hits,
             disk: self.disk_read_hits,
         }
-    }
-
-    pub fn is_full(&self) -> bool {
-        let host_full = self.host.len() >= self.host_capacity_pages;
-        let disk_full = self
-            .disk
-            .as_ref()
-            .is_none_or(|d| d.store.available_slots() == 0 || !d.accepting_writes);
-        host_full && disk_full
     }
 
     pub fn contains(&self, key: u64) -> bool {
