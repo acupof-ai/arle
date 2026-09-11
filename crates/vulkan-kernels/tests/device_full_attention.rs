@@ -13,9 +13,12 @@
 //! f32-in/f32-out (tight tolerance); flash_attn stores K/V as f16 and accumulates
 //! the online softmax in f32, so its tolerance is looser (f16 K/V rounding).
 //!
-//! Runs only with `--features vulkan` + a working device; skips cleanly
-//! otherwise.
+//! Runs only with `--features vulkan` + a working device; without one it
+//! skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to make a missing
+//! device panic instead (so CI cannot pass by skipping all gates).
 #![cfg(feature = "vulkan")]
+
+mod common;
 
 use vulkan_kernels::{
     FlashAttentionSpec, Kernel, KernelCache, KernelParams, flash_attn_dispatch, flash_attn_params,
@@ -203,12 +206,8 @@ fn host_rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 
 #[test]
 fn rope_neox_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping rope_neox oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan rope_neox proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();
@@ -272,12 +271,8 @@ fn rope_neox_matches_host_oracle() {
 
 #[test]
 fn per_head_rms_norm_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping per-head rms_norm oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!(
         "ARLE Vulkan per-head rms_norm proof on: {}",
@@ -358,12 +353,8 @@ fn host_sdpa_f16kv(q: &[f32], k: &[Vec<f32>], v: &[Vec<f32>], scale: f32) -> Vec
 
 #[test]
 fn sigmoid_mul_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping sigmoid_mul oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan sigmoid_mul proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();
@@ -427,12 +418,8 @@ fn sigmoid_mul_matches_host_oracle() {
 
 #[test]
 fn flash_attn_matches_host_sdpa_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping flash_attn oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan flash_attn proof on: {}", ctx.device_name());
     let (sg, sg_min, sg_max) = ctx.subgroup_size();
@@ -502,4 +489,213 @@ fn flash_attn_matches_host_sdpa_oracle() {
         );
     }
     let _ = KernelParams::empty();
+}
+
+/// Served full-attention geometry: `Qwen3.6-27B-Q8_0` on the Vulkan path is
+/// hd256 with 24 query heads / 4 KV heads (GQA group 6). The flash shader is
+/// specialized with gqa_ratio=1, so the forward maps GQA on the host
+/// (`forward.rs` `let kvh = hh / group`, one ranged K/V plane descriptor per
+/// KV head) and dispatches it once per query head. This test reproduces that
+/// exactly: 4 separate K/V planes, one dispatch per query head against plane
+/// `qh / 6`, and the oracle asserts the mapping. Cache lengths cover the
+/// decode boundaries (1, intra-tile 9, tile 128, cross-tile 257) plus one
+/// 4096 long-context case.
+#[test]
+fn flash_attn_hd256_gqa_matches_host_sdpa_oracle() {
+    let Some(ctx) = common::require_device() else {
+        return;
+    };
+    eprintln!(
+        "ARLE Vulkan flash_attn hd256 GQA 24q/4kv proof on: {}",
+        ctx.device_name()
+    );
+    let mut cache = KernelCache::new();
+    let mut rng = Rng(0xF1A5_2560_DEAD_BEEF);
+
+    const HD: usize = 256; // served head_dim (HSK = HSV)
+    const NQ: usize = 24; // num_attention_heads
+    const NKV: usize = 4; // num_key_value_heads
+    const GROUP: usize = NQ / NKV; // query heads per KV head
+    let scale = 1.0f32 / (HD as f32).sqrt();
+
+    for &kv_len in &[1usize, 9, 128, 257, 4096] {
+        // The 4096 case runs one full GQA group (2 heads share KV plane 0); the
+        // short cases run all 24 heads so every qh -> qh/6 mapping is checked.
+        let query_heads: Vec<usize> = if kv_len == 4096 {
+            vec![0, GROUP - 1]
+        } else {
+            (0..NQ).collect()
+        };
+
+        // One independent K/V plane per KV head.
+        let planes: Vec<(Vec<f32>, Vec<f32>)> = (0..NKV)
+            .map(|_| {
+                let k: Vec<f32> = (0..kv_len * HD).map(|_| rng.next_f32()).collect();
+                let v: Vec<f32> = (0..kv_len * HD).map(|_| rng.next_f32()).collect();
+                (k, v)
+            })
+            .collect();
+        let plane_bufs: Vec<(DeviceBuffer, DeviceBuffer)> = planes
+            .iter()
+            .map(|(k, v)| (upload_f16(&ctx, k), upload_f16(&ctx, v)))
+            .collect();
+
+        for &qh in &query_heads {
+            let kvh = qh / GROUP;
+            let q: Vec<f32> = (0..HD).map(|_| rng.next_f32()).collect();
+            let k_rows: Vec<Vec<f32>> = (0..kv_len)
+                .map(|t| planes[kvh].0[t * HD..(t + 1) * HD].to_vec())
+                .collect();
+            let v_rows: Vec<Vec<f32>> = (0..kv_len)
+                .map(|t| planes[kvh].1[t * HD..(t + 1) * HD].to_vec())
+                .collect();
+            let want = host_sdpa_f16kv(&q, &k_rows, &v_rows, scale);
+
+            let buf_q = upload_f32(&ctx, &q);
+            let buf_mask = upload_f16(&ctx, &[0.0f32]);
+            let buf_sinks = upload_f32(&ctx, &[0.0f32]);
+            let buf_out = upload_f32(&ctx, &vec![0.0f32; HD]);
+            let buf_mask_opt = upload_i32(&ctx, &[0]);
+
+            let spec = FlashAttentionSpec::f32_f16(HD as u32);
+            let push = flash_attn_params(HD as u32, HD as u32, kv_len as u32, scale).to_le_bytes();
+            launch_cached(
+                &mut cache,
+                &ctx,
+                Kernel::FlashAttn,
+                &[
+                    &buf_q,
+                    &plane_bufs[kvh].0,
+                    &plane_bufs[kvh].1,
+                    &buf_mask,
+                    &buf_sinks,
+                    &buf_out,
+                    &buf_mask_opt,
+                ],
+                flash_attn_dispatch(),
+                &push,
+                spec.specialization_u32(),
+            )
+            .expect("flash_attn hd256 gqa dispatch");
+            assert_close(
+                &format!("flash_attn_hd256 qh={qh} kvh={kvh} kv_len={kv_len}"),
+                &read_f32(&buf_out, HD),
+                &want,
+                2e-3,
+                5e-3,
+            );
+        }
+    }
+}
+
+/// Production full-attention head geometry: hd256 with PARTIAL rotary
+/// `rope.dimension_count = 64` (the HF→GGUF convention bug fixed in
+/// `324dbaff`; the served 27B ships 64 per `config.rs`). The hd256 full-row
+/// rope test above rotates all 256 dims.
+///
+/// The llama.cpp rope shader only writes the `rotary_dim` prefix; elements
+/// beyond it are copied implicitly because the serving call is IN-PLACE
+/// (`forward.rs` passes in_off == out_off). The test binds one buffer for
+/// input and output exactly like the forward.
+#[test]
+fn rope_neox_hd256_partial64_matches_host_oracle() {
+    let Some(ctx) = common::require_device() else {
+        return;
+    };
+    eprintln!(
+        "ARLE Vulkan rope_neox hd256/rotary64 proof on: {}",
+        ctx.device_name()
+    );
+    let mut cache = KernelCache::new();
+    let mut rng = Rng(0x20FE_6425_6000_0001);
+
+    let head_dim = 256usize;
+    let rotary_dim = 64usize;
+    let theta = 1.0e7f32;
+    for &pos in &[0usize, 1, 128, 4095] {
+        let nrows = 2usize;
+        let x: Vec<f32> = (0..nrows * head_dim).map(|_| rng.next_f32()).collect();
+        let mut want = vec![0.0f32; nrows * head_dim];
+        for r in 0..nrows {
+            let row = &x[r * head_dim..(r + 1) * head_dim];
+            let mut full = row.to_vec();
+            let rotated = host_rope_neox(row, pos, rotary_dim, theta);
+            full[..rotary_dim].copy_from_slice(&rotated[..rotary_dim]);
+            want[r * head_dim..(r + 1) * head_dim].copy_from_slice(&full);
+        }
+
+        // In-place like the forward: the SAME buffer occupies the input (0)
+        // and output (3) descriptor slots; the unrotated tail already lives
+        // there. Binding one buffer in two slots is legal (the forward does it
+        // via two ranged descriptors into one arena buffer at one offset).
+        let buf_xd = upload_f32(&ctx, &x);
+        let buf_pos = upload_i32(&ctx, &vec![pos as i32; nrows]);
+        let buf_ff = upload_f32(&ctx, &[0.0f32]);
+        let buf_idx = upload_i32(&ctx, &[0, 0]);
+        let push =
+            rope_neox_params(head_dim as u32, rotary_dim as u32, nrows as u32, theta).to_le_bytes();
+        launch_cached(
+            &mut cache,
+            &ctx,
+            Kernel::RopeNeox,
+            &[&buf_xd, &buf_pos, &buf_ff, &buf_xd, &buf_idx],
+            rope_neox_dispatch(rotary_dim as u32, nrows as u32),
+            &push,
+            Kernel::RopeNeox.specialization_u32(),
+        )
+        .expect("rope_neox hd256/rotary64 dispatch");
+        assert_close(
+            &format!("rope_neox hd256 rotary64 pos={pos}"),
+            &read_f32(&buf_xd, nrows * head_dim),
+            &want,
+            5e-4,
+            5e-4,
+        );
+    }
+}
+
+/// Per-head RMSNorm at n=128: the GDR (linear-attention) path calls rms_norm
+/// once per value head over `linear_value_head_dim = 128` (`ssm_norm`,
+/// `forward.rs` `for vh in 0..nv { record_rms_norm(.., vd, ..) }`). The
+/// full-attention q/k norm at head_dim 256 is gated in
+/// `per_head_rms_norm_matches_host_oracle`.
+#[test]
+fn per_head_rms_norm_n128_gdr_matches_host_oracle() {
+    let Some(ctx) = common::require_device() else {
+        return;
+    };
+    eprintln!(
+        "ARLE Vulkan GDR per-head rms_norm n=128 proof on: {}",
+        ctx.device_name()
+    );
+    let mut cache = KernelCache::new();
+    let mut rng = Rng(0x2D15_0128_0000_0001);
+    let head_dim = 128usize; // GDR linear_value_head_dim
+    let eps = 1e-6f32;
+    for _ in 0..4 {
+        let x: Vec<f32> = (0..head_dim).map(|_| rng.next_f32()).collect();
+        let w: Vec<f32> = (0..head_dim).map(|_| 0.8 + rng.next_f32() * 0.4).collect();
+        let want = host_rms_norm(&x, &w, eps);
+        let buf_a = upload_f32(&ctx, &x);
+        let buf_b = upload_f32(&ctx, &w);
+        let buf_d = upload_f32(&ctx, &vec![0.0f32; head_dim]);
+        let push = rms_norm_params(head_dim as u32, eps).to_le_bytes();
+        launch_cached(
+            &mut cache,
+            &ctx,
+            Kernel::RmsNorm,
+            &[&buf_a, &buf_b, &buf_d],
+            rms_norm_dispatch(),
+            &push,
+            Kernel::RmsNorm.specialization_u32(),
+        )
+        .expect("GDR n=128 rms_norm dispatch");
+        assert_close(
+            "gdr_per_head_rms_norm n=128",
+            &read_f32(&buf_d, head_dim),
+            &want,
+            1e-4,
+            1e-4,
+        );
+    }
 }

@@ -21,9 +21,12 @@
 //!      `y[r] = sum_c dequant(W)[r,c] * x[c]` within a tolerance that accounts
 //!      for the q8_1 activation quantization.
 //!
-//! Runs only with `--features vulkan` + a working device; skips cleanly
-//! otherwise.
+//! Runs only with `--features vulkan` + a working device; without one it
+//! skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to make a missing
+//! device panic instead (so CI cannot pass by skipping all gates).
 #![cfg(feature = "vulkan")]
+
+mod common;
 
 use infer_gguf::dequant::{dequantize_row_q4_k, dequantize_row_q8_0};
 use vulkan_kernels::{
@@ -234,12 +237,8 @@ fn run_gemv_case(
 
 #[test]
 fn quantized_gemv_executes_on_device() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping device GEMV test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan GEMV proof on: {}", ctx.device_name());
 

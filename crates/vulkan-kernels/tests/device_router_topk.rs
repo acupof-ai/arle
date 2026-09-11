@@ -7,9 +7,12 @@
 //! weights. IDs must match exactly; weights match within tolerance (GPU `exp`
 //! vs host `exp` differ by a few ULP, which never flips a well-separated top-k).
 //!
-//! Runs only with `--features vulkan` + a working device; skips cleanly
-//! otherwise.
+//! Runs only with `--features vulkan` + a working device; without one it
+//! skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to make a missing
+//! device panic instead (so CI cannot pass by skipping all gates).
 #![cfg(feature = "vulkan")]
+
+mod common;
 
 use vulkan_kernels::{
     Kernel, KernelCache, launch_cached, qwen36_moe_weighted_accum_dispatch,
@@ -94,12 +97,8 @@ fn host_routes(logits: &[f32], top_k: usize, norm_topk_prob: bool) -> (Vec<i32>,
 
 #[test]
 fn qwen36_router_topk_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping router_topk oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan router_topk proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();
@@ -182,12 +181,8 @@ fn host_router_gemv(x: &[f32], w: &[f32], n_out: usize, apply_sigmoid: bool) -> 
 
 #[test]
 fn qwen36_router_gemv_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping router_gemv oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan router_gemv proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();
@@ -236,12 +231,8 @@ fn qwen36_router_gemv_matches_host_oracle() {
 
 #[test]
 fn qwen36_moe_weighted_accum_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping weighted_accum oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan weighted_accum proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();

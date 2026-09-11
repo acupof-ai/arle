@@ -899,3 +899,80 @@ fallback = "mlx quantized_matmul"
 
 [policy."metal.qwen35.w4a16_projection_m16"]
 fallback_status = "legacy-default-unqualified"
+# ── Vulkan (infer-vulkan) compute kernels · gfx1151 bring-up lane ──────────
+# Numeric gates are on-device cargo tests (MoltenVK/AMD): host oracles are
+# independent of the shaders, quant formats decoded from the GGUF spec via
+# infer-gguf. Every gate below must be run with
+# ARLE_REQUIRE_VULKAN_DEVICE=1 (tests/common/mod.rs::require_device panics when
+# set and no device exists; without it a missing ICD is a silent skip). Audit:
+# docs/plans/2026-09-11-kernel-parity-coverage.md § Vulkan.
+
+[[semantic]]
+id = "vulkan.quant_gemv"
+kind = "op"
+inputs = ["activation", "packed_q_weight"]
+outputs = ["projection"]
+reference = "vulkan.mul_mat_vecq"
+correctness_gate = "crates/vulkan-kernels/tests/device_gemv.rs; crates/vulkan-kernels/tests/device_production_geometry.rs"
+gate_env = "ARLE_REQUIRE_VULKAN_DEVICE=1 (panic without a device; unset = silent skip)"
+gate_scope = "production"
+
+[[semantic]]
+id = "vulkan.moe_expert_gemv"
+kind = "op"
+inputs = ["activation", "stacked_packed_experts", "expert_ids"]
+outputs = ["expert_projections"]
+reference = "vulkan.mul_mat_vec_id"
+correctness_gate = "crates/vulkan-kernels/tests/device_gemv_id.rs; crates/vulkan-kernels/tests/device_production_geometry.rs"
+gate_env = "ARLE_REQUIRE_VULKAN_DEVICE=1 (panic without a device; unset = silent skip)"
+gate_scope = "production"
+
+[[semantic]]
+id = "vulkan.q8_1_quantize"
+kind = "op"
+inputs = ["f32_activation"]
+outputs = ["q8_1_x4_activation"]
+reference = "vulkan.quantize_q8_1"
+correctness_gate = "crates/vulkan-kernels/tests/device_q8_1.rs; crates/vulkan-kernels/tests/device_production_geometry.rs"
+gate_env = "ARLE_REQUIRE_VULKAN_DEVICE=1 (panic without a device; unset = silent skip)"
+gate_scope = "production"
+
+[[semantic]]
+id = "vulkan.elementwise_norm"
+kind = "composite"
+inputs = ["x", "weight"]
+outputs = ["normed", "gated", "residual"]
+reference = "vulkan.rms_norm_silu_add"
+correctness_gate = "crates/vulkan-kernels/tests/device_elementwise.rs"
+gate_env = "ARLE_REQUIRE_VULKAN_DEVICE=1 (panic without a device; unset = silent skip)"
+gate_scope = "production"
+
+[[semantic]]
+id = "vulkan.full_attention"
+kind = "composite"
+inputs = ["q", "packed_kv", "head_dim"]
+outputs = ["attn_out", "rotated_qk", "normed_qk"]
+reference = "vulkan.flash_attn_rope"
+correctness_gate = "crates/vulkan-kernels/tests/device_full_attention.rs"
+gate_env = "ARLE_REQUIRE_VULKAN_DEVICE=1 (panic without a device; unset = silent skip)"
+gate_scope = "production"
+
+[[semantic]]
+id = "vulkan.linear_attention_gdn"
+kind = "composite"
+inputs = ["x", "conv_ring", "gdn_state"]
+outputs = ["conv_out", "gdn_out", "updated_state"]
+reference = "vulkan.qwen35_ssm_conv_gated_delta_net"
+correctness_gate = "crates/vulkan-kernels/tests/device_linear_attention.rs"
+gate_env = "ARLE_REQUIRE_VULKAN_DEVICE=1 (panic without a device; unset = silent skip)"
+gate_scope = "production"
+
+[[semantic]]
+id = "vulkan.moe_routing"
+kind = "composite"
+inputs = ["hidden", "router_logits", "expert_outputs"]
+outputs = ["expert_ids", "expert_weights", "combined_hidden"]
+reference = "vulkan.qwen36_router_topk_gemv_weighted_accum"
+correctness_gate = "crates/vulkan-kernels/tests/device_router_topk.rs"
+gate_env = "ARLE_REQUIRE_VULKAN_DEVICE=1 (panic without a device; unset = silent skip)"
+gate_scope = "production"

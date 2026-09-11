@@ -8,13 +8,16 @@
 //! asserts it stays at 1 across 100 `get` + `record_dispatch` calls.
 //!
 //! Runs only with `--features vulkan` + a working device + compiled `.spv`;
-//! skips cleanly otherwise.
+//! skips cleanly otherwise. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to panic when
+//! no device exists instead of skipping.
 #![cfg(feature = "vulkan")]
+
+mod common;
 
 use vulkan_kernels::{
     Kernel, KernelCache, q8_1_quantize_dispatch, q8_1_quantize_params, record_dispatch,
 };
-use vulkan_sys::{CommandRecorder, DeviceBuffer, VulkanContext};
+use vulkan_sys::{CommandRecorder, DeviceBuffer};
 
 /// 100 cached dispatches of one kernel build the pipeline exactly once.
 ///
@@ -29,12 +32,8 @@ use vulkan_sys::{CommandRecorder, DeviceBuffer, VulkanContext};
 /// one pipeline must be cached.
 #[test]
 fn kernel_pipeline_built_exactly_once_across_100_dispatches() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping pipeline-cache build-once test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("KernelCache build-once proof on: {}", ctx.device_name());
 

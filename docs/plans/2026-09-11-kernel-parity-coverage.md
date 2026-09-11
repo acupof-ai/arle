@@ -239,3 +239,136 @@ label, not an executable gate; its consumers are hygiene + an evidence-JSON
 reducer. `KERNEL_CAPABILITIES` is a build identity string, not a numeric check.
 Neither is parity coverage — the varlen kernel was the same class of
 "listed/shipped, never compared".
+
+---
+
+# Vulkan kernel parity-coverage audit (lane vulkan-kernel-parity)
+
+Date: 2026-09-11 · Backend: `infer-vulkan` + `crates/vulkan-kernels` (llama.cpp
+`vulkan-shaders` @ d2462f8f adapted). The gates below are real-device
+`cargo test` on MoltenVK 1.4.0 (Apple M4 Pro, Vulkan 1.2, subgroup 32) with
+`ARLE_REQUIRE_VULKAN_DEVICE=1`; the serving target is AMD Radeon 8060S
+(gfx1151, Strix Halo), which exposes the same Vulkan compute path.
+
+## Served model and its geometry
+
+`docs/support-matrix.md`: the coherent forward is **Qwen3.5 27B dense
+`Qwen3.6-27B-Q8_0` GGUF** (Qwen3.5 GDN architecture), plus the Qwen3.6
+35B-A3B MoE FFN. Production dimensions used below:
+
+| Surface | Dense 27B |
+|---|---|
+| hidden / FFN inter | 5120 / 17408 |
+| full-attn heads / head_dim | hd **256**, **24 query / 4 KV heads** (GQA group 6); `attention.key_length` from GGUF (`config.rs:101`) |
+| rotary | partial: `rope.dimension_count = 64` of the 256-dim head (`config.rs:124-137`) |
+| linear attn channels | 16 key heads + 48 value heads × 128 = **10240** |
+| conv kernel | K=4 |
+| MoE (35B-A3B, same lane) | 256 experts, top-8; hidden **2048**, expert intermediate **512**; gate/up contract K=2048→512, down K=512→2048 |
+
+Weight quants reachable on the serving path (`forward.rs::gemv_id_kernel_for`,
+the dense `record_gemv` projections):
+**Q4_K, Q5_K, Q6_K, Q8_0**, activations quantized on-device to Q8_1.
+
+## Coverage matrix — every compute shader vs the serving path
+
+Gate legend: **P** = on-device test vs host f32/f64 oracle · **P(geo)** =
+tested AT production geometry · **P(toy)** = oracle exists but only at a small
+synthetic shape.
+
+### Quantized matmul (HOT every decode)
+| Shader (Kernel) | Computes | Serving caller | Existing test | Production-geometry? |
+|---|---|---|---|---|
+| `mul_mat_vecq_q4_k` (GemvQ4K) | Q4_K weight × Q8_1 activation dot per row | `forward.rs` dense proj | **P(geo)** `device_production_geometry` (oracle: `infer-gguf` spec dequant) | K=5120 and 17408, per-family corruption gate |
+| `mul_mat_vecq_q5_k` (GemvQ5K) | Q5_K variant | `forward.rs` dense proj | **P(geo)** `device_production_geometry` | K=5120 and 17408 |
+| `mul_mat_vecq_q6_k` (GemvQ6K) | Q6_K variant | `forward.rs` dense proj | **P(geo)** `device_production_geometry` | K=5120 and 17408 |
+| `mul_mat_vecq_q8_0` (GemvQ8_0) | Q8_0 variant | `forward.rs` dense proj | **P(geo)** `device_production_geometry` | K=5120 and 17408 |
+| `mul_mat_vec_id_{q4_k,q5_k,q6_k,q8_0}` (GemvIdQ*) | fused top-k expert GEMV in one dispatch | `forward.rs::record_gemv_id` MoE FFN (gate/up ne11=1, down ne11=top_k) | **P(geo)** `device_production_geometry` (independent dequant·dot oracle per selected id) | **35B-A3B shape**: 256 experts/top-8, gate/up K=2048→512, down K=512→2048; Q4_K/Q5_K/Q6_K/Q8_0; 8 output rows sampled across the full width per expert; sparse 256-slot table proves id dereference |
+| `q8_1_quantize` (QuantizeQ8_1) | f32 activation → Q8_1 x4 blocks | `forward.rs` before every GEMV | **P(geo)** `device_production_geometry` (block d + i8 spec-exact at both widths) | K=5120 and linear 10240 |
+
+### Elementwise / norm (HOT)
+| Shader | Computes | Serving caller | Existing test | Production-geometry? |
+|---|---|---|---|---|
+| `rms_norm` | x·rsqrt(mean x²+eps) | `forward.rs` | **P(geo)** `device_elementwise` (n∈{256,**5120**,**17408**}) | yes |
+| `swiglu` | SiLU(gate)·up | `forward.rs`, `model_qwen36` | **P(geo)** `device_elementwise` ({256,**17408**}) | yes |
+| `add` | residual add | `forward.rs` | **P(geo)** `device_elementwise` ({256,**5120**}) | yes |
+| `scaled_add` | acc + s·x | **not called** (MoE accum uses qwen36_moe_weighted_accum) | **P(toy)** `device_elementwise` | n/a — off serving path |
+| `sigmoid_mul` | σ(gate)·val, in-place | `forward.rs` attn/linear gate | **P(geo)** `device_elementwise` ({256,**5120**}) | yes |
+| `f16_kv_pack` | f32 K/V row → f16 RNE | `forward.rs:1320` kv pack (once per K/V head row, hd=256) | **P(geo)** `device_elementwise` (bit-exact RNE, n∈{**256**,1024}) | yes — 256 is the served head row, 1024 a kv_dim-wide block |
+| `geglu` | GELU(gate)·up | **not called** (model uses SwiGLU) | — | off serving path |
+| `swiglu_clamped` | clamped SiLU gating | compiled, **not called** by infer-vulkan | — | off serving path |
+
+### Full attention (HOT dense 27B)
+| Shader | Computes | Serving caller | Existing test | Production-geometry? |
+|---|---|---|---|---|
+| `rope_neox` | partial/full Neox rotary | `forward.rs:1164` (in-place, slots 0 and 3) | **P(geo)** `device_full_attention`: hd256/rotary256 full-row and **hd256/rotary64 partial** in-place, the same buffer bound in both slots | yes |
+| `flash_attn` | online-softmax SDPA, f16 K/V | `forward.rs` full-attn block (GQA mapped host-side: `kvh = qh / 6`, one plane per KV head, gqa_ratio=1) | **P(geo)** `device_full_attention`: hd256 single-head kv∈{1,2,8,33,64,65,200} and **hd256 GQA 24q/4kv** kv∈{1,9,128,257,4096}, oracle reads K/V at f16 precision | yes |
+| per-head `rms_norm` | head-wise norm inside attn / GDR | `forward.rs:1278/1297` q/k norm hd256; `:1684` GDR ssm_norm n=128 | **P(geo)** `device_full_attention`: n=**256** q/k and n=**128** GDR value-head | yes |
+
+### Linear attention GDN (HOT dense 27B)
+| Shader | Computes | Serving caller | Existing test | Production-geometry? |
+|---|---|---|---|---|
+| `qwen35_ssm_conv` | K=4 depthwise causal conv + SiLU + ring advance | `forward.rs` linear block | **P(geo)** `device_linear_attention` (nc∈{7,**10240**}, seq 1/5) | yes |
+| `qwen35_gated_delta_net` | gated-delta recurrent state update | `forward.rs` linear block | **P(geo)** `device_linear_attention` (nk16/nv48/hd128, seq 1/2, nonzero state) | yes |
+
+### MoE routing (HOT 35B-A3B)
+| Shader | Computes | Serving caller | Existing test | Production-geometry? |
+|---|---|---|---|---|
+| `qwen36_router_topk` | softmax → top-k → renorm | `model_qwen36.rs` | **P(geo)** `device_router_topk` (**256** experts top-8 norm/non-norm) | yes |
+| `qwen36_router_gemv` | F32 router/shared-gate GEMV | `model_qwen36.rs` | **P(geo)** `device_router_topk` (256×**2048**, n_out=1 sigmoid) | yes |
+| `qwen36_moe_weighted_accum` | Σ_e weight_e·expert_e | `model_qwen36.rs` | **P(geo)** `device_router_topk` (hidden **2048**, count 8/1) | yes |
+
+### Off the Vulkan serving path (no gate required here)
+`rope_norm`, `silu`, `get_rows`, `soft_max`, `argmax` (elemental llama.cpp
+shaders retained for parity with the borrowed corpus; the forward uses
+`rope_neox`, `swiglu`, fused kernels and CUDA-side samplers). All 9
+`dsv4_*` shaders + `qwen35_gated_delta_net` DSv4 variants are compiled for
+the DSv4 bring-up but `infer-vulkan` serves Qwen3.5/3.6 only — zero
+infer-vulkan callers; their gates belong to the CUDA DSv4 audit above.
+
+## Gaps closed in this lane (S33)
+
+Production-geometry parity tests added (host oracles independent of the
+shaders; quant formats decoded from the GGUF spec via `infer-gguf`):
+
+1. **GEMV Q4_K/Q5_K/Q6_K/Q8_0 at 5120 and 17408 contraction**, sampled output
+   rows (the oracle is f32 dequant·dot over the SAME block bytes), with a
+   per-family corruption assertion.
+2. **Q8_1 quantize oracle at 5120/10240**: block d/s + i8 checked against an
+   f32 host quantizer transcribed from the Q8_1 spec.
+3. **fused GemvId Q4_K/Q5_K/Q6_K/Q8_0** vs an INDEPENDENT per-expert
+   dequant·dot oracle (the existing `device_gemv_id` cross-checks against the
+   plain device GEMV) at the served 35B-A3B routing shape: 256 experts/top-8,
+   gate/up K=2048→512, down K=512→2048. The 256-slot weight table is sparse
+   (only the 8 routed slots populated, ids scattered …,255) so the gate proves
+   `data_ids[slot]` dereference; 8 output rows per expert are sampled across the
+   full width. Numeric assertions are TWO-ARMED: rel-L2 plus an elementwise
+   slope+floor bound `|g-w| <= 0.03|w| + 0.03·rms(want)` (the floor keeps the
+   bound finite for near-zero outputs; worst element printed). Each family has
+   its own 3×-expectation corruption control that must trip both arms.
+4. **f16_kv_pack at n=256** (the served full-attention head row; n=1024 covers
+   a kv_dim block), bit-exact host RNE.
+5. **rope_neox hd256/rotary64** partial in-place (slots 0 and 3 aliased),
+   **flash_attn hd256 at the served GQA 24q/4kv** with kv lengths
+   {1,9,128,257,4096}, and **per-head rms_norm n=256** (full-attn q/k) with a
+   second n=128 case for the GDR `ssm_norm` caller.
+
+## Device availability gate
+
+Device tests silently skip when no Vulkan device exists, so a green CI without
+an ICD proves nothing. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to turn
+"no device" into a panic (`tests/common/mod.rs::require_device`, shared by
+every device test file). Verification command on this Mac (MoltenVK):
+
+```
+ARLE_REQUIRE_VULKAN_DEVICE=1 \
+VK_ICD_FILENAMES=/path/to/molten_icd.json \
+DYLD_LIBRARY_PATH=<dir with libvulkan.dylib> \
+cargo test -p vulkan-kernels -p infer-vulkan --features vulkan
+```
+
+Without the env var the same binary prints `skipping device test` and passes;
+with it set and no ICD it panics `ARLE_REQUIRE_VULKAN_DEVICE set but no Vulkan
+device is available: …` and exits non-zero.
+
+Already at production geometry and unchanged: rms_norm/swiglu/add/sigmoid_mul,
+ssm_conv, gated_delta_net, and the three qwen36 router kernels.

@@ -4,7 +4,8 @@
 //! mathematically correct result.
 //!
 //! Runs only with `--features vulkan` and a working Vulkan device + compiled
-//! shaders; skips cleanly otherwise (CI / no-GPU boxes). On the AMD Radeon
+//! shaders; without one it skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1`
+//! to panic when no device exists. On the AMD Radeon
 //! 8060S (Strix Halo) this is the first end-to-end ARLE-on-Vulkan execution.
 //!
 //! Case: quantize 128 values all equal to 1.0 with `q8_1`. The block amax is
@@ -14,10 +15,12 @@
 //! the output must be 128 bytes of 0x7F preceded by 4×(d≈1/127, s≈32).
 #![cfg(feature = "vulkan")]
 
+mod common;
+
 use vulkan_kernels::{
     BLOCK_Q8_1_BYTES, q8_1_quantize, q8_1_quantize_dispatch, q8_1_quantize_params,
 };
-use vulkan_sys::{DeviceBuffer, VulkanContext};
+use vulkan_sys::DeviceBuffer;
 
 /// Minimal IEEE-754 half → f32 decode (test-local; no dep on infer-gguf).
 fn f16_to_f32(h: u16) -> f32 {
@@ -36,12 +39,8 @@ fn f16_to_f32(h: u16) -> f32 {
 
 #[test]
 fn q8_1_quantize_executes_on_device() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping device smoke test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan device smoke on: {}", ctx.device_name());
 
