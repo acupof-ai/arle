@@ -690,6 +690,26 @@ fallback = ""
 fallback_status = "no-fallback"
 
 [[semantic]]
+id = "qwen35.dspark_draft_ring_attention"
+kind = "kernel"
+inputs = ["draft_q", "ctx_k_ring", "ctx_v_ring", "ring_base", "kv_len"]
+outputs = ["draft_attn_out"]
+reference = "cuda.qwen35.dspark_draft_ring_attention"
+correctness_gate = "crates/infer-cuda/examples/dspark_draft_attn_parity.rs"
+gate_scope = "production"
+
+[[implementation]]
+id = "cuda.qwen35.dspark_draft_ring_attention"
+semantic = "qwen35.dspark_draft_ring_attention"
+provider = "arle"
+source = "crates/cuda-kernels/csrc/attention/nonpaged_prefill_attention.cu"
+legality = "Qwen3.8-DSpark draft head full attention; 40q/8kv hd128 draft block 7 (--dspark-block-size clamp path 4); per-row ragged non-causal window [ring_base, +kv_len) walked over an absolute-position ctx ring with physical row (base+j)%cap; config sliding_window null so production ring is request-length cap=min(max_seq_len,max_total_tokens)+block (serve 32768+7=32775), full attention over thousands of keys with no wrap; single and slot-batched ABIs are one kernel (gridZ slot axis); caller guarantees kv_len<=cap"
+fallback = ""
+
+[policy."qwen35.dspark_draft_ring_attention"]
+fallback_status = "no-fallback"
+
+[[semantic]]
 id = "dsv4.dsa_indexer"
 kind = "composite"
 inputs = ["indexer_q", "freqs_cis", "indexer_scores", "page_table"]
