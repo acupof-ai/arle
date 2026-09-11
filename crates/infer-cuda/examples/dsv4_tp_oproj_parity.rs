@@ -51,6 +51,16 @@
 //! rank (TP>1), and one corrupted wo_b weight scale per lane. Prints
 //! NEGATIVE CONTROL OK, exit 0; teeth are internal.
 //!
+//! `--direct-cache` is a diagnostic arm: it builds the wo_a resident cache
+//! from native e4m3 weights with host-decoded e8m0→FP32 scales
+//! (`from_fp8_block_scaled_weight`, a D2D copy), skipping the
+//! `dsv4_block_scaled_to_fp8_deepgemm` re-quantization kernel the production
+//! lane uses (`from_dsv4_weight`). The f64 oracle models the direct e4m3·e8m0
+//! representation, so this arm isolates that conversion: PASS here with a FAIL
+//! on the default lane points at the conversion cache, FAIL at both points at
+//! the dense DeepGEMM plumbing. Diagnostic only — runs the clean lane, no
+//! teeth.
+//!
 //! Run on a pod:
 //! `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/dsv4_tp_oproj_parity`
 
@@ -60,12 +70,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
+    let direct_cache = std::env::args().any(|a| a == "--direct-cache");
+    real::run(negative, direct_cache)
 }
 
 #[cfg(not(feature = "cuda"))]
 mod real {
-    pub(super) fn run(_negative: bool) -> anyhow::Result<()> {
+    pub(super) fn run(_negative: bool, _direct_cache: bool) -> anyhow::Result<()> {
         eprintln!("dsv4_tp_oproj_parity is a CUDA harness; rebuild with --features cuda.");
         Ok(())
     }
@@ -400,16 +411,30 @@ mod real {
         }
     }
 
-    /// Resident DeepGEMM cache for global group `gr` (built the same way
-    /// load.rs builds wo_a_group_deepgemm: DeviceMatrix → row-range cache).
+    /// Resident DeepGEMM cache for global group `gr`. The production lane
+    /// (`direct=false`) re-quantizes the per-128 e4m3+e8m0 weight through
+    /// `dsv4_block_scaled_to_fp8_deepgemm` (`from_dsv4_weight`); the
+    /// diagnostic lane (`direct=true`) decodes e8m0 to FP32 on the host and
+    /// uploads native e4m3+FP32 scales unchanged (`from_fp8_block_scaled`),
+    /// bypassing that conversion kernel. The f64 oracle models the direct
+    /// representation, so this arm isolates the conversion cache.
     fn group_cache(
         ctx: &DeviceContext,
         g: &Global,
         gr: usize,
+        direct: bool,
     ) -> Result<Dsv4Fp8DeepGemmWeightCache> {
         let (w, s) = g.qa_shard(gr, 1);
-        let mat = DeviceMatrix::from_dsv4_fp8_block_scaled(ctx, &w, &s, C, WG, C / BLK, WG / BLK)?;
-        Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &mat)
+        if direct {
+            // e8m0 power-of-two bytes -> FP32 scales, same [C/BLK, WG/BLK] order.
+            let s_f32: Vec<f32> = s.iter().map(|&b| e8m0_decode(b) as f32).collect();
+            let native = DeviceMatrix::from_fp8_block_scaled(ctx, &w, &s_f32, C, WG, BLK, BLK)?;
+            Dsv4Fp8DeepGemmWeightCache::from_fp8_block_scaled_weight(ctx, &native)
+        } else {
+            let mat =
+                DeviceMatrix::from_dsv4_fp8_block_scaled(ctx, &w, &s, C, WG, C / BLK, WG / BLK)?;
+            Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &mat)
+        }
     }
 
     /// One rank's run on one lane. Returns host f64 (head slice, latent,
@@ -424,6 +449,7 @@ mod real {
         rank: usize,
         dg: bool,
         sabotage: Sabotage,
+        direct_cache: bool,
     ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
         let groups = G / tp;
         let g0 = rank * groups;
@@ -464,7 +490,7 @@ mod real {
                 } else {
                     g0
                 };
-                let cache = group_cache(ctx, glob, gr)?;
+                let cache = group_cache(ctx, glob, gr, direct_cache)?;
                 scr.gemm(ctx, &cache, &slice_d, &mut lat_d, s)?;
             } else {
                 let mut in_g = ctx.stream.alloc_zeros::<bf16>(s * WG)?;
@@ -495,7 +521,7 @@ mod real {
                             gather_g as i32,
                         )?;
                     }
-                    let cache = group_cache(ctx, glob, cache_g)?;
+                    let cache = group_cache(ctx, glob, cache_g, direct_cache)?;
                     scr.gemm(ctx, &cache, &in_g, &mut out_g, s)?;
                     {
                         let (ogp, _) = out_g.device_ptr(&ctx.stream);
@@ -646,7 +672,7 @@ mod real {
         let mut sum = vec![0f64; s * H];
         for &r in take {
             let sb = if r == 0 { sabotage } else { Sabotage::None };
-            let (_, _, ya) = run_rank(ctx, glob, v_d, s, tp, r, dg, sb)?;
+            let (_, _, ya) = run_rank(ctx, glob, v_d, s, tp, r, dg, sb, false)?;
             for j in 0..s * H {
                 sum[j] += ya[j];
             }
@@ -664,8 +690,17 @@ mod real {
         dg: bool,
         orc: &Oracle,
         negative: bool,
+        direct_cache: bool,
     ) -> Result<()> {
-        let tag = if dg { "deepgemm" } else { "gemv" };
+        let tag = if dg {
+            if direct_cache {
+                "deepgemm-direct-cache"
+            } else {
+                "deepgemm"
+            }
+        } else {
+            "gemv"
+        };
         let label = format!("tp={tp} s={s} {tag}");
         let (lat_b, out_b) = if dg {
             (
@@ -684,7 +719,7 @@ mod real {
         let mut sum = vec![0f64; s * H];
         let mut lat_ok = true;
         for (r, want) in latents_want.iter().enumerate() {
-            let (_, la, ya) = run_rank(ctx, glob, v_d, s, tp, r, dg, Sabotage::None)?;
+            let (_, la, ya) = run_rank(ctx, glob, v_d, s, tp, r, dg, Sabotage::None, direct_cache)?;
             let (ok, rel) = bound(&la, want, lat_b.0, lat_b.1, lat_b.2);
             if !ok {
                 eprintln!("  [{label}] rank={r} latent l2={rel:.3e}");
@@ -716,11 +751,12 @@ mod real {
 
         // Gather-offset tooth exists only with g>1 (TP<8) on the DeepGEMM lane.
         if dg && tp < 8 {
-            let (_, la_bad, _) = run_rank(ctx, glob, v_d, s, tp, 0, true, Sabotage::DgGather)?;
+            let (_, la_bad, _) =
+                run_rank(ctx, glob, v_d, s, tp, 0, true, Sabotage::DgGather, false)?;
             let (ok, rel) = bound(&la_bad, &latents_want[0], lat_b.0, lat_b.1, lat_b.2);
             ensure!(!ok, "{label}: dg gather-offset tooth dead (l2={rel:.3e})");
         }
-        let (_, la_bad, _) = run_rank(ctx, glob, v_d, s, tp, 0, dg, map_sabotage)?;
+        let (_, la_bad, _) = run_rank(ctx, glob, v_d, s, tp, 0, dg, map_sabotage, false)?;
         let (map_ok, map_rel) = bound(&la_bad, &latents_want[0], lat_b.0, lat_b.1, lat_b.2);
         ensure!(!map_ok, "{label}: {map_name} tooth dead (l2={map_rel:.3e})");
 
@@ -735,7 +771,7 @@ mod real {
         }
 
         // wo_b scale tooth: latent unchanged, final sum wrong.
-        let (_, la_good, y_bad) = run_rank(ctx, glob, v_d, s, tp, 0, dg, wb_sabotage)?;
+        let (_, la_good, y_bad) = run_rank(ctx, glob, v_d, s, tp, 0, dg, wb_sabotage, false)?;
         let (lat_still, _) = bound(&la_good, &latents_want[0], lat_b.0, lat_b.1, lat_b.2);
         ensure!(
             lat_still,
@@ -743,7 +779,7 @@ mod real {
         );
         let mut scale_sum = y_bad;
         for r in 1..tp {
-            let (_, _, ya) = run_rank(ctx, glob, v_d, s, tp, r, dg, Sabotage::None)?;
+            let (_, _, ya) = run_rank(ctx, glob, v_d, s, tp, r, dg, Sabotage::None, false)?;
             for j in 0..s * H {
                 scale_sum[j] += ya[j];
             }
@@ -774,14 +810,23 @@ mod real {
         tp: usize,
         native: bool,
         negative: bool,
+        direct_cache: bool,
     ) -> Result<bool> {
         let v_d = ctx.stream.clone_htod(v)?;
         let orc = oracle(glob, v, s, tp);
 
+        // Diagnostic arm: only the clean DeepGEMM direct-cache lane; no slice
+        // family, no sabotage teeth (those are production-cache specific).
+        if direct_cache {
+            ensure!(native, "--direct-cache needs has_deepgemm_native()");
+            check_lane(ctx, glob, &v_d, s, tp, true, &orc, false, true)?;
+            return Ok(true);
+        }
+
         // Family 1: head o-slice bit-exact.
         let mut slice_ok = true;
         for r in 0..tp {
-            let (sl, _, _) = run_rank(ctx, glob, &v_d, s, tp, r, false, Sabotage::None)?;
+            let (sl, _, _) = run_rank(ctx, glob, &v_d, s, tp, r, false, Sabotage::None, false)?;
             slice_ok &= sl == want_slice(v, s, tp, r);
         }
         if negative {
@@ -790,7 +835,8 @@ mod real {
                 "tp={tp} s={s}: baseline slice not exact before teeth"
             );
             if tp > 1 {
-                let (sl, _, _) = run_rank(ctx, glob, &v_d, s, tp, 0, false, Sabotage::Slice)?;
+                let (sl, _, _) =
+                    run_rank(ctx, glob, &v_d, s, tp, 0, false, Sabotage::Slice, false)?;
                 ensure!(
                     sl != want_slice(v, s, tp, 0),
                     "tp={tp} s={s}: slice tooth dead"
@@ -801,20 +847,20 @@ mod real {
             eprintln!("[tp={tp} s={s}] PASS head o-slice exact");
         }
 
-        check_lane(ctx, glob, &v_d, s, tp, false, &orc, negative)?;
+        check_lane(ctx, glob, &v_d, s, tp, false, &orc, negative, false)?;
         if native {
-            check_lane(ctx, glob, &v_d, s, tp, true, &orc, negative)?;
+            check_lane(ctx, glob, &v_d, s, tp, true, &orc, negative, false)?;
         } else {
             eprintln!("[tp={tp} s={s}] SKIP deepgemm lane (has_deepgemm_native()=false)");
         }
         Ok(native)
     }
 
-    pub(super) fn run(negative: bool) -> Result<()> {
+    pub(super) fn run(negative: bool, direct_cache: bool) -> Result<()> {
         let ctx = DeviceContext::new()?;
         let native = cuda_kernels::has_deepgemm_native();
         eprintln!(
-            "[dsv4-tp-oproj-parity] device={} build={} deepgemm_native={native}{}",
+            "[dsv4-tp-oproj-parity] device={} build={} deepgemm_native={native} direct_cache={direct_cache}{}",
             ctx.ordinal(),
             cuda_kernels::KERNEL_BUILD_ID,
             if negative { " NEGATIVE-CONTROL" } else { "" }
@@ -831,7 +877,7 @@ mod real {
             for &s in &cases {
                 let mut rng = Rng::new(SEED ^ ((s as u64) << 20) ^ ((tp as u64) << 32));
                 let v: Vec<bf16> = (0..s * W).map(|_| bf(rng.normal() * 0.3)).collect();
-                let ran = run_case(&ctx, &glob, &v, s, tp, native, negative)?;
+                let ran = run_case(&ctx, &glob, &v, s, tp, native, negative, direct_cache)?;
                 if ran {
                     dg_ran += 1;
                 }
