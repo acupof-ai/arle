@@ -7,7 +7,10 @@
 
 use crate::{
     AutogradError, Result,
-    backend::{Backend, Device, DeviceHandle, MlxHandle, matmul_output_shape, validate_broadcast},
+    backend::{
+        Backend, Device, DeviceHandle, MlxHandle, matmul_bt_output_shape, matmul_output_shape,
+        validate_broadcast,
+    },
 };
 use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
@@ -15,7 +18,7 @@ use mlx_sys::{
     mlx_concatenate_axis, mlx_contiguous, mlx_eval, mlx_fast_rms_norm, mlx_logsumexp_axis,
     mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative, mlx_reciprocal, mlx_reshape,
     mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_sqrt, mlx_subtract,
-    mlx_sum_axis, mlx_take_axis, mlx_transpose_axes,
+    mlx_sum_axis, mlx_take_axis, mlx_transpose, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::MutexGuard;
@@ -57,6 +60,54 @@ fn bump_eval_count() {
     METAL_EVAL_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+fn metal_handle(h: &DeviceHandle) -> Result<&MlxHandle> {
+    match h {
+        DeviceHandle::Metal(h) => Ok(h),
+        _ => Err(AutogradError::TapeInvariant(
+            "metal backend cannot operate on a non-metal device handle",
+        )),
+    }
+}
+
+fn null_ptr_check(p: *mut mlx_sys::mlx_array, what: &'static str) -> Result<()> {
+    if p.is_null() {
+        Err(AutogradError::TapeInvariant(what))
+    } else {
+        Ok(())
+    }
+}
+
+// Swap the last two axes (rank-3 batch) or both axes (rank-2). Caller frees.
+//
+// Safety: caller holds mlx_guard and `h` is a live borrowed node.
+unsafe fn transpose_last(h: &MlxHandle, rank: usize) -> Result<*mut mlx_sys::mlx_array> {
+    // SAFETY: precondition above; FFI only reads the node and returns a new view.
+    let view = unsafe {
+        if rank == 2 {
+            mlx_transpose(h.as_ptr())
+        } else {
+            let axes = [0i32, 2, 1];
+            mlx_transpose_axes(h.as_ptr(), axes.as_ptr(), 3)
+        }
+    };
+    null_ptr_check(view, "mlx transpose returned null")?;
+    Ok(view)
+}
+
+// One lazy MLX matmul node wrapped in a Metal handle.
+//
+// Safety: caller holds mlx_guard; both nodes live for the call; the result
+// transfers into the returned handle, neither input is consumed.
+unsafe fn matmul_node(
+    a: *mut mlx_sys::mlx_array,
+    b: *mut mlx_sys::mlx_array,
+) -> Result<DeviceHandle> {
+    // SAFETY: precondition above.
+    let r = unsafe { mlx_matmul(a, b) };
+    null_ptr_check(r, "mlx_matmul returned null")?;
+    Ok(DeviceHandle::Metal(MlxHandle::from_raw(r)))
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MetalBackend;
 
@@ -95,26 +146,12 @@ impl Backend for MetalBackend {
             DeviceHandle::Cpu(data) => Ok(data.clone()),
             DeviceHandle::Metal(handle) => {
                 let _guard = mlx_guard();
-
-                // Safety: the raw MLX array pointer is owned by `handle` for the
-                // duration of this borrow, the caller is responsible for having
-                // evaluated the array before readback, and the destination host
-                // buffer is freshly allocated for this copy.
-                let host = unsafe {
-                    let array = handle.as_ptr();
-                    let size = mlx_array_size(array);
-                    let data_ptr = mlx_array_data_float32(array);
-                    if data_ptr.is_null() {
-                        return Err(AutogradError::TapeInvariant(
-                            "mlx_array_data_float32 returned null",
-                        ));
-                    }
-
-                    let mut out = vec![0.0f32; size];
-                    std::ptr::copy_nonoverlapping(data_ptr, out.as_mut_ptr(), size);
-                    out
-                };
-
+                // The trait-default device fallbacks (matmul_bt, slice write,
+                // accumulate, …) reach readback with unevaluated lazy nodes.
+                // `data<float>()` on an unrealized array dereferences a null
+                // buffer (SIGSEGV), so realize inside eval_and_readback.
+                // SAFETY: handle borrowed and live for the call; mlx_guard held.
+                let host = unsafe { eval_and_readback(handle.as_ptr())? };
                 Ok(host)
             }
             #[cfg(feature = "cuda")]
@@ -245,6 +282,147 @@ impl Backend for MetalBackend {
             need_grad_a,
             need_grad_b,
         )
+    }
+
+    // Lazy `C = A @ B^T`: both operands stay device-resident and the returned
+    // node is unevaluated, matching the CUDA device override.
+    fn matmul_bt(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let out_shape = matmul_bt_output_shape(a_shape, b_shape)?;
+        let a_h = metal_handle(a)?;
+        let b_h = metal_handle(b)?;
+        let _guard = mlx_guard();
+        // Safety: two borrowed live nodes; caller holds mlx_guard.
+        let out = unsafe {
+            let bt = transpose_last(b_h, 2)?;
+            let r = matmul_node(a_h.as_ptr(), bt)?;
+            mlx_array_free(bt);
+            r
+        };
+        Ok((out, out_shape))
+    }
+
+    // Lazy device backward for `C = A @ B`. The trait-default fallback reads
+    // operands back with `mlx_array_data_float32` before they are evaluated,
+    // dereferencing MLX's null unevaluated buffer (SIGSEGV).
+    fn matmul_backward_device(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        if !need_grad_a && !need_grad_b {
+            return Ok((None, None));
+        }
+        let expected = matmul_output_shape(a_shape, b_shape)?;
+        if grad_out_shape != expected.as_slice() {
+            return Err(AutogradError::ShapeMismatch {
+                expected,
+                got: grad_out_shape.to_vec(),
+            });
+        }
+        let a_h = metal_handle(a)?;
+        let b_h = metal_handle(b)?;
+        let g_h = metal_handle(grad_out)?;
+        let _guard = mlx_guard();
+        // Safety: three borrowed live nodes; mlx_matmul consumes the lazy
+        // transposed views directly, so they are never materialized.
+        unsafe {
+            let grad_a = need_grad_a
+                .then(|| {
+                    let bt = transpose_last(b_h, a_shape.len())?;
+                    let r = matmul_node(g_h.as_ptr(), bt)?;
+                    mlx_array_free(bt);
+                    Ok(r)
+                })
+                .transpose()?;
+            let grad_b = need_grad_b
+                .then(|| {
+                    let at = transpose_last(a_h, a_shape.len())?;
+                    let r = matmul_node(at, g_h.as_ptr())?;
+                    mlx_array_free(at);
+                    Ok(r)
+                })
+                .transpose()?;
+            Ok((grad_a, grad_b))
+        }
+    }
+
+    // Lazy device backward for `C = A @ B^T` (rank-2 by contract).
+    fn matmul_bt_backward_device(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        if !need_grad_a && !need_grad_b {
+            return Ok((None, None));
+        }
+        let expected = matmul_bt_output_shape(a_shape, b_shape)?;
+        if grad_out_shape != expected.as_slice() {
+            return Err(AutogradError::ShapeMismatch {
+                expected,
+                got: grad_out_shape.to_vec(),
+            });
+        }
+        let a_h = metal_handle(a)?;
+        let b_h = metal_handle(b)?;
+        let g_h = metal_handle(grad_out)?;
+        let _guard = mlx_guard();
+        // Safety: three borrowed live Metal nodes; grad_a = grad_out @ B,
+        // grad_b = grad_out^T @ A.
+        unsafe {
+            let grad_a = need_grad_a
+                .then(|| matmul_node(g_h.as_ptr(), b_h.as_ptr()))
+                .transpose()?;
+            let grad_b = need_grad_b
+                .then(|| {
+                    let gt = transpose_last(g_h, 2)?;
+                    let r = matmul_node(gt, a_h.as_ptr())?;
+                    mlx_array_free(gt);
+                    Ok(r)
+                })
+                .transpose()?;
+            Ok((grad_a, grad_b))
+        }
+    }
+
+    // Lazy `grad_a = grad_out @ B` for frozen weights; same fix class.
+    fn matmul_bt_input_grad_device(
+        &self,
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        input_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let expected = matmul_bt_output_shape(input_shape, b_shape)?;
+        if grad_out_shape != expected.as_slice() {
+            return Err(AutogradError::ShapeMismatch {
+                expected,
+                got: grad_out_shape.to_vec(),
+            });
+        }
+        let b_h = metal_handle(b)?;
+        let g_h = metal_handle(grad_out)?;
+        let _guard = mlx_guard();
+        // Safety: two borrowed live nodes; caller holds mlx_guard.
+        unsafe { matmul_node(g_h.as_ptr(), b_h.as_ptr()) }
     }
 
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
@@ -2736,9 +2914,13 @@ unsafe fn eval_and_readback(arr: *mut mlx_sys::mlx_array) -> Result<Vec<f32>> {
     // duration of this call (see function-level safety doc); mlx_guard() is
     // held by the caller.
     unsafe {
-        let mut eval_handles = [arr];
-        mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
-        bump_eval_count();
+        // Already-realized arrays skip the eval boundary: readback after the
+        // batched pre-backward flush must not count as a new realization.
+        if mlx_sys::mlx_array_is_available(arr) == 0 {
+            let mut eval_handles = [arr];
+            mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
+            bump_eval_count();
+        }
         let size = mlx_array_size(arr);
         let data_ptr = mlx_array_data_float32(arr);
         if data_ptr.is_null() {
