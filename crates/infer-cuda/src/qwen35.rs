@@ -60,6 +60,8 @@ use crate::workspace::{HiddenSlot, PinnedSlot, SliceSlot, VecSlot};
 
 #[path = "qwen35/dspark.rs"]
 pub(crate) mod dspark;
+#[cfg(feature = "cuda")]
+pub(crate) mod dspark_batch_invariance;
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 

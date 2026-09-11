@@ -85,6 +85,9 @@ pub use qwen35::{
     StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
 };
 
+#[cfg(feature = "cuda")]
+pub use qwen35::dspark_batch_invariance::GateReport as DsparkDrafterBatchInvarianceReport;
+
 // Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
 // `enable_cuda_graph` load flag actually gate the B=1 decode graph instead of
 // being discarded; the `--no-cuda-graph` flag controls it.
@@ -508,6 +511,23 @@ impl CudaExecutor {
             }
             CudaExecutorInner::Real(real) => real.dsv4_verify_forward_selftest(prompt),
         }
+    }
+
+    /// Dev-only whole-drafter-step batch-invariance gate for DSpark
+    /// (`dspark_drafter_batch_invariance`). Builds a synthetic drafter head at
+    /// the served geometry (no checkpoint, no loaded executor model) and
+    /// asserts one sequence's draft logits/tokens are identical run alone and
+    /// batched at index 0 and 3; with `negative`, the two slot-swap controls
+    /// must each move the output. Returns the per-family report lines and an
+    /// overall pass flag.
+    #[cfg(feature = "cuda")]
+    pub fn dspark_drafter_batch_invariance(
+        &self,
+        config_path: Option<&std::path::Path>,
+        negative: bool,
+    ) -> anyhow::Result<DsparkDrafterBatchInvarianceReport> {
+        let _ = self;
+        crate::qwen35::dspark_batch_invariance::run(config_path, negative)
     }
 
     /// Placeholder forward — produces one deterministic token per scheduled row.
