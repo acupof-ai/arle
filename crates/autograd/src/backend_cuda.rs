@@ -193,8 +193,9 @@ const CUBLASLT_BF16_GEMMEX_MIN_N: usize = 32;
 /// Complete artifact identity of one autograd NVRTC compile unit — the
 /// training analogue of the serving side's `KERNEL_BUILD_ID`. Two runs with
 /// equal identity load numerically identical cubins.
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NvrtcIdentity {
+pub(crate) struct NvrtcIdentity {
     /// FNV-1a 64 hex hash of the dtype prelude + concatenated kernel sources.
     pub source_hash: String,
     pub compile_flags: String,

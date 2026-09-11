@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_write_scalar_at(
+pub(crate) fn cuda_write_scalar_at(
     backend: &CudaBackend,
     dest: &DeviceHandle,
     src: &DeviceHandle,
@@ -44,7 +44,7 @@ pub(super) fn cuda_write_scalar_at(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_transpose_axes_swap_device(
+pub(crate) fn cuda_transpose_axes_swap_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     old_shape: &[usize],
@@ -157,7 +157,7 @@ pub(super) fn cuda_transpose_axes_swap_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_slice_device(
+pub(crate) fn cuda_slice_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     old_shape: &[usize],
@@ -278,7 +278,7 @@ pub(super) fn cuda_slice_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_concat_axis2_device(
+pub(crate) fn cuda_concat_axis2_device(
     backend: &CudaBackend,
     a: &DeviceHandle,
     a_shape: &[usize],
@@ -397,7 +397,7 @@ pub(super) fn cuda_concat_axis2_device(
     Ok((DeviceHandle::Cuda(CudaStorage::new(d_out)), out_shape))
 }
 
-pub(super) fn cuda_slice_backward_device(
+pub(crate) fn cuda_slice_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     input_shape: &[usize],
@@ -422,7 +422,7 @@ pub(super) fn cuda_slice_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_write_slice_device(
+pub(crate) fn cuda_write_slice_device(
     backend: &CudaBackend,
     dest: &DeviceHandle,
     upstream: &DeviceHandle,
@@ -437,7 +437,7 @@ pub(super) fn cuda_write_slice_device(
 /// destination may already carry another consumer's contribution, so a store
 /// would drop it — disjoint slice regions are not enough to make one safe.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_accumulate_slice_device(
+pub(crate) fn cuda_accumulate_slice_device(
     backend: &CudaBackend,
     dest: &DeviceHandle,
     upstream: &DeviceHandle,

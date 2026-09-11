@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_kv_cache_write_axis2(
+pub(crate) fn cuda_kv_cache_write_axis2(
     backend: &CudaBackend,
     dst: &DeviceHandle,
     dst_shape: &[usize],
@@ -94,7 +94,7 @@ pub(super) fn cuda_kv_cache_write_axis2(
 
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_causal_sdpa_decode_gqa_cache(
+pub(crate) fn cuda_causal_sdpa_decode_gqa_cache(
     backend: &CudaBackend,
     q: &DeviceHandle,
     q_shape: &[usize],
@@ -230,7 +230,7 @@ pub(super) fn cuda_causal_sdpa_decode_gqa_cache(
 #[cfg(not(feature = "no-cuda"))]
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_qwen_decode_prepare_q(
+pub(crate) fn cuda_qwen_decode_prepare_q(
     backend: &CudaBackend,
     q_full: &DeviceHandle,
     q_full_shape: &[usize],
@@ -363,7 +363,7 @@ pub(super) fn cuda_qwen_decode_prepare_q(
 
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_qwen_decode_prepare_kv(
+pub(crate) fn cuda_qwen_decode_prepare_kv(
     backend: &CudaBackend,
     k_full: &DeviceHandle,
     k_full_shape: &[usize],

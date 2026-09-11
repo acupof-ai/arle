@@ -22,11 +22,6 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Exact for values that were originally bf16 (lower 16 bits are zero).
-pub fn f32_to_bf16_bits(f: f32) -> u16 {
-    (f.to_bits() >> 16) as u16
-}
-
 pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
     let exp = i32::from((bits >> 3) & 0x0f);
@@ -44,14 +39,14 @@ pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
 }
 
 /// FP4 E2M1 codebook: 1 sign bit, 2 exponent bits, 1 mantissa bit.
-pub const FP4_E2M1_LUT: [f32; 16] = [
+const FP4_E2M1_LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// Host twin of the `fp4_e2m1_group_to_bf16` device kernel: packed E2M1
 /// `[rows, cols/2]` (low nibble = even col) x per-row per-group FP8 E4M3 scale
 /// x one F32 global scale.
-pub fn dequantize_fp4_e2m1_group_host(
+pub(crate) fn dequantize_fp4_e2m1_group_host(
     weight: &[u8],
     scales: &[u8],
     global_scale: f32,
@@ -112,7 +107,7 @@ pub fn dequantize_fp4_e2m1_group_host(
     Ok(out)
 }
 
-pub fn dequantize_fp8_block_scaled_host(
+pub(crate) fn dequantize_fp8_block_scaled_host(
     weight: &[u8],
     scales: &[f32],
     shape: &[usize],
@@ -134,7 +129,7 @@ pub fn dequantize_fp8_block_scaled_host(
     Ok(out)
 }
 
-pub fn validate_fp8_block_scaled(
+pub(crate) fn validate_fp8_block_scaled(
     weight: &[u8],
     scales: &[f32],
     shape: &[usize],
@@ -222,7 +217,7 @@ pub fn cpu_matmul_forward(
     }
 }
 
-pub fn matmul_bt_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {
+pub(crate) fn matmul_bt_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {
     use crate::AutogradError;
     if a_shape.len() != 2 || b_shape.len() != 2 {
         return Err(AutogradError::InvalidRank {
@@ -742,7 +737,7 @@ pub fn cpu_mul_scalar_forward(a: &[f32], s: f32) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| x * s).collect())
 }
 
-pub fn cpu_add_broadcast_forward(
+pub(crate) fn cpu_add_broadcast_forward(
     a: &[f32],
     a_shape: &[usize],
     b: &[f32],
@@ -848,13 +843,13 @@ pub fn cpu_neg_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| -x).collect())
 }
 
-pub fn cpu_abs_forward(a: &[f32]) -> Result<Vec<f32>> {
+pub(crate) fn cpu_abs_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| x.abs()).collect())
 }
 
 /// CPU reference `sign(x)` with `sign(0) = 0` — the L1 subgradient `abs`
 /// picks. `f32::signum` cannot be used: it maps ±0.0 to ±1.0.
-pub fn cpu_sign(x: f32) -> f32 {
+pub(crate) fn cpu_sign(x: f32) -> f32 {
     if x > 0.0 {
         1.0
     } else if x < 0.0 {
@@ -870,7 +865,7 @@ pub fn cpu_silu_forward(a: &[f32]) -> Result<Vec<f32>> {
         .collect())
 }
 
-pub fn cpu_sigmoid_forward(a: &[f32]) -> Result<Vec<f32>> {
+pub(crate) fn cpu_sigmoid_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter()
         .map(|&x| 1.0_f32 / (1.0_f32 + (-x).exp()))
         .collect())
@@ -1479,7 +1474,7 @@ fn offset4(
     (((batch * heads + head) * seq_len + token) * head_dim) + dim
 }
 
-pub fn cpu_kv_cache_write_axis2(
+pub(crate) fn cpu_kv_cache_write_axis2(
     dst: &mut [f32],
     dst_shape: &[usize],
     src: &[f32],
@@ -1543,7 +1538,7 @@ pub fn cpu_kv_cache_write_axis2(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn cpu_causal_sdpa_decode_gqa_cache(
+pub(crate) fn cpu_causal_sdpa_decode_gqa_cache(
     q: &[f32],
     q_shape: &[usize],
     k: &[f32],
@@ -1875,7 +1870,7 @@ pub(crate) fn validate_qwen_decode_prepare_kv_shapes(
     Ok(())
 }
 
-pub fn validate_decode_gqa_cache_shapes(
+pub(crate) fn validate_decode_gqa_cache_shapes(
     q_shape: &[usize],
     k_shape: &[usize],
     v_shape: &[usize],

@@ -4,7 +4,7 @@ use super::*;
 // host-side physical transpose. Operand order is the cuBLAS column-major
 // swap — see per-branch comments. PENDING REMOTE CUDA VERIFICATION.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_matmul_backward(
+pub(crate) fn cuda_matmul_backward(
     backend: &CudaBackend,
     a: &[f32],
     a_shape: &[usize],
@@ -202,7 +202,7 @@ pub(super) fn cuda_matmul_backward(
 // fence per training step.
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_matmul_backward_device(
+pub(crate) fn cuda_matmul_backward_device(
     backend: &CudaBackend,
     a: &DeviceHandle,
     a_shape: &[usize],
@@ -404,7 +404,7 @@ pub(super) fn cuda_matmul_backward_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_matmul_bt_input_grad_device(
+pub(crate) fn cuda_matmul_bt_input_grad_device(
     backend: &CudaBackend,
     b: &DeviceHandle,
     b_shape: &[usize],
@@ -494,7 +494,7 @@ pub(super) fn cuda_matmul_bt_input_grad_device(
 
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_matmul_bt_backward_device(
+pub(crate) fn cuda_matmul_bt_backward_device(
     backend: &CudaBackend,
     a: &DeviceHandle,
     a_shape: &[usize],

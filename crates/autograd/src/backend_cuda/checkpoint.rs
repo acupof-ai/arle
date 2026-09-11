@@ -3,7 +3,7 @@ use super::*;
 /// 64 MiB slot granularity: varying trajectory lengths share size classes instead
 /// of exhausting the budget on exact-fit slots.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) const PINNED_SLOT_GRANULARITY: usize = 16 << 20;
+const PINNED_SLOT_GRANULARITY: usize = 16 << 20;
 
 /// Reusable pinned host buffers holding parked checkpoint activations.
 ///
@@ -13,7 +13,7 @@ pub(super) const PINNED_SLOT_GRANULARITY: usize = 16 << 20;
 /// `checkpoint_pin_readback` drains the stream itself.
 #[cfg(not(feature = "no-cuda"))]
 #[derive(Default)]
-pub(super) struct PinnedCheckpointPool {
+pub(crate) struct PinnedCheckpointPool {
     slots: Vec<PinnedHostSlice<f32>>,
     free: Vec<u32>,
     allocated_bytes: usize,
@@ -94,7 +94,7 @@ impl PinnedCheckpointPool {
     }
 }
 
-pub(super) fn cuda_checkpoint_pin_offload(
+pub(crate) fn cuda_checkpoint_pin_offload(
     backend: &CudaBackend,
     handle: &DeviceHandle,
     len: usize,
@@ -137,7 +137,7 @@ pub(super) fn cuda_checkpoint_pin_offload(
     Ok(Some(slot))
 }
 
-pub(super) fn cuda_checkpoint_pin_reload(
+pub(crate) fn cuda_checkpoint_pin_reload(
     backend: &CudaBackend,
     slot: u32,
     shape: &[usize],
@@ -168,7 +168,7 @@ pub(super) fn cuda_checkpoint_pin_reload(
     Ok(DeviceHandle::Cuda(CudaStorage::new(device)))
 }
 
-pub(super) fn cuda_checkpoint_pin_readback(
+pub(crate) fn cuda_checkpoint_pin_readback(
     backend: &CudaBackend,
     slot: u32,
     dst: &mut [f32],

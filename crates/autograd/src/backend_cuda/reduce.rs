@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_softmax_like(
+pub(crate) fn cuda_softmax_like(
     backend: &CudaBackend,
     x: &[f32],
     shape: &[usize],
@@ -62,7 +62,7 @@ pub(super) fn cuda_softmax_like(
 // caller owns the terminal eval. Serves both softmax and log_softmax via
 // `kernel_name`.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_softmax_like_device(
+pub(crate) fn cuda_softmax_like_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     shape: &[usize],
@@ -139,7 +139,7 @@ pub(super) fn cuda_softmax_like_device(
 // Device-resident log_softmax backward; returned unevaluated for the tape's
 // terminal eval. Same reduce shape as `softmax_last_axis_f32`.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_log_softmax_last_axis_backward(
+pub(crate) fn cuda_log_softmax_last_axis_backward(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     log_softmax_output: &DeviceHandle,
@@ -236,7 +236,7 @@ pub(super) fn cuda_log_softmax_last_axis_backward(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_softmax_last_axis_backward(
+pub(crate) fn cuda_softmax_last_axis_backward(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     softmax_output: &DeviceHandle,
@@ -326,7 +326,7 @@ pub(super) fn cuda_softmax_last_axis_backward(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_argmax_last_dim(
+pub(crate) fn cuda_argmax_last_dim(
     backend: &CudaBackend,
     x: &DeviceHandle,
     shape: &[usize],
@@ -384,7 +384,7 @@ pub(super) fn cuda_argmax_last_dim(
 // the caller's terminal eval forces the passes. Sibling of the host-reduce
 // path `sum_all` takes.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_sum_all_device(
+pub(crate) fn cuda_sum_all_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     size: usize,
@@ -448,7 +448,7 @@ pub(super) fn cuda_sum_all_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_reduce_last_axis(
+pub(crate) fn cuda_reduce_last_axis(
     backend: &CudaBackend,
     x: &[f32],
     shape: &[usize],

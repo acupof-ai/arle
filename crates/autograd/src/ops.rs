@@ -143,14 +143,6 @@ pub fn cat_seq(
     attention::cat_seq(a, b, store, tape)
 }
 
-pub fn cat_heads(
-    inputs: &[TensorId],
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    attention::cat_heads(inputs, store, tape)
-}
-
 pub fn add_broadcast(
     a: TensorId,
     b: TensorId,

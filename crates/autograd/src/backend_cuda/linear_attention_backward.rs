@@ -5,7 +5,7 @@ use super::*;
 /// rank owns H/cp value heads and Hg/cp key heads, so the built set is one
 /// geometry per (model, cp_size). The table is generated from kernels.toml.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<&'static ffi::FlashqlaGdrSyms> {
+pub(crate) fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<&'static ffi::FlashqlaGdrSyms> {
     ffi::FLASHQLA_GDR_TABLE
         .iter()
         .find(|g| g.q_heads as usize == h && g.kv_heads as usize == hg)
@@ -28,10 +28,10 @@ pub(super) fn flashqla_gdr_symbols(h: usize, hg: usize) -> Result<&'static ffi::
 /// 128x128 state) independent of seq_len; 8 lanes x 48 rows = 384 blocks fills
 /// H20's ~624-resident-block budget without oversubscribing it.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) const LA_BWD_CHUNK_WAVE: usize = 8;
+const LA_BWD_CHUNK_WAVE: usize = 8;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_linear_attention_backward_device(
+pub(crate) fn cuda_linear_attention_backward_device(
     backend: &CudaBackend,
     args: LinearAttentionDeviceBackwardArgs<'_>,
 ) -> Result<Option<LinearAttentionDeviceBackwardResult>> {
@@ -114,7 +114,7 @@ pub(super) fn cuda_linear_attention_backward_device(
 
 /// Only FlashQLA re-derives g/beta; the recurrent routes read them off the tape.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn taped_g_beta<'a>(
+fn taped_g_beta<'a>(
     beta: Option<&'a CudaSlice<f32>>,
     g: Option<&'a CudaSlice<f32>>,
 ) -> Result<(&'a CudaSlice<f32>, &'a CudaSlice<f32>)> {
@@ -124,7 +124,7 @@ pub(super) fn taped_g_beta<'a>(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_linear_attention_backward_device_row(
+fn cuda_linear_attention_backward_device_row(
     backend: &CudaBackend,
     args: LinearAttentionDeviceBackwardArgs<'_>,
 ) -> Result<LinearAttentionDeviceBackwardResult> {
@@ -861,7 +861,7 @@ pub(super) fn cuda_linear_attention_backward_device_row(
 /// GPU assist for the host-fallback backward — reachable only for shapes the
 /// device path declines (non-128 head dims); kept for those, not a hot path.
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_linear_attention_scan_backward(
+pub(crate) fn cuda_linear_attention_scan_backward(
     backend: &CudaBackend,
     args: LinearAttentionScanBackwardArgs<'_>,
 ) -> Result<Option<LinearAttentionScanBackwardGrads>> {

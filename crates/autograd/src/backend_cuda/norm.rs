@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_rms_norm(
+pub(crate) fn cuda_rms_norm(
     backend: &CudaBackend,
     x: &[f32],
     weight: &[f32],
@@ -64,7 +64,7 @@ pub(super) fn cuda_rms_norm(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_rms_norm_device(
+pub(crate) fn cuda_rms_norm_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     weight: &[f32],
@@ -163,7 +163,7 @@ pub(super) fn cuda_rms_norm_device(
 // Returned handles are unevaluated; the terminal `eval` belongs to the caller.
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_rms_norm_backward_device(
+pub(crate) fn cuda_rms_norm_backward_device(
     backend: &CudaBackend,
     upstream: &DeviceHandle,
     x: &DeviceHandle,

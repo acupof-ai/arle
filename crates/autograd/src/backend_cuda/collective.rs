@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn cuda_all_reduce_sum_device(
+pub(crate) fn cuda_all_reduce_sum_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     shape: &[usize],
@@ -43,7 +43,7 @@ pub(super) fn cuda_all_reduce_sum_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
 }
 
-pub(super) fn cuda_all_gather_seq_device(
+pub(crate) fn cuda_all_gather_seq_device(
     backend: &CudaBackend,
     x: &DeviceHandle,
     local_shape: &[usize],
@@ -106,7 +106,7 @@ pub(super) fn cuda_all_gather_seq_device(
     unreachable!("world>1 without nccl feature")
 }
 
-pub(super) fn cuda_ring_send_recv_kv(
+pub(crate) fn cuda_ring_send_recv_kv(
     backend: &CudaBackend,
     block: &DeviceHandle,
     block_shape: &[usize],
@@ -171,7 +171,7 @@ pub(super) fn cuda_ring_send_recv_kv(
 /// Blocking point-to-point send on the CP communicator (a lone `ncclSend` is
 /// safe: the peer's matching `ncclRecv` is the only other party).
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_cp_send(
+pub(crate) fn cuda_cp_send(
     backend: &CudaBackend,
     handle: &DeviceHandle,
     len: usize,
@@ -207,7 +207,7 @@ pub(super) fn cuda_cp_send(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_cp_recv(backend: &CudaBackend, len: usize, peer: usize) -> Result<DeviceHandle> {
+pub(crate) fn cuda_cp_recv(backend: &CudaBackend, len: usize, peer: usize) -> Result<DeviceHandle> {
     #[cfg(feature = "nccl")]
     {
         let nccl = backend

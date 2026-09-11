@@ -2,7 +2,7 @@ use super::*;
 
 impl CudaBackend {
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn cublaslt_bf16_gemm_n(rows: usize) -> usize {
+    fn cublaslt_bf16_gemm_n(rows: usize) -> usize {
         if rows == 0 {
             0
         } else {
@@ -11,13 +11,13 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn checked_bf16_len(rows: usize, cols: usize, op: &'static str) -> Result<usize> {
+    fn checked_bf16_len(rows: usize, cols: usize, op: &'static str) -> Result<usize> {
         rows.checked_mul(cols)
             .ok_or(AutogradError::TapeInvariant(op))
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn maybe_pad_bf16_gemm_n(
+    fn maybe_pad_bf16_gemm_n(
         &self,
         src: &CudaSlice<u16>,
         rows: usize,
@@ -38,7 +38,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_device(
+    pub(crate) fn matmul_device(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -127,7 +127,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_bt_device_f32_bf16(
+    fn matmul_bt_device_f32_bf16(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -228,7 +228,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_device_f32_bf16(
+    pub(crate) fn matmul_device_f32_bf16(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -519,7 +519,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn fp8_block_scaled_as_bf16(
+    fn fp8_block_scaled_as_bf16(
         &self,
         storage: &CudaFp8BlockScaledStorage,
     ) -> Result<(Arc<CudaSlice<u16>>, Vec<usize>)> {
@@ -529,7 +529,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn fp4_e2m1_group_as_bf16(
+    fn fp4_e2m1_group_as_bf16(
         &self,
         storage: &CudaFp4E2M1GroupStorage,
     ) -> Result<(Arc<CudaSlice<u16>>, Vec<usize>)> {
@@ -539,7 +539,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_bt_device_f32_fp4_e2m1_group(
+    fn matmul_bt_device_f32_fp4_e2m1_group(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -550,7 +550,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_bt_device_f32_fp8_block_scaled(
+    fn matmul_bt_device_f32_fp8_block_scaled(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -575,7 +575,7 @@ impl CudaBackend {
     /// (128×128 blocks, `rows%8==0`, `cols%128==0`, SM≥9) so the caller falls
     /// back to the bf16 dequant GEMM.
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_bt_device_fp8_deepgemm(
+    fn matmul_bt_device_fp8_deepgemm(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -665,7 +665,7 @@ impl CudaBackend {
 
     /// DeepGEMM FP8 needs Hopper+ (sm_90 / sm_100). Major ≥ 9.
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn fp8_deepgemm_sm_ok(&self) -> bool {
+    fn fp8_deepgemm_sm_ok(&self) -> bool {
         use cudarc::driver::sys::CUdevice_attribute as Attr;
         self.stream
             .context()
@@ -674,7 +674,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_device_f32_fp8_block_scaled(
+    pub(crate) fn matmul_device_f32_fp8_block_scaled(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -685,7 +685,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(super) fn matmul_device_f32_fp4_e2m1_group(
+    pub(crate) fn matmul_device_f32_fp4_e2m1_group(
         &self,
         a: &CudaSlice<f32>,
         a_shape: &[usize],
@@ -696,7 +696,7 @@ impl CudaBackend {
     }
 }
 
-pub(super) fn cuda_matmul_bt(
+pub(crate) fn cuda_matmul_bt(
     backend: &CudaBackend,
     a: &DeviceHandle,
     a_shape: &[usize],

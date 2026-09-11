@@ -23,7 +23,7 @@ fn ring_core_err(e: anyhow::Error, label: &'static str) -> AutogradError {
 
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_ring_block_fwd_merge(
+pub(crate) fn cuda_ring_block_fwd_merge(
     backend: &CudaBackend,
     q: &DeviceHandle,
     k_blk: &DeviceHandle,
@@ -115,7 +115,7 @@ pub(super) fn cuda_ring_block_fwd_merge(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-pub(super) fn cuda_ring_block_finalize(
+pub(crate) fn cuda_ring_block_finalize(
     backend: &CudaBackend,
     acc_m: &DeviceHandle,
     acc_l: &DeviceHandle,
@@ -159,7 +159,7 @@ pub(super) fn cuda_ring_block_finalize(
 
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cuda_ring_block_bwd(
+pub(crate) fn cuda_ring_block_bwd(
     backend: &CudaBackend,
     q: &DeviceHandle,
     k_blk: &DeviceHandle,

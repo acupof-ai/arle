@@ -598,7 +598,7 @@ fn causal_sdpa_recompute_backward_device_chunked(
 
 /// Concatenate rank-4 tensors along the head axis (axis 1). Host-only: runs
 /// ~once per layer, not in the inner softmax loop, so correctness over speed.
-pub fn cat_heads(
+pub(crate) fn cat_heads(
     inputs: &[TensorId],
     store: &mut TensorStore,
     tape: &mut crate::Tape,

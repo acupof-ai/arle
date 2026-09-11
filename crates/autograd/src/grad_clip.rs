@@ -50,7 +50,7 @@ pub fn compute_global_norm_f64(
     Ok(total_sq_norm.sqrt())
 }
 
-pub fn ensure_finite_loss<O: Optimizer>(
+fn ensure_finite_loss<O: Optimizer>(
     loss: f32,
     params: &[TensorId],
     optimizer: &mut O,
