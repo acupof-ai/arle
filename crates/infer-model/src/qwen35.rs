@@ -103,10 +103,9 @@ pub fn linear_state_bytes(cfg: &Qwen35Config, shard: LocalShard) -> (usize, usiz
 }
 
 /// FlashQLA chunked GDR has an AOT instantiation for this geometry. This is the
-/// single geometry predicate for every "use the chunked FlashQLA recurrence"
-/// decision — the per-row `use_fq_chunked` dispatch and the uniform-multi-chain
-/// verify router must agree, or batched spec verify silently drops to a
-/// different (never parity-gated) varlen recurrent kernel.
+/// geometry predicate behind the `gdr_fq_available` router; an unsupported
+/// geometry advances each row through the single-sequence recurrent prefill
+/// kernel instead, whose serving-shape math is covered only by autograd tests.
 pub fn fq_geometry_supported(
     key_heads: usize,
     value_heads: usize,
@@ -323,10 +322,9 @@ mod tests {
         assert!(!cp_decode_possible(8, shard)); // kv 8 ok, lin 4 not
     }
 
-    /// The chunked-GDR router and the per-row `use_fq_chunked` dispatch must use
-    /// exactly this predicate, so c=1 verify and c=N batched verify pick the
-    /// same FlashQLA recurrence. A geometry drifting out of sync silently drops
-    /// the batch to the unvalidated varlen recurrent kernel.
+    /// The set of AOT-instantiated FlashQLA geometries is exactly what this
+    /// predicate accepts, so the chunked-GDR router never names a geometry the
+    /// AOT table cannot dispatch.
     #[test]
     fn fq_geometry_matches_aot_instantiations() {
         assert!(fq_geometry_supported(16, 32, 128, 128));

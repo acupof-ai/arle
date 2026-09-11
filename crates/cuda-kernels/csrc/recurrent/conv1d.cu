@@ -206,48 +206,6 @@ cudaError_t conv1d_prefill_cuda(
     return cudaGetLastError();
 }
 
-// Varlen twin: slot `s` reads `x_ptrs[s]` for `row_len[s]` rows.
-cudaError_t conv1d_prefill_varlen_cuda(
-    const __nv_bfloat16* const* x_ptrs,
-    const __nv_bfloat16* conv_weight,
-    __nv_bfloat16* const* state_ptrs,
-    const int* row_len,
-    __nv_bfloat16* out_seq,
-    int num_channels,
-    int max_len,
-    int kernel_size,
-    int batch,
-    cudaStream_t stream
-) {
-    if (batch <= 0 || max_len <= 0) {
-        return cudaErrorInvalidValue;
-    }
-    // max_len == 1 forces every row_len to 1: the decode form covers all slots.
-    if (max_len == 1) {
-        dim3 dgrid((num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK, batch);
-        conv1d_decode_kernel<<<dgrid, CONV1D_BLOCK, 0, stream>>>(
-            nullptr, x_ptrs, conv_weight, nullptr, state_ptrs,
-            out_seq, num_channels, kernel_size
-        );
-        return cudaGetLastError();
-    }
-    int total = num_channels * max_len;
-    dim3 grid((total + CONV1D_BLOCK - 1) / CONV1D_BLOCK, batch);
-    conv1d_prefill_kernel<<<grid, CONV1D_BLOCK, 0, stream>>>(
-        nullptr, x_ptrs, conv_weight, nullptr, state_ptrs, row_len,
-        out_seq, num_channels, max_len, kernel_size
-    );
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return err;
-    }
-    dim3 sgrid((num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK, batch);
-    conv1d_state_update_kernel<<<sgrid, CONV1D_BLOCK, 0, stream>>>(
-        nullptr, x_ptrs, nullptr, state_ptrs, row_len, num_channels, max_len, kernel_size
-    );
-    return cudaGetLastError();
-}
-
 } // extern "C"
 
 // `count` equal-sized device-to-device copies in one launch. The DSpark spec

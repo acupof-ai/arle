@@ -81,41 +81,6 @@ pub fn conv1d_prefill_raw(
     }
 }
 
-/// Varlen prefill conv1d: slot `s` reads `x_tbl[s]`, runs `row_len[s]` rows
-/// into `state_tbl[s]`, writes at its `s * max_len` block of `out`.
-#[allow(clippy::too_many_arguments)]
-pub fn conv1d_prefill_varlen_raw(
-    stream: &CudaStream,
-    x_tbl: u64,
-    weight_ptr: u64,
-    state_tbl: u64,
-    row_len_ptr: u64,
-    out_ptr: u64,
-    num_channels: usize,
-    max_len: usize,
-    kernel_size: usize,
-    batch: usize,
-) -> Result<()> {
-    // SAFETY: caller passes live device addresses (tables hold `batch` live
-    // pointers) sized to the dims below, stream-ordered on `stream`.
-    unsafe {
-        ffi::conv1d_prefill_varlen_cuda(
-            x_tbl as *const *const ffi::Half,
-            weight_ptr as *const ffi::Half,
-            state_tbl as *const *mut ffi::Half,
-            row_len_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            rec_i32(num_channels, "conv1d_varlen channels")?,
-            rec_i32(max_len, "conv1d_varlen max_len")?,
-            rec_i32(kernel_size, "conv1d_varlen kernel")?,
-            rec_i32(batch, "conv1d_varlen batch")?,
-            stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("conv1d_prefill_varlen_cuda failed at batch={batch}: {e}"))
-    }
-}
-
 /// Single-token GDR decode step; `state` is the `[v_heads, key_dim, val_dim]`
 /// f32 recurrent state, advanced in place.
 #[allow(clippy::too_many_arguments)]
@@ -194,54 +159,6 @@ pub fn gdr_prefill_recurrent_raw(
         .result()
         .map_err(|e| {
             anyhow!("gated_delta_rule_prefill_recurrent_cuda failed at seq={seq_len}: {e}")
-        })
-    }
-}
-
-/// Varlen GDR replay: slot `s` reads qkv / writes output at its `s * max_len`
-/// block, running `row_len[s]` rows into `state_tbl[s]`; `b_tbl`/`a_tbl` hold
-/// per-slot input pointers.
-#[allow(clippy::too_many_arguments)]
-pub fn gdr_prefill_recurrent_varlen_raw(
-    stream: &CudaStream,
-    qkv_ptr: u64,
-    b_tbl: u64,
-    a_tbl: u64,
-    dt_bias_ptr: u64,
-    a_log_ptr: u64,
-    state_tbl: u64,
-    row_len_ptr: u64,
-    out_ptr: u64,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    val_dim: usize,
-    max_len: usize,
-    batch: usize,
-) -> Result<()> {
-    // SAFETY: caller passes live device addresses (tables hold `batch` live
-    // pointers) sized to the dims below, stream-ordered on `stream`.
-    unsafe {
-        ffi::gated_delta_rule_prefill_recurrent_varlen_cuda(
-            qkv_ptr as *const ffi::Half,
-            b_tbl as *const *const ffi::Half,
-            a_tbl as *const *const ffi::Half,
-            dt_bias_ptr as *const ffi::Half,
-            a_log_ptr as *const f32,
-            state_tbl as *const *mut f32,
-            row_len_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            rec_i32(num_key_heads, "gdr_varlen k_heads")?,
-            rec_i32(num_value_heads, "gdr_varlen v_heads")?,
-            rec_i32(key_dim, "gdr_varlen key_dim")?,
-            rec_i32(val_dim, "gdr_varlen val_dim")?,
-            rec_i32(max_len, "gdr_varlen max_len")?,
-            rec_i32(batch, "gdr_varlen batch")?,
-            stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| {
-            anyhow!("gated_delta_rule_prefill_recurrent_varlen_cuda failed at batch={batch}: {e}")
         })
     }
 }

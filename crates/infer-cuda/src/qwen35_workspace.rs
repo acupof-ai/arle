@@ -163,10 +163,6 @@ pub(crate) struct LinearAttnScratch {
     pub(crate) fq_g: SliceSlot<f32>,
     pub(crate) fq_g_cumsum: SliceSlot<f32>,
     pub(crate) fq_beta: SliceSlot<f32>,
-    pub(crate) batch_ptrs: SliceSlot<u64>,
-    pub(crate) batch_len: SliceSlot<i32>,
-    pub(crate) batch_host: Vec<u64>,
-    pub(crate) batch_len_host: Vec<i32>,
     /// CP prefill only: this rank's q-slice copy of the full-chunk `normed`.
     pub(crate) cp_in: HiddenSlot,
     /// CP prefill only: pre-out_proj-reduce slice output.
@@ -174,11 +170,6 @@ pub(crate) struct LinearAttnScratch {
     /// CP prefill only: `[cp, pad, hidden]` row all-gather (in-place).
     pub(crate) cp_row_gather: HiddenSlot,
 }
-
-/// Rows this long or shorter take the batched recurrent core instead of
-/// per-row FlashQLA: one chunk holds them, so there is no chunk parallelism
-/// to win back against B times the launches.
-pub(crate) const LINEAR_BATCH_MAX_LEN: usize = 64;
 
 /// One slot's contiguous column range in a ragged batch. Its `len` token-major
 /// columns advance THIS slot's state; its capture receives them from offset 0.

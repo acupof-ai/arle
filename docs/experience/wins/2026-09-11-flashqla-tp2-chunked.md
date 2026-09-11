@@ -1,6 +1,10 @@
 # Chunked FlashQLA GDN on the attn_tp=2/4 shards — cuda, 2026-09-11
 
 > Status: pending-remote
+>
+> Update (#300, same day): `gdr_varlen_parity` was renamed
+> `flashqla_chunk_parity` after the varlen half was deleted; run the
+> FlashQLA-vs-f64 checks below under the new name.
 
 ## Goal
 
