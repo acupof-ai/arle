@@ -24,8 +24,8 @@ decomposition, or a verdict. Not needed for routine edits.
   its fallback, and verify the kill switch exists by name in the build before
   trusting it. Recurred in one review cycle: DSv4 hidden/intermediate copied
   from DeepSeek-V3's 7168/20480; the Qwen DSpark ring cap taken from DSv4's
-  window 128 / block 5 (#331); Qwen3.6-27B full-attention head_dim used as the
-  GDR linear-attention dim 128 (#333); an hd128 unit-test struct read as model
+  window 128 / block 5 (#331); the GDR linear-attention head dim 128 used as
+  Qwen3.6-27B's full-attention head_dim (256) (#333); an hd128 unit-test struct read as model
   geometry (#330); a gate covering the fallback lane instead of the default
   (#335); and a gate switched on `ARLE_QWEN35_GDR_CHUNKED`, a name that no
   longer existed, so the gate did nothing (#300/#334).
