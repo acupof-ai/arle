@@ -108,6 +108,7 @@ numeric gate. Every row is **Gated (GPU run pending)**: the gate compiles and
 is wired into `scripts/parity_gpu_batch.sh`, but no on-device run is recorded
 yet (header status).
 
+
 | # | Kernel family | Default-path role | Gate file | PR |
 |---|---|---|---|---|
 | 1 | FlashMLA sparse decode + metadata shims (CSA ratio 4, plus HCA ratio 128) | HOT DSv4-Flash decode | `crates/infer-cuda/examples/flashmla_sparse_decode_parity.rs` (CSA, B=8 batched); `crates/infer-cuda/examples/flashmla_hca_decode_parity.rs` (HCA, explicit B=1) | #320, #324 |
@@ -122,9 +123,11 @@ yet (header status).
 | 10 | DSpark sampling accept/filter/draft kernels | WARM spec decode | `crates/infer-cuda/examples/dspark_sampler_parity.rs` (filter/sample/chain-accept vs f64) | #312 |
 | 11 | FA2 sm70 (`arle_fa2_sm70_attention_cuda`, V100 sm<80) | MTP spec-head contiguous-cache attention (NOT regular serving decode; see geometry note) | `crates/infer-cuda/examples/fa2_sm70_parity.rs` (GQA 8/2 + 24/4 hd256, hd128 contract, B=1/B=8, decode + causal chunked prefill off 16/64 tiles, kv 4096; f64 SDPA, per-family negative control) | #336. GPU run pending V100. |
 
+
 ### Geometry mismatches (gate exists, production shape in question)
 
-Status per item; one remains **Open**.
+Status per item; **no Open items remain** (two closed in code pending the GPU
+batch, two closed outright).
 
 - **attn_tp≥2 GDN — closed in code, GPU run pending.** Chunked FlashQLA is now
   selected at every supported shard: (8,24) attn_tp=2 and (4,12) attn_tp=4
@@ -147,11 +150,22 @@ Status per item; one remains **Open**.
   reachable config is gated by
   `crates/infer-cuda/examples/paged_quant_attn_parity.rs` (#330).
 - **FA2 sm70 gate — Gated (GPU run pending, V100).** The dense seq4/q2-kv1/hd256 host gate (`fa2_sm70_matches_host_reference`) is superseded by `crates/infer-cuda/examples/fa2_sm70_parity.rs` (#336). Reachability, full-tree: the kernel is contiguous-cache only (grid `(q_heads, ceil(seq/16))`, no batch or page-table axis) and its only callers are the MTP spec head's `full_attention_into` — single `qwen35_spec.rs:77` and the B>1 per-row loop `:316` (decoder qwen35_attention.rs:201 decode / :281 prefill). Regular serving prefill/decode uses `full_attention_paged`, whose sm<80 fallback is `paged_attention_v1_raw` (qwen35_attention.rs:961), so there is no paged sm70 shape and no non-identity page table to gate. The example covers GQA 8/2 and 24/4 at hd256 plus the non-production hd128 contract, B=1/B=8, decode and causal chunked prefill off the 16/64 tiles through kv_len 4096.
-- **DSv4 TP/EP sharding o-projection — Open.** `dsv4_parity` runs TP=8 but
-  gates only the first prefill token; the decode-band TP Q-repack is bit-exact
-  gated at TP=2/4/8 by `crates/infer-cuda/examples/dsv4_decode_moe_parity.rs`,
-  while the o-slice and grouped o-projection are still exercised only through
-  that one argmax (dense-BF16 o-proj is cuBLAS). No code gate yet.
+- **DSv4 TP/EP sharding o-projection — Gated (GPU run pending).**
+  `dsv4_parity` runs TP=8 but gates only the first prefill token; the
+  decode-band TP Q-repack is bit-exact gated at TP=2/4/8 by
+  `crates/infer-cuda/examples/dsv4_decode_moe_parity.rs`. The attention-output
+  side is gated at TP=1/2/4/8 (S=1/8/32) by
+  `crates/infer-cuda/examples/dsv4_tp_oproj_parity.rs`: head o-slice bit-exact;
+  the H20-default DeepGEMM O-LoRA lane (per-group
+  gather→pack-quantize→`dsv4_deepgemm_fp8_gemm_nt`→scatter for g>1,
+  contiguous for g==1; wo_b DeepGEMM, attention.rs:5290-5299/:5393-5415) with
+  per-group resident caches; AND the scalar fallback
+  (`dsv4_fp8_route_gemv_batch`/`dsv4_fp8_gemv_batch`, the non-sm90 / failed
+  preflight lane), both vs one f64 oracle with per-lane teeth (slice, gather
+  offset, cache→group map, route-table map, dropped rank, wo_b scale).
+  Remaining: NCCL itself is host-summed in the gate, and weights are
+  synthetic. The dense-BF16 `wo_a` re-serialization lane (per-group cuBLAS +
+  gather/scatter) is vendor-trusted.
 
 ## Metal (MLX) hand-written kernel parity
 
