@@ -105,11 +105,6 @@ impl Families {
         self.failed.push((name.into(), failed));
     }
 
-    /// True if any recorded family failed on this run.
-    pub fn any_failed(&self) -> bool {
-        self.failed.iter().any(|(_, f)| *f)
-    }
-
     /// Final verdict shared by every gate.
     ///
     /// Clean run (`negative == false`): every family must be green; one red
@@ -166,7 +161,9 @@ impl Families {
 }
 
 /// Relative L2 distance `||got-want||_2 / ||want||_2` over f64 pairs.
-pub fn rel_l2(got: &[f64], want: &[f64]) -> f64 {
+/// Private: [`compare`] is the single external entry and reports this on the
+/// [`Verdict`]; no gate reads the raw scalar separately.
+fn rel_l2(got: &[f64], want: &[f64]) -> f64 {
     let (mut num, mut den) = (0f64, 0f64);
     for (g, w) in got.iter().zip(want) {
         let d = g - w;
