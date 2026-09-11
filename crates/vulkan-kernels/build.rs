@@ -14,32 +14,6 @@ struct ShaderSpec {
 }
 
 const VENDORED: &[ShaderSpec] = &[
-    ShaderSpec {
-        name: "mul_mat_vec_iq2_xxs",
-        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec_iq2_xxs.comp",
-        defines: &[
-            ("FLOAT_TYPE", "float"),
-            ("FLOAT_TYPEV2", "vec2"),
-            ("DATA_A_IQ2_XXS", "1"),
-            ("B_TYPE", "float"),
-            ("B_TYPEV2", "vec2"),
-            ("B_TYPEV4", "vec4"),
-            ("D_TYPE", "float"),
-        ],
-    },
-    ShaderSpec {
-        name: "mul_mat_vec_q2_k",
-        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vec_q2_k.comp",
-        defines: &[
-            ("FLOAT_TYPE", "float"),
-            ("FLOAT_TYPEV2", "vec2"),
-            ("DATA_A_Q2_K", "1"),
-            ("B_TYPE", "float"),
-            ("B_TYPEV2", "vec2"),
-            ("B_TYPEV4", "vec4"),
-            ("D_TYPE", "float"),
-        ],
-    },
     // The decode GEMVs run a BLOCK_SIZE=64 workgroup pinned to a single 64-wide
     // subgroup (see `SPEC_GEMV_K_Q8_1` + `Kernel::required_subgroup_size`), so
     // `USE_SUBGROUP_ADD` collapses the cross-lane row reduction to ONE hardware
@@ -170,16 +144,6 @@ const VENDORED: &[ShaderSpec] = &[
         defines: &[("A_TYPE", "float"), ("ROPE_D_TYPE", "float")],
     },
     ShaderSpec {
-        name: "rope_norm",
-        source: "vendor/llama.cpp/vulkan-shaders/rope_norm.comp",
-        defines: &[("A_TYPE", "float"), ("ROPE_D_TYPE", "float")],
-    },
-    ShaderSpec {
-        name: "silu",
-        source: "vendor/llama.cpp/vulkan-shaders/silu.comp",
-        defines: &[("A_TYPE", "float"), ("D_TYPE", "float")],
-    },
-    ShaderSpec {
         name: "swiglu",
         source: "vendor/llama.cpp/vulkan-shaders/swiglu.comp",
         defines: &[("A_TYPE", "float"), ("D_TYPE", "float")],
@@ -193,39 +157,6 @@ const VENDORED: &[ShaderSpec] = &[
             ("D_TYPE", "float"),
             ("FLOAT_TYPE", "float"),
             ("ADD_RMS", "0"),
-        ],
-    },
-    ShaderSpec {
-        name: "get_rows",
-        source: "vendor/llama.cpp/vulkan-shaders/get_rows.comp",
-        defines: &[
-            ("FLOAT_TYPE", "float"),
-            ("FLOAT_TYPEV2", "vec2"),
-            ("TEMP_TYPE", "FLOAT_TYPE"),
-            ("DATA_A_F32", "1"),
-            ("B_TYPE", "int"),
-            ("D_TYPE", "float"),
-        ],
-    },
-    ShaderSpec {
-        name: "soft_max",
-        source: "vendor/llama.cpp/vulkan-shaders/soft_max.comp",
-        defines: &[
-            ("FLOAT_TYPE", "float"),
-            ("FLOAT_TYPEV2", "vec2"),
-            ("A_TYPE", "float"),
-            ("B_TYPE", "float"),
-            ("D_TYPE", "float"),
-        ],
-    },
-    ShaderSpec {
-        name: "argmax",
-        source: "vendor/llama.cpp/vulkan-shaders/argmax.comp",
-        defines: &[
-            ("FLOAT_TYPE", "float"),
-            ("FLOAT_TYPEV2", "vec2"),
-            ("A_TYPE", "float"),
-            ("D_TYPE", "int"),
         ],
     },
     ShaderSpec {
@@ -249,11 +180,6 @@ const LOCAL: &[ShaderSpec] = &[
     ShaderSpec {
         name: "q8_1_quantize",
         source: "crates/vulkan-kernels/shaders/q8_1_quantize.comp",
-        defines: &[],
-    },
-    ShaderSpec {
-        name: "geglu",
-        source: "crates/vulkan-kernels/shaders/geglu.comp",
         defines: &[],
     },
     ShaderSpec {
@@ -289,16 +215,6 @@ const LOCAL: &[ShaderSpec] = &[
     ShaderSpec {
         name: "dsv4_output_inverse_rope",
         source: "crates/vulkan-kernels/shaders/dsv4_output_inverse_rope.comp",
-        defines: &[],
-    },
-    ShaderSpec {
-        name: "swiglu_clamped",
-        source: "crates/vulkan-kernels/shaders/swiglu_clamped.comp",
-        defines: &[],
-    },
-    ShaderSpec {
-        name: "scaled_add",
-        source: "crates/vulkan-kernels/shaders/scaled_add.comp",
         defines: &[],
     },
     ShaderSpec {

@@ -31,6 +31,7 @@
 mod common;
 
 use infer_gguf::dequant::dequantize_row_q4_k;
+use infer_gguf::gguf::GgmlType;
 use vulkan_kernels::{
     BLOCK_Q4_K_BYTES, BLOCK_Q8_0_BYTES, BLOCK_Q8_1_BYTES, Dispatch, KernelParams, Result,
     gemv_dispatch, gemv_id_dispatch, gemv_id_params, gemv_params, q4_k_gemv_id_with_params,
@@ -323,7 +324,7 @@ fn fused_mul_mat_vec_id_matches_per_expert_loop() {
     let ids: Vec<i32> = vec![3, 0, 5, 5];
 
     // ---- Q4_K experts (the 35B-A3B routed expert quant) ----
-    let q4k_row = vulkan_kernels::q4_k_row_bytes(ncols).expect("q4_k row bytes");
+    let q4k_row = GgmlType::Q4K.row_bytes(ncols).expect("q4_k row bytes");
     run_id_case(
         &ctx,
         "id_Q4_K",
@@ -342,7 +343,7 @@ fn fused_mul_mat_vec_id_matches_per_expert_loop() {
     let _ = dequantize_row_q4_k(&make_q4_k_block(&mut rng), ncols);
 
     // ---- Q8_0 experts (some down_exps ship Q8_0) ----
-    let q8_0_row = vulkan_kernels::q8_0_row_bytes(ncols).expect("q8_0 row bytes");
+    let q8_0_row = GgmlType::Q8_0.row_bytes(ncols).expect("q8_0 row bytes");
     run_id_case(
         &ctx,
         "id_Q8_0",

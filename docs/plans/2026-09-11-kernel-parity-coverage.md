@@ -309,11 +309,8 @@ synthetic shape.
 | `rms_norm` | x·rsqrt(mean x²+eps) | `forward.rs` | **P(geo)** `device_elementwise` (n∈{256,**5120**,**17408**}) | yes |
 | `swiglu` | SiLU(gate)·up | `forward.rs`, `model_qwen36` | **P(geo)** `device_elementwise` ({256,**17408**}) | yes |
 | `add` | residual add | `forward.rs` | **P(geo)** `device_elementwise` ({256,**5120**}) | yes |
-| `scaled_add` | acc + s·x | **not called** (MoE accum uses qwen36_moe_weighted_accum) | **P(toy)** `device_elementwise` | n/a — off serving path |
 | `sigmoid_mul` | σ(gate)·val, in-place | `forward.rs` attn/linear gate | **P(geo)** `device_elementwise` ({256,**5120**}) | yes |
 | `f16_kv_pack` | f32 K/V row → f16 RNE | `forward.rs:1320` kv pack (once per K/V head row, hd=256) | **P(geo)** `device_elementwise` (bit-exact RNE, n∈{**256**,1024}) | yes — 256 is the served head row, 1024 a kv_dim-wide block |
-| `geglu` | GELU(gate)·up | **not called** (model uses SwiGLU) | — | off serving path |
-| `swiglu_clamped` | clamped SiLU gating | compiled, **not called** by infer-vulkan | — | off serving path |
 
 #### Full attention (HOT dense 27B)
 | Shader | Computes | Serving caller | Existing test | Production-geometry? |
@@ -335,13 +332,22 @@ synthetic shape.
 | `qwen36_router_gemv` | F32 router/shared-gate GEMV | `model_qwen36.rs` | **P(geo)** `device_router_topk` (256×**2048**, n_out=1 sigmoid) | yes |
 | `qwen36_moe_weighted_accum` | Σ_e weight_e·expert_e | `model_qwen36.rs` | **P(geo)** `device_router_topk` (hidden **2048**, count 8/1) | yes |
 
-#### Off the Vulkan serving path (no gate required here)
-`rope_norm`, `silu`, `get_rows`, `soft_max`, `argmax` (elemental llama.cpp
-shaders retained for parity with the borrowed corpus; the forward uses
-`rope_neox`, `swiglu`, fused kernels and CUDA-side samplers). All 9
-`dsv4_*` shaders + `qwen35_gated_delta_net` DSv4 variants are compiled for
-the DSv4 bring-up but `infer-vulkan` serves Qwen3.5/3.6 only — zero
-infer-vulkan callers; their gates belong to the CUDA DSv4 audit above.
+#### Removed as dead code, and retained DSv4 shaders
+The elemental llama.cpp shaders with zero `infer-vulkan` caller and zero test
+— `rope_norm`, `silu`, `geglu`, `get_rows`, `soft_max`, `argmax`,
+`swiglu_clamped`, plus the two unused quant-matvecs `mul_mat_vec_iq2_xxs`
+and `mul_mat_vec_q2_k` (Q2_K models dequantize on the host at load,
+`loader.rs`), and the off-path `scaled_add` (MoE accumulation uses
+`qwen36_moe_weighted_accum`) — were removed from the `Kernel` enum, the build
+manifest, and their local `.comp` files (the vendored llama.cpp sources under
+`vendor/` are untouched). The forward uses `rope_neox`, `swiglu`, fused
+kernels and host/CUDA-side samplers. All 7 `dsv4_*` shaders stay:
+`docs/architecture.md` plans the DSv4 Vulkan bring-up ("DSv4 over
+vulkan-sys/vulkan-kernels; device execution pending the shader ABI"), and they
+currently have zero `infer-vulkan` callers because `infer-vulkan` serves
+Qwen3.5/3.6 only.
+
+The compiled shader count went from 38 to 28 (10 removed: 7 vendored, 3 local); the remainder is 13 vendored + 15 local.
 
 ### Vulkan gaps closed by these gates
 

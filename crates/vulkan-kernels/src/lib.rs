@@ -14,67 +14,14 @@ pub const QK_K: usize = 256;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
 
-pub const BLOCK_IQ2_XXS_BYTES: usize = 66;
-pub const BLOCK_Q2_K_BYTES: usize = 84;
 pub const BLOCK_Q4_K_BYTES: usize = 144;
 pub const BLOCK_Q5_K_BYTES: usize = 176;
 pub const BLOCK_Q6_K_BYTES: usize = 210;
 pub const BLOCK_Q8_0_BYTES: usize = 34;
 pub const BLOCK_Q8_1_BYTES: usize = 36;
 
-pub const fn iq2_xxs_row_bytes(ncols: usize) -> Option<usize> {
-    if ncols == 0 || !ncols.is_multiple_of(QK_K) {
-        return None;
-    }
-    Some(ncols / QK_K * BLOCK_IQ2_XXS_BYTES)
-}
-
-pub const fn q2_k_row_bytes(ncols: usize) -> Option<usize> {
-    if ncols == 0 || !ncols.is_multiple_of(QK_K) {
-        return None;
-    }
-    Some(ncols / QK_K * BLOCK_Q2_K_BYTES)
-}
-
-pub const fn q4_k_row_bytes(ncols: usize) -> Option<usize> {
-    if ncols == 0 || !ncols.is_multiple_of(QK_K) {
-        return None;
-    }
-    Some(ncols / QK_K * BLOCK_Q4_K_BYTES)
-}
-
-pub const fn q5_k_row_bytes(ncols: usize) -> Option<usize> {
-    if ncols == 0 || !ncols.is_multiple_of(QK_K) {
-        return None;
-    }
-    Some(ncols / QK_K * BLOCK_Q5_K_BYTES)
-}
-
-pub const fn q6_k_row_bytes(ncols: usize) -> Option<usize> {
-    if ncols == 0 || !ncols.is_multiple_of(QK_K) {
-        return None;
-    }
-    Some(ncols / QK_K * BLOCK_Q6_K_BYTES)
-}
-
-pub const fn q8_0_row_bytes(ncols: usize) -> Option<usize> {
-    if ncols == 0 || !ncols.is_multiple_of(QK8_0) {
-        return None;
-    }
-    Some(ncols / QK8_0 * BLOCK_Q8_0_BYTES)
-}
-
-pub const fn q8_1_row_bytes(ncols: usize) -> Option<usize> {
-    if ncols == 0 || !ncols.is_multiple_of(QK8_1) {
-        return None;
-    }
-    Some(ncols / QK8_1 * BLOCK_Q8_1_BYTES)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kernel {
-    MmvqIq2Xxs,
-    MmvqQ2K,
     GemvQ4K,
     GemvQ5K,
     GemvQ6K,
@@ -90,16 +37,9 @@ pub enum Kernel {
     QuantizeQ8_1,
     RmsNorm,
     RopeNeox,
-    RopeNorm,
-    Silu,
-    GeGlu,
     SwiGlu,
     Add,
-    ScaledAdd,
     SigmoidMul,
-    GetRows,
-    SoftMax,
-    ArgMax,
     FlashAttn,
     Dsv4PrepareQk,
     Dsv4CompressorUpdate,
@@ -108,7 +48,6 @@ pub enum Kernel {
     Dsv4SwaAttention,
     Dsv4Mhc,
     Dsv4OutputInverseRope,
-    SwigluClamped,
     /// Pack one f32 head row into the f16 KV cache (`out[i] = float16_t(in[i])`).
     /// Lets the full-attention block write this token's roped K / raw V into the
     /// device-resident f16 cache without a host readback, so the projection /
@@ -149,8 +88,6 @@ const SPEC_FLASH_ATTN_F32_F16_HD256: &[(u32, u32)] = &[
     (14, 2),
     (15, 2),
 ];
-const SPEC_MMVQ_IQ2_XXS: &[(u32, u32)] = &[(0, 32), (1, 4), (2, 1)];
-const SPEC_MMVQ_Q2_K: &[(u32, u32)] = &[(0, 32), (1, 2), (2, 1)];
 // BLOCK_SIZE=64 matches the 8060S wave width (subgroup_size=64): a 32-wide
 // workgroup would leave half of every wave idle. `mul_mat_vecq.comp` derives its
 // per-thread iteration count from `ncols/(K_PER_ITER*BLOCK_SIZE)`, so a wider
@@ -164,8 +101,6 @@ const SPEC_RMS_NORM_MUL: &[(u32, u32)] = &[(1, 1)];
 
 impl Kernel {
     pub const ALL: &'static [Self] = &[
-        Self::MmvqIq2Xxs,
-        Self::MmvqQ2K,
         Self::GemvQ4K,
         Self::GemvQ5K,
         Self::GemvQ6K,
@@ -177,16 +112,9 @@ impl Kernel {
         Self::QuantizeQ8_1,
         Self::RmsNorm,
         Self::RopeNeox,
-        Self::RopeNorm,
-        Self::Silu,
-        Self::GeGlu,
         Self::SwiGlu,
         Self::Add,
-        Self::ScaledAdd,
         Self::SigmoidMul,
-        Self::GetRows,
-        Self::SoftMax,
-        Self::ArgMax,
         Self::FlashAttn,
         Self::Dsv4PrepareQk,
         Self::Dsv4CompressorUpdate,
@@ -195,7 +123,6 @@ impl Kernel {
         Self::Dsv4SwaAttention,
         Self::Dsv4Mhc,
         Self::Dsv4OutputInverseRope,
-        Self::SwigluClamped,
         Self::F16KvPack,
         Self::Qwen36RouterTopk,
         Self::Qwen36RouterGemv,
@@ -206,8 +133,6 @@ impl Kernel {
 
     pub const fn shader_name(self) -> &'static str {
         match self {
-            Kernel::MmvqIq2Xxs => "mul_mat_vec_iq2_xxs",
-            Kernel::MmvqQ2K => "mul_mat_vec_q2_k",
             Kernel::GemvQ4K => "mul_mat_vecq_q4_k",
             Kernel::GemvQ5K => "mul_mat_vecq_q5_k",
             Kernel::GemvQ6K => "mul_mat_vecq_q6_k",
@@ -219,16 +144,9 @@ impl Kernel {
             Kernel::QuantizeQ8_1 => "q8_1_quantize",
             Kernel::RmsNorm => "rms_norm",
             Kernel::RopeNeox => "rope_neox",
-            Kernel::RopeNorm => "rope_norm",
-            Kernel::Silu => "silu",
-            Kernel::GeGlu => "geglu",
             Kernel::SwiGlu => "swiglu",
             Kernel::Add => "add",
-            Kernel::ScaledAdd => "scaled_add",
             Kernel::SigmoidMul => "sigmoid_mul",
-            Kernel::GetRows => "get_rows",
-            Kernel::SoftMax => "soft_max",
-            Kernel::ArgMax => "argmax",
             Kernel::FlashAttn => "flash_attn",
             Kernel::Dsv4PrepareQk => "dsv4_prepare_qk",
             Kernel::Dsv4CompressorUpdate => "dsv4_compressor_update",
@@ -237,7 +155,6 @@ impl Kernel {
             Kernel::Dsv4SwaAttention => "dsv4_swa_attention",
             Kernel::Dsv4Mhc => "dsv4_mhc",
             Kernel::Dsv4OutputInverseRope => "dsv4_output_inverse_rope",
-            Kernel::SwigluClamped => "swiglu_clamped",
             Kernel::F16KvPack => "f16_kv_pack",
             Kernel::Qwen35SsmConv => "qwen35_ssm_conv",
             Kernel::Qwen35GatedDeltaNet => "qwen35_gated_delta_net",
@@ -249,8 +166,6 @@ impl Kernel {
 
     pub const fn specialization_u32(self) -> &'static [(u32, u32)] {
         match self {
-            Kernel::MmvqIq2Xxs => SPEC_MMVQ_IQ2_XXS,
-            Kernel::MmvqQ2K => SPEC_MMVQ_Q2_K,
             Kernel::GemvQ4K
             | Kernel::GemvQ5K
             | Kernel::GemvQ6K
@@ -261,17 +176,11 @@ impl Kernel {
             | Kernel::GemvIdQ8_0 => SPEC_GEMV_K_Q8_1,
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
-            Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
             Kernel::FlashAttn => SPEC_FLASH_ATTN_F32_F16_HD256,
             Kernel::RopeNeox
-            | Kernel::RopeNorm
-            | Kernel::Silu
-            | Kernel::GeGlu
             | Kernel::SwiGlu
             | Kernel::Add
-            | Kernel::ScaledAdd
             | Kernel::SigmoidMul
-            | Kernel::GetRows
             | Kernel::Dsv4PrepareQk
             | Kernel::Dsv4CompressorUpdate
             | Kernel::Dsv4CsaSelect
@@ -279,7 +188,6 @@ impl Kernel {
             | Kernel::Dsv4SwaAttention
             | Kernel::Dsv4Mhc
             | Kernel::Dsv4OutputInverseRope
-            | Kernel::SwigluClamped
             | Kernel::F16KvPack
             | Kernel::Qwen35SsmConv
             | Kernel::Qwen35GatedDeltaNet
@@ -420,10 +328,6 @@ impl KernelParams {
         Self {
             words: words.into(),
         }
-    }
-
-    pub fn len_bytes(&self) -> usize {
-        self.words.len() * std::mem::size_of::<u32>()
     }
 
     pub fn words(&self) -> &[u32] {
@@ -779,27 +683,11 @@ pub fn add_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
 }
 
-/// `scaled_add.comp` (ARLE-local): `out[i] = a[i] + scale * b[i]` over `n`
-/// elements. Bindings `0=A` (accumulator, read), `1=B` (addend, read),
-/// `2=D` (out, write) — same 3-binding layout as `add`, so it shares the
-/// decode `ring3`. The 2-field push is `[n (u32), scale (f32 bits)]`.
-///
-/// Folds the MoE router weight into the per-expert accumulate
-/// (`acc += w_e * y_e`) so the whole accumulate stays device-resident — no host
-/// readback of the expert output to scale + add.
-pub fn scaled_add_params(n: u32, scale: f32) -> KernelParams {
-    KernelParams::from_words(vec![n, scale.to_bits()])
-}
-
-pub fn scaled_add_dispatch(n: u32) -> Dispatch {
-    Dispatch::x(n.div_ceil(256).max(1))
-}
-
 /// `sigmoid_mul.comp` (ARLE-local): `out[i] = sigmoid(a[i]) * b[i]` over `n`
 /// elements. Bindings `0=A` (gate, read), `1=B` (value, read), `2=D` (out,
-/// write) — same 3-binding layout as `add`/`scaled_add`, so it shares the
-/// decode `ring3`. The single push field is `[n (u32)]`. Applies the
-/// full-attention per-head sigmoid gate device-resident.
+/// write) — same 3-binding layout as `add`, so it shares the decode `ring3`.
+/// The single push field is `[n (u32)]`. Applies the full-attention per-head
+/// sigmoid gate device-resident.
 pub fn sigmoid_mul_params(n: u32) -> KernelParams {
     KernelParams::from_words(vec![n])
 }
@@ -1025,22 +913,6 @@ pub fn flash_attn_dispatch() -> Dispatch {
 
 macro_rules! launcher_fns {
     ($call:path, $call_params:path) => {
-        pub fn mmvq_iq2_xxs(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::MmvqIq2Xxs, ctx, buffers, dispatch)
-        }
-
-        pub fn mmvq_q2_k(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::MmvqQ2K, ctx, buffers, dispatch)
-        }
-
         // The `mul_mat_vecq` GEMV requires the 13-uint push-constant block from
         // `mul_mat_vec_base.glsl` (ncols/strides/row-count). The no-push
         // launchers above are insufficient on their own — use these
@@ -1121,30 +993,6 @@ macro_rules! launcher_fns {
             $call(Kernel::RopeNeox, ctx, buffers, dispatch)
         }
 
-        pub fn rope_norm(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::RopeNorm, ctx, buffers, dispatch)
-        }
-
-        pub fn silu(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::Silu, ctx, buffers, dispatch)
-        }
-
-        pub fn geglu(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::GeGlu, ctx, buffers, dispatch)
-        }
-
         pub fn swiglu(
             ctx: &vulkan_sys::VulkanContext,
             buffers: &[&vulkan_sys::DeviceBuffer<'_>],
@@ -1159,22 +1007,6 @@ macro_rules! launcher_fns {
             dispatch: Dispatch,
         ) -> Result<()> {
             $call(Kernel::Add, ctx, buffers, dispatch)
-        }
-
-        pub fn soft_max(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::SoftMax, ctx, buffers, dispatch)
-        }
-
-        pub fn argmax(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-        ) -> Result<()> {
-            $call(Kernel::ArgMax, ctx, buffers, dispatch)
         }
 
         pub fn flash_attn(
@@ -1256,15 +1088,6 @@ macro_rules! fused_launcher_fns {
                 dispatch,
                 params,
             )
-        }
-
-        pub fn swiglu_clamped(
-            ctx: &vulkan_sys::VulkanContext,
-            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
-            dispatch: Dispatch,
-            params: &KernelParams,
-        ) -> Result<()> {
-            $call(Kernel::SwigluClamped, ctx, buffers, dispatch, params)
         }
 
         pub fn qwen35_ssm_conv(

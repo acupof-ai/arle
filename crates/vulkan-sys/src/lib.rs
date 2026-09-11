@@ -1515,87 +1515,6 @@ mod real {
             Ok(Self { ctx, pool, set })
         }
 
-        /// Bind a descriptor set to **sub-ranges** of buffers: each entry is
-        /// `(buffer, offset_bytes, range_bytes)`. The shader sees each bound
-        /// range as starting at index 0 (Vulkan applies the descriptor offset),
-        /// so this is what threads an activation arena's named slots into the
-        /// per-GEMV bindings without a per-call allocation. Every `offset` MUST
-        /// honor the device's `minStorageBufferOffsetAlignment` (query via
-        /// [`VulkanContext::min_storage_buffer_offset_alignment`]) or the bind is
-        /// invalid. Unlike [`Self::storage_buffers`] (which hardcodes offset 0 /
-        /// full range), this is the ranged form the arena needs.
-        pub fn storage_buffers_ranged(
-            ctx: &'a VulkanContext,
-            layout: &DescriptorSetLayout<'_>,
-            buffers: &[(&DeviceBuffer<'_>, u64, u64)],
-        ) -> Result<Self> {
-            let descriptor_count = u32::try_from(buffers.len())
-                .map_err(|e| runtime_error("converting descriptor buffer count", e))?;
-            if descriptor_count == 0 {
-                return Err(VulkanError::Runtime(
-                    "descriptor set needs at least one storage buffer".to_string(),
-                ));
-            }
-            let pool_sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(descriptor_count)];
-            let pool_create = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
-                .pool_sizes(&pool_sizes);
-            // SAFETY: live device; the one pool size covers the single set's
-            // STORAGE_BUFFER descriptors counted above.
-            let pool = unsafe { ctx.device.create_descriptor_pool(&pool_create, None) }
-                .map_err(|e| vk_error("creating Vulkan descriptor pool", e))?;
-            let layouts = [layout.raw()];
-            let alloc = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(pool)
-                .set_layouts(&layouts);
-            // SAFETY: `pool` has max_sets(1) and enough descriptors for `layout`.
-            let sets = match unsafe { ctx.device.allocate_descriptor_sets(&alloc) } {
-                Ok(sets) => sets,
-                Err(e) => {
-                    // SAFETY: failed allocation leaves the pool holding no sets.
-                    unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
-                    return Err(vk_error("allocating Vulkan descriptor set", e));
-                }
-            };
-            let set = match sets.first().copied() {
-                Some(set) => set,
-                None => {
-                    // SAFETY: empty result means no set was handed out.
-                    unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
-                    return Err(VulkanError::Runtime(
-                        "Vulkan descriptor allocation returned no sets".to_string(),
-                    ));
-                }
-            };
-            let infos: Vec<_> = buffers
-                .iter()
-                .map(|(buf, offset, range)| {
-                    vk::DescriptorBufferInfo::default()
-                        .buffer(buf.raw())
-                        .offset(*offset)
-                        .range(*range)
-                })
-                .collect();
-            let writes: Vec<_> = infos
-                .iter()
-                .enumerate()
-                .map(|(idx, info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(idx as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(std::slice::from_ref(info))
-                })
-                .collect();
-            // SAFETY: every write targets `set` (allocated from `pool`) and
-            // references a live DeviceBuffer whose byte range covers the
-            // descriptor; there are no copy descriptors.
-            unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
-            Ok(Self { ctx, pool, set })
-        }
-
         pub fn raw(&self) -> vk::DescriptorSet {
             self.set
         }
@@ -2103,14 +2022,6 @@ mod stub {
             _ctx: &'a VulkanContext,
             _layout: &DescriptorSetLayout<'_>,
             _buffers: &[&DeviceBuffer<'_>],
-        ) -> Result<Self> {
-            Err(VULKAN_NOT_COMPILED)
-        }
-
-        pub fn storage_buffers_ranged(
-            _ctx: &'a VulkanContext,
-            _layout: &DescriptorSetLayout<'_>,
-            _buffers: &[(&DeviceBuffer<'_>, u64, u64)],
         ) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
