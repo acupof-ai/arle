@@ -159,7 +159,7 @@ pub type CudaKvPool = HostPagedKvPool;
 
 /// In-flight handle for a submitted CUDA step. Resolves synchronously today.
 #[derive(Debug)]
-pub struct CudaInflight {
+pub(crate) struct CudaInflight {
     output: StepOutput,
 }
 

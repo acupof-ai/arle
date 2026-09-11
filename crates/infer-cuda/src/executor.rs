@@ -115,7 +115,7 @@ impl CudaKvCacheDtype {
     }
 
     #[must_use]
-    pub fn kv_format(self) -> KVFormat {
+    pub(crate) fn kv_format(self) -> KVFormat {
         match self {
             Self::Bf16 => KVFormat::BF16,
             Self::Int8 => KVFormat::INT8,
