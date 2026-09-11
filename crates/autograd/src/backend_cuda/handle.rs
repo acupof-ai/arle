@@ -668,7 +668,7 @@ impl CudaBackend {
 
     /// f32 view of a handle: borrows f32 storage, imports (exact widen) bf16.
     #[cfg(not(feature = "no-cuda"))]
-    pub(crate) fn f32_operand<'a>(
+    pub(in crate::backend_cuda) fn f32_operand<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
@@ -687,7 +687,7 @@ impl CudaBackend {
     /// Like `f32_operand`, but under bf16 tape dtype an f32 handle is
     /// round-tripped through bf16 so backward reads the value forward saw.
     #[cfg(not(feature = "no-cuda"))]
-    pub(crate) fn f32_operand_tape_quantized<'a>(
+    pub(in crate::backend_cuda) fn f32_operand_tape_quantized<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
@@ -705,7 +705,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
-    pub(crate) fn bf16_operand<'a>(
+    pub(in crate::backend_cuda) fn bf16_operand<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
