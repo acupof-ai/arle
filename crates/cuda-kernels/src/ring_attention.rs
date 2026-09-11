@@ -41,7 +41,7 @@ pub struct RingBlockDims {
 /// Per-block partial attention statistics for one (batch·head) tile.
 /// `out` is the UNNORMALIZED `P_j @ V_j`; `m`/`l` are the per-row running max and
 /// denominator of the online softmax.
-pub struct BlockStats {
+struct BlockStats {
     out: Vec<f32>, // [rows, dim] unnormalized
     m: Vec<f32>,   // [rows] row max
     l: Vec<f32>,   // [rows] row denom (sum of exp(S - m))
@@ -53,7 +53,7 @@ pub struct BlockStats {
 /// rows) masks correctly. q row `r` attends k col `c` iff `k_pos[c] <= q_pos[r]`;
 /// cols are not assumed ordered (skip future, don't break).
 #[allow(clippy::too_many_arguments)]
-pub fn block_stats(
+fn block_stats(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -107,7 +107,7 @@ pub fn block_stats(
 
 /// Merge one block's stats into the running (m, l, out) accumulators — the exact
 /// flash-2 rescale. All buffers are `[rows*dim]` / `[rows]`.
-pub fn merge_block(
+fn merge_block(
     acc_m: &mut [f32],
     acc_l: &mut [f32],
     acc_out: &mut [f32],

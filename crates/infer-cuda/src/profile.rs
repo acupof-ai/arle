@@ -7,9 +7,9 @@ use cuda_kernels::prelude::DeviceContext;
 use cudarc::driver::sys::CUevent_flags;
 
 #[derive(Default)]
-pub struct OpStats {
-    pub total_cuda_micros: AtomicU64,
-    pub count: AtomicU64,
+pub(crate) struct OpStats {
+    pub(crate) total_cuda_micros: AtomicU64,
+    pub(crate) count: AtomicU64,
 }
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -23,7 +23,7 @@ fn stats() -> &'static RwLock<HashMap<String, OpStats>> {
     STATS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub fn profile_op<T>(
+pub(crate) fn profile_op<T>(
     ctx: &DeviceContext,
     name: &str,
     layer_idx: Option<usize>,
@@ -92,7 +92,7 @@ pub fn profile_op<T>(
     result
 }
 
-pub fn get_op_stats() -> Vec<(String, u64, u64)> {
+pub(crate) fn get_op_stats() -> Vec<(String, u64, u64)> {
     let read = stats().read().unwrap_or_else(|e| e.into_inner());
     let mut out: Vec<(String, u64, u64)> = read
         .iter()

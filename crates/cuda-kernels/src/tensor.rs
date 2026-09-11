@@ -355,7 +355,8 @@ pub fn cache_ptr_on<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> RawDevicePt
 
 /// A null [`RawDevicePtr`] — for optional kernel tables the kernel treats as
 /// absent (e.g. `expert_indices` when the compact index is the expert index).
-pub fn null_raw_ptr<T>() -> RawDevicePtr<T> {
+#[cfg(test)]
+pub(crate) fn null_raw_ptr<T>() -> RawDevicePtr<T> {
     RawDevicePtr {
         ptr: 0,
         _marker: PhantomData,

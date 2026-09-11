@@ -17,10 +17,10 @@ use log::info;
 
 use super::tensor::DeviceContext;
 use crate::kv_quant::paged_attention_quantized_fa3_workspace_bytes;
-use crate::kv_types::{KVCacheDtype, KVFormat};
+use crate::kv_types::KVFormat;
 
 /// Logical-page marker for a page that has been **evict-dropped** out of HBM
-/// under the write-through tiered KV model ([`TokenKVPool::evict_slot_page`]).
+/// under the write-through tiered KV model (`infer_seam::KvAllocator::evict_slot_page`).
 ///
 /// A recall slot keeps its `page_indices[slot]` vector at full logical length so
 /// a logical page index still maps to the right entry; an evicted middle page
@@ -92,14 +92,12 @@ pub struct TokenKVPool {
     ///
     /// This is the radix / detached-page pin count: pages with
     /// `page_ref_count[p] > 0` must not be reclaimed even when no live slot
-    /// currently attaches them. `retain_pages` / `release_pages` manipulate
-    /// this counter; `free_slot` only returns a page to the free list once
+    /// currently attaches them. `alloc_detached_pages` sets and
+    /// `release_pages` decrements this counter; `free_slot` only returns a page to the free list once
     /// both `page_attach_count[p] == 0` and `page_ref_count[p] == 0`.
     page_ref_count: Vec<u32>,
 
     pub format: KVFormat,
-    /// Legacy compat — maps to format.
-    pub dtype: KVCacheDtype,
     pub num_layers: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -203,13 +201,13 @@ impl TokenKVPool {
         (data_bytes + scale_bytes) * self.num_layers
     }
 
-    pub fn storage_bytes_for_tokens(&self, token_count: usize) -> usize {
+    pub(crate) fn storage_bytes_for_tokens(&self, token_count: usize) -> usize {
         self.storage_bytes_per_token() * token_count
     }
 
     /// Full per-page host-image size (all layers, K+V, scales/norms) — the
     /// payload unit `copy_pages_to_host`/`copy_pages_from_host` move.
-    pub fn storage_bytes_per_page(&self) -> usize {
+    pub(crate) fn storage_bytes_per_page(&self) -> usize {
         self.storage_bytes_for_tokens(self.page_size)
     }
 
@@ -259,53 +257,9 @@ impl TokenKVPool {
         }
     }
 
+    #[cfg(test)]
     fn slot_hot_tail_len(&self, slot: usize) -> usize {
         self.seq_lens[slot] % self.page_size
-    }
-
-    fn slot_hot_tail_page(&self, slot: usize) -> Option<u32> {
-        if self.slot_hot_tail_len(slot) == 0 {
-            None
-        } else {
-            self.page_indices[slot].last().copied()
-        }
-    }
-
-    fn page_is_shared_read_only(&self, page: u32) -> bool {
-        let page_idx = page as usize;
-        self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1
-    }
-
-    fn slot_shared_hot_tail_page(&self, slot: usize) -> Option<u32> {
-        let hot_tail_page = self.slot_hot_tail_page(slot)?;
-        self.page_is_shared_read_only(hot_tail_page)
-            .then_some(hot_tail_page)
-    }
-
-    /// Extra physical pages needed to detach a shared partial tail before append.
-    pub fn append_cow_pages_needed(&self, slot: usize) -> usize {
-        usize::from(self.slot_shared_hot_tail_page(slot).is_some())
-    }
-
-    /// Physical pages needed to append `count` logical tokens to `slot`.
-    ///
-    /// This includes both the optional COW page for a radix-shared hot tail and
-    /// any fresh pages required after filling the current tail.
-    pub fn append_pages_needed(&self, slot: usize, count: usize) -> usize {
-        if count == 0 {
-            return 0;
-        }
-        let page_size = self.page_size.max(1);
-        let hot_tail_len = self.slot_hot_tail_len(slot);
-        let available_in_last_page = if hot_tail_len == 0 {
-            0
-        } else {
-            page_size - hot_tail_len
-        };
-        self.append_cow_pages_needed(slot)
-            + count
-                .saturating_sub(available_in_last_page)
-                .div_ceil(page_size)
     }
 
     fn recycle_page_if_unreferenced(&mut self, page: u32) -> bool {
@@ -327,34 +281,6 @@ impl TokenKVPool {
             self.free_pages.swap_remove(pos);
         }
         self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
-    }
-
-    ///
-    /// `budget_bytes` controls how much GPU memory to allocate for the pool.
-    /// `max_total_tokens` is derived from the budget: all memory is allocated
-    /// up-front at construction time.
-    pub fn new(
-        ctx: &DeviceContext,
-        num_layers: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        num_slots: usize,
-        budget_bytes: usize,
-        dtype: KVCacheDtype,
-    ) -> Result<Self> {
-        let format = match dtype {
-            KVCacheDtype::BF16 => KVFormat::BF16,
-            KVCacheDtype::INT8 => KVFormat::INT8,
-        };
-        Self::with_format(
-            ctx,
-            num_layers,
-            num_kv_heads,
-            head_dim,
-            num_slots,
-            budget_bytes,
-            format,
-        )
     }
 
     pub fn with_format(
@@ -496,14 +422,6 @@ impl TokenKVPool {
                 (None, 0)
             };
 
-        // Legacy dtype mapping. PackedBytes carries no per-head quant
-        // dispatch — BF16 is the inert legacy mapping (the FlashMLA
-        // consumer reads the packed record directly, never this field).
-        let dtype = match format {
-            KVFormat::BF16 | KVFormat::PackedBytes { .. } => KVCacheDtype::BF16,
-            KVFormat::FP8E4M3 | KVFormat::INT8 => KVCacheDtype::INT8,
-        };
-
         Ok(Self {
             k_data,
             v_data,
@@ -520,7 +438,6 @@ impl TokenKVPool {
             page_attach_count,
             page_ref_count,
             format,
-            dtype,
             num_layers,
             num_kv_heads,
             head_dim,
@@ -537,7 +454,8 @@ impl TokenKVPool {
     /// Returns the newly allocated physical page ids. Existing callers mostly
     /// ignore the return value; the canonical slot state lives inside
     /// `page_indices[slot]` + `seq_lens[slot]`.
-    pub fn alloc_tokens(&mut self, slot: usize, count: usize) -> Result<Vec<u32>> {
+    #[cfg(test)]
+    pub(crate) fn alloc_tokens(&mut self, slot: usize, count: usize) -> Result<Vec<u32>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -576,7 +494,7 @@ impl TokenKVPool {
 
     /// Extend a fixed-layout band's page table by `count` pages from the free
     /// list WITHOUT moving the logical token cursor — the band-demand-paging
-    /// counterpart of [`Self::alloc_tokens`] (DSv4 grows the
+    /// counterpart of `alloc_tokens` (DSv4 grows the
     /// comp region at page boundaries; `set_band_cursor` owns the cursor).
     /// Returns the newly attached page ids; the caller must zero them (a
     /// recycled page carries a prior occupant's bytes).
@@ -712,7 +630,7 @@ impl TokenKVPool {
     /// KV directly.
     ///
     /// Mirrored slots bypass `free_pages`/`page_attach_count`; do not mix
-    /// `mirror_slot` with [`Self::alloc_tokens`]/[`Self::free_slot`] on the
+    /// `mirror_slot` with `alloc_tokens`/`free_slot` on the
     /// same pool.
     pub fn mirror_slot(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> Result<()> {
         ensure!(
@@ -732,8 +650,8 @@ impl TokenKVPool {
         );
         for &page in pages {
             // The evict sentinel marks a logical page whose physical HBM page was
-            // returned to the pool under the write-through tiered KV model
-            // (`evict_slot_page`); it is not a real page id, so it bypasses the
+            // returned by the host pool under the write-through tiered KV model
+            // (infer_seam KvAllocator eviction); it is not a real page id, so it bypasses the
             // bounds check. It only appears on the opt-in recall path — the
             // default decode path mirrors a fully contiguous, sentinel-free table.
             ensure!(
@@ -813,40 +731,6 @@ impl TokenKVPool {
     /// Borrowed full pages are sealed shared prefix blocks. If `token_count`
     /// leaves the final page partial, that borrowed frontier is a read-only
     /// hot tail; the caller must not mutate it in place.
-    pub fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) -> Result<()> {
-        if !self.page_indices[slot].is_empty() || self.seq_lens[slot] != 0 {
-            return Err(anyhow!(
-                "TokenKVPool::attach_pages requires an empty slot (slot={slot})"
-            ));
-        }
-        if token_count > pages.len().saturating_mul(self.page_size) {
-            return Err(anyhow!(
-                "TokenKVPool::attach_pages token_count={} exceeds page capacity={}",
-                token_count,
-                pages.len().saturating_mul(self.page_size)
-            ));
-        }
-
-        for &page in pages {
-            let idx = page as usize;
-            if idx >= self.max_total_pages {
-                return Err(anyhow!(
-                    "TokenKVPool::attach_pages page index out of bounds: {page}"
-                ));
-            }
-            if self.page_attach_count[idx] == 0 && self.page_ref_count[idx] == 0 {
-                return Err(anyhow!(
-                    "TokenKVPool::attach_pages page {page} is not live in any tier"
-                ));
-            }
-            self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
-        }
-
-        self.page_indices[slot].extend_from_slice(pages);
-        self.seq_lens[slot] = token_count;
-        Ok(())
-    }
-
     /// Reject any page id outside the pool before byte-offset math runs.
     /// Codex review (9d63682d): the tier (#82/#83) and whole-slot swap
     /// transports feed these copies caller-built page lists; a corrupt list
@@ -1116,100 +1000,6 @@ impl TokenKVPool {
         Ok(recycled)
     }
 
-    /// **Write-through evict-drop**: release one *middle* physical page of a live
-    /// slot back to the pool while the slot keeps decoding, leaving its logical
-    /// length (`seq_lens[slot]`) and logical page-table length unchanged.
-    ///
-    /// The page is named by its *logical* page index within the slot. Its
-    /// physical HBM page is recycled to `free_pages` (the real free — this is the
-    /// flat-VRAM win), and the logical slot is overwritten with [`EVICTED_PAGE`]
-    /// so the surviving pages stay logically addressable. Returns the freed
-    /// physical page id, or `None` if that logical page was already evicted,
-    /// pinned by a radix/detached refcount, or out of range.
-    ///
-    /// The dropped page's KV is the tier's responsibility (it was mirrored by the
-    /// write-through verb before this call), so nothing is written back. No
-    /// in-tree caller today (the `--kv-recall` driver was deleted, 3f826c204);
-    /// kept for the remote-L3 hole-tolerance path.
-    pub fn evict_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
-        let page = *self.page_indices.get(slot)?.get(logical_page)?;
-        if page == EVICTED_PAGE {
-            return None; // already evicted
-        }
-        let page_idx = page as usize;
-        // A page pinned by the radix/detached store (ref > 0) or shared by more
-        // than this slot must not be freed out from under the other owner.
-        if self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1 {
-            return None;
-        }
-        self.page_attach_count[page_idx] = self.page_attach_count[page_idx].saturating_sub(1);
-        let freed = self.recycle_page_if_unreferenced(page);
-        debug_assert!(
-            freed,
-            "evict_slot_page: unpinned single-owner page must recycle"
-        );
-        // Keep logical length intact: replace with the sentinel, never shrink.
-        self.page_indices[slot][logical_page] = EVICTED_PAGE;
-        Some(page)
-    }
-
-    /// Return a previously parked evicted page to the free list (the
-    /// keepalive's one-step-later free). The page was parked OUT of `free_pages`
-    /// for the whole keepalive step, so no `alloc_tokens` / `reinstate_slot_page`
-    /// could have re-popped it; at release it is single-owner detached (attach 0,
-    /// ref 0) and recycles cleanly.
-    pub fn release_evicted_page(&mut self, page: u32) {
-        if page == EVICTED_PAGE {
-            return;
-        }
-        debug_assert_eq!(
-            self.page_attach_count[page as usize], 0,
-            "release_evicted_page: parked page {page} should have zero slot refs"
-        );
-        self.recycle_page_if_unreferenced(page);
-    }
-
-    /// **Re-recall prefetch reinstate**: the inverse of [`Self::evict_slot_page`].
-    /// Allocate one fresh physical page from `free_pages` and bind it to the given
-    /// *logical* page index of `slot`, which MUST currently hold an [`EVICTED_PAGE`]
-    /// sentinel (its KV was evict-dropped and mirrored to the tier). Returns the
-    /// fresh physical page id so the caller can H2D-copy the tier payload into it.
-    ///
-    /// Restores the dual-residency invariant exactly: `page_attach_count` for the
-    /// new page starts at 1 (single owner, this slot), logical length is unchanged
-    /// (a sentinel is swapped for a real id, never grown). `None` if the logical
-    /// index is out of range, was not a sentinel (already resident — nothing to
-    /// do), or the pool is out of free pages (caller keeps it evicted; no KV loss
-    /// because the tier copy persists). NEVER called on the default decode path.
-    pub fn reinstate_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
-        let cur = *self.page_indices.get(slot)?.get(logical_page)?;
-        if cur != EVICTED_PAGE {
-            return None; // already resident
-        }
-        let new_page = self.free_pages.pop()?;
-        self.page_attach_count[new_page as usize] = 1;
-        self.page_indices[slot][logical_page] = new_page;
-        Some(new_page)
-    }
-
-    /// Bump the external reference count on each of the given pages by one.
-    ///
-    /// Used by the scheduler's `publish_to_prefix_cache` path: when a
-    /// finished request's prompt is folded into the radix, the
-    /// scheduler calls `retain_pages` on exactly the pages that are
-    /// being indexed so they survive the subsequent `free_slot` call.
-    ///
-    /// Pages must currently be valid pool indices (`< max_total_tokens`).
-    /// Calling with a page that is already in `free_slots` is safe but
-    /// will not move it out — a page becomes pinned only when it is
-    /// retained *before* being freed. The scheduler's ordering
-    /// (`retain_pages` → `free_slot`) enforces that invariant.
-    pub fn retain_pages(&mut self, pages: &[u32]) {
-        for &idx in pages {
-            self.page_ref_count[idx as usize] = self.page_ref_count[idx as usize].saturating_add(1);
-        }
-    }
-
     /// Decrement the external reference count on each page by one and return
     /// the set of pages that actually moved back to the free-page stack.
     ///
@@ -1225,8 +1015,8 @@ impl TokenKVPool {
     /// Panics in debug builds if any page in `pages` has refcount 0
     /// (that would be a double-release, which signals a scheduler /
     /// radix book-keeping bug). In release builds the saturating
-    /// subtraction keeps the counter at 0 silently — same conservative
-    /// stance as `retain_pages`'s `saturating_add`.
+    /// subtraction keeps the counter at 0 silently — paired with
+    /// `alloc_detached_pages`, which initializes the count to 1.
     pub fn release_pages(&mut self, pages: &[u32]) -> Vec<u32> {
         let mut newly_freed = Vec::new();
         for &idx in pages {
@@ -1262,33 +1052,6 @@ impl TokenKVPool {
         self.free_pages.len()
     }
 
-    fn page_span_for_token_range(
-        &self,
-        slot: usize,
-        start_pos: usize,
-        token_count: usize,
-    ) -> std::ops::Range<usize> {
-        let seq_len = self.seq_len(slot);
-        debug_assert!(
-            start_pos + token_count <= seq_len,
-            "token range [{start_pos}, {}) exceeds seq_len={seq_len}",
-            start_pos + token_count
-        );
-        let start_page = start_pos / self.page_size;
-        let end_page = (start_pos + token_count).div_ceil(self.page_size);
-        start_page..end_page
-    }
-
-    pub fn page_indices_for_token_range(
-        &self,
-        slot: usize,
-        start_pos: usize,
-        token_count: usize,
-    ) -> &[u32] {
-        let span = self.page_span_for_token_range(slot, start_pos, token_count);
-        &self.page_indices[slot][span]
-    }
-
     pub fn token_rows_for_range(
         &self,
         slot: usize,
@@ -1309,19 +1072,6 @@ impl TokenKVPool {
             .collect()
     }
 
-    /// Whether the pool has allocated buffers.
-    pub fn is_active(&self) -> bool {
-        !self.k_data.is_empty()
-    }
-
-    // `k_ptr` / `v_ptr` = the "write target" for decode_prep_paged:
-    //   BF16 -> per-layer data buffer (also read by TileLang)
-    //   FP8/INT8 → shared bf16 working buffer (quantized to pool after write)
-    //
-    // `k_data_ptr` / `v_data_ptr` = the quantized data buffer (read by attention):
-    //   Used by fused-dequant INT8/FP8 attention.
-
-    /// Write-target pointer for decode_prep_paged (bf16 for all formats).
     pub fn k_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         if self.format.needs_work_buffer() {
             let (ptr, _guard) = self.k_work.as_ref().expect("k_work").device_ptr(stream);
@@ -1387,19 +1137,9 @@ impl TokenKVPool {
     pub fn k_data_slice_mut(&mut self, layer: usize) -> &mut CudaSlice<u8> {
         &mut self.k_data[layer]
     }
-
-    pub fn build_indices(&self, slots: &[usize]) -> Vec<i32> {
-        slots
-            .iter()
-            .flat_map(|&slot| self.page_indices[slot].iter().map(|&idx| idx as i32))
-            .collect()
-    }
 }
 
 // Type alias for backward compatibility
 
 /// Backward-compatible alias. New code should use `TokenKVPool` directly.
 pub type PagedKVPool = TokenKVPool;
-
-/// Default BF16 paged-KV page size used by M0.3.
-pub const DEFAULT_PAGE_SIZE: usize = 16;

@@ -22,7 +22,7 @@ fn count_cuda_devices(value: &str) -> Option<usize> {
 ///
 /// # Errors
 /// Errors if the resolved `(world_size, rank)` is invalid.
-pub fn resolve_tp_config(
+pub(crate) fn resolve_tp_config(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> infer_topo::Result<TpConfig> {
     let explicit_size = lookup_usize("INFER_TP_SIZE", &mut lookup);
@@ -36,11 +36,11 @@ pub fn resolve_tp_config(
 
 /// # Errors
 /// Errors if the resolved `(world_size, rank)` pair is invalid.
-pub fn resolve_tp_config_from_env() -> infer_topo::Result<TpConfig> {
+pub(crate) fn resolve_tp_config_from_env() -> infer_topo::Result<TpConfig> {
     resolve_tp_config(|key| std::env::var(key).ok())
 }
 
-pub enum TpComm {
+pub(crate) enum TpComm {
     Single,
     #[cfg(feature = "nccl")]
     Nccl(Box<cuda_kernels::collective::NcclBackend>),
@@ -48,12 +48,12 @@ pub enum TpComm {
 
 impl TpComm {
     #[must_use]
-    pub fn single() -> Self {
+    pub(crate) fn single() -> Self {
         Self::Single
     }
 
     #[must_use]
-    pub fn is_collective(&self) -> bool {
+    pub(crate) fn is_collective(&self) -> bool {
         match self {
             Self::Single => false,
             #[cfg(feature = "nccl")]
@@ -62,7 +62,7 @@ impl TpComm {
     }
 }
 
-pub struct TpRuntime {
+pub(crate) struct TpRuntime {
     config: TpConfig,
     comm: TpComm,
     /// Aliases [`TpComm::Single`] when attn_tp=1 (the default TP8/EP8 route).
@@ -132,7 +132,7 @@ impl TpRuntime {
     /// A `world_size > 1` config here performs no collectives (NCCL is wired
     /// separately).
     #[must_use]
-    pub fn new(config: TpConfig) -> Self {
+    pub(crate) fn new(config: TpConfig) -> Self {
         Self {
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
@@ -150,7 +150,7 @@ impl TpRuntime {
 
     /// # Errors
     /// Errors if the resolved `(world_size, rank)` pair is invalid.
-    pub fn from_env() -> infer_topo::Result<Self> {
+    pub(crate) fn from_env() -> infer_topo::Result<Self> {
         Ok(Self::new(resolve_tp_config_from_env()?))
     }
 
@@ -160,7 +160,7 @@ impl TpRuntime {
     /// # Errors
     /// Errors if the resolved `(world_size, rank)` is invalid or NCCL init fails.
     #[cfg(feature = "nccl")]
-    pub fn from_env_with_nccl(
+    pub(crate) fn from_env_with_nccl(
         unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
     ) -> anyhow::Result<Self> {
         use infer_topo::{MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_tp_groups};
@@ -257,19 +257,19 @@ impl TpRuntime {
     }
 
     #[must_use]
-    pub fn config(&self) -> &TpConfig {
+    pub(crate) fn config(&self) -> &TpConfig {
         &self.config
     }
 
     #[must_use]
-    pub fn attn_tp(&self) -> &TpComm {
+    pub(crate) fn attn_tp(&self) -> &TpComm {
         &self.attn_tp
     }
 
     /// The comm the attn_cp collectives run on: the split sub-comm, or the
     /// GLOBAL comm when the cp partition is the single global group.
     #[must_use]
-    pub fn attn_cp(&self) -> &TpComm {
+    pub(crate) fn attn_cp(&self) -> &TpComm {
         if self.attn_cp_uses_global {
             &self.comm
         } else {
@@ -278,24 +278,24 @@ impl TpRuntime {
     }
 
     #[must_use]
-    pub fn attn_cp_size(&self) -> usize {
+    pub(crate) fn attn_cp_size(&self) -> usize {
         self.attn_cp_size
     }
 
     #[must_use]
-    pub fn attn_cp_rank(&self) -> usize {
+    pub(crate) fn attn_cp_rank(&self) -> usize {
         self.attn_cp_rank
     }
 
     /// This rank's attention head-shard index (== `config().rank` at attn_cp=1).
     #[must_use]
-    pub fn attn_tp_rank(&self) -> usize {
+    pub(crate) fn attn_tp_rank(&self) -> usize {
         self.attn_tp_rank
     }
 
     /// Attention head-shard world (== `config().world_size` at attn_cp=1).
     #[must_use]
-    pub fn attn_tp_size(&self) -> usize {
+    pub(crate) fn attn_tp_size(&self) -> usize {
         self.attn_tp_size
     }
 
@@ -303,17 +303,17 @@ impl TpRuntime {
     /// (world ≥ 4). The single geometry predicate — prefill ring, decode
     /// merge, pool sizing, and the spec/recall mutexes all read this.
     #[must_use]
-    pub fn two_d_engaged(&self) -> bool {
+    pub(crate) fn two_d_engaged(&self) -> bool {
         self.attn_tp_size >= 2 && self.attn_cp_size >= 2
     }
 
     #[must_use]
-    pub fn is_single(&self) -> bool {
+    pub(crate) fn is_single(&self) -> bool {
         self.config.is_single()
     }
 
     #[must_use]
-    pub fn is_collective(&self) -> bool {
+    pub(crate) fn is_collective(&self) -> bool {
         self.comm.is_collective()
     }
 
@@ -321,7 +321,7 @@ impl TpRuntime {
     /// probe/boot/self-test failure on ANY rank degrades EVERY rank to NCCL via
     /// the built-in ok-votes.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
-    pub fn init_oneshot_comm(&mut self, ctx: &cuda_kernels::prelude::DeviceContext) {
+    pub(crate) fn init_oneshot_comm(&mut self, ctx: &cuda_kernels::prelude::DeviceContext) {
         if crate::runtime_flags::comm_nccl_only() {
             log::info!("[comm-oneshot] disabled via --comm-backend nccl");
             return;
@@ -357,7 +357,7 @@ impl TpRuntime {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn all_reduce_sum(
+    pub(crate) fn all_reduce_sum(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
@@ -373,7 +373,7 @@ impl TpRuntime {
     /// `Comm` brackets with compute↔comm fences; `Compute` is unfenced for
     /// callers that overlap the AR with comm-stream work (dsv4 shared expert).
     #[cfg(feature = "cuda")]
-    pub fn all_reduce_sum_on(
+    pub(crate) fn all_reduce_sum_on(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
@@ -395,7 +395,7 @@ impl TpRuntime {
     /// partials span only the attn_tp group; the global comm would double-count
     /// the cp replicas. attn_cp=1 keeps the global (one-shot-capable) path.
     #[cfg(feature = "cuda")]
-    pub fn attn_all_reduce_sum(
+    pub(crate) fn attn_all_reduce_sum(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
@@ -481,7 +481,7 @@ impl TpRuntime {
     #[cfg(feature = "cuda")]
     // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused.
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub fn all_reduce_sum_over(
+    pub(crate) fn all_reduce_sum_over(
         &self,
         comm: &TpComm,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -547,7 +547,7 @@ impl TpRuntime {
     #[cfg(feature = "cuda")]
     // Without `nccl` the only arm is `Single => Ok(value)`, so `ctx` is unused.
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub fn all_reduce_min_scalar_i32(
+    pub(crate) fn all_reduce_min_scalar_i32(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         value: i32,
@@ -603,7 +603,7 @@ impl TpRuntime {
     /// group must call with the same `sendcount`.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn all_gather_bf16_raw(
+    pub(crate) unsafe fn all_gather_bf16_raw(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         sendbuf: *const std::ffi::c_void,
@@ -658,7 +658,7 @@ impl TpRuntime {
     /// `compute_waits_for_comm` before the first compute reading `recvbuf`.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_all_gather_bf16_unfenced(
+    pub(crate) unsafe fn attn_cp_all_gather_bf16_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         sendbuf: *const std::ffi::c_void,
@@ -700,7 +700,7 @@ impl TpRuntime {
     /// comm-written buffer.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_send_unfenced(
+    pub(crate) unsafe fn attn_cp_send_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: *const std::ffi::c_void,
@@ -738,7 +738,7 @@ impl TpRuntime {
     /// post the matching send.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_recv_unfenced(
+    pub(crate) unsafe fn attn_cp_recv_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: *mut std::ffi::c_void,
@@ -777,7 +777,7 @@ impl TpRuntime {
     /// must hold `count` elements and stay valid until the op completes.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
-    pub unsafe fn attn_cp_broadcast_unfenced(
+    pub(crate) unsafe fn attn_cp_broadcast_unfenced(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: *mut std::ffi::c_void,
@@ -808,7 +808,7 @@ impl TpRuntime {
     /// Open an NCCL group on the attn_cp sub-comm. P2P sends/recvs inside a
     /// group are submitted together at `attn_cp_group_end`, so the host never
     /// blocks in `ncclSend` waiting for a peer recv that hasn't been posted.
-    pub fn attn_cp_group_start(&self) -> anyhow::Result<()> {
+    pub(crate) fn attn_cp_group_start(&self) -> anyhow::Result<()> {
         match self.attn_cp() {
             TpComm::Single => Ok(()),
             #[cfg(feature = "nccl")]
@@ -821,7 +821,7 @@ impl TpRuntime {
 
     /// Close an NCCL group opened by `attn_cp_group_start`. May block until
     /// all operations in the group are submitted to the device.
-    pub fn attn_cp_group_end(&self) -> anyhow::Result<()> {
+    pub(crate) fn attn_cp_group_end(&self) -> anyhow::Result<()> {
         match self.attn_cp() {
             TpComm::Single => Ok(()),
             #[cfg(feature = "nccl")]
@@ -834,7 +834,7 @@ impl TpRuntime {
 
     /// RAII attn_cp NCCL group: `drop` closes it after an early `?`, so the
     /// thread-local group depth can't leak and hang the next collective.
-    pub fn attn_cp_group(&self) -> anyhow::Result<AttnCpGroupGuard<'_>> {
+    pub(crate) fn attn_cp_group(&self) -> anyhow::Result<AttnCpGroupGuard<'_>> {
         self.attn_cp_group_start()?;
         Ok(AttnCpGroupGuard {
             tp: self,
@@ -845,7 +845,7 @@ impl TpRuntime {
     /// Host-visible all-gather for small byte payloads (CUDA IPC handles, device
     /// ids); requires NCCL to be initialized.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
-    pub fn all_gather_bytes(
+    pub(crate) fn all_gather_bytes(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         input: &[u8],
@@ -856,7 +856,7 @@ impl TpRuntime {
 
     /// [`Self::all_gather_bytes`] over a sub-communicator (`attn_tp`, `attn_cp`).
     #[cfg(all(feature = "cuda", feature = "nccl"))]
-    pub fn all_gather_bytes_over(
+    pub(crate) fn all_gather_bytes_over(
         &self,
         comm: &TpComm,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -1028,7 +1028,7 @@ impl TpRuntime {
     /// the per-forward collective count and deadlocks the lockstep coordinator.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
-    pub fn broadcast_rank0_i32(
+    pub(crate) fn broadcast_rank0_i32(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         values: &[i32],
@@ -1358,14 +1358,14 @@ mod oneshot {
 }
 
 /// RAII guard for an attn_cp NCCL group; see [`TpRuntime::attn_cp_group`].
-pub struct AttnCpGroupGuard<'a> {
+pub(crate) struct AttnCpGroupGuard<'a> {
     tp: &'a TpRuntime,
     finished: bool,
 }
 
 impl<'a> AttnCpGroupGuard<'a> {
     /// Close the group, propagating errors; consumes self so drop won't double-close.
-    pub fn finish(mut self) -> anyhow::Result<()> {
+    pub(crate) fn finish(mut self) -> anyhow::Result<()> {
         self.finished = true;
         self.tp.attn_cp_group_end()
     }
