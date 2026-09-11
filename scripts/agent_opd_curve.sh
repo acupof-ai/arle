@@ -196,7 +196,8 @@ if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
         echo "[curve] comfort-band: empty/failed band (rc=$?) — falling back to full corpus $CORPUS" >&2
     fi
     # #173 phases 1-2 stop here: the band root gets a final security re-scan before
-    # phase 3 spends GPU-days training on it (docs/plans/2026-07-24-sweetspot-...).
+    # phase 3 spends GPU-days training on it (sweet-spot first-gradient plan,
+    # abandoned 2026-07-25; see errors 2026-07-24 sweetspot3 band-1 wall).
     if [[ ${PROFILE_ONLY:-0} == 1 ]]; then
         echo "[curve] PROFILE_ONLY=1 — band cut, stopping before training. Band: $CORPUS"
         exit 0

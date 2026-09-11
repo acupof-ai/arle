@@ -34,8 +34,7 @@ a pipe and exit 0:
 - `clippy -p infer-api --release --no-default-features --features
   cuda,no-cuda,nccl,deepep --lib -- -D warnings` (the CLAUDE.md lane)
 
-The plan doc's struct table (`docs/plans/2026-08-21-batched-mtp-verify.md:55`)
-was updated to the new name.
+The batched-MTP plan doc's struct table was updated to the new name (plan deleted 2026-09-11; the batched MTP feature shipped #248/#258).
 
 ## Rule
 

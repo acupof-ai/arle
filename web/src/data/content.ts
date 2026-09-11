@@ -639,10 +639,10 @@ const BATTLE_ROWS_EN: BattleRow[] = [
     where: "scripts/bench_multiturn_ttft.py · benchmarks/",
   },
   {
-    pri: "P1 · active",
+    pri: "P1 · shipped",
     title: "Batched speculative verify",
     desc: "Speculative decode is inert from c=4 until the verify step is batched; the measured top lever on the NVFP4 27B, projected −32% decode latency at c=16",
-    where: "infer-cuda · docs/plans/2026-08-21-batched-mtp-verify.md",
+    where: "infer-cuda · docs/experience/errors/2026-09-10-batched-mtp-acceptance-break-even.md",
   },
   {
     pri: "P2 · active",
@@ -679,10 +679,10 @@ const BATTLE_ROWS_ZH: BattleRow[] = [
     where: "scripts/bench_multiturn_ttft.py · benchmarks/",
   },
   {
-    pri: "P1 · active",
+    pri: "P1 · shipped",
     title: "批量化的推测校验",
     desc: "c=4 起推测解码失效，直到 verify 步批量化；NVFP4 27B 上实测的最大杠杆，预计 c=16 解码延迟 −32%",
-    where: "infer-cuda · docs/plans/2026-08-21-batched-mtp-verify.md",
+    where: "infer-cuda · docs/experience/errors/2026-09-10-batched-mtp-acceptance-break-even.md",
   },
   {
     pri: "P2 · active",

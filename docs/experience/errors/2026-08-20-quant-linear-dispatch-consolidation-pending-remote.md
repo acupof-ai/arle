@@ -4,7 +4,7 @@
 
 ## Context
 
-Tranche 1 of `docs/plans/2026-08-20-qwen-quant-linear-dispatch-consolidation.md`:
+Tranche 1 of the quant-linear dispatch consolidation plan (deleted 2026-09-11; superseded by the `infer-quant` layout decision, #263):
 `crates/infer-cuda/src/ops/quant_linear.rs` (1,829 lines) split into four
 modules — entry dispatch (481) + `quant_linear_fp8.rs` (1,021) +
 `quant_linear_fp4.rs` (224) + `quant_linear_int.rs` (349). `gemm_batch`/`gemv`

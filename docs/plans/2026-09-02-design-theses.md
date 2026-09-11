@@ -1,6 +1,6 @@
 # Design theses: what the runtime demonstrates, and how to make it legible
 
-Date: 2026-09-02 · Status: Plan, accepted · Owner: ckl
+Date: 2026-09-02 · Status: Done — all five design notes written and linked here (docs/design/hybrid-prefix-cache.md, speculative-decoding.md, seam-cost-contract.md, memory-is-the-product.md, matched-measurement.md, plus what-breaks.md) · Owner: ckl
 
 ## Purpose
 

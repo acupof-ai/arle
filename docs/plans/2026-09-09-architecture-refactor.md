@@ -1,6 +1,6 @@
 # Architecture: stage boundaries the compiler enforces
 
-Date: 2026-09-09 · Status: Plan, pending acceptance · Owner: ckl
+Date: 2026-09-09 · Status: Active — phase exit through Step 2 (CHANGELOG 2026-09-10; four crates above the device line, #255/#256/#258/#259/#260/#262); Step 3a (executor dispersion into infer-plan/infer-model) landed #268/#271/#273/#274/#277/#280/#293, Step 3b (dispersal, infer-protocol/infer-model target) not started · Owner: ckl
 
 ## What this document decides
 

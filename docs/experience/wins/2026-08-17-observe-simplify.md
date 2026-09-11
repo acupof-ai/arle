@@ -2,7 +2,7 @@
 
 ## Context
 
-The observability feature (2026-08-17-observability-infra) shipped with dead
+The observability feature (wins/2026-08-17-observability-infra) shipped with dead
 state and a redundant endpoint. A /simplify pass (4-agent review) flagged
 them; one finding was also a multiproc correctness bug.
 

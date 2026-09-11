@@ -22,8 +22,9 @@
 > Scope: all production CUDA operator paths for Qwen3, Qwen3.5/3.6/3.8,
 > DeepSeek V4, GLM-5.2, and OPD autograd.
 >
-> First implementation unit:
-> [Qwen CUDA quant-linear dispatch consolidation](2026-08-20-qwen-quant-linear-dispatch-consolidation.md).
+> The first implementation unit was the Qwen CUDA quant-linear dispatch
+> consolidation (plan deleted 2026-09-11 — superseded by the `infer-quant`
+> layout decision in #263, `crates/infer-quant/src/layout.rs`).
 
 ## Decision
 

@@ -1,5 +1,6 @@
 # CP ideal state: one mesh, one attention-CP core, engine + training
-
+> Status: **Done through T3.3 (2026-08-22).** T1, T2 (2026-08-16), T3.1 B2 (wins/2026-08-17-b2-cp-decode-gate), T3.2/T3.2b 2D ownership (wins/2026-08-18-2d-cp-empty-shard-guards), T3.3 cross-CP decode merge (wins/2026-08-17-cross-cp-decode-merge); acceptance superseded upward — global 262,144 trains on 2 GPUs (wins/2026-08-22-sp-linear-attention-core-262144-cp4), cp=4 ceiling 229,376 (wins/2026-08-19-cp4-seq-ceiling-229376). **Open: T3.4 (CP×quant-KV/spec), T4 (cp=4 gdr smem re-gate), single-GPU 256K** — see 2026-08-24-roadmap item 4.
+>
 > Status: accepted 2026-08-16 (ckl: "把 cp 重构成理想态,引擎和训练都得支持").
 > T1 accepted 2026-08-16 (gates in
 > `docs/experience/wins/2026-08-16-cp-t1-ring-core-extraction.md`). T2 accepted
