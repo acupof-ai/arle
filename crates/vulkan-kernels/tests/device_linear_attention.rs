@@ -16,9 +16,12 @@
 //! shader `round_to_bf16`), so the conv tolerance is tight; the gated-delta
 //! recurrence is pure f32 in/out, also tight.
 //!
-//! Runs only with `--features vulkan` + a working device; skips cleanly
-//! otherwise.
+//! Runs only with `--features vulkan` + a working device; without one it
+//! skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to make a missing
+//! device panic instead (so CI cannot pass by skipping all gates).
 #![cfg(feature = "vulkan")]
+
+mod common;
 
 use vulkan_kernels::{
     Kernel, KernelCache, launch_cached, qwen35_gated_delta_net_dispatch,
@@ -232,12 +235,8 @@ fn host_gated_delta(
 
 #[test]
 fn qwen35_ssm_conv_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping ssm_conv oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan ssm_conv proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();
@@ -311,12 +310,8 @@ fn qwen35_ssm_conv_matches_host_oracle() {
 
 #[test]
 fn qwen35_gated_delta_net_matches_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping gated_delta oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan gated_delta proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();

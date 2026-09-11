@@ -11,9 +11,12 @@
 //! f32 out, so the tolerance is tight (1e-4 relative / 1e-5 absolute) — any
 //! drift means the push/spec contract is wrong.
 //!
-//! Runs only with `--features vulkan` + a working device; skips cleanly
-//! otherwise.
+//! Runs only with `--features vulkan` + a working device; without one it
+//! skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to make a missing
+//! device panic instead (so CI cannot pass by skipping all gates).
 #![cfg(feature = "vulkan")]
+
+mod common;
 
 use vulkan_kernels::{
     Kernel, KernelCache, add_dispatch, add_params, f16_kv_pack_dispatch, f16_kv_pack_params,
@@ -115,12 +118,8 @@ fn assert_close(label: &str, got: &[f32], want: &[f32]) {
 
 #[test]
 fn elementwise_kernels_match_host_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping elementwise oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan elementwise proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();
@@ -264,19 +263,17 @@ fn elementwise_kernels_match_host_oracle() {
 /// (head_dim=256) and a kv_dim-wide block (kv_heads*head_dim).
 #[test]
 fn f16_kv_pack_matches_host_rne_oracle() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping f16_kv_pack oracle test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan f16_kv_pack proof on: {}", ctx.device_name());
     let mut cache = KernelCache::new();
     let mut rng = Rng(0xF16C_AFE0_1234_5678);
 
     for &n in &[256usize, 1024] {
-        // Attention K/V magnitudes (post-rope / projection) span roughly [-8, 8];
+        // n=256 is one served full-attention head row (the only f16_kv_pack
+        // caller, `forward.rs::record_f16_kv_pack`, runs once per K/V head row
+        // at head_dim=256); n=1024 covers a kv_dim-wide block (4 kv heads).
         // sample a comparable range plus a few exact-representable corner values.
         let mut x: Vec<f32> = (0..n).map(|_| rng.next_f32() * 8.0).collect();
         for (i, corner) in [0.0f32, 1.0, -1.0, 0.5, 65504.0, -65504.0]

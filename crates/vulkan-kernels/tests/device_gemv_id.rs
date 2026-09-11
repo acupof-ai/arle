@@ -23,9 +23,12 @@
 //!      `id_list[i]` within the q8_1 activation tolerance (bit-identical math,
 //!      same activation, so they should match to ~1e-3, not just q8_1 tol).
 //!
-//! Runs only with `--features vulkan` + a working device; skips cleanly
-//! otherwise.
+//! Runs only with `--features vulkan` + a working device; without one it
+//! skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to make a missing
+//! device panic instead (so CI cannot pass by skipping all gates).
 #![cfg(feature = "vulkan")]
+
+mod common;
 
 use infer_gguf::dequant::dequantize_row_q4_k;
 use vulkan_kernels::{
@@ -302,12 +305,8 @@ fn make_one_block_len(row_bytes: usize, ncols: usize) -> usize {
 
 #[test]
 fn fused_mul_mat_vec_id_matches_per_expert_loop() {
-    let ctx = match VulkanContext::create() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no Vulkan device available ({e}); skipping fused mul_mat_vec_id test");
-            return;
-        }
+    let Some(ctx) = common::require_device() else {
+        return;
     };
     eprintln!("ARLE Vulkan fused MoE GEMV proof on: {}", ctx.device_name());
 
