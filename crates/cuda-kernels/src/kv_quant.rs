@@ -8,7 +8,9 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
 use crate::kv_types::KVFormat;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+#[cfg(test)]
+use crate::tensor::DeviceVec;
+use crate::tensor::{DeviceContext, HiddenStates};
 
 const MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH: usize = 65_535;
 
@@ -18,7 +20,8 @@ const MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH: usize = 65_535;
 /// `kv_int8`:  INT8 storage, same layout
 /// `scales`:   f32 per-head per-token, layout `[num_kv_heads, max_seq_len]`
 #[allow(clippy::too_many_arguments)]
-pub fn quantize_kv(
+#[cfg(test)]
+pub(crate) fn quantize_kv(
     ctx: &DeviceContext,
     kv_bf16: &DeviceVec,
     kv_int8: &mut CudaSlice<i8>,
@@ -61,7 +64,8 @@ pub fn quantize_kv(
 /// Dequantize INT8 KV data → bf16 for tokens `[0..token_count)`.
 ///
 /// Writes to the bf16 working buffer so attention kernels can read it.
-pub fn dequantize_kv(
+#[cfg(test)]
+pub(crate) fn dequantize_kv(
     ctx: &DeviceContext,
     kv_int8: &CudaSlice<i8>,
     scales: &CudaSlice<f32>,
