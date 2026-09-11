@@ -2,14 +2,19 @@
 //! at binary startup before any engine load. Multiproc worker ranks re-exec
 //! the same binary, so `register_all` in `main` covers them too.
 
+#[path = "backends/cpu.rs"]
 #[cfg(feature = "cpu")]
 mod cpu;
+#[path = "backends/cuda.rs"]
 #[cfg(feature = "cuda")]
 mod cuda;
+#[path = "backends/hip.rs"]
 #[cfg(feature = "hip")]
 mod hip;
+#[path = "backends/metal.rs"]
 #[cfg(feature = "metal")]
 mod metal;
+#[path = "backends/vulkan.rs"]
 #[cfg(feature = "vulkan")]
 mod vulkan;
 

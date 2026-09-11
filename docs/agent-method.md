@@ -75,8 +75,9 @@ not yet decomposed — "hard" is a confession, not a property.
 **Cost comes AFTER the concrete work, never before** (ckl 2026-06-20). A cost
 guessed ahead of decomposition biases the work down and pre-commits a wrong size.
 Empirical: DSv4 batched decode was hand-waved "very hard, multi-day new infra" —
-reading the code collapsed it to "one per-row `for` at `dsv4.rs:1872` → batch it
-→ ~2×".
+reading the code collapsed it to "one per-row `for` in the DSv4 executor →
+batch it → ~2×" (the batched path now lives in
+`crates/infer-cuda/src/executor/dsv4.rs`).
 
 ---
 

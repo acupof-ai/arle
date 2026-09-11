@@ -145,8 +145,8 @@ raw-logits + per-step student-LoRA re-merge surface is exposed at
 Key files (surviving the pivot):
 
 - `crates/cli/src/train_cli.rs`: `arle train env`, `estimate-memory`, and `opd` front door
-- `crates/train/src/trainer.rs`: `Trainer<O, C, S>` skeleton — kept; OPD will provide its own `step_fn`
-- `crates/train/src/{checkpoint,cli_args,grad_accum,grad_clip,loss,lora,tokenizer,causal_lm,qwen35,qwen35_checkpoint,model_family}.rs`: substrate kept for OPD
+- `crates/train/src/trainer.rs`: OPD step helpers (`cleanup_after_backward`, grad clip/loss re-exports) — the generic `Trainer<O,C,S>` skeleton is gone; the only generic trainer left is `spec_train::trainer::Trainer` (draft-target training).
+- `crates/train/src/{checkpoint,causal_lm,loss,lora,tokenizer,qwen35,qwen35_checkpoint,model_family}.rs`: substrate kept for OPD. The `cli_args` module and the `grad_accum`/`Trainer` subsystem were deleted as dead after the OPD pivot (`4b5ba9085`, `7c19ff177`); grad clipping is the re-exported `autograd::grad_clip`, and grad accumulation is `TensorStore::accumulate_grad`.
 
 ## 3. Runtime crate map (the `infer-*` graph)
 
@@ -181,8 +181,10 @@ server → front door), with `infer-core` carrying **no** backend dependency.
 - `crates/infer-seam/src/kv_batch.rs`: `KvBatchDescriptor`/`KvBatchRow` — the
  host-only batch-addressable description backends lower from
  (the Phase 1 unified-batched plan's seam piece).
-- `crates/infer-seam/src/{kv_dtype,resource,host_paged_kv_pool}.rs`:
- `KvCacheDtype`, `SlotBudget`/`HostTierBudget`/`split_host_tiers`, and the
+- `crates/infer-seam/src/{kv_dtype,kv_budget,resource,host_paged_kv_pool}.rs`:
+ `KvCacheDtype`, `SlotBudget` and the tier-budget request `KvTierBudget`
+ (`Fraction`/`Bytes`/`Off`, resolved by the backend builder; renamed from
+ `HostTierBudget`/`split_host_tiers` in `e8d8363bb`), and the
  shared production host page allocator.
 
 This is the old `infer/src/backend.rs` backend-trait surface, recast as a
@@ -276,8 +278,9 @@ host-only seam with zero device coupling.
  `LocalMultimodalTx` in-process channel to `run_on_executor`.
 - `crates/infer-server/src/tokenizer.rs`: tokenizer wiring.
 
-Metal is wired via the `metal` feature; non-Metal builds fall back to an
-`EchoExecutor`. CUDA is wired one layer up at `infer-api`.
+Metal is wired via the `metal` feature; feature-free CPU builds use
+`infer-metal`'s placeholder `MetalExecutor` (constructed in
+`src/backends/cpu.rs`). CUDA is wired one layer up at `infer-api`.
 
 ### 3.7 `infer-api` — the single public front door
 
@@ -307,10 +310,12 @@ front door) + `infer-util`.
  `head_shard` / `column_shard` / `row_shard`, SGLang-style multi-axis rank
  groups). Ported from legacy `infer/src/tensor_parallel.rs` with all GPU/NCCL
  coupling dropped.
-- `crates/infer-moe/src/{lib,route,config,error,tests}.rs`: pure,
+- `crates/infer-moe/src/{lib,route,config,error}.rs`: pure,
  CPU-verifiable MoE routing/gating math — the reference the GPU kernel is
  verified against (`route`, `RoutingDecision`, `MoeConfig`; DSv4 vs Qwen3.6
- routing rules; `group_limited_mask` reference for grouped routing).
+ routing rules; `group_limited_mask` reference for grouped routing). Its
+ inline unit tests were removed with the other pre-2026-07 unit-test files
+ (`2e74f47e6`); routing math is exercised from the e2e/kernel gates.
 - `crates/infer-model/src/{lib,qwen35,dspark}.rs`: pure host model geometry —
  per-rank shard dims, recurrent-state sizes, the joint KV-budget solve,
  cp-decode/decode-graph routing decisions, and the DSpark drafter's RNG
@@ -361,7 +366,7 @@ These crates sit around the runtime graph:
 - `crates/vulkan-sys`: ash-backed Vulkan loader wrapper (stub off the `vulkan` feature, mirroring `hip-sys`)
 - `crates/vulkan-kernels`: glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` (typecheck-only without `glslc`)
 - `crates/infer-gguf`: GGUF v2/v3 memmap reader + llama.cpp-port CPU dequantizers + per-arch GGUF→spec-config mappers (`deepseek4`); consumers: `infer-hip`, `infer-vulkan`
-- `crates/kv-native-sys`: local persistence substrate for KV tier disk transport — `KvMmapStore` (file-backed sparse mmap page-slot store: memcpy writes, zero-copy `&[u8]` reads, slot allocator + free list). Unused: WAL, shm, mmap descriptors (kept for future shared-memory tier). Sharded block ops (`write_block_cache_sharded` / `read_block_into_sharded` / `remove_block_sharded`) — consumers: `infer-cuda` KV-tier hooks (`executor/dsv4/slot_tier.rs`; the store itself is `kv-native-sys::KvTierStore`) and `infer-metal`'s SSD tier (`kv_ssd.rs`).
+- `crates/kv-native-sys`: local persistence substrate for KV tier disk transport — `KvMmapStore` (file-backed sparse mmap page-slot store: memcpy writes, zero-copy `&[u8]` reads, slot allocator + free list). The key/value front door is `KvTierStore` (`insert`/`read`/`read_many`/`read_chunked`/`remove_chunked`); consumers are the CUDA DSv4 slot and prefix hooks (`executor/dsv4/slot_tier.rs`, `attention/prefix_state.rs`) and `infer-metal`'s SSD tier (`kv_ssd.rs`). The earlier WAL/shm/mmap-descriptor surface and the sharded block-file ops were deleted as unused (`6e3347d6e`, `b1b817958`).
 - `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — consumer: `infer-server/src/grammar.rs` (OpenAI `response_format` → `GrammarHook`). The `real` feature builds the C++ engine (requires `XGRAMMAR_SOURCE_DIR`); without it the crate exports stubs that reject at runtime.
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
@@ -427,7 +432,9 @@ Integration / adapter tests:
 - `tests/cli_smoke.rs`, `tests/cli_agent_live.rs`, `tests/cli_test_support.rs`:
  root-package (`arle`) CLI smoke + live agent paths
 - `crates/autograd/tests/`, `crates/train/tests/`: training-stack tests
-- `infer-moe` carries its reference-routing tests in `crates/infer-moe/src/tests.rs`
+- `infer-moe` had in-file reference-routing unit tests in `src/tests.rs`
+ (removed with the unit-test sweep `2e74f47e6`); routing math is now covered
+ by the kernel/e2e gates that consume it
 
 CI (`.github/workflows/ci.yml`) builds and tests `infer-api`, `cli`, the
 `arle` smoke path, and the support crates per backend (metal/cpu).
