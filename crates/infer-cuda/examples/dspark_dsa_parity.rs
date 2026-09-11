@@ -434,7 +434,7 @@ mod real {
             .collect();
         let positions: Vec<i32> = (0..INDEX_BATCH as i32).collect();
         let freqs = build_freqs(&positions);
-        let weights = vec![1.0f32; works];
+        let weights = vec![bf(1.0); works];
         let (want_bytes, want_scales) = fused_q_indexer_ref(&q, &freqs, &positions, INDEX_HEADS);
 
         let q_d = ctx.stream.clone_htod(&q)?;
