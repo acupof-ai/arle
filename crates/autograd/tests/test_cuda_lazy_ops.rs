@@ -752,7 +752,7 @@ fn cuda_layout_device_lazy_matches_cpu() {
         .expect("cuda slice");
     backend.eval(&[&slice_h]).expect("cuda eval slice");
     let dev_slice = backend.readback(&slice_h).expect("slice readback");
-    assert_eq!(dev_slice.len(), slice_shape.iter().product());
+    assert_eq!(dev_slice.len(), slice_shape.iter().product::<usize>());
     let (excess_s, abs_s, idx_s) = max_err(&dev_slice, &host_slice);
     assert!(
         excess_s <= 1.0,
@@ -1985,7 +1985,7 @@ fn cuda_long_rectangular_sdpa_stays_fused() {
     let out = causal_sdpa_recompute_with_q_start(q, k, v, 1, &mut store, &mut tape)
         .expect("long rectangular SDPA");
     let out = store.to_host(out).expect("readback");
-    assert_eq!(out.len(), q_shape.iter().product());
+    assert_eq!(out.len(), q_shape.iter().product::<usize>());
     assert!(out.iter().all(|x| *x == 0.0));
 }
 
