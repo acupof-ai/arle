@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use crate::ffi;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct CudaAllocTraceKey {
+pub(crate) struct CudaAllocTraceKey {
     pub file: &'static str,
     pub line: u32,
     pub column: u32,
@@ -23,7 +23,7 @@ pub struct CudaAllocTraceKey {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct CudaAllocTraceStats {
+pub(crate) struct CudaAllocTraceStats {
     pub calls: u64,
     pub bytes: u64,
 }
@@ -64,7 +64,7 @@ pub(super) fn record_cuda_alloc<T>(kind: &'static str, label: &'static str, len:
     stats.bytes = stats.bytes.saturating_add(bytes);
 }
 
-pub trait CudaAllocTraceExt {
+pub(crate) trait CudaAllocTraceExt {
     /// Allocate and attribute the call site when `ARLE_CUDA_ALLOC_TRACE=1`.
     ///
     /// # Safety
@@ -213,7 +213,7 @@ impl DeviceContext {
         Self::on_device(ordinal)
     }
 
-    pub fn on_device(ordinal: u32) -> Result<Self> {
+    pub(crate) fn on_device(ordinal: u32) -> Result<Self> {
         let ctx = CudaContext::new(ordinal as usize)
             .map_err(|e| anyhow!("Failed to create CUDA context on device {ordinal}: {e}"))?;
 
@@ -406,14 +406,15 @@ impl DeviceContext {
             .map_err(|e| anyhow!("Sync failed: {}", e))
     }
 
-    pub fn sync_copy(&self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn sync_copy(&self) -> Result<()> {
         self.copy_stream
             .synchronize()
             .map_err(|e| anyhow!("Copy stream sync failed: {}", e))
     }
 
     #[must_use]
-    pub fn pipeline_stream(&self, kind: CudaPipelineStreamKind) -> &Arc<CudaStream> {
+    pub(crate) fn pipeline_stream(&self, kind: CudaPipelineStreamKind) -> &Arc<CudaStream> {
         match kind {
             CudaPipelineStreamKind::Compute => &self.stream,
             CudaPipelineStreamKind::Copy => &self.copy_stream,
