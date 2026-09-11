@@ -1,10 +1,10 @@
 # OPD writeback 显存墙：逐 op 实测归因与无损 128K 单卡路径
 
 > **Superseded (2026-07-29)** by
-> [`docs/plans/2026-07-29-single-gpu-256k-training-repair.md`](../plans/2026-07-29-single-gpu-256k-training-repair.md),
-> the single current capability page. The per-op attribution below remains
-> accurate as a decomposition; the up-to-date single-GPU ladder and terminal
-> ceiling live in that plan's T5.
+> By the single-GPU 256K training repair plan (deleted 2026-09-11 — the
+> single-GPU goal was abandoned and reached instead on context-parallel;
+> see wins/2026-08-22-sp-linear-attention-core-262144-cp4). The per-op
+> attribution below remains accurate as a decomposition.
 
 ## Correction (2026-07-28, post-Move-1 backward per-op probe)
 

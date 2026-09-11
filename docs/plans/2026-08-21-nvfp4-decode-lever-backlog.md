@@ -1,5 +1,6 @@
 # NVFP4 optimisation backlog — ranked by measured attack surface, 2026-08-21
-
+> **Status: Active (top lever open).** Rows 2 and 4 closed on measurement; row 1 (more rows per Marlin call) stays the open top lever, row 3 gated on it, row 5 after it. Roadmap 2026-08-24 item 3 carries this backlog. Original header below.
+>
 > Status: Open. Worked top-down; every row is closed with a measurement, not an
 > argument. Runtime (v0.5.7), Qwen3.8-27B-NVFP4, 1xH20.
 

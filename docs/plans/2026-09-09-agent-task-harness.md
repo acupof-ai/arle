@@ -1,6 +1,6 @@
 # Agent task harness: goals, gates, execution, report
 
-Date: 2026-09-09 · Status: Built, in use · Owner: ckl
+Date: 2026-09-09 · Status: Done — built and in use (scripts/agenda.py ledger + docs/agenda.jsonl, board page, hygiene gate); indexed from docs/index.md · Owner: ckl
 
 ## Problem
 

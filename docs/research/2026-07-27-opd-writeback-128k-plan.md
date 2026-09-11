@@ -1,9 +1,10 @@
 # OPD writeback single-GPU memory plan — 40960 → 128K, no precision/attention/sequence change
 
 > **Superseded (2026-07-29)** by
-> [`docs/plans/2026-07-29-single-gpu-256k-training-repair.md`](../plans/2026-07-29-single-gpu-256k-training-repair.md),
-> the single current capability page. The 128K figures below are pre-repair
-> estimates; the measured single-GPU ladder lives in that plan's T5.
+> the single-GPU 256K training repair plan (deleted 2026-09-11 — the
+> single-GPU goal was abandoned and reached instead on context-parallel;
+> see wins/2026-08-22-sp-linear-attention-core-262144-cp4). The 128K figures
+> below are pre-repair estimates.
 >
 > Approach doc. Architectural (>5 files across the ladder), so this is written for
 > sign-off before any code. Grounded in a code-level audit (file:line below) and

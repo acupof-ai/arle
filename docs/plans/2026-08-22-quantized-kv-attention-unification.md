@@ -69,7 +69,7 @@ per-request decode tok/s: no-spec 73.0 / 42.1 / 25.9 / 14.8; MTP d=2 **84.3**
 / 42.0 / 24.8 / 14.0; MTP d=4 83.0 / 42.1 / 26.3 / 15.1. TTFT identical.
 MTP pays +15 % at c=1 only — the default `--spec-type auto` already selects
 it — and is inert from c=4 because the verify step is not batched
-([plan](2026-08-21-batched-mtp-verify.md)). The free Marlin rows (M ≤ 8) bound
+(batched MTP plan, shipped 2026-09-09; see [errors/2026-09-10-batched-mtp-acceptance-break-even](../experience/errors/2026-09-10-batched-mtp-acceptance-break-even.md)). The free Marlin rows (M ≤ 8) bound
 the lever: c=1·d=2 verifies at M=3; c=4·d=2 would already be M=12. d=4 does
 not beat d=2 (acceptance-limited). Caveat for future runs: with a drafter on,
 `ITL p50` collapses (0.03 ms at d=4 — accepted tokens stream together); read
