@@ -8,6 +8,8 @@ detail in the linked wins/errors entry. Oldest sections are condensed.
 
 ## [Unreleased]
 
+- **Vulkan device-to-host reads work on non-UMA devices (#338).** `DeviceBuffer::copy_to_host` mapped device memory directly, which fails on MoltenVK and discrete GPUs when the buffer is device-local; it now stages through a host-visible buffer in that case and keeps the direct map for host-visible memory, so the serving forward is unchanged. The loader upload test that failed on MoltenVK passes without modification.
+
 - **V100 attention kernel gated; GPU batch reports skipped gates (#336, #337).** (a) The FA2 sm70 attention kernel, whose only serving caller is the MTP speculative head, has a parity example at Qwen3.5 geometry (GQA 8/2 and 24/4, head_dim 256) with B=1 and B=8, prefill lengths across tile boundaries and a 4096-key case; `scripts/parity_gpu_batch.sh` records a gate that prints `SKIP:` as skipped rather than passed or failed, so this gate reads SKIP on H20 and runs on V100 (#336). (b) The kernel coverage audit now lists each gated family with its gate file and PR; every CUDA gate still awaits its GPU run (#337).
 
 - **Vulkan shaders audited and gated at served geometry (#333).** All 38 Vulkan kernels are listed with their caller and test; 22 run on the Qwen3.6-27B-Q8_0 forward. New tests decode the quantized weights from the GGUF spec and check Q4_K/Q5_K/Q6_K/Q8_0 matrix-vector products at K 5120 and 17408, the MoE expert-indexed product at 256 experts top-8, flash attention at head_dim 256 with 24 query / 4 KV heads up to 4096 keys, and partial rotary 64 of 256. Setting `ARLE_REQUIRE_VULKAN_DEVICE=1` makes a missing Vulkan device fail the tests instead of skipping them.
