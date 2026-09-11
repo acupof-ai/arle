@@ -11,7 +11,7 @@ use qwen35_spec::Qwen35Config;
 /// # Errors
 /// Errors if the config is not a MoE checkpoint (`num_experts == 0`) or the
 /// resulting [`MoeConfig`] fails [`MoeConfig::validate`].
-pub fn moe_config_from_qwen35(config: &Qwen35Config) -> Result<MoeConfig> {
+pub(crate) fn moe_config_from_qwen35(config: &Qwen35Config) -> Result<MoeConfig> {
     ensure!(
         config.is_moe(),
         "qwen3.5 config is dense (num_experts == 0); no MoE router to build"
@@ -30,7 +30,7 @@ pub fn moe_config_from_qwen35(config: &Qwen35Config) -> Result<MoeConfig> {
 /// owns the contiguous block `[local_expert_start, local_expert_start +
 /// experts_per_rank)`. Single-GPU (`ep_size == 1`) keeps every expert local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpertSplit {
+pub(crate) struct ExpertSplit {
     pub num_experts: usize,
     pub ep_size: usize,
     pub ep_rank: usize,
@@ -44,7 +44,7 @@ impl ExpertSplit {
     /// Errors if `ep_size == 0`, `ep_rank >= ep_size`, or `num_experts` is not
     /// divisible by `ep_size` (the EP partition must be uniform, matching the
     /// `dsv4_*` local-expert kernels' fixed `experts_per_rank`).
-    pub fn new(num_experts: usize, ep_size: usize, ep_rank: usize) -> Result<Self> {
+    pub(crate) fn new(num_experts: usize, ep_size: usize, ep_rank: usize) -> Result<Self> {
         ensure!(ep_size > 0, "ep_size must be > 0");
         ensure!(
             ep_rank < ep_size,
@@ -65,7 +65,7 @@ impl ExpertSplit {
     }
 
     #[must_use]
-    pub fn single(num_experts: usize) -> Self {
+    pub(crate) fn single(num_experts: usize) -> Self {
         Self {
             num_experts,
             ep_size: 1,
@@ -76,12 +76,12 @@ impl ExpertSplit {
     }
 
     #[must_use]
-    pub fn local_expert_end(&self) -> usize {
+    pub(crate) fn local_expert_end(&self) -> usize {
         self.local_expert_start + self.experts_per_rank
     }
 
     #[must_use]
-    pub fn owns(&self, global_expert: usize) -> bool {
+    pub(crate) fn owns(&self, global_expert: usize) -> bool {
         (self.local_expert_start..self.local_expert_end()).contains(&global_expert)
     }
 }
