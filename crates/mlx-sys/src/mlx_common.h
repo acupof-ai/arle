@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 using namespace mlx::core;
@@ -52,6 +53,18 @@ extern "C" const char* mlx_last_error();
     }
 
 struct mlx_array;  // opaque
+
+static inline void require_rank(const array& arr, int expected, const char* name) {
+    if (arr.ndim() != expected) {
+        throw std::invalid_argument(std::string(name) + " must have rank " + std::to_string(expected));
+    }
+}
+
+static inline void require_dtype(const array& arr, Dtype expected, const char* name) {
+    if (arr.dtype() != expected) {
+        throw std::invalid_argument(std::string(name) + " has an unexpected dtype");
+    }
+}
 
 // Qwen3.5/3.6 sparse-MoE helper shared between the compiled model path and
 // the Rust fallback. `qwen35_moe_block_forward_cpp()` is the internal

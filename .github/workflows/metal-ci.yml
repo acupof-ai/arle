@@ -97,6 +97,13 @@ jobs:
           cargo test -p infer-metal --release --features metal --lib
           -- --test-threads 1
 
+      # Hand-written Metal kernel parity (tests/kernel_parity.rs): GDR
+      # gated-delta + tape replay, 2-pass SDPA, fixed-M=16 4-bit QMM, each
+      # against an f64 host oracle at Qwen3.6-35B-A3B geometry with a
+      # per-family negative control. Tests serialize themselves via mlx_guard.
+      - name: cargo test (mlx-sys Metal kernel parity)
+        run: cargo test -p mlx-sys --release
+
       - name: cargo check (metal train/autograd libs)
         run: |
           cargo check -p autograd --release --features metal --lib

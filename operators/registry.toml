@@ -809,3 +809,93 @@ provider = "arle"
 source = "crates/cuda-kernels/src/moe.rs"
 legality = "sum a token's top-k weighted route outputs into its final hidden"
 fallback = ""
+
+# ---- Metal (MLX) hand-written kernels; audited 2026-09-11 (S30) ----
+
+[[semantic]]
+id = "metal.qwen35.gdr_recurrent_step"
+kind = "primitive"
+inputs = ["q", "k", "v", "g", "beta", "gdr_state"]
+outputs = ["y", "gdr_state_out", "innovation_tape"]
+reference = "metal.qwen35.gated_delta_step_kernel"
+correctness_gate = "crates/mlx-sys/tests/kernel_parity.rs"
+gate_gap = "Qwen3.6-35B-A3B-4bit GDR geometry Hk=16 Hv=32 Dk=Dv=128, T in {1,16} (decode + prefill verify chunk), B in {1,4} (B=4 pins the B*Hv z-grid; production Metal pins batch_size=1 at every FFI entry and the executor calls step_session per slot), bf16 q/k/v, f32 g/beta/state, y/state/tape each compared vs an f64 host oracle with a k-spike and a v-spike negative control; gaps: synthetic random activations (not checkpoint), no conv1d coupling"
+
+[[implementation]]
+id = "metal.qwen35.gated_delta_step_kernel"
+semantic = "metal.qwen35.gdr_recurrent_step"
+provider = "mlx-fast-metal-kernel"
+source = "crates/mlx-sys/src/mlx_qwen35_model.cpp"
+legality = "32 linear_attention layers, AGENT_INFER_GDR_METAL_KERNEL!=0 (default), Dk%32==0 && Hv%Hk==0"
+fallback = "mlx composed recurrent scan (same TU, env=0)"
+
+[[implementation]]
+id = "metal.qwen35.gated_delta_step_tape_kernel"
+semantic = "metal.qwen35.gdr_recurrent_step"
+provider = "mlx-fast-metal-kernel"
+source = "crates/mlx-sys/src/mlx_qwen35_model.cpp"
+legality = "same kernel with record_tapes during draft verification; additionally emits the bf16 innovation tape"
+fallback = ""
+
+[policy."metal.qwen35.gdr_recurrent_step"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "metal.qwen35.gdr_tape_replay"
+kind = "primitive"
+inputs = ["innovation_tape", "k", "g", "gdr_state"]
+outputs = ["gdr_state_out"]
+reference = "metal.qwen35.tape_replay_kernel"
+correctness_gate = "crates/mlx-sys/tests/kernel_parity.rs"
+gate_gap = "replayed state matches an f64 replay oracle consuming the same bf16 tape at Hk=16 Hv=32 Dk=Dv=128 T=16, tape byte-flip negative control; gaps: synthetic tape, B=1, single contiguous chunk"
+
+[[implementation]]
+id = "metal.qwen35.tape_replay_kernel"
+semantic = "metal.qwen35.gdr_tape_replay"
+provider = "mlx-fast-metal-kernel"
+source = "crates/mlx-sys/src/mlx_bridge.cpp"
+legality = "GDR rollback after rejected sampled draft tokens; Dk%32==0, Hv%Hk==0"
+fallback = ""
+
+[policy."metal.qwen35.gdr_tape_replay"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "metal.qwen35.sdpa_2pass"
+kind = "primitive"
+inputs = ["queries", "keys", "values"]
+outputs = ["attn_out"]
+reference = "metal.qwen35.batched_sdpa_2pass"
+correctness_gate = "crates/mlx-sys/tests/kernel_parity.rs"
+gate_gap = "full-attention geometry Hq=16 Hk=2 D=256 q_len=16 GQA 8, B in {1,4}, N in {16,100,129,1000,4113} (arbitrary cache_pos+S; N<128 leaves partial blocks empty), plus K/V rounded through the production 8-bit/group-128 KV quantizer then dequantized, output vs f64 softmax with packed-chunk causal mask, value-spike negative control; gap: synthetic inputs; production FFI entries pin batch_size=1 so B=4 is kernel-address coverage"
+
+[[implementation]]
+id = "metal.qwen35.batched_sdpa_2pass"
+semantic = "metal.qwen35.sdpa_2pass"
+provider = "mlx-fast-metal-kernel"
+source = "crates/mlx-sys/src/mlx_bridge.cpp"
+legality = "8 full_attention layers, is_verify && B==1 && seq_len==16, D==V in {128,256}, Hq==Hk*gqa_factor; otherwise fast::scaled_dot_product_attention"
+fallback = "mlx fast::scaled_dot_product_attention"
+
+[policy."metal.qwen35.sdpa_2pass"]
+fallback_status = "legacy-default-unqualified"
+
+[[semantic]]
+id = "metal.qwen35.w4a16_projection_m16"
+kind = "primitive"
+inputs = ["activation", "int4_packed_weight", "group_scales", "group_biases"]
+outputs = ["projection"]
+reference = "metal.qwen35.verify_qmm_mma2big"
+correctness_gate = "crates/mlx-sys/tests/kernel_parity.rs"
+gate_gap = "M=16 K=2048 bits=4 affine, N in {512,2048}, group_size in {32,64,128} (64 is the checkpoint group), scales/biases BF16 (checkpoint safetensors dtype), output vs f64 dequant matmul nib*scale+bias with bf16-rounded scale/bias, per-group-size scale-spike negative control; gaps: synthetic weights/activations, affine mode only (mxfp4 mode=1 routes to stock MLX quantized_matmul), no MoE grouped path"
+
+[[implementation]]
+id = "metal.qwen35.verify_qmm_mma2big"
+semantic = "metal.qwen35.w4a16_projection_m16"
+provider = "mlx-fast-metal-kernel"
+source = "crates/mlx-sys/src/mlx_bridge.cpp"
+legality = "QWeight::apply with prefer_verify_m16 on the verify batch (B=1,S=16): transposed 4-bit affine, K,N%32==0, group_size in {32,64,128}; falls back to quantized_matmul otherwise"
+fallback = "mlx quantized_matmul"
+
+[policy."metal.qwen35.w4a16_projection_m16"]
+fallback_status = "legacy-default-unqualified"

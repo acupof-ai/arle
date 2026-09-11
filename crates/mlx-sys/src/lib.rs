@@ -157,6 +157,14 @@ unsafe extern "C" {
         bits: i32,
         mode: i32,
     ) -> *mut mlx_array;
+    pub fn mlx_quantize(
+        w: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_w: *mut *mut mlx_array,
+        out_scales: *mut *mut mlx_array,
+        out_biases: *mut *mut mlx_array,
+    );
 
     pub fn mlx_contiguous(a: *mut mlx_array) -> *mut mlx_array;
 
@@ -625,6 +633,36 @@ unsafe extern "C" {
         g: *mut mlx_array,
         state_in: *mut mlx_array,
         steps: i32,
+    ) -> *mut mlx_array;
+
+    // Production GDR recurrent kernel op boundary (defined in
+    // mlx_qwen35_model.cpp; drives gated_delta_step / gated_delta_step_tape).
+    pub fn mlx_qwen35_gated_delta_step(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_in: *mut mlx_array,
+        record_tape: i32,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+        out_tape: *mut *mut mlx_array,
+    );
+    pub fn mlx_batched_sdpa_2pass(
+        queries: *mut mlx_array,
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        scale: f32,
+        gqa_factor: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_verify_quantized_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
     ) -> *mut mlx_array;
 
     pub fn qwen35_set_tape_mode(model: *mut std::ffi::c_void, enabled: bool);
