@@ -33,13 +33,16 @@
 //!   INFER_CUDA_DEVICE=<free-gpu> target/release/examples/dspark_dsa_parity --negative-control
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -51,7 +54,7 @@ mod real {
 
 #[cfg(feature = "cuda")]
 mod real {
-    use anyhow::{Result, ensure};
+    use anyhow::Result;
     use cuda_kernels::attention::{
         dsv4_deepseek_v4_topk_transform_raw, dsv4_dsa_fused_q_indexer_rope_hadamard_quant_raw,
         dsv4_dspark_draft_attention_raw,
@@ -59,6 +62,8 @@ mod real {
     use cuda_kernels::prelude::DeviceContext;
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
+
+    use super::parity_common::{Families, Rng};
 
     const SEED: u64 = 0xd5a1_7d5a_c01d_51a1;
 
@@ -100,27 +105,6 @@ mod real {
     const FP8_ABS_FLOOR: f32 = 3e-2;
     // Scale = row abs-max/448 over bf16-rounded inputs.
     const SCALE_REL_MAX: f32 = 1e-2;
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn normal(&mut self) -> f32 {
-            let u1 = self.unit().max(1e-7);
-            let u2 = self.unit();
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
-    }
 
     fn bf(v: f32) -> bf16 {
         bf16::from_f32(v)
@@ -644,23 +628,9 @@ mod real {
         }
         let idx_ok = check_indexer(&ctx, negative)?;
 
-        if negative {
-            ensure!(
-                !attn_ok,
-                "dspark_dsa_parity negative control did NOT fail the attention family"
-            );
-            ensure!(
-                !idx_ok,
-                "dspark_dsa_parity negative control did NOT fail the indexer family"
-            );
-            eprintln!("[dspark-dsa-parity] NEGATIVE CONTROL OK (both families failed as required)");
-            return Ok(());
-        }
-        ensure!(
-            attn_ok && idx_ok,
-            "dspark_dsa_parity FAILED — see violations above"
-        );
-        eprintln!("[dspark-dsa-parity] ALL PASS");
-        Ok(())
+        let mut families = Families::new();
+        families.record("attention", !attn_ok);
+        families.record("indexer", !idx_ok);
+        families.finish("dspark-dsa-parity", negative)
     }
 }

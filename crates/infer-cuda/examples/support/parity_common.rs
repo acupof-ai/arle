@@ -15,7 +15,6 @@
 //! Host-only, no CUDA dependency; each example gates the `mod` include behind
 //! its own `#[cfg(feature = "cuda")]` block (mirroring `attn_common.rs`).
 
-
 /// xorshift* generator, bit-for-bit identical to the inline Rng each parity
 /// example used to carry. Deterministic across platforms; `normal` is
 /// Box-Muller on the same 24-bit unit draws.
@@ -42,8 +41,12 @@ impl Rng {
 
 /// Result of the common CLI parse.
 pub struct Cli {
-    /// `--negative-control` was passed.
+    /// `--negative-control` (any form) was passed.
     pub negative: bool,
+    /// The value after `--negative-control=<value>`, for gates that select a
+    /// single family to corrupt (`--negative-control=int8`). `None` for the
+    /// bare flag or when no value was given.
+    pub negative_value: Option<String>,
 }
 
 /// Outcome of the common CLI parse: either run the gate, or `--kernel-build-id`
@@ -56,15 +59,30 @@ pub enum Parsed {
 /// Parse the two flags every parity example shares. `--kernel-build-id` prints
 /// the embedded bundle id (it must answer without a CUDA context) and returns
 /// [`Parsed::BuildIdPrinted`], which the example's `main` turns into an early
-/// `Ok(())`; `--negative-control` is reported inside [`Parsed::Run`].
+/// `Ok(())`. Both `--negative-control` and `--negative-control=<family>` are
+/// recognized; the family string (if any) is in [`Cli::negative_value`].
+/// Unknown arguments are ignored here — gates that take no other args may
+/// reject them in their own `main` after matching on [`Parsed`].
 pub fn cli() -> Parsed {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().skip(1).any(|a| a == "--kernel-build-id") {
         println!("{}", cuda_kernels::KERNEL_BUILD_ID);
         return Parsed::BuildIdPrinted;
     }
-    let negative = args.iter().any(|a| a == "--negative-control");
-    Parsed::Run(Cli { negative })
+    let mut negative = false;
+    let mut negative_value = None;
+    for a in args.iter().skip(1) {
+        if a == "--negative-control" {
+            negative = true;
+        } else if let Some(v) = a.strip_prefix("--negative-control=") {
+            negative = true;
+            negative_value = Some(v.to_string());
+        }
+    }
+    Parsed::Run(Cli {
+        negative,
+        negative_value,
+    })
 }
 
 /// One bit per comparator family. A family is any independently-named
@@ -104,22 +122,40 @@ impl Families {
     /// returns an `Err` (already formatted) on failure, `Ok(())` on success.
     pub fn finish(self, tag: &str, negative: bool) -> anyhow::Result<()> {
         if negative {
-            let alive: Vec<&str> = self.failed.iter().filter(|(_, f)| !f).map(|(n, _)| n.as_str()).collect();
+            let alive: Vec<&str> = self
+                .failed
+                .iter()
+                .filter(|(_, f)| !f)
+                .map(|(n, _)| n.as_str())
+                .collect();
             if !alive.is_empty() {
                 anyhow::bail!(
                     "{tag} negative control did NOT fail {}: {}",
-                    if alive.len() == 1 { "family" } else { "families" },
+                    if alive.len() == 1 {
+                        "family"
+                    } else {
+                        "families"
+                    },
                     alive.join(", ")
                 );
             }
             eprintln!("[{tag}] NEGATIVE CONTROL OK");
             Ok(())
         } else {
-            let dead: Vec<&str> = self.failed.iter().filter(|(_, f)| *f).map(|(n, _)| n.as_str()).collect();
+            let dead: Vec<&str> = self
+                .failed
+                .iter()
+                .filter(|(_, f)| *f)
+                .map(|(n, _)| n.as_str())
+                .collect();
             if !dead.is_empty() {
                 anyhow::bail!(
                     "{tag} FAILED {}: {}",
-                    if dead.len() == 1 { "family" } else { "families" },
+                    if dead.len() == 1 {
+                        "family"
+                    } else {
+                        "families"
+                    },
                     dead.join(", ")
                 );
             }
@@ -159,8 +195,6 @@ pub struct Verdict {
 }
 
 impl Verdict {
-    /// Green when rel-L2 is finite and within `rel_max` AND no element breaches
-    /// its absolute band.
     /// Green when rel-L2 is finite and within `rel_max` (inclusive, matching
     /// the dominant gate form) AND no element breaches its absolute band.
     pub fn is_ok(&self, rel_max: f64) -> bool {

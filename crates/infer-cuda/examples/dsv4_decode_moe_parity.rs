@@ -31,13 +31,16 @@
 //! `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/dsv4_decode_moe_parity`
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)]
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -55,6 +58,8 @@ mod real {
     use cuda_kernels::tensor::cache_ptr;
     use cudarc::driver::{CudaSlice, DevicePtr};
     use half::bf16;
+
+    use super::parity_common::{Families, Rng};
 
     // Production DSv4-Flash-0731 MoE widths.
     const HIDDEN_K: usize = 4096;
@@ -82,27 +87,6 @@ mod real {
         Swiglu,
         Down,
         QRepack,
-    }
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn normal(&mut self) -> f32 {
-            let u1 = self.unit().max(1e-7);
-            let u2 = self.unit();
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
     }
 
     fn rint_ne(x: f32) -> i32 {
@@ -564,6 +548,9 @@ mod real {
         if negative {
             // Each family must trip on its own corruption while the others stay
             // green. Use the widest batch so every family sees production fan-out.
+            // The cross-family isolation asserts are stricter than the shared
+            // Families aggregator (which records one bit per family), so they
+            // stay here; Families still records that each family has teeth.
             let moe = run_moe_batch(&ctx, *BATCHES.last().unwrap())?;
             let (sw, dn, _, _) = compare_moe(&moe, Sabotage::Swiglu);
             ensure!(!sw, "swiglu negative did not trip — comparator dead");
@@ -573,8 +560,13 @@ mod real {
             ensure!(sw2, "down sabotage wrongly tripped swiglu");
             let qbad = run_q_repack(&ctx, Sabotage::QRepack)?;
             ensure!(!qbad, "q-repack negative did not trip — comparator dead");
-            eprintln!("[dsv4-decode-parity] NEGATIVE CONTROL OK");
-            return Ok(());
+            let mut families = Families::new();
+            // Comparator pass=false under its own sabotage = that family
+            // correctly failed; record the failure bit (`!pass`).
+            families.record("swiglu", !sw);
+            families.record("down", !dn2);
+            families.record("q-repack", !qbad);
+            return families.finish("dsv4-decode-parity", true);
         }
 
         let mut all_ok = true;
@@ -584,8 +576,9 @@ mod real {
             all_ok &= swiglu_ok && down_ok;
         }
         let q_ok = run_q_repack(&ctx, Sabotage::None)?;
-        ensure!(all_ok && q_ok, "dsv4_decode_moe_parity FAILED");
-        eprintln!("[dsv4-decode-parity] ALL PASS");
-        Ok(())
+        let mut families = Families::new();
+        families.record("moe swiglu/down", !all_ok);
+        families.record("q-repack", !q_ok);
+        families.finish("dsv4-decode-parity", false)
     }
 }

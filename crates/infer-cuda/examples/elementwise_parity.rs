@@ -114,7 +114,11 @@ mod real {
         if !pass {
             *failed = true;
         }
-        eprintln!("[{label}] {} {}", v.worst_line(), if pass { "PASS" } else { "FAIL" });
+        eprintln!(
+            "[{label}] {} {}",
+            v.worst_line(),
+            if pass { "PASS" } else { "FAIL" }
+        );
     }
 
     fn check_bitexact(label: &str, got: &[bf16], want: &[bf16], failed: &mut bool) {

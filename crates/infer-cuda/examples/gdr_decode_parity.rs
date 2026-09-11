@@ -23,13 +23,16 @@
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/gdr_decode_parity`
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
-        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
-        return Ok(());
+    use parity_common::Parsed;
+    match parity_common::cli() {
+        Parsed::BuildIdPrinted => Ok(()),
+        Parsed::Run(cli) => real::run(cli.negative),
     }
-    let negative = std::env::args().any(|a| a == "--negative-control");
-    real::run(negative)
 }
+
+#[allow(dead_code)] // shared harness; each gate uses only the subset it needs
+#[path = "support/parity_common.rs"]
+mod parity_common;
 
 #[cfg(not(feature = "cuda"))]
 mod real {
@@ -41,11 +44,13 @@ mod real {
 
 #[cfg(feature = "cuda")]
 mod real {
-    use anyhow::{Result, ensure};
+    use anyhow::Result;
     use cuda_kernels::prelude::DeviceContext;
     use cuda_kernels::recurrent::{conv1d_decode_batch_raw, gdr_decode_batch_raw, gdr_decode_raw};
     use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::bf16;
+
+    use super::parity_common::{Rng, compare as common_compare};
 
     const KEY_DIM: usize = 128;
     const VAL_DIM: usize = 128;
@@ -64,27 +69,6 @@ mod real {
     // only rsqrtf/expf ulp error carries across steps.
     const STATE_REL_L2_MAX: f64 = 2e-3;
     const STATE_ABS_MAX: f32 = 2e-3;
-
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            Self(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn unit(&mut self) -> f32 {
-            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-        }
-        fn normal(&mut self) -> f32 {
-            let u1 = self.unit().max(1e-7);
-            let u2 = self.unit();
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-        }
-    }
 
     fn bf(v: f32) -> bf16 {
         bf16::from_f32(v)
@@ -206,16 +190,6 @@ mod real {
         }
     }
 
-    fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
-        let (mut num, mut den) = (0f64, 0f64);
-        for (g, r) in got.iter().zip(want) {
-            let d = *g as f64 - *r as f64;
-            num += d * d;
-            den += (*r as f64) * (*r as f64);
-        }
-        (num / den.max(1e-12)).sqrt()
-    }
-
     /// One fail bit per comparator family, so --negative-control can prove
     /// each family independently has teeth.
     #[derive(Clone, Copy)]
@@ -247,20 +221,20 @@ mod real {
         got: &[f32],
         want: &[f32],
         rel_cap: f64,
-        tol: impl Fn(f32) -> f32,
+        abs_floor: f32,
+        abs_slope: f32,
         failed: &mut bool,
     ) {
-        let rel = rel_l2(got, want);
-        let mut max_excess = f32::NEG_INFINITY;
-        for (g, r) in got.iter().zip(want) {
-            max_excess = max_excess.max((g - r).abs() - tol(*r));
-        }
-        let pass = rel.is_finite() && rel <= rel_cap && max_excess.is_finite() && max_excess <= 0.0;
+        let gv: Vec<f64> = got.iter().map(|g| *g as f64).collect();
+        let wv: Vec<f64> = want.iter().map(|w| *w as f64).collect();
+        let v = common_compare(&gv, &wv, abs_floor as f64, abs_slope as f64);
+        let pass = v.is_ok(rel_cap);
         if !pass {
             *failed = true;
         }
         eprintln!(
-            "[{label}] relL2={rel:.4e} maxExcess={max_excess:.4e} {}",
+            "[{label}] {} {}",
+            v.worst_line(),
             if pass { "PASS" } else { "FAIL" }
         );
     }
@@ -416,7 +390,8 @@ mod real {
                     &co,
                     &want_co,
                     OUT_REL_L2_MAX,
-                    |r| OUT_ABS_FLOOR + OUT_ABS_SLOPE * r.abs(),
+                    OUT_ABS_FLOOR,
+                    OUT_ABS_SLOPE,
                     &mut fams.batch_conv_out,
                 );
 
@@ -431,7 +406,8 @@ mod real {
                     &cr_got,
                     &cr_want,
                     OUT_REL_L2_MAX,
-                    |_| OUT_ABS_FLOOR,
+                    OUT_ABS_FLOOR,
+                    0.0,
                     &mut fams.batch_conv_state,
                 );
 
@@ -448,7 +424,8 @@ mod real {
                     &go,
                     &want_go,
                     OUT_REL_L2_MAX,
-                    |r| OUT_ABS_FLOOR + OUT_ABS_SLOPE * r.abs(),
+                    OUT_ABS_FLOOR,
+                    OUT_ABS_SLOPE,
                     &mut fams.batch_gdr_out,
                 );
 
@@ -460,7 +437,8 @@ mod real {
                     &state_got[lane],
                     &reference.state[lane],
                     STATE_REL_L2_MAX,
-                    |_| STATE_ABS_MAX,
+                    STATE_ABS_MAX,
+                    0.0,
                     &mut fams.batch_gdr_state,
                 );
                 if negative && step == 0 && lane == 0 {
@@ -589,7 +567,8 @@ mod real {
                 &go,
                 &want_go,
                 OUT_REL_L2_MAX,
-                |r| OUT_ABS_FLOOR + OUT_ABS_SLOPE * r.abs(),
+                OUT_ABS_FLOOR,
+                OUT_ABS_SLOPE,
                 &mut fams.sing_gdr_out,
             );
             if negative && step == 0 {
@@ -600,7 +579,8 @@ mod real {
                 &state_got,
                 &reference.state[0],
                 STATE_REL_L2_MAX,
-                |_| STATE_ABS_MAX,
+                STATE_ABS_MAX,
+                0.0,
                 &mut fams.sing_gdr_state,
             );
             if negative && step == 0 {
@@ -616,7 +596,8 @@ mod real {
                 &cr,
                 &cr_want,
                 OUT_REL_L2_MAX,
-                |_| OUT_ABS_FLOOR,
+                OUT_ABS_FLOOR,
+                0.0,
                 &mut fams.sing_conv_state,
             );
         }
@@ -649,33 +630,10 @@ mod real {
             }
         }
 
-        if negative {
-            let unfired = fams
-                .entries()
-                .into_iter()
-                .filter_map(|(n, fired)| (!fired).then_some(n))
-                .collect::<Vec<_>>();
-            ensure!(
-                unfired.is_empty(),
-                "gdr_decode_parity negative control did NOT fail family: {}",
-                unfired.join(", ")
-            );
-            eprintln!(
-                "[gdr-parity] NEGATIVE CONTROL OK (all 7 comparator families failed as required)"
-            );
-            return Ok(());
+        let mut families = super::parity_common::Families::new();
+        for (name, fired) in fams.entries() {
+            families.record(name, fired);
         }
-        let failed = fams
-            .entries()
-            .into_iter()
-            .filter_map(|(n, fired)| fired.then_some(n))
-            .collect::<Vec<_>>();
-        ensure!(
-            failed.is_empty(),
-            "gdr_decode_parity FAILED families: {}",
-            failed.join(", ")
-        );
-        eprintln!("[gdr-parity] ALL PASS");
-        Ok(())
+        families.finish("gdr-parity", negative)
     }
 }
