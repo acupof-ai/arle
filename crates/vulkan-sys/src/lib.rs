@@ -573,6 +573,10 @@ mod real {
         buffer: vk::Buffer,
         memory: vk::DeviceMemory,
         len: usize,
+        /// Property flags the backing `vk::DeviceMemory` was allocated with.
+        /// Records whether it is host-mappable; `copy_to_host_at` stages a
+        /// transfer when `HOST_VISIBLE` is absent rather than mapping it.
+        memory_flags: vk::MemoryPropertyFlags,
     }
 
     impl<'a> DeviceBuffer<'a> {
@@ -678,6 +682,7 @@ mod real {
                 buffer,
                 memory,
                 len,
+                memory_flags,
             })
         }
 
@@ -691,6 +696,13 @@ mod real {
 
         pub fn raw(&self) -> vk::Buffer {
             self.buffer
+        }
+
+        /// Whether the backing memory was allocated HOST_VISIBLE (mappable);
+        /// false means `copy_to_host` stages a device->host transfer.
+        pub fn is_host_visible(&self) -> bool {
+            self.memory_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
         }
 
         pub fn copy_from_host(&mut self, src: &[u8]) -> Result<()> {
@@ -727,9 +739,39 @@ mod real {
             if dst.is_empty() {
                 return Ok(());
             }
-            // SAFETY rationale lives in `read_mapped`; the assert above bounds
-            // the slice to this buffer's allocated length.
-            read_mapped(&self.ctx.device, self.memory, offset, dst, "D2H")
+            // Host-mappable memory keeps the direct-map fast path (UMA APU and
+            // every HOST_VISIBLE buffer). Pure DEVICE_LOCAL memory cannot be
+            // mapped on MoltenVK or discrete GPUs, so stage a device→host
+            // transfer first (mirror of `alloc_device_local_from_host`).
+            if self
+                .memory_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            {
+                return read_mapped(&self.ctx.device, self.memory, offset, dst, "D2H");
+            }
+            let staging = Self::alloc_with_usage(
+                self.ctx,
+                dst.len(),
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let pool = CommandPool::create(self.ctx)?;
+            pool.one_shot_submit(|cmd| {
+                let region = vk::BufferCopy::default()
+                    .src_offset(offset)
+                    .size(dst.len() as vk::DeviceSize);
+                // SAFETY: `cmd` is the recording primary buffer; this buffer was
+                // created with TRANSFER_SRC and `staging` with TRANSFER_DST, and
+                // the bounds assert above plus the equal allocation size make
+                // the region in range.
+                unsafe {
+                    self.ctx
+                        .device
+                        .cmd_copy_buffer(cmd, self.buffer, staging.buffer, &[region]);
+                }
+                Ok(())
+            })?;
+            staging.copy_to_host(dst)
         }
 
         /// Allocate a **DEVICE_LOCAL** (not host-visible) buffer and fill it from
@@ -1966,6 +2008,10 @@ mod stub {
             true
         }
 
+        pub fn is_host_visible(&self) -> bool {
+            true
+        }
+
         pub fn copy_from_host(&mut self, _src: &[u8]) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)
         }
@@ -2155,28 +2201,8 @@ mod tests {
     #[cfg(feature = "vulkan")]
     #[test]
     fn probe_and_roundtrip_or_skip() {
-        if let Err(e) = init() {
-            eprintln!("vulkan-sys smoke: loader unavailable — skipping ({e})");
+        let Some(ctx) = test_context_or_skip() else {
             return;
-        }
-        let n = match device_count() {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("vulkan-sys smoke: device enumeration failed — skipping ({e})");
-                return;
-            }
-        };
-        if n == 0 {
-            eprintln!("vulkan-sys smoke: 0 devices — skipping");
-            return;
-        }
-        let ctx = match VulkanContext::create() {
-            Ok(ctx) => ctx,
-            Err(VulkanError::NoComputeDevice) => {
-                eprintln!("vulkan-sys smoke: no compute queue — skipping");
-                return;
-            }
-            Err(e) => panic!("failed to create Vulkan context: {e}"),
         };
         eprintln!(
             "vulkan-sys smoke: device = {}, queue_family = {}",
@@ -2185,18 +2211,91 @@ mod tests {
         );
 
         let src: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-        let mut buf = match DeviceBuffer::alloc(&ctx, src.len()) {
-            Ok(buf) => buf,
-            Err(e) => panic!("failed to allocate Vulkan buffer: {e}"),
+        let mut buf = DeviceBuffer::alloc(&ctx, src.len())
+            .unwrap_or_else(|e| panic!("failed to allocate Vulkan buffer: {e}"));
+        buf.copy_from_host(&src)
+            .unwrap_or_else(|e| panic!("H2D copy failed: {e}"));
+        let mut back = vec![0u8; src.len()];
+        buf.copy_to_host(&mut back)
+            .unwrap_or_else(|e| panic!("D2H copy failed: {e}"));
+        assert_eq!(src, back, "H2D/D2H round-trip mismatch");
+    }
+
+    /// Round-trip a pure DEVICE_LOCAL buffer. Its memory is not host-visible on
+    /// MoltenVK / discrete GPUs, so `copy_to_host` must internally stage a
+    /// device->host transfer rather than mapping the device memory. On a unified
+    /// device where the DEVICE_LOCAL heap is also HOST_VISIBLE the staging branch
+    /// is not exercised; the test prints that so such a pass is not mistaken for
+    /// staging coverage.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn device_local_roundtrip_via_staging_or_skip() {
+        let Some(ctx) = test_context_or_skip() else {
+            return;
         };
-        if let Err(e) = buf.copy_from_host(&src) {
-            panic!("H2D copy failed: {e}");
+        let src: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let buf = match DeviceBuffer::alloc_device_local_from_host(&ctx, &src) {
+            Ok(buf) => buf,
+            // A device with no DEVICE_LOCAL heap at all cannot exercise it.
+            Err(e) => {
+                eprintln!("vulkan-sys smoke: no DEVICE_LOCAL heap - skipping ({e})");
+                skip_or_panic(&format!("no DEVICE_LOCAL heap: {e}"));
+                return;
+            }
+        };
+        let host_visible = buf.is_host_visible();
+        eprintln!("device_local round-trip: memory_flags HOST_VISIBLE={host_visible}");
+        if host_visible {
+            eprintln!("staging branch not exercised (DEVICE_LOCAL is HOST_VISIBLE on this device)");
+        } else {
+            eprintln!("staging branch exercised (DEVICE_LOCAL memory is not host-visible)");
         }
         let mut back = vec![0u8; src.len()];
-        if let Err(e) = buf.copy_to_host(&mut back) {
-            panic!("D2H copy failed: {e}");
+        buf.copy_to_host(&mut back)
+            .expect("DEVICE_LOCAL D2H must round-trip");
+        assert_eq!(src, back, "DEVICE_LOCAL D2H round-trip mismatch");
+    }
+
+    /// Skip a device test unless `ARLE_REQUIRE_VULKAN_DEVICE` is set, in which
+    /// case the missing device is a hard failure (same rule as the
+    /// vulkan-kernels `require_device` helper: CI without an ICD must not pass by
+    /// silently skipping).
+    fn skip_or_panic(reason: &str) {
+        if std::env::var_os("ARLE_REQUIRE_VULKAN_DEVICE").is_some() {
+            panic!("ARLE_REQUIRE_VULKAN_DEVICE set but no Vulkan device is available: {reason}");
         }
-        assert_eq!(src, back, "H2D/D2H roundtrip mismatch");
+    }
+
+    /// Create a compute `VulkanContext` for a device test, or `None` after
+    /// printing the skip reason (panics under `ARLE_REQUIRE_VULKAN_DEVICE`).
+    #[cfg(feature = "vulkan")]
+    fn test_context_or_skip() -> Option<VulkanContext> {
+        if let Err(e) = init() {
+            eprintln!("vulkan-sys smoke: loader unavailable - skipping ({e})");
+            skip_or_panic(&format!("loader unavailable: {e}"));
+            return None;
+        }
+        match device_count() {
+            Ok(0) => {
+                eprintln!("vulkan-sys smoke: 0 devices - skipping");
+                skip_or_panic("0 devices");
+                None
+            }
+            Err(e) => {
+                eprintln!("vulkan-sys smoke: device enumeration failed - skipping ({e})");
+                skip_or_panic(&format!("enumeration failed: {e}"));
+                None
+            }
+            Ok(_) => match VulkanContext::create() {
+                Ok(ctx) => Some(ctx),
+                Err(VulkanError::NoComputeDevice) => {
+                    eprintln!("vulkan-sys smoke: no compute queue - skipping");
+                    skip_or_panic("no compute queue");
+                    None
+                }
+                Err(e) => panic!("failed to create Vulkan context: {e}"),
+            },
+        }
     }
 
     /// Find `glslc` the same way `vulkan-kernels/build.rs` does: explicit
