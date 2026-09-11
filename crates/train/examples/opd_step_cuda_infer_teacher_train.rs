@@ -744,13 +744,14 @@ mod app {
             let elapsed = step_started.elapsed().as_secs_f64();
             log_memory_summary("after_train_step", store);
             log_device_vram(&format!("06_after_train_step_{step}"), &vram_backend);
-            if let Some(max_step_seconds) = args.max_step_seconds {
-                if step == 1 && elapsed > max_step_seconds {
-                    return Err(format!(
-                        "first {teacher_source} TeacherForward OPD step took {elapsed:.6}s, above configured ceiling {max_step_seconds:.6}s"
-                    )
-                    .into());
-                }
+            if let Some(max_step_seconds) = args.max_step_seconds
+                && step == 1
+                && elapsed > max_step_seconds
+            {
+                return Err(format!(
+                    "first {teacher_source} TeacherForward OPD step took {elapsed:.6}s, above configured ceiling {max_step_seconds:.6}s"
+                )
+                .into());
             }
             let runtime_profile = teacher_profile();
             step_losses.push(outcome.loss as f64);

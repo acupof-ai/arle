@@ -68,7 +68,9 @@ mod app {
     }
 
     pub fn main() -> Result<()> {
-        let args = parse_args()?;
+        let Some(args) = parse_args()? else {
+            return Ok(());
+        };
         // autograd flags come from apply_runtime_flags, never the environment, so
         // the FlashQLA GDN backward only engages when this is set explicitly.
         autograd::apply_runtime_flags(&autograd::AutogradRuntimeFlags {
@@ -296,7 +298,7 @@ mod app {
         Ok(())
     }
 
-    fn parse_args() -> Result<Args> {
+    fn parse_args() -> Result<Option<Args>> {
         let mut model = env::var_os("ARLE_QWEN36_FP8_MODEL")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
@@ -381,7 +383,7 @@ mod app {
                          [--freeze-base-routes] [--sparse-logit-probe] \
                          [--frozen-prompt-kv --prompt-len N] [--gdr-chunkwise]"
                     );
-                    std::process::exit(0);
+                    return Ok(None);
                 }
                 other => bail!("unknown argument {other:?}"),
             }
@@ -418,7 +420,7 @@ mod app {
                 );
             }
         }
-        Ok(Args {
+        Ok(Some(Args {
             model,
             device,
             lora: LoraConfig { rank, alpha },
@@ -437,7 +439,7 @@ mod app {
             prompt_len,
             gdr_chunkwise,
             fp8_native_gemm,
-        })
+        }))
     }
 
     fn next_arg(flag: &'static str, args: &mut impl Iterator<Item = String>) -> Result<String> {
@@ -1109,7 +1111,7 @@ mod app {
         );
 
         let mut op_rows = profile.op_totals.iter().collect::<Vec<_>>();
-        op_rows.sort_by(|(_, left), (_, right)| right.duration.cmp(&left.duration));
+        op_rows.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.duration));
         for (rank, (op, stats)) in op_rows.into_iter().take(16).enumerate() {
             let seconds = secs(stats.duration);
             let pct_total = pct(seconds, total_seconds);
@@ -1123,7 +1125,7 @@ mod app {
         }
 
         let mut site_rows = profile.site_totals.iter().collect::<Vec<_>>();
-        site_rows.sort_by(|(_, left), (_, right)| right.duration.cmp(&left.duration));
+        site_rows.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.duration));
         for (rank, ((op, site), stats)) in site_rows.into_iter().take(16).enumerate() {
             let seconds = secs(stats.duration);
             let pct_total = pct(seconds, total_seconds);

@@ -72,6 +72,8 @@ mod app {
         fn load() -> NvtxFns {
             #[cfg(target_os = "linux")]
             unsafe {
+                // SAFETY: dlopen/dlsym receive valid NUL-terminated names; the
+                // resolved function pointers are null-checked before transmute.
                 let handle = [
                     "libnvtx3interop.so.1",
                     "libnvtx3interop.so",
@@ -121,6 +123,7 @@ mod app {
                 return Range { active: false };
             };
             unsafe {
+                // SAFETY: `push` was resolved to a non-null nvtxRangePushA symbol.
                 push(name.as_ptr());
             }
             Range {
@@ -137,6 +140,7 @@ mod app {
                     return;
                 };
                 unsafe {
+                    // SAFETY: `pop` was resolved to a non-null nvtxRangePop symbol.
                     pop();
                 }
             }

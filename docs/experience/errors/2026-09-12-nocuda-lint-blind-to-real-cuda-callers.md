@@ -59,6 +59,22 @@ restores the `AtomicUsize` and the `pub fn set_submit_cap`. Same rule: a
 "zero callers" deletion must grep the code that is compiled under every
 feature the item is visible to, including root-crate feature gates.
 
+## Third instance: example targets, not lib targets (train CUDA examples)
+
+The third case was in `--all-targets` rather than the library. Once the
+lib-side real-CUDA lints were clean, `cargo clippy -p train -p cli --features
+cuda --all-targets` surfaced nine pre-existing lints in the CUDA train
+**examples** (`opd_step_cuda_*`, `qwen36_fp8_lora_*`): `collapsible_if`,
+`undocumented_unsafe_blocks` (NVTX FFI), `clippy::exit` on `--help`, and
+`unnecessary_sort_by`. The no-cuda lint and even a real-CUDA `--lib` check
+compile no examples, so a clean library is exactly what exposed them: they had
+been behind both the cfg blind spot and the target-selection gap. Fix was
+lint-only (let-chains, safety comments, `sort_by_key(Reverse(..))`, and
+`--help` returning `Ok(None)` from the parser instead of `process::exit(0)`).
+Rule addition: when the library first compiles clean under real CUDA, the gate
+must include `--all-targets`; example and bench targets carry their own
+unverified code and fail independently of the lib.
+
 ## Rule
 
 For any crate whose CUDA code is `#[cfg(not(feature = "no-cuda"))]`, the
