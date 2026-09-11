@@ -417,15 +417,15 @@ kind = "composite"
 inputs = ["qkv", "b", "a", "conv_state", "gdr_state"]
 outputs = ["gdr_out"]
 reference = "cuda.qwen35.gdr_recurrent_scan"
-correctness_gate = "crates/infer-cuda/examples/gdr_decode_parity.rs;crates/infer-cuda/examples/gdr_varlen_parity.rs;crates/autograd/tests/test_linear_attention.rs"
-gate_gap = "both serving bands gated vs f64 host recurrence at local (K,V)=(16,48) and the attn_tp=2 (8,24) shard: decode (conv1d/gdr decode batch + singular, B=1/8, 5 carried steps) and VARLEN prefill replay (conv1d_prefill_varlen + gdr_prefill_recurrent_varlen, per-slot lengths 1/2/5/17/64 incl a FlashMLA page, B=1/4/8, nonzero initial ring+state, conv output, rebuilt ring, GDR output and final state each an independent comparator/negative tooth), plus a cross-path check at (16,48)/(8,24)/(4,12)/(2,6) lengths 5/17/64 — the DSpark block, a 17-row verify and one FlashMLA page — running the same input through BOTH the varlen recurrent and chunked FlashQLA pipelines against the same f64 anchor, printing the varlen-vs-FQ max diff per geometry across every supported TP shard; every multi-row advance now routes to chunked FlashQLA, so varlen has no remaining production caller (#300 deletion unblocked for all TP); remaining gaps: the single-row host ABI gdr_prefill_recurrent/conv1d_prefill (non-varlen, same kernel math) is covered only through autograd tests, and training grads have no serving gate"
+correctness_gate = "crates/infer-cuda/examples/gdr_decode_parity.rs;crates/infer-cuda/examples/flashqla_chunk_parity.rs;crates/autograd/tests/test_linear_attention.rs"
+gate_gap = "both serving multi-row paths gated vs one f64 host recurrence in flashqla_chunk_parity.rs at the four serve shards (16,48)/(8,24)/(4,12)/(2,6), lengths 5/17/64 (the DSpark block, a 17-row verify, one FlashMLA paged-KV page), nonzero initial ring+state: (a) the default sm90 chunked FlashQLA pipeline (conv1d->gdr_fq_prep->cumsum->kkt->fwd; GDR output and final f32 state teeth), and (b) the single-sequence recurrent fallback conv1d_prefill + gdr_prefill_recurrent — taken when --qwen35-gdr-chunked is off, on non-sm90 hosts, or on an unsupported geometry, and the only multi-row GDR path on sm80 — with conv output, rebuilt conv ring, GDR output and final state comparators and four teeth; decode is gated separately by gdr_decode_parity.rs ((16,48)/(8,24), B=1/8), training forward by autograd test_linear_attention.rs. The batched varlen kernels had no caller on the default path and were deleted in #300 — on the fallback configurations one batched conv+GDR launch per layer becomes B per-slot launches of the single-sequence recurrent kernel; pending-remote DSpark c=8 ITL/acceptance A/B with `--qwen35-gdr-chunked false` (no env override; the run log's `linear/gdr_recurrent` profile events must prove the treatment arm engaged) records the cost. Remaining gaps: GPU runs are pod-only and training grads have no serving gate"
 
 [[implementation]]
 id = "cuda.qwen35.conv1d_front"
 semantic = "qwen35.linear_attention"
 provider = "arle"
 source = "crates/infer-cuda/src/qwen35_attention.rs"
-legality = "always (depthwise conv stage ahead of GDR; decode-batch / prefill / prefill-varlen ABI by shape)"
+legality = "always (depthwise conv stage ahead of GDR; decode-batch / single-sequence prefill ABI by shape)"
 fallback = ""
 
 [[implementation]]
@@ -441,7 +441,7 @@ id = "cuda.qwen35.gdr_recurrent_scan"
 semantic = "qwen35.linear_attention"
 provider = "arle"
 source = "crates/infer-cuda/src/qwen35_attention.rs"
-legality = "seq_len>1 (host-scalar and varlen ABIs)"
+legality = "seq_len>1 (single-sequence host-scalar ABI; the flag-off / unsupported-geometry / non-sm90 fallback)"
 fallback = ""
 
 [[implementation]]
@@ -449,7 +449,7 @@ id = "cuda.qwen35.gdr_fq_chunked"
 semantic = "qwen35.linear_attention"
 provider = "tilelang"
 source = "crates/infer-cuda/src/qwen35_attention.rs"
-legality = "seq_len>1 && --qwen35-gdr-chunked && sm==9.0 && flashqla in KERNEL_CAPABILITIES && key/value head_dim==128 && (k_heads,v_heads) in {(16,32),(16,48),(8,24),(4,12),(2,6)} (global and attn_tp=2/4/8 shards); every multi-row GDN advance (prefill, verify, replay) at every supported TP now takes chunked FlashQLA — the recurrent varlen kernel has no production caller and #300 can delete it"
+legality = "seq_len>1 && --qwen35-gdr-chunked && sm==9.0 && flashqla in KERNEL_CAPABILITIES && key/value head_dim==128 && (k_heads,v_heads) in {(16,32),(16,48),(8,24),(4,12),(2,6)} (global and attn_tp=2/4/8 shards); every multi-row GDN advance (prefill, verify, replay) takes this path on the default config — the batched varlen kernels were deleted in #300, and fallback configs (flag off / non-sm90 / other geometry) take B per-slot launches of cuda.qwen35.gdr_recurrent_scan"
 fallback = "cuda.qwen35.gdr_recurrent_scan"
 
 [policy."qwen35.linear_attention"]

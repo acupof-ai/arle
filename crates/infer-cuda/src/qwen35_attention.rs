@@ -1700,10 +1700,6 @@ impl Qwen35Model {
             fq_g,
             fq_g_cumsum,
             fq_beta,
-            batch_ptrs,
-            batch_len,
-            batch_host,
-            batch_len_host,
             cp_in,
             cp_out,
             cp_row_gather,
@@ -1958,57 +1954,33 @@ impl Qwen35Model {
                 } else {
                     None
                 };
-                // Uniform short rows pack identically to the varlen kernels'
-                // `s * len` stride, so the whole batch is one conv + one GDR
-                // launch instead of B of each.
-                let uniform = rs.first().map(|r| r.len).filter(|len| {
-                    (1..=LINEAR_BATCH_MAX_LEN).contains(len) && rs.iter().all(|r| r.len == *len)
-                });
-                // When chunked FlashQLA is active, use its SAME per-slot kernel
-                // (not the never-parity-gated varlen batched recurrence).
-                let chunked_fq_active = uniform.is_some_and(|len| self.gdr_chunked_fq_active(len));
-                if let (Some(len), true, false) = (uniform, rs.len() > 1, chunked_fq_active) {
-                    self.advance_linear_conv_gdr_batched(
+                // Every multi-row linear advance takes the per-slot kernel,
+                // which selects chunked FlashQLA at every supported TP shard;
+                // single-row slots take the single-token decode recurrence.
+                let mut off = 0usize;
+                for r in rs.iter_mut() {
+                    self.advance_linear_conv_gdr(
                         attn,
-                        rs,
+                        &qkv.data.slice(off * qkv_dim..(off + r.len) * qkv_dim),
+                        &b_proj.data.slice(off * b_dim..(off + r.len) * b_dim),
+                        &a_proj.data.slice(off * a_dim..(off + r.len) * a_dim),
+                        r.slot,
                         linear_idx,
-                        len,
-                        qkv,
-                        b_proj,
-                        a_proj,
-                        qkv_conv,
-                        gdr_out,
-                        batch_ptrs,
-                        batch_len,
-                        batch_host,
-                        batch_len_host,
+                        r.len,
+                        &mut qkv_conv
+                            .data
+                            .slice_mut(off * qkv_dim..(off + r.len) * qkv_dim),
+                        &mut gdr_out.data.slice_mut(off * z_dim..(off + r.len) * z_dim),
+                        fq_q,
+                        fq_k,
+                        fq_v,
+                        fq_a,
+                        fq_g,
+                        fq_g_cumsum,
+                        fq_beta,
+                        decode_geom,
                     )?;
-                } else {
-                    let mut off = 0usize;
-                    for r in rs.iter_mut() {
-                        self.advance_linear_conv_gdr(
-                            attn,
-                            &qkv.data.slice(off * qkv_dim..(off + r.len) * qkv_dim),
-                            &b_proj.data.slice(off * b_dim..(off + r.len) * b_dim),
-                            &a_proj.data.slice(off * a_dim..(off + r.len) * a_dim),
-                            r.slot,
-                            linear_idx,
-                            r.len,
-                            &mut qkv_conv
-                                .data
-                                .slice_mut(off * qkv_dim..(off + r.len) * qkv_dim),
-                            &mut gdr_out.data.slice_mut(off * z_dim..(off + r.len) * z_dim),
-                            fq_q,
-                            fq_k,
-                            fq_v,
-                            fq_a,
-                            fq_g,
-                            fq_g_cumsum,
-                            fq_beta,
-                            decode_geom,
-                        )?;
-                        off += r.len;
-                    }
+                    off += r.len;
                 }
             }
             LinearCore::Tables { conv, gdr } => {
@@ -2138,122 +2110,6 @@ impl Qwen35Model {
                 },
             )?;
         }
-        Ok(())
-    }
-
-    /// [`Self::advance_linear_conv_gdr`] for B rows of the SAME `len` in one
-    /// conv + one GDR launch. Uniform `len` makes the varlen kernels' `s * len`
-    /// row stride identical to the trunk's ragged packing, so the shared
-    /// scratch needs no repack.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn advance_linear_conv_gdr_batched(
-        &self,
-        attn: &LinearAttn,
-        rs: &mut [LinearRow<'_>],
-        linear_idx: usize,
-        len: usize,
-        qkv: &HiddenStates,
-        b_proj: &HiddenStates,
-        a_proj: &HiddenStates,
-        qkv_conv: &mut HiddenStates,
-        gdr_out: &mut HiddenStates,
-        batch_ptrs: &mut SliceSlot<u64>,
-        batch_len: &mut SliceSlot<i32>,
-        host: &mut Vec<u64>,
-        len_host: &mut Vec<i32>,
-    ) -> Result<()> {
-        let ctx = &self.ctx;
-        let c = &self.config;
-        let b = rs.len();
-        let qkv_dim = self.local_linear_qkv_dim();
-        let b_dim = attn.in_proj_ba.rows / 2;
-        let (qkv_base, _g0) = qkv.data.device_ptr(&ctx.stream);
-        let (b_base, _g1) = b_proj.data.device_ptr(&ctx.stream);
-        let (a_base, _g2) = a_proj.data.device_ptr(&ctx.stream);
-        let elem = std::mem::size_of::<bf16>() as u64;
-        // Five contiguous B-entry tables in one upload, in kernel argument
-        // order: conv x, conv ring, b, a, GDR state.
-        host.clear();
-        host.resize(5 * b, 0);
-        for (i, r) in rs.iter_mut().enumerate() {
-            let row = (i * len) as u64;
-            let conv_state = &mut r.slot.conv_states[linear_idx];
-            ensure!(
-                conv_state.len == qkv_dim * (c.linear_conv_kernel_dim - 1),
-                "Qwen3.5 conv state len {} != qkv_dim*(kernel-1) {}",
-                conv_state.len,
-                qkv_dim * (c.linear_conv_kernel_dim - 1)
-            );
-            host[i] = qkv_base + row * qkv_dim as u64 * elem;
-            host[b + i] = conv_state.data.device_ptr_mut(&ctx.stream).0;
-            host[2 * b + i] = b_base + row * b_dim as u64 * elem;
-            host[3 * b + i] = a_base + row * b_dim as u64 * elem;
-            host[4 * b + i] = r.slot.gdr_states[linear_idx].device_ptr_mut(&ctx.stream).0;
-        }
-        let tbl = batch_ptrs.get(ctx, host.len())?;
-        ctx.stream
-            .memcpy_htod(host, tbl)
-            .map_err(|e| anyhow!("H2D linear batch pointer table: {e}"))?;
-        let (base, _gt) = tbl.device_ptr(&ctx.stream);
-        // Same for every layer of a tick, so upload only when its shape
-        // changes; `get` zero-fills a resize, so both dims must be checked.
-        let d = batch_len.get(ctx, b)?;
-        if len_host.len() != b || len_host[0] != len as i32 {
-            len_host.clear();
-            len_host.resize(b, len as i32);
-            ctx.stream
-                .memcpy_htod(len_host, d)
-                .map_err(|e| anyhow!("H2D linear batch row lengths: {e}"))?;
-        }
-        let (len_ptr, _gl) = d.device_ptr(&ctx.stream);
-        let (w_ptr, _g3) = attn.conv1d_weight.data.device_ptr(&ctx.stream);
-        let (dt_ptr, _g4) = attn.dt_bias.data.device_ptr(&ctx.stream);
-        let (alog_ptr, _g5) = attn.a_log.device_ptr(&ctx.stream);
-        let (cv_ptr, _g6) = qkv_conv.data.device_ptr_mut(&ctx.stream);
-        let (o_ptr, _g7) = gdr_out.data.device_ptr_mut(&ctx.stream);
-        let table = |k: u64| base + k * b as u64 * 8;
-        crate::profile::profile_op(ctx, "linear/conv1d", Some(linear_idx), b * len, || {
-            // Each table holds `b` live pointers staged above; the shared
-            // scratch is `[b * len, dim]`.
-            cuda_kernels::recurrent::conv1d_prefill_varlen_raw(
-                &ctx.stream,
-                table(0),
-                w_ptr,
-                table(1),
-                len_ptr,
-                cv_ptr,
-                qkv_dim,
-                len,
-                c.linear_conv_kernel_dim,
-                b,
-            )
-        })?;
-        crate::profile::profile_op(
-            ctx,
-            "linear/gdr_recurrent",
-            Some(linear_idx),
-            b * len,
-            || {
-                // Same tables; qkv_conv/gdr_out are `[b * len, dim]`.
-                cuda_kernels::recurrent::gdr_prefill_recurrent_varlen_raw(
-                    &ctx.stream,
-                    cv_ptr,
-                    table(2),
-                    table(3),
-                    dt_ptr,
-                    alog_ptr,
-                    table(4),
-                    len_ptr,
-                    o_ptr,
-                    self.local_linear_k_heads,
-                    self.local_linear_v_heads,
-                    c.linear_key_head_dim,
-                    c.linear_value_head_dim,
-                    len,
-                    b,
-                )
-            },
-        )?;
         Ok(())
     }
 
@@ -2639,126 +2495,5 @@ impl Qwen35Model {
             "spec replay advanced {li} linear layers != slot count {num_linear}"
         );
         Ok(())
-    }
-
-    /// [`Self::replay_linear_only`] for a whole batch: one conv1d and one
-    /// gated-delta launch per layer instead of two per slot per layer. Each
-    /// slot keeps its own capture and state, reached through `tables`.
-    pub(crate) fn replay_linear_only_batched(
-        &self,
-        slots: &mut [&mut Qwen35SlotState],
-        captures: &[&Qwen35LinearCapture],
-        ks: &[usize],
-        tables: &mut Qwen35ReplayTables,
-        ws: &mut Qwen35Workspace,
-    ) -> Result<()> {
-        let b = slots.len();
-        ensure!(
-            b == captures.len() && b == ks.len(),
-            "batched replay: {b} slots vs {} captures / {} ks",
-            captures.len(),
-            ks.len()
-        );
-        let num_linear = slots[0].conv_states.len();
-        let max_len = ks.iter().map(|k| k + 1).max().unwrap_or(0);
-        ensure!(max_len >= 1, "batched replay with no rows");
-        for (s, cap) in captures.iter().enumerate() {
-            ensure!(
-                cap.qkv.len() == num_linear && ks[s] < cap.rows,
-                "batched replay slot {s}: capture {} layers / {} rows cannot hold {} rows of \
-                 {num_linear} layers",
-                cap.qkv.len(),
-                cap.rows,
-                ks[s] + 1
-            );
-        }
-        let ctx = &self.ctx;
-        tables.stage(ctx, slots, captures, ks, num_linear)?;
-
-        let qkv_dim = self.local_linear_qkv_dim();
-        let z_dim = self.local_linear_z_dim();
-        let rows = b * max_len;
-        let Qwen35Workspace { linear, .. } = ws;
-        let qkv_conv = linear.qkv_conv.get(ctx, qkv_dim, rows)?;
-        let gdr_out = linear.gdr_out.get(ctx, z_dim, rows)?;
-        let (cv_ptr, _gc) = qkv_conv.data.device_ptr_mut(&ctx.stream);
-        let (go_ptr, _gg) = gdr_out.data.device_ptr_mut(&ctx.stream);
-        let stride = num_linear * b;
-        let (tbl, _gt) = tables
-            .ptrs
-            .get(ctx, REPLAY_TABLES * stride)?
-            .device_ptr(&ctx.stream);
-        let lay = ReplayLayout {
-            base: tbl,
-            ..tables.layout
-        };
-        let (len_ptr, _gl) = tables.row_len.get(ctx, b)?.device_ptr(&ctx.stream);
-        let c = &self.config;
-        let mut li = 0usize;
-        for layer in &self.layers {
-            let Qwen35Attn::Linear(attn) = &layer.attn else {
-                continue;
-            };
-            let (w_ptr, _g0) = attn.conv1d_weight.data.device_ptr(&ctx.stream);
-            let (dt_ptr, _g1) = attn.dt_bias.data.device_ptr(&ctx.stream);
-            let (alog_ptr, _g2) = attn.a_log.device_ptr(&ctx.stream);
-            let qkv_tbl = lay.table(TBL_QKV, li);
-            let b_tbl = lay.table(TBL_B, li);
-            let a_tbl = lay.table(TBL_A, li);
-            let conv_tbl = lay.table(TBL_CONV, li);
-            let gdr_tbl = lay.table(TBL_GDR, li);
-            // Each table holds `b` pointers staged above; the shared
-            // scratch is `[b * max_len, dim]`.
-            cuda_kernels::recurrent::conv1d_prefill_varlen_raw(
-                &ctx.stream,
-                qkv_tbl,
-                w_ptr,
-                conv_tbl,
-                len_ptr,
-                cv_ptr,
-                qkv_dim,
-                max_len,
-                c.linear_conv_kernel_dim,
-                b,
-            )?;
-            cuda_kernels::recurrent::gdr_prefill_recurrent_varlen_raw(
-                &ctx.stream,
-                cv_ptr,
-                b_tbl,
-                a_tbl,
-                dt_ptr,
-                alog_ptr,
-                gdr_tbl,
-                len_ptr,
-                go_ptr,
-                self.local_linear_k_heads,
-                self.local_linear_v_heads,
-                c.linear_key_head_dim,
-                c.linear_value_head_dim,
-                max_len,
-                b,
-            )?;
-            li += 1;
-        }
-        ensure!(
-            li == num_linear,
-            "batched replay advanced {li} linear layers != slot count {num_linear}"
-        );
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::quant_decode_num_splits;
-
-    #[test]
-    fn splits_track_occupancy_not_depth() {
-        // H20 = 78 SMs, Qwen3.8 = 4 KV heads.
-        assert_eq!(quant_decode_num_splits(78, 1, 4), 20);
-        assert_eq!(quant_decode_num_splits(78, 8, 4), 8); // floor binds
-        assert_eq!(quant_decode_num_splits(78, 1, 1), 64); // ceiling binds
-        assert_eq!(quant_decode_num_splits(40, 1, 4), 10); // small card
-        assert_eq!(quant_decode_num_splits(78, 64, 4), 8); // floor binds at depth
     }
 }

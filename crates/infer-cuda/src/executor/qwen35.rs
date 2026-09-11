@@ -89,7 +89,6 @@ pub(crate) struct MtpExec {
     /// linear-state copy, replay tables) — the machinery is head-agnostic.
     scratch: crate::qwen35::dspark::DsparkScratch,
     copy: crate::qwen35::Qwen35CopyScratch,
-    replay_tables: crate::qwen35::Qwen35ReplayTables,
     /// Cumulative counters (host-side, no device sync) — the /v1/stats spec source.
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
@@ -708,7 +707,6 @@ impl Qwen35CudaExecutor {
                 slots: (0..num_slots).map(|_| None).collect(),
                 scratch: Default::default(),
                 copy: Default::default(),
-                replay_tables: Default::default(),
                 accepts: 0,
                 rejects: 0,
                 chains: 0,
@@ -1714,12 +1712,7 @@ impl Qwen35CudaExecutor {
                     },
                 )
                 .collect();
-            model.dspark_rollback_batch(
-                &mut rolls,
-                &mut mtp_exec.replay_tables,
-                &mut mtp_exec.copy,
-                workspace,
-            )?;
+            model.dspark_rollback_batch(&mut rolls, &mut mtp_exec.copy, workspace)?;
         }
         Ok(out.into_iter().flatten().collect())
     }
@@ -2148,12 +2141,7 @@ impl Qwen35CudaExecutor {
                     },
                 )
                 .collect();
-            model.dspark_rollback_batch(
-                &mut rolls,
-                &mut ds.replay_tables,
-                &mut ds.copy,
-                workspace,
-            )?;
+            model.dspark_rollback_batch(&mut rolls, &mut ds.copy, workspace)?;
         }
         Ok(out.into_iter().flatten().collect())
     }

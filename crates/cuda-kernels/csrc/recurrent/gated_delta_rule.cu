@@ -391,35 +391,6 @@ cudaError_t gated_delta_rule_prefill_recurrent_cuda(
     return cudaGetLastError();
 }
 
-// Varlen twin: slot `s` reads qkv / writes output at its `s*max_len` block.
-cudaError_t gated_delta_rule_prefill_recurrent_varlen_cuda(
-    const __nv_bfloat16* qkv,
-    const __nv_bfloat16* const* b_ptrs,
-    const __nv_bfloat16* const* a_ptrs,
-    const __nv_bfloat16* dt_bias,
-    const float* A_log,
-    float* const* state_ptrs,
-    const int* row_len,
-    __nv_bfloat16* output,
-    int num_key_heads,
-    int num_value_heads,
-    int key_dim,
-    int val_dim,
-    int max_len,
-    int batch,
-    cudaStream_t stream
-) {
-    if (key_dim != GDR_KEY_DIM || val_dim != GDR_VAL_DIM || batch <= 0 || max_len <= 0) {
-        return cudaErrorInvalidValue;
-    }
-    dim3 grid(num_value_heads, batch);
-    gated_delta_rule_prefill_recurrent_kernel<<<grid, GDR_VAL_DIM, 0, stream>>>(
-        qkv, nullptr, nullptr, b_ptrs, a_ptrs, dt_bias, A_log, nullptr, state_ptrs, row_len,
-        output, num_key_heads, num_value_heads, key_dim, val_dim, max_len
-    );
-    return cudaGetLastError();
-}
-
 } // extern "C"
 
 // FlashQLA chunked-prefill prep — unpack the fused [q|k|v] projection row

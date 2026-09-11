@@ -46,13 +46,14 @@ unit test vs ref · **—** = no gate.
 ### 1. Qwen3.5/3.6 GDN linear attention (recurrent + conv1d)
 | Kernel | Heat | Gate | Geometry gap |
 |---|---|---|---|
-| `gdr_fq_prep` + AOT `gdr_fq_{cumsum,kkt,fwd}` (FlashQLA) | WARM | **U+P** (`crates/autograd` `test_linear_attention.rs`, vs CPU f32 incl grads; k8/v32 **and 16/48**, d128, chunk+batched) | tested heads 8/32 & 16/48; serve launcher only emits (16,32)/(16,48); AOT also compiles (24,8)(12,4)(16,8)(16,16) used only by training backward |
+| `gdr_fq_prep` + AOT `gdr_fq_{cumsum,kkt,fwd}` (FlashQLA) | WARM | **U+P** (`crates/autograd` `test_linear_attention.rs`, vs CPU f32 incl grads; k8/v32 **and 16/48**, d128, chunk+batched) + **P** `flashqla_chunk_parity` family A (full serve pipeline conv1d→prep→cumsum→kkt→fwd vs f64, all four serve shards (16,48)/(8,24)/(4,12)/(2,6), lengths 5/17/64, output+final state) | AOT also compiles (24,8)(12,4)(16,8)(16,16) used only by training backward; GPU run pod-only |
 | `gdr_decode_cuda` / `gdr_decode_batch_cuda` | **HOT** (c=1 default; c≥2 batch) | **P** `gdr_decode_parity` (B=1/8, (16,48)/(8,24), 5 carried steps, output+state vs f32 anchor) | — |
 | `conv1d_decode_batch_cuda` | HOT (c≥2) | **P** same `gdr_decode_parity` (conv output + shifted ring) | — |
-| `*_prefill_recurrent_varlen_cuda` + `conv1d_prefill_varlen_cuda` (attn_tp≥2 spec verify / DSpark replay) | WARM | **P** `gdr_varlen_parity` (lengths 1/2/5/17/64, B=1/4/8, nonzero init, output+ring+final state vs f64) + FlashQLA-vs-varlen cross-path check at (16,48) lengths 5/17/64 with max-diff output | — |
-| `gated_delta_rule_prefill_recurrent_cuda` (non-chunked / fq-unavailable) | WARM | **U+P** training-side vs CPU; `gdr_varlen_parity` covers the same kernel math via the varlen ABI at the serve head set | single-row host ABI itself only driven in autograd tests |
-| `conv1d_prefill_cuda` | WARM | **U+P** (training) + **P** (`gdr_varlen_parity` FlashQLA cross-check drives the single-row prefill ABI) | — |
-| 5 AOT `gated_delta_rule_chunk_{cumsum,a,recompute,state,o}` (serving build matrix) | **DEAD** | **—** zero callers + no test | kernels.toml rows with no symbol consumer anywhere (subsequently deleted) |
+
+| `gated_delta_rule_prefill_recurrent_cuda` (single-sequence fallback: flag off / non-sm90 / unsupported geometry) | WARM fallback | **U+P** training-side vs CPU + **P** `flashqla_chunk_parity` family B (same f64 anchor, same four shards/lengths, conv output + rebuilt ring + GDR output + final state, four teeth); the only multi-row GDR path on sm80 | GPU run pod-only |
+| `conv1d_prefill_cuda` | WARM | **U+P** (training) + **P** (`flashqla_chunk_parity` drives it as the conv stage of both family A and family B) | — |
+| `conv1d_prefill_varlen_cuda` / `*_prefill_recurrent_varlen_cuda` (batched per-slot) | **DELETED #300** | were **P** `gdr_varlen_parity` | on the default sm90 path they had no caller after #327/#329; they WERE still reached by fallback configs (flag off, non-sm90, unsupported geometry), where #300 replaces one batched launch per layer with B per-slot single-sequence launches — kernels, FFI, wrappers and staging removed; pending-remote c=8 A/B with `--qwen35-gdr-chunked false` records the cost |
+| 5 AOT `gated_delta_rule_chunk_{cumsum,a,recompute,state,o}` (serving build matrix) | **DEAD** | **—** zero callers + no test | kernels.toml rows with no symbol consumer anywhere (deleted in kernel-parity-s11) |
 | `batched_copy_uniform_cuda` | HOT (c≥2 setup) | E2E only | memcpy, low risk |
 
 ### 2. Full attention — FA3 / FlashMLA / FA2 / paged
@@ -102,6 +103,7 @@ unit test vs ref · **—** = no gate.
 | `quantize_kv_bf16_to_int8` / `dequantize_kv_int8_to_bf16` safe wrappers | test-only | INT8 roundtrip unit calls them (`gemm_tests.rs`) | retained — that test is the only INT8-KV gate |
 
 ## Production kernel gate status
+
 
 All ten families the initial audit flagged as E2E-only now have a code-side
 numeric gate. Every row is **Gated (GPU run pending)**: the gate compiles and
