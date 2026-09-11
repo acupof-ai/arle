@@ -16,7 +16,6 @@ pub use dsv4::{
     reusable_prefix_blocks_for_prompt,
 };
 pub use tier::{
-    KvSlotTier, NS_SIDECAR, NS_SIDECAR_CHUNK, NS_SLOT, NS_SLOT_CHUNK, SidecarSnapshot,
-    hash_prefix_tokens, sidecar_candidates, sidecar_lstar, sidecar_mat_len,
-    sidecar_periodic_savable, tier_io_stats,
+    KvSlotTier, NS_SLOT, NS_SLOT_CHUNK, SidecarSnapshot, hash_prefix_tokens, sidecar_lstar,
+    sidecar_mat_len, sidecar_periodic_savable, tier_io_stats,
 };

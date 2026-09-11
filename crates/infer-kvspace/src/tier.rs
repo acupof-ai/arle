@@ -14,8 +14,8 @@ use std::sync::mpsc;
 /// disjoint.
 pub const NS_SLOT: u64 = 1;
 pub const NS_SLOT_CHUNK: u64 = 2;
-pub const NS_SIDECAR: u64 = 3;
-pub const NS_SIDECAR_CHUNK: u64 = 4;
+pub(crate) const NS_SIDECAR: u64 = 3;
+pub(crate) const NS_SIDECAR_CHUNK: u64 = 4;
 
 /// FNV-1a hash of a token id slice, folded to the tier store's chunked key
 /// width — keys a sidecar blob to its prefix. The store packs the chunk
@@ -64,7 +64,7 @@ pub fn sidecar_periodic_savable(pos: usize, mat_len: usize) -> bool {
 /// `hash(tokens[..b])` rendezvous with the probe at the boundaries.
 ///
 /// `stride` must be > 0.
-pub fn sidecar_candidates(matched_len: usize, stride: usize) -> Vec<usize> {
+pub(crate) fn sidecar_candidates(matched_len: usize, stride: usize) -> Vec<usize> {
     debug_assert!(stride > 0);
     let mut candidates = Vec::new();
     if matched_len > 0 {
