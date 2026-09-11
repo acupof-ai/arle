@@ -718,7 +718,7 @@ impl<'a> DecodeResources<'a> {
 
     /// Zero the device-resident gated-delta + conv state for a fresh generation
     /// (mirrors [`Qwen35ForwardState::reset`] for the on-device path).
-    #[cfg_attr(not(test), allow(dead_code))] // driven via model reset_state used by on-box test
+    #[cfg(all(test, feature = "vulkan"))]
     pub(crate) fn reset_linear_state(&mut self) -> Result<()> {
         let conv_len = self.lin_conv_state.len();
         let gdr_len = self.lin_gdr_state.len();
@@ -749,7 +749,7 @@ impl<'a> DecodeResources<'a> {
     /// Drain the accumulated GEMV timing as
     /// `(submit_secs, other_secs, gemv_count)` and reset the counters. `other`
     /// is the host-side prep + descriptor build + readback around the submit.
-    #[cfg_attr(not(test), allow(dead_code))] // drained through model take_decode_profile for on-box timing
+    #[cfg(all(test, feature = "vulkan"))]
     pub(crate) fn take_profile(&mut self) -> (f64, f64, u64) {
         let s = self.gemv_submit_ns as f64 / 1e9;
         let o = self.gemv_other_ns as f64 / 1e9;
@@ -902,9 +902,9 @@ fn forward_layers_resident<'a>(
     // throughout — no host bridge), then `submit_and_wait` ONCE at token end. This
     // collapses the old 64 per-layer fence-wait GPU stalls into a single submit.
     // The descriptor rings are sized to a whole token (see `DecodeResources::new`),
-    // so no slot is reused while its dispatch is still in flight. `--vulkan-submit-cap`
-    // (default: whole token) caps the per-batch dispatch count as a TDR safety valve;
-    // a flush at a layer boundary stays numerically identical because the `hid`
+    // so no slot is reused while its dispatch is still in flight. The whole-token
+    // dispatch cap is a TDR safety valve (currently fixed at whole token); a
+    // flush at a layer boundary stays numerically identical because the `hid`
     // hand-off across the flush is fence-ordered by the next `begin()`.
     let cap = submit_dispatch_cap();
     // Per-layer-type GPU timing probe (ARLE_PROFILE_LAYERS=1): submit + wait after
@@ -1374,23 +1374,15 @@ fn record_full_attention<'a>(
 
 /// Max compute dispatches recorded into one command buffer before the
 /// residual-resident loop flushes (submit + re-begin) at the next layer boundary.
-/// Default `usize::MAX` = a whole token in ONE submit (the perf-parity target). A
-/// flush is numerically transparent — the `hid` hand-off is fence-ordered by the
-/// reopening `begin()` — so `--vulkan-submit-cap <n>` is a pure TDR/latency safety
-/// valve (lower → more submits, smaller command buffers) with no effect on output.
-static SUBMIT_DISPATCH_CAP: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
-
-/// `--vulkan-submit-cap`, set once pre-load (values `> 0`).
-#[allow(dead_code)] // knob wired pre-load; submit_dispatch_cap() reads it on the hot path
-pub(crate) fn set_submit_cap(cap: usize) {
-    if cap > 0 {
-        SUBMIT_DISPATCH_CAP.store(cap, std::sync::atomic::Ordering::Relaxed);
-    }
-}
+/// Fixed at `usize::MAX` = a whole token in ONE submit (the perf-parity target).
+/// The cap-flush branch is numerically transparent — the `hid` hand-off is
+/// fence-ordered by the reopening `begin()` — so lowering this stays a pure
+/// TDR/latency safety valve (more submits, smaller command buffers) with no
+/// effect on output if a setter is wired later.
+const SUBMIT_DISPATCH_CAP: usize = usize::MAX;
 
 fn submit_dispatch_cap() -> usize {
-    SUBMIT_DISPATCH_CAP.load(std::sync::atomic::Ordering::Relaxed)
+    SUBMIT_DISPATCH_CAP
 }
 
 /// Record (NO begin/submit) the WHOLE linear (gated-delta) attention block

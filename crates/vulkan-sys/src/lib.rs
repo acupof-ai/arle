@@ -349,7 +349,7 @@ mod real {
 
         // Used alongside device_name by the in-crate smoke test to report the
         // picked queue family; production reads the field internally.
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn queue_family_index(&self) -> u32 {
             self.queue_family_index
         }
@@ -360,7 +360,7 @@ mod real {
 
         // Exposed for the in-crate device tests (staging round-trip); the
         // forward uses recorded command buffers, not the raw ash device.
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn raw_device(&self) -> &ash::Device {
             &self.device
         }
@@ -658,7 +658,7 @@ mod real {
         /// false means `copy_to_host` stages a device->host transfer.
         // Used by the in-crate staging-path test to prove device-local
         // readback actually transfers; the forward never branches on this.
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn is_host_visible(&self) -> bool {
             self.memory_flags
                 .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
@@ -1654,7 +1654,7 @@ mod real {
         // Simplest pipeline constructor; only the in-crate descriptor/push
         // test exercises it (production goes through the cache with
         // specialization + subgroup size).
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn create_with_push_constants(
             ctx: &'a VulkanContext,
             shader: &ShaderModule<'_>,
@@ -1860,12 +1860,6 @@ mod stub {
             ""
         }
 
-        // Mirrors the real VulkanContext API for the no-vulkan stub.
-        #[allow(dead_code)]
-        pub(crate) fn queue_family_index(&self) -> u32 {
-            0
-        }
-
         pub fn min_storage_buffer_offset_alignment(&self) -> u64 {
             0
         }
@@ -1889,11 +1883,6 @@ mod stub {
         }
 
         pub fn is_empty(&self) -> bool {
-            true
-        }
-
-        #[allow(dead_code)]
-        pub(crate) fn is_host_visible(&self) -> bool {
             true
         }
 
@@ -2023,28 +2012,6 @@ mod stub {
             Err(VULKAN_NOT_COMPILED)
         }
 
-        // No-vulkan stub: never callable, kept to mirror the real signature.
-        #[allow(dead_code)]
-        pub(crate) fn create_with_push_constants(
-            _ctx: &'a VulkanContext,
-            _shader: &ShaderModule<'_>,
-            _descriptor_layouts: &[&DescriptorSetLayout<'_>],
-            _push_constant_bytes: u32,
-        ) -> Result<Self> {
-            Err(VULKAN_NOT_COMPILED)
-        }
-
-        #[allow(dead_code)]
-        pub(crate) fn create_with_push_constants_and_specialization(
-            _ctx: &'a VulkanContext,
-            _shader: &ShaderModule<'_>,
-            _descriptor_layouts: &[&DescriptorSetLayout<'_>],
-            _push_constant_bytes: u32,
-            _specialization_u32: &[(u32, u32)],
-        ) -> Result<Self> {
-            Err(VULKAN_NOT_COMPILED)
-        }
-
         pub fn create_with_push_constants_specialization_and_subgroup_size(
             _ctx: &'a VulkanContext,
             _shader: &ShaderModule<'_>,
@@ -2140,7 +2107,7 @@ mod tests {
     /// case the missing device is a hard failure (same rule as the
     /// vulkan-kernels `require_device` helper: CI without an ICD must not pass by
     /// silently skipping).
-    #[allow(dead_code)] // only invoked inside cfg(vulkan) device tests
+    #[cfg(all(test, feature = "vulkan"))]
     fn skip_or_panic(reason: &str) {
         if std::env::var_os("ARLE_REQUIRE_VULKAN_DEVICE").is_some() {
             panic!("ARLE_REQUIRE_VULKAN_DEVICE set but no Vulkan device is available: {reason}");

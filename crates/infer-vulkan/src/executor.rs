@@ -109,8 +109,7 @@ impl VulkanExecutor {
     }
 
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] load smoke test
-    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))] // stub executor never holds a model
+    #[cfg(all(test, feature = "vulkan"))]
     pub(crate) fn has_model(&self) -> bool {
         #[cfg(feature = "vulkan")]
         {
@@ -125,9 +124,8 @@ impl VulkanExecutor {
     /// `(resident_tensor_count, resident_device_bytes)` for the loaded model, or
     /// `None` if no model is loaded. Lets a load smoke-test assert the weights
     /// actually landed on the device.
-    #[cfg(feature = "vulkan")]
+    #[cfg(all(test, feature = "vulkan"))]
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] load smoke test observability
     pub(crate) fn resident_stats(&self) -> Option<(usize, u64)> {
         let model = self.model.as_ref()?;
         Some(match model {
