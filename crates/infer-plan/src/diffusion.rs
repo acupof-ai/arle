@@ -391,7 +391,7 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
 /// Sort positions by entropy, accept positions whose cumulative entropy
 /// excluding the current maximum remains within the bound.
 #[must_use]
-pub fn entropy_bound_acceptance_mask(entropies: &[f32], entropy_bound: f32) -> Vec<bool> {
+fn entropy_bound_acceptance_mask(entropies: &[f32], entropy_bound: f32) -> Vec<bool> {
     let mut sorted: Vec<(usize, f32)> = entropies.iter().copied().enumerate().collect();
     sorted.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     let mut mask = vec![false; entropies.len()];

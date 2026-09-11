@@ -14,7 +14,7 @@ pub enum SpecKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeRoute {
+enum DecodeRoute {
     Plain,
     /// c=1 / low-concurrency win.
     Mtp,
@@ -30,7 +30,7 @@ pub enum DecodeRoute {
 ///
 /// `vetoed` covers request features the selected speculative implementation
 /// cannot apply to every accepted token in a chain.
-pub fn route_decode(spec_kind: SpecKind, n_rows: usize, gate: usize, vetoed: bool) -> DecodeRoute {
+fn route_decode(spec_kind: SpecKind, n_rows: usize, gate: usize, vetoed: bool) -> DecodeRoute {
     if vetoed || n_rows > gate {
         return DecodeRoute::Plain;
     }
