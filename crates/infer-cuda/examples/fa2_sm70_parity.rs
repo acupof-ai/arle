@@ -472,11 +472,20 @@ mod real {
 
     pub(super) fn run(corrupt: Option<String>) -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let (major, _) = ctx.compute_capability();
+        let (major, minor) = ctx.compute_capability();
         if major >= 8 {
-            eprintln!(
-                "fa2_sm70_parity: device is sm_{major}x; arle_fa2_sm70 is the sm<80 \
-                 (V100/T4) kernel. Run on the V100 box (pending-remote)."
+            // Machine-readable skip for parity_gpu_batch.sh: one SKIP: line,
+            // rc 0, and deliberately NO pass/negative marker (a real run
+            // prints ALL PASS / NEGATIVE CONTROL OK). Both positive and
+            // --negative-control invocations skip identically.
+            let mode = if corrupt.is_some() {
+                " (negative-control run)"
+            } else {
+                ""
+            };
+            println!(
+                "SKIP: requires sm_70, device is sm_{major}{minor}{mode}; \
+                 arle_fa2_sm70 is the sm<80 kernel — run on the V100 box"
             );
             return Ok(());
         }
@@ -508,7 +517,7 @@ mod real {
                 if !failures.is_empty() {
                     bail!("fa2_sm70 parity failures: {failures:?}");
                 }
-                println!("FA2 sm70 PARITY OK — {}", cuda_kernels::KERNEL_BUILD_ID);
+                println!("FA2 sm70 ALL PASS — {}", cuda_kernels::KERNEL_BUILD_ID);
             }
         }
         Ok(())

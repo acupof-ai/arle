@@ -124,7 +124,7 @@ yet (header status).
 
 ### Geometry mismatches (gate exists, production shape in question)
 
-Status per item; two remain **Open**.
+Status per item; one remains **Open**.
 
 - **attn_tp≥2 GDN — closed in code, GPU run pending.** Chunked FlashQLA is now
   selected at every supported shard: (8,24) attn_tp=2 and (4,12) attn_tp=4

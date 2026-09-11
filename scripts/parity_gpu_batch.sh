@@ -158,6 +158,11 @@ cap_log() {
 # rc 0 AND the NEGATIVE CONTROL OK line.
 pos_marker() { grep -F 'ALL PASS' "$1" | tail -n 1 || true; }
 neg_marker() { grep -F 'NEGATIVE CONTROL OK' "$1" | tail -n 1 || true; }
+# A gate that cannot run on this device prints a single `SKIP: <reason>`
+# line with rc 0 and NO pass marker. Recognize it explicitly so rc=0 alone
+# is neither a false FAIL nor a silent PASS.
+skip_marker() { grep -E '^SKIP: ' "$1" | tail -n 1 || true; }
+skip_reason() { sed -n 's/^SKIP: //p' "$1" | tail -n 1 | tr '\t' ' ' | cut -c1-200; }
 fail_lines() {  # FAIL / family-teeth lines, TSV-safe single line
     grep -E 'FAIL|negative teeth OK' "$1" | tail -n 20 \
         | tr '\t\n' '  ' | sed 's/  */ /g' | cut -c1-800 || true
@@ -196,7 +201,12 @@ for line in "${gates[@]}"; do
     set -e
     cap_log "$pos_log"
     pos_verdict="$(pos_marker "$pos_log")"
-    if [ "$pos_rc" -eq 0 ] && [ -n "$pos_verdict" ]; then
+    pos_skip="$(skip_marker "$pos_log")"
+    if [ -n "$pos_skip" ]; then
+        pos_status=SKIP
+        pos_verdict="$pos_skip"
+        n_skip=$((n_skip + 1))
+    elif [ "$pos_rc" -eq 0 ] && [ -n "$pos_verdict" ]; then
         pos_status=PASS; n_pass=$((n_pass + 1))
     else
         pos_status=FAIL; n_fail=$((n_fail + 1)); fail_names="$fail_names $name(positive rc=$pos_rc)"
@@ -211,7 +221,14 @@ for line in "${gates[@]}"; do
         set -e
         cap_log "$neg_log"
         neg_verdict="$(neg_marker "$neg_log")"
-        if [ "$neg_rc" -eq 0 ] && [ -n "$neg_verdict" ]; then
+        neg_skip="$(skip_marker "$neg_log")"
+        if [ -n "$neg_skip" ]; then
+            # Same device gate skips in both worlds; counted once (the
+            # positive SKIP above) so a skipped gate yields exactly one
+            # n_skip, not two.
+            neg_status=SKIP
+            neg_verdict="$neg_skip"
+        elif [ "$neg_rc" -eq 0 ] && [ -n "$neg_verdict" ]; then
             neg_status=PASS
         else
             neg_status=FAIL
@@ -227,10 +244,14 @@ for line in "${gates[@]}"; do
     fails="$(fail_lines "$pos_log")"
     if [ "$neg_status" = FAIL ]; then fails="$fails | $(fail_lines "${neg_log:-/dev/null}")"; fi
     status="$pos_status"
-    if [ "$neg_status" = FAIL ]; then status=FAIL; fi
+    if [ "$neg_status" = FAIL ] || { [ "$pos_status" = FAIL ] && [ "$neg_status" != SKIP ]; }; then
+        status=FAIL
+    fi
+    tsv_reason="${fails:-—}"
+    if [ "$pos_status" = SKIP ]; then tsv_reason="$(skip_reason "$pos_log")"; fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$name" "$sm90" "$neg_mode" "$pos_rc" "${pos_verdict:-—}" \
-        "$neg_rc" "${neg_verdict:-—}" "$status" "${fails:-—}" >>"$TSV"
+        "$neg_rc" "${neg_verdict:-—}" "$status" "$tsv_reason" >>"$TSV"
 done
 
 # ── Markdown table (wins/errors-ready) ─────────────────────────────────────

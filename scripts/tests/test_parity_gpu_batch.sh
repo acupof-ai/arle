@@ -91,6 +91,41 @@ ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_noneg" ARLE_PARITY_GPU=7 
 grep -qE '^gate_noneg\tno\tallowlisted\t0\t.*\t-\t' "$OUT_AL/results.tsv" \
     || { echo "FAIL: allowlisted row wrong" >&2; cat "$OUT_AL/results.tsv" >&2; exit 1; }
 
+# ── Device-gated example: rc 0 and a SKIP line but NO pass marker, in both
+# the positive and --negative-control worlds. Must be SKIP (one n_skip),
+# never PASS (silent) nor FAIL (false). ──
+cat > "$BIN/gate_skip" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--kernel-build-id" ]; then echo mock-kernel-1; exit 0; fi
+# No ALL PASS / NEGATIVE CONTROL OK marker in either world.
+echo "SKIP: requires sm_70, device is sm_90"
+exit 0
+SH
+chmod +x "$BIN/gate_skip"
+OUT_SK="$TMP/out-skip"
+if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_skip" ARLE_PARITY_GPU=7 \
+    ARLE_PARITY_SKIP_PREREG=1 \
+    bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_SK" >"$TMP/skip.log" 2>&1; then
+    :
+else
+    echo "FAIL: SKIP world exited non-zero" >&2; cat "$TMP/skip.log" >&2; exit 1
+fi
+# Status column must be SKIP for both worlds, rc 0, with the reason captured.
+grep -qE $'^gate_skip\tno\trequired\t0\tSKIP: requires sm_70.*\t0\tSKIP: requires sm_70.*\tSKIP\t' \
+    "$OUT_SK/results.tsv" \
+    || { echo "FAIL: skip gate row not SKIP/SKIP with reason" >&2
+         cat "$OUT_SK/results.tsv" >&2; exit 1; }
+if grep -qE 'PASS|FAIL' "$OUT_SK/results.tsv"; then
+    echo "FAIL: a SKIP gate leaked a PASS/FAIL verdict" >&2
+    cat "$OUT_SK/results.tsv" >&2; exit 1
+fi
+grep -q 'pass=0 fail=0 skip=1' "$TMP/skip.log" \
+    || { echo "FAIL: skip counted wrong (must be pass=0 fail=0 skip=1)" >&2
+         cat "$TMP/skip.log" >&2; exit 1; }
+grep -qE '^\| gate_skip .* \| SKIP \| SKIP \|' "$OUT_SK/results.md" \
+    || { echo "FAIL: markdown did not render SKIP/SKIP" >&2
+         cat "$OUT_SK/results.md" >&2; exit 1; }
+
 # ── Dirty world: positive FAIL and dead negative control ──
 make_mock gate_b posfail
 make_mock gate_c negdead
