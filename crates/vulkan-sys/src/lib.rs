@@ -347,11 +347,10 @@ mod real {
             &self.device_name
         }
 
-        pub fn physical_device(&self) -> vk::PhysicalDevice {
-            self.physical_device
-        }
-
-        pub fn queue_family_index(&self) -> u32 {
+        // Used alongside device_name by the in-crate smoke test to report the
+        // picked queue family; production reads the field internally.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn queue_family_index(&self) -> u32 {
             self.queue_family_index
         }
 
@@ -359,16 +358,11 @@ mod real {
             self.queue
         }
 
-        pub fn raw_device(&self) -> &ash::Device {
+        // Exposed for the in-crate device tests (staging round-trip); the
+        // forward uses recorded command buffers, not the raw ash device.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn raw_device(&self) -> &ash::Device {
             &self.device
-        }
-
-        /// The device-wide pipeline cache. Thread this into every
-        /// `createComputePipeline` so the driver can reuse prior compile work
-        /// (mirrors `ggml-vulkan` building each pipeline once; here the driver
-        /// also de-duplicates shared backend state across pipelines).
-        pub fn pipeline_cache(&self) -> vk::PipelineCache {
-            self.pipeline_cache
         }
 
         /// `minStorageBufferOffsetAlignment` (bytes) — every storage-buffer
@@ -387,7 +381,7 @@ mod real {
         /// `(timestampPeriod ns/tick, timestampValidBits)` for GPU timestamp
         /// profiling. `valid_bits == 0` means the compute queue does not support
         /// timestamps (profiling must be disabled).
-        pub fn timestamp_info(&self) -> (f32, u32) {
+        pub(crate) fn timestamp_info(&self) -> (f32, u32) {
             // SAFETY: both queries read `self.physical_device`, owned by
             // `self.instance` for the context's lifetime; results are copied.
             let props = unsafe {
@@ -434,44 +428,6 @@ mod real {
                 size_control.min_subgroup_size,
                 size_control.max_subgroup_size,
             )
-        }
-
-        pub fn memory_heaps(&self) -> Vec<(u64, bool)> {
-            // SAFETY: `self.physical_device` is owned by `self.instance`; the
-            // returned arrays are read only within the copied-out ranges below.
-            let props = unsafe {
-                self.instance
-                    .get_physical_device_memory_properties(self.physical_device)
-            };
-            (0..props.memory_heap_count as usize)
-                .map(|i| {
-                    let heap = props.memory_heaps[i];
-                    (
-                        heap.size,
-                        heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
-                    )
-                })
-                .collect()
-        }
-
-        pub fn memory_types(&self) -> Vec<(u32, bool, bool)> {
-            // SAFETY: valid owned physical device; only copied-out fields are read.
-            let props = unsafe {
-                self.instance
-                    .get_physical_device_memory_properties(self.physical_device)
-            };
-            (0..props.memory_type_count as usize)
-                .map(|i| {
-                    let ty = props.memory_types[i];
-                    (
-                        ty.heap_index,
-                        ty.property_flags
-                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
-                        ty.property_flags
-                            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
-                    )
-                })
-                .collect()
         }
 
         fn memory_type_index(
@@ -620,7 +576,7 @@ mod real {
             })
         }
 
-        pub fn alloc_with_usage(
+        pub(crate) fn alloc_with_usage(
             ctx: &'a VulkanContext,
             len: usize,
             usage: vk::BufferUsageFlags,
@@ -700,7 +656,10 @@ mod real {
 
         /// Whether the backing memory was allocated HOST_VISIBLE (mappable);
         /// false means `copy_to_host` stages a device->host transfer.
-        pub fn is_host_visible(&self) -> bool {
+        // Used by the in-crate staging-path test to prove device-local
+        // readback actually transfers; the forward never branches on this.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn is_host_visible(&self) -> bool {
             self.memory_flags
                 .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
         }
@@ -1364,7 +1323,7 @@ mod real {
             Self::from_spirv_words(ctx, &words)
         }
 
-        pub fn from_spirv_words(ctx: &'a VulkanContext, words: &[u32]) -> Result<Self> {
+        pub(crate) fn from_spirv_words(ctx: &'a VulkanContext, words: &[u32]) -> Result<Self> {
             let create = vk::ShaderModuleCreateInfo::default().code(words);
             // SAFETY: the device is held by `ctx`; `words` is a valid SPIR-V
             // blob (length-multiple-of-4 checked by the caller), referenced for
@@ -1692,7 +1651,11 @@ mod real {
             )
         }
 
-        pub fn create_with_push_constants(
+        // Simplest pipeline constructor; only the in-crate descriptor/push
+        // test exercises it (production goes through the cache with
+        // specialization + subgroup size).
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn create_with_push_constants(
             ctx: &'a VulkanContext,
             shader: &ShaderModule<'_>,
             descriptor_layouts: &[&DescriptorSetLayout<'_>],
@@ -1707,7 +1670,7 @@ mod real {
             )
         }
 
-        pub fn create_with_push_constants_and_specialization(
+        pub(crate) fn create_with_push_constants_and_specialization(
             ctx: &'a VulkanContext,
             shader: &ShaderModule<'_>,
             descriptor_layouts: &[&DescriptorSetLayout<'_>],
@@ -1897,7 +1860,9 @@ mod stub {
             ""
         }
 
-        pub fn queue_family_index(&self) -> u32 {
+        // Mirrors the real VulkanContext API for the no-vulkan stub.
+        #[allow(dead_code)]
+        pub(crate) fn queue_family_index(&self) -> u32 {
             0
         }
 
@@ -1927,7 +1892,8 @@ mod stub {
             true
         }
 
-        pub fn is_host_visible(&self) -> bool {
+        #[allow(dead_code)]
+        pub(crate) fn is_host_visible(&self) -> bool {
             true
         }
 
@@ -2057,7 +2023,9 @@ mod stub {
             Err(VULKAN_NOT_COMPILED)
         }
 
-        pub fn create_with_push_constants(
+        // No-vulkan stub: never callable, kept to mirror the real signature.
+        #[allow(dead_code)]
+        pub(crate) fn create_with_push_constants(
             _ctx: &'a VulkanContext,
             _shader: &ShaderModule<'_>,
             _descriptor_layouts: &[&DescriptorSetLayout<'_>],
@@ -2066,7 +2034,8 @@ mod stub {
             Err(VULKAN_NOT_COMPILED)
         }
 
-        pub fn create_with_push_constants_and_specialization(
+        #[allow(dead_code)]
+        pub(crate) fn create_with_push_constants_and_specialization(
             _ctx: &'a VulkanContext,
             _shader: &ShaderModule<'_>,
             _descriptor_layouts: &[&DescriptorSetLayout<'_>],
@@ -2171,6 +2140,7 @@ mod tests {
     /// case the missing device is a hard failure (same rule as the
     /// vulkan-kernels `require_device` helper: CI without an ICD must not pass by
     /// silently skipping).
+    #[allow(dead_code)] // only invoked inside cfg(vulkan) device tests
     fn skip_or_panic(reason: &str) {
         if std::env::var_os("ARLE_REQUIRE_VULKAN_DEVICE").is_some() {
             panic!("ARLE_REQUIRE_VULKAN_DEVICE set but no Vulkan device is available: {reason}");

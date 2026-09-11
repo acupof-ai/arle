@@ -50,7 +50,8 @@ impl VulkanQwen35Model {
     /// the host `Qwen35ForwardState` (the host linear-attention oracle path) and
     /// the device-resident gated-delta + conv state (the on-device path), so a
     /// fresh sequence starts clean regardless of which path is selected.
-    pub fn reset_state(&mut self) {
+    #[allow(dead_code)] // retained for API symmetry with qwen36; no qwen35 generation test
+    pub(crate) fn reset_state(&mut self) {
         self.state.reset();
         if let Err(e) = self.decode.reset_linear_state() {
             panic!("reset device linear state: {e}");
@@ -60,21 +61,25 @@ impl VulkanQwen35Model {
     /// Drain the accumulated GEMV timing `(submit_secs, other_secs, gemv_count)`
     /// from the decode resources and reset it — lets a timed decode attribute
     /// time between the GPU submits and the host prep/readback around them.
-    pub fn take_decode_profile(&mut self) -> (f64, f64, u64) {
+    #[allow(dead_code)] // retained for API symmetry with qwen36; no qwen35 generation test
+    pub(crate) fn take_decode_profile(&mut self) -> (f64, f64, u64) {
         self.decode.take_profile()
     }
 
-    pub fn decode_submit_count(&self) -> u64 {
+    #[allow(dead_code)] // retained for API symmetry with qwen36; no qwen35 generation test
+    pub(crate) fn decode_submit_count(&self) -> u64 {
         self.decode.submit_count()
     }
 
     /// Number of device-resident weight tensors (token_embd is host-side and not
     /// counted). Lets a load smoke-test assert the model actually landed.
-    pub fn resident_tensor_count(&self) -> usize {
+    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] load assertion
+    pub(crate) fn resident_tensor_count(&self) -> usize {
         self.weights.tensors.len()
     }
 
-    pub fn resident_device_bytes(&self) -> u64 {
+    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] load assertion
+    pub(crate) fn resident_device_bytes(&self) -> u64 {
         self.weights
             .tensors
             .values()

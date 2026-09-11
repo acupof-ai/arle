@@ -43,7 +43,10 @@ pub const QWEN36_MOE_OPS: &[Qwen36MoeOp] = &[
 ];
 
 #[cfg(feature = "vulkan")]
-pub fn qwen36_kernel_for_launcher(kind: Qwen36MoeLauncherKind) -> Option<vulkan_kernels::Kernel> {
+#[cfg_attr(not(test), allow(dead_code))] // in-crate launcher-selection unit test
+pub(crate) fn qwen36_kernel_for_launcher(
+    kind: Qwen36MoeLauncherKind,
+) -> Option<vulkan_kernels::Kernel> {
     Some(match kind {
         Qwen36MoeLauncherKind::RouterGemv | Qwen36MoeLauncherKind::QuantizedExpertGemv => {
             vulkan_kernels::Kernel::GemvQ4K
@@ -183,27 +186,32 @@ impl VulkanQwen36Model {
     /// the host `Qwen35ForwardState` and the device-resident gated-delta + conv
     /// state (the on-device linear-attention path), so a fresh sequence starts
     /// clean regardless of which path is selected.
-    pub fn reset_state(&mut self) {
+    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] coherence test lifecycle
+    pub(crate) fn reset_state(&mut self) {
         self.state.reset();
         if let Err(e) = self.decode.reset_linear_state() {
             panic!("reset device linear state: {e}");
         }
     }
 
-    pub fn take_decode_profile(&mut self) -> (f64, f64, u64) {
+    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] decode timing
+    pub(crate) fn take_decode_profile(&mut self) -> (f64, f64, u64) {
         self.decode.take_profile()
     }
 
-    pub fn decode_submit_count(&self) -> u64 {
+    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] submit-count instrumentation
+    pub(crate) fn decode_submit_count(&self) -> u64 {
         self.decode.submit_count()
     }
 
     /// Number of device-resident weight tensors (token_embd is host-side).
-    pub fn resident_tensor_count(&self) -> usize {
+    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] load assertion
+    pub(crate) fn resident_tensor_count(&self) -> usize {
         self.weights.tensors.len()
     }
 
-    pub fn resident_device_bytes(&self) -> u64 {
+    #[cfg_attr(not(test), allow(dead_code))] // on-box #[ignore] load assertion
+    pub(crate) fn resident_device_bytes(&self) -> u64 {
         self.weights
             .tensors
             .values()

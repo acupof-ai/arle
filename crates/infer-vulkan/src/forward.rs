@@ -718,7 +718,8 @@ impl<'a> DecodeResources<'a> {
 
     /// Zero the device-resident gated-delta + conv state for a fresh generation
     /// (mirrors [`Qwen35ForwardState::reset`] for the on-device path).
-    pub fn reset_linear_state(&mut self) -> Result<()> {
+    #[cfg_attr(not(test), allow(dead_code))] // driven via model reset_state used by on-box test
+    pub(crate) fn reset_linear_state(&mut self) -> Result<()> {
         let conv_len = self.lin_conv_state.len();
         let gdr_len = self.lin_gdr_state.len();
         zero_device_buffer(&mut self.lin_conv_state, conv_len)?;
@@ -729,7 +730,7 @@ impl<'a> DecodeResources<'a> {
     /// Rewind every descriptor-set ring's round-robin cursor. Called once at the
     /// start of each token so its dispatches reuse the rings from slot 0 (the
     /// prior token's submissions have all fence-completed).
-    pub fn reset_rings(&mut self) {
+    pub(crate) fn reset_rings(&mut self) {
         self.ring2.reset();
         self.ring3.reset();
         self.ring4.reset();
@@ -748,7 +749,8 @@ impl<'a> DecodeResources<'a> {
     /// Drain the accumulated GEMV timing as
     /// `(submit_secs, other_secs, gemv_count)` and reset the counters. `other`
     /// is the host-side prep + descriptor build + readback around the submit.
-    pub fn take_profile(&mut self) -> (f64, f64, u64) {
+    #[cfg_attr(not(test), allow(dead_code))] // drained through model take_decode_profile for on-box timing
+    pub(crate) fn take_profile(&mut self) -> (f64, f64, u64) {
         let s = self.gemv_submit_ns as f64 / 1e9;
         let o = self.gemv_other_ns as f64 / 1e9;
         let n = self.gemv_count;
@@ -1380,7 +1382,8 @@ static SUBMIT_DISPATCH_CAP: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 /// `--vulkan-submit-cap`, set once pre-load (values `> 0`).
-pub fn set_submit_cap(cap: usize) {
+#[allow(dead_code)] // knob wired pre-load; submit_dispatch_cap() reads it on the hot path
+pub(crate) fn set_submit_cap(cap: usize) {
     if cap > 0 {
         SUBMIT_DISPATCH_CAP.store(cap, std::sync::atomic::Ordering::Relaxed);
     }
