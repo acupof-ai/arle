@@ -34,8 +34,8 @@ use infer_seam::{BackendExecutor, KvPool};
 mod anthropic;
 mod coordinator;
 mod execution;
-mod grammar;
 mod gpu_nvml;
+mod grammar;
 mod metrics;
 pub mod multimodal;
 pub mod multiproc_relay;
@@ -309,13 +309,10 @@ impl ServeHandle {
         let loop_counters = Arc::clone(&counters);
         let observe_counters = Arc::clone(&counters);
         observe::spawn_observe_task(move |gpu| {
-            observe_counters
-                .lock()
-                .ok()
-                .map(|mut s| {
-                    s.gpu = gpu;
-                    s.clone()
-                })
+            observe_counters.lock().ok().map(|mut s| {
+                s.gpu = gpu;
+                s.clone()
+            })
         });
         let max_live_requests = executor.step_limits().max_live_requests.max(1);
         let join = thread::Builder::new()
@@ -365,13 +362,10 @@ impl ServeHandle {
         let loop_counters = Arc::clone(&counters);
         let observe_counters = Arc::clone(&counters);
         observe::spawn_observe_task(move |gpu| {
-            observe_counters
-                .lock()
-                .ok()
-                .map(|mut s| {
-                    s.gpu = gpu;
-                    s.clone()
-                })
+            observe_counters.lock().ok().map(|mut s| {
+                s.gpu = gpu;
+                s.clone()
+            })
         });
         let join = thread::Builder::new()
             .name("infer-engine".to_string())

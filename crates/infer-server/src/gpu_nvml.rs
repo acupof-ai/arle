@@ -61,8 +61,7 @@ mod ffi {
         // same pointer width), so transmute_copy's size assumption holds.
         unsafe {
             let ptr = dlsym(handle, cname.as_ptr());
-            (!ptr.is_null())
-                .then(|| std::mem::transmute_copy::<*mut c_void, T>(&ptr))
+            (!ptr.is_null()).then(|| std::mem::transmute_copy::<*mut c_void, T>(&ptr))
         }
     }
 
