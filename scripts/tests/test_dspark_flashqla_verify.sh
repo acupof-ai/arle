@@ -32,10 +32,12 @@ if [ "${1:-}" = serve ]; then
     echo "port=$port profile=${ARLE_CUDA_PROFILE:-0}" >> "$ARLE_DSV_SERVE_ENV_LOG"
   fi
   echo "[multiproc-coord] world_size=1; serving single-process (no workers)"
-  exec python3 - "$port" <<'PY'
-import sys, threading
+  FQOFF="${ARLE_DSV_MOCK_FQ_OFF:-0}"
+  exec env FQOFF="$FQOFF" python3 - "$port" <<'PY'
+import sys, threading, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 lock = threading.Lock(); drafted = 0; accepted = 0
+fqoff = os.environ.get("FQOFF", "0") == "1"
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _send(self, body, ctype="application/json"):
@@ -46,7 +48,7 @@ class H(BaseHTTPRequestHandler):
         if self.path.endswith("/v1/models"):
             self._send(b"{}"); return
         with lock:
-            fq = drafted // 100  # one gdr_fq op hit per processed request
+            fq = 0 if fqoff else drafted // 100  # one gdr_fq op hit per processed request
             body = (
                 '{"spec_decode":{"available":true,"drafted":%d,"accepted":%d},'
                 '"op_timing":{"ops":[{"name":"linear/gdr_fq","total_micros":12,"count":%d},'
@@ -153,7 +155,9 @@ fi
 nrows=$(tail -n +2 "$OUT1/results.tsv" | wc -l | tr -d ' ')
 [ "$nrows" = 12 ] || { echo "FAIL: expected 12 rows, got $nrows" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
 grep -qE '^base\t1\tgdr-path\tgdr_fq=[0-9]+ gdr_recurrent=0\tINFO\t' "$OUT1/results.tsv" \
-    || { echo "FAIL: default gdr-path INFO row wrong" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
+    || { echo "FAIL: base gdr-path must stay INFO (pre-change may route varlen)" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
+grep -qE '^treatment\t1\tgdr-path\tgdr_fq=[1-9][0-9]* gdr_recurrent=0 \(chunked route live\)\tPASS\t' "$OUT1/results.tsv" \
+    || { echo "FAIL: treatment must gate gdr_fq>0 PASS (chunked route live)" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
 grep -qE '^base\t1\tneedle\t.*\tPASS\t' "$OUT1/results.tsv" \
     || { echo "FAIL: base needle row not PASS" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
 grep -qE '^base\t1\tlaunch\tobserved workers=1 \(attn_tp=1\)\tPASS\t' "$OUT1/results.tsv" \
@@ -222,4 +226,29 @@ fi
 grep -qE '^base\t1\tgdr-path\tgdr_fq=[1-9][0-9]* .*\tFAIL\t' "$OUT4/results.tsv" \
     || { echo "FAIL: gdr-path enforcement row missing" >&2; cat "$OUT4/results.tsv" >&2; exit 1; }
 
-echo "test_dspark_flashqla_verify: PASS (clean exit0 + 12 rows + global c8=800, needle fail exit1, gpu SKIP, gdr-off enforced)"
+# ── Treatment never routes chunked: gdr_fq=0 in default mode must FAIL ──
+# A treatment binary that still reports zero linear/gdr_fq ops means the
+# every-TP chunked-routing change did not take effect; the batch must go red
+# rather than record the routing row as a harmless INFO.
+mkdir -p "$TMP/binfqoff"
+# The mock reads ARLE_DSV_MOCK_FQ_OFF itself; wrap it so only the treatment
+# binary sets it (base keeps the normal fq>0 mock).
+cat > "$TMP/bin/arle-fqoff" <<'SH2'
+#!/usr/bin/env bash
+export ARLE_DSV_MOCK_FQ_OFF=1
+exec "$(dirname "$0")/arle" "$@"
+SH2
+chmod +x "$TMP/bin/arle-fqoff"
+OUT5="$TMP/out-fqoff"
+: > "$ACCEPT_INVOC_LOG"
+# shellcheck disable=SC2046  # intentional KEY=VAL word-split
+if env $(common_env "$TMP/lever-ok.sh") ARLE_DSV_BIN_TREAT="$TMP/bin/arle-fqoff" \
+    bash "$ROOT/scripts/dspark_flashqla_verify.sh" deadbeef cafebabe "$OUT5" \
+    >"$TMP/fqoff.log" 2>&1; then
+    echo "FAIL: treatment with gdr_fq=0 in default mode must fail (routing never verified)" >&2
+    cat "$TMP/fqoff.log" >&2; exit 1
+fi
+grep -qE '^treatment\t1\tgdr-path\tgdr_fq=0 gdr_recurrent=0 \(treatment must show gdr_fq>0\)\tFAIL\t' "$OUT5/results.tsv" \
+    || { echo "FAIL: missing treatment gdr_fq=0 FAIL row" >&2; cat "$OUT5/results.tsv" >&2; exit 1; }
+
+echo "test_dspark_flashqla_verify: PASS (clean exit0 + 12 rows + global c8=800, needle fail exit1, gpu SKIP, gdr-off enforced, treatment gdr_fq=0 fails)"

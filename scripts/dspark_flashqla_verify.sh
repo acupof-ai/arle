@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# One-command runtime verification for the FlashQLA / DSpark batched-verify
-# series (#327/#329/S34): base SHA vs treatment SHA, on the pod, across
-# attn_tp 1/2/4/8 as free SM90 GPUs allow.
+# One-command runtime verification for the chunked-FlashQLA / DSpark
+# batched-verify series (routing every multi-row GDR advance through chunked
+# FlashQLA, plus the DSpark drafter ring gate): base SHA vs treatment SHA, on
+# the pod, across attn_tp 1/2/4/8 as free SM90 GPUs allow.
 #
 # For EACH arm and attn_tp it runs, on a Qwen3.8-27B-DSpark serve:
 #   (a) correctness: scripts/lever_gate.sh needle ladder x3 + concurrent arm,
@@ -9,16 +10,22 @@
 #   (b) matched TTFT / prefill tok/s A/B on long prompts (bench_throughput.py);
 #   (c) DSpark draft acceptance A/B at c=1 and c=8 (bench_dspark_accept.py,
 #       the existing /v1/stats accepted/drafted measurement; c=8 = eight
-#       concurrent clients). Reuses the #292 measurement, does not invent one.
+#       concurrent clients). Reuses the existing /v1/stats accepted/drafted
+#       measurement, does not invent one.
 #
 # Both SHAs are built --release (a bench-labelled pod-remote-run requires a
 # release build receipt) in detached git worktrees. A prereg row is opened and
 # closed per arm. Writes results.tsv / results.md. Exits non-zero on any
-# correctness (needle/lever) failure; TTFT and acceptance are recorded, not
-# gated — this batch MEASURES them.
+# correctness failure: needle/lever, launch-TP mismatch, and the GDR path. In
+# the default run the TREATMENT must show linear/gdr_fq>0 — the routing change
+# that makes every multi-row GDN advance take chunked FlashQLA at every
+# attn_tp must actually be live; with GDR_CHUNKED=0 every arm must show
+# gdr_fq=0. The base arm's default-mode path is recorded INFO (pre-change it
+# may legitimately run varlen). TTFT and acceptance are recorded, not gated —
+# this batch MEASURES them.
 #
-# Required env (model paths; no default invented — nothing is mounted at
-# /data00 on every box):
+# Required env (model paths; no default invented — the checkpoint mount is
+# not at a fixed location on every box):
 #   MODEL                trunk checkpoint dir (Qwen3.8-27B)
 #   DRAFT_MODEL          DSpark draft head dir (.../Qwen3.8-27B-DSpark)
 # Optional:
@@ -28,7 +35,7 @@
 #   BENCH_SECONDS        seconds per prefill cell (default 60)
 #   ACCEPT_REQUESTS      requests per acceptance client (default 30)
 #   EXTRA_SERVE_FLAGS    extra flags for every serve (both arms)
-#   GDR_CHUNKED=0        #300 fallback A/B: pass --qwen35-gdr-chunked false to
+#   GDR_CHUNKED=0        varlen-deletion fallback A/B: pass --qwen35-gdr-chunked false to
 #                        both arms and verify from /v1/stats that gdr_fq=0
 #
 # Test seams (shell test only):
@@ -72,7 +79,7 @@ if [ "${ARLE_DSV_SKIP_PREREG:-0}" != 1 ]; then
 fi
 # shellcheck disable=SC2206  # intentional word-split of caller passthrough
 EXTRA=( ${EXTRA_SERVE_FLAGS:-} )
-# #300 fallback A/B: GDR_CHUNKED=0 appends `--qwen35-gdr-chunked false` to BOTH
+# Varlen-deletion fallback A/B: GDR_CHUNKED=0 appends `--qwen35-gdr-chunked false` to BOTH
 # arms (cli/src/args.rs:829-830 — the only switch; there is no env var). The
 # effect is verified from a dedicated profile-enabled PROBE serve, never from
 # the measured serves.
@@ -324,6 +331,20 @@ PY
         else
             row "$arm" "$tp" gdr-path "$gdr_path (expected gdr_fq=0)" FAIL "$logdir/probe.log"
         fi
+    elif [ "$arm" = treatment ]; then
+        # Default mode verifies the every-TP chunked-routing change: the
+        # treatment must route the multi-row advance through chunked FlashQLA,
+        # so gdr_fq must be observed > 0. A treatment that prints gdr_fq=0
+        # silently did not change the route (wrong binary, dropped cubin,
+        # geometry rejected) and must FAIL — recording it as INFO would let
+        # the routing change pass unexercised. The base arm is not gated
+        # (pre-change it may legitimately run the varlen recurrent kernel).
+        local tfq="${gdr_path#gdr_fq=}"; tfq="${tfq%% *}"
+        if [ "$tfq" -gt 0 ] 2>/dev/null; then
+            row "$arm" "$tp" gdr-path "$gdr_path (chunked route live)" PASS "$logdir/probe.log"
+        else
+            row "$arm" "$tp" gdr-path "$gdr_path (treatment must show gdr_fq>0)" FAIL "$logdir/probe.log"
+        fi
     else
         row "$arm" "$tp" gdr-path "$gdr_path" INFO "$logdir/probe.log"
     fi
@@ -363,8 +384,9 @@ done
         echo "| $arm | $t | $phase | $metric | $st | $detail |"
     done
     echo
-    echo "Needle FAIL = correctness failure (exit 1). prefill/accept rows are"
-    echo "recorded measurements, not gates."
+    echo "needle/launch/gdr-path FAIL = correctness failure (exit 1). In the"
+    echo "default run treatment gdr_fq=0 is a FAIL; with GDR_CHUNKED=0 gdr_fq>0"
+    echo "is. prefill/accept rows are recorded measurements, not gates."
 } >"$MD"
 
 if [ "$CORRECT_FAIL" -eq 0 ]; then
