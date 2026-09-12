@@ -1,7 +1,10 @@
 # Omit unmeasured metrics from /metrics and /v1/stats — 2026-09-13
 
 > Status: Shipped, CPU-only unit gates. No device behavior involved; no pod
-> build. Closes three findings from the false-zero measurement audit.
+> build. Closes findings #1, #2, #5 from the false-zero measurement audit.
+>
+> Rule in one sentence: a surface publishes a number only when something
+> measured it.
 
 ## Context
 
@@ -17,7 +20,9 @@ as a confident number:
    so the two surfaces disagreed.
 3. The five copy/wait fields from
    `2026-09-12-omit-impossible-page-tier-copy-metrics` were omitted from
-   Prometheus but still serialized as `0` in the `/v1/stats` JSON.
+   Prometheus but still serialized as `0` in the `/v1/stats` JSON. (The audit
+   also named the observe JSONL surface; that was wrong — `StoredSample` never
+   carried the five fields, so the JSON path alone closed #5.)
 
 ## What changed
 
@@ -60,3 +65,15 @@ codebase's convention, which these fixes converge on rather than introduce:
   or hold the last good sample — never aggregate the empty set into a default
   struct and serve it, because a default gauge like `free_pages = 0` asserts an
   extreme and false state (full pool).
+
+## Remaining audit findings
+
+| # | Finding | Status |
+|---|---|---|
+| 3 | `reasoning_tokens` scan seeds `in_thinking` from the request intent flag, so marker-less output counts the whole completion as reasoning — a false non-zero, worse than a false zero. Details-object presence is a separate bug. | Written up separately; fix gated on a concrete-input demonstration. |
+| 4 | `ssd_recall.lookups`/`hits` are never written yet render under `available:true`. | Open product decision: wire or suppress. |
+| 6 | Prometheus `kv_system_host_demoted_pages` / `_disk_pages` hard-zero on backends with no page-tier view (HIP, Vulkan, OCR, CUDA placeholder) where CUDA carries live samples. | Open; needs a presence gate. |
+| 7 | Prometheus `kv_tier_resident_blocks` structurally pinned 0 on CUDA (capacity 0; CUDA parks whole slots) while slots are actively demoted. | Open; needs a presence gate. |
+| 8 | `kv_system_resident_pages` / `_resident_evictable_pages` default 0 in pools that do not override the trait methods (`infer-seam/src/kv_query.rs:18-29`); `VulkanKvPool` allocates pages but leaves the defaults. | Recorded, latent: Vulkan numeric forward fails loud today, no serving deployment. |
+| 9 | Observe JSONL `cpu_pct` / `disk_used_pct` fall back to 0.0 on a sampling failure (`observe.rs:26-33`), indistinguishable from idle; no availability flag. | Recorded; never triggers on the Linux hosts (CPUs and `/` always present). |
+| 10 | `arle doctor` turns an unparseable nvidia-smi memory row into `Cuda{0.0GB}` instead of `None` (`cli/hardware.rs:170`), so `min_memory_gb` checks pass. | Recorded; CLI status only, not serve HTTP. |
