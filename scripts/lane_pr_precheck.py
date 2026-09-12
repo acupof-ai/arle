@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Pre-PR rules for `scripts/lane.sh pr`, checked on the origin/main...HEAD diff.
+"""Content/marker gates, run in two places over one shared range computation.
+
+Two entry points:
+
+- `lane.sh pr` (default): all rules below against merge-base origin/main..HEAD,
+  including the three PR-BODY marker rules (BUILD/CUDA/CLIPPY_EXIT) that need a
+  PR body a push does not have.
+- the pre-push hook (`--push-content BASE..HEAD`): only the body-less CONTENT
+  rules (1,2,3,6,8 below), over the exact pushed range. This is what closes the
+  direct-to-main hole — a push to main has no PR and otherwise bypassed
+  everything except the checker's selftest.
+
+The content rules are 1 bench-entry, 2 comment refs, 3 abs paths, 6 gate
+registry, 8 dead docs shas. The marker rules are 4 build-exit, 5 cuda-check,
+7 clippy-exit.
 
 1. A commit touching crates/, scripts/bench_*/, or src/ has a
    "Bench-entry exemption" body line or the PR adds a
@@ -93,14 +107,38 @@ UPSTREAM_CUE = re.compile(
 )
 
 
+# Named abs-path exemptions, by exact path. The two ledgers are run-provenance
+# records whose purpose is to record where a run happened; the two scripts must
+# contain the path strings they print or test for. CHANGELOG prose is
+# deliberately absent: a ledger paragraph is exactly what this rule must catch.
+ABS_PATH_EXEMPT_FILES = frozenset(
+    {
+        "docs/agenda.jsonl",
+        "docs/experience/prereg.jsonl",
+        "scripts/lane.sh",
+        "scripts/check_repo_hygiene.py",
+    }
+)
+# comment-ref exempts upstream CI config (its comments cite upstream PR numbers).
+COMMENT_REF_EXEMPT_PREFIX = ".github/"
+# These four paths are the COMPLETE exemption set: the two ledgers exist to
+# record run locations, the two scripts must contain the strings they print or
+# test for. A fifth entry means the rule itself is wrong and should be
+# rethought — do not grow the whitelist.
+
+
 def git(args: list[str], cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-def added_lines(repo: Path, base: str) -> dict[str, list[str]]:
+def added_lines(repo: Path, base: str, head: str) -> dict[str, list[str]]:
+    # Explicit endpoints. `base..head` is the set of objects the caller is
+    # pushing or proposing; callers pass a base already resolved for their
+    # context (remote tip for a push, merge-base for a PR), so this is the one
+    # range computation both paths share.
     files: dict[str, list[str]] = {}
     current: str | None = None
-    for raw in git(["diff", "--unified=0", "--no-color", f"{base}...HEAD"], repo).splitlines():
+    for raw in git(["diff", "--unified=0", "--no-color", f"{base}..{head}"], repo).splitlines():
         if raw.startswith("+++ b/"):
             current = raw[6:]
         elif current and raw.startswith("+") and not raw.startswith("+++"):
@@ -108,11 +146,19 @@ def added_lines(repo: Path, base: str) -> dict[str, list[str]]:
     return files
 
 
-def check_bench_exemption(repo: Path, base: str, adds_experience: bool) -> list[str]:
+def changed_files(repo: Path, base: str, head: str) -> list[str]:
+    return [
+        p
+        for p in git(["diff", "--name-only", f"{base}..{head}"], repo).splitlines()
+        if p
+    ]
+
+
+def check_bench_exemption(repo: Path, base: str, head: str, adds_experience: bool) -> list[str]:
     if adds_experience:
         return []
     failures: list[str] = []
-    for commit in git(["rev-list", f"{base}..HEAD"], repo).split():
+    for commit in git(["rev-list", f"{base}..{head}"], repo).split():
         touched = git(["diff-tree", "--no-commit-id", "--name-only", "-r", commit], repo)
         if not any(RUNTIME_PATH.match(p) for p in touched.splitlines() if p):
             continue
@@ -129,6 +175,8 @@ def check_bench_exemption(repo: Path, base: str, adds_experience: bool) -> list[
 def check_comments(added: dict[str, list[str]]) -> list[str]:
     failures: list[str] = []
     for path, lines in added.items():
+        if path.startswith(COMMENT_REF_EXEMPT_PREFIX):
+            continue  # upstream CI config legitimately cites upstream PR numbers
         if DATED_EXPERIENCE.match(path):
             continue
         if SLASH_FILES.search(path):
@@ -150,6 +198,8 @@ def check_comments(added: dict[str, list[str]]) -> list[str]:
 def check_abs_paths(added: dict[str, list[str]]) -> list[str]:
     failures = []
     for path, lines in added.items():
+        if path in ABS_PATH_EXEMPT_FILES:
+            continue  # named run-provenance / machinery files; see set comment
         shell = bool(SHELL_PATH.search(path))
         for n, line in enumerate(lines, 1):
             for m in ABS_PATH.finditer(line):
@@ -166,10 +216,6 @@ def check_abs_paths(added: dict[str, list[str]]) -> list[str]:
                     f"abs-path: {path}:{n} adds a machine-local absolute path"
                 )
     return failures
-
-
-def changed_files(repo: Path, base: str) -> list[str]:
-    return [p for p in git(["diff", "--name-only", f"{base}...HEAD"], repo).splitlines() if p]
 
 
 def crate_has_no_cuda(repo: Path, crate: str) -> bool:
@@ -290,19 +336,42 @@ def check_gate_registry(repo: Path, changed: list[str]) -> list[str]:
     return failures
 
 
-def run(repo: Path, pr_body: str) -> list[str]:
-    base = git(["merge-base", "origin/main", "HEAD"], repo).strip()
-    added = added_lines(repo, base)
-    changed = changed_files(repo, base)
-    failures = check_bench_exemption(repo, base, any(EXPERIENCE_ENTRY.match(p) for p in added))
+def run_content(repo: Path, base: str, head: str) -> list[str]:
+    """The body-less content rules, run over an explicit range.
+
+    Shared by the PR path (base = merge-base with main, head = HEAD) and the
+    pre-push hook (base = remote tip, head = pushed tip). These rules need no PR
+    body, so they are the ones that can and must also gate a direct-to-main
+    push. The three body-marker rules (build/cuda/clippy) are PR-only and live
+    in `run_pr`, because a push has no body to carry the marker.
+    """
+    added = added_lines(repo, base, head)
+    changed = changed_files(repo, base, head)
+    failures = check_bench_exemption(
+        repo, base, head, any(EXPERIENCE_ENTRY.match(p) for p in added)
+    )
     failures += check_comments(added)
     failures += check_abs_paths(added)
-    failures += check_build_exit(added, pr_body)
-    failures += check_cuda_check_exit(repo, changed, pr_body)
-    failures += check_clippy_exit(repo, changed, pr_body)
     failures += check_gate_registry(repo, changed)
     failures += check_doc_dead_sha(repo, added, base)
     return failures
+
+
+def run_pr(repo: Path, pr_body: str) -> list[str]:
+    """PR-time check: all content rules plus the three PR-body marker rules."""
+    base = git(["merge-base", "origin/main", "HEAD"], repo).strip()
+    added = added_lines(repo, base, "HEAD")
+    changed = changed_files(repo, base, "HEAD")
+    failures = run_content(repo, base, "HEAD")
+    failures += check_build_exit(added, pr_body)
+    failures += check_cuda_check_exit(repo, changed, pr_body)
+    failures += check_clippy_exit(repo, changed, pr_body)
+    return failures
+
+
+def run_push(repo: Path, base: str, head: str) -> list[str]:
+    """Pre-push content gate over the exact bytes being pushed."""
+    return run_content(repo, base, head)
 
 
 # --- selftest: one clean world, one broken fixture per rule ----------------
@@ -504,7 +573,7 @@ def selftest() -> int:
     for name, files, body, pr_body, expected in cases:
         root = world(files, body)
         try:
-            got = run(root, pr_body)
+            got = run_pr(root, pr_body)
         except Exception as exc:  # a crash is a selftest failure
             got = [f"checker raised {exc!r}"]
         shutil.rmtree(root, ignore_errors=True)
@@ -536,7 +605,7 @@ def selftest() -> int:
         (root / "docs").mkdir(parents=True)
         (root / "docs" / "note.md").write_text(f"Depends on `{lane_sha}` (lane-only).\n")
         g("add", "docs/note.md"); g("commit", "-q", "-m", "doc cites lane sha")
-        got = run(root, "")
+        got = run_pr(root, "")
         hit = next((f for f in got if f.startswith("dead-sha:")), None)
         name = "dead-sha branch-only commit fails"
         if hit:
@@ -561,23 +630,40 @@ def main() -> int:
     ap.add_argument("--repo", default=".")
     ap.add_argument("--pr-body")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument(
+        "--push-content",
+        metavar="BASE..HEAD",
+        help=(
+            "Run only the body-less content rules over an explicit pushed range "
+            "(the pre-push hook uses this with remote-tip..pushed-tip)."
+        ),
+    )
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
 
-    pr_body = os.environ.get("ARLE_PR_BODY", "")
-    if args.pr_body:
-        pr_body = Path(args.pr_body).read_text()
-    elif not sys.stdin.isatty():
-        pr_body = sys.stdin.read()
+    if args.push_content:
+        if ".." not in args.push_content:
+            print("push-content expects BASE..HEAD", file=sys.stderr)
+            return 2
+        base, head = args.push_content.split("..", 1)
+        failures = run_push(Path(args.repo).resolve(), base, head)
+        label = "push-content"
+    else:
+        pr_body = os.environ.get("ARLE_PR_BODY", "")
+        if args.pr_body:
+            pr_body = Path(args.pr_body).read_text()
+        elif not sys.stdin.isatty():
+            pr_body = sys.stdin.read()
+        failures = run_pr(Path(args.repo).resolve(), pr_body)
+        label = "lane-precheck"
 
-    failures = run(Path(args.repo).resolve(), pr_body)
     if failures:
-        print("[lane-precheck] FAIL — refusing PR:")
+        print(f"[{label}] FAIL — refusing:")
         print("\n".join(f"- {f}" for f in failures))
         return 1
-    print("[lane-precheck] OK")
+    print(f"[{label}] OK")
     return 0
 
 
