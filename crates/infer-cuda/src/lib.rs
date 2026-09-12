@@ -650,7 +650,6 @@ impl BackendExecutor for CudaExecutor {
             artifact: infer_seam::BackendArtifactIdentity {
                 kernel_bundle_id: cuda_kernels::KERNEL_BUILD_ID.to_string(),
             },
-            gpu: None,
         }
     }
 

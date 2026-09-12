@@ -284,15 +284,15 @@ pub struct WireStats {
     pub operator_dispatch: infer_seam::OperatorDispatchStats,
     #[serde(default)]
     pub op_timing: infer_seam::OpTimingStats,
-    #[serde(default)]
-    pub gpu: Option<infer_seam::GpuSample>,
 }
 
 impl WireStats {
     /// Reconstruct the per-tick counters; request-boundary operator stats remain
     /// in the wire payload for `/v1/stats` only.
     pub(crate) fn into_counter_snapshot(self) -> crate::CounterSnapshot {
+        // GPU telemetry is sampled node-side by the observe task, not relayed.
         crate::CounterSnapshot {
+            gpu: None,
             active_requests: self.active_requests,
             queue_depth: self.queue_depth,
             kv_free_pages: self.kv_free_pages,
@@ -381,7 +381,6 @@ impl WireStats {
                 partial_ctx_chains: self.spec_partial_ctx_chains,
             },
             op_timing: self.op_timing,
-            gpu: self.gpu,
         }
     }
 
@@ -475,7 +474,6 @@ impl WireStats {
             spec_partial_ctx_chains: c.spec_decode.partial_ctx_chains,
             operator_dispatch,
             op_timing: c.op_timing.clone(),
-            gpu: c.gpu,
         }
     }
 }
@@ -631,9 +629,6 @@ fn merge_wire_stats_dp(acc: &mut WireStats, other: WireStats) {
         } else {
             acc.op_timing.ops.push(entry);
         }
-    }
-    if acc.gpu.is_none() {
-        acc.gpu = other.gpu;
     }
 }
 
@@ -1468,7 +1463,6 @@ mod tests {
             prefix_hits: 50,
             kv_system_disk_pages: 10,
             spec_accepted: 5,
-            gpu: Some(infer_seam::GpuSample::default()),
             ..Default::default()
         };
         let g1 = WireStats {
@@ -1488,7 +1482,6 @@ mod tests {
         assert_eq!(agg.kv_system_disk_pages, 14);
         assert_eq!(agg.spec_accepted, 8);
         assert_eq!(agg.build_identity.product_binary_sha256, "abc");
-        assert!(agg.gpu.is_some());
     }
 
     #[test]

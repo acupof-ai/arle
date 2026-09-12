@@ -326,9 +326,6 @@ pub struct BackendStats {
     pub op_timing: OpTimingStats,
     /// Exact backend build-artifact identity, if the build verified one.
     pub artifact: BackendArtifactIdentity,
-    /// GPU utilization/VRAM/temp/power from the backend's background sampler.
-    /// `None` for backends without one (Metal, placeholder, non-zero TP rank).
-    pub gpu: Option<GpuSample>,
 }
 
 /// Host-only engine-core to backend-executor seam: the core submit/poll loop,

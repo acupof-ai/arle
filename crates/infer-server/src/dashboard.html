@@ -73,6 +73,15 @@ h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8
 .card-title { color: var(--ink-2); font-size: 13px; }
 .card-now { font-size: 15px; font-weight: 600; white-space: nowrap; }
 .card svg { display: block; width: 100%; height: auto; }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 2px 2px 6px;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.legend-item i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 .card-body.empty {
   display: flex;
   align-items: center;
@@ -115,13 +124,18 @@ const tooltip = document.getElementById('tooltip');
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const W = 640, H = 210, ML = 42, MR = 10, MT = 18, MB = 22;
 
-const gpu0 = s => (s.gpu && s.gpu.devices && s.gpu.devices[0]) || null;
+const gpuDevice = (s, i) =>
+  (s.gpu && s.gpu.devices && i < (s.gpu.device_count || 0) && s.gpu.devices[i]) || null;
+
+// Distinct hues for up to 8 devices; device index maps to a fixed color.
+const GPU_COLORS = ['#4f9cff', '#ff7a59', '#35c46b', '#c77dff',
+  '#ffd166', '#ff5d8f', '#21c7c7', '#a3a380'];
 
 const CHARTS = [
   { id: 'gpu-util', title: 'GPU utilization', unit: '%', yMax: 100,
-    f: s => { const d = gpu0(s); return d ? d.util_pct : null; } },
+    gpu: d => d.util_pct, agg: a => Math.round(a.reduce((x, y) => x + y, 0) / a.length) },
   { id: 'vram', title: 'VRAM used', unit: 'GB',
-    f: s => { const d = gpu0(s); return d ? d.memory_used_mb / 1024 : null; } },
+    gpu: d => d.memory_used_mb / 1024, agg: a => Math.round(a.reduce((x, y) => x + y, 0) * 10) / 10 },
   { id: 'cpu', title: 'CPU utilization', unit: '%', yMax: 100, f: s => s.cpu_pct },
   { id: 'ram', title: 'RAM used', unit: 'GB',
     f: s => s.ram_used_mb == null ? null : s.ram_used_mb / 1024 },
@@ -190,12 +204,36 @@ function el(name, attrs) {
   return e;
 }
 
+function gpuSeries(samples, pick) {
+  const nDev = samples.reduce((m, s) => Math.max(m, s.gpu ? s.gpu.device_count || 0 : 0), 0);
+  const series = [];
+  for (let i = 0; i < nDev; i++) {
+    const pts = mapSeries(samples, s => { const d = gpuDevice(s, i); return d ? pick(d) : null; });
+    if (pts.length) series.push({ label: 'GPU' + i, color: GPU_COLORS[i % GPU_COLORS.length], pts });
+  }
+  return series;
+}
+
+function chartSeries(cfg, samples) {
+  if (cfg.gpu) {
+    const series = gpuSeries(samples, cfg.gpu);
+    if (series.length > 1) return series;
+    if (series.length === 1) {
+      // Single device: keep the original aggregate card semantics.
+      return [{ label: '', color: null, pts: series[0].pts }];
+    }
+    return [];
+  }
+  const pts = cfg.rate ? rateSeries(samples, cfg.rate) : mapSeries(samples, cfg.f);
+  return pts.length ? [{ label: '', color: null, pts }] : [];
+}
+
 function renderChart(card, cfg, samples) {
   const head = card.querySelector('.card-head');
   const body = card.querySelector('.card-body');
   const now = card.querySelector('.card-now');
-  const pts = cfg.rate ? rateSeries(samples, cfg.rate) : mapSeries(samples, cfg.f);
-  if (!pts.length) {
+  const series = chartSeries(cfg, samples);
+  if (!series.length) {
     head.style.display = 'none';
     body.className = 'card-body empty';
     body.textContent = 'No data in range';
@@ -203,15 +241,24 @@ function renderChart(card, cfg, samples) {
   }
   head.style.display = '';
   body.className = 'card-body';
-  now.textContent = fmtV(pts[pts.length - 1].v, cfg.unit);
+  body.textContent = '';
+  const lastVals = series.map(sz => sz.pts[sz.pts.length - 1].v);
+  const single = series.length === 1;
+  now.textContent = single
+    ? fmtV(lastVals[0], cfg.unit)
+    : fmtV(cfg.agg(lastVals), cfg.unit) + ' avg';
 
+  // Union timeline across series (a device may be missing on some ticks).
+  const pts = [...new Set(series.flatMap(sz => sz.pts.map(p => p.t)))]
+    .sort((a, b) => a - b)
+    .map(t => ({ t, v: 0 }));
   const n = pts.length;
   let vmax, step;
   if (cfg.yMax != null) {
     vmax = cfg.yMax;
     step = vmax / 4;
   } else {
-    let m = Math.max.apply(null, pts.map(p => p.v));
+    let m = Math.max.apply(null, series.flatMap(sz => sz.pts.map(p => p.v)));
     if (!(m > 0)) m = 1;
     step = niceStep(m / 4);
     vmax = step * Math.ceil(m / step);
@@ -219,6 +266,8 @@ function renderChart(card, cfg, samples) {
 
   const xAt = i => ML + (n === 1 ? (W - ML - MR) / 2 : (i * (W - ML - MR)) / (n - 1));
   const yAt = v => MT + (1 - v / vmax) * (H - MT - MB);
+  // Timeline comes from the longest series; map every point to it by time.
+  const idxByTime = new Map(pts.map((p, i) => [p.t, i]));
 
   const svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img' });
 
@@ -244,25 +293,48 @@ function renderChart(card, cfg, samples) {
   u.textContent = cfg.unit;
   svg.appendChild(u);
 
-  let d = '';
-  for (let i = 0; i < n; i++) {
-    d += (i ? 'L' : 'M') + xAt(i).toFixed(1) + ' ' + yAt(pts[i].v).toFixed(1);
+  for (const sz of series) {
+    const stroke = sz.color || 'var(--series)';
+    let d = '';
+    for (let i = 0; i < sz.pts.length; i++) {
+      const gi = idxByTime.get(sz.pts[i].t);
+      d += (i ? 'L' : 'M') + xAt(gi).toFixed(1) + ' ' + yAt(sz.pts[i].v).toFixed(1);
+    }
+    if (single) {
+      const dArea = d + 'L' + xAt(n - 1).toFixed(1) + ' ' + yAt(0).toFixed(1) +
+        'L' + xAt(0).toFixed(1) + ' ' + yAt(0).toFixed(1) + 'Z';
+      svg.appendChild(el('path', { d: dArea, fill: 'var(--series)', 'fill-opacity': 0.1 }));
+    }
+    svg.appendChild(el('path', { d, fill: 'none', stroke,
+      'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
   }
-  const dArea = d + 'L' + xAt(n - 1).toFixed(1) + ' ' + yAt(0).toFixed(1) +
-    'L' + xAt(0).toFixed(1) + ' ' + yAt(0).toFixed(1) + 'Z';
-  svg.appendChild(el('path', { d: dArea, fill: 'var(--series)', 'fill-opacity': 0.1 }));
-  svg.appendChild(el('path', { d: d, fill: 'none', stroke: 'var(--series)',
-    'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+  if (single) {
+    const lp = series[0].pts[series[0].pts.length - 1];
+    const ex = xAt(idxByTime.get(lp.t)), ey = yAt(lp.v);
+    svg.appendChild(el('circle', { cx: ex, cy: ey, r: 4.5,
+      fill: 'var(--series)', stroke: 'var(--surface)', 'stroke-width': 2 }));
+  }
 
-  const ex = xAt(n - 1), ey = yAt(pts[n - 1].v);
-  svg.appendChild(el('circle', { cx: ex, cy: ey, r: 4.5,
-    fill: 'var(--series)', stroke: 'var(--surface)', 'stroke-width': 2 }));
+  if (!single) {
+    const legend = document.createElement('div');
+    legend.className = 'legend';
+    for (const sz of series) {
+      const item = document.createElement('span');
+      item.className = 'legend-item';
+      item.innerHTML = '<i style="background:' + sz.color + '"></i>' + sz.label;
+      legend.appendChild(item);
+    }
+    body.appendChild(legend);
+  }
 
   const hoverLine = el('line', { y1: MT, y2: H - MB, stroke: 'var(--axis)', 'stroke-width': 1, visibility: 'hidden' });
-  const hoverDot = el('circle', { r: 4.5, fill: 'var(--series)',
-    stroke: 'var(--surface)', 'stroke-width': 2, visibility: 'hidden' });
   svg.appendChild(hoverLine);
-  svg.appendChild(hoverDot);
+  const hoverDots = series.map(sz => {
+    const c = el('circle', { r: 4, fill: sz.color || 'var(--series)',
+      stroke: 'var(--surface)', 'stroke-width': 1.5, visibility: 'hidden' });
+    svg.appendChild(c);
+    return c;
+  });
 
   svg.addEventListener('mousemove', e => {
     const r = svg.getBoundingClientRect();
@@ -272,28 +344,37 @@ function renderChart(card, cfg, samples) {
       const dd = Math.abs(xAt(i) - mx);
       if (dd < bd) { bd = dd; bi = i; }
     }
-    const px = xAt(bi), py = yAt(pts[bi].v);
-    hoverLine.setAttribute('x1', px);
-    hoverLine.setAttribute('x2', px);
+    const t = pts[bi].t;
+    hoverLine.setAttribute('x1', xAt(bi));
+    hoverLine.setAttribute('x2', xAt(bi));
     hoverLine.setAttribute('visibility', 'visible');
-    hoverDot.setAttribute('cx', px);
-    hoverDot.setAttribute('cy', py);
-    hoverDot.setAttribute('visibility', 'visible');
-    tooltip.innerHTML = hhmm(pts[bi].t) + ' &nbsp;<b>' + fmtV(pts[bi].v, cfg.unit) + '</b>';
+    let html = hhmm(t);
+    series.forEach((sz, si) => {
+      const p = sz.pts.find(p => p.t === t);
+      if (p != null) {
+        html += ' &nbsp;<b style="color:' + (sz.color || 'var(--series)') + '">' +
+          (sz.label ? sz.label + ' ' : '') + fmtV(p.v, cfg.unit) + '</b>';
+        hoverDots[si].setAttribute('cx', xAt(bi));
+        hoverDots[si].setAttribute('cy', yAt(p.v));
+        hoverDots[si].setAttribute('visibility', 'visible');
+      } else {
+        hoverDots[si].setAttribute('visibility', 'hidden');
+      }
+    });
+    tooltip.innerHTML = html;
     tooltip.hidden = false;
     let tx = e.clientX + 14;
     const ty = e.clientY - 12;
-    if (tx + 140 > window.innerWidth) tx = e.clientX - 150;
+    if (tx + 200 > window.innerWidth) tx = e.clientX - 210;
     tooltip.style.left = tx + 'px';
     tooltip.style.top = ty + 'px';
   });
   svg.addEventListener('mouseleave', () => {
     tooltip.hidden = true;
     hoverLine.setAttribute('visibility', 'hidden');
-    hoverDot.setAttribute('visibility', 'hidden');
+    hoverDots.forEach(c => c.setAttribute('visibility', 'hidden'));
   });
 
-  body.innerHTML = '';
   body.appendChild(svg);
 }
 

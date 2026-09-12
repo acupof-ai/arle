@@ -35,6 +35,7 @@ mod anthropic;
 mod coordinator;
 mod execution;
 mod grammar;
+mod gpu_nvml;
 mod metrics;
 pub mod multimodal;
 pub mod multiproc_relay;
@@ -307,7 +308,15 @@ impl ServeHandle {
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
         let observe_counters = Arc::clone(&counters);
-        observe::spawn_observe_task(move || observe_counters.lock().ok().map(|s| s.clone()));
+        observe::spawn_observe_task(move |gpu| {
+            observe_counters
+                .lock()
+                .ok()
+                .map(|mut s| {
+                    s.gpu = gpu;
+                    s.clone()
+                })
+        });
         let max_live_requests = executor.step_limits().max_live_requests.max(1);
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
@@ -355,7 +364,15 @@ impl ServeHandle {
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
         let observe_counters = Arc::clone(&counters);
-        observe::spawn_observe_task(move || observe_counters.lock().ok().map(|s| s.clone()));
+        observe::spawn_observe_task(move |gpu| {
+            observe_counters
+                .lock()
+                .ok()
+                .map(|mut s| {
+                    s.gpu = gpu;
+                    s.clone()
+                })
+        });
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
             .spawn(move || match builder() {
