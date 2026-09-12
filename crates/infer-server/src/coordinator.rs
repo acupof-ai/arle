@@ -454,10 +454,18 @@ fn think_budget_for_effort(effort: &str) -> Option<usize> {
     }
 }
 
-/// Count reasoning tokens in a generated token stream. The chat template
-/// pre-fills `<think>` into the prompt, so thinking starts immediately
-/// (`start_in_thinking = true` when thinking is on). Think start/end tokens
-/// themselves are not counted — matches the engine's `update_think_state`.
+/// Whether generation begins inside a think block the prompt already opened.
+/// The intent flag is not evidence: a template may ignore `enable_thinking`
+/// and render no marker, while `prompt_prefills_think` may force one on. The
+/// rendered prompt's tail token is the truth.
+fn reasoning_seed(prompt_tokens: &[u32], think_ids: Option<(u32, u32)>) -> bool {
+    matches!(think_ids.zip(prompt_tokens.last()), Some(((start, _), last)) if *last == start)
+}
+
+/// Count reasoning tokens in a generated token stream. When the rendered prompt
+/// ended with the think-start token, the block is already open; otherwise
+/// counting waits for a start marker in the stream, so marker-less content is
+/// not billed as reasoning. Start/end tokens themselves are not counted.
 fn count_reasoning_tokens(
     tokens: &[u32],
     think_ids: Option<(u32, u32)>,
@@ -1461,6 +1469,7 @@ async fn chat_completions(
             let prompt = crate::multimodal::expand_image_markers(&prompt, &images, Some(kind))?;
             let prompt_tokens = encode(&state, &prompt)?;
             let prompt_token_count = prompt_tokens.len();
+            let think_open = reasoning_seed(&prompt_tokens, state.think_token_ids);
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             state
                 .multimodal_tx
@@ -1485,7 +1494,7 @@ async fn chat_completions(
             let (content, tool_calls, split_thinking) =
                 finalize_chat_content(decoded, tools_active, thinking);
             let reasoning_tokens =
-                count_reasoning_tokens(&delta.token_ids, state.think_token_ids, thinking);
+                count_reasoning_tokens(&delta.token_ids, state.think_token_ids, think_open);
             return Ok(Json(ChatCompletionResponse::from_parts(
                 state.model.clone(),
                 content,
@@ -1517,6 +1526,7 @@ async fn chat_completions(
     };
     let prompt_tokens = encode(&state, &prompt)?;
     let thinking = thinking || prompt_prefills_think(&prompt);
+    let think_open = reasoning_seed(&prompt_tokens, state.think_token_ids);
 
     if stream {
         let prompt_len = prompt_tokens.len();
@@ -1539,7 +1549,10 @@ async fn chat_completions(
             let _guard = guard;
             let mut completion_count = 0usize;
             let mut reasoning_count = 0usize;
-            let mut in_thinking = thinking;
+            // Counting seeds on the rendered prompt's tail marker, not on the
+            // intent flag: the pipeline below still uses `thinking` for text
+            // splitting.
+            let mut in_thinking = think_open;
             // Converged reasoning-then-tools pipeline (shared with /v1/messages).
             let mut pipeline = StreamPipeline::new(thinking, tools_active);
             let mut completed_calls: Vec<chat::ToolCall> = Vec::new();
@@ -1744,8 +1757,11 @@ async fn chat_completions(
             total_completion_tokens += outcome.generated_tokens.len();
             total_cached_prompt_tokens =
                 combine_choice_cached(total_cached_prompt_tokens, outcome.cached_prompt_tokens);
-            total_reasoning_tokens +=
-                count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, thinking);
+            total_reasoning_tokens += count_reasoning_tokens(
+                &outcome.generated_tokens,
+                state.think_token_ids,
+                think_open,
+            );
             let decoded = decode(&state, &outcome.generated_tokens)?;
             let decoded = request.stop.as_deref().map_or_else(
                 || decoded.clone(),
@@ -1833,7 +1849,7 @@ async fn chat_completions(
         None
     };
     let reasoning_tokens =
-        count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, thinking);
+        count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, think_open);
     Ok(Json(ChatCompletionResponse::from_parts(
         state.model.clone(),
         content,
@@ -1929,6 +1945,7 @@ async fn anthropic_messages(
         .map_err(|err| MessagesError::invalid_request(err.to_string()))?;
     request.validate()?;
     let (chat_request, thinking, tools_active, prompt_tokens) = anthropic_prompt(&state, &request)?;
+    let think_open = reasoning_seed(&prompt_tokens, state.think_token_ids);
     let mut sampling = chat_request.sampling_params();
     // Convert string `stop` sequences to token ids (engine only supports
     // token-id stops). Try as-is and with leading space/newline.
@@ -2116,7 +2133,7 @@ async fn anthropic_messages(
         .map(|(index, call)| ResponseToolCall::from_parsed(call, index))
         .collect();
     let reasoning_tokens =
-        count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, thinking);
+        count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, think_open);
     let chat = ChatCompletionResponse::from_parts(
         model,
         content,
@@ -2362,5 +2379,94 @@ mod choice_cached_tests {
         // If choices genuinely disagree, max keeps the largest real value
         // rather than averaging them away.
         assert_eq!(combine_choice_cached(Some(100), Some(60)), Some(100));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_marker_scan_tests {
+    use super::{count_reasoning_tokens, reasoning_seed};
+    use crate::OpenAiTokenizer;
+
+    const IMDS: (u32, u32) = (100, 101);
+
+    #[test]
+    fn markerless_prompt_and_output_count_zero_under_intent_on() {
+        // thinking intent is on (budget or enable_thinking kwarg) but the
+        // rendered prompt carries no trailing start id and the model emits no
+        // marker: every token is content, reasoning must be 0.
+        let prompt: Vec<u32> = vec![1, 2, 3];
+        let answer: Vec<u32> = vec![500, 501, 502, 503, 504, 505, 506, 507, 508, 509];
+        assert!(!reasoning_seed(&prompt, Some(IMDS)));
+        assert_eq!(
+            count_reasoning_tokens(&answer, Some(IMDS), reasoning_seed(&prompt, Some(IMDS))),
+            0
+        );
+    }
+
+    #[test]
+    fn prompt_prefilled_start_counts_the_block_only() {
+        // Prompt ends with the start id (template prefills an open block): the
+        // block tokens count, the end marker closes it, later content does not.
+        let prompt: Vec<u32> = vec![1, 2, IMDS.0];
+        assert!(reasoning_seed(&prompt, Some(IMDS)));
+        let output = vec![900, 901, IMDS.1, 902];
+        assert_eq!(
+            count_reasoning_tokens(&output, Some(IMDS), reasoning_seed(&prompt, Some(IMDS))),
+            2
+        );
+    }
+
+    #[test]
+    fn marker_opened_in_stream_counts_neither_prefix_nor_suffix() {
+        // No prefill, model emits a start marker itself: tokens before the
+        // marker are content, only the block interior counts.
+        let prompt: Vec<u32> = vec![1, 2, 3];
+        let output = vec![42, 43, IMDS.0, 900, 901, IMDS.1, 902];
+        assert_eq!(
+            count_reasoning_tokens(&output, Some(IMDS), reasoning_seed(&prompt, Some(IMDS))),
+            2
+        );
+    }
+
+    #[test]
+    fn no_think_ids_in_vocab_counts_zero() {
+        let answer = vec![500, 501, 502];
+        assert_eq!(count_reasoning_tokens(&answer, None, true), 0);
+    }
+
+    #[test]
+    fn chatml_fixture_prompt_does_not_seed_and_answer_counts_zero() {
+        // End-to-end with the checked-in Qwen3.5 tokenizer: a non-thinking
+        // checkpoint renders ChatML with no trailing start marker, carries the
+        // think ids in vocab, and an ordinary answer tokenizes without markers.
+        // The old flag-seeded scan billed all six answer tokens as reasoning.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/Qwen3.5-0.8B-runtime");
+        let Ok(tok) = OpenAiTokenizer::from_model_dir(&path) else {
+            return; // no tokenizer fixture in CI
+        };
+        if tok.defaults_thinking_on() {
+            return; // prefill checkpoint, not the ChatML case
+        }
+        let ids = tok.think_token_ids().expect("Qwen vocab carries think ids");
+        let prompt = tok
+            .render_chat(&[serde_json::from_str::<crate::ChatMessage>(
+                r#"{"role":"user","content":"hi"}"#,
+            )
+            .unwrap()])
+            .expect("render");
+        assert!(!prompt.trim_end().ends_with("<think>"), "{prompt}");
+        let prompt_tokens = tok.encode(&prompt).expect("encode prompt");
+        let answer = tok.encode("The sky is blue today.").unwrap_or_default();
+        assert_eq!(answer.len(), 6);
+        assert!(!answer.contains(&ids.0) && !answer.contains(&ids.1));
+        assert_eq!(
+            count_reasoning_tokens(
+                &answer,
+                Some(ids),
+                reasoning_seed(&prompt_tokens, Some(ids))
+            ),
+            0
+        );
     }
 }
