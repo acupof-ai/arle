@@ -127,8 +127,12 @@ Floor at 4.0 TB/s: **7.3 ms**. Real stacks land at 35–65% of peak → 11–21 
 
 The constant term is measured, not extrapolated: a 66-token prompt, no spec,
 c=1, on today's binary gives **37.60 tok/s = 26.6 ms/token** (6 trials, spread
-0.6%) — against `baselines.md`'s row of 38.62 tok/s at 128 tokens,
-i.e. inside the ±3% drift band. **Short-context decode has not regressed.**
+0.6%) — it was compared against a baselines.md row of 38.62 tok/s at 128 tokens
+and called inside the ±3% drift band, but **that 38.62 row is unresolvable
+against the current baselines.md (no such figure survives; the cited row was
+removed or rewritten), so the drift-band comparison has no source today.** The
+37.60 measurement itself stands; **Short-context decode has not regressed**
+rested on the missing comparison and is unconfirmed by this document.
 Splitting the 32k measurement against that anchor:
 
 | | bytes | time | effective | % peak |

@@ -554,12 +554,30 @@ workload before ranking.
 those acceptance figures are a few-dozen-chain sample, not an indicator. The
 c=8/16 points are plain decode.
 
+> **STALE at c=8/16 — do not quote those columns as current decode.** Three
+> multi-GPU default flips landed after this row: TP decode graph (2026-08-22),
+> TP batched decode (2026-08-23, `CHANGELOG.md`, wins
+> `2026-08-23-tp-batched-decode.md` — the rows>1 per-row forward this row's
+> c=8/16 ran through is gone), and FlashQLA chunked GDN at attn_tp=8
+> (2026-09-11, #329). The c=1 point also predates the batched spec-verify GDR
+> reroute (#292, 2026-09-10) and the TP8 chunked kernel, both pending a GPU
+> A/B. Successor run is pending-remote queue P15 (8-card DSpark re-measure
+> on the 32K agent fingerprint), which runs after the P3 verify grid proves
+> chunked routing at tp=8; not a number in this file. The binary SHA above
+> still reproduces this exact row; what is stale is the shipped-default
+> configuration.
+
 Rule 3 re-anchor, not a regression against `868043f5f` (2026-08-10). That row
 predates which added `ignore_eos=true`: its points average
 120.7 / 110.1 / 113.5 completion tokens per request, so its requests stopped at
 EOS, while every request here emits exactly 128. Forcing generation past EOS is
 where the drafter agrees least, which moves acceptance 58.7% → 50.4% at an
 unchanged chain rate (16.5 chains/s).
+
+> The runtime-commit shas cited in this DSv4 section (the one in the
+> paragraph above, and the c=1-graph row's) are unreachable rebased objects
+> as of 2026-09-12. The binary SHA-256 in each affected row is the
+> verifiable anchor; treat the commit-sha lines as historical labels.
 
 Correctness: needle ladder 512/4096/16384 ×3 passed 9/9 exact (NONDET at
 4096/16384 is MoE routing). The c=16 point flags 7/241 responses, all from the
@@ -620,6 +638,8 @@ Identity:
 
 - Runtime commit `1c56ca0dd`, build `c1-graph-v26` (headline A/B); the
  c=8/16 and FP8 rows below are from / `c1-graph-v24b`
+- That runtime-commit sha is an unreachable rebased object (2026-09-12
+ check); cite the build tag and the wins entry below, not the sha.
 - Models `/data00/DeepSeek-V4-Flash-0731` (NVFP4 experts) and `-FP8`
 - GPU: 4×H20 (sm_90), TP=4, 4 slots/rank, BF16 KV, `--comm-backend nccl`
 - Workload `bench-agent-32k-16x8.jsonl`, prompt p50 28568 tok, max_tokens 256
@@ -653,6 +673,13 @@ through concurrent Marlin and Markov-head work.
 Correctness: MMLU 5-shot, 200 samples, greedy — 171/200 in both arms, 0
 per-item diffs. DSpark control (`--spec-type dspark`): ITL p50 65.8 (off) vs
 66.4 ms (on) with 0 graph captures in either arm.
+
+> **Decode columns current; the TTFT column is stale.** The c=1 decode graph
+> gate is unchanged by the later TP batched-decode flip (its c=1 effect washed).
+> But the 7.9 s TTFT points predate the FlashQLA chunked-GDN default prefill
+> path at attn_tp=2/4 (#327, 2026-09-11), which changed the shipped TP=4
+> prefill kernel; its TTFT/needle/acceptance A/B is pending-remote (queue P3).
+> Do not rank TP=4 prefill work off the TTFT numbers in this table.
 
 [Wins entry](experience/wins/2026-08-23-dsv4-c1-decode-graph.md)
 
@@ -709,9 +736,15 @@ prompts 64, 60 s/point, max_tokens 256, seed 20260416. KV pool 16384 tok BF16
 TTFT grows linearly with concurrency (queueing).
 
 **DSpark on V100 is KILLED (−91% at c=1, errors at c≥8).** ITL 40 → 499 ms;
-c=16 produced 131204 errors in 60 s with `[coordinator] lockstep stalled`. The
-TP lockstep proposal path deadlocks at world_size=1 — needs a TP=1 fast path
-before this arm is retried.
+c=16 produced 131204 errors in 60 s with `[coordinator] lockstep stalled`.
+That stall was fixed 2026-07-25 (#168) and a HEAD re-measure saw zero stalls,
+but the arm stayed KILLED on different grounds: the 8192-page pool floor OOMs
+32 GB (#178, since fixed) and the sm_70 drafter output at temp=0 is garbage
+(#179, **closed wont-fix 2026-07-31: V100 is a verification lane, not a
+spec-decode deployment target**). These figures describe the pre-#168 binary
+and there is no successor run by decision; the W4A16 no-spec rows above are
+unaffected and stand
+([error](experience/errors/2026-07-21-dspark-v100-tp-lockstep-stall-kill.md)).
 
 ---
 

@@ -593,10 +593,10 @@ things in it were wrong, found by four adversarial reviews of that commit:
 | "every >2× win is in ③" | false in this file: FlashQLA took linear attention **7.231 → 0.441 s, 16.4×** (§1.2), and it is a kernel replacement. |
 | "rank by factor before size" | refuted by that same example: 16.4× on a module worth 23% of prefill yielded −26% end to end. **Factor size × share governs.** A lever's ceiling belongs to the lever, not to a category. |
 | "22 ms intercept is the part adding rows does not amortize" | inverted. Per-token verify cost is `22/(R·A) + slope/A`; the intercept **is** the term that falls as rows grow. The slope is what does not. |
-| the `22 ms + 2.48 ms/row` model itself | superseded on the current binary (`baselines.md:162`) by a pure per-row fit, **5.69 verify + 3.04 draft**, 85% of the tick. §3 now carries the current one. |
+| the `22 ms + 2.48 ms/row` model itself | superseded on the current binary by a pure per-row fit, **5.69 verify + 3.04 draft**, 85% of the tick — see the "Step budget — where the time goes" note in [baselines](baselines.md) (27B-FP8 anchor). §3 now carries the current one. |
 | "36% of verify at c=16" | no measurement produces it: it multiplies a short-context slope by a nominal row count the same capture measured as 11.0. |
 | 27e9 params for FLOPs | §1.2 uses 22.3e9 GEMM params for the same purpose. |
-| "acceptance may collapse with batch" | already withdrawn in `baselines.md:137` — `accept` tracks cache state, not concurrency (0.532 vs 0.313 at matched c=16). Do not re-file it. |
+| "acceptance may collapse with batch" | already withdrawn — the 27B-FP8 DSpark anchor in [baselines](baselines.md) holds acceptance flat at ~27% across c=2–16 and attributes the c=1 difference to prefix-cache warm hits, not concurrency (see the row's "112 warm hits" paragraph). The earlier 0.532-vs-0.313 figures came from the pre-2026-08-10 baseline, which was corrected out of the file; do not re-file the claim. |
 
 The ①②③ tags are dropped from §6 for the reason in the "rank by factor" row.
 What survives from
@@ -1126,8 +1126,9 @@ row is sampled, so the batched path never fires.
 
 **Not yet isolated:** the sampled arm has no `accept_rate` figure, and the
 envelope mismatch above means the gate's share is unattributed. The rival
-hypothesis that "accept halves at concurrency" is already withdrawn
-(`baselines.md:137`); `accept` tracks prefix-cache state, not `c`.
+hypothesis that "accept halves at concurrency" is already withdrawn — see the
+27B-FP8 DSpark anchor in [baselines](baselines.md); `accept` tracks
+prefix-cache state, not `c`.
 
 ---
 
