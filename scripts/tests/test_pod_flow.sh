@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Negative-assertion rule: a failing-command check and the message/state it
+# proves are TWO assertions, never `[ "$rc" -ne 0 ] && grep …`. Under set -e
+# that `&&` line is red only if the command unexpectedly SUCCEEDS — the
+# regression the test exists for — and then short-circuits with the grep never
+# running, so the suite stays green. Write both as independent || { FAIL; exit; }
+# brackets (see the source-changed / stale-binary / busy-GPU blocks below).
+
 # Hooks export GIT_DIR; the `git init` below must create the temp repo.
 unset GIT_DIR GIT_WORK_TREE
 
@@ -168,7 +175,9 @@ printf '\0' > "$TMP/empty-argv"
 set +e
 POD_TREE="$TREE" POD_STATE="$STATE" setsid bash "$TREE/scripts/pod-remote-run.sh" run good changed auto op-change "$TMP/empty-argv" >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && grep -q 'source changed since build' "$STATE/runs/changed/log"
+[ "$rc" -ne 0 ] || { echo "FAIL: source-changed run was accepted (rc=$rc)" >&2; exit 1; }
+grep -q 'source changed since build' "$STATE/runs/changed/log" \
+  || { echo "FAIL: source-changed rejection message missing" >&2; cat "$STATE/runs/changed/log" >&2; exit 1; }
 grep -Fq "pod-remote-run.sh' run '\$build'" "$LOCAL/scripts/pod.sh"
 printf rename > "$TREE/new name"
 digest_now="$(POD_TREE="$TREE" bash "$TREE/scripts/pod-remote-build.sh" source-digest "$TREE")"
@@ -231,12 +240,13 @@ printf 'op=foreign\npid=%s\npgid=%s\nstart=0\n' "$$" "$$" > "$STATE/runs/stale/p
 set +e
 POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" kill stale >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && kill -0 $$
+[ "$rc" -ne 0 ] || { echo "FAIL: kill of a stale foreign process entry succeeded" >&2; exit 1; }
 
 set +e
 "$LOCAL/scripts/pod.sh" build bad --release --profile release-fast --bin arle >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && [ ! -e "$STATE/builds/bad" ]
+[ "$rc" -ne 0 ] || { echo "FAIL: bad build reported success" >&2; exit 1; }
+[ ! -e "$STATE/builds/bad" ] || { echo "FAIL: bad build left a build state dir" >&2; exit 1; }
 printf '%s\0' --release --message-format json --bin arle > "$TMP/reserved-format"
 set +e
 POD_TREE="$TREE" bash "$TREE/scripts/pod-remote-build.sh" validate-build-args "$TMP/reserved-format" >/dev/null 2>&1
@@ -270,7 +280,9 @@ for case in missing-exe duplicate-exe missing-out duplicate-out embedded-mismatc
   set +e
   CARGO_CASE="$case" POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-build.sh" build "$label" "op-$case" "$TMP/$label" >/dev/null
   rc=$?; set -e
-  [ "$rc" -ne 0 ] && [ "$(awk -F= '$1=="exit" {print $2}' "$STATE/builds/$label/receipt")" -ne 0 ]
+  [ "$rc" -ne 0 ] || { echo "FAIL: build case $label succeeded (expected failure)" >&2; exit 1; }
+  [ "$(awk -F= '$1=="exit" {print $2}' "$STATE/builds/$label/receipt")" -ne 0 ] \
+    || { echo "FAIL: build case $label receipt did not record a nonzero exit" >&2; exit 1; }
 done
 
 printf stale >> "$TREE/target/release/arle"
@@ -278,12 +290,16 @@ printf '\0' > "$TMP/stale-run-argv"
 set +e
 POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" run manifest stale-binary auto op-stale "$TMP/stale-run-argv" >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && grep -q 'binary SHA mismatch' "$STATE/runs/stale-binary/log"
+[ "$rc" -ne 0 ] || { echo "FAIL: stale-binary run was accepted" >&2; exit 1; }
+grep -q 'binary SHA mismatch' "$STATE/runs/stale-binary/log" \
+  || { echo "FAIL: stale-binary mismatch message missing" >&2; cat "$STATE/runs/stale-binary/log" >&2; exit 1; }
 printf '%s\0' --release --features cuda --bin arle > "$TMP/failed-run-argv"
 set +e
 POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" run build-fail failed-build auto op-failed "$TMP/failed-run-argv" >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && grep -q 'successful build receipt required' "$STATE/runs/failed-build/log"
+[ "$rc" -ne 0 ] || { echo "FAIL: run against a failed-build receipt was accepted" >&2; exit 1; }
+grep -q 'successful build receipt required' "$STATE/runs/failed-build/log" \
+  || { echo "FAIL: failed-build receipt message missing" >&2; cat "$STATE/runs/failed-build/log" >&2; exit 1; }
 
 mkdir -p "$STATE/builds/shared" "$STATE/runs/shared" "$TMP/proc/4242"
 printf 'exit=0\n' > "$STATE/builds/shared/receipt"
@@ -325,16 +341,44 @@ set +e
 SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,1,2 >/dev/null 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ]
+# A live foreign claim on GPU 2. pick-gpu reaps claims whose pid is dead OR
+# whose start token mismatches. Its liveness read is $PROC_ROOT (pick-gpu.sh:5),
+# not a hardcoded /proc, so a synthetic proc root is honored identically on
+# macOS and Linux: the fake pid 77001 exists only there on either platform,
+# never touching the host's real /proc. On a host WITH a /proc the same applies
+# because PROC_ROOT is explicitly overridden.
+FAKE_PROC="$TMP/proc-claims"
+mkdir -p "$FAKE_PROC/77001"
+CLAIM_START_TOK="424242"
+# Linux /proc/<pid>/stat field 22 (1-indexed) is starttime; 21 fields then token.
+{ printf '0 (bash) S'; for _ in $(seq 1 18); do printf ' 1'; done; printf ' 424242\n'; } \
+  | awk '{$1=$1; print}' > "$FAKE_PROC/77001/stat"
 mkdir -p "$TMP/tp4-busy"
-printf 'schema=arle-gpu-claim-v1\nop=foreign\npid=%s\nstart=%s\n' "$$" "$(claim_start)" > "$TMP/tp4-busy/2"
+printf 'schema=arle-gpu-claim-v1\nop=foreign\npid=77001\nstart=%s\n' "$CLAIM_START_TOK" > "$TMP/tp4-busy/2"
 set +e
-SMI="$TP4_SET" ARLE_GPU_CLAIMS="$TMP/tp4-busy" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3 >/dev/null 2>&1
+PROC_ROOT="$FAKE_PROC" SMI="$TP4_SET" ARLE_GPU_CLAIMS="$TMP/tp4-busy" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3 >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && [ ! -e "$TMP/tp4-busy/0" ] && [ ! -e "$TMP/tp4-busy/1" ] && [ ! -e "$TMP/tp4-busy/3" ]
+[ "$rc" -ne 0 ] || { echo "FAIL: reserve-set on a busy GPU 2 succeeded" >&2; exit 1; }
+for g in 0 1 3; do
+  [ ! -e "$TMP/tp4-busy/$g" ] || { echo "FAIL: busy reserve-set created a claim on GPU $g" >&2; exit 1; }
+done
+# Reverse control: a STALE foreign claim (dead pid) is reaped, so the same
+# check passes and proves the gate keys on liveness rather than file presence.
+# This claim differs from the live one in EXACTLY one byte of semantic state —
+# pid 77001 (a stat file exists in FAKE_PROC) vs pid 77002 (none does); the
+# start token and every other field are identical.
+printf 'schema=arle-gpu-claim-v1\nop=foreign\npid=77002\nstart=%s\n' "$CLAIM_START_TOK" > "$TMP/tp4-busy/2"
+set +e
+PROC_ROOT="$FAKE_PROC" SMI="$TP4_SET" ARLE_GPU_CLAIMS="$TMP/tp4-busy" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3 >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -eq 0 ] || { echo "FAIL: stale (dead-pid) claim was not reaped; check-free-set must pass" >&2; exit 1; }
 set +e
 SMI="$TP4_SET" SMI_COMPUTE='GPU-2\n' ARLE_GPU_CLAIMS="$TMP/tp4-free" bash "$TREE/scripts/pick-gpu.sh" reserve-set 0,1,2,3 >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && [ ! -e "$TMP/tp4-free/0" ] && [ ! -e "$TMP/tp4-free/1" ] && [ ! -e "$TMP/tp4-free/2" ] && [ ! -e "$TMP/tp4-free/3" ]
+[ "$rc" -ne 0 ] || { echo "FAIL: reserve-set succeeded despite a compute app on GPU 2" >&2; exit 1; }
+for g in 0 1 2 3; do
+  [ ! -e "$TMP/tp4-free/$g" ] || { echo "FAIL: blocked reserve-set created a claim on GPU $g" >&2; exit 1; }
+done
 low_compute="$(ARLE_GPU_CLAIMS="$TMP/low-compute" ARLE_OP_ID=ours ARLE_OWNER=test SMI='0, GPU-0, 1, 9.0\n1, GPU-1, 0, 9.0' SMI_COMPUTE='GPU-0\n' bash "$TREE/scripts/pick-gpu.sh")"
 [ "$low_compute" = 1 ]
 
@@ -359,7 +403,12 @@ PY
   status_rc=$?
   PROC_ROOT="$TMP/proc" KILL_CMD="$BIN/mock-kill" POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" kill shared >/dev/null 2>&1
   kill_rc=$?; set -e
-  [ "$status_rc" -ne 0 ] && [ "$kill_rc" -ne 0 ] && [ ! -e "$KILL_MARKER" ]
+  [ "$status_rc" -ne 0 ] \
+    || { echo "FAIL: status accepted a corrupted process descriptor ($mismatch)" >&2; exit 1; }
+  [ "$kill_rc" -ne 0 ] \
+    || { echo "FAIL: kill accepted a corrupted process descriptor ($mismatch)" >&2; exit 1; }
+  [ ! -e "$KILL_MARKER" ] \
+    || { echo "FAIL: corrupted kill ($mismatch) dispatched the mock kill command" >&2; exit 1; }
   mv "$TMP/process.good" "$STATE/runs/shared/process"
 done
 
@@ -433,7 +482,9 @@ grep -Fxq 'exit=1' "$STATE/runs/kabfail/receipt"
 set +e
 POD_TREE="$TREE" POD_STATE="$STATE" ARLE_GPU_CLAIMS="$KAB_CLAIMS" bash "$TREE/scripts/pod-remote-run.sh" kernel-ab kabfast bench-kabguard 0 1,64,32 7 >/dev/null 2>&1
 rc=$?; set -e
-[ "$rc" -ne 0 ] && grep -q 'bench run requires a release build' "$STATE/runs/bench-kabguard/log"
+[ "$rc" -ne 0 ] || { echo "FAIL: bench kernel-ab accepted a non-release build" >&2; exit 1; }
+grep -q 'bench run requires a release build' "$STATE/runs/bench-kabguard/log" \
+  || { echo "FAIL: bench release-guard message missing" >&2; cat "$STATE/runs/bench-kabguard/log" >&2; exit 1; }
 unset ARGV_APPEND KAB_FAIL
 
 # Negative control for the push_scripts-in-sync bootstrap fix. apply-sync runs
