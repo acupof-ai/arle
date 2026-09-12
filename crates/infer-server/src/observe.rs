@@ -2,9 +2,15 @@
 //! thread only writes the snapshot it already publishes per tick.
 
 use crate::execution::CounterSnapshot;
+use crate::gpu_nvml::NvmlSampler;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
+
+/// Observe tick cadence. The NVML sample is taken once per tick, so this is
+/// also the GPU polling interval; keeping one constant for the sleep and the
+/// documented cadence prevents them drifting apart.
+const TICK_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct HostSample {
@@ -157,11 +163,13 @@ fn write_sample(dir: &std::path::Path, snap: &CounterSnapshot, host: HostSample)
 }
 
 /// Spawn the background observe task. `snapshot` returns the current counter
-/// snapshot, or `None` to skip this tick (e.g. mutex poisoned). The flock
+/// snapshot, or `None` to skip this tick (e.g. mutex poisoned); it receives the
+/// node-wide GPU sample for this tick (`None` when GPU sampling is off or
+/// unavailable) and stores it alongside the other counters. The flock
 /// singleton ensures only one writer per machine.
 pub(crate) fn spawn_observe_task<F>(mut snapshot: F)
 where
-    F: FnMut() -> Option<CounterSnapshot> + Send + 'static,
+    F: FnMut(Option<infer_seam::GpuSample>) -> Option<CounterSnapshot> + Send + 'static,
 {
     std::thread::Builder::new()
         .name("arle-observe".to_string())
@@ -171,14 +179,16 @@ where
                 Some(f) => f,
                 None => return,
             };
+            let nvml = NvmlSampler::if_enabled();
             sweep_retention(&dir, retention_days());
             let mut sys = sysinfo::System::new();
             let mut disks = sysinfo::Disks::new_with_refreshed_list();
             let mut tick: u32 = 0;
             loop {
-                std::thread::sleep(Duration::from_secs(10));
+                std::thread::sleep(TICK_INTERVAL);
                 let host = sample_host(&mut sys, &mut disks, tick);
-                let Some(snap) = snapshot() else {
+                let gpu = nvml.as_ref().and_then(NvmlSampler::sample);
+                let Some(snap) = snapshot(gpu) else {
                     tick += 1;
                     continue;
                 };

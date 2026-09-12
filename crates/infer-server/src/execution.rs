@@ -77,7 +77,6 @@ fn publish_counters(engine: &Engine, counters: &CounterHandle) {
         snap.kv_system = engine.kv_system_metrics();
         snap.spec_decode = stats.spec_decode;
         snap.op_timing = stats.op_timing;
-        snap.gpu = stats.gpu;
     }
 }
 

@@ -549,8 +549,9 @@ fn spawn_coordinator_observe(dp: Arc<DpCoordinator>) {
         return;
     };
     let cached = Arc::clone(&dp.cached_stats);
-    crate::observe::spawn_observe_task(move || {
-        let snap = rt.block_on(dp.query_stats_all(Duration::from_secs(5)));
+    crate::observe::spawn_observe_task(move |gpu| {
+        let mut snap = rt.block_on(dp.query_stats_all(Duration::from_secs(5)));
+        snap.gpu = gpu;
         if let Ok(mut guard) = cached.write() {
             *guard = Some(snap.clone());
         }
