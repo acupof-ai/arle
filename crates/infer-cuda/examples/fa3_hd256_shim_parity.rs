@@ -622,6 +622,10 @@ mod real {
     struct CmpOutcome {
         mirror_ok: bool,
         anchor_ok: Option<bool>,
+        /// Negative tooth measured on the single corrupted row alone, so the
+        /// number of other checked rows/heads cannot dilute it.
+        mirror_tooth_ok: bool,
+        anchor_tooth_ok: Option<bool>,
         mirror: attn_common::Metrics,
         anchor: Option<attn_common::Metrics>,
     }
@@ -652,6 +656,8 @@ mod real {
             return CmpOutcome {
                 mirror_ok,
                 anchor_ok: None,
+                mirror_tooth_ok: m.corrupted_row_fails(tol),
+                anchor_tooth_ok: None,
                 mirror: m,
                 anchor: None,
             };
@@ -670,6 +676,8 @@ mod real {
         CmpOutcome {
             mirror_ok,
             anchor_ok: Some(anchor_ok),
+            mirror_tooth_ok: m.corrupted_row_fails(tol),
+            anchor_tooth_ok: Some(ma.corrupted_row_fails(&TOL_FP8_ANCHOR)),
             mirror: m,
             anchor: Some(ma),
         }
@@ -1123,15 +1131,17 @@ mod real {
             st.any_case = true;
             st.has_anchor |= out.clean.anchor_ok.is_some();
             st.clean &= out.clean.mirror_ok && out.clean.anchor_ok.unwrap_or(true);
-            // Mirror tooth: the corrupted mirror expectation MUST fail; the
-            // anchor comparator, evaluated uncorrupted in the same pair, MUST
-            // still pass for the requant family.
+            // Mirror tooth: the corrupted mirror expectation MUST fail,
+            // measured on the corrupted row itself (not the global violation
+            // fraction, which more checked rows would dilute); the anchor
+            // comparator, evaluated uncorrupted in the same pair, MUST still
+            // pass for the requant family.
             st.mirror_tooth &=
-                !out.mirror_neg.mirror_ok && out.mirror_neg.anchor_ok.is_none_or(|ok| ok);
+                out.mirror_neg.mirror_tooth_ok && out.mirror_neg.anchor_ok.is_none_or(|ok| ok);
             if let Some(an) = &out.anchor_neg {
-                // Anchor tooth: corrupted anchor expectation MUST fail while
-                // the uncorrupted mirror in that pair still passes.
-                st.anchor_tooth &= an.mirror_ok && !an.anchor_ok.unwrap_or(true);
+                // Anchor tooth: corrupted anchor MUST fail on its own row
+                // while the uncorrupted mirror in that pair still passes.
+                st.anchor_tooth &= an.mirror_ok && an.anchor_tooth_ok.unwrap_or(false);
             }
             print_verdict(case, &out.clean);
         }

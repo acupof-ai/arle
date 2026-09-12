@@ -172,7 +172,14 @@ TSV="$OUT/results.tsv"
 MD="$OUT/results.md"
 printf 'example\tsm90_only\tnegative_supported\tpositive_exit\tpositive_verdict\tnegative_exit\tnegative_verdict\tstatus\tfail_lines\n' >"$TSV"
 
-n_pass=0; n_fail=0; n_skip=0; fail_names=""
+n_pass=0; n_fail=0; n_skip=0; fail_names=""; notrun_list=""
+# Record a gate that produced no verdict this run. $1=name $2=reason; the list
+# is one "name<TAB>reason" record per line so spaces inside a reason survive.
+mark_notrun() {
+    local r
+    r="$(printf '%s' "$2" | tr '[:space:]' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
+    notrun_list="${notrun_list}${1}"$'\t'"${r}"$'\n'
+}
 for line in "${gates[@]}"; do
     name="${line%%$'\t'*}"; flags="${line#*$'\t'}"
     sm90=no; model=no; neg=yes; neg_mode="required"
@@ -184,6 +191,7 @@ for line in "${gates[@]}"; do
         printf '%s\t%s\t%s\t-\t-\t-\t-\tSKIP\tneeds multi-rank model launcher + INFER_DSV4_MODEL_PATH\n' \
             "$name" "$sm90" "$neg_mode" >>"$TSV"
         n_skip=$((n_skip + 1))
+        mark_notrun "$name" "needs multi-rank model launcher + INFER_DSV4_MODEL_PATH"
         continue
     fi
     bin="$BIN_DIR/$name"
@@ -206,6 +214,7 @@ for line in "${gates[@]}"; do
         pos_status=SKIP
         pos_verdict="$pos_skip"
         n_skip=$((n_skip + 1))
+        mark_notrun "$name" "$(skip_reason "$pos_log")"
     elif [ "$pos_rc" -eq 0 ] && [ -n "$pos_verdict" ]; then
         pos_status=PASS; n_pass=$((n_pass + 1))
     else
@@ -268,17 +277,38 @@ done
         if [ "$neg_s" = required ]; then n_cell="rc=${n_rc} ${n_v}"; fi
         echo "| ${ex} | ${sm} | ${neg_s} | ${p_cell} | ${n_cell} | ${fails} |"
     done
+    if [ "$n_skip" -gt 0 ]; then
+        echo
+        echo "## Never executed on this device (${n_skip}): no positive or negative verdict"
+        echo
+        echo "These gates were SKIP, not PASS — neither their positive arm nor a"
+        echo "negative control ran here, so this batch says nothing about their"
+        echo "correctness on GPU ${GPU}. Run them on the named device/launcher."
+        echo
+        printf '%s' "$notrun_list" | while IFS=$'\t' read -r n r; do
+            [ -n "$n" ] || continue
+            printf -- '- %s(%s)\n' "$n" "$r"
+        done
+    fi
 } >"$MD"
 
 echo "parity-batch: pass=$n_pass fail=$n_fail skip=$n_skip"
 [ -z "$fail_names" ] || echo "parity-batch: FAILING:$fail_names"
+if [ "$n_skip" -gt 0 ]; then
+    notrun_display="$(printf '%s' "$notrun_list" | sed '/^$/d; s/\t/(/; s/$/)/' | paste -sd ' ' -)"
+    echo "parity-batch: NEVER EXECUTED on this device ($n_skip; no positive/negative verdict): $notrun_display"
+fi
 echo "parity-batch: $TSV"
 echo "parity-batch: $MD"
 
 if [ "$n_fail" -eq 0 ]; then
     PREREG_RESULT="pass=$n_pass fail=0 skip=$n_skip"
-    PREREG_FINDING="every registry-listed parity gate printed its positive verdict and every negative-control run printed NEGATIVE CONTROL OK"
-    PREREG_DECISION="gates accepted on this build; results.md is ready for the wins entry"
+    if [ "$n_skip" -eq 0 ]; then
+        PREREG_FINDING="every registry-listed parity gate printed its positive verdict and every negative-control run printed NEGATIVE CONTROL OK"
+    else
+        PREREG_FINDING="$n_pass gates green; $n_skip gates never executed on this device (no verdict): $notrun_display"
+    fi
+    PREREG_DECISION="gates accepted on this build; results.md lists the non-executed gates and their required device/launcher"
     prereg_done ok
     exit 0
 fi

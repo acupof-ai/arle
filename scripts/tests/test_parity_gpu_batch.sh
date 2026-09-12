@@ -64,6 +64,16 @@ grep -qE '^gate_d\tno\tallowlisted\t-\t-\t-\t-\tSKIP\t' "$OUT1/results.tsv" \
     || { echo "FAIL: model gate not recorded SKIP/allowlisted" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
 grep -q 'pass=1 fail=0 skip=1' "$TMP/ok.log" \
     || { echo "FAIL: summary counts wrong" >&2; cat "$TMP/ok.log" >&2; exit 1; }
+# The model-gated gate must be named as never executed in stdout and the MD.
+grep -q 'NEVER EXECUTED on this device' "$TMP/ok.log" \
+    || { echo "FAIL: clean run with a skip missing the NEVER-EXECUTED stdout line" >&2
+         cat "$TMP/ok.log" >&2; exit 1; }
+grep -qE '^- gate_d\(needs multi-rank model launcher' "$OUT1/results.md" \
+    || { echo "FAIL: results.md never-executed section missing model gate" >&2
+         cat "$OUT1/results.md" >&2; exit 1; }
+grep -q '## Never executed on this device' "$OUT1/results.md" \
+    || { echo "FAIL: results.md missing the never-executed heading" >&2
+         cat "$OUT1/results.md" >&2; exit 1; }
 grep -q '| gate_a | yes | required |' "$OUT1/results.md" \
     || { echo "FAIL: markdown table missing gate_a" >&2; exit 1; }
 grep -q 'mock-kernel-1' "$OUT1/kernel-build-id.txt" \
@@ -125,6 +135,13 @@ grep -q 'pass=0 fail=0 skip=1' "$TMP/skip.log" \
 grep -qE '^\| gate_skip .* \| SKIP \| SKIP \|' "$OUT_SK/results.md" \
     || { echo "FAIL: markdown did not render SKIP/SKIP" >&2
          cat "$OUT_SK/results.md" >&2; exit 1; }
+# Device-gated gate must also be named in the never-executed section.
+grep -q -- '- gate_skip(requires sm_70' "$OUT_SK/results.md" \
+    || { echo "FAIL: device-gated gate not named as never executed" >&2
+         cat "$OUT_SK/results.md" >&2; exit 1; }
+grep -q 'NEVER EXECUTED on this device' "$TMP/skip.log" \
+    || { echo "FAIL: skip run missing NEVER-EXECUTED stdout line" >&2
+         cat "$TMP/skip.log" >&2; exit 1; }
 
 # ── Dirty world: positive FAIL and dead negative control ──
 make_mock gate_b posfail
