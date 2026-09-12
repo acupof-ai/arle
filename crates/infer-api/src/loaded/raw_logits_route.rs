@@ -62,10 +62,16 @@ async fn handle_raw_logits(
     }
     // The forward is a blocking CUDA call; keep it off the async worker.
     let result = tokio::task::block_in_place(|| {
-        let raw = engine.forward_token_logits(&req.input_ids, &req.positions)?;
-        let shape = [raw.seq_len(), raw.vocab_size()];
-        let host = raw.to_host_f32()?;
-        anyhow::Ok((shape, host))
+        engine.with_cuda_executor({
+            let input_ids = req.input_ids.clone();
+            let positions = req.positions.clone();
+            move |executor| {
+                let (logits, shape, device) =
+                    executor.forward_token_logits(&input_ids, &positions)?;
+                let host = logits.to_host(&device)?;
+                anyhow::Ok((shape, host))
+            }
+        })
     });
     match result {
         Ok((shape, host)) => {

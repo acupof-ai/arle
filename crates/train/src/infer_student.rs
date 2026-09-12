@@ -24,6 +24,8 @@ use infer_api::{
 use infer_plan::SamplingParams;
 
 #[cfg(feature = "cuda")]
+use crate::cuda_opd_ext::CudaInferenceEngineExt;
+#[cfg(feature = "cuda")]
 use crate::lora::LoraConfig;
 
 #[cfg(feature = "cuda")]

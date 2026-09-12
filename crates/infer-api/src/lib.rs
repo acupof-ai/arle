@@ -100,8 +100,6 @@ pub use infer_cuda::{
 pub use infer_cuda::{mint_nccl_unique_id_hex, nccl_unique_id_from_env};
 #[cfg(feature = "cuda")]
 pub use student_lora::{LoraHalf, parse_student_adapter_name};
-#[cfg(feature = "cuda")]
-pub use types::RawLogits;
 pub use types::{
     ChatPromptImage, ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
     CompletionStreamError, FinishReason, InferenceEngine, MultimodalChatRequest, SamplingParams,

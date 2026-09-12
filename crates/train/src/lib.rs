@@ -18,6 +18,9 @@ pub mod cc_harness;
 pub mod checkpoint;
 #[path = "context_parallel.rs"]
 pub mod context_parallel;
+#[cfg(feature = "cuda")]
+#[path = "cuda_opd_ext.rs"]
+pub mod cuda_opd_ext;
 #[path = "ema_self_teacher.rs"]
 pub mod ema_self_teacher;
 pub use autograd::grad_clip;

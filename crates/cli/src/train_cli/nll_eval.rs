@@ -10,6 +10,7 @@ use {super::resolve_local_tokenizer_path, std::fs, train::tokenizer::ChatTokeniz
 #[cfg(feature = "cuda")]
 pub(super) fn run_ppl(args: TrainPplArgs) -> Result<()> {
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+    use train::cuda_opd_ext::CudaInferenceEngineExt;
 
     let ctx = args.ctx;
     let model_path = args
