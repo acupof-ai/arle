@@ -36,8 +36,9 @@ never by picking a free index by hand.
 5. Independent single-card serve studies — P6 splits-64 perf, P7 step1b
    gate, P10 NVML A/B, P14 thinking-needle channel (folds into P7's serve)
    — slot onto any card not running the P3 grid.
-6. Multi-rank DSv4 e2e (P12) and OPD cp=2 (P13) need separate setup (model
-   weights / training lane) and are scheduled on their own.
+6. Multi-rank DSv4 e2e (P12), the DSv4-TP8 DSpark anchor re-measure (P15,
+   after P3), and OPD cp=2 (P13) need separate setup (model weights /
+   training lane) and are scheduled on their own.
 
 ## The queue
 
@@ -316,7 +317,43 @@ never by picking a free index by hand.
 - **Prereg:** `needle-reasoning-channel-<ts>`.
 - **Depends on:** nothing; shares a serve window with P7.
 
+### P15 — DSv4 8×H20 DSpark anchor re-measure on the 32K agent fingerprint
+
+- **State:** `docs/baselines.md` DSv4-Flash-FP8 8×H20 SOTA (2026-08-14) is
+  marked STALE at c=8/16. The TP decode-graph flip (2026-08-22), TP batched
+  decode (2026-08-23), and FlashQLA chunked attn_tp=8 (#329, 2026-09-11)
+  all postdate it; the c=1 point also predates the batched spec-verify GDR
+  reroute (#292). The archived binary still reproduces the old row; the
+  shipped-default configuration is unmeasured.
+- **Command:** release build on the pod; export `INFER_DSV4_MODEL_PATH`
+  (DSv4-Flash-FP8 base) and `DRAFT_MODEL` (the DSpark draft-fp8 dir, same
+  convention `scripts/dspark_flashqla_verify.sh` uses), then serve with
+  `--spec-type dspark --mtp-draft-model "$DRAFT_MODEL"
+  --comm-backend nccl --tensor-parallel-size 8`; load
+  `scripts/bench_throughput.py` against `bench-agent-32k-16x8.jsonl`
+  (`--concurrency-grid 1,8,16 --max-tokens 128 --temperature 0 --seed 42`),
+  with `scripts/bench_dspark_accept.py --concurrency {1,8}` between grid
+  points for the chains/drafted/accepted counters (the 2026-08-14 row's
+  acceptance denominators were a few-dozen-chain sample at c≥8 and must not
+  be quoted again).
+- **Device:** all eight sm90 cards, whole-box reservation like P3 tp=8;
+  DSv4-Flash weights and the DSpark draft on NVMe.
+- **Decides:** successor numbers for the stale c=8/16 decode columns and a
+  current c=1 DSpark point on the agent workload the old row explicitly said
+  it was not. Counter deltas distinguish a scheduling-driven acceptance
+  collapse (run P5 logic first) from a verify-path defect. Measurement, not
+  a hard gate; needle ladder ×3 stays the correctness gate.
+- **Prereg:** `dsv4-tp8-dspark-32k-reanchor-<ts>`.
+- **Depends on:** #334 and the P3 tp=8 result (chunked-routing engagement
+  proven before quoting the reanchor); whole-box, runs after P3.
+
 ## Not in this queue (different blocking resource or stale)
+
+- **V100 DSpark re-bench (deliberately absent):** the lockstep stall was
+  fixed (#168) but issue #179 (sm_70 drafter garbage at temp=0) closed
+  wont-fix 2026-07-31 — V100 is a verification lane, not a spec-decode
+  target. The baselines V100 DSpark row is marked as a pre-fix record with
+  no successor run by decision. Do not schedule one without reopening #179.
 
 - **ttft-35b (blocked):** needs a Mac without swap pressure, not a GPU.
   Stays out of the card queue.
@@ -345,6 +382,7 @@ never by picking a free index by hand.
 | P10 NVML A/B | 1 sm90 | matched pair | other cards (not the P3 serves) |
 | P3 verify tp=1/2/4 | 1/2/4 sm90 | long | 1-card jobs on leftover cards, one serve per card |
 | P3 verify tp=8 / P2 | 8 sm90 | whole box | nothing else |
+| P15 DSv4-TP8 DSpark reanchor | 8 sm90 | whole box | nothing else; after P3 tp=8 |
 | P12 dsv4 multirank | N sm90 | multi-rank | its own reservation |
 | P13 OPD cp2 | 2 sm90 | training reservation | its own lane |
 | P9 fa2 sm70 | 1 V100 (separate host) | short | **all H20 jobs concurrently** |
