@@ -18,6 +18,10 @@
    so the body also needs a CLIPPY_EXIT=0 from a pod
    `cargo clippy --workspace --all-targets --features cuda,nccl
    -- -D warnings` run without no-cuda.
+8. An ADDED line under docs/ may not cite a backticked short sha (7-12 hex)
+   that does not resolve to a commit in THIS repository. Existing lines are
+   not scanned, so historical dead shas are left alone; a sha attributed to an
+   upstream project is allowed via an explicit upstream cue.
 """
 
 from __future__ import annotations
@@ -70,6 +74,21 @@ SLASH_FILES = re.compile(r"\.(rs|cu|cuh|h|cc|cpp)$")
 HASH_FILES = re.compile(r"\.(py|sh|toml|yml|yaml)$")
 SLASH_COMMENT = re.compile(r"^\+\s*///?\s?\S")
 HASH_COMMENT = re.compile(r"^\+\s*#\s?\S")
+
+# Rule 8: a backticked 7-12 hex code span in an added docs line is treated as a
+# commit citation. The {7,12} bound deliberately excludes the 16-char per-row
+# block/data hashes in analysis tables, and the backticks keep it to a
+# deliberate citation rather than prose. Both a digit and an a-f letter are
+# required (a bare decimal must not match).
+DOC_MD_PATH = re.compile(r"^docs/.*\.md$")
+DOC_SHORT_SHA = re.compile(
+    r"`(?=[0-9a-f]{7,12}`)(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,12}`"
+)
+# A sha attributed to another repository is not supposed to resolve here. The
+# cue must be explicit on the same line; this is the only carve-out.
+UPSTREAM_CUE = re.compile(
+    r"upstream|NVlabs|mlc-ai|llama\.cpp|cuda-oxide|xgrammar", re.IGNORECASE
+)
 
 
 def git(args: list[str], cwd: Path) -> str:
@@ -203,6 +222,41 @@ def check_build_exit(added: dict[str, list[str]], pr_body: str) -> list[str]:
     return ["build-exit: examples/ or benches/ changed but the PR body has no BUILD_EXIT=0 line"]
 
 
+def _sha_in_main(repo: Path, sha: str, base: str) -> bool:
+    """True if sha resolves AND is reachable from base (origin/main merge-base).
+
+    A sha that resolves only on the feature branch is the rebase/squash death
+    the rule targets: it is a real commit now, but after merge it is not, so a
+    doc citing it is already stale.
+    """
+    r = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", sha, base],
+        cwd=repo,
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
+def check_doc_dead_sha(repo: Path, added: dict[str, list[str]], base: str) -> list[str]:
+    failures: list[str] = []
+    for path, lines in added.items():
+        if not DOC_MD_PATH.match(path):
+            continue
+        for n, line in enumerate(lines, 1):
+            if UPSTREAM_CUE.search(line):
+                continue
+            for m in DOC_SHORT_SHA.finditer(line):
+                sha = m.group(0).strip("`")
+                if _sha_in_main(repo, sha, base):
+                    continue
+                failures.append(
+                    f"dead-sha: {path}:{n} cites `{sha}` which does not resolve to a "
+                    "commit on origin/main (rebased/squashed lane sha?). Cite the PR "
+                    "number, or mark an upstream-repo sha with its project on the line"
+                )
+    return failures
+
+
 def check_gate_registry(repo: Path, changed: list[str]) -> list[str]:
     gates = [
         rel for rel in changed
@@ -245,6 +299,7 @@ def run(repo: Path, pr_body: str) -> list[str]:
     failures += check_cuda_check_exit(repo, changed, pr_body)
     failures += check_clippy_exit(repo, changed, pr_body)
     failures += check_gate_registry(repo, changed)
+    failures += check_doc_dead_sha(repo, added, base)
     return failures
 
 
@@ -275,10 +330,11 @@ def world(files: dict[str, str], body: str) -> Path:
     g("branch", "-M", "main")
     g("branch", "origin/main")
     g("checkout", "-q", "-b", "lane/x")
+    base_sha = git(["rev-parse", "HEAD"], root).strip()[:9]
     for rel, content in files.items():
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
+        p.write_text(content.replace("{{BASE_SHA}}", base_sha))
         g("add", rel)
     g("commit", "-q", "-m", body.splitlines()[0], "-m", body)
     return root
@@ -411,6 +467,26 @@ def selftest() -> int:
          {"crates/infer-cuda/examples/bar.rs": "fn main() {}\n"},
          EXEMPT_BODY, "BUILD_EXIT=0\n", None),
     ]
+    cases += [
+        ("dead-sha on main commit passes",
+         {"docs/note.md": "See commit `{{BASE_SHA}}` for the fix.\n"},
+         BARE_BODY, "", None),
+        ("dead-sha unresolvable fails",
+         {"docs/note.md": "Landed in `0123abcd`.\n"},
+         BARE_BODY, "", "dead-sha"),
+        ("dead-sha upstream cue passes",
+         {"docs/research/x.md": "Upstream pinned at `0123abcd` (NVlabs/cuda-oxide).\n"},
+         BARE_BODY, "", None),
+        ("dead-sha 16-char data hash passes",
+         {"docs/note.md": "Block hash `0123456789abcdef` in the table.\n"},
+         BARE_BODY, "", None),
+        ("dead-sha decimal passes",
+         {"docs/note.md": "Counter `1048576` and word `abcdef` not a sha.\n"},
+         BARE_BODY, "", None),
+        ("dead-sha outside docs passes",
+         {"README-notes.txt": "Landed in `0123abcd`.\n"},
+         BARE_BODY, "", None),
+    ]
     failures = []
     for name, files, body, pr_body, expected in cases:
         root = world(files, body)
@@ -426,6 +502,36 @@ def selftest() -> int:
             failures.append(f"{name}: expected pass, got {got}")
         else:
             print(f"[selftest] {name}: {'FAILs as designed -> ' + hit if hit else 'PASS'}")
+
+    # Branch-only sha world: a real commit that lives only on the lane, not on
+    # the merge-base, is the rebase/squash death. Two lane commits — a work
+    # commit then a doc that cites it — so the cited sha exists in the object
+    # store but is not an ancestor of origin/main.
+    root = Path(tempfile.mkdtemp(prefix="precheck-world-"))
+    try:
+        g = lambda *a: subprocess.run(["git", *a], cwd=root, check=True, capture_output=True)
+        g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        (root / ".base").write_text("b"); g("add", ".base")
+        g("commit", "-q", "-m", "base"); g("branch", "-M", "main"); g("branch", "origin/main")
+        g("checkout", "-q", "-b", "lane/x")
+        (root / "crates_x").write_text("x"); g("add", "crates_x")
+        g("commit", "-q", "-m", "lane work")
+        lane_sha = git(["rev-parse", "HEAD"], root).strip()[:9]
+        (root / "docs").mkdir(parents=True)
+        (root / "docs" / "note.md").write_text(f"Depends on `{lane_sha}` (lane-only).\n")
+        g("add", "docs/note.md"); g("commit", "-q", "-m", "doc cites lane sha")
+        got = run(root, "")
+        hit = next((f for f in got if f.startswith("dead-sha:")), None)
+        name = "dead-sha branch-only commit fails"
+        if hit:
+            print(f"[selftest] {name}: FAILs as designed -> {hit}")
+        else:
+            failures.append(f"{name}: expected dead-sha failure, got {got}")
+    except Exception as exc:
+        failures.append(f"branch-sha world raised {exc!r}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
     if failures:
         print("[lane-precheck][selftest] FAIL")
         print("\n".join(f"- {f}" for f in failures))
