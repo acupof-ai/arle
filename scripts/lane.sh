@@ -7,7 +7,13 @@
 # not multiplying the 8.5 GB.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# This script is tracked, so a copy runs inside every linked worktree:
+# BASH_SOURCE there points at the LANE, not the main checkout, and deriving
+# paths from it builds $LANES/arle-lanes (a second target dir). Resolve the
+# main checkout from git's shared common dir: $ROOT/.git for the main tree,
+# <main>/.git for a linked worktree.
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(dirname "$(git -C "$SCRIPT_ROOT" rev-parse --path-format=absolute --git-common-dir)")"
 LANES="${ARLE_LANES:-$(dirname "$ROOT")/arle-lanes}"
 
 usage() {

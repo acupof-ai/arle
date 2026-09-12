@@ -114,8 +114,29 @@ check "preexist: branch still points at its own commit" bash -c '
   [ "$(/usr/bin/git -C "'"$d/r"'" rev-parse lane/epsilon)" != "$(/usr/bin/git -C "'"$d/r"'" rev-parse main)" ]'
 check "preexist: stray directory removed" test ! -e "$d/arle-lanes/epsilon"
 
+# ── 6. `new` run from INSIDE a linked worktree resolves the main checkout ────
+# lane.sh is tracked, so a copy exists in every lane. The old ROOT derivation
+# took the script's own dir: from inside a lane that made LANES the doubled
+# arle-lanes/arle-lanes, created the new worktree there, and wrote a second
+# .cargo/config.toml whose target-dir was the LANE's own target/ (a second
+# 8.5 GB build dir). ROOT must come from git's shared common dir instead.
+d="$TMP/linked"; make_repo "$d"
+( cd "$d/r" && PATH=/usr/bin:/bin scripts/lane.sh new outer >/dev/null )
+# The worktree carries its own copy of the tracked script.
+mkdir -p "$d/arle-lanes/outer/scripts"
+cp "$d/r/scripts/lane.sh" "$d/arle-lanes/outer/scripts/lane.sh"
+( cd "$d/arle-lanes/outer" && PATH=/usr/bin:/bin scripts/lane.sh new inner >/dev/null )
+check "linked: exits 0 and creates under the shared LANES" /usr/bin/git -C "$d/arle-lanes/inner" rev-parse --is-inside-work-tree
+check "linked: no doubled arle-lanes/arle-lanes directory" test ! -e "$d/arle-lanes/arle-lanes"
+# git's absolute paths are physical (/var -> /private/var on macOS); compare
+# against the resolved main checkout, not the possibly-symlinked $d.
+main_phys="$(cd "$d/r" && pwd -P)"
+check "linked: target config points at the main checkout, not the lane" \
+    bash -c 'grep -q "target-dir = \"'"$main_phys"'/target\"" "'"$d"'/arle-lanes/.cargo/config.toml"'
+check "linked: only one cargo config exists" bash -c '[ "$(find "'"$d"'/arle-lanes" -path "*/.cargo/config.toml" | wc -l | tr -d " ")" = 1 ]'
+
 if [ "$fail" -eq 0 ]; then
-    echo "PASS: lane.sh new rollback (happy, nonzero add, unlinked, directory-gone, preexisting branch)"
+    echo "PASS: lane.sh new rollback (happy, nonzero add, unlinked, directory-gone, preexisting branch, linked-worktree ROOT)"
     exit 0
 fi
 echo "FAIL: lane.sh new rollback tests" >&2
