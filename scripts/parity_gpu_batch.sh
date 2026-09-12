@@ -10,6 +10,8 @@
 #      --negative-control;
 #   4. writes results.tsv and a wins/errors-ready results.md under the
 #      caller-given output dir, with per-run capped logs.
+# Before the GPU gates it runs the cuda-kernels host-only unit tests with an
+# explicit name filter (no GPU claim); a failure aborts before any gate runs.
 #
 # Exit non-zero if any positive run fails or any --negative-control run does
 # not print NEGATIVE CONTROL OK. Multi-rank model gates (dsv4_parity,
@@ -116,6 +118,36 @@ else
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
     BIN_DIR="$target_dir/release/examples"
 fi
+
+# ── cuda-kernels HOST-only unit tests (no GPU claim, run before gates) ──────
+# These functions are behind feature cuda but touch no device (shape
+# validation, env parsing), so they cannot join the toolchain-free CI lane.
+# The device functions are NOT listed: a pass that depends on the runner
+# lacking a GPU is not a gate. Explicit filters — never the whole crate.
+run_host_units() {
+    # Seam for the shell test (mock binaries, no toolchain): command that
+    # stands in for the cargo test invocation.
+    if [ -n "${ARLE_PARITY_HOST_UNITS_CMD:-}" ]; then
+        bash -c "$ARLE_PARITY_HOST_UNITS_CMD"
+        return
+    fi
+    # Name filters OR-match; they go after `--` (cargo accepts one positional
+    # filter itself, the rest must be forwarded to libtest).
+    cargo test --release -p cuda-kernels --features cuda --lib -- \
+        'tensor::weight_format::tests::' \
+        'tensor::device_context::tests::parse_device_ordinal'
+}
+echo "parity-batch: cuda-kernels host-only unit tests"
+if ! run_host_units >"$OUT/host-units.log" 2>&1; then
+    echo "parity-batch: host-only unit tests failed" >&2
+    tail -n 40 "$OUT/host-units.log" >&2
+    PREREG_RESULT="host unit tests failed"
+    PREREG_FINDING="cuda-kernels host-only unit tests failed before any GPU gate ran; see host-units.log"
+    PREREG_DECISION="fix the host failure before reading any parity signal"
+    prereg_done rejected
+    exit 1
+fi
+echo "parity-batch: host-only unit tests PASS"
 
 # ── Kernel build id, once ──────────────────────────────────────────────────
 kernel_id=""
