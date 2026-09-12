@@ -5,8 +5,8 @@
 #   - .github/workflows/ci.yml "Shell Contracts" step
 #
 # The list is discovered, never enumerated: every scripts/tests/test_*.sh
-# runs on both callers, so a new test cannot be in the hook but absent from CI
-# (that gap let #423's test merge "green" with CI never running it).
+# runs on both callers, so a new test cannot land in the hook but stay absent
+# from CI (a parity-batch test once merged "green" with CI never running it).
 #
 # A test that cannot run on a platform says so in its own first lines:
 #   # TEST-SKIP: linux: <reason>

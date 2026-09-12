@@ -236,7 +236,8 @@ run_fast_checks() {
         return 0
     fi
     # Discovered by the shared runner — never a hand list here (CI used to
-    # enumerate 8 of 19; #423's test merged with CI never running it).
+    # enumerate 8 of 19; a parity-batch test once merged with CI never
+    # running it).
     SHELL_TEST_CHANGED_FILES="${changed_files}" run_fast bash scripts/run_shell_tests.sh
 }
 run_fast_checks &
