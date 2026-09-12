@@ -13,6 +13,11 @@
 6. A parity gate under crates/infer-cuda/examples/ is named in an
    operators/registry.toml correctness_gate and prints the negative-control
    marker scripts/parity_gpu_batch.sh greps for.
+7. Same trigger as rule 5, but a `cargo check` passes while clippy lints are
+   denied (`-D warnings` deprecated/unused-mut lints are invisible to check),
+   so the body also needs a CLIPPY_EXIT=0 from a pod
+   `cargo clippy --workspace --all-targets --features cuda,nccl
+   -- -D warnings` run without no-cuda.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ REGISTRY_REL = "operators/registry.toml"
 
 BUILD_EXIT_OK = re.compile(r"^BUILD_EXIT=0\s*$", re.MULTILINE)
 CUDA_CHECK_EXIT_OK = re.compile(r"^CUDA_CHECK_EXIT=0\s*$", re.MULTILINE)
+CLIPPY_EXIT_OK = re.compile(r"^CLIPPY_EXIT=0\s*$", re.MULTILINE)
 CRATE_RUST_PATH = re.compile(r"^crates/([^/]+)/.*\.rs$")
 ROOT_RUST_PATH = re.compile(r"^src/.*\.rs$")
 CUDA_KERNELS_PATH = re.compile(r"^crates/cuda-kernels/")
@@ -145,21 +151,34 @@ def root_has_no_cuda(repo: Path) -> bool:
         return False
 
 
-def check_cuda_check_exit(repo: Path, base: str, changed: list[str], pr_body: str) -> list[str]:
-    if CUDA_CHECK_EXIT_OK.search(pr_body):
-        return []
-    needs = any(CUDA_KERNELS_PATH.match(p) for p in changed)
-    if not needs:
-        crates = {m.group(1) for p in changed if (m := CRATE_RUST_PATH.match(p))}
-        needs = any(crate_has_no_cuda(repo, c) for c in crates)
-    if not needs and any(ROOT_RUST_PATH.match(p) for p in changed):
-        needs = root_has_no_cuda(repo)
-    if not needs:
+def cuda_gate_triggered(repo: Path, changed: list[str]) -> bool:
+    """Rules 5 and 7 share one trigger: CUDA-only code the no-cuda lint hides."""
+    if any(CUDA_KERNELS_PATH.match(p) for p in changed):
+        return True
+    crates = {m.group(1) for p in changed if (m := CRATE_RUST_PATH.match(p))}
+    if any(crate_has_no_cuda(repo, c) for c in crates):
+        return True
+    return any(ROOT_RUST_PATH.match(p) for p in changed) and root_has_no_cuda(repo)
+
+
+def check_cuda_check_exit(repo: Path, changed: list[str], pr_body: str) -> list[str]:
+    if CUDA_CHECK_EXIT_OK.search(pr_body) or not cuda_gate_triggered(repo, changed):
         return []
     return [
         "cuda-check: diff touches Rust in a no-cuda-gated crate (or crates/cuda-kernels/); "
         "run a pod `cargo check --features cuda,nccl` WITHOUT no-cuda and put a "
         "CUDA_CHECK_EXIT=0 line in the PR body"
+    ]
+
+
+def check_clippy_exit(repo: Path, changed: list[str], pr_body: str) -> list[str]:
+    if CLIPPY_EXIT_OK.search(pr_body) or not cuda_gate_triggered(repo, changed):
+        return []
+    return [
+        "clippy-exit: diff touches Rust in a no-cuda-gated crate (or crates/cuda-kernels/); "
+        "`cargo check` runs no clippy lints, so run a pod "
+        "`cargo clippy --workspace --all-targets --features cuda,nccl -- -D warnings` "
+        "WITHOUT no-cuda and put a CLIPPY_EXIT=0 line in the PR body"
     ]
 
 
@@ -208,7 +227,8 @@ def run(repo: Path, pr_body: str) -> list[str]:
     failures += check_comments(added)
     failures += check_abs_paths(added)
     failures += check_build_exit(added, pr_body)
-    failures += check_cuda_check_exit(repo, base, changed, pr_body)
+    failures += check_cuda_check_exit(repo, changed, pr_body)
+    failures += check_clippy_exit(repo, changed, pr_body)
     failures += check_gate_registry(repo, changed)
     return failures
 
@@ -281,7 +301,7 @@ def selftest() -> int:
                 "crates/x/Cargo.toml": "[features]\nno-cuda = []\n",
             },
             EXEMPT_BODY,
-            "CUDA_CHECK_EXIT=0\n",
+            "CUDA_CHECK_EXIT=0\nCLIPPY_EXIT=0\n",
             None,
         ),
         (
@@ -316,12 +336,40 @@ def selftest() -> int:
                 "Cargo.toml": "[features]\nno-cuda = [\"cli/no-cuda\"]\n",
             },
             EXEMPT_BODY,
-            "CUDA_CHECK_EXIT=0\n",
+            "CUDA_CHECK_EXIT=0\nCLIPPY_EXIT=0\n",
             None,
         ),
         (
             "cuda-check root crate without feature passes",
             {"src/main.rs": "fn main() {}\n", "Cargo.toml": "[features]\ncuda = []\n"},
+            EXEMPT_BODY,
+            "",
+            None,
+        ),
+        (
+            "clippy-exit missing despite check marker",
+            {
+                "crates/x/src/lib.rs": "pub fn x() {}\n",
+                "crates/x/Cargo.toml": "[features]\nno-cuda = []\n",
+            },
+            EXEMPT_BODY,
+            "CUDA_CHECK_EXIT=0\n",
+            "clippy-exit",
+        ),
+        (
+            "clippy-exit present",
+            {
+                "crates/x/src/lib.rs": "pub fn x() {}\n",
+                "crates/x/Cargo.toml": "[features]\nno-cuda = []\n",
+            },
+            EXEMPT_BODY,
+            "CUDA_CHECK_EXIT=0\nCLIPPY_EXIT=0\n",
+            None,
+        ),
+        (
+            "clippy-exit non-cuda change unaffected",
+            {"crates/x/src/lib.rs": "pub fn x() {}\n",
+             "crates/x/Cargo.toml": "[features]\ncuda = []\n"},
             EXEMPT_BODY,
             "",
             None,
