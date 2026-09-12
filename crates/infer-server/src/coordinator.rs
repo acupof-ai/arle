@@ -808,6 +808,8 @@ struct CollectedGeneration {
     /// when the request did not ask or the backend does not surface it.
     top_logprobs: Vec<Vec<(u32, f32)>>,
     finish: Option<FinishReason>,
+    /// Prompt tokens served from prefix cache; `None` when unreported.
+    cached_prompt_tokens: Option<usize>,
 }
 
 /// RAII guard for one in-flight request: `Drop` does the `in_flight` decrement +
@@ -919,6 +921,7 @@ async fn submit_and_collect(
     let mut gen_logprobs: Vec<f32> = Vec::new();
     let mut top_logprobs: Vec<Vec<(u32, f32)>> = Vec::new();
     let mut finish: Option<FinishReason> = None;
+    let mut cached_prompt_tokens: Option<usize> = None;
     let mut error: Option<String> = None;
     while let Some(mut delta) = rx.recv().await {
         generated_tokens.extend_from_slice(&delta.token_ids);
@@ -928,6 +931,8 @@ async fn submit_and_collect(
         error = error.or(delta.error);
         if done {
             finish = delta.finish_reason;
+            // Reported once on the terminal delta; None means unreported, not 0.
+            cached_prompt_tokens = delta.cached_prompt_tokens;
             break;
         }
     }
@@ -940,7 +945,21 @@ async fn submit_and_collect(
         gen_logprobs,
         top_logprobs,
         finish,
+        cached_prompt_tokens,
     })
+}
+
+fn combine_choice_cached(acc: Option<usize>, next: Option<usize>) -> Option<usize> {
+    // The n>1 choices share one encoded prompt (counted once) and each attaches
+    // to that same prefix, so their cached counts are equal and prompt-scoped:
+    // take the max, not a sum (which would read ~n× the real reuse). A None
+    // choice (unreported) never masks a measured one.
+    match (acc, next) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 fn encode(state: &CoordinatorHandle, text: &str) -> Result<Vec<u32>, ApiError> {
@@ -1220,8 +1239,12 @@ async fn completions(
                     let final_chunk =
                         completion_stream_chunk(&id, created, &model, tail, Some(fr), None);
                     let usage_chunk = include_usage.then(|| {
-                        let usage = serde_json::to_value(Usage::new(prompt_len, completion_count))
-                            .unwrap_or_default();
+                        let usage = serde_json::to_value(Usage::with_cached(
+                            prompt_len,
+                            completion_count,
+                            delta.cached_prompt_tokens,
+                        ))
+                        .unwrap_or_default();
                         stream_usage_chunk(&id, created, &model, "text_completion", usage)
                     });
                     let _ = chunk_tx
@@ -1326,6 +1349,7 @@ async fn completions(
         return_token_ids.then_some(outcome.generated_tokens),
         prompt_token_ids,
         logprobs_value,
+        outcome.cached_prompt_tokens,
     ))
     .into_response())
 }
@@ -1462,6 +1486,7 @@ async fn chat_completions(
                 split_thinking,
                 tool_calls,
                 None,
+                delta.cached_prompt_tokens,
             ))
             .into_response());
         }
@@ -1649,9 +1674,18 @@ async fn chat_completions(
                     );
                     let usage_chunk = include_usage.then(|| {
                         let usage = if thinking {
-                            Usage::with_reasoning(prompt_len, completion_count, reasoning_count)
+                            Usage::with_reasoning_cached(
+                                prompt_len,
+                                completion_count,
+                                reasoning_count,
+                                delta.cached_prompt_tokens,
+                            )
                         } else {
-                            Usage::new(prompt_len, completion_count)
+                            Usage::with_cached(
+                                prompt_len,
+                                completion_count,
+                                delta.cached_prompt_tokens,
+                            )
                         };
                         let usage = serde_json::to_value(usage).unwrap_or_default();
                         stream_usage_chunk(&id, created, &model, "chat.completion.chunk", usage)
@@ -1683,6 +1717,9 @@ async fn chat_completions(
         let want_lps = request.logprobs.unwrap_or(false);
         let mut total_completion_tokens = 0usize;
         let mut total_reasoning_tokens = 0usize;
+        // Summed across prompt choices; `None` total only if every choice left
+        // it unreported, so one measured choice is never masked to zero.
+        let mut total_cached_prompt_tokens: Option<usize> = None;
         for i in 0..n {
             let mut params = sampling.clone();
             params.seed = Some(sampling.seed.unwrap_or(0).wrapping_add(i as u64));
@@ -1695,6 +1732,8 @@ async fn chat_completions(
             )
             .await?;
             total_completion_tokens += outcome.generated_tokens.len();
+            total_cached_prompt_tokens =
+                combine_choice_cached(total_cached_prompt_tokens, outcome.cached_prompt_tokens);
             total_reasoning_tokens +=
                 count_reasoning_tokens(&outcome.generated_tokens, state.think_token_ids, thinking);
             let decoded = decode(&state, &outcome.generated_tokens)?;
@@ -1733,13 +1772,18 @@ async fn chat_completions(
             });
         }
         let usage = if thinking {
-            Usage::with_reasoning(
+            Usage::with_reasoning_cached(
                 prompt_tokens.len(),
                 total_completion_tokens,
                 total_reasoning_tokens,
+                total_cached_prompt_tokens,
             )
         } else {
-            Usage::new(prompt_tokens.len(), total_completion_tokens)
+            Usage::with_cached(
+                prompt_tokens.len(),
+                total_completion_tokens,
+                total_cached_prompt_tokens,
+            )
         };
         return Ok(Json(ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -1790,6 +1834,7 @@ async fn chat_completions(
         split_thinking,
         tool_calls,
         logprobs_value,
+        outcome.cached_prompt_tokens,
     ))
     .into_response())
 }
@@ -2072,6 +2117,7 @@ async fn anthropic_messages(
         thinking,
         tool_calls,
         None,
+        outcome.cached_prompt_tokens,
     );
     Ok(Json(anthropic::MessagesResponse::from_chat(&chat, emit_thinking)).into_response())
 }
@@ -2218,5 +2264,30 @@ mod dp_failure_domain_tests {
             .err()
             .expect("dead group must reject submits");
         assert!(err.message().contains("torn down"), "{}", err.message());
+    }
+}
+
+#[cfg(test)]
+mod choice_cached_tests {
+    use super::combine_choice_cached;
+
+    #[test]
+    fn repeated_shared_prefix_is_max_not_sum() {
+        // n>1 choices share one prompt and all reuse the same prefix. With the
+        // old summing combiner, four choices × 100 cached read 400 and broke
+        // cached <= prompt; max reports the single prompt-scoped value once.
+        let mut acc: Option<usize> = None;
+        for _ in 0..4 {
+            acc = combine_choice_cached(acc, Some(100));
+        }
+        assert_eq!(acc, Some(100));
+
+        // An unreported choice never masks a measured one.
+        assert_eq!(combine_choice_cached(Some(100), None), Some(100));
+        assert_eq!(combine_choice_cached(None, None), None);
+
+        // If choices genuinely disagree, max keeps the largest real value
+        // rather than averaging them away.
+        assert_eq!(combine_choice_cached(Some(100), Some(60)), Some(100));
     }
 }

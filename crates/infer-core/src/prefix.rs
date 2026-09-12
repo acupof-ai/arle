@@ -162,6 +162,7 @@ impl Engine {
         if restored_len == 0 {
             self.record_prefix_restore_metrics(0);
             request.prefill_start_pos = 0;
+            request.cached_prompt_tokens = Some(0);
             request.reused_prefix_pages = Vec::new();
             request.phase = RequestPhase::Prefilling { progress: 0 };
             return Ok(());
@@ -173,6 +174,7 @@ impl Engine {
         );
         self.record_prefix_restore_metrics(restored_len);
 
+        request.cached_prompt_tokens = Some(restored_len);
         request.prefill_start_pos = restored_len;
         request.reused_prefix_pages = prefix_match.block_ids;
         request.phase = if request.prefill_start_pos == target {

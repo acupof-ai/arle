@@ -125,6 +125,10 @@ pub struct CompletedRequest {
     pub handle: RequestHandle,
     pub prompt_tokens: Vec<u32>,
     pub generated_tokens: Vec<u32>,
+    /// This request's prompt tokens served from prefix cache. `None` means the
+    /// deployment did not measure it (prefix cache disabled); `Some(0)` means
+    /// measured with no reuse. Carried to the OpenAI `cached_tokens` field.
+    pub cached_prompt_tokens: Option<usize>,
     pub finish: Option<FinishReason>,
     pub submitted_at: std::time::Instant,
     pub first_token_at: Option<std::time::Instant>,
@@ -332,6 +336,11 @@ struct RequestState {
     sampling: SamplingParams,
     phase: RequestPhase,
     prefill_start_pos: usize,
+    /// This request's prompt tokens served from prefix cache, captured once at
+    /// attach (`restored_len`). `None` until measured (prefix cache disabled) —
+    /// distinct from `Some(0)` (enabled, no reuse). Not read back from
+    /// `prefill_start_pos`, which chunked prefill mutates into a moving cursor.
+    cached_prompt_tokens: Option<usize>,
     reused_prefix_pages: Vec<BlockId>,
     /// Whole-slot tier key while this request's complete restore image is
     /// swapped out. Re-admission promotes and resumes decode; generated tokens
@@ -378,6 +387,7 @@ impl RequestState {
             sampling,
             phase: RequestPhase::Prefilling { progress: 0 },
             prefill_start_pos: 0,
+            cached_prompt_tokens: None,
             reused_prefix_pages: Vec::new(),
             swap_key: None,
             swap_seq_len: 0,
@@ -442,6 +452,7 @@ impl RequestState {
     fn reset_for_recompute(mut self) -> Self {
         self.phase = RequestPhase::Prefilling { progress: 0 };
         self.prefill_start_pos = 0;
+        self.cached_prompt_tokens = None;
         self.reused_prefix_pages.clear();
         // Store-entry lifetime is the caller's job (drop before reset); the
         // key is cleared so a recomputed request can never promote stale state.
@@ -501,6 +512,7 @@ impl From<RequestState> for CompletedRequest {
             handle: request.handle,
             prompt_tokens: request.prompt_tokens,
             generated_tokens: request.generated_tokens,
+            cached_prompt_tokens: request.cached_prompt_tokens,
             finish: request.finish,
             submitted_at: request.submitted_at,
             first_token_at: request.first_token_at,

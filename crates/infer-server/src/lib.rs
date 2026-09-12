@@ -728,6 +728,7 @@ fn relay_stream(
             execution::StreamItem::Done(completed) => multiproc_relay::RelayCompletionDelta {
                 finish: true,
                 finish_reason: completed.finish.clone(),
+                cached_prompt_tokens: completed.cached_prompt_tokens,
                 ..Default::default()
             },
         };

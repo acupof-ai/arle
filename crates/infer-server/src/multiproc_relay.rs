@@ -653,6 +653,11 @@ pub struct RelayCompletionDelta {
     #[serde(default)]
     pub top_logprobs: Vec<Vec<(u32, f32)>>,
     pub finish: bool,
+    /// This request's prompt tokens served from prefix cache. `None` (the
+    /// serde default) means the worker did not report it; a delta without the
+    /// field means "unreported", never zero. Terminal delta only.
+    #[serde(default)]
+    pub cached_prompt_tokens: Option<usize>,
     /// Finish reason on the terminal delta, so the coordinator reports the real
     /// OpenAI `finish_reason` rather than always "stop".
     pub finish_reason: Option<infer_plan::FinishReason>,
@@ -1526,5 +1531,34 @@ mod tests {
         };
         assert_eq!(hits("a"), Some(15));
         assert_eq!(hits("b"), Some(7));
+    }
+
+    #[test]
+    fn cached_prompt_tokens_absent_by_default_not_zero() {
+        // A serialized terminal delta that omits the optional field (version
+        // skew, or reuse unmeasured) deserializes to None, not 0.
+        let mut json = serde_json::to_value(RelayCompletionDelta {
+            finish: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(json.remove("cached_prompt_tokens").is_some());
+        let absent: RelayCompletionDelta =
+            serde_json::from_value(serde_json::Value::Object(json)).unwrap();
+        assert_eq!(absent.cached_prompt_tokens, None);
+
+        // An explicit value round-trips.
+        let with = RelayCompletionDelta {
+            finish: true,
+            cached_prompt_tokens: Some(7),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("\"cached_prompt_tokens\":7"));
+        let back: RelayCompletionDelta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cached_prompt_tokens, Some(7));
     }
 }
