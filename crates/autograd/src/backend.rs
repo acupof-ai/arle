@@ -744,7 +744,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// the infer engine's pool allocations during a weight reload can collide
     /// with the train backward's still-outstanding pool ops — handing out the
     /// same physical block twice and dropping reloaded side buffers (observed
-    /// as the W4A8 "missing Marlin-packed side buffer" on the teacher reload).
+    /// as a missing-Marlin-side-buffer load error (NVFP4 Fp4Marlin) on the teacher reload).
     /// A full train-side device sync orders the train work ahead of the reload.
     fn device_synchronize(&self) -> Result<()> {
         Ok(())

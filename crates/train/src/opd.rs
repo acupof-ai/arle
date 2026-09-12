@@ -88,7 +88,7 @@ pub enum EngineOffloadMode {
     Student,
     /// Offload ONLY the scoring teacher; keep student resident. Frees ~3.0 GB
     /// and avoids the student↔teacher offload interleaving that corrupts the
-    /// W4A8 Marlin reload under `All`.
+    /// NVFP4 Fp4Marlin reload under `All`.
     Teacher,
 }
 

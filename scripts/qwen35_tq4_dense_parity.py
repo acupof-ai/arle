@@ -26,7 +26,6 @@ QUANT_SUFFIXES = (
     ".g_idx",
     ".marlin_qweight",
     ".marlin_scales",
-    ".marlin_w4a8_qweight",
 )
 
 
