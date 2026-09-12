@@ -9,9 +9,14 @@ spec-decode). Ends with a survey of the latest spec-decode practice
 
 > **Line numbers are point-in-time snapshots (2026-06-29 `main`).** They drift
 > across checkouts. Re-grep the **symbol names** (stable anchors) before
-> trusting an exact line: e.g. `forward_tokens_stream_impl`,
-> `try_flashmla_decode_attention`, `deepgemm_grouped_experts`, `csa_select`,
-> `commit_accepted_fold`, `kv_budget_num_slots`, `flashmla_device_page_table`.
+> trusting an exact line: e.g. `forward_tokens_stream_impl`
+> (`dsv4/prefill.rs`), `layer_dsa_and_flashmla_batch_mut`
+> (`attention/kv_layout.rs`), `deepgemm_grouped_experts` (`moe/dsv4.rs`),
+> `csa_select` (`attention.rs`), `commit_accepted_fold` (`dsv4/slot.rs`),
+> `kv_budget_plan` (`dsv4/budget.rs`), `refresh_flashmla_device_page_tables`
+> (`dsv4/slot.rs`). The monolithic `dsv4.rs`/`attention.rs` were split into the
+> `dsv4/` and `attention/` module dirs; the symbol names survive, the bare
+> `dsv4.rs:line` citations below do not.
 
 Companion docs: [architecture.md](architecture.md) (crate boundaries),
 [codebase-map.md](codebase-map.md) (where to start reading),
@@ -29,21 +34,22 @@ Two CUDA model families ride this path, selected by `model_type` /
 
 ## 0. Top-level dispatch — who routes prefill vs decode
 
-`Dsv4Model::forward_tokens` → `forward_tokens_impl` (`dsv4.rs:1882 / 1917`) is the
+`Dsv4Model::forward_tokens` → `forward_tokens_impl` (`dsv4/prefill.rs:49`) is the
 single-sequence entry. **Prefill and eager-decode share one function**
-(`forward_tokens_stream_impl`, `dsv4.rs:4661`), forking on `seq_len` (token count)
+(`forward_tokens_stream_impl`, `dsv4/prefill.rs:80`), forking on `seq_len` (token count)
 and `start_pos_device` (filled only when `seq_len==1`).
 
 ```
-forward_tokens_impl (dsv4.rs:1917)
+forward_tokens_impl (dsv4/prefill.rs:49)
 └─ forward_tokens_stream_impl ← prefill (seq_len>1) AND decode (seq_len==1)
 
-forward_decode_batch (dsv4.rs:2125) → forward_decode_batch_stream_impl (dsv4.rs:2175)
- → batched decode lane, MODEL1-only, concurrency lever #60 → decode_lane_fwd (dsv4.rs:3275)
+forward_decode_batch (executor/dsv4.rs:423 → dsv4/decode_batch.rs:14)
+ → forward_decode_batch_stream_impl (dsv4/decode_batch.rs:77)
+ → batched decode lane, MODEL1-only, concurrency lever #60 → decode_lane_fwd
+   (attention/flashmla.rs:1191)
 
-forward_tokens_verify_scheduled (dsv4.rs:2054) ← MTP spec-decode chain verify (frozen)
-forward_tokens_verify_stream_persistent (dsv4.rs:4351)
-forward_decode_batch_verify (dsv4.rs:3858)
+forward_tokens_verify_scheduled (dsv4/spec_verify.rs:66) ← MTP spec-decode chain verify (frozen)
+forward_tokens_verify_stream_persistent (dsv4/spec_verify.rs:117)
 ```
 
 Per layer, `forward_tokens_stream_impl` runs two HC-wrapped halves:
@@ -110,8 +116,8 @@ RoPE / indexer) + `mla_attention_fwd` (the attention kernel).
 
 Three physical lanes share the same kernels. **B=1 always takes the eager
 single-row lane**: `forward_decode_batch` early-returns to the single-row path
-when `rows.len()==1` (`executor.rs:2798`) — the batched lane never executes at
-B=1.
+when `batch.rows.len()==1` (`executor/dsv4.rs:459`) — the batched lane never
+executes at B=1.
 
 ### 2.1 Eager decode (`forward_tokens_stream_impl`, `seq_len==1` branch)
 
@@ -120,22 +126,24 @@ head-slab all-gather (`attention.rs:2750`), the attn O-LoRA all-reduce
 (`dsv4.rs:5055`), and the MoE all-reduce (`dsv4.rs:5308`). lm_head is
 replicated (full-vocab GEMV per rank, `dsv4.rs:6286`) and sampling is
 rank-local, so the step total is exactly `3 × num_hidden_layers`.
-MODEL1 (`w_kc/w_vc/o_proj` all `None`) → `mla_attention_decode_graph`
-(`dsv4.rs:4859`, eager call does not capture); V32/GLM → `mla_attention`
-(`dsv4.rs:4881`). Attention core = `try_flashmla_decode_attention`
-(`attention.rs:6746`):
+MODEL1 and V32/GLM both go through `mla_attention_decode` for the eager
+single-row decode (`attention.rs:3092`; the MODEL1 batched path uses
+`layer_dsa_and_flashmla_batch_mut`, `attention/kv_layout.rs:948`). Attention
+core is the FlashMLA sparse-decode path (`sparse_decode_fwd_batched`,
+`attention/flashmla.rs:874`):
 
 1. **Write KV (FP8 pack)**: `flashmla_pack_sw_ring` / `flashmla_pack_one_sw_token`
  / `flashmla_pack_compressed_delta` (`attention.rs:6819/6824/6836`, hand-rolled
  `csrc/attention/dsv4_fp8_kv_pack.cu`).
-2. **Read-side page table**: `pool.flashmla_device_page_table(slot)`
- (`attention.rs:6870`). **Fixed**: eager decode now routes the device page
- table (the historic `None` at ~`attention.rs:6496` is stale — 6496 is now in
- the prefill function body).
-3. **Build decode indices**: `dsv4_flashmla_decode_build_indices_start_pos_ptr`
- (`attention.rs:6875`; kernel `csrc/attention/dsv4_flashmla_decode_build_indices.cu:186`).
+2. **Read-side page table**: the device page table is routed via
+ `refresh_device_page_table` (`attention/flashmla.rs:223`) /
+ `refresh_flashmla_device_page_table` (`attention/dsa.rs:1040`); eager decode
+ resolves it from the engine page identity, not slot arithmetic.
+3. **Build decode indices**: `_flashmla_decode_build_indices_start_pos_ptr_raw`
+ (`attention.rs:1920`; kernel `csrc/attention/dsv4_flashmla_decode_build_indices.cu:186`).
 4. **Decode attention kernel** = `arle_flashmla_sm90_sparse_decode_fwd`
- (`attention.rs:7016`; shim `csrc/attention/arle_flashmla_decode_shim.cu:204`) →
+ (shim `csrc/attention/arle_flashmla_decode_shim.cu:204`, wrapped by
+ `sparse_decode_fwd_batched` `attention/flashmla.rs:874`) →
  **vendored FlashMLA `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`
  + `run_flash_mla_combine_kernel`** (SM90 sparse-FP8 split-KV decode).
 
@@ -149,19 +157,21 @@ is opt-in:
 - LL transport (opt-in) = DeepEP `internode_ll` dispatch/combine (NVSHMEM
  IBGDA, **FP8 e4m3 packed in-flight**).
 - Small-batch bypass: `total_routes ≤ 8` → `dsv4_moe_forward_decode_fp8`
- (`moe.rs:2918`), a hand-rolled warp-per-row w8a16 grouped GEMV (not DeepGEMM).
+ (`moe/dsv4.rs:1306`), a hand-rolled warp-per-row w8a16 grouped GEMV (not DeepGEMM).
 - **Comm-overlap**: shared expert runs on `comm_stream` concurrent with the
  routed all-reduce (`dsv4.rs:4989/5140`, pipeline fence).
 
 ### 2.2 Batched decode lane (`forward_decode_batch_stream_impl`, MODEL1-only, lever #60)
-`decode_lane_fwd` (`attention.rs:2510`): `build_indices_batched` (per-row page
-table) → `sched_meta_for_batch` → **one** batched
-`arle_flashmla_sm90_sparse_decode_fwd` over n rows (`attention.rs:2218`). This is
-the **21→76 slot concurrency payoff** executor (commit `5352e247`, TP=4/EP=4,
-max_seq=16384, ~3.62×).
+`decode_lane_fwd` (`attention/flashmla.rs:1191`): `build_indices_batched`
+(`attention/flashmla.rs:762`, per-row page table) → `sched_meta_for_batch`
+(`attention/flashmla.rs:829`) → **one** batched
+`arle_flashmla_sm90_sparse_decode_fwd` (`sparse_decode_fwd_batched`
+`attention/flashmla.rs:874`) over n rows. This is
+the **21→76 slot concurrency payoff** executor (the phase-1 batched serving
+license, #60; TP=4/EP=4, max_seq=16384, ~3.62×).
 
 ### 2.3 LM-head tail (all lanes)
-`forward_stream_last_token` (`dsv4.rs:4285`): last-token wide-stream row → head HC
+`forward_stream_last_token` (`dsv4/head.rs:103`): last-token wide-stream row → head HC
 fold (MODEL1) / `copy_row_to_vec` (GLM) → final `rms_norm_vec` →
 `lm_head_project` (GEMV, replicated full-vocab per rank) → `sample_cuda_token`
 (the NON-scratched sampler: greedy argmax allocs a 1-int scratch every token,
@@ -288,9 +298,10 @@ config-driven (GLM-DSA 32/128/2048, a DSv4 fixture 64/128/512).
 - **FP8 store** (`fused_store_indexer_cache_kernel`, `.cu:334`): page=8448B/64slot,
  per-slot `[128B fp8 key][4B f32 scale]=132B`; `page=index>>6, offset=index&63`.
 - **Fixed-band sidecar — NOT in the FlashMLA page pool**:
- `Dsv4LayerKvLayout.dsa_key_cache` (`attention.rs:262`, FP8, full history, what
- the scoring kernel reads), summed as `state_caches_per_slot` in
- `kv_budget_num_slots` (`dsv4.rs:1645`). The FP8 cache still grows linearly with
+ `Dsv4LayerKvLayout.dsa_key_cache` (FP8, full history, what
+ the scoring kernel reads), summed into the per-slot device-bytes budget in
+ `kv_budget_plan` via `per_slot_device_bytes` (`dsv4/budget.rs:169,315`). The
+ FP8 cache still grows linearly with
  `max_seq` and is restored as part of `Dsv4SlotSnapshot`; it is not yet a
  page-granular radix-tier object. The bf16 `rotated_keys` is **no longer** a
  full-history mirror: as
@@ -405,10 +416,10 @@ attention KV pool, where MODEL1 uses e8m0.)
 MTP input-combine/output-head tensors (`enorm/hnorm/e_proj/h_proj/head_hc/norm`).
 Loaded only when `spec_decode_on && num_nextn_predict_layers>0`; asserts exactly
 one nextn layer; forced `compress_ratio=0` (SlidingWindow). Proposal
-`mtp_forward_level` (`dsv4.rs:5303`): `h' = e_proj(enorm(emb)) + h_proj(hnorm(h_prev))`
+`mtp_forward_level` (`dsv4/mtp.rs:8`): `h' = e_proj(enorm(emb)) + h_proj(hnorm(h_prev))`
 → one full layer (reads the **frozen target layer's** committed KV ring,
 `mtp_frozen_target_layer_idx`) → head + `mtp_topk_device`. Chain `draft_chain`
-(`spec_decode.rs:582`): `depth = --mtp-draft-tokens` clamped `[1,8]`, default 2;
+(`executor/spec_decode.rs:148`): `depth = --mtp-draft-tokens` clamped `[1,8]`, default 2;
 topk default 1 (only widens candidate matching, adds no verify rows).
 
 ### 6.2 Chain verify (one FlashMLA sparse call per layer)
@@ -421,9 +432,9 @@ one sparse pass verifies all `depth+1` rows with exact chain causality,
 **without writing the slot's rolling SW cache**.
 
 ### 6.3 Accept + commit-fold
-`accept_path` (`spec_decode.rs:190`): a row extends the path only if the verify
+`SpecChain::accept_path` (`infer-plan/src/spec.rs:451`): a row extends the path only if the verify
 argmax both is in that row's top-k *and* equals the drafted token; first mismatch
-stops, target argmax becomes the bonus. `commit_accepted_fold` (`dsv4.rs:1806`)
+stops, target argmax becomes the bonus. `commit_accepted_fold` (`dsv4/slot.rs:683`)
 **re-ingests the persisted attn-normed rows** (each layer's `normed` was D2D-copied
 into `slot.spec_normed[layer]` during verify, `dsv4.rs:4814`) rather than re-running
 a full forward, then `flashmla_alloc_append(m)` + `seq_len=start_pos+m`. Rejected
@@ -432,7 +443,8 @@ rows are never gathered.
 ### 6.4 Rollback snapshot — full mutated-buffer enumeration
 This is the area `AGENTS.md` flags as the hard-won EAGLE bug (`truncate_decode_len`
 once restored only `compressed.seq_len`, missing `pending_kv`/`prev_overlap`/
-`sw_window`/`fp8_kv_pool` ring slots). Order (`spec_decode.rs:327`):
+`sw_window`/`fp8_kv_pool` ring slots). Order (orchestrated in
+`executor/spec_decode.rs`, the truncation itself at `dsv4/slot.rs:648`):
 `truncate_slot(start_pos) → restore_spec_ring_tail → commit_accepted_fold`. Snapshot
 `Dsv4SpecRingSnapshot` (`attention.rs:3295`) taken pre-draft, pre-allocated per
 (slot,layer), D2D (no per-step alloc).
@@ -491,13 +503,16 @@ CUDA-only. The B=1 adaptive-MTP skip and its `--mtp-adaptive` flag were removed;
 >
 > **The wall is trigger, and capacity is unmeasured.**
 > [baselines](baselines.md)' DSv4 DSpark arm reads ~no-op because
-> `--dspark-max-prompt-tokens 64` routes multi-k-token prompts to no-spec: not
-> measured, not ineffective. On capacity, a 2026-07-14 binary logged an explicit
+> a 2026-07-14 binary's prompt gate routed multi-k-token prompts to no-spec
+> (the DSpark-specific prompt-length flag has since been removed; only the
+> generic `--max-prompt-tokens` remains): not measured, not ineffective. On
+> capacity, that same 2026-07-14 binary logged an explicit
 > `DSpark draft reserve 19000MB → pool_total 141MB, affordable 1`; **that reserve
 > term no longer exists.** At HEAD `load_dspark_draft` shards the draft's experts
 > and attention through the same `ExpertSplit`/`TpConfig` as the trunk (≈1/EP of
 > the ~20 GB fp8 draft per rank), and the only budget term is a small per-slot
-> `latent_kv + attn` over `sliding_window + block_size` (`executor/dsv4.rs:560`).
+> `latent_kv + attn` over `sliding_window + block_size` (`dsv4/budget.rs`, the
+> draft-span term `sliding_window + dspark_block_size`).
 > Read the budget line at HEAD before designing anything.
 >
 > Paper: *DSpark: Confidence-Scheduled Speculative Decoding with
@@ -595,25 +610,25 @@ Priority follows measured TP=4 B=4 wall-clock/kernels.
 
 | Concern | Symbol | File |
 |---------|--------|------|
-| Forward dispatch | `forward_tokens_impl`, `forward_tokens_stream_impl` | `dsv4.rs` |
-| Batched decode lane | `forward_decode_batch_stream_impl`, `decode_lane_fwd` | `dsv4.rs`, `attention.rs` |
-| MLA attention | `mla_attention`, `mla_attention_prepare`, `mla_attention_fwd` | `attention.rs` |
-| FlashMLA decode | `try_flashmla_decode_attention`, `sparse_decode_fwd_batched` | `attention.rs` |
-| FlashMLA prefill | `try_flashmla_prefill_attention` | `attention.rs` |
+| Forward dispatch | `forward_tokens_impl`, `forward_tokens_stream_impl` | `dsv4/prefill.rs` |
+| Batched decode lane | `forward_decode_batch_stream_impl`, `decode_lane_fwd` | `dsv4/decode_batch.rs`, `attention/flashmla.rs` |
+| MLA attention | `mla_attention`, `mla_attention_decode`, `mla_attention_prepare`, `mla_attention_fwd` | `attention.rs` |
+| FlashMLA decode | `layer_dsa_and_flashmla_batch_mut`, `sparse_decode_fwd_batched` | `attention/kv_layout.rs`, `attention/flashmla.rs` |
+| FlashMLA prefill | `flashmla_prefill_attention` | `attention.rs` |
 | FP8 KV pack | `flashmla_pack_*`, `dsv4_fp8_kv_pack.cu` | `attention.rs`, `csrc/attention/` |
 | DSA indexer | `csa_select`, `csa_select_official`, `dsv4_dsa_official.cu` | `attention.rs`, `csrc/attention/` |
 | Paged MQA logits | `dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda` | `deepgemm_native.cu` |
-| MoE routing | `dsv4_route`, `dsv4_route.cu` | `moe.rs`, `csrc/moe/` |
-| Grouped GEMM | `deepgemm_grouped_experts*`, `sm90_fp8_gemm_1d2d_impl` | `moe.rs`, `vendor/deepgemm/` |
-| DeepEP transport | `dsv4_moe_forward_deepep{,_ll}`, `deepep.rs` | `moe.rs`, `infer-cuda/src/` |
-| MTP spec-decode | `Dsv4MtpLayer`, `forward_tokens_verify_scheduled`, `commit_accepted_fold` | `dsv4.rs` |
-| Rollback snapshot | `Dsv4SpecRingSnapshot`, `truncate_decode_len`, `restore_spec_ring_tail` | `attention.rs` |
-| KV budget | `kv_budget_num_slots`, `dsv4_dsa_key_cache_bytes` | `dsv4.rs`, `attention.rs` |
+| MoE routing | `dsv4_route`, `dsv4_route.cu` | `moe/dsv4.rs`, `csrc/moe/` |
+| Grouped GEMM | `deepgemm_grouped_experts*`, `sm90_fp8_gemm_1d2d_impl` | `moe/dsv4.rs`, `vendor/deepgemm/` |
+| DeepEP transport | `dsv4_moe_forward_deepep{,_ll}`, `deepep.rs` | `moe/dsv4.rs`, `infer-cuda/src/` |
+| MTP spec-decode | `Dsv4MtpLayer`, `forward_tokens_verify_scheduled`, `commit_accepted_fold` | `dsv4/weights.rs`, `dsv4/spec_verify.rs`, `dsv4/slot.rs` |
+| Rollback snapshot | `Dsv4SpecRingSnapshot`, `truncate_decode_len`, `restore_spec_ring_tail` | `attention/dsa.rs`, `dsv4/slot.rs` |
+| KV budget | `kv_budget_plan` (`per_slot_device_bytes`), `dsv4_dsa_key_cache_bytes` | `dsv4/budget.rs`, `attention/dsa.rs` |
 
 ## References
 
 - Stage-B shared-pool payoff: `experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md`
-- B=1 graph wash: `experience/errors/2026-06-10-dsv4-wholestep-graph-production-path-wash-rekill.md`
+- B=1 decode graph (measured facts + open question; the original whole-step graph wash entry was retired): `experience/errors/2026-07-07-dsv4-foundation-lever-investigation.md`
 - EAGLE rollback bug: `AGENTS.md` §0.1 (DSv4 EAGLE rollback, 2026-06-06)
-- MoE i32 overflow (masked vs contiguous): `experience/errors/2026-06-05-dsv4-prefill-moe-i32-overflow-crash.md`
+- MoE i32 overflow (masked vs contiguous): `experience/errors/2026-09-09-dsv4-prefill-i32-overflow-doc-claim-stale.md` (supersedes the 2026-06-05 claim entry)
 - DSpark: *Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation*, DeepSeek × PKU, 2026-06-27 (DeepSpec, MIT)
