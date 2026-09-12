@@ -194,8 +194,8 @@ INFER_MOE_TOP_K=6 ./target/release/arle serve --backend metal \
 ### `MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` (MLX upstream)
 
 Tune MLX's per-command-buffer commit cadence. Defaults vary by Apple
-Silicon tier (40/40 on base/pro, 50/50 on Max/Ultra) — see
-`mlx/backend/metal/device.cpp:498-522`. **Recommended for any Metal
+Silicon tier (40 on base/pro, 50 on Max/Ultra) — see
+`mlx/backend/metal/device.cpp:340-360`. **Recommended for any Metal
 bench at c≥8**: export `MLX_MAX_OPS_PER_BUFFER=200
 MLX_MAX_MB_PER_BUFFER=200`. With Qwen3.6 MoE forward at c≥8, the MLX
 defaults force 4–5 implicit `commandBuffer.commit()` per decode step;
@@ -444,21 +444,14 @@ Default: `python3`
 
 ### `INFER_TEST_MODEL_PATH`
 
-Override model path for infer-side GPU tests.
-
-**Backend defaults**:
-- **Metal**: `mlx-community/Qwen3.6-35B-A3B-4bit` (canonical, see
- `AGENTS.md` §"Metal canonical model"). Use `INFER_TEST_MODEL_PATH`
- to opt down to a smaller model for fast iteration on dense-only
- paths.
-- **CUDA**: `models/Qwen3.5-4B` (canonical for CUDA bench/test scripts).
+Model directory for the Metal train→save→load→generate SFT smoke
+`scripts/train_and_chat.sh`. Default `models/Qwen3-0.6B`; override to point
+the smoke at a different local model. It is read only by that shell script —
+no Rust test reads it, and there is no `e2e` cargo test target.
 
 Example:
 
 ```bash
-# CUDA — use a smaller model for a quick e2e test:
-INFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release --test e2e
-
 # Metal — bench the canonical Qwen3.6 35B-A3B MoE:
 ./target/release/arle serve --backend metal \
  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
