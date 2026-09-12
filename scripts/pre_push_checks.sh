@@ -246,7 +246,8 @@ run_fast_checks() {
         test_hook_skips_shell_tests.sh \
         test_parity_gpu_batch.sh \
         test_lane_new_rollback.sh \
-        test_bench_ab_control_arm.sh; do
+        test_bench_ab_control_arm.sh \
+        test_dspark_flashqla_verify.sh; do
         run_fast bash "scripts/tests/${test}"
     done
 }
