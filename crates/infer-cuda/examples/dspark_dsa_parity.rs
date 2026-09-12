@@ -85,6 +85,9 @@ mod real {
 
     // Kernel accumulates head_dim*kv_len f32 products then rounds to bf16 once.
     // The final bf16 store dominates; bound is element-wise slope+floor.
+    // The mechanism (f32 dot accumulation, single bf16 store, f32-vs-f64
+    // softmax) is stated here but no per-constant supremum is computed from the
+    // kv_len/head_dim counts; the three values are clean-run-set and need one.
     const ATTN_REL_L2_MAX: f64 = 4e-2;
     const ATTN_ABS_FLOOR: f32 = 2e-2;
     const ATTN_ABS_SLOPE: f32 = 5e-2;
@@ -103,7 +106,10 @@ mod real {
     // bug produces order-unity deviations, so the slope stays discriminating.
     const FP8_ABS_SLOPE: f32 = 8e-2;
     const FP8_ABS_FLOOR: f32 = 3e-2;
-    // Scale = row abs-max/448 over bf16-rounded inputs.
+    // Scale = row abs-max/448 over bf16-rounded inputs. The scale value comes
+    // from a bf16 amax, whose worst-case RN rel error is half a bf16 ULP,
+    // 2^-8 ≈ 3.9e-3; 1e-2 is ~2.5x that and also absorbs one-bin amax
+    // disagreement between the f32 and f64 reductions.
     const SCALE_REL_MAX: f32 = 1e-2;
 
     fn bf(v: f32) -> bf16 {

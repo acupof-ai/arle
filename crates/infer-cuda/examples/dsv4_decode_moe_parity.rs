@@ -72,6 +72,13 @@ mod real {
     const BATCHES: &[usize] = &[1, 8];
     // Relative-L2 + per-element slope/floor bounds (two fp8 operands, ~K/128
     // scale-block accumulations; floor covers near-zero outputs rel-L2 can't).
+    // e4m3 RN rms rel error is (2^-4)/sqrt(3) ≈ 3.1% per operand; the two
+    // operands are independent block quantizations, so the product rms is
+    // 3.1%*sqrt(2) ≈ 4.4%; 6% adds the single bf16 output store. The per-element
+    // slope 0.10 reflects the two-operand worst-bin sum 2*6.25% ≈ 12.5%
+    // discounted for the measure-zero simultaneous-worst case, so it is NOT a
+    // hard supremum; a strict bound would be 0.125. The floor covers near-zero
+    // outputs and is clean-run-set.
     const MAX_REL_L2: f64 = 0.06;
     const ABS_SLOPE: f64 = 0.10;
     const ABS_FLOOR: f64 = 2e-2;

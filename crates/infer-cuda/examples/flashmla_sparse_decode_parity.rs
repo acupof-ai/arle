@@ -100,7 +100,11 @@ mod real {
     // dominant-key channel is quantization-exact and only small random keys
     // contribute bounded error (E4M3 worst half-ULP 1/16 in the top binade;
     // they land in much tighter low binades). Pre-GPU analytic caps, to be
-    // confirmed/tightened from the measured run.
+    // confirmed/tightened from the measured run. PACK_NOPE_REL 0.07 specifically
+    // clears the pure-repack e4m3 RN supremum: worst bf16 value rounding down a
+    // bin over the smallest shared e4m3 value is 16/272 ≈ 0.0588, f32-scale
+    // bind 17/273 ≈ 0.0623, correct packs measure ≤0.044. PACK_ROPE_ABS 0.01
+    // (bf16-only rope channel) and the LSE 0.10 caps are not separately derived.
     const PASS_MAX_REL_OUT: f64 = 0.05;
     const PASS_MAX_ABS_LSE: f64 = 0.10;
     const PACK_NOPE_REL: f64 = 0.07;
