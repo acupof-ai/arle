@@ -34,10 +34,12 @@
 //! are both covered. EP is a single rank owning the contiguous
 //! `[0, experts_per_rank)` window, swept 32→256.
 //!
-//! `--negative-control` runs one pipeline per regime and sabotages each
-//! comparison family (route / counts / offsets / pack / weights / combine)
-//! independently, asserting that family trips. It prints NEGATIVE CONTROL OK
-//! and exits 0; the teeth assertions are internal.
+//! `--negative-control` runs one pipeline per regime and sabotages seven
+//! comparison families (route / counts / offsets / pack / m_indices / weights /
+//! combine) independently, asserting each trips and the others stay green. The
+//! eighth family, totals, has no sabotage because it is derived
+//! (`total = Σ counts`, aligned_total = aligned scan end) — see the comment at
+//! run(). It prints NEGATIVE CONTROL OK and exits 0; the teeth are internal.
 //!
 //! Run on a pod:
 //! `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/moe_routing_parity`
@@ -298,12 +300,16 @@ mod real {
         );
 
         if negative {
-            // Per-family teeth: one pipeline per mode (mid geometry), then six
-            // one-sided sabotages, each of which only its own comparator must
-            // catch. Only the six sabotaged families are asserted here; totals
-            // and m_indices share the offsets/counts comparators and get their
-            // teeth transitively, so this gate's negative control is not shaped
-            // as all-eight-must-fail and stays on its bespoke tail.
+            // Seven one-sided sabotages, each of which only its own comparator
+            // must catch (route/counts/offsets/pack/m_indices/weights/combine).
+            // The eighth family, Totals, has no sabotage by construction:
+            // `total = Σ counts` and `aligned_total` is the end of the aligned
+            // scan over counts, so there is no value to perturb that breaks a
+            // total while leaving counts/offsets correct. The Totals positive
+            // comparator still guards the scan accumulator directly. m_indices
+            // IS independently sabotaged because it is a separate kernel
+            // (dsv4_fill_m_indices_from_counts) whose output could be wrong with
+            // counts/offsets/pack all correct.
             for &mode in MODES {
                 let bundle = pipeline(&ctx, mode, 8, 64)?;
                 verify_negative_teeth(&bundle)?;
@@ -781,7 +787,15 @@ mod real {
             anyhow::ensure!(f.get(&clean), "negative baseline already failing `{f:?}`");
         }
 
-        for name in ["route", "counts", "offsets", "pack", "weights", "combine"] {
+        for name in [
+            "route",
+            "counts",
+            "offsets",
+            "pack",
+            "m_indices",
+            "weights",
+            "combine",
+        ] {
             let mut expected = b.clone();
             match name {
                 "route" => expected.got_indices[0] ^= 1,
@@ -797,17 +811,48 @@ mod real {
                         expected.orc.packed_route_slot[0] ^= 1;
                     }
                 }
+                "m_indices" => {
+                    // Distinct kernel (dsv4_fill_m_indices_from_counts): flip a
+                    // guaranteed-LIVE expert row, never a -1 pad slot. The live
+                    // index comes from the oracle but is applied to got_m; this
+                    // lines up only because the all-green baseline asserted
+                    // above guarantees got and oracle agree at that index. counts /
+                    // offsets / pack are separate precomputed fields and stay
+                    // green, so a red here isolates a fill bug.
+                    let live = expected
+                        .orc
+                        .m_indices
+                        .iter()
+                        .position(|&v| v >= 0)
+                        .expect("m-indices has at least one routed expert row");
+                    expected.got_m_indices[live] ^= 1;
+                }
                 "weights" => expected.got_weights[0] = expected.got_weights[0].mul_add(2.0, 1.0),
                 "combine" => expected.exp_combined[0] += 1.0,
                 _ => unreachable!(),
             }
             let fam = expected.compare(name, NEAR_TIE_EPS);
+            let target = Family::by_name(name);
             anyhow::ensure!(
-                !Family::by_name(name).get(&fam),
+                !target.get(&fam),
                 "negative control did NOT trip `{name}` — comparator is dead"
             );
+            // Specificity: the sabotaged family is the ONLY one red. The oracle
+            // stores every derived quantity (offsets/total/aligned_total/
+            // m_indices/pack) as independently precomputed fields, so corrupting
+            // one after construction does not propagate to the others; an
+            // over-broad sabotage that also reddens a sibling means the two
+            // comparators are not measuring independent things and fails here.
+            for other in Family::all() {
+                if *other != target {
+                    anyhow::ensure!(
+                        other.get(&fam),
+                        "sabotage `{name}` collateral-tripped `{other:?}` — comparators not independent"
+                    );
+                }
+            }
         }
-        eprintln!("[{tag}] negative teeth OK (6 families each trip on their own corruption)");
+        eprintln!("[{tag}] negative teeth OK (7 families trip, each alone)");
         Ok(())
     }
 
@@ -917,6 +962,7 @@ mod real {
                 "route" => Family::Route,
                 "counts" => Family::Counts,
                 "offsets" => Family::Offsets,
+                "m_indices" => Family::MIndices,
                 "pack" => Family::Pack,
                 "weights" => Family::Weights,
                 "combine" => Family::Combine,
