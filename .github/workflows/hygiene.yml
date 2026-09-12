@@ -10,7 +10,7 @@ name: Hygiene
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, probe/docs-red ]
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
