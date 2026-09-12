@@ -63,7 +63,53 @@ new)
     path="$LANES/$name"
     [ -e "$path" ] && { echo "lane: $path already exists" >&2; exit 2; }
     git -C "$ROOT" fetch --quiet origin main 2>/dev/null || true
-    git -C "$ROOT" worktree add -b "lane/$name" "$path" main
+    branch_existed=0
+    git -C "$ROOT" show-ref --verify --quiet "refs/heads/lane/$name" && branch_existed=1
+    # Undo the add. The rm target is safe because the `[ -e "$path" ]`
+    # precheck above proved the path absent immediately before the add: this
+    # removes only what the add created (the charset validator and `--` are
+    # secondary defense). Shared by the nonzero-return and the
+    # returned-0-but-unregistered forms.
+    rollback_add() {
+        rm -rf -- "$path"
+        git -C "$ROOT" worktree prune
+        if [ "$branch_existed" -eq 0 ]; then
+            git -C "$ROOT" branch -D "lane/$name" >/dev/null 2>&1 || true
+        fi
+    }
+    # worktree add can create the directory and branch and then fail before
+    # registering the worktree; without cleanup the stray directory makes the
+    # precheck block every retry while being invisible to `worktree remove`.
+    if ! git -C "$ROOT" worktree add -b "lane/$name" "$path" main; then
+        rollback_add
+        echo "lane: worktree add failed; removed $path" >&2
+        exit 1
+    fi
+    # A zero return with no live registration (the form actually observed:
+    # another process removed the worktree between add and here), OR the
+    # directory gone entirely, must reach the same rollback. Three traps:
+    #  - the check cannot be rev-parse --is-inside-work-tree: a stranded
+    #    directory inside the main checkout resolves to the PARENT repo;
+    #  - a registered linked worktree is its own top level, so compare its
+    #    toplevel to its own path;
+    #  - the cd is inside a condition: a missing dir must not trip set -e and
+    #    abort before the branch rollback (a left-behind lane/<name> makes the
+    #    name permanently unusable: the next add fails on the branch and keeps
+    #    it because branch_existed is then 1).
+    registered=0
+    if [ -d "$path" ]; then
+        if real_path="$(cd "$path" && pwd -P)"; then
+            # rev-parse fails (set -e) on an unregistered dir; `|| true` keeps
+            # the failure as an empty toplevel -> registered stays 0.
+            toplevel="$(git -C "$path" rev-parse --path-format=absolute --show-toplevel 2>/dev/null || true)"
+            [ "$toplevel" = "$real_path" ] && registered=1
+        fi
+    fi
+    if [ "$registered" -eq 0 ]; then
+        rollback_add
+        echo "lane: $path was not a live registered work tree after add; removed it" >&2
+        exit 1
+    fi
     echo
     echo "lane $name ready:"
     echo "  cd $path"
