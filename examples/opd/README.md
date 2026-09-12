@@ -95,7 +95,7 @@ against the held-out eval use, validates tokenization, records `max_tokens`
 as the actual tokenized prompt length capped at 512, and drops 4 MMLU rows
 that exceeded 512 tokens. The file carries only the prompt/completion records;
 the construction notes are recorded in
-[2026-05-24-gkd-real-corpus-tape-oom-kill.md](../../docs/experience/errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md).
+`2026-05-24-gkd-real-corpus-tape-oom-kill.md` (entry purged 2026-07-22).
 
 License attribution:
 

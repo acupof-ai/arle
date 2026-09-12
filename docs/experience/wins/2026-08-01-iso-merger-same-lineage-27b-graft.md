@@ -3,7 +3,8 @@
 > Status: **method validated**. Same-lineage Qwen3.6-27B: base +
 > ThinkingCap (reasoning RL) + Huihui (de-censoring RL) → one merge that keeps
 > TC's reasoning (MMLU 0.808, GSM8K 0.949) *and* answers what TC refuses. Data-free,
-> no rollouts/gradients/distillation. Tool: [`scripts/iso_merger.py`](../../../scripts/iso_merger.py).
+> no rollouts/gradients/distillation. Tool: `scripts/iso_merger.py`
+> (history-only one-off, removed 2026-09-11).
 
 ## Context
 

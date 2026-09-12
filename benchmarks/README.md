@@ -16,7 +16,7 @@ links to). Stale micro-benches from deleted code paths get archived, not quoted.
 
 512-in / 128-out · temp=0 · median of 6 · build `4ea77e11` · decode = single-stream generation rate.
 Snapshot: [`snapshots/2026-06-14-metal-m4pro-ladder.json`](snapshots/2026-06-14-metal-m4pro-ladder.json) ·
-wins: [2026-06-14-bench-metal-m4pro-local-model-ladder](../docs/experience/wins/2026-06-14-bench-metal-m4pro-local-model-ladder.md)
+wins: `2026-06-14-bench-metal-m4pro-local-model-ladder` (entry purged 2026-07-22)
 
 | Model · Metal 4-bit | Decode | TPOT | TTFT |
 |---|---:|---:|---:|
@@ -54,9 +54,9 @@ not re-measured here — provenance is the linked wins):
 
 | Metric | Value | Source |
 |---|---:|---|
-| B=1 decode | 53.3 tok/s (42.7 ms/forward-step, ~2.3 tok/step MTP) | [d2-chain-fold](../docs/experience/wins/2026-06-13-dsv4-mtp-d2-chain-fold-53.md) |
-| B=1 prefill | 23 ms | [decode-6ms-FINAL](../docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md) |
-| c=8 batched lane | 45.6 → 67.6 tok/s (+48%) | [batched-flashmla-phaseA](../docs/experience/wins/2026-06-14-dsv4-batched-flashmla-decode-phaseA.md) |
+| B=1 decode | 53.3 tok/s (42.7 ms/forward-step, ~2.3 tok/step MTP) | `2026-06-13-dsv4-mtp-d2-chain-fold-53` (entry purged 2026-07-22) |
+| B=1 prefill | 23 ms | `2026-06-08-dsv4-decode-6ms-FINAL-consolidated` (entry purged 2026-07-22) |
+| c=8 batched lane | 45.6 → 67.6 tok/s (+48%) | `2026-06-14-dsv4-batched-flashmla-decode-phaseA` (entry purged 2026-07-22) |
 
 ## Snapshot index
 

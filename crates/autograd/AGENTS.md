@@ -235,7 +235,7 @@ that strengthens the runtime spine). It must stay narrow:
 
 ## Related memories
 
-- [`feedback_no_half_states.md`](~/.claude/projects/-Users-bytedance-code-agent-infer/memory/feedback_no_half_states.md)
-- [`feedback_matched_ab_for_small_bench_effects.md`](~/.claude/projects/-Users-bytedance-code-agent-infer/memory/feedback_matched_ab_for_small_bench_effects.md)
+- `feedback_no_half_states.md` (agent working memory, not in the repo)
+- `feedback_matched_ab_for_small_bench_effects.md` (agent working memory, not in the repo)
 </content>
 </invoke>
