@@ -21,7 +21,9 @@
 8. An ADDED line under docs/ may not cite a backticked short sha (7-12 hex)
    that does not resolve to a commit in THIS repository. Existing lines are
    not scanned, so historical dead shas are left alone; a sha attributed to an
-   upstream project is allowed via an explicit upstream cue.
+   upstream project is allowed via an explicit upstream cue. Known limit: a
+   dead sha whose short form is all decimal digits cannot be distinguished
+   from an ordinary number and is intentionally not matched.
 """
 
 from __future__ import annotations
@@ -318,9 +320,20 @@ REGISTRY_OTHER = 'correctness_gate = "crates/infer-cuda/examples/other_parity.rs
 
 
 
+# Selftest worlds pin commit dates: a sha prefix the cases cite is derived from
+# the commit timestamp, so wall-clock dates make a world nondeterministic — when
+# the 9-char prefix happens to be all decimal digits the sha regex (which must
+# reject plain decimals) stops matching and the dead-sha arm spuriously passes.
+PINNED_GIT_ENV = {
+    "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
+    "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+}
+
+
 def world(files: dict[str, str], body: str) -> Path:
     root = Path(tempfile.mkdtemp(prefix="precheck-world-"))
-    g = lambda *a: subprocess.run(["git", *a], cwd=root, check=True, capture_output=True)
+    env = dict(os.environ, **PINNED_GIT_ENV)
+    g = lambda *a: subprocess.run(["git", *a], cwd=root, check=True, capture_output=True, env=env)
     g("init", "-q")
     g("config", "user.email", "t@t")
     g("config", "user.name", "t")
@@ -506,10 +519,13 @@ def selftest() -> int:
     # Branch-only sha world: a real commit that lives only on the lane, not on
     # the merge-base, is the rebase/squash death. Two lane commits — a work
     # commit then a doc that cites it — so the cited sha exists in the object
-    # store but is not an ancestor of origin/main.
+    # store but is not an ancestor of origin/main. Dates are pinned because the
+    # cited 9-char prefix derives from the commit timestamp; an all-decimal
+    # prefix (~1.5%) would not match the sha regex, which must reject decimals.
     root = Path(tempfile.mkdtemp(prefix="precheck-world-"))
     try:
-        g = lambda *a: subprocess.run(["git", *a], cwd=root, check=True, capture_output=True)
+        env = dict(os.environ, **PINNED_GIT_ENV)
+        g = lambda *a: subprocess.run(["git", *a], cwd=root, check=True, capture_output=True, env=env)
         g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
         (root / ".base").write_text("b"); g("add", ".base")
         g("commit", "-q", "-m", "base"); g("branch", "-M", "main"); g("branch", "origin/main")
