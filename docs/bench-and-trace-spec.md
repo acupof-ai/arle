@@ -132,9 +132,9 @@ Rules:
 
 `scripts/bench_multiturn_ttft.py` measures what a coding-agent session feels:
 one conversation, `--turns` (default 12) turns, a `--system-words` system
-prompt (default ~4.8K tokens) and `--tool-words` of synthetic tool output per
-turn (default ~350 tokens), every turn re-sending the whole history over
-`/v1/chat/completions`. Content and the assistant replies are fixed, so two
+prompt (default 4500 words, ~6K tokens) and `--tool-words` of synthetic tool
+output per turn (default 300 words, ~400 tokens), every turn re-sending the
+whole history over `/v1/chat/completions`. Content and the assistant replies are fixed, so two
 servers receive byte-identical requests. Report turn 1 (cold), the median of
 turns 2..N, and turn N; always `--warmup` so turn 1 is prefill, not model
 load. A cross-server row needs the same weights on the same machine in the
@@ -255,8 +255,19 @@ insufficient.
 - Capture server logs and `/v1/stats` before and after every point.
 - A 200 response with empty output, missing usage, incomplete stream, or retry
   exhaustion is a failure, not throughput.
-- ITL is valid only when each non-empty SSE event carries one completion token;
-  the runner rejects event/token count mismatches instead of reporting chunk latency.
+- ITL is measured per non-empty SSE **event**, not per token: the runner
+  records one timestamp per chunk (`itl` / `output_events`), increments
+  `output_events`, and never compares it to the completion-token count — there
+  is no event/token mismatch rejection. One timestamp is a per-token interval
+  only when one event carries exactly one token. Under MTP or speculative
+  decode a single event can carry multiple accepted tokens, so the reported ITL
+  is then a per-event quantity and cannot be converted to per-token without a
+  tokens-per-event count the runner does not capture (it records only the
+  aggregate `completion_tokens` from final usage). Treat decode `tok/s`
+  (`1000 / ITL mean`, §1) as per-token only on a one-token-per-event
+  configuration; on a multi-token-per-event configuration it is an
+  events-per-second figure. This is a known measurement gap, not a validated
+  gate.
 - Cold-load time is separate from request TTFT. Report it independently.
 
 ## 6. Duration and stop rules
