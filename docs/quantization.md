@@ -11,28 +11,34 @@ with concrete evidence.
 > - **scale** = per-tensor / per-channel / per-group / per-(token, head),
 > plus what numeric range it normalizes to (e.g. FP8 E4M3 absmax = 448,
 > INT8 = 127).
-> - **status** uses one of: `production` (default-safe), `opt-in`
-> (verified for known use cases, not auto-default), `experimental`
-> (works but quality not gated), `known-broken` (reproduces a logged
-> failure today), `not-shipped` (planned).
+> - **status** uses the same vocabulary as [`support-matrix.md`](support-matrix.md):
+> `production` (default-safe, optionally with a parenthetical scope), `opt-in`
+> (verified but enabled by an explicit flag, not the default), `experimental`
+> (works but quality not gated, with a scope), `deferred` (accepted by config
+> but no runtime arm), or `not implemented` (no code path).
 
 ---
 
 ## 0. At a glance
 
+> Where a support level here disagrees with [`support-matrix.md`](support-matrix.md),
+> the support matrix is canonical; this page gives the mechanism, the matrix
+> gives the shipped readiness.
+
 | Axis | Format | Status | Enable | Notes |
 |---|---|---|---|---|
 | **KV cache** | BF16 | production | `--kv-cache-dtype bf16` | Reference fallback. CUDA-paged + Metal. The only value DSv4 accepts. |
-| KV cache | INT8 | production (Metal default + CUDA) | `--kv-cache-dtype int8`; Metal `auto` resolves to int8 | Metal stores full-attention K/V as MLX affine 8-bit packed triples (`uint32 data + bf16 scale/bias`, group 128/64/32 by head_dim). CUDA uses per-(token, head) scales for K and V (/127); decode on `paged_attention_quantized_fa3.cu`. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
-| KV cache | FP8 E4M3 | production (CUDA, opt-in) | `--kv-cache-dtype fp8` | Per-(token, head) scales for K and V (/448). Same code shape as INT8 modulo quant range. **CUDA: Qwen3.5/3.6 family only** — DSv4 rejects any non-BF16 value at engine construction (`infer-api/src/loaded.rs:2054`); its MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
-| KV cache | TurboQuant TQ4 | deferred (CUDA) | `--kv-cache-dtype tq4` (the clap enum accepts `auto\|bf16\|int8\|fp8\|tq4` — there is no `tq2`/`tq3`, `args.rs:927`) | No runtime arm: engine construction bails with an explicit-deferral message (`infer-cuda/src/executor.rs:100`). |
+| KV cache | INT8 | production (Metal default + CUDA) | `--kv-cache-dtype int8`; Metal `auto` resolves to int8 | Metal stores full-attention K/V as MLX affine 8-bit packed triples (`uint32 data + bf16 scale/bias`, group 128/64/32 by head_dim). CUDA uses per-(token, head) scales for K and V (/127); decode on `paged_attention_quantized_fa3.cu`. **CUDA: Qwen3.5/3.6 family only** — a non-BF16 value bails at engine construction for any non-Qwen35 kind (`infer-api/src/loaded.rs:1020`); DSv4 MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
+| KV cache | FP8 E4M3 | opt-in (CUDA) | `--kv-cache-dtype fp8` | Per-(token, head) scales for K and V (/448). Same code shape as INT8 modulo quant range. **CUDA: Qwen3.5/3.6 family only** — a non-BF16 value bails at engine construction for any non-Qwen35 kind (`infer-api/src/loaded.rs:1020`); DSv4 MLA KV is already FP8-packed at 584 B/token regardless of the flag (`infer-cuda/src/dsv4/budget.rs:39-88`). |
+| KV cache | TurboQuant TQ4 | deferred (CUDA) | `--kv-cache-dtype tq4` (the clap enum accepts `auto\|bf16\|int8\|fp8\|tq4` — there is no `tq2`/`tq3`, `args.rs:941`) | No runtime arm: engine construction bails with an explicit-deferral message (`infer-cuda/src/executor.rs:108`). |
 | **Weights** | DenseBF16 | production | default | No quantization. |
-| Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4_gemv` + Marlin W4 prefill. |
+| Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4a16_gemv` + Marlin W4 prefill. |
 | Weights | W8A16 (per-group INT8) | production (CUDA) | safetensors metadata | GEMV + GEMM path. |
-| Weights | W2A16 (per-group packed INT2) | experimental (CUDA) | safetensors metadata | Enum variant `WeightFormat::W2A16` exists; no load or kernel scaffolding is wired; not gate-validated. |
-| Weights | GGUF Q3_K / Q4_K / Q5_K / Q6_K | production (CUDA & Metal) | `.gguf` extension | Packed superblock kernels in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`. |
-| Weights | DSv4 FP8 E4M3 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp8BlockScaled` format; CUDA V4 attention/MoE/MTP kernels are the runtime blocker. |
-| Weights | DSv4 FP4 E2M1 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp4BlockScaled`; same DSv4 dependency chain. |
+| Weights | W2A16 (per-group packed INT2) | not implemented | safetensors metadata | Enum variant `WeightFormat::W2A16` exists; no load or kernel scaffolding is wired; not gate-validated. |
+| Weights | GGUF Q4_K / Q5_K / Q6_K | experimental (Vulkan & HIP; not served on CUDA or Metal) | `.gguf` extension | Packed superblock kernels live in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`, but they are consumed only by the HIP path (`infer-hip/src/model.rs` calls `q4k/q5k/q6k_gemv_cuda`); Vulkan CPU-dequants in `infer-vulkan/src/loader.rs`. `infer-cuda` and `infer-metal` have no `infer-gguf` dependency and no GGUF loader branch, so there is no CUDA/Metal edge. |
+| Weights | GGUF Q3_K | not implemented (no host launcher on any backend) | `.gguf` extension | Parsed by `infer-gguf/src/gguf.rs`, but there is no host launcher or gemv kernel on Vulkan, HIP, CUDA, or Metal. |
+| Weights | DSv4 FP8 E4M3 block-scaled | production (CUDA, TP=8/EP=8) | DSv4 checkpoints | `Dsv4Fp8BlockScaled` dispatched on the serving path — attention/route GEMV `crates/infer-cuda/src/attention.rs:341,4943`, grouped MoE in `moe/dsv4.rs`, loader `dsv4/load.rs:928`. |
+| Weights | DSv4 FP4 E2M1 block-scaled | production (CUDA, TP=8/EP=8) | DSv4 checkpoints | `Dsv4Fp4BlockScaled` dispatched one sibling line down — `attention.rs:353,4951`, `dsv4/load.rs:929`, FP4 grouped MoE + `marlin_fp4`. |
 
 > **Default policy** (`--kv-cache-dtype auto`): Metal resolves `auto` to INT8
 > full-attention KV after the 2026-06-11 long-context gate. CUDA keeps its
@@ -89,34 +95,35 @@ hardware FP8 conversion.
  `KVFormat::FP8E4M3`.
 - **Decode-attn kernel**: `paged_attention_quantized_fa3.cu` (shared with
  INT8; format selects the dequant idiom).
-- **Status**: production (CUDA); same gate as INT8.
+- **Status**: opt-in (CUDA); same gate as INT8.
 
 ### 1.4 TurboQuant TQ4
 
 Deferred. `--kv-cache-dtype tq4` is accepted by the CLI but fails loud at
-engine construction (`infer-cuda/src/executor.rs:100`); the pack/unpack and
+engine construction (`infer-cuda/src/executor.rs:108`); the pack/unpack and
 decode-attention kernels were removed with the TurboQuant weight format.
 
 ---
 
 ## 2. Weight quantization (CUDA)
 
-All weight formats live in `crates/cuda-kernels/src/tensor.rs::WeightFormat`;
-kernels live in `crates/cuda-kernels/csrc/gemm/`. Format detection at
-safetensors load runs in the CUDA weight loader (`crates/infer-cuda/src/loader.rs`).
+All weight formats live in `crates/cuda-kernels/src/tensor/weight_format.rs::WeightFormat`
+(re-exported from `tensor.rs`); kernels live in `crates/cuda-kernels/csrc/gemm/`.
+Format detection at safetensors load runs in the CUDA weight loader
+(`crates/infer-cuda/src/loader.rs`).
 
 | Format | Bits | Scale | Kernel | Status |
 |---|---|---|---|---|
 | `DenseBf16` | 16 | n/a | `cublasLt` / cublasGemmEx | production |
-| `W8A16` | 8 | per-group BF16 | `gemv_w8a16` | production |
-| `W4A16` | 4 packed | per-group BF16 | `w4_gemv_kernel` + Marlin W4 prefill | production |
-| `W2A16` | 2 packed | per-group BF16 | none (enum variant only) | experimental |
-| `GgufQ3K` | 3 packed (superblock) | embedded | `gguf_q3k_gemv` | production (CUDA + Metal) |
-| `GgufQ4K` | 4 packed (superblock) | embedded | `q4k_gemv_kernel` + packed fast path | production (CUDA + Metal) |
-| `GgufQ5K` | 5 packed (superblock) | embedded | `gguf_q5k_gemv` | production (CUDA + Metal) |
-| `GgufQ6K` | 6 packed (superblock) | embedded | `gguf_q6k_gemv` | production (CUDA + Metal) |
-| `Dsv4Fp8BlockScaled` | 8 (E4M3) | per-block FP8 E8M0 | DSv4-specific | in progress (DSv4 dependency) |
-| `Dsv4Fp4BlockScaled` | 4 packed (E2M1) | per-block FP8 E8M0 | DSv4-specific | in progress (DSv4 dependency) |
+| `W8A16` | 8 | per-group BF16 | `w8a16_gemv_cuda` | production |
+| `W4A16` | 4 packed | per-group BF16 | `w4a16_gemv_cuda` + Marlin W4 prefill | production |
+| `W2A16` | 2 packed | per-group BF16 | none (enum variant only) | not implemented |
+| `GgufQ3K` | 3 packed (superblock) | embedded | none (no host launcher) | not implemented (no backend) |
+| `GgufQ4K` | 4 packed (superblock) | embedded | `q4k_gemv_cuda` (HIP call only) | experimental (HIP; Vulkan CPU-dequant); not CUDA/Metal |
+| `GgufQ5K` | 5 packed (superblock) | embedded | `q5k_gemv_cuda` (HIP call only) | experimental (HIP; Vulkan CPU-dequant); not CUDA/Metal |
+| `GgufQ6K` | 6 packed (superblock) | embedded | `q6k_gemv_cuda` (HIP call only) | experimental (HIP; Vulkan CPU-dequant); not CUDA/Metal |
+| `Dsv4Fp8BlockScaled` | 8 (E4M3) | per-block FP8 E8M0 | DSv4-specific GEMV + grouped MoE | production (CUDA, TP=8/EP=8) |
+| `Dsv4Fp4BlockScaled` | 4 packed (E2M1) | per-block FP8 E8M0 | DSv4-specific GEMV + FP4 grouped MoE / Marlin FP4 | production (CUDA, TP=8/EP=8) |
 
 ### 1.5 Metal INT8 (MLX affine groups)
 
@@ -162,62 +169,26 @@ Source: the `--kv-cache-dtype` CLI parser in `crates/cli`, carried through
 
 | Test | What it runs | What it proves | What it does NOT prove |
 |---|---|---|---|
-| `cargo test --test kv_precision_parity` | Boots scheduler per precision, sends string prompts via the IncomingRequest path, greedy decode, compares token trajectories vs the BF16 result. | The audit dispatch path produces the same/different token-IDs across precisions. Includes a **degenerate-baseline guard** (added 2026-05-27) that warns when the BF16 reference is a single-token repetition — that condition makes `mean_match` a noise-fidelity metric, not a quality metric. | Anything about generation *quality*. Greedy + base/chat LM + long prompts collapse to `!`-loops and INT8 reads as "perfect" because it faithfully reproduces the junk. |
-| `cargo test --test kv_fp8_prefill_logit_parity` | BF16 vs FP8 raw logit deltas via the scheduler's `forward_raw_logits` (token-by-token decode loop, **not** batched paged prefill). | Single-token decode kernels produce sensible per-vocab logits. Last A100 run: `max_abs=0.000000, argmax_bf16=16, argmax_fp8=16, argmax_match=true, top1_val=17.625`. | Batched paged prefill correctness — the path the production scheduler uses for real prompts is *not* exercised here. |
+| `cargo run -p infer-cuda --features cuda --example paged_quant_attn_parity` (`crates/infer-cuda/examples/paged_quant_attn_parity.rs`) | Boots the engine per KV precision, sends the needle ladder through the serving path, and compares the quantized paged-attention result against the BF16 envelope; carries a `--negative-control` arm. | Quantized INT8/FP8 paged decode answers the same needles as BF16 at the served geometry. | Anything about generation *quality* on open-ended prompts; a needle ladder is retrieval, not a distributional comparison. |
 | `scripts/bench_throughput.py` | OpenAI-compatible streaming requests over a checked JSONL workload. Measures throughput, TTFT, and ITL. | Throughput and latency under load. Kernels run. | Independent output quality; use decoded cases and the model-specific correctness gate. |
 | HuggingFace transformers reference | `AutoModelForCausalLM.from_pretrained(..., torch_dtype=bfloat16) + greedy generate` on the same prompt + chat template. | Independent ground truth for what greedy *should* generate. On Qwen3-4B chat + Eiffel Tower ChatML prompt: first 8 tokens `[151667, 198, 32313, 11, 279, 1196, 3855, 448]` = `"<think>\nOkay, the user started with"`. | Anything about ARLE's runtime kernels — it's a different stack entirely. |
 
-**Reading the matrix**: a precision passing
-`kv_precision_parity` means the bytes match BF16. A precision passing
-`kv_fp8_prefill_logit_parity` means single-token decode logits are
-clean. Neither implies "matches the HF reference on a chat prompt"
-— that comparison is what the 2026-05-27 chain exposed as missing.
+**Reading the matrix**: passing the paged-quant attention parity example
+means the quantized pool answers BF16's needles at the served shape; it does
+not imply "matches the HF reference on an open chat prompt", which is a
+separate quality comparison.
 
 ---
 
 ## 5. Retired paths
 
 The dense Qwen3 CUDA path (HD128 TileLang paged prefill, per-channel K
-KV quantization, fused-dequant decode) was removed 2026-08-22; the
-investigation record lives under `docs/experience/errors/2026-05-26-*`.
+KV quantization, fused-dequant decode) was removed 2026-08-22; the record is
+[`wins/2026-08-22-delete-qwen3-dense-cuda-and-kivi.md`](experience/wins/2026-08-22-delete-qwen3-dense-cuda-and-kivi.md).
 
 ---
 
-## 6. Cross-references
-
-**Recent errors (chronological)**:
-- `errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md` — the
- retract chain; `mean_match` under a degenerate `!`-loop reference is
- noise-fidelity, not quality.
-- `errors/2026-05-26-kivi-per-channel-k-insufficient-for-qwen3-4b-fp8.md`
- — retracted; the metric was invalid.
-- `errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md` — the
- "precision-floor compounding" hypothesis from f50dd674. Needs
- re-evaluation under a non-degenerate reference once the paged-prefill
- investigation closes.
-- `errors/2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill.md` —
- TurboQuant tensor-local fixes don't gate full-model logits parity.
-- `errors/2026-05-02-qwen3-fp8-kv-numerical-tier1-fail.md`,
- `2026-05-05-fp8-kv-tier1-still-fail.md` — earlier FP8 KV failure
- characterizations also relied on `mean_match`; the retract chain
- applies.
-
-**Recent wins**:
-- `wins/2026-05-26-bench-int8-vs-bf16-kv-a100.md` — throughput numbers,
- independent of the quality investigation.
-
-**Commits central to this matrix**:
-- `25c7d409` fix(cuda): remove FP8 quant `s_scale` 1e-6 floor.
-- `e0c283d1` fix(cuda): recursive `rerun-if-changed` for csrc/ subdirs
- (so .cu edits actually trigger rebuilds).
-- `228d6eb8` test(kv-tier): don't force `INFER_DETERMINISTIC` + document
- scheduler-path bug.
-- `9259fe13` test(kv-tier): natural-continuation prompt 0 + document
- repetition-penalty wiring gap.
-
----
-
-## 7. Update rule
+## 6. Update rule
 
 If the status of any quantization scheme changes (new format, fix
 lands, kill decision):
