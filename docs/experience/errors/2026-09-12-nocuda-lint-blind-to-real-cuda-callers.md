@@ -75,11 +75,39 @@ Rule addition: when the library first compiles clean under real CUDA, the gate
 must include `--all-targets`; example and bench targets carry their own
 unverified code and fail independently of the lib.
 
+## Fourth instance: test targets (autograd CUDA-only tests)
+
+The fourth case was the remaining target class: integration **tests**. After
+the lib, root-crate, and example targets were clean, a pod
+`cargo clippy --workspace --all-targets --features cuda,nccl,deepep
+-- -D warnings` failed in two autograd `tests/` files that compile only under
+real CUDA:
+
+- `test_cuda_marlin_fp4_share.rs:179` — `CudaStream::memcpy_stod`, deprecated
+  in cudarc (`-D deprecated`); use `clone_htod`.
+- `test_linear_attention.rs:1997,2035` — two `Fn` closures bound `mut`
+  (`unused-mut`); their mutable state is local or passed by parameter, not
+  captured.
+
+`cargo check` reports none of these — check type-compiles but does not run
+clippy lints — which is why the rule-5 `CUDA_CHECK_EXIT` gate let all four
+instances through. With this case the blind spot covers the whole target
+matrix: lib (#368), the root crate (#370 Vulkan), examples (#375 train), and
+tests (this fix). The pod gate therefore has to be
+`cargo clippy --workspace --all-targets --features cuda,nccl -- -D warnings`
+without `no-cuda`, not `cargo check`.
+
 ## Rule
 
 For any crate whose CUDA code is `#[cfg(not(feature = "no-cuda"))]`, the
 no-cuda lint is necessary but not sufficient: it proves the stub/feature surface
 compiles, not that the CUDA code does. Every change that deletes, hides, or
-renames an item in those crates needs a real-CUDA `cargo check --features
-cuda,nccl` (pod, no `no-cuda`) before merge, and a "zero callers" deletion claim
-must grep the `cfg(not(no-cuda))` code, not just the no-cuda-compiled tree.
+renames an item in those crates needs a real-CUDA gate (pod, no `no-cuda`)
+before merge, and a "zero callers" deletion claim must grep the
+`cfg(not(no-cuda))` code, not just the no-cuda-compiled tree. That gate must be
+`cargo clippy --workspace --all-targets --features cuda,nccl -- -D warnings`:
+`--workspace --all-targets` to cover lib, root-crate, example, bench, and test
+targets alike, and `clippy -D warnings` rather than `cargo check`, because
+deprecated-item and unused-mut lints (the fourth-instance failures) are
+invisible to check. Four separate hotfixes (#368, #370, #375, and the test
+case above) established each arm of this matrix.

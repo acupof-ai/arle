@@ -176,7 +176,7 @@ fn cuda_marlin_fp4_dequant_matches_the_serving_gemm() {
     let x: Vec<bf16> = (0..m * k)
         .map(|i| bf16::from_f32(((i % 7) as f32 - 3.0) * 0.25))
         .collect();
-    let x_dev = ctx.stream.memcpy_stod(&x).expect("H2D x");
+    let x_dev = ctx.stream.clone_htod(&x).expect("H2D x");
     let mut serve_out = ctx
         .stream
         .alloc_zeros::<bf16>(m * n)
