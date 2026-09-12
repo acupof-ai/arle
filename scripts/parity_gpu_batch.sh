@@ -372,9 +372,9 @@ for line in "${gates[@]}"; do
         n_skip=$((n_skip + 1))
         mark_notrun "$name" "$(skip_reason "$pos_log")"
     elif [ "$pos_rc" -eq 0 ] && [ -n "$pos_verdict" ]; then
-        pos_status=PASS; n_pass=$((n_pass + 1))
+        pos_status=PASS
     else
-        pos_status=FAIL; n_fail=$((n_fail + 1)); fail_names="$fail_names $name(positive rc=$pos_rc)"
+        pos_status=FAIL; fail_names="$fail_names $name(positive rc=$pos_rc)"
     fi
 
     neg_rc="-"; neg_verdict="-"; neg_status="n/a"; neg_log=""
@@ -397,7 +397,6 @@ for line in "${gates[@]}"; do
             neg_status=PASS
         else
             neg_status=FAIL
-            n_fail=$((n_fail + 1))
             if [ "$neg_rc" -ne 0 ]; then
                 fail_names="$fail_names $name(no negative control)"
             else
@@ -412,6 +411,15 @@ for line in "${gates[@]}"; do
     if [ "$neg_status" = FAIL ] || { [ "$pos_status" = FAIL ] && [ "$neg_status" != SKIP ]; }; then
         status=FAIL
     fi
+    # Count the gate, not its arms. A row whose positive passes and whose
+    # negative control fails is one FAIL; incrementing at each arm made it
+    # one pass AND one fail, so the totals exceeded the row count and the
+    # headline disagreed with the table beneath it. run_model_gate writes
+    # its own row and keeps its own counters.
+    case "$status" in
+        PASS) n_pass=$((n_pass + 1)) ;;
+        FAIL) n_fail=$((n_fail + 1)) ;;
+    esac
     tsv_reason="${fails:-—}"
     if [ "$pos_status" = SKIP ]; then tsv_reason="$(skip_reason "$pos_log")"; fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

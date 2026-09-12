@@ -213,6 +213,16 @@ grep -qE '^gate_a\tno\trequired\t0\t.*\t0\t' "$OUT2/results.tsv" \
     || { echo "FAIL: gate_a not green in dirty report" >&2; exit 1; }
 grep -q 'family-x' "$OUT2/results.tsv" \
     || { echo "FAIL: verdict FAIL lines not captured into TSV" >&2; exit 1; }
+# The headline counts gates, not arms. gate_a PASS, gate_b positive FAIL,
+# gate_c dead negative control = 1 pass and 2 fails over three rows. Counting
+# per arm scored gate_c as a pass AND a fail, so the totals exceeded the row
+# count and the headline disagreed with the table beneath it.
+grep -q 'pass=1 fail=2 skip=0' "$TMP/bad.log" \
+    || { echo "FAIL: dirty-world counts are not per gate (want pass=1 fail=2 skip=0)" >&2
+         grep 'parity-batch: pass=' "$TMP/bad.log" >&2; exit 1; }
+rows_bad="$(($(wc -l <"$OUT2/results.tsv") - 1))"
+[ "$rows_bad" -eq 3 ] \
+    || { echo "FAIL: dirty world wrote $rows_bad rows, want 3" >&2; exit 1; }
 
 # ── Host-unit failure aborts before any GPU gate runs ──
 OUT_HU="$TMP/out-hu"
@@ -298,4 +308,4 @@ grep -q 'crates/infer-cuda/examples/gate_absent.rs' "$TMP/registry-missing.log" 
 [ ! -f "$OUT_RM/results.tsv" ] \
     || { echo "FAIL: gates ran despite the missing registry example" >&2; exit 1; }
 
-echo "PASS: parity_gpu_batch mocks (host units green+red; clean green; positive fail and dead negative control red; log capped; registry missing-example red)"
+echo "PASS: parity_gpu_batch mocks (host units green+red; clean green; positive fail and dead negative control red; log capped; registry missing-example red; per-gate counts)"
