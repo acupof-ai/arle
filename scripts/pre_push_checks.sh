@@ -55,41 +55,74 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Read the push range FIRST to decide what this run must do -------------
-# Pre-push stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>.
-# Empty stdin (manual run) defaults to compiling.
+# Pre-push stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>. With no
+# stdin (a manual run) changed_files stays empty below, so the cargo steps are
+# skipped (this is pre-existing behaviour; see the SKIP_CARGO decision).
+# RELEVANCE_RE is a constant that must be defined even when the loop body never
+# runs (empty stdin, or a deletion-only push), so source the runner BEFORE the
+# loop — under `set -u` reading the variable unsourced aborts the hook.
+# shellcheck source=scripts/run_shell_tests.sh
+source "${REPO_ROOT}/scripts/run_shell_tests.sh"
 SKIP_CARGO=0
 SKIP_SHELL_TESTS=0
 METAL_WANTED="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 changed_files=""
+# A single push can carry several ref updates (e.g. `git push origin :old new`).
+# Process every non-deletion ref (continue, never break): a deletion first must
+# not mask the branch carrying bytes. The content gate runs per ref immediately;
+# the cargo/shell decisions below use the UNION of every ref's changed files.
+# This is the single range computation for the push; SKIP_CARGO and
+# SKIP_SHELL_TESTS consume the same file list, not a second diff.
+CONTENT_FAILURES=0
 while read -r _local_ref local_sha _remote_ref remote_sha; do
-    if [[ "$remote_sha" =~ ^0{40}$ ]]; then
+    if [[ "$local_sha" =~ ^0{40}$ ]]; then
+        continue   # ref deletion: nothing added, nothing to gate
+    elif [[ "$remote_sha" =~ ^0{40}$ ]]; then
         # New branch: no remote tip. The merge-base with main is the range the
         # push actually adds; HEAD~1 covers a repo with no origin.
         base="$(git -C "${REPO_ROOT}" merge-base HEAD origin/main 2>/dev/null || echo HEAD~1)"
-        changed_files="$(git -C "${REPO_ROOT}" diff --name-only "${base}..HEAD" 2>/dev/null || true)"
+        ref_files="$(git -C "${REPO_ROOT}" diff --name-only "${base}..HEAD" 2>/dev/null || true)"
     else
-        changed_files="$(git -C "${REPO_ROOT}" diff --name-only "${remote_sha}..${local_sha}" 2>/dev/null || true)"
+        base="$remote_sha"
+        ref_files="$(git -C "${REPO_ROOT}" diff --name-only "${remote_sha}..${local_sha}" 2>/dev/null || true)"
     fi
-    if ! grep -q '\.rs$' <<< "${changed_files}"; then
-        SKIP_CARGO=1
+
+    # Body-less content rules (bench-entry, comment refs/SHAs, machine paths,
+    # parity-gate registration, dead docs shas) over THIS ref's exact bytes.
+    # These also gate a direct-to-main push, which has no PR body and skips the
+    # PR precheck. The body-marker rules (BUILD/CUDA/CLIPPY_EXIT) stay PR-only.
+    # Runs before the snapshot/cargo work, so a violation fails in milliseconds
+    # without taking the build lock, and cannot hide behind another ref.
+    info "checking pushed range ${base:0:9}..${local_sha:0:9} content rules"
+    if ! python3 "${REPO_ROOT}/scripts/lane_pr_precheck.py" --repo "${REPO_ROOT}" \
+            --push-content "${base}..${local_sha}"; then
+        CONTENT_FAILURES=1
     fi
-    # The scripts/tests/*.sh batch takes minutes and holds the pre-push SSH
-    # connection idle (push exits 141 after the checks pass). Run it only when
-    # the push could change what those tests exercise. Several read real tree
-    # files, not only scripts/: cuda_prebuilt_export / kernel_artifact /
-    # pod_flow read crates/cuda-kernels/{build.rs,kernels.toml,generated} and
-    # the crate package; hook_disowns reads .githooks/pre-push; pod_flow copies
-    # the root .gitignore. Trigger on the whole cuda-kernels crate (conservative)
-    # plus scripts/ .githooks/ .github/ .gitignore. Hygiene and fmt always
-    # run. RELEVANCE_RE is the single copy, shared with CI's runner.
-    # shellcheck source=scripts/run_shell_tests.sh
-    source "${REPO_ROOT}/scripts/run_shell_tests.sh"
-    if ! grep -qE "$RELEVANCE_RE" <<< "${changed_files}"; then
-        SKIP_SHELL_TESTS=1
-        info "no shell-test inputs (scripts/.githooks/.github/cuda-kernels/.gitignore) in pushed range; skipping shell test batch"
-    fi
-    break
+
+    changed_files+=$'\n'"$ref_files"
 done
+
+if [[ "${CONTENT_FAILURES}" == "1" ]]; then
+    fail "content rules failed on one or more pushed refs; see the list above"
+    exit 1
+fi
+
+if ! grep -q '\.rs$' <<< "${changed_files}"; then
+    SKIP_CARGO=1
+fi
+# The scripts/tests/*.sh batch takes minutes and holds the pre-push SSH
+# connection idle (push exits 141 after the checks pass). Run it only when the
+# push could change what those tests exercise. Several read real tree files,
+# not only scripts/: cuda_prebuilt_export / kernel_artifact / pod_flow read
+# crates/cuda-kernels/{build.rs,kernels.toml,generated} and the crate package;
+# hook_disowns reads .githooks/pre-push; pod_flow copies the root .gitignore.
+# Trigger on the whole cuda-kernels crate (conservative) plus scripts/
+# .githooks/ .github/ .gitignore. Hygiene and fmt always run.
+if ! grep -qE "$RELEVANCE_RE" <<< "${changed_files}"; then
+    SKIP_SHELL_TESTS=1
+    info "no shell-test inputs (scripts/.githooks/.github/cuda-kernels/.gitignore) in pushed range; skipping shell test batch"
+fi
+
 if [[ "${SKIP_CARGO}" == "1" ]]; then
     info "no .rs files in pushed range; skipping cargo steps"
 fi
