@@ -89,6 +89,7 @@ scripts/prereg.py start --name nvml-observe-ab \
 | `crates/infer-seam/src/lib.rs` | Delete `BackendStats.gpu` |
 | `crates/infer-cuda/src/lib.rs` | Delete `gpu: None` |
 | `crates/infer-server/src/multiproc_relay.rs` | Delete `WireStats.gpu`, first-wins merge, relayed mappings |
+| `crates/cli/src/serve_multiproc.rs` | Stop populating the relayed `WireStats.gpu` from the worker |
 | `crates/infer-server/src/dashboard.html` | Per-device GPU lines (up to 8) |
 
 ## Rule
