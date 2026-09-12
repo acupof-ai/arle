@@ -1038,10 +1038,13 @@ impl Engine {
             };
         metrics.host_demoted_pages = host_demoted_pages;
         metrics.disk_pages = disk_pages;
-        metrics.reuse_hit_host_demoted = metrics
-            .reuse_hit_host_demoted
-            .saturating_add(tier_hits.host_demoted);
-        metrics.reuse_hit_disk = metrics.reuse_hit_disk.saturating_add(tier_hits.disk);
+        // Single source for host/disk reuse hits: the tier store's own read
+        // counters. The page-promote path counts the same blocks as reuse
+        // decisions, so folding those in too reports one reuse twice (and only
+        // on a page-tier backend; the CUDA slot store feeds this view with
+        // page capacity pinned to 0).
+        metrics.reuse_hit_host_demoted = tier_hits.host_demoted;
+        metrics.reuse_hit_disk = tier_hits.disk;
         metrics.tier_io_mode = io.mode;
         metrics.tier_io_useful_read_bytes = io.useful_read_bytes;
         metrics.tier_io_useful_write_bytes = io.useful_write_bytes;
