@@ -6,7 +6,9 @@ import re
 
 SUMMARY = re.compile(
     r"^SUMMARY len=(?P<len>\d+) depth=(?P<depth>[\d.]+) exact=(?P<exact>\d+) "
-    r"partial=(?P<partial>\d+) miss=(?P<miss>\d+) (?P<det>DET|NONDET)(?: kv=.*)?$"
+    r"partial=(?P<partial>\d+) miss=(?P<miss>\d+)"
+    r"(?: reasoning_only=(?P<reasoning_only>\d+))?"
+    r" (?P<det>DET|NONDET)(?: kv=.*)?$"
 )
 
 

@@ -34,7 +34,8 @@ never by picking a free index by hand.
    H20.** Already built to one command; it needs the V100 free and an
    explicit go decision.
 5. Independent single-card serve studies — P6 splits-64 perf, P7 step1b
-   gate, P10 NVML A/B — slot onto any card not running the P3 grid.
+   gate, P10 NVML A/B, P14 thinking-needle channel (folds into P7's serve)
+   — slot onto any card not running the P3 grid.
 6. Multi-rank DSv4 e2e (P12) and OPD cp=2 (P13) need separate setup (model
    weights / training lane) and are scheduled on their own.
 
@@ -290,6 +291,31 @@ never by picking a free index by hand.
 - **Depends on:** the OPD lane owner and a two-card reservation; outside
   the inference parity queue.
 
+### P14 — Thinking-model needle channel: budget artifact vs serving bug vs widen
+
+- **State:** diagnostic mechanism merged, criterion deliberately unchanged;
+  decision pending-remote per
+  `docs/plans/2026-09-12-reasoning-content-criterion.md`.
+- **Commands (one ThinkingCap serve with `--max-thinking-tokens 512`):**
+  1. `NEEDLE_MAX_TOKENS=16 python3 scripts/needle_gate.py 115,241,446 3 0.0`
+     — reproduce `NEEDLE_REASONING_ONLY` at the current gate budget;
+  2. `NEEDLE_MAX_TOKENS=512 ... needle_gate.py 115,241,446 3 0.0` — does a
+     completed answer reach `content`;
+  3. `RAW=1 TEMPLATE=qwen3_nonthink ...` same ladder — retrieval control;
+  4. archive the raw JSON of one A and one B response (`content`,
+     `reasoning_content`, `finish_reason`, `completion_tokens`).
+- **Device:** one sm90 card, one ThinkingCap serve window; folds into P7
+  (same model class, same ladder shape).
+- **Decides:** leading hypothesis is the 16-token gate budget, not the
+  criterion: B puts the needle in `content` with `finish_reason=stop` →
+  budget guidance, gate unchanged. Empty content with needle in reasoning
+  under adequate budget + `finish_reason=stop` → serving-splitter bug (fix
+  `split_reasoning`/SSE lockstep) before ever widening; only if a reference
+  serve also returns empty content and real callers read reasoning does the
+  greedy arm widen. The full decision table is the criterion plan's table.
+- **Prereg:** `needle-reasoning-channel-<ts>`.
+- **Depends on:** nothing; shares a serve window with P7.
+
 ## Not in this queue (different blocking resource or stale)
 
 - **ttft-35b (blocked):** needs a Mac without swap pressure, not a GPU.
@@ -315,6 +341,7 @@ never by picking a free index by hand.
 | P6 splits A/B | 1 sm90 | long | other cards |
 | P7 step1b gate | 1 sm90 | one serve window | other cards |
 | P8 flag check | 1 sm90 | folds into a serve | n/a |
+| P14 thinking channel | 1 sm90 | folds into the P7 serve | n/a |
 | P10 NVML A/B | 1 sm90 | matched pair | other cards (not the P3 serves) |
 | P3 verify tp=1/2/4 | 1/2/4 sm90 | long | 1-card jobs on leftover cards, one serve per card |
 | P3 verify tp=8 / P2 | 8 sm90 | whole box | nothing else |

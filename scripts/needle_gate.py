@@ -33,6 +33,10 @@ grep-split; the caller restarts serve with the matching --kv-cache-dtype).
 
 Prints one line per run with the raw decoded completion, then a per-length
 summary line: exact/partial/miss counts + deterministic? (all runs identical).
+Each run also prints loc=, where the needle surfaced across content and
+reasoning_content (content/both/reasoning_only/neither); reasoning_only is a
+diagnostic and never changes the verdict — see
+docs/plans/2026-09-12-reasoning-content-criterion.md.
 """
 import os, sys, json, urllib.request, time
 
@@ -102,9 +106,8 @@ def one_completion(prompt):
     t0 = time.time()
     d = json.loads(urllib.request.urlopen(req, timeout=1800).read())
     dt = time.time() - t0
-    out = d["choices"][0]["text"]
-    pt = d.get("usage", {}).get("prompt_tokens")
-    return out, pt, dt
+    # Raw completions have no reasoning channel; judge the whole text.
+    return d["choices"][0]["text"], "", d.get("usage", {}).get("prompt_tokens"), dt
 
 
 def one_chat(prompt):
@@ -117,9 +120,15 @@ def one_chat(prompt):
     t0 = time.time()
     d = json.loads(urllib.request.urlopen(req, timeout=1800).read())
     dt = time.time() - t0
-    out = d["choices"][0]["message"]["content"]
-    pt = d.get("usage", {}).get("prompt_tokens")
-    return out, pt, dt
+    msg = d["choices"][0]["message"]
+    # CRITERION (deliberately unchanged — see reasoning-location note below):
+    # the greedy verdict reads message.content ONLY. A real API caller receives
+    # content; a needle that surfaces only in reasoning_content was not returned
+    # to the caller. reasoning is captured separately for diagnostics, never
+    # folded into the judged text.
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or ""
+    return content, reasoning, d.get("usage", {}).get("prompt_tokens"), dt
 
 
 one = one_completion if os.environ.get("RAW") == "1" else one_chat
@@ -178,31 +187,50 @@ def classify(out):
     return "miss"
 
 
+def needle_location(content, reasoning):
+    # Diagnostic label for where the needle surfaced; never enters the verdict.
+    if NEEDLE in content:
+        return "content" if NEEDLE not in reasoning else "both"
+    return "reasoning_only" if NEEDLE in reasoning else "neither"
+
+
 exact_per_length = {}
 errors_per_length = {}
 for target in lengths:
     prompt = build_prompt(target, depth)
     outs = []
     n_errors = 0
+    n_reasoning_only = 0
     for r in range(runs):
         try:
-            out, pt, dt = one(prompt)
+            out, reasoning, pt, dt = one(prompt)
         except Exception as e:  # noqa: BLE001 - surface and count; fatal at the end
             print("len=%d depth=%.2f run=%d ERROR %r" % (target, depth, r, e))
             n_errors += 1
             continue
+        loc = needle_location(out, reasoning)
+        if loc == "reasoning_only":
+            # Diagnostic only — does NOT change cls/verdict/exit. This is the
+            # open thinking-model criterion question (see PR/wins note): the
+            # caller-facing content missed the needle even though reasoning had
+            # it, so the greedy arm still scores a miss while flagging where
+            # the fact actually surfaced.
+            n_reasoning_only += 1
+            print("NEEDLE_REASONING_ONLY len=%d depth=%.2f run=%d "
+                  "(needle in reasoning_content, content=%r)"
+                  % (target, depth, r, out[:60]))
         outs.append(out)
-        print("len=%d depth=%.2f run=%d pt=%s cls=%s wall=%.1fs kv=%s out=%r"
-              % (target, depth, r, pt, classify(out), dt, KV_DTYPE, out))
+        print("len=%d depth=%.2f run=%d pt=%s cls=%s loc=%s wall=%.1fs kv=%s out=%r"
+              % (target, depth, r, pt, classify(out), loc, dt, KV_DTYPE, out))
     errors_per_length[target] = n_errors
     ok = outs
     cls = [classify(o) for o in ok]
     n_exact = cls.count("exact")
     exact_per_length[target] = n_exact
     det = "DET" if len(set(ok)) <= 1 and len(ok) == runs else "NONDET"
-    print("SUMMARY len=%d depth=%.2f exact=%d partial=%d miss=%d %s kv=%s"
+    print("SUMMARY len=%d depth=%.2f exact=%d partial=%d miss=%d reasoning_only=%d %s kv=%s"
           % (target, depth, n_exact, cls.count("partial"),
-             cls.count("miss"), det, KV_DTYPE))
+             cls.count("miss"), n_reasoning_only, det, KV_DTYPE))
     sys.stdout.flush()
 
 # A request error is never a miss: the run could not retrieve, so the gate has
