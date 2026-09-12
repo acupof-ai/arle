@@ -1885,3 +1885,209 @@ impl Qwen35Model {
         Ok(logits)
     }
 }
+
+// Deterministic splitmix64 bf16 RNG for the synthetic gate head.
+struct GateRng(u64);
+
+impl GateRng {
+    fn take(&mut self, n: usize) -> Vec<bf16> {
+        (0..n)
+            .map(|_| {
+                self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^= z >> 31;
+                let u = (z >> 40) as f32 / (1u64 << 24) as f32 - 1.0;
+                bf16::from_f32(u * 0.25)
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn synth_dspark_head(
+    ctx: &DeviceContext,
+    cfg: DsparkConfig,
+    max_seq_len: usize,
+    max_total_tokens: usize,
+) -> Result<Qwen35DsparkHead> {
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let q_dim = cfg.num_attention_heads * cfg.head_dim;
+    let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+    let hd = cfg.head_dim;
+    let mut rng = GateRng(0xD54A_F155_0000_0001u64);
+    let mat = |rows: usize, cols: usize, rng: &mut GateRng| -> Result<DeviceMatrix> {
+        let vals = rng.take(rows * cols);
+        DeviceMatrix::from_host(ctx, &vals, rows, cols)
+    };
+    let layers = (0..cfg.num_hidden_layers)
+        .map(|_| {
+            Ok(DsparkLayer {
+                q_proj: mat(2 * q_dim, hidden, &mut rng)?,
+                k_proj: mat(kv_dim, hidden, &mut rng)?,
+                v_proj: mat(kv_dim, hidden, &mut rng)?,
+                o_proj: mat(hidden, q_dim, &mut rng)?,
+                q_norm: DeviceVec::from_host(ctx, &rng.take(hd / 2))?,
+                k_norm: DeviceVec::from_host(ctx, &rng.take(hd / 2))?,
+                input_layernorm: DeviceVec::from_host(ctx, &vec![bf16::ONE; hidden])?,
+                post_attention_layernorm: DeviceVec::from_host(ctx, &vec![bf16::ONE; hidden])?,
+                mlp: DenseMlp {
+                    gate_up_proj: mat(2 * inter, hidden, &mut rng)?,
+                    down_proj: mat(hidden, inter, &mut rng)?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rope_cap = infer_model::dspark::rope_cap(max_seq_len, max_total_tokens, cfg.block_size);
+    let cap = infer_model::dspark::ctx_cap(cfg.sliding_window, rope_cap, cfg.block_size);
+    let (cos_cache, sin_cache) =
+        crate::ops::precompute_rope(ctx, hd, rope_cap, cfg.rope_theta, None)?;
+    Ok(Qwen35DsparkHead {
+        sps: DsparkSps::default(),
+        cfg,
+        fc: Vec::new(),
+        hidden_norm: DeviceVec::from_host(ctx, &vec![bf16::ONE; hidden])?,
+        norm: DeviceVec::from_host(ctx, &vec![bf16::ONE; hidden])?,
+        layers,
+        // No markov/confidence: greedy argmax at every row, the simplest
+        // whole-step sampler and the one the batched path supports.
+        markov: None,
+        confidence: None,
+        cos_cache,
+        sin_cache,
+        cap,
+        rope_cap,
+    })
+}
+
+/// Minimal Qwen35Model for the drafter gate: the draft fns read only `ctx` and
+/// `embed_tokens` from the model (the head carries its own layers/norm/cos/
+/// sin, and `output_projection()` ties to embed_tokens). Trunk layers/lm_head/
+/// MoE are unused, so they are built empty; `config`/`norm` are touched only by
+/// `verify_logits`, which this gate never calls.
+pub(crate) fn synth_drafter_model(
+    ctx: DeviceContext,
+    embed_tokens: DeviceMatrix,
+    vocab: usize,
+    hidden: usize,
+    rms_norm_eps: f32,
+) -> Qwen35Model {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::AtomicBool;
+    let empty_norm = DeviceVec::zeros(&ctx, hidden).expect("empty trunk norm");
+    let empty_cos = DeviceVec::zeros(&ctx, 0).expect("empty trunk cos");
+    let empty_sin = DeviceVec::zeros(&ctx, 0).expect("empty trunk sin");
+    Qwen35Model {
+        ctx,
+        config: Qwen35Config {
+            hidden_size: hidden,
+            intermediate_size: 0,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            rms_norm_eps,
+            stop_token_ids: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: 0,
+            tie_word_embeddings: true,
+            num_attention_heads: 0,
+            num_key_value_heads: 0,
+            head_dim: 0,
+            linear_num_key_heads: 0,
+            linear_key_head_dim: 0,
+            linear_num_value_heads: 0,
+            linear_value_head_dim: 0,
+            linear_conv_kernel_dim: 0,
+            rope_theta: 1e7,
+            rope_scaling: None,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 0,
+            rope_cache_len_hint: None,
+            layer_types: Vec::new(),
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: false,
+            mlp_only_layers: Vec::new(),
+            full_attn_gated: false,
+        },
+        embed_tokens,
+        lm_head: None,
+        layers: Vec::new(),
+        norm: empty_norm,
+        cos_cache: empty_cos,
+        sin_cache: empty_sin,
+        moe_config: None,
+        tp: crate::tp::TpRuntime::new(TpConfig::default()),
+        local_q_heads: 0,
+        local_kv_heads: 0,
+        local_linear_k_heads: 0,
+        local_linear_v_heads: 0,
+        expert_split: ExpertSplit::single(0),
+        max_seq_len: 0,
+        mtp: None,
+        spec_draft_tokens: 0,
+        offloaded: None,
+        frozen_base_ptrs_exported: AtomicBool::new(false),
+        lora_delta_scratch: None,
+        lora_dirty: HashSet::new(),
+        lora_base_dev: HashMap::new(),
+    }
+}
+
+/// Fill a slot's per-layer K/V ctx rings with deterministic, slot-distinct
+/// bf16 over the first `ctx_len` physical rows, so batch slots never share
+/// context. The gate keeps every attention window inside those rows.
+pub(crate) fn gate_fill_rings(
+    ctx: &DeviceContext,
+    df: &mut Qwen35DsparkSlotState,
+    head: &Qwen35DsparkHead,
+    slot_seed: u64,
+    ctx_len: usize,
+) -> Result<()> {
+    let kv_dim = head.cfg.num_key_value_heads * head.cfg.head_dim;
+    let n = ctx_len * kv_dim;
+    let nlayers = df.k_ctx.len();
+    for li in 0..nlayers {
+        let seed_k = slot_seed.wrapping_add((li as u64) << 40);
+        let host_k = GateRng(seed_k).take(n);
+        let tmp_k = DeviceVec::from_host(ctx, &host_k)?;
+        let mut dst_k = df.k_ctx[li].data.slice_mut(0..n);
+        ctx.stream
+            .memcpy_dtod(&tmp_k.data, &mut dst_k)
+            .map_err(|e| anyhow!("ring K fill: {e}"))?;
+        let host_v = GateRng(seed_k ^ 0x5555_5555_5555_5555).take(n);
+        let tmp_v = DeviceVec::from_host(ctx, &host_v)?;
+        let mut dst_v = df.v_ctx[li].data.slice_mut(0..n);
+        ctx.stream
+            .memcpy_dtod(&tmp_v.data, &mut dst_v)
+            .map_err(|e| anyhow!("ring V fill: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Read a slot's draft logits back to host (`[block, vocab]` bf16).
+pub(crate) fn gate_slot_logits_to_host(
+    ctx: &DeviceContext,
+    df: &mut Qwen35DsparkSlotState,
+    head: &Qwen35DsparkHead,
+    vocab: usize,
+) -> Result<Vec<bf16>> {
+    let block = head.cfg.block_size;
+    let buf = df.logits.get(ctx, vocab, block)?;
+    Ok(ctx.stream.clone_dtoh(&buf.data)?)
+}
+
+/// Exchange the two slots' layer-0 K/V ring DeviceVecs (kv-base negative
+/// control). Disjoint slots make the swap safe.
+pub(crate) fn gate_swap_layer0_rings(a: &mut Qwen35DsparkSlotState, b: &mut Qwen35DsparkSlotState) {
+    std::mem::swap(&mut a.k_ctx[0], &mut b.k_ctx[0]);
+    std::mem::swap(&mut a.v_ctx[0], &mut b.v_ctx[0]);
+}
+
+/// Per-layer ctx ring row count for the gate.
+pub(crate) fn gate_cap(head: &Qwen35DsparkHead) -> usize {
+    head.cap
+}
