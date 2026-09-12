@@ -42,11 +42,19 @@ class H(BaseHTTPRequestHandler):
                        "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
         self._send(json.dumps(payload).encode())
     def log_message(self, *a): pass
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+srv = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+# Bind 0 + report the assigned port: a fixed port collides when two hook runs
+# overlap on a shared box, and surfaces as a test failure instead of a conflict.
+open(sys.argv[2], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
 PY
 
-export PORT=19400
-start() { FAILMODE="$1" python3 "$TMP/server.py" "$PORT" >/dev/null 2>&1 & SRV_PID=$!; sleep 1.2; }
+start() {
+    local pf="$TMP/port"; rm -f "$pf"
+    FAILMODE="$1" python3 "$TMP/server.py" 0 "$pf" >/dev/null 2>&1 & SRV_PID=$!
+    for _ in $(seq 1 100); do [ -s "$pf" ] && break; sleep 0.05; done
+    PORT="$(cat "$pf")"; export PORT
+}
 stop() { kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; }
 gate() { python3 "$ROOT/scripts/needle_gate.py" "$@" >/dev/null 2>&1; }
 expect_rc() { # $1=want $2=label ; rest=args

@@ -154,22 +154,22 @@ fi
 # 2 arms x (launch + needle + prefill + accept-c1 + accept-c8 + gdr-path) = 12.
 nrows=$(tail -n +2 "$OUT1/results.tsv" | wc -l | tr -d ' ')
 [ "$nrows" = 12 ] || { echo "FAIL: expected 12 rows, got $nrows" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
-grep -qE '^base\t1\tgdr-path\tgdr_fq=[0-9]+ gdr_recurrent=0\tINFO\t' "$OUT1/results.tsv" \
+grep -qE $'^base\t1\tgdr-path\tgdr_fq=[0-9]+ gdr_recurrent=0\tINFO\t' "$OUT1/results.tsv" \
     || { echo "FAIL: base gdr-path must stay INFO (pre-change may route varlen)" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
-grep -qE '^treatment\t1\tgdr-path\tgdr_fq=[1-9][0-9]* gdr_recurrent=0 \(chunked route live\)\tPASS\t' "$OUT1/results.tsv" \
+grep -qE $'^treatment\t1\tgdr-path\tgdr_fq=[1-9][0-9]* gdr_recurrent=0 \(chunked route live\)\tPASS\t' "$OUT1/results.tsv" \
     || { echo "FAIL: treatment must gate gdr_fq>0 PASS (chunked route live)" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
-grep -qE '^base\t1\tneedle\t.*\tPASS\t' "$OUT1/results.tsv" \
+grep -qE $'^base\t1\tneedle\t.*\tPASS\t' "$OUT1/results.tsv" \
     || { echo "FAIL: base needle row not PASS" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
-grep -qE '^base\t1\tlaunch\tobserved workers=1 \(attn_tp=1\)\tPASS\t' "$OUT1/results.tsv" \
+grep -qE $'^base\t1\tlaunch\tobserved workers=1 \(attn_tp=1\)\tPASS\t' "$OUT1/results.tsv" \
     || { echo "FAIL: launch/attn_tp row missing" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
-grep -qE '^treatment\t1\tneedle\t.*\tPASS\t' "$OUT1/results.tsv" \
+grep -qE $'^treatment\t1\tneedle\t.*\tPASS\t' "$OUT1/results.tsv" \
     || { echo "FAIL: treatment needle row not PASS" >&2; exit 1; }
 grep -qE 'ttft_mean_ms=120.5' "$OUT1/results.tsv" \
     || { echo "FAIL: prefill TTFT metric missing" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
 # Single global pair: c=1 drafted=100; c=8 (8 POSTs) drafted=800, NOT 8*800.
-grep -qE '^base\t1\taccept-c1\t13/100\tPASS' "$OUT1/results.tsv" \
+grep -qE $'^base\t1\taccept-c1\t13/100\tPASS' "$OUT1/results.tsv" \
     || { echo "FAIL: accept-c1 global delta wrong" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
-grep -qE '^base\t1\taccept-c8\t104/800\tPASS' "$OUT1/results.tsv" \
+grep -qE $'^base\t1\taccept-c8\t104/800\tPASS' "$OUT1/results.tsv" \
     || { echo "FAIL: accept-c8 must be single global pair 104/800 (overlap would be ~832/6400)" >&2
          cat "$OUT1/results.tsv" >&2; exit 1; }
 # Exactly one tool invocation per c with the right --concurrency.
@@ -197,7 +197,7 @@ if env $(common_env "$TMP/lever-bad.sh") \
 fi
 grep -q 'correctness FAIL' "$TMP/bad.log" \
     || { echo "FAIL: missing correctness FAIL line" >&2; cat "$TMP/bad.log" >&2; exit 1; }
-grep -qE '^base\t1\tneedle\t-\tFAIL\t' "$OUT2/results.tsv" \
+grep -qE $'^base\t1\tneedle\t-\tFAIL\t' "$OUT2/results.tsv" \
     || { echo "FAIL: FAIL row not recorded" >&2; cat "$OUT2/results.tsv" >&2; exit 1; }
 
 # ── Insufficient GPUs: tp 8 SKIPped, still exit 0 when nothing fails ──
@@ -208,7 +208,7 @@ if ! env $(common_env "$TMP/lever-ok.sh") ARLE_DSV_TPS="8" \
     >"$TMP/skip.log" 2>&1; then
     echo "FAIL: skip world exited non-zero" >&2; cat "$TMP/skip.log" >&2; exit 1
 fi
-grep -qE '^base\t8\tall\t-\tSKIP\t' "$OUT3/results.tsv" \
+grep -qE $'^base\t8\tall\t-\tSKIP\t' "$OUT3/results.tsv" \
     || { echo "FAIL: tp8 SKIP row missing" >&2; cat "$OUT3/results.tsv" >&2; exit 1; }
 
 # ── GDR_CHUNKED=0: the path check enforces gdr_fq=0; the mock serve can't
@@ -223,7 +223,7 @@ if env $(common_env "$TMP/lever-ok.sh") GDR_CHUNKED=0 \
     echo "FAIL: GDR_CHUNKED=0 with gdr_fq>0 must fail (switch not enforced)" >&2
     cat "$TMP/gdr.log" >&2; exit 1
 fi
-grep -qE '^base\t1\tgdr-path\tgdr_fq=[1-9][0-9]* .*\tFAIL\t' "$OUT4/results.tsv" \
+grep -qE $'^base\t1\tgdr-path\tgdr_fq=[1-9][0-9]* .*\tFAIL\t' "$OUT4/results.tsv" \
     || { echo "FAIL: gdr-path enforcement row missing" >&2; cat "$OUT4/results.tsv" >&2; exit 1; }
 
 # ── Treatment never routes chunked: gdr_fq=0 in default mode must FAIL ──
@@ -248,7 +248,7 @@ if env $(common_env "$TMP/lever-ok.sh") ARLE_DSV_BIN_TREAT="$TMP/bin/arle-fqoff"
     echo "FAIL: treatment with gdr_fq=0 in default mode must fail (routing never verified)" >&2
     cat "$TMP/fqoff.log" >&2; exit 1
 fi
-grep -qE '^treatment\t1\tgdr-path\tgdr_fq=0 gdr_recurrent=0 \(treatment must show gdr_fq>0\)\tFAIL\t' "$OUT5/results.tsv" \
+grep -qE $'^treatment\t1\tgdr-path\tgdr_fq=0 gdr_recurrent=0 \(treatment must show gdr_fq>0\)\tFAIL\t' "$OUT5/results.tsv" \
     || { echo "FAIL: missing treatment gdr_fq=0 FAIL row" >&2; cat "$OUT5/results.tsv" >&2; exit 1; }
 
 echo "test_dspark_flashqla_verify: PASS (clean exit0 + 12 rows + global c8=800, needle fail exit1, gpu SKIP, gdr-off enforced, treatment gdr_fq=0 fails)"

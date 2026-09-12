@@ -27,7 +27,10 @@ class H(BaseHTTPRequestHandler):
         m = re.search(r"secret access code is (\d+)", body)
         self._send(json.dumps({"choices": [{"text": m.group(1) if m else "none"}]}).encode())
     def log_message(self, *a): pass
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+srv = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+# Bind 0 + report the assigned port (concurrent hook runs must not collide).
+open(sys.argv[2], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
 PY
 # miss: returns a fixed wrong secret for every row.
 cat > "$TMP/miss.py" <<'PY'
@@ -42,7 +45,10 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0)); self.rfile.read(n)
         self._send(json.dumps({"choices": [{"text": "wrong secret entirely"}]}).encode())
     def log_message(self, *a): pass
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+srv = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+# Bind 0 + report the assigned port (concurrent hook runs must not collide).
+open(sys.argv[2], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
 PY
 # bad: valid HTTP/JSON but no choices[] (malformed transcript) -> request error.
 cat > "$TMP/bad.py" <<'PY'
@@ -57,22 +63,35 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0)); self.rfile.read(n)
         self._send(json.dumps({"unexpected": "shape"}).encode())
     def log_message(self, *a): pass
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+srv = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+# Bind 0 + report the assigned port: concurrent hook runs must not collide.
+open(sys.argv[2], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
 PY
 
-python3 "$TMP/good.py" 19931 >/dev/null 2>&1 & SP=$!; sleep 1.5
-good_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" 19931 3 100 1 0 >"$TMP/good.log" 2>&1 || good_rc=$?
+# Bind 0 and read back the assigned port; the "dead" case reuses a closed port.
+serve() {  # $1=script $2=portfile -> sets $SVPORT; server pid in $SP
+    rm -f "$2"
+    python3 "$TMP/$1" 0 "$2" >/dev/null 2>&1 & SP=$!
+    for _ in $(seq 1 100); do [ -s "$2" ] && break; sleep 0.05; done
+    SVPORT="$(cat "$2")"
+}
+
+serve good.py "$TMP/p.good"; sleep 1.0
+good_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" "$SVPORT" 3 100 1 0 >"$TMP/good.log" 2>&1 || good_rc=$?
 kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true
 
-python3 "$TMP/miss.py" 19932 >/dev/null 2>&1 & SP=$!; sleep 1.5
-miss_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" 19932 3 100 1 0 >"$TMP/miss.log" 2>&1 || miss_rc=$?
+serve miss.py "$TMP/p.miss"; sleep 1.0
+miss_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" "$SVPORT" 3 100 1 0 >"$TMP/miss.log" 2>&1 || miss_rc=$?
 kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true
 
-python3 "$TMP/bad.py" 19933 >/dev/null 2>&1 & SP=$!; sleep 1.5
-bad_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" 19933 3 100 1 0 >"$TMP/bad.log" 2>&1 || bad_rc=$?
+serve bad.py "$TMP/p.bad"; sleep 1.0
+bad_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" "$SVPORT" 3 100 1 0 >"$TMP/bad.log" 2>&1 || bad_rc=$?
 kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true
 
-dead_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" 19934 2 100 1 0 >"$TMP/dead.log" 2>&1 || dead_rc=$?
+# Closed listener port: connection refused, indistinguishable from a dead serve.
+dead_port="$SVPORT"
+dead_rc=0; python3 "$ROOT/scripts/needle_concurrent.py" "$dead_port" 2 100 1 0 >"$TMP/dead.log" 2>&1 || dead_rc=$?
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 [ "$good_rc" = 0 ] || fail "good run want 0 got $good_rc"

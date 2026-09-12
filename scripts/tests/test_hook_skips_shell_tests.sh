@@ -17,8 +17,11 @@ BIN="$TMP/bin"; mkdir -p "$BIN"
 # Fixture repo: base carries no-op stand-ins for the hook's fast checks.
 mkdir -p "$FIX/scripts/tests" "$FIX/docs"
 cp "$ROOT/scripts/pre_push_checks.sh" "$FIX/scripts/pre_push_checks.sh"
-for t in $(sed -n '/for test in \\/,/; do/p' "$FIX/scripts/pre_push_checks.sh" | grep -o 'test_[a-z_]*\.sh'); do
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$FIX/scripts/tests/$t"
+# The hook sources run_shell_tests.sh for RELEVANCE_RE and invokes it to
+# discover the batch, so both files and a stub per discovered test are needed.
+cp "$ROOT/scripts/run_shell_tests.sh" "$FIX/scripts/run_shell_tests.sh"
+for t in "$ROOT"/scripts/tests/test_*.sh; do
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$FIX/scripts/tests/$(basename "$t")"
 done
 printf "print(\"fixture hygiene ok\")\n" > "$FIX/scripts/check_repo_hygiene.py"
 printf "print(\"fixture precheck ok\")\n" > "$FIX/scripts/lane_pr_precheck.py"
