@@ -1,0 +1,24 @@
+name: Probe shell tests on Linux
+on:
+  push:
+    branches: [lane/ci-shell-test-discovery]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run all scripts/tests/test_*.sh individually
+        run: |
+          set -u
+          fail=0
+          for t in $(git ls-files 'scripts/tests/test_*.sh' | sort); do
+            echo "===== PROBE $t ====="
+            if bash "$t" >"/tmp/$(basename "$t").log" 2>&1; then
+              echo "PROBE-RESULT $t PASS"
+            else
+              echo "PROBE-RESULT $t FAIL (exit $?)"
+              tail -25 "/tmp/$(basename "$t").log"
+              fail=1
+            fi
+          done
+          echo "PROBE-DONE fail=$fail"
