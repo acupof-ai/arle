@@ -54,10 +54,16 @@ mod ffi {
 
     fn sym<T>(handle: *mut c_void, name: &str) -> Option<T> {
         let cname = std::ffi::CString::new(name).ok()?;
-        // SAFETY: handle is a successful dlopen result; cname is NUL-terminated.
-        // The pointer is null-checked and only transmuted to its declared ABI.
-        let ptr = unsafe { dlsym(handle, cname.as_ptr()) };
-        (!ptr.is_null()).then(|| unsafe { std::mem::transmute_copy::<*mut c_void, T>(&ptr) })
+        // SAFETY: `handle` is a successful dlopen result and `cname` is
+        // NUL-terminated, so dlsym is sound. A null result returns None; any
+        // non-null pointer is reinterpreted as the caller-declared ABI fn
+        // pointer (all `T` call sites are the `extern "C" fn` aliases above,
+        // same pointer width), so transmute_copy's size assumption holds.
+        unsafe {
+            let ptr = dlsym(handle, cname.as_ptr());
+            (!ptr.is_null())
+                .then(|| std::mem::transmute_copy::<*mut c_void, T>(&ptr))
+        }
     }
 
     /// Resolve every NVML entry point used. Returns None if the library or any
