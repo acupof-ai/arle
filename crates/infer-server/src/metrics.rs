@@ -302,41 +302,16 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         kv_system.demote_mset_count,
     );
     push(
-        "kv_system_demote_mset_copy_bytes_total",
-        "counter",
-        "Bytes copied by synchronous page-tier mset.",
-        kv_system.demote_mset_copy_bytes,
-    );
-    push(
-        "kv_system_demote_mset_copy_ms_total",
-        "counter",
-        "Milliseconds spent in synchronous page-tier mset.",
-        kv_system.demote_mset_copy_ms,
-    );
-    push(
         "kv_system_promote_mget_count_total",
         "counter",
         "Synchronous page-tier mget batches.",
         kv_system.promote_mget_count,
     );
-    push(
-        "kv_system_promote_mget_copy_bytes_total",
-        "counter",
-        "Bytes copied by synchronous page-tier mget.",
-        kv_system.promote_mget_copy_bytes,
-    );
-    push(
-        "kv_system_promote_mget_copy_ms_total",
-        "counter",
-        "Milliseconds spent in synchronous page-tier mget.",
-        kv_system.promote_mget_copy_ms,
-    );
-    push(
-        "kv_system_fetch_wait_ms_total",
-        "counter",
-        "Milliseconds spent waiting for synchronous KV fetch.",
-        kv_system.fetch_wait_ms,
-    );
+    // The five copy/wait counters (demote_mset_copy_bytes/_ms,
+    // promote_mget_copy_bytes/_ms, fetch_wait_ms) are not exported: no
+    // current backend is a capacity-bearing copying page tier, so they are
+    // permanently zero. An absent series reports the gap honestly; a zero
+    // would read as a measurement. They remain in /v1/stats and JSONL.
     push(
         "kv_system_fallback_recompute_total",
         "counter",
@@ -442,4 +417,33 @@ fn escape_label_value(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_prometheus;
+    use crate::execution::CounterSnapshot;
+
+    #[test]
+    fn impossible_copy_tier_counters_are_absent_from_prometheus() {
+        // The five copy/wait counters cannot be populated by any current
+        // backend (no capacity-bearing copying page tier). They must be
+        // omitted, not emitted as a zero series that reads as a measurement.
+        let out = render_prometheus(&CounterSnapshot::default(), "m");
+        for series in [
+            "arle_kv_system_demote_mset_copy_bytes_total",
+            "arle_kv_system_demote_mset_copy_ms_total",
+            "arle_kv_system_promote_mget_copy_bytes_total",
+            "arle_kv_system_promote_mget_copy_ms_total",
+            "arle_kv_system_fetch_wait_ms_total",
+        ] {
+            assert!(
+                !out.contains(series),
+                "impossible series must be omitted: {series}"
+            );
+        }
+        // Selective omission: a live sibling in the same block still exports.
+        assert!(out.contains("arle_kv_system_promote_mget_count_total"));
+        assert!(out.contains("arle_kv_system_demote_mset_count_total"));
+    }
 }
