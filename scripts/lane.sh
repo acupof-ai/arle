@@ -86,16 +86,28 @@ new)
         exit 1
     fi
     # A zero return with no live registration (the form actually observed:
-    # another process removed the worktree between add and here) leaves the
-    # same stranded directory — clean it up too instead of only reporting.
-    # rev-parse --is-inside-work-tree is NOT the test: a stranded directory
-    # inside the main checkout resolves to the PARENT repo. A registered linked
-    # worktree is its own top level, so compare its toplevel to its own path.
-    real_path="$(cd "$path" && pwd -P)"
-    toplevel="$(git -C "$path" rev-parse --path-format=absolute --show-toplevel 2>/dev/null)"
-    if [ "$toplevel" != "$real_path" ]; then
+    # another process removed the worktree between add and here), OR the
+    # directory gone entirely, must reach the same rollback. Three traps:
+    #  - the check cannot be rev-parse --is-inside-work-tree: a stranded
+    #    directory inside the main checkout resolves to the PARENT repo;
+    #  - a registered linked worktree is its own top level, so compare its
+    #    toplevel to its own path;
+    #  - the cd is inside a condition: a missing dir must not trip set -e and
+    #    abort before the branch rollback (a left-behind lane/<name> makes the
+    #    name permanently unusable: the next add fails on the branch and keeps
+    #    it because branch_existed is then 1).
+    registered=0
+    if [ -d "$path" ]; then
+        if real_path="$(cd "$path" && pwd -P)"; then
+            # rev-parse fails (set -e) on an unregistered dir; `|| true` keeps
+            # the failure as an empty toplevel -> registered stays 0.
+            toplevel="$(git -C "$path" rev-parse --path-format=absolute --show-toplevel 2>/dev/null || true)"
+            [ "$toplevel" = "$real_path" ] && registered=1
+        fi
+    fi
+    if [ "$registered" -eq 0 ]; then
         rollback_add
-        echo "lane: $path was not a registered work tree after add; removed it" >&2
+        echo "lane: $path was not a live registered work tree after add; removed it" >&2
         exit 1
     fi
     echo

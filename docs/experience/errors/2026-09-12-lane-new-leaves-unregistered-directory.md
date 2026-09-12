@@ -75,14 +75,24 @@ was a registered worktree and had no way to detect or recover this state.
 
 ## Fix
 
-Make `new` verify its outcome and run the same cleanup on both failure forms:
+Make `new` verify its outcome and run the same cleanup on three failure forms:
 
 1. nonzero return from `worktree add`;
 2. zero return but the path is not a registered linked worktree afterward
-   (the observed form).
+   (the observed form — `.git` link removed, directory present);
+3. zero return but the directory is gone entirely, so the verification `cd`
+   itself fails.
 
-In both cases remove the fresh name-validated directory, delete the branch
-only when it did not pre-exist, and prune. The verification cannot be
+In every case remove the fresh name-validated directory, delete the branch
+only when it did not pre-exist, and prune. Form 3 is the subtle one: a bare
+`real_path="$(cd "$path" && pwd -P)"` under `set -e` aborts the script
+BEFORE the rollback, leaving the branch behind — and then the name is
+permanently unusable because the retry fails `-b` on the branch and treats
+it as pre-existing. The `cd` and the `rev-parse` both run inside guarded
+conditions (`if … ; then` / `|| true`), so a missing path flows through to
+cleanup with `registered=0` instead of aborting.
+
+The verification cannot be
 `git -C "$path" rev-parse --is-inside-work-tree`: a stranded directory inside
 the main checkout resolves to the PARENT repository and answers true. It
 compares `pwd -P` of the path against
@@ -95,18 +105,27 @@ defense, not the load-bearing one. A registration deleted by another session
 after "ready" is a shared-worktree hygiene issue and is not preventable from
 inside `new`.
 
-Verified in a throwaway repo: happy path; duplicate name; pre-existing
-diverged lane branch (kept, stray dir removed); forced nonzero add via a
-failing post-checkout hook; and the observed zero-but-unregistered form,
-simulated with a git wrapper that removes the new worktree's `.git` link and
-prunes between the add and the check (a stand-in for the real race, since
-the race could not be forced). The fifth case leaves no directory, branch, or
-worktree entry and exits 1.
+The rollback is committed as a checked test,
+`scripts/tests/test_lane_new_rollback.sh`, registered in
+`scripts/pre_push_checks.sh` (the hook runs a hardcoded list, not a glob).
+Five cases in throwaway repos, 19 assertions:
+
+1. happy path registers a live worktree;
+2. nonzero add (failing `post-checkout` hook): no dir, branch, or worktree;
+3. the observed zero-but-unregistered form — a git wrapper removes the new
+   worktree's `.git` link and prunes between add and check (a stand-in; the
+   real race cannot be forced) — fully rolled back, and the name is reusable;
+4. zero add with the directory removed entirely (verification `cd` fails):
+   the branch is still deleted and the name is reusable — the regression
+   guard for the form-3 `set -e` hole;
+5. a pre-existing diverged `lane/<name>` branch is preserved (never deleted)
+   while the stray directory is removed.
 
 ## Rule
 
 A script that creates a directory and then runs a command that can fail
-partway needs an outcome check and cleanup: the success-looking trailing
-output is not evidence the registration happened. Verify with
-`git -C "$path" rev-parse --is-inside-work-tree` and `git worktree list`
-before reporting "ready".
+partway needs an outcome check and cleanup, and the check must itself be
+safe under `set -e` — a verification step that aborts before the cleanup is
+the same defect reached from another direction. The success-looking trailing
+output is not evidence the registration happened; a checked, hook-run test
+is what keeps it from regressing.
