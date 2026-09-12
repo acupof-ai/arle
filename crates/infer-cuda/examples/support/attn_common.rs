@@ -128,6 +128,21 @@ pub struct Metrics {
     pub rel_l2: f64,
     pub viol_frac: f64,
     pub max_dev: f64,
+    /// Fraction of band violations on the single corrupted row (row 0) under
+    /// `corrupt=true`; `None` for a clean comparison. The negative-control
+    /// tooth asserts on THIS, not the global `viol_frac`, so adding more
+    /// checked rows/heads cannot dilute the corruption below the threshold.
+    pub corrupt_row_viol_frac: Option<f64>,
+}
+
+impl Metrics {
+    /// The corrupted row breaches the elementwise band on its own: its
+    /// violation fraction exceeds the same `max_viol_frac` the clean arm must
+    /// stay under. Returns false for a clean comparison (no corruption applied).
+    pub fn corrupted_row_fails(&self, tol: &Tol) -> bool {
+        self.corrupt_row_viol_frac
+            .is_some_and(|frac| frac > tol.max_viol_frac)
+    }
 }
 
 /// Compare one flat row-major output `[rows, d]` against f64 expectations.
@@ -149,6 +164,9 @@ pub fn compare_rows(
     let mut violators = 0usize;
     let mut total = 0usize;
     let mut max_dev = 0f64;
+    // Row-0-only counts, populated only under corruption.
+    let mut row0_violators = 0usize;
+    let mut row0_total = 0usize;
     for (i, (token, h)) in row_ids.iter().enumerate().take(n_rows) {
         for dd in 0..d {
             let mut w = wants[i][dd];
@@ -161,8 +179,15 @@ pub fn compare_rows(
             ref_sq += w.powi(2);
             max_dev = max_dev.max(dev);
             total += 1;
-            if dev > tol.floor + tol.slope * w.abs() {
+            let outside = dev > tol.floor + tol.slope * w.abs();
+            if outside {
                 violators += 1;
+            }
+            if corrupt && i == 0 {
+                row0_total += 1;
+                if outside {
+                    row0_violators += 1;
+                }
             }
         }
     }
@@ -170,6 +195,11 @@ pub fn compare_rows(
         rel_l2: (diff_sq / ref_sq.max(1e-12)).sqrt(),
         viol_frac: violators as f64 / total as f64,
         max_dev,
+        corrupt_row_viol_frac: if corrupt && row0_total > 0 {
+            Some(row0_violators as f64 / row0_total as f64)
+        } else {
+            None
+        },
     }
 }
 

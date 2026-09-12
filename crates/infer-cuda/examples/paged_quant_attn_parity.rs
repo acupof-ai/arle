@@ -446,7 +446,14 @@ mod real {
         });
 
         let m = compare_rows(&got, &wants, rows.len(), D, H, &rows, &TOL, corrupt);
-        let pass = metrics_pass(&m, &TOL);
+        // Clean: global metrics. Corrupt: the tooth is measured on the
+        // corrupted row alone so additional checked rows/heads cannot dilute
+        // the violation fraction below max_viol_frac.
+        let pass = if corrupt {
+            m.corrupted_row_fails(&TOL)
+        } else {
+            metrics_pass(&m, &TOL)
+        };
         eprintln!(
             "[{} {} B={} total_q={} kv={:?} table={:?} splits={}] rel_l2={:.2e} \
              viol_frac={:.2e} max_dev={:.2e} {}",
