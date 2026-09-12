@@ -232,6 +232,9 @@ pub struct WireStats {
     pub kv_tier_promoted_pages: u64,
     pub kv_tier_promote_failures: u64,
     pub kv_tier_resident_blocks: usize,
+    /// At least one rank serves a capacity-bearing page tier.
+    #[serde(default)]
+    pub kv_tier_page_blocks_measured: bool,
     pub kv_tier_demoted_slots: u64,
     pub kv_tier_slot_demote_failures: u64,
     pub kv_tier_promoted_slots: u64,
@@ -240,6 +243,9 @@ pub struct WireStats {
     pub kv_system_resident_evictable_pages: usize,
     pub kv_system_host_demoted_pages: usize,
     pub kv_system_disk_pages: usize,
+    /// At least one rank backs the residency gauges with a real tier store.
+    #[serde(default)]
+    pub kv_system_residency_measured: bool,
     pub kv_system_reuse_hit_resident: u64,
     pub kv_system_reuse_hit_host_demoted: u64,
     pub kv_system_reuse_hit_disk: u64,
@@ -340,6 +346,7 @@ impl WireStats {
                 promoted_pages: self.kv_tier_promoted_pages,
                 promote_failures: self.kv_tier_promote_failures,
                 resident_blocks: self.kv_tier_resident_blocks,
+                page_blocks_measured: self.kv_tier_page_blocks_measured,
                 demoted_slots: self.kv_tier_demoted_slots,
                 slot_demote_failures: self.kv_tier_slot_demote_failures,
                 promoted_slots: self.kv_tier_promoted_slots,
@@ -354,6 +361,7 @@ impl WireStats {
                 reuse_hit_host_demoted: self.kv_system_reuse_hit_host_demoted,
                 reuse_hit_disk: self.kv_system_reuse_hit_disk,
                 reuse_miss: self.kv_system_reuse_miss,
+                residency_measured: self.kv_system_residency_measured,
                 demote_mset_count: self.kv_system_demote_mset_count,
                 demote_mset_copy_bytes: self.kv_system_demote_mset_copy_bytes,
                 demote_mset_copy_ms: self.kv_system_demote_mset_copy_ms,
@@ -437,6 +445,7 @@ impl WireStats {
             kv_tier_promoted_pages: c.kv_tier.promoted_pages,
             kv_tier_promote_failures: c.kv_tier.promote_failures,
             kv_tier_resident_blocks: c.kv_tier.resident_blocks,
+            kv_tier_page_blocks_measured: c.kv_tier.page_blocks_measured,
             kv_tier_demoted_slots: c.kv_tier.demoted_slots,
             kv_tier_slot_demote_failures: c.kv_tier.slot_demote_failures,
             kv_tier_promoted_slots: c.kv_tier.promoted_slots,
@@ -449,6 +458,7 @@ impl WireStats {
             kv_system_reuse_hit_host_demoted: c.kv_system.reuse_hit_host_demoted,
             kv_system_reuse_hit_disk: c.kv_system.reuse_hit_disk,
             kv_system_reuse_miss: c.kv_system.reuse_miss,
+            kv_system_residency_measured: c.kv_system.residency_measured,
             kv_system_demote_mset_count: c.kv_system.demote_mset_count,
             kv_system_demote_mset_copy_bytes: c.kv_system.demote_mset_copy_bytes,
             kv_system_demote_mset_copy_ms: c.kv_system.demote_mset_copy_ms,
@@ -502,6 +512,10 @@ pub(crate) fn aggregate_wire_stats(mut ranks: Vec<WireStats>) -> WireStats {
             .kv_system_host_demoted_pages
             .min(r.kv_system_host_demoted_pages);
         agg.kv_system_disk_pages = agg.kv_system_disk_pages.min(r.kv_system_disk_pages);
+        // Presence is a deployment-wide OR: one rank with a real store keeps
+        // the series, and gauges are already the min across ranks.
+        agg.kv_tier_page_blocks_measured |= r.kv_tier_page_blocks_measured;
+        agg.kv_system_residency_measured |= r.kv_system_residency_measured;
     }
     agg
 }
@@ -569,6 +583,7 @@ fn merge_wire_stats_dp(acc: &mut WireStats, other: WireStats) {
     acc.kv_tier_promoted_pages += other.kv_tier_promoted_pages;
     acc.kv_tier_promote_failures += other.kv_tier_promote_failures;
     acc.kv_tier_resident_blocks += other.kv_tier_resident_blocks;
+    acc.kv_tier_page_blocks_measured |= other.kv_tier_page_blocks_measured;
     acc.kv_tier_demoted_slots += other.kv_tier_demoted_slots;
     acc.kv_tier_slot_demote_failures += other.kv_tier_slot_demote_failures;
     acc.kv_tier_promoted_slots += other.kv_tier_promoted_slots;
@@ -581,6 +596,7 @@ fn merge_wire_stats_dp(acc: &mut WireStats, other: WireStats) {
     acc.kv_system_reuse_hit_host_demoted += other.kv_system_reuse_hit_host_demoted;
     acc.kv_system_reuse_hit_disk += other.kv_system_reuse_hit_disk;
     acc.kv_system_reuse_miss += other.kv_system_reuse_miss;
+    acc.kv_system_residency_measured |= other.kv_system_residency_measured;
     acc.kv_system_demote_mset_count += other.kv_system_demote_mset_count;
     acc.kv_system_demote_mset_copy_bytes += other.kv_system_demote_mset_copy_bytes;
     acc.kv_system_demote_mset_copy_ms += other.kv_system_demote_mset_copy_ms;
