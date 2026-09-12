@@ -8,6 +8,15 @@ token, and two ordinary follow-ups must answer non-empty (the TP>1 relay
 failure answers 200 and then kills every rank). /v1/stats supplies the
 spec-engagement counters and product_binary_sha256 for path identity.
 Method: docs/experience/wins/2026-08-14-sampling-penalties-verified-on-both-runtimes.md
+
+Exit codes are the verdict, distinct so a caller never confuses an infra
+failure with a sampling regression:
+  0  every arm passed
+  1  a reachable serve returned responses that failed an arm (the penalty /
+     bias / liveness defect this gate exists for)
+  2  request or transcript error — dead serve, connection refused, timeout,
+     malformed JSON, missing choices. A run that could not fetch its
+     completions is invalid and never reads as "penalties regressed".
 """
 import argparse
 import json
@@ -132,7 +141,10 @@ def main():
             ok &= passed
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         print(f"sampling_gate: cannot reach serve at {base}: {e}", file=sys.stderr)
-        return 1
+        return 2
+    except (KeyError, IndexError, ValueError) as e:
+        print(f"sampling_gate: malformed transcript from {base}: {e!r}", file=sys.stderr)
+        return 2
 
     stats_line = "stats: unavailable"
     try:

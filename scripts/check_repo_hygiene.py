@@ -459,6 +459,147 @@ def _gate_relpaths(gate: str) -> list[str]:
     return [p.strip() for p in gate.split(";") if p.strip()]
 
 
+# File types whose text can actually launch a gate. Markdown (docs, READMEs)
+# is deliberately excluded and must STAY excluded: documentation that names a
+# gate is the failure this check exists to catch — adding ".md" would make
+# every README mention count as invocation and hollow the rule. The registry
+# (a declaration) and this checker (the rule text) are skipped as callers in
+# the closure for the same reason.
+_GATE_CALLER_SUFFIXES = {".sh", ".py", ".rs", ".toml", ".yml", ".yaml"}
+# Gate scripts that exist by their own contract even when no registry row names
+# them: longctx_numerical_gate.py was on disk and in the README, reached by
+# nothing.
+_GATE_SCRIPT_RE = re.compile(r"^scripts/.*_gate\.(sh|py)$")
+# A standalone gate script declares itself operator-run with a header comment:
+#   # gate_invoke: manual: <who runs it and how>
+_MANUAL_INVOKE_RE = re.compile(r"gate_invoke\s*:\s*manual:")
+
+
+def _gate_auto_invoked(relpath: str, contents: dict[str, str]) -> bool:
+    """Paths the test/batch machinery reaches without an executable caller:
+    examples are derived from the registry by parity_gpu_batch.sh, files in a
+    crate's `tests/` directory are cargo integration tests, and a source file
+    pulled in through `#[cfg(test)] #[[path = "…"]]` is a cargo unit-test
+    module (e.g. crates/cuda-kernels/src/ffi/gemm_tests.rs)."""
+    if relpath.startswith("crates/infer-cuda/examples/"):
+        return True
+    if "tests" in Path(relpath).parts:
+        return True
+    name = Path(relpath).name
+    pattern = re.compile(
+        r'#\[cfg\(test\)\][\s\S]{0,120}?#\[path\s*=\s*"[^"]*' + re.escape(name) + r'"'
+    )
+    return any(pattern.search(text) for text in contents.values())
+
+
+def _tracked_text_files() -> list[str]:
+    try:
+        output = subprocess.check_output(
+            ["git", "ls-files"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        )
+        candidates = output.splitlines()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        candidates = [
+            repo_path(path)
+            for path in ROOT.rglob("*")
+            if path.is_file() and ".git" not in path.parts
+        ]
+    return [
+        f for f in candidates
+        if Path(f).suffix in _GATE_CALLER_SUFFIXES and not f.startswith("docs/")
+    ]
+
+
+def check_registry_gate_invocation() -> list[str]:
+    """An existing path is not coverage: a runnable path has to reach it.
+
+    Reachability is a closure over tracked executable files: file A invokes B
+    when A's text names B's basename. Roots are (a) structurally executed
+    paths — CUDA examples (batch-derived), files under a crate's tests/
+    (cargo), and CI workflow files; and (b) explicitly manual gates carrying
+    gate_invoke="manual: …" (a registry TOML field for registry rows, a
+    `gate_invoke: manual:` header comment on a standalone script). Every
+    registry gate path and every scripts/*_gate.{sh,py} file must be
+    reachable from a root, or it is a declared-but-never-run gate.
+
+    Known limitation: an edge is "A's text contains B's basename", so a bare
+    mention inside a comment counts as invocation — a dead gate whose name
+    survives in a comment reads as covered. The direction the rule fires on,
+    "reached by nothing", is a proof of absence and is exact; the comment
+    false-positive is the accepted inverse cost."""
+    errors: list[str] = []
+    try:
+        entries = _registry_semantic_entries()
+    except Exception:  # malformed TOML already reported by the path check
+        return []
+    text_files = _tracked_text_files()
+    contents: dict[str, str] = {}
+    for rel in text_files:
+        try:
+            contents[rel] = (ROOT / rel).read_text(errors="ignore")
+        except OSError:
+            pass
+
+    # Caller edges A -> B: A names B's basename. The registry declares gates;
+    # it does not execute them, so it is excluded as a caller.
+    callers: dict[str, list[str]] = {}
+    for a, text in contents.items():
+        # The registry declares gates and this checker names them in rules;
+        # neither executes anything.
+        if a == "operators/registry.toml" or a == "scripts/check_repo_hygiene.py":
+            continue
+        for b in text_files:
+            if a != b and Path(b).name in text:
+                callers.setdefault(b, []).append(a)
+
+    roots = {f for f in text_files if _gate_auto_invoked(f, contents)}
+    roots.update(f for f in text_files if f.startswith(".github/workflows/"))
+    for entry in entries:
+        value = str(entry.get("gate_invoke", "")).strip()
+        if not value:
+            continue
+        if not value.startswith("manual:"):
+            errors.append(
+                f"{REGISTRY_PATH}: semantic {entry.get('id')} gate_invoke must use "
+                f'the form "manual: <who runs it and how>", got {value[:40]!r}'
+            )
+        for part in _gate_relpaths(str(entry.get("correctness_gate", ""))):
+            roots.add(part)
+    for rel, text in contents.items():
+        head = "\n".join(text.splitlines()[:15])
+        if _MANUAL_INVOKE_RE.search(head):
+            roots.add(rel)
+
+    reachable = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for b, aa in list(callers.items()):
+            if b not in reachable and any(a in reachable for a in aa):
+                reachable.add(b)
+                changed = True
+
+    seeds: dict[str, str] = {}
+    for entry in entries:
+        sid = str(entry.get("id", "<unknown>"))
+        for part in _gate_relpaths(str(entry.get("correctness_gate", ""))):
+            if (ROOT / part).exists():
+                seeds[part] = f"registry semantic {sid}"
+    for rel in text_files:
+        if _GATE_SCRIPT_RE.match(rel):
+            seeds.setdefault(rel, "standalone gate script:")
+
+    for part, origin in sorted(seeds.items()):
+        if part not in reachable:
+            errors.append(
+                f"{REGISTRY_PATH}: {origin} {part} exists but nothing in the tree reaches it "
+                "(no invocation chain from CI, cargo, or the GPU batch) — add "
+                'gate_invoke="manual: <who runs it and how>" (registry field or a script '
+                "header line) or wire a caller"
+            )
+    return errors
+
+
 def check_registry_gate_paths() -> list[str]:
     errors: list[str] = []
     try:
@@ -743,6 +884,17 @@ def break_registry_gate_undeclared_scope(root: Path) -> None:
     path.write_text("".join(kept))
 
 
+def break_registry_gate_undeclared_invocation(root: Path) -> None:
+    """A gate path with no caller in the tree must carry a gate_invoke manual
+    declaration; strip every such line so an uninvokable declared gate fails."""
+    path = root / REGISTRY_FIXTURE
+    lines = path.read_text().splitlines(keepends=True)
+    kept = [ln for ln in lines if not re.match(r"\s*gate_invoke\s*=", ln)]
+    if len(kept) == len(lines):
+        raise AssertionError("no gate_invoke line to remove")
+    path.write_text("".join(kept))
+
+
 def break_repo_wide_markers(root: Path) -> None:
     path = root / MARKER_FIXTURE
     path.write_text(path.read_text() + "\nbuilt at /Users/someone/code/agent-infer\n")
@@ -816,6 +968,18 @@ SELFTEST_WORLDS = [
          for p in _gate_relpaths(str(entry.get("correctness_gate", "")))
      })),
      break_registry_gate_undeclared_scope),
+    ("registry_gate_invocation_declared", check_registry_gate_invocation,
+     (REGISTRY_FIXTURE,
+      # The two manually-invoked registry scripts keep their gate_invoke
+      # declarations (in the registry); the vendor-trusted lever gate is a
+      # workflow-named root; gemm_tests.rs is reached through cfg(test) in
+      # gemm.rs. Missing fixture files simply are not seeds in this world.
+      "scripts/kernel_ab_fp4.sh", "scripts/sampling_gate.py",
+      "scripts/lever_gate.sh",
+      "crates/cuda-kernels/src/ffi/gemm_tests.rs",
+      "crates/cuda-kernels/src/ffi/gemm.rs",
+      ".github/workflows/metal-ci.yml"),
+     break_registry_gate_undeclared_invocation),
     ("repo_wide_disallowed_markers", check_repo_wide_disallowed_markers,
      (MARKER_FIXTURE,), break_repo_wide_markers),
     ("wins_baseline_citations", check_wins_baseline_citations, (WINS_FIXTURE,), break_wins_baseline),
@@ -877,6 +1041,7 @@ def main() -> int:
     errors.extend(check_decode_graph_invalidation())
     errors.extend(check_registry_covers_runtime_counters())
     errors.extend(check_registry_gate_paths())
+    errors.extend(check_registry_gate_invocation())
     errors.extend(check_prereg_no_stale_running())
     errors.extend(check_agenda_ledger())
 

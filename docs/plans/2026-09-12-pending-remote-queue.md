@@ -17,6 +17,11 @@ bench-labelled run (`pod-remote-run.sh` rejects other profiles). GPU claims
 go through `scripts/pick-gpu.sh` (or `ARLE_PARITY_GPU=<i>` to pin one),
 never by picking a free index by hand.
 
+P-row numbers follow the same rule across lanes: a lane branches from the
+current main and reads a next-free P index that another unmerged lane may
+already hold, so a P number is assigned **after rebasing onto current main**,
+re-derived from the merged queue headings, never from the branch point.
+
 ## Order at a glance
 
 1. **One sm90 card frees → parity batch (P1).** It is self-contained, runs in
@@ -25,8 +30,9 @@ never by picking a free index by hand.
    measured clean-run margin the Phase-2 tightenings (P11) need, so P11
    cannot start until P1 has run.
 2. **Cheap single-card diagnostics, any card, short holds:** P4 fp4 M=1
-   A/B, P5 DSpark c=8 branch decider, P8 decode-graph flag check. Run P5
-   before interpreting any DSpark acceptance result from P3.
+   A/B, P5 DSpark c=8 branch decider, P8 decode-graph flag check, P16
+   drafter batch-invariance (no model load). Run P5 before interpreting any
+   DSpark acceptance result from P3.
 3. **#334 must merge, then P3 (FlashQLA/DSpark verify grid).** This is the
    multi-card consumer and the gate for P2 (the #300 varlen deletion).
    Run tp=1 first (one card, earliest signal), then tp=2/4/8 as cards free.
@@ -347,6 +353,26 @@ never by picking a free index by hand.
 - **Depends on:** #334 and the P3 tp=8 result (chunked-routing engagement
   proven before quoting the reanchor); whole-box, runs after P3.
 
+### P16 — DSpark drafter batch-invariance gate, first ever run
+
+- **State:** wired into the registry 2026-09-12 (`477ef006c`); the 2026-09-11
+  parity batch predates it, so no positive or negative verdict has ever been
+  produced for this gate. Source review says the negative arm is reachable:
+  clean mode builds a synthetic drafter head, no checkpoint needed.
+- **Commands (pod tree):**
+  `INFER_CUDA_DEVICE=<free-sm90> target/release/examples/dspark_drafter_batch_invariance`
+  then the same binary with `--negative-control`.
+- **Device:** one sm90 card, no model weights (synthetic head at the served
+  geometry); one of the cheapest rows in this queue, fits alongside any
+  single-card job on a leftover card.
+- **Decides:** whether the whole-step batched DSpark drafter (the c=1 13% /
+  c=8 0% acceptance collapse suspect) produces identical target drafts when
+  batched with 7 live foreign slots vs alone, at target index 0 and 3;
+  the two sabotages (slot-start swap, K/V ring-base exchange) must each
+  move the target beyond the bound (`NEGATIVE CONTROL OK`).
+- **Prereg:** `drafter-batch-invariance-<ts>`.
+- **Depends on:** nothing; no model load, no multi-card set.
+
 ## Not in this queue (different blocking resource or stale)
 
 - **V100 DSpark re-bench (deliberately absent):** the lockstep stall was
@@ -383,6 +409,7 @@ never by picking a free index by hand.
 | P3 verify tp=1/2/4 | 1/2/4 sm90 | long | 1-card jobs on leftover cards, one serve per card |
 | P3 verify tp=8 / P2 | 8 sm90 | whole box | nothing else |
 | P15 DSv4-TP8 DSpark reanchor | 8 sm90 | whole box | nothing else; after P3 tp=8 |
+| P16 drafter invariance | 1 sm90 | short, no model | other 1-card jobs |
 | P12 dsv4 multirank | N sm90 | multi-rank | its own reservation |
 | P13 OPD cp2 | 2 sm90 | training reservation | its own lane |
 | P9 fa2 sm70 | 1 V100 (separate host) | short | **all H20 jobs concurrently** |
