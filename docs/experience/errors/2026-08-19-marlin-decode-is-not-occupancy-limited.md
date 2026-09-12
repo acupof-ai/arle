@@ -4,7 +4,7 @@
 
 ## Context
 
-After [](../wins/2026-08-19-nvfp4-marlin-remaining-load-sites.md) put
+After [the NVFP4 Marlin port's last four load sites](../wins/2026-08-19-nvfp4-marlin-remaining-load-sites.md) put
 every quantised GEMM of Qwen3.8-27B-NVFP4 on Marlin, c=16 sat at +13.3% over
 Qwen3.6-27B-FP8 while c=1..8 were all above +30%. A per-op profile put the whole
 residue in `dense_ffn`, and an in-tree comment recorded the kernel as
