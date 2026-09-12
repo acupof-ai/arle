@@ -318,8 +318,23 @@ mod real {
             ensure!(pack_ok, "clean pack mismatch before corruption");
         }
 
-        // Build indices + topk_length.
-        let mut indices_dev = ctx.stream.alloc_zeros::<i32>(s_q * TOPK)?;
+        // Build indices + topk_length. Per-mode row pitch, mirroring
+        // production (infer-cuda attention.rs derives one topk_unified and uses
+        // it for alloc, fwd topk and stride): CSA = SW+INDEX_TOPK; HCA =
+        // SW+ceil128(compressed_count). The same value must size the buffer,
+        // the builder, and the fwd stride below, or token rows are written and
+        // read at different pitches.
+        let max_keys = match mode {
+            Mode::Csa => INDEX_TOPK,
+            Mode::Hca => compressed_count.div_ceil(128) * 128,
+        };
+        let topk_unified = SW + max_keys;
+        ensure!(
+            topk_unified.is_multiple_of(128),
+            "harness topk_unified {topk_unified} must be %128"
+        );
+        let mut indices_dev = ctx.stream.alloc_zeros::<i32>(s_q * topk_unified)?;
+        let indices_len = s_q * topk_unified;
         let mut topk_dev = ctx.stream.alloc_zeros::<i32>(s_q)?;
         let selected_dev = if matches!(mode, Mode::Csa) {
             Some(ctx.stream.clone_htod(&selected)?)
@@ -343,7 +358,10 @@ mod real {
                     ratio as i32,
                 )?,
                 Mode::Hca => {
-                    let max_keys = compressed_count.div_ceil(128) * 128;
+                    // max_keys is the ceil128 capacity computed above; the
+                    // builder writes rows at SW+max_keys == topk_unified, the
+                    // same pitch the buffer and fwd stride use. Selection count
+                    // is clamped to compressed_count inside the builder.
                     attention::flashmla_hca_build_indices_raw(
                         &ctx.stream,
                         idx_ptr,
@@ -392,13 +410,13 @@ mod real {
                 H_KV,
                 D as i32,
                 D as i32,
-                TOPK as i32,
+                topk_unified as i32,
                 1.0 / (D as f32).sqrt(),
                 (H_Q * D) as i32,
                 D as i32,
                 D as i32,
                 0,
-                TOPK as i32,
+                topk_unified as i32,
                 0,
                 0,
             )?;
@@ -443,7 +461,12 @@ mod real {
             }
         }
 
-        let idx_ok = indices == ref_indices;
+        // indices_dev is sized to the per-mode topk_unified; the oracle emits
+        // the fixed TOPK layout. Compare the prefix both share: the device
+        // vector's valid length must equal s_q*topk_unified and agree there
+        // (trailing slots past a shorter HCA pitch are not device-written).
+        let idx_ok =
+            indices.len() == indices_len && indices[..indices_len] == ref_indices[..indices_len];
         let topk_ok = check_topk(&topk_len, case, compressed_count);
         let out_ok = max_rel_out <= PASS_MAX_REL_OUT;
         let lse_ok = max_abs_lse <= PASS_MAX_ABS_LSE;
