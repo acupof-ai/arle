@@ -1994,7 +1994,7 @@ fn cuda_linear_attention_seq_carry_grads_match_unchunked() -> Result<()> {
     let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
     let z_shape = [params.batch, params.seq_len, z_dim(params)];
     let head_shape = [params.batch, params.seq_len, params.num_value_heads];
-    let mut run = |chunked: bool| -> Result<Vec<Vec<f32>>> {
+    let run = |chunked: bool| -> Result<Vec<Vec<f32>>> {
         let mut store = TensorStore::with_backend(Arc::new(CudaBackend::new(0)?));
         let mut tape = Tape::new();
         let qkv = store.from_slice(&fixture.qkv, &qkv_shape)?;
@@ -2032,7 +2032,7 @@ fn cuda_linear_attention_seq_carry_grads_match_unchunked() -> Result<()> {
             let mut outs = Vec::new();
             for c in 0..2 {
                 let (r0, r1) = (c * half, (c + 1) * half);
-                let mut rows = |x: TensorId, w: usize, st: &mut TensorStore, tp: &mut Tape| {
+                let rows = |x: TensorId, w: usize, st: &mut TensorStore, tp: &mut Tape| {
                     slice(x, &[0, r0, 0], &[params.batch, r1, w], st, tp)
                 };
                 let qkv_c = rows(qkv, qkv_dim(params), &mut store, &mut tape)?;
