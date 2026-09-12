@@ -222,7 +222,7 @@ jobs:
           -p infer-moe -p infer-model -p infer-topo -p infer-util -p deepseek-spec -p agent
           -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys
           -p infer-quant -p infer-gguf
-          -p spec-train
+          -p spec-train -p cuda-kernels
 
   fmt:
     name: Format
