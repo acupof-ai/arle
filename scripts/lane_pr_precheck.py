@@ -40,10 +40,13 @@ PR_REF = re.compile(r"#\d{2,}")
 # decimal like 1048576 must not match.
 LONG_SHA = re.compile(r"(?=\b[0-9a-f]*[0-9][0-9a-f]*\b)(?=\b[0-9a-f]*[a-f][0-9a-f]*\b)\b[0-9a-f]{7,40}\b")
 # Banned path literals are assembled, not written: check_repo_hygiene bans
-# those strings in tracked text.
-ABS_PATH = re.compile(
-    r"(?<![\w./-])(" + "|".join(["/" + s for s in ("Users/", "root/", "data0", "mnt/", "host/")]) + r")"
-)
+# those strings in tracked text. ABS_PATH uses a strict lookbehind (no hyphen)
+# so the shell overridable-default idiom ${VAR:-<build-tree>} cannot hide a
+# literal even behind the `:-`; check_abs_paths re-allows that form solely
+# inside executable .sh code, never in a comment and never outside shell.
+_ABS_SEGMENTS = "|".join(["/" + s for s in ("Users/", "root/", "data0", "mnt/", "host/")])
+ABS_PATH = re.compile(r"(?<![\w./])(" + _ABS_SEGMENTS + r")")
+SHELL_PATH = re.compile(r"\.sh$")
 PARITY_EXAMPLE_PATH = re.compile(r"^crates/infer-cuda/examples/[A-Za-z0-9_]+\.rs$")
 # parity_gpu_batch.sh derives its gate list from registry correctness_gate
 # values and reads these two markers out of each run's log.
@@ -124,12 +127,24 @@ def check_comments(added: dict[str, list[str]]) -> list[str]:
 
 
 def check_abs_paths(added: dict[str, list[str]]) -> list[str]:
-    return [
-        f"abs-path: {path}:{n} adds a machine-local absolute path"
-        for path, lines in added.items()
-        for n, line in enumerate(lines, 1)
-        if ABS_PATH.search(line)
-    ]
+    failures = []
+    for path, lines in added.items():
+        shell = bool(SHELL_PATH.search(path))
+        for n, line in enumerate(lines, 1):
+            for m in ABS_PATH.finditer(line):
+                # The only carve-out from the strict rule is the shell
+                # parameter-expansion default in executable .sh code — never
+                # in a .sh comment, and nowhere outside shell.
+                if (
+                    shell
+                    and not HASH_COMMENT.match("+" + line)
+                    and line[max(0, m.start() - 2):m.start()] == ":-"
+                ):
+                    continue
+                failures.append(
+                    f"abs-path: {path}:{n} adds a machine-local absolute path"
+                )
+    return failures
 
 
 def changed_files(repo: Path, base: str) -> list[str]:
@@ -271,6 +286,8 @@ def world(files: dict[str, str], body: str) -> Path:
 
 def selftest() -> int:
     _root = "/" + "root/"
+    _host_tree = "/" + "host/arle-build"
+    _root_tree = "/" + "root/arle-build"
     cases = [
         ("clean world", {RUNTIME_FIXTURE: "pub fn x() {}\n", EXAMPLE_FIXTURE: "fn main() {}\n"},
          EXEMPT_BODY, "BUILD_EXIT=0\n", None),
@@ -283,6 +300,11 @@ def selftest() -> int:
         ("hash script PR ref", {"scripts/x.sh": "# fixed in #123\n"}, EXEMPT_BODY, "", "comment-ref"),
         ("history entry", {HISTORY_FIXTURE: "# Title\n\nSuperseded by #123 (abcdef12).\n"}, BARE_BODY, "", None),
         ("abs path", {RUNTIME_FIXTURE: f'pub const L: &str = "{_root}x";\n'}, EXEMPT_BODY, "", "abs-path"),
+        ("abs path shell override idiom", {"scripts/x.sh": f'TREE="${{TREE:-{_host_tree}}}"\n'}, EXEMPT_BODY, "", None),
+        ("abs path shell plain literal", {"scripts/x.sh": f'cd {_root_tree}\n'}, EXEMPT_BODY, "", "abs-path"),
+        ("abs path shell comment override", {"scripts/x.sh": f'# default is {_host_tree} here\n'}, EXEMPT_BODY, "", "abs-path"),
+        ("abs path prose override form", {"README.md": f"use `${{TREE:-{_host_tree}}}` as the tree\n"}, BARE_BODY, "", "abs-path"),
+        ("hyphen non-path passes", {"scripts/x.sh": 'flag --x-root /none-such\n'}, EXEMPT_BODY, "", None),
         ("build-exit", {EXAMPLE_FIXTURE: "fn main() {}\n"}, EXEMPT_BODY, "", "build-exit"),
         (
             "cuda-check missing",

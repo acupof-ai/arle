@@ -29,13 +29,26 @@ export CMAKE_CUDA_ARCHITECTURES=90
 # builds like -p autograd don't touch this.)
 if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
   # Match the CI trusted producer's pin exactly — a loose >= probe let the pod
-  # build kernels with a different codegen than the published bundle.
-  tilelang_pin="$(grep -oE 'tilelang==[0-9.]+' "${TREE:-/host/arle-build}/requirements-build.txt" 2>/dev/null | cut -d= -f3)"
-  tilelang_pin="${tilelang_pin:-0.1.13}"
+  # build kernels with a different codegen than the published bundle. Read the
+  # pin from THIS tree's requirements file. The file is git-tracked, so it is
+  # present in every clean sync and fresh clone; it is only absent in a
+  # half-finished sync or when sourced outside a tree, where a hard failure
+  # would turn a recoverable build dead — keep the literal fallback for that
+  # case, but fail loudly if the file is present and no longer pins tilelang.
+  _req="${TREE:-/host/arle-build}/requirements-build.txt"
+  if [ -f "$_req" ]; then
+    tilelang_pin="$(grep -oE 'tilelang==[0-9.]+' "$_req" | cut -d= -f3)"
+    if [ -z "$tilelang_pin" ]; then
+      echo "pod-build-env: $_req exists but has no tilelang== pin; refusing to guess a TileLang interpreter" >&2
+      exit 1
+    fi
+  else
+    tilelang_pin="0.1.13"
+    echo "pod-build-env: $_req absent (partial sync?); falling back to tilelang pin $tilelang_pin" >&2
+  fi
   for python in \
     "${ARLE_TILELANG_VENV:-/root/arle-ops/tilelang-venv}/bin/python" \
     "${TREE:-/host/arle-build}/crates/cuda-kernels/tools/tilelang/.venv/bin/python" \
-    /host/arle-build/crates/cuda-kernels/tools/tilelang/.venv/bin/python \
     "$(command -v python3 2>/dev/null)"; do
     [ -x "$python" ] || continue
     if "$python" -c "import importlib.metadata as m; assert m.version('tilelang') == '$tilelang_pin'" >/dev/null 2>&1; then
@@ -43,6 +56,11 @@ if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
       break
     fi
   done
+  if [ -n "${INFER_TILELANG_PYTHON:-}" ]; then
+    echo "pod-build-env: INFER_TILELANG_PYTHON=$INFER_TILELANG_PYTHON (tilelang $tilelang_pin)"
+  else
+    echo "pod-build-env: no interpreter matched tilelang $tilelang_pin; AOT regen will fail (set INFER_TILELANG_PYTHON or scripts/pod.sh setup-tilelang)" >&2
+  fi
 fi
 # CUTLASS for the W4AFP8 MoE kernel: the FlashMLA vendored CUTLASS 4.x
 # (crates/cuda-kernels/vendor/flashmla/csrc/cutlass/) — build.rs points at it
