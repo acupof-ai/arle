@@ -30,7 +30,11 @@
 //!   - max_logits — per-row max pre-softmax logit vs the reference.
 //!
 //! `--negative-control` corrupts one thing per family; prints NEGATIVE
-//! CONTROL OK and exits 0 only if every flag fired.
+//! CONTROL OK and exits 0 only if every flag fired. The index family is a
+//! real kernel tooth: the CSA index builder is re-run on a corrupted
+//! selection and its produced indices must differ from the clean oracle yet
+//! match the oracle rebuilt from that selection (matching the sparse/hca
+//! decode gates — never a host-edited copy).
 //!
 //! Mode select: default runs both CSA and HCA. sm90 only. Build/run (pod;
 //! pod.sh build rejects --example):
@@ -482,19 +486,52 @@ mod real {
             compressed_count,
         );
 
-        // indices: tamper the last query token's one SW index on device, rerun
-        // fwd is not needed; the family flag is whether oracle differs.
-        let mut bad_indices = indices.clone();
+        // indices: a REAL index-builder tooth, matching sparse/hca decode. Feed
+        // the CSA builder a corrupted selection (the last token's first
+        // compressed key points at a different valid key) and compare the
+        // indices the KERNEL produces — not a host-edited copy — against both
+        // the clean oracle (must differ) and the oracle rebuilt from the
+        // corrupted selection (must match: the kernel honoured the bad input).
         let last = s_q - 1;
-        let sw_count_last =
-            (start + last as i32) - (start + last as i32 - SW as i32 + 1).max(0) + 1;
-        let slot0 = (sw_count_last as usize).saturating_sub(1);
-        let saved = bad_indices[last * TOPK + slot0];
-        bad_indices[last * TOPK + slot0] = -1;
-        let neg_indices = bad_indices != ref_indices && saved >= 0;
+        let mut bad_selected = selected.clone();
+        let sel_base = last * INDEX_TOPK;
+        // Pick a valid compressed key different from the current first choice
+        // and visible at the last token; corrupting an entry the builder would
+        // drop as out-of-range could leave the output unchanged.
+        let valid_last = compressed_count.min(INDEX_TOPK);
+        let first_choice = bad_selected[sel_base];
+        let replacement = (0..valid_last as i32)
+            .find(|&c| {
+                c != first_choice && c * ratio as i32 + (ratio as i32 - 1) <= start + last as i32
+            })
+            .expect("a second visible compressed key exists for the negative");
+        bad_selected[sel_base] = replacement;
+        let mut bad_idx_dev = ctx.stream.alloc_zeros::<i32>(s_q * TOPK)?;
+        let mut bad_topk_dev = ctx.stream.alloc_zeros::<i32>(s_q)?;
+        {
+            let bad_sel_dev = ctx.stream.clone_htod(&bad_selected)?;
+            let (idx_ptr, _gi) = bad_idx_dev.device_ptr_mut(&ctx.stream);
+            let (topk_ptr, _gt) = bad_topk_dev.device_ptr_mut(&ctx.stream);
+            attention::flashmla_csa_build_indices_raw(
+                &ctx.stream,
+                idx_ptr,
+                topk_ptr,
+                bad_sel_dev.device_ptr(&ctx.stream).0,
+                s_q as i32,
+                start,
+                SW as i32,
+                INDEX_TOPK as i32,
+                compressed_count as i32,
+                ratio as i32,
+            )?;
+        }
+        ctx.sync()?;
+        let bad_indices = ctx.stream.clone_dtoh(&bad_idx_dev)?;
+        let bad_ref = oracle_indices(case, &bad_selected, compressed_count);
+        // Differs from clean AND self-consistent with the corrupted oracle.
+        let neg_indices = bad_indices != ref_indices && bad_indices == bad_ref;
 
-        // output/LSE/maxlogit: run fwd again with the tampered index set.
-        let mut bad_idx_dev = ctx.stream.clone_htod(&bad_indices)?;
+        // output/LSE/maxlogit: run fwd again with the kernel-built bad indices.
         let mut bad_out = ctx.stream.alloc_zeros::<bf16>(s_q * H_Q * D)?;
         let mut bad_max = ctx.stream.alloc_zeros::<f32>(s_q * H_Q)?;
         let mut bad_lse = ctx.stream.alloc_zeros::<f32>(s_q * H_Q)?;
