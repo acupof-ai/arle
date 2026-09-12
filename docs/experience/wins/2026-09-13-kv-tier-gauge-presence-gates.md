@@ -44,10 +44,15 @@ Reuse-hit counters in the same block stay unconditional: they are monotonic
 event counters whose zero is honest. The wire DTO gains both bools with
 `#[serde(default)]` (older workers read false → omitted, never zero-present);
 presence is OR-aggregated across TP ranks and DP groups. OR (rather than
-omitting when any rank is unmeasured) is correct because ranks in one
-deployment are homogeneous: one measuring rank proves the quantity exists, and
-the accompanying gauges are already min/sum aggregates of the ranks that
-reported.
+omitting when any rank is unmeasured, or AND) is chosen because ranks in one
+deployment are homogeneous: they load one model/backend configuration, so one
+measuring rank proves the quantity exists for the deployment, and the
+accompanying gauges are already min/sum aggregates of the ranks that reported.
+The named limitation: in an unsupported mixed layout where one rank held a page
+tier and another did not, OR would report present while the non-tier rank
+contributes no residency. That configuration is not a valid TP layout (ranks
+cannot differ in backend), so the trade is stated, not built around with
+per-rank series.
 
 Gates: a metrics test renders the default snapshot and asserts all three series
 are absent, then flips both flags and asserts the measured-zero series export.
