@@ -14,7 +14,7 @@ construction (`min(max_running_requests, num_slots)`, infer-core/src/lib.rs).
 
 ## What Worked
 
-Commit : a set cap IS the requested executor slot budget
+A set cap IS the requested executor slot budget
 (`max_running_requests.unwrap_or(num_slots).max(1)`); unset keeps the
 `num_slots` auto-ceiling. Predicted at cap=32: ~9.1GB freed -> pool ~1.28M
 tokens (~15x). Bench numbers pending the pod A/B.

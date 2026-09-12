@@ -19,7 +19,7 @@ Dequantize the FP8 block-scaled weight to bf16 on device (one memory-bound
 elementwise kernel, ~0.1ms per 27B weight) and delegate to the existing
 `matmul[_bt]_device_f32_bf16` cuBLAS tensor-core path. Both naive GEMM kernels
 and the orphaned `launch_2d` helper deleted (net −181 LOC); no shape/model
-guards — any FP8 block-scaled weight on any model qualifies. Commit.
+guards — any FP8 block-scaled weight on any model qualifies.
 
 Same toy config A/B (run-fp8dq-toy1r vs run-profile3-toy1r, same pod, same
 task, GPU 1, RUN_EXIT=0, zero NVRTC/runtime errors):

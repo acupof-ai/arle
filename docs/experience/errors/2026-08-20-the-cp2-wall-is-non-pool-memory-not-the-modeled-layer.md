@@ -5,8 +5,8 @@ allocation fails`).
 
 ## Context
 
-Target is global sequence 262,144 on 2 GPUs. The ceiling has sat at 131,072
-since. Global 163,840 (local 81,920) fails in the backward on
+Target is global sequence 262,144 on 2 GPUs. The ceiling had sat at 131,072
+before this refresh. Global 163,840 (local 81,920) fails in the backward on
 `zeros [1, 81920, 5120]`, 1.6 GB, and the peak model reads
 `actual=77,026 MiB` of 97,508 — apparently 20 GB of headroom.
 

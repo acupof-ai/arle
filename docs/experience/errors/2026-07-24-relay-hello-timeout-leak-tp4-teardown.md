@@ -6,8 +6,8 @@
 
 A review-fix (LOW#18) added a read timeout to `accept_n` in
 `infer-server/src/multiproc_relay.rs` to stop a silent peer from wedging the
-single-threaded coordinator accept loop at boot. It shipped in commit
-. Local `cargo test` + Mac CUDA typecheck + CI were all green; the H20
+single-threaded coordinator accept loop at boot. It shipped in the relay
+streaming fix. Local `cargo test` + Mac CUDA typecheck + CI were all green; the H20
 DSv4-Flash TP=4/EP=4 needle gate passed 15/15 and c1/c4 throughput was
 perf-neutral. Then at **c8** the serve tore itself down:
 

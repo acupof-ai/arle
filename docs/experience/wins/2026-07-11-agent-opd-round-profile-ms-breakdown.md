@@ -5,8 +5,8 @@
 First precise end-to-end profile of an in-process `train agent-opd` round.
 8×H20 GPU 1, 27B FP8 student (zero-copy shared base), 4 tasks × 2 samples,
 max-turns 5, max-tokens 512, writeback-cap 4, LoRA r16 qv, temp 0.7, 1 round +
-round-0 eval. Instrumentation: `ARLE_AOPD_PROFILE=1` (commit
-`crates/train/src/aopd_profile.rs`), zero-cost when off. RUN_EXIT=0.
+round-0 eval. Instrumentation: `ARLE_AOPD_PROFILE=1`, implemented in
+`crates/train/src/aopd_profile.rs`, zero-cost when off. RUN_EXIT=0.
 
 ## The breakdown (round wall = 173523.7 ms)
 

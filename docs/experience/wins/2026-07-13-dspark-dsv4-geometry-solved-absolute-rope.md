@@ -32,8 +32,7 @@ the absolute target-position frame.
 
 ## What Worked
 
-Decouple the RoPE position frame from the `latent_kv` write offset (commit
-). Thread `block_abs` (= executor `verify_pos = start_pos + 1`) through
+Decouple the RoPE position frame from the `latent_kv` write offset. Thread `block_abs` (= executor `verify_pos = start_pos + 1`) through
 `dspark_forward_block → dspark_stage_forward / dspark_append_latent`:
 - noise block Q/K RoPE at absolute `block_abs + [0..block)`;
 - each step's committed-token context at absolute `block_abs - 1` (all `hc_mult`

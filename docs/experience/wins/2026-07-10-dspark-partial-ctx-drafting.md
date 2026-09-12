@@ -39,7 +39,7 @@ Pod verdict — **LICENSED on the production multi-turn shape**:
   run 2's prefix-hit changes drafter ctx → different proposal chains → a
   different (equally valid) sampled realization. Cache-ON same-seed still
   diverges by design.
-- Env-sweep smoke (..): plain decode 42.7 tok/s decode-only
+- Env-sweep smoke across the flag sweep: plain decode 42.7 tok/s decode-only
   vs 42.6–43.6 baseline band → **Δ≈0%**, flag-plumbing-only claim holds.
 
 ## Rule

@@ -20,11 +20,10 @@ failed after these changes were combined.
 ## Fix
 
  restored `expf` and `logf`. restored the scalar split
-kernels and the direct GEMV input loads. The restored split file matches the
-parent of the eight fast-math files match the same parent, and the
-GEMV file matches the parent of.
+kernels and the direct GEMV input loads. The restored split file, and the
+GEMV file, match the parent of the eight fast-math files.
 
-Remote verification used an isolated clean tree at exact commit
+Remote verification used an isolated clean tree at an exact commit
 on one H20:
 
 - CUDA release build completed with exit 0;

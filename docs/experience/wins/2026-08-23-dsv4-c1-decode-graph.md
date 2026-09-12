@@ -156,8 +156,7 @@ binary is symbol-stripped, so the shim's frames were resolved against a
 Defect 7's fix regressed once: the constructor sized the n=1 O-LoRA staging
 from `dsv4_oproj_group_dims(config)` while the runtime used the TP-local
 `shape.cols_per_group`, so the mismatch re-introduced 86 alloc nodes. The
-staging now resizes on the eager warm step when the loaded table dims differ
-.
+staging now resizes on the eager warm step when the loaded table dims differ.
 
 ## Learnings
 

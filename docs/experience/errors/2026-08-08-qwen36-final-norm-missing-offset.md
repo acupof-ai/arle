@@ -260,7 +260,6 @@ a key.
 - **Check a diagnostic is wired for the model under test.**
   `ARLE_PROBE_LENS_LAYERS` and `ARLE_PROBE_STAGES` both had call sites only in
   `dsv4.rs` while their `meta` line printed as if armed — a silent empty result
-  reads as "no divergence found". Fixed for both
-.
+  reads as "no divergence found"; fixed for both variables.
 - Scripts named after stdlib modules (`bisect.py`) on the CWD shadow the stdlib
   and execute on import; this corrupted one measurement before it was caught.

@@ -47,8 +47,6 @@ base pointers and promotes `blockIdx.z` to a slot axis; the new
 existing per-slot loop and runs attention once after it. Grid becomes
 (32, 6, 16) = 3072 blocks, one launch per layer instead of 16.
 
-Commit.
-
 ## Measured — pinned shape
 
 `crates/cuda-kernels/tools/nonpaged_attn_bench.cu batch 16 6 <kv_len>`, 16 slots

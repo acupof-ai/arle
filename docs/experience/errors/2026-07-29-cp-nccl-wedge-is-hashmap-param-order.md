@@ -46,7 +46,7 @@ Deterministic order at the source, not a sort at the all-reduce entry.
 param-ordering callers (`register_linear`, `collect_linear_ids`) use it. The
 model-level `adapter_name_map()` stays a HashMap — its callers are name-keyed
 (checkpoint/sync/EMA), not position-keyed, so their iteration order never
-reaches a collective. Commit.
+reaches a collective.
 
 ## Rule
 

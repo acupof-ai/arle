@@ -62,7 +62,7 @@ still emitted, so a stream cannot stall holding them.
 by construction (one extra decode of ≤4 tokens only while a codepoint is
 incomplete).
 
-Verified on the pod at (isolated build tree, serve on an idle GPU so
+Verified on the pod in an isolated build tree (serve on an idle GPU so
 production's binary and endpoints were untouched): the assembled streamed text
 carries **zero U+FFFD and is byte-identical to the non-streaming decode of the
 same greedy generation**. The old binary on the same class of prompt put the

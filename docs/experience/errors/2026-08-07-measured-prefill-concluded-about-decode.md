@@ -61,7 +61,7 @@ confounded design produces, not a result.
 The knob that isolates step latency is the per-tick token budget
 (`max_num_batched_tokens`, Sarathi-Serve's "token budget"), which had no CLI
 path at all: a hardcoded 16384 in `SchedulerConfig::default()` that nobody
-chose and nobody could test. Exposed in.
+chose and nobody could test; it is now exposed as the `--max-num-batched-tokens` flag.
 
 ## Fix
 

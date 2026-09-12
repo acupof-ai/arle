@@ -22,12 +22,12 @@ Not yet attributed to a commit — but the case is fully decoded and bounded:
   absolute position 4 exactly, matching the first compress-ratio-4 chunk
   (`compress_ratios` layer arm = 4: chunk covers pos 0-3, first consumed at
   pos 4). Mechanistic suspect: the DSv4 compressed-attention chunk path.
-- Bisect (worktree boots, same box/model/shape): reproduces on
- and the round-6 build — probe commit
- LoRA-FP8 promotion and the whole round-7 window exonerated.
+- Bisect (worktree boots, same box/model/shape): the regression reproduces on
+  the two suspect builds and the round-6 build; the per-position probe commit,
+  LoRA-FP8 promotion, and the whole round-7 window are exonerated.
   Tier flags exonerated (control without `--kv-disk` reproduces).
 - Contradiction to resolve: round-6 recorded "DSv4 regression completion
- clean" on measured on this shape NaNs. That check
+  clean" on the round-6 build; that same build NaNs on this shape. That check
   must have used a different shape/criterion (or never looked at text).
 
 ## Fix
