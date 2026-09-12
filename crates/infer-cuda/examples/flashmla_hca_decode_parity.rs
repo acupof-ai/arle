@@ -150,17 +150,17 @@ mod real {
         let mut nope_src = vec![0f32; total_tokens * HEAD_NOPE];
         let mut rope_src = vec![0f32; total_tokens * HEAD_ROPE];
         let mut used = vec![false; total_tokens];
-        // Per-row dominant compressed row (last causal) → physical token.
-        let mut dom_phys = [0usize; B];
         let mut pool = ctx.stream.alloc_zeros::<u8>(TOTAL_BLOCKS * BLOCK_BYTES)?;
 
         for r in 0..B {
             let start = START_POS[r];
             let comp_count = (start / COMPRESS_RATIO as i32) as usize; // dense rows
-            let dom_c = comp_count - 1;
-            dom_phys[r] = {
-                let logical = SW_BLOCKS + dom_c / PAGE;
-                phys_of(r, logical) * PAGE + dom_c % PAGE
+            // Last causal compressed row is the designated dominant; absent
+            // (comp_count == 0 for start < ratio) there is no dominant row.
+            let dom_c = if comp_count > 0 {
+                comp_count - 1
+            } else {
+                usize::MAX
             };
 
             let mut pack_nope = Vec::new();
@@ -250,7 +250,7 @@ mod real {
 
         let pool_bytes = ctx.stream.clone_dtoh(&pool)?;
         let records = decode_pool(&pool_bytes);
-        let (pack_ok, pack_max_nope, pack_max_rope) =
+        let (pack_ok, pack_max_nope, pack_max_rope, pack_worst) =
             check_pack(&pool_bytes, &nope_src, &rope_src, &used);
 
         let (num_sm_parts, fixed_overhead, block_size_topk) =
@@ -268,7 +268,7 @@ mod real {
             "pack family: decoded pool differs from BF16 sources (nope {pack_max_nope}, rope {pack_max_rope})"
         );
         println!(
-            "pack max_rel_nope={pack_max_nope:.6} max_abs_rope={pack_max_rope:.6} pass={pack_ok}"
+            "pack max_rel_nope={pack_max_nope:.6} max_abs_rope={pack_max_rope:.6} pass={pack_ok} worst[{pack_worst}]"
         );
 
         if !negative {
@@ -395,10 +395,16 @@ mod real {
         let neg_lse = lse_good > PASS_MAX_ABS_LSE;
         let bad_self_consistent = rel_bad <= PASS_MAX_REL_OUT && lse_bad <= PASS_MAX_ABS_LSE;
 
-        // Pack: flip a NoPE exponent byte on a written token.
+        // Flip the first written token's tile-0 E8M0 scale byte so the whole-tile ratio must read ~1.
         let mut corrupt = pool_bytes.clone();
-        corrupt[dom_phys[0] * ROW_BYTES] ^= 0x20;
-        let (neg_pack, _, _) = check_pack(&corrupt, &nope_src, &rope_src, &used);
+        let neg_phys = (0..used.len())
+            .find(|&p| used[p])
+            .expect("at least one written token");
+        let nb = neg_phys / PAGE;
+        let nr = neg_phys % PAGE;
+        let scale_byte = nb * BLOCK_BYTES + PAGE * (HEAD_NOPE + HEAD_ROPE * 2) + nr * 8;
+        corrupt[scale_byte] ^= 0x20;
+        let (neg_pack, neg_nope, _, neg_worst) = check_pack(&corrupt, &nope_src, &rope_src, &used);
 
         // Scheduler: 8x topk.
         let mut meta8 = Vec::new();
@@ -416,7 +422,7 @@ mod real {
         )?;
         let neg_sched = meta8 != sched_good || splits8 != splits_good;
 
-        println!("negative pack fired={neg_pack}");
+        println!("negative pack fired={neg_pack} (nope rel {neg_nope:.6}) worst[{neg_worst}]");
         println!("negative indices fired={neg_indices}");
         println!("negative out rel_vs_good={rel_good:.6} (self {rel_bad:.6}, fired={neg_out})");
         println!("negative lse abs_vs_good={lse_good:.6} fired={neg_lse}");
@@ -486,9 +492,11 @@ mod real {
         nope_src: &[f32],
         rope_src: &[f32],
         used: &[bool],
-    ) -> (bool, f64, f32) {
+    ) -> (bool, f64, f32, String) {
         let mut max_rel_nope = 0f64;
         let mut max_abs_rope = 0f32;
+        // Worst NoPE tile coordinates, printed so a wrong pack is attributable on the next GPU run.
+        let mut worst = String::new();
         for phys in 0..used.len() {
             if !used[phys] {
                 continue;
@@ -504,12 +512,24 @@ mod real {
                 } else {
                     2f32.powi(i32::from(e8m0) - 127)
                 };
+                // tile max-abs error / tile amax: FP8 shares one scale per 64-lane tile, so per-lane /|want| diverges near zero.
+                let mut tile_amax = 0f32;
+                let mut tile_max_err = 0f32;
                 for lane in 0..64usize {
                     let d = tile * 64 + lane;
                     let got = decode_e4m3(pool[data_base + d]) * scale;
                     let want = nope_src[phys * HEAD_NOPE + d];
-                    max_rel_nope = max_rel_nope
-                        .max(((got - want) / want.abs().max(f32::MIN_POSITIVE)).abs() as f64);
+                    tile_amax = tile_amax.max(want.abs());
+                    tile_max_err = tile_max_err.max((got - want).abs());
+                }
+                if tile_amax > 0.0 {
+                    let ratio = (tile_max_err / tile_amax) as f64;
+                    if ratio > max_rel_nope {
+                        max_rel_nope = ratio;
+                        worst = format!(
+                            "block={block} row={row} tile={tile} e8m0={e8m0} scale={scale:.3e} tile_amax={tile_amax:.3e} ratio={ratio:.4}"
+                        );
+                    }
                 }
             }
             for d in 0..HEAD_ROPE {
@@ -520,7 +540,7 @@ mod real {
             }
         }
         let ok = max_rel_nope <= PACK_NOPE_REL && max_abs_rope <= PACK_ROPE_ABS;
-        (ok, max_rel_nope, max_abs_rope)
+        (ok, max_rel_nope, max_abs_rope, worst)
     }
 
     fn decode_pool(bytes: &[u8]) -> Vec<Vec<f32>> {
@@ -728,7 +748,7 @@ mod real {
                 oacc_ptr,
                 meta_ptr,
                 split_ptr,
-                B as i32,
+                b as i32,
                 1,
                 H_Q as i32,
                 H_KV,
@@ -788,7 +808,7 @@ mod real {
             let (split_ptr, _gn) = splits.device_ptr_mut(&ctx.stream);
             attention::flashmla_sm90_sparse_decode_sched_meta_raw(
                 &ctx.stream,
-                B as i32,
+                b as i32,
                 1,
                 block_size_topk,
                 fixed_overhead,

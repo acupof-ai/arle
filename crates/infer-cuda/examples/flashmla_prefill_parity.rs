@@ -644,21 +644,27 @@ mod real {
         compressed_count: usize,
     ) -> bool {
         let sw_base = (start - SW as i32).max(0) as usize;
+        // The sources are uploaded after an f32 -> bf16 round (to_bf16) and the
+        // pack kernel copies bf16 -> bf16 with no other conversion, so the
+        // bit-exact target is the bf16-rounded source, not the raw f32.
+        let want_bf = |x: f32| -> f32 { bf16::from_f32(x).to_f32() };
         for row in 0..SW {
             let slot = (sw_base + row) % SW;
             for d in 0..D {
-                if (unified[row * D + d].to_f32() - window[slot * D + d]).abs() as f64 != PACK_ABS {
+                if (unified[row * D + d].to_f32() - want_bf(window[slot * D + d])).abs() as f64
+                    != PACK_ABS
+                {
                     return false;
                 }
             }
         }
         for i in 0..s_q * D {
-            if unified[SW * D + i].to_f32() != chunk[i] {
+            if unified[SW * D + i].to_f32() != want_bf(chunk[i]) {
                 return false;
             }
         }
         for i in 0..compressed_count * D {
-            if unified[(SW + s_q) * D + i].to_f32() != comp[i] {
+            if unified[(SW + s_q) * D + i].to_f32() != want_bf(comp[i]) {
                 return false;
             }
         }
