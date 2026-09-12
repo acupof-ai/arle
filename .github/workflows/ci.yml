@@ -45,34 +45,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  repo-hygiene:
-    name: Repo Hygiene
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Run repo hygiene checks
-        run: python3 scripts/check_repo_hygiene.py
-
-      - name: Prove the hygiene checks can fail
-        run: python3 scripts/check_repo_hygiene.py --selftest
-
+  # Repo hygiene lives in hygiene.yml with no path filter: it is the cheap
+  # docs-relevant gate and must run on docs-only PRs, which this workflow's
+  # paths-ignore excludes to spare the compile lanes.
   shell-contracts:
     name: Shell Contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Run artifact, release, and pod contract tests
-        run: |
-          bash scripts/tests/test_cuda_prebuilt_export.sh
-          bash scripts/tests/test_lever_gate.sh
-          bash scripts/tests/test_kernel_artifact_qualification.sh
-          bash scripts/tests/test_validate_release.sh
-          bash scripts/tests/test_pod_flow.sh
-          bash scripts/tests/test_hook_disowns_git_env.sh
-          bash scripts/tests/test_prepush_snapshot_mtime.sh
-          bash scripts/tests/test_hook_skips_shell_tests.sh
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+
+      # Base package deps (httpx, tokenizers): the gate tests drive the real
+      # Python gate scripts against mock servers.
+      - name: Install Python dependencies
+        run: pip install -e .
+
+      # Discovers scripts/tests/test_*.sh (no hand list), scoped to changes
+      # that can affect them with the same relevance rule as the pre-push
+      # hook; an unresolvable base runs them all.
+      - name: Run shell contract tests
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: bash scripts/run_shell_tests.sh
 
   # macOS Metal coverage lives in metal-ci.yml (superset: checks + tests +
   # artifact packaging on macos-14). A second macOS job here was a duplicate.

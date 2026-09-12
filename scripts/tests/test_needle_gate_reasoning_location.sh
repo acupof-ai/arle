@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'kill "${SRV_PID:-0}" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+trap 'if [ -n "${SRV_PID:-}" ]; then kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 
 # Response shapes, FAILMODE:
 #   content -> needle in content, no reasoning
@@ -58,11 +58,18 @@ class H(BaseHTTPRequestHandler):
                        "usage": {"prompt_tokens": 5, "completion_tokens": toks}}
         self._send(json.dumps(payload).encode())
     def log_message(self, *a): pass
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+srv = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+# Bind 0 + report the assigned port (concurrent hook runs must not collide).
+open(sys.argv[2], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
 PY
 
-export PORT=19941
-start() { FAILMODE="$1" python3 "$TMP/server.py" "$PORT" >/dev/null 2>&1 & SRV_PID=$!; sleep 1.2; }
+start() {
+    local pf="$TMP/port"; rm -f "$pf"
+    FAILMODE="$1" python3 "$TMP/server.py" 0 "$pf" >/dev/null 2>&1 & SRV_PID=$!
+    for _ in $(seq 1 100); do [ -s "$pf" ] && break; sleep 0.05; done
+    PORT="$(cat "$pf")"; export PORT
+}
 stop() { kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; }
 
 check() { # $1=want rc $2=mode $3=label ; rest=gate args

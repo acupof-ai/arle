@@ -60,9 +60,9 @@ if ! run_batch "gate_a:sm90 gate_d:model" "$OUT1" >"$TMP/ok.log" 2>&1; then
 fi
 [ -f "$OUT1/results.tsv" ] || { echo "FAIL: results.tsv missing" >&2; exit 1; }
 [ -f "$OUT1/results.md" ] || { echo "FAIL: results.md missing" >&2; exit 1; }
-grep -qE '^gate_a\tyes\trequired\t0\t.*ALL PASS.*\t0\t.*NEGATIVE CONTROL OK' "$OUT1/results.tsv" \
+grep -qE $'^gate_a\tyes\trequired\t0\t.*ALL PASS.*\t0\t.*NEGATIVE CONTROL OK' "$OUT1/results.tsv" \
     || { echo "FAIL: gate_a row missing/incorrect" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
-grep -qE '^gate_d\tno\tallowlisted\t-\t-\t-\t-\tSKIP\t' "$OUT1/results.tsv" \
+grep -qE $'^gate_d\tno\tallowlisted\t-\t-\t-\t-\tSKIP\t' "$OUT1/results.tsv" \
     || { echo "FAIL: model gate not recorded SKIP/allowlisted" >&2; cat "$OUT1/results.tsv" >&2; exit 1; }
 grep -q 'pass=1 fail=0 skip=1' "$TMP/ok.log" \
     || { echo "FAIL: summary counts wrong" >&2; cat "$TMP/ok.log" >&2; exit 1; }
@@ -145,7 +145,7 @@ if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_noneg" ARLE_PARITY_GPU
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_NN" >"$TMP/noneg.log" 2>&1; then
     echo "FAIL: non-allowlisted gate without negative mode exited 0" >&2; cat "$TMP/noneg.log" >&2; exit 1
 fi
-grep -qE '^gate_noneg\tno\trequired\t0\t.*\t2\t' "$OUT_NN/results.tsv" \
+grep -qE $'^gate_noneg\tno\trequired\t0\t.*\t2\t' "$OUT_NN/results.tsv" \
     && grep -q 'no negative control' "$TMP/noneg.log" \
     || { echo "FAIL: missing-negative-mode gate not reported FAIL (no negative control)" >&2
          cat "$OUT_NN/results.tsv" >&2; cat "$TMP/noneg.log" >&2; exit 1; }
@@ -158,7 +158,7 @@ ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_noneg" ARLE_PARITY_GPU=7 
     ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_AL" >"$TMP/allow.log" 2>&1 \
     || { echo "FAIL: allowlisted gate did not run green" >&2; cat "$TMP/allow.log" >&2; exit 1; }
-grep -qE '^gate_noneg\tno\tallowlisted\t0\t.*\t-\t' "$OUT_AL/results.tsv" \
+grep -qE $'^gate_noneg\tno\tallowlisted\t0\t.*\t-\t' "$OUT_AL/results.tsv" \
     || { echo "FAIL: allowlisted row wrong" >&2; cat "$OUT_AL/results.tsv" >&2; exit 1; }
 
 # ── Device-gated example: rc 0 and a SKIP line but NO pass marker, in both
@@ -211,12 +211,12 @@ OUT2="$TMP/out-bad"
 if run_batch "gate_a gate_b gate_c" "$OUT2" >"$TMP/bad.log" 2>&1; then
     echo "FAIL: dirty world exited 0" >&2; cat "$TMP/bad.log" >&2; exit 1
 fi
-grep -qE '^gate_b\t.*\tFAIL\t' "$OUT2/results.tsv" \
+grep -qE $'^gate_b\t.*\tFAIL\t' "$OUT2/results.tsv" \
     || { echo "FAIL: gate_b positive failure not recorded" >&2; cat "$OUT2/results.tsv" >&2; exit 1; }
-grep -qE '^gate_c\t.*\tFAIL\t' "$OUT2/results.tsv" \
+grep -qE $'^gate_c\t.*\tFAIL\t' "$OUT2/results.tsv" \
     || { echo "FAIL: gate_c dead negative control not recorded" >&2; cat "$OUT2/results.tsv" >&2; exit 1; }
 # gate_a must still be green in the same report.
-grep -qE '^gate_a\tno\trequired\t0\t.*\t0\t' "$OUT2/results.tsv" \
+grep -qE $'^gate_a\tno\trequired\t0\t.*\t0\t' "$OUT2/results.tsv" \
     || { echo "FAIL: gate_a not green in dirty report" >&2; exit 1; }
 grep -q 'family-x' "$OUT2/results.tsv" \
     || { echo "FAIL: verdict FAIL lines not captured into TSV" >&2; exit 1; }
