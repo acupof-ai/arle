@@ -568,7 +568,8 @@ c=8/16 points are plain decode.
 > configuration.
 
 Rule 3 re-anchor, not a regression against `868043f5f` (2026-08-10). That row
-predates which added `ignore_eos=true`: its points average
+predates the fixed-output runner change, which added `ignore_eos=true`: its
+points average
 120.7 / 110.1 / 113.5 completion tokens per request, so its requests stopped at
 EOS, while every request here emits exactly 128. Forcing generation past EOS is
 where the drafter agrees least, which moves acceptance 58.7% → 50.4% at an
