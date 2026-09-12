@@ -583,6 +583,15 @@ pub trait KvPageTier {
     /// byte-for-byte unchanged.
     fn kv_tier_capacity_pages(&self) -> usize;
 
+    /// Whether host/disk residency gauges are backed by a real tier store. A
+    /// backend stub or a backend with no tier (HIP/Vulkan) reports false so the
+    /// surfaces omit those gauges instead of publishing hardcoded zeros. This
+    /// is independent of [`Self::kv_tier_capacity_pages`]: a zero-capacity
+    /// store still reports real residency samples, while a stub does not.
+    fn kv_tier_residency_measured(&self) -> bool {
+        false
+    }
+
     fn kv_tier_page_bytes(&self) -> usize;
 
     fn kv_tier_host_demoted_pages(&self) -> usize;

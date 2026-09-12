@@ -571,6 +571,19 @@ impl infer_seam::KvPageTier for MetalExecutor {
         0
     }
 
+    fn kv_tier_residency_measured(&self) -> bool {
+        // Disk residency is a real sample once a Metal backend is constructed;
+        // host-demoted stays 0 by design (the store is disk-backed only).
+        #[cfg(feature = "metal")]
+        {
+            self.real.is_some()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
+    }
+
     fn kv_tier_page_bytes(&self) -> usize {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {

@@ -230,6 +230,11 @@ pub struct KvTierStats {
     /// Promotions that failed (entry severed, tail re-prefilled instead).
     pub promote_failures: u64,
     pub resident_blocks: usize,
+    /// A capacity-bearing *page* tier backs `resident_blocks`. False on
+    /// backends that park whole slots instead (CUDA), where the block count is
+    /// structurally 0; the gauge is omitted rather than reading "page tiering
+    /// idle" during active slot spilling.
+    pub page_blocks_measured: bool,
     pub demoted_slots: u64,
     pub slot_demote_failures: u64,
     pub promoted_slots: u64,
@@ -246,6 +251,12 @@ pub struct KvSystemMetrics {
     pub reuse_hit_host_demoted: u64,
     pub reuse_hit_disk: u64,
     pub reuse_miss: u64,
+    /// A real tier store backs the host/disk residency gauges. False on
+    /// backends with no tier view (HIP/Vulkan) and the CUDA placeholder, where
+    /// `host_demoted_pages`/`disk_pages` are hardcoded zeros rather than
+    /// samples; the gauges are omitted when this is false. Independent of page
+    /// capacity: CUDA's whole-slot store reports residency at page capacity 0.
+    pub residency_measured: bool,
     pub demote_mset_count: u64,
     /// Always 0: written only by a non-zero-copy page tier (CUDA pins page
     /// capacity to 0; Metal is zero-copy); a future copying page tier would set it.
@@ -1026,6 +1037,10 @@ impl Engine {
     pub fn kv_tier_stats(&self) -> KvTierStats {
         let mut stats = self.kv_tier_stats;
         stats.resident_blocks = self.radix.demoted_block_count();
+        stats.page_blocks_measured = self
+            .executor
+            .kv_page_tier_view()
+            .is_some_and(|tier| tier.kv_tier_capacity_pages() > 0);
         stats
     }
 
@@ -1040,23 +1055,26 @@ impl Engine {
         let mut metrics = self.kv_system_metrics;
         metrics.resident_pages = self.kv.resident_pages();
         metrics.resident_evictable_pages = self.kv.resident_evictable_pages();
-        let (host_demoted_pages, disk_pages, tier_hits, io) =
+        let (host_demoted_pages, disk_pages, tier_hits, io, residency_measured) =
             match self.executor.kv_page_tier_view() {
                 Some(tier) => (
                     tier.kv_tier_host_demoted_pages(),
                     tier.kv_tier_disk_pages(),
                     tier.kv_tier_read_hits(),
                     tier.kv_tier_io_stats(),
+                    tier.kv_tier_residency_measured(),
                 ),
                 None => (
                     0,
                     0,
                     infer_seam::KvTierReadHits::default(),
                     infer_seam::KvTierIoStats::default(),
+                    false,
                 ),
             };
         metrics.host_demoted_pages = host_demoted_pages;
         metrics.disk_pages = disk_pages;
+        metrics.residency_measured = residency_measured;
         // Single source for host/disk reuse hits: the tier store's own read
         // counters. The page-promote path counts the same blocks as reuse
         // decisions, so folding those in too reports one reuse twice (and only

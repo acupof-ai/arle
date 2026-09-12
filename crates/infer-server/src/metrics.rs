@@ -213,12 +213,17 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         "Tokens rejected by speculative decode verification.",
         spec.rejected,
     );
-    push!(
-        "kv_tier_resident_blocks",
-        "gauge",
-        "Prefix blocks currently resident in the host KV tier.",
-        counters.kv_tier.resident_blocks as u64,
-    );
+    // Block residency exists only on a capacity-bearing page tier. CUDA parks
+    // whole slots (page capacity 0), so an unconditional 0 reads "page tiering
+    // idle" during active slot spilling; omit there.
+    if counters.kv_tier.page_blocks_measured {
+        push!(
+            "kv_tier_resident_blocks",
+            "gauge",
+            "Prefix blocks currently resident in the host KV tier.",
+            counters.kv_tier.resident_blocks as u64,
+        );
+    }
     push!(
         "kv_tier_demoted_pages_total",
         "counter",
@@ -273,18 +278,23 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         "Resident prefix pages currently evictable.",
         kv_system.resident_evictable_pages as u64,
     );
-    push!(
-        "kv_system_host_demoted_pages",
-        "gauge",
-        "KV pages currently demoted to host RAM.",
-        kv_system.host_demoted_pages as u64,
-    );
-    push!(
-        "kv_system_disk_pages",
-        "gauge",
-        "KV pages currently stored on disk.",
-        kv_system.disk_pages as u64,
-    );
+    // Host/disk residency exists only where a real tier store backs it. On a
+    // backend with no tier view these are hardcoded zeros, not "nothing
+    // currently demoted"; omit them. Reuse counters stay (honest event zeros).
+    if kv_system.residency_measured {
+        push!(
+            "kv_system_host_demoted_pages",
+            "gauge",
+            "KV pages currently demoted to host RAM.",
+            kv_system.host_demoted_pages as u64,
+        );
+        push!(
+            "kv_system_disk_pages",
+            "gauge",
+            "KV pages currently stored on disk.",
+            kv_system.disk_pages as u64,
+        );
+    }
     push!(
         "kv_system_reuse_hit_resident_total",
         "counter",
@@ -459,6 +469,35 @@ mod tests {
         // Selective omission: a live sibling in the same block still exports.
         assert!(out.contains("arle_kv_system_promote_mget_count_total"));
         assert!(out.contains("arle_kv_system_demote_mset_count_total"));
+    }
+
+    #[test]
+    fn tier_residency_gauges_follow_their_presence_flags() {
+        // Default snapshot: no backend reported a tier view or page capacity,
+        // so the three residency gauges are absent. A zero series would read
+        // "nothing currently demoted" / "page tiering idle" on backends where
+        // the quantity does not exist.
+        let out = render_prometheus(&CounterSnapshot::default(), "m");
+        for series in [
+            "arle_kv_tier_resident_blocks",
+            "arle_kv_system_host_demoted_pages",
+            "arle_kv_system_disk_pages",
+        ] {
+            assert!(
+                !out.contains(series),
+                "absent-tier gauge must be omitted: {series}"
+            );
+        }
+
+        // A backend that measures them reports real values and the gauges
+        // export, including honest zeros ("currently empty", measured).
+        let mut snap = CounterSnapshot::default();
+        snap.kv_tier.page_blocks_measured = true;
+        snap.kv_system.residency_measured = true;
+        let out = render_prometheus(&snap, "m");
+        assert!(out.contains("arle_kv_tier_resident_blocks{model_name=\"m\"} 0"));
+        assert!(out.contains("arle_kv_system_host_demoted_pages{model_name=\"m\"} 0"));
+        assert!(out.contains("arle_kv_system_disk_pages{model_name=\"m\"} 0"));
     }
 
     #[test]
