@@ -13,6 +13,15 @@ forever — so the default gate passes under `--kv-recall` without ever exercisi
 recall's retrieval. Gate recall at depth 50.
 
 Usage: needle_concurrent.py [port] [concurrency] [prompt_tokens] [rounds] [depth_pct]
+
+Exit codes carry the verdict distinctly:
+  0  every row retrieved its own needle
+  1  a row got a valid response that was not its needle (cross-row state mix-up
+     or a retrieval miss — the batched-decode defect this gate exists for)
+  2  one or more rows hit a request ERROR (dead serve, connection refused,
+     malformed response). That is an invalid run, NOT a needle miss, so the
+     summary reports total_error separately and infra failure is never written
+     into the cross-row miss count.
 """
 import json, sys, threading, urllib.request
 
@@ -48,7 +57,7 @@ def prompt_for(row, needle):
     return "Read the following notes carefully.\n\n" + " ".join(sents) + tail
 
 
-def ask(row, needle, out):
+def ask(row, needle, out, errors):
     body = json.dumps({
         "model": "x", "prompt": prompt_for(row, needle),
         "max_tokens": 16, "temperature": 0.0, "stream": False,
@@ -60,30 +69,52 @@ def ask(row, needle, out):
             d = json.loads(r.read())
         out[row] = d["choices"][0]["text"].strip()
     except Exception as e:
+        # Recorded as a distinct error, not folded into a needle miss: a dead
+        # serve is an invalid run, never evidence that batched decode mixed up
+        # cross-row state. The row still can't contain its needle, so it is
+        # excluded from the miss verdict and fails the run separately (rc 2).
+        errors.add(row)
         out[row] = "ERROR: %s" % e
 
 
-fail = 0
+miss_total = 0
+error_total = 0
 for rnd in range(ROUNDS):
     needles = ["%06d" % (100000 + rnd * CONC + i) for i in range(CONC)]
     out = {}
-    ts = [threading.Thread(target=ask, args=(i, needles[i], out)) for i in range(CONC)]
+    errors = set()
+    ts = [threading.Thread(target=ask, args=(i, needles[i], out, errors)) for i in range(CONC)]
     for t in ts:
         t.start()
     for t in ts:
         t.join()
+    error_total += len(errors)
     miss = []
     for i in range(CONC):
+        if i in errors:
+            continue  # request failed; judged via the error path, not as a miss
         got = out.get(i, "")
         if needles[i] not in got:
             miss.append((i, needles[i], got[:40], [j for j in range(CONC)
                                                    if j != i and needles[j] in got]))
-    fail += len(miss)
-    print("round=%d conc=%d pt~%d depth=%d%% exact=%d miss=%d"
-          % (rnd, CONC, TARGET, DEPTH, CONC - len(miss), len(miss)))
+    miss_total += len(miss)
+    print("round=%d conc=%d pt~%d depth=%d%% exact=%d miss=%d errors=%d"
+          % (rnd, CONC, TARGET, DEPTH, CONC - len(miss) - len(errors),
+             len(miss), len(errors)))
+    for i in sorted(errors):
+        print("  row=%d ERROR '%s'" % (i, out.get(i, "")[:60]))
     for i, want, got, cross in miss:
         tag = " CROSS_ROW=%s" % cross if cross else ""
         print("  row=%d want=%s got='%s'%s" % (i, want, got, tag))
 
-print("CONCURRENT_NEEDLE %s total_miss=%d" % ("PASS" if fail == 0 else "FAIL", fail))
-sys.exit(1 if fail else 0)
+# A request error is checked before the miss verdict and is fatal in its own
+# code (2), so a transcript of a broken run can never be quoted as "N rows
+# missed the needle" — the record distinguishes infra failure from a wrong
+# secret. Cross-row/retrieval misses stay exit 1; clean pass exit 0.
+if error_total:
+    print("CONCURRENT_NEEDLE ERROR total_error=%d total_miss=%d"
+          % (error_total, miss_total))
+    sys.exit(2)
+print("CONCURRENT_NEEDLE %s total_miss=%d total_error=0"
+      % ("PASS" if miss_total == 0 else "FAIL", miss_total))
+sys.exit(1 if miss_total else 0)

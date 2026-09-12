@@ -248,7 +248,8 @@ run_fast_checks() {
         test_lane_new_rollback.sh \
         test_bench_ab_control_arm.sh \
         test_dspark_flashqla_verify.sh \
-        test_needle_gate_exit_code.sh; do
+        test_needle_gate_exit_code.sh \
+        test_needle_concurrent_error_exit.sh; do
         run_fast bash "scripts/tests/${test}"
     done
 }
