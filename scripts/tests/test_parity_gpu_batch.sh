@@ -47,6 +47,7 @@ run_batch() {  # $1 = gate list, $2 = out dir; extra env via HOST_UNITS_RC
     ARLE_PARITY_NO_NEG_ALLOWLIST="gate_d" \
     ARLE_PARITY_SKIP_PREREG=1 \
     ARLE_PARITY_HOST_UNITS_CMD="${ARLE_PARITY_HOST_UNITS_CMD:-true}" \
+    ARLE_PARITY_DEVICE_UNITS_CMD="${ARLE_PARITY_DEVICE_UNITS_CMD:-true}" \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$2"
 }
 
@@ -67,6 +68,8 @@ grep -q 'pass=1 fail=0 skip=1' "$TMP/ok.log" \
     || { echo "FAIL: summary counts wrong" >&2; cat "$TMP/ok.log" >&2; exit 1; }
 grep -q 'host-only unit tests PASS' "$TMP/ok.log" \
     || { echo "FAIL: host-only unit phase not reported" >&2; cat "$TMP/ok.log" >&2; exit 1; }
+grep -q 'device unit test PASS' "$TMP/ok.log" \
+    || { echo "FAIL: device unit phase not reported" >&2; cat "$TMP/ok.log" >&2; exit 1; }
 # The model-gated gate must be named as never executed in stdout and the MD.
 grep -q 'NEVER EXECUTED on this device' "$TMP/ok.log" \
     || { echo "FAIL: clean run with a skip missing the NEVER-EXECUTED stdout line" >&2
@@ -95,6 +98,7 @@ run_model_batch() {  # $1 gate list, $2 out dir
     ARLE_PARITY_GPU=7 \
     ARLE_PARITY_SKIP_PREREG=1 \
     ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$2"
 }
 # Mock binary: print the right first token; the launcher prints ALL PASS.
@@ -137,6 +141,7 @@ make_mock gate_noneg plain
 OUT_NN="$TMP/out-noneg"
 if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_noneg" ARLE_PARITY_GPU=7 \
     ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_NN" >"$TMP/noneg.log" 2>&1; then
     echo "FAIL: non-allowlisted gate without negative mode exited 0" >&2; cat "$TMP/noneg.log" >&2; exit 1
 fi
@@ -150,6 +155,7 @@ OUT_AL="$TMP/out-allowlist"
 ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_noneg" ARLE_PARITY_GPU=7 \
     ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_NO_NEG_ALLOWLIST="gate_noneg" \
     ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_AL" >"$TMP/allow.log" 2>&1 \
     || { echo "FAIL: allowlisted gate did not run green" >&2; cat "$TMP/allow.log" >&2; exit 1; }
 grep -qE '^gate_noneg\tno\tallowlisted\t0\t.*\t-\t' "$OUT_AL/results.tsv" \
@@ -169,6 +175,7 @@ chmod +x "$BIN/gate_skip"
 OUT_SK="$TMP/out-skip"
 if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_skip" ARLE_PARITY_GPU=7 \
     ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_SK" >"$TMP/skip.log" 2>&1; then
     :
 else
@@ -238,6 +245,25 @@ grep -q 'host fail' "$OUT_HU/host-units.log" \
 [ ! -f "$OUT_HU/results.tsv" ] \
     || { echo "FAIL: GPU gates ran after host-unit failure (results.tsv exists)" >&2; exit 1; }
 
+# ── Device-unit failure aborts after the GPU claim, before parity gates ──
+OUT_DU="$TMP/out-du"
+if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_a" ARLE_PARITY_GPU=7 \
+    ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_DEVICE_UNITS_CMD='echo device fail; exit 1' \
+    bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_DU" >"$TMP/du.log" 2>&1; then
+    echo "FAIL: device-unit failure exited 0" >&2; cat "$TMP/du.log" >&2; exit 1
+fi
+grep -q 'device unit test failed' "$TMP/du.log" \
+    || { echo "FAIL: device-unit failure not reported" >&2; cat "$TMP/du.log" >&2; exit 1; }
+grep -q 'device fail' "$OUT_DU/device-units.log" \
+    || { echo "FAIL: device-unit output not captured to device-units.log" >&2; exit 1; }
+grep -q 'gpu=7' "$TMP/du.log" \
+    || { echo "FAIL: device phase did not run on the claimed GPU" >&2; exit 1; }
+# The device phase runs before the parity gate loop, so its failure leaves no
+# gate TSV.
+[ ! -f "$OUT_DU/results.tsv" ] \
+    || { echo "FAIL: parity gates ran after device-unit failure (results.tsv exists)" >&2; exit 1; }
+
 # ── Log byte cap ──
 cat > "$BIN/gate_big" <<'SH'
 #!/usr/bin/env bash
@@ -253,6 +279,7 @@ OUT3="$TMP/out-cap"
 ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_big" ARLE_PARITY_GPU=7 \
     ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_LOG_CAP_BYTES=65536 \
     ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT3" >/dev/null 2>&1 \
     || { echo "FAIL: capped run exited non-zero" >&2; exit 1; }
 size="$(wc -c <"$OUT3/logs/gate_big.positive.log" | tr -d ' ')"
@@ -281,7 +308,7 @@ make_mock gate_absent pass
 
 run_fake() {  # $1 = out dir
     ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GPU=7 ARLE_PARITY_SKIP_PREREG=1 \
-        ARLE_PARITY_HOST_UNITS_CMD=true \
+        ARLE_PARITY_HOST_UNITS_CMD=true ARLE_PARITY_DEVICE_UNITS_CMD=true \
         bash "$FAKE/scripts/parity_gpu_batch.sh" "$1"
 }
 
@@ -308,4 +335,4 @@ grep -q 'crates/infer-cuda/examples/gate_absent.rs' "$TMP/registry-missing.log" 
 [ ! -f "$OUT_RM/results.tsv" ] \
     || { echo "FAIL: gates ran despite the missing registry example" >&2; exit 1; }
 
-echo "PASS: parity_gpu_batch mocks (host units green+red; clean green; positive fail and dead negative control red; log capped; registry missing-example red; per-gate counts)"
+echo "PASS: parity_gpu_batch mocks (host+device units green+red; clean green; positive fail and dead negative control red; log capped; registry missing-example red; per-gate counts)"
