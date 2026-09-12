@@ -366,6 +366,49 @@ mod tests {
     use super::*;
     use qwen35_spec::LayerType;
 
+    /// Verdict for a missing CUDA device given whether the runner declared one
+    /// mandatory. Panics when mandatory; returns after a visible skip note
+    /// otherwise. Mirrors the Vulkan pair (`skip_or_panic` / `require_device`
+    /// keyed on `ARLE_REQUIRE_VULKAN_DEVICE`): an ordinary host skips, a GPU
+    /// runner that expected a card fails loudly instead of the test reporting
+    /// `ok` with the device-gated body never executed.
+    fn cuda_device_unavailable(required: bool, error: &str) {
+        if required {
+            panic!("ARLE_REQUIRE_CUDA_DEVICE set but no usable CUDA device is available: {error}");
+        }
+        eprintln!("no CUDA device available ({error}); skipping device test");
+    }
+
+    /// Acquire a CUDA context for a device test, or `None` after a visible
+    /// skip. `ARLE_REQUIRE_CUDA_DEVICE` turns an absent device into a panic.
+    fn require_cuda_device() -> Option<DeviceContext> {
+        match DeviceContext::new() {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                cuda_device_unavailable(
+                    std::env::var_os("ARLE_REQUIRE_CUDA_DEVICE").is_some(),
+                    &e.to_string(),
+                );
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn missing_device_skips_visibly_when_not_required() {
+        // Must return to the caller (visible skip), not panic.
+        cuda_device_unavailable(false, "synthetic no device");
+    }
+
+    #[test]
+    fn missing_device_panics_when_required() {
+        assert!(
+            std::panic::catch_unwind(|| cuda_device_unavailable(true, "synthetic no device"))
+                .is_err(),
+            "a required device that is absent must fail, not skip"
+        );
+    }
+
     /// G3 whole-slot spill: `from_bytes(to_bytes(img))` must reproduce EVERY
     /// field byte-for-byte (the new correctness surface — the device buffers and
     /// the round-trip are independently proven). Ragged per-vec lengths +
@@ -498,8 +541,7 @@ mod tests {
     /// within BF16 tolerance. Requires a real CUDA device (run on GPU7).
     #[test]
     fn device_lora_merge_matches_host_reference() {
-        let Ok(ctx) = DeviceContext::new() else {
-            eprintln!("[device_lora_merge] no CUDA device; skipping");
+        let Some(ctx) = require_cuda_device() else {
             return;
         };
 

@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::error::Error;
+use std::path::PathBuf;
 
 use train::qwen35::{LayerType, Qwen35Config};
 
@@ -119,5 +120,34 @@ fn tiny_base_qwen35_config(max_seq_len: usize, vocab_size: usize) -> Qwen35Confi
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
         full_attn_gated: true,
+    }
+}
+
+/// Verdict for a test whose fixture (model dir, device, …) is absent.
+/// Panics when the runner declared the fixture mandatory via
+/// `ARLE_REQUIRE_TEST_FIXTURE`; prints a visible skip note otherwise.
+/// Mirrors the Vulkan require-device pattern: the skip is the unmet
+/// precondition, never a `Ok(())` pass.
+pub fn test_fixture_unavailable(required: bool, what: &str, hint: &str) {
+    if required {
+        panic!("ARLE_REQUIRE_TEST_FIXTURE set but fixture is missing: {what} ({hint})");
+    }
+    eprintln!("fixture unavailable ({what}: {hint}); skipping test");
+}
+
+/// Require a fixture path. Returns it when present, else the caller returns
+/// from the test after a visible skip (or a panic when the fixture was
+/// declared mandatory).
+pub fn require_fixture_path(path: Option<PathBuf>, what: &str, hint: &str) -> Option<PathBuf> {
+    match path {
+        Some(p) => Some(p),
+        None => {
+            test_fixture_unavailable(
+                std::env::var_os("ARLE_REQUIRE_TEST_FIXTURE").is_some(),
+                what,
+                hint,
+            );
+            None
+        }
     }
 }

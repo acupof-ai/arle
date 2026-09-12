@@ -17,6 +17,9 @@ const DEFAULT_QWEN35_08B_DIR: &str = "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3
 const DOMINANT_TOP_K: usize = 64;
 const DOMINANT_RELERR_GATE: f32 = 5.0e-2;
 
+mod common;
+use common::qwen35_test_support::require_fixture_path;
+
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 fn resolve_qwen35_08b_dir() -> Option<PathBuf> {
@@ -35,11 +38,11 @@ fn resolve_qwen35_08b_dir() -> Option<PathBuf> {
 
 #[test]
 fn infer_teacher_matches_in_process_on_dominant_logits() -> TestResult {
-    let Some(model_dir) = resolve_qwen35_08b_dir() else {
-        eprintln!(
-            "infer_teacher_matches_in_process_on_dominant_logits: skipping; \
-             set ARLE_PARITY_QWEN35_08B_DIR or populate {DEFAULT_QWEN35_08B_DIR}"
-        );
+    let Some(model_dir) = require_fixture_path(
+        resolve_qwen35_08b_dir(),
+        "Qwen3.5-0.8B checkpoint",
+        &format!("set ARLE_PARITY_QWEN35_08B_DIR or populate {DEFAULT_QWEN35_08B_DIR}"),
+    ) else {
         return Ok(());
     };
 
