@@ -80,8 +80,11 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     # pod_flow read crates/cuda-kernels/{build.rs,kernels.toml,generated} and
     # the crate package; hook_disowns reads .githooks/pre-push; pod_flow copies
     # the root .gitignore. Trigger on the whole cuda-kernels crate (conservative)
-    # plus scripts/ .githooks/ .github/ .gitignore. Hygiene and fmt always run.
-    if ! grep -qE '^(scripts|\.githooks|\.github)/|^\.gitignore$|^crates/cuda-kernels/' <<< "${changed_files}"; then
+    # plus scripts/ .githooks/ .github/ .gitignore. Hygiene and fmt always
+    # run. RELEVANCE_RE is the single copy, shared with CI's runner.
+    # shellcheck source=scripts/run_shell_tests.sh
+    source "${REPO_ROOT}/scripts/run_shell_tests.sh"
+    if ! grep -qE "$RELEVANCE_RE" <<< "${changed_files}"; then
         SKIP_SHELL_TESTS=1
         info "no shell-test inputs (scripts/.githooks/.github/cuda-kernels/.gitignore) in pushed range; skipping shell test batch"
     fi
@@ -232,28 +235,9 @@ run_fast_checks() {
     if [[ "${SKIP_SHELL_TESTS}" == "1" ]]; then
         return 0
     fi
-    for test in \
-        test_cuda_prebuilt_export.sh \
-        test_lever_gate.sh \
-        test_kernel_artifact_qualification.sh \
-        test_validate_release.sh \
-        test_pod_flow.sh \
-        test_pod_tree_identity.sh \
-        test_hook_disowns_git_env.sh \
-        test_prepush_nested_snapshot.sh \
-        test_prepush_fresh_invariant.sh \
-        test_prepush_snapshot_mtime.sh \
-        test_hook_skips_shell_tests.sh \
-        test_parity_gpu_batch.sh \
-        test_lane_new_rollback.sh \
-        test_bench_ab_control_arm.sh \
-        test_dspark_flashqla_verify.sh \
-        test_needle_gate_exit_code.sh \
-        test_needle_concurrent_error_exit.sh \
-        test_needle_gate_reasoning_location.sh \
-        test_gate_infra_exit_codes.sh; do
-        run_fast bash "scripts/tests/${test}"
-    done
+    # Discovered by the shared runner — never a hand list here (CI used to
+    # enumerate 8 of 19; #423's test merged with CI never running it).
+    SHELL_TEST_CHANGED_FILES="${changed_files}" run_fast bash scripts/run_shell_tests.sh
 }
 run_fast_checks &
 FAST_PID=$!
