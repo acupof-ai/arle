@@ -166,7 +166,7 @@ mod real {
         zero_weights: bool,
     }
 
-    fn build_band(rng: &mut Rng, valid: usize, k: usize, n: usize, zero_weights: bool) -> Band {
+    fn build_band(rng: &mut Rng, valid: usize, n: usize, k: usize, zero_weights: bool) -> Band {
         let kb = k / BLOCK;
         let a_q: Vec<u8> = (0..M_CAP * k).map(|_| fp8(rng)).collect();
         let a_scale: Vec<f32> = (0..kb).map(|_| uniform(rng, 0.03, 0.15)).collect();
