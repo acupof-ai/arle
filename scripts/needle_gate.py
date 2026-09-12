@@ -6,9 +6,21 @@ Usage: python3 needle_gate.py [lengths_csv] [runs] [depth]
   runs         same-config repeats per length (default 3)
   depth        needle depth 0.0=start .. 1.0=end (default 0.0)
 
-  --check      exit 0/1: PASS if every length has >= --min-exact exact hits,
-               FAIL otherwise. Standalone gate without a baseline log.
-  --min-exact  minimum exact hits per length for --check (default 1).
+  --check      standalone threshold gate (default behavior; kept for explicit
+               callers): PASS (exit 0) only if every length has >= --min-exact
+               exact hits; a model miss exits 1.
+  --report     report-only: print summaries and exit 0 on a model miss so an
+               external comparator can apply its own verdict (lever_gate.sh
+               does this against a baseline envelope).
+  --min-exact  minimum exact hits per length for the gate (default 1).
+
+  Exit codes are the verdict, distinct so a caller never confuses an infra
+  failure with a model miss:
+    0  PASS (gate) / model miss tolerated (--report)
+    1  model miss in the gate (a length under the exact-hit threshold)
+    2  request ERROR in ANY mode — a run that could not fetch every
+       completion (dead serve, connection refused, malformed transcript)
+       is invalid and must never be read as a miss.
 
 Routing (the gate is model-neutral via the checkpoint Jinja chat template, #66):
   default      /v1/chat/completions — correct for any model, no per-model shim
@@ -24,15 +36,21 @@ summary line: exact/partial/miss counts + deterministic? (all runs identical).
 """
 import os, sys, json, urllib.request, time
 
-CHECK = "--check" in sys.argv
-MIN_EXACT = 1
-if CHECK:
+REPORT = "--report" in sys.argv
+# Default (no --report) is the gate: exit 1 on any length under the exact-hit
+# threshold or on any request error. --check is accepted as a no-op alias for
+# that default (existing explicit callers). --report inverts the miss verdict
+# for external comparators but request errors stay fatal (see --report).
+if "--report" in sys.argv:
+    sys.argv.remove("--report")
+if "--check" in sys.argv:
     sys.argv.remove("--check")
-    for i, a in enumerate(sys.argv):
-        if a == "--min-exact" and i + 1 < len(sys.argv):
-            MIN_EXACT = int(sys.argv[i + 1])
-            sys.argv[i : i + 2] = []
-            break
+MIN_EXACT = 1
+for i, a in enumerate(sys.argv):
+    if a == "--min-exact" and i + 1 < len(sys.argv):
+        MIN_EXACT = int(sys.argv[i + 1])
+        sys.argv[i : i + 2] = []
+        break
 
 BASE = "http://127.0.0.1:" + os.environ.get("PORT", "18189")
 NEEDLE = "738291"
@@ -161,20 +179,23 @@ def classify(out):
 
 
 exact_per_length = {}
+errors_per_length = {}
 for target in lengths:
     prompt = build_prompt(target, depth)
     outs = []
+    n_errors = 0
     for r in range(runs):
         try:
             out, pt, dt = one(prompt)
-        except Exception as e:  # noqa: BLE001 - surface and continue the matrix
+        except Exception as e:  # noqa: BLE001 - surface and count; fatal at the end
             print("len=%d depth=%.2f run=%d ERROR %r" % (target, depth, r, e))
-            outs.append(None)
+            n_errors += 1
             continue
         outs.append(out)
         print("len=%d depth=%.2f run=%d pt=%s cls=%s wall=%.1fs kv=%s out=%r"
               % (target, depth, r, pt, classify(out), dt, KV_DTYPE, out))
-    ok = [o for o in outs if o is not None]
+    errors_per_length[target] = n_errors
+    ok = outs
     cls = [classify(o) for o in ok]
     n_exact = cls.count("exact")
     exact_per_length[target] = n_exact
@@ -184,10 +205,19 @@ for target in lengths:
              cls.count("miss"), det, KV_DTYPE))
     sys.stdout.flush()
 
-if CHECK:
+# A request error is never a miss: the run could not retrieve, so the gate has
+# no result to judge. This is fatal in every mode, including --report, so a dead
+# serve or malformed transcript can't be read as "the model forgot the needle".
+errored = [t for t in lengths if errors_per_length.get(t, 0) > 0]
+if errored:
+    print("GATE ERROR: %d request ERROR(s) at lengths %s (run failed, not a miss)"
+          % (sum(errors_per_length.values()), errored))
+    sys.exit(2)
+
+if not REPORT:
     bad = [t for t in lengths if exact_per_length.get(t, 0) < MIN_EXACT]
     if bad:
         print("CHECK FAIL: lengths %s have < %d exact hits" % (bad, MIN_EXACT))
         sys.exit(1)
     print("CHECK PASS: all %d lengths have >= %d exact hits" % (len(lengths), MIN_EXACT))
-    sys.exit(0)
+sys.exit(0)

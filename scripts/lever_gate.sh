@@ -190,13 +190,17 @@ if [ -n "$EXPECTED_PRODUCT_SHA256" ]; then
     mv "$stats_tmp" "$STATS_OUT"
 fi
 
-# When no baseline is provided, fall back to the standalone --check threshold
-# (>= 1 exact hit per length) instead of the baseline-envelope comparison.
-NEEDLE_CHECK=""
+# Needle invocation mode. No baseline + first-baseline-allowed: run the
+# standalone threshold gate. With a BASELINE_LOG, run --report so the per-length
+# envelope comparison below (validate_summary) is the verdict — a healthy
+# treatment need not hit the standalone exact threshold, only stay inside the
+# baseline envelope. Either way needle_gate.py exits non-zero on a request
+# ERROR, so a failed fetch can never be compared as a miss.
+NEEDLE_MODE="--report"
 if [ -z "${BASELINE_LOG:-}" ] && [ "${LEVER_GATE_ALLOW_NO_BASELINE:-0}" = "1" ]; then
-    NEEDLE_CHECK="--check"
+    NEEDLE_MODE="--check"
 fi
-PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" $NEEDLE_CHECK "$LENGTHS" "$RUNS" 0.0 2>&1 | tee "$OUT"
+PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" $NEEDLE_MODE "$LENGTHS" "$RUNS" 0.0 2>&1 | tee "$OUT"
 status=${PIPESTATUS[0]}
 if [ "$status" -ne 0 ]; then
     echo "[gate] needle gate failed with status $status"
