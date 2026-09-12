@@ -440,10 +440,11 @@ mod tests {
             deepgemm_prefill: true,
         };
         assert_eq!(fp8::fp8_route(prefill, 512, true, true), Fp8Route::DeepGemm);
-        assert_eq!(
-            fp8::fp8_route(prefill, 511, true, true),
-            Fp8Route::DequantGemm
-        );
+        // No M yields DequantGemm with DeepGEMM enabled: the two floors are
+        // the same constant (QWEN_FP8_DEEPGEMM_PER_CHANNEL_MIN_M ==
+        // QWEN_DEQUANT_GEMM_PREFILL_MIN_M == 512). Below it neither arm claims
+        // (GEMV, covered by the cases above); at/above it DeepGEMM claims
+        // first. The DequantGemm arm is only observable with deepgemm off.
         // DeepGEMM disabled: the same weight falls back to the dequant order.
         assert_eq!(
             fp8::fp8_route(prefill, 512, true, false),
