@@ -14,7 +14,7 @@ value — the reference/expectation, or the captured output after
 device-to-host — and on one gate there is no negative arm by design.
 
 Cross-referencing the six device teeth against the P1 results
-(`/host/p1-results/results.tsv`, status column: 11 PASS / 9 FAIL / 2 SKIP):
+(the batch's `results.tsv`, status column: 11 PASS / 9 FAIL / 2 SKIP):
 none of the six is among the eleven PASS rows. Every gate that reported green
 in that batch did so on a host-side tooth. All six device teeth sit on gates
 that failed, panicked, or skipped. The marker text is identical in both
