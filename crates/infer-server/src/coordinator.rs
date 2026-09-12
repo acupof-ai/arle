@@ -392,10 +392,16 @@ impl DpCoordinator {
 
     /// Aggregate stats from every TP group into a deployment-level
     /// [`CounterSnapshot`]. Groups serve disjoint requests, so counters and
-    /// gauges sum across groups.
-    async fn query_stats_all(&self, timeout: Duration) -> CounterSnapshot {
+    /// gauges sum across groups. `None` when no group responded: aggregating
+    /// the empty set would fabricate an all-zero snapshot (a `kv_free_pages`
+    /// of 0 reads as a full pool), and both `/metrics` and the observer treat
+    /// that as "no data", not as a measurement.
+    async fn query_stats_all(&self, timeout: Duration) -> Option<CounterSnapshot> {
         let groups = self.collect_wire_stats_all(timeout).await;
-        crate::multiproc_relay::aggregate_wire_stats_dp(groups).into_counter_snapshot()
+        if groups.is_empty() {
+            return None;
+        }
+        Some(crate::multiproc_relay::aggregate_wire_stats_dp(groups).into_counter_snapshot())
     }
 
     /// Per-group aggregated [`WireStats`] from every TP group, queried
@@ -550,7 +556,11 @@ fn spawn_coordinator_observe(dp: Arc<DpCoordinator>) {
     };
     let cached = Arc::clone(&dp.cached_stats);
     crate::observe::spawn_observe_task(move |gpu| {
-        let mut snap = rt.block_on(dp.query_stats_all(Duration::from_secs(5)));
+        let Some(mut snap) = rt.block_on(dp.query_stats_all(Duration::from_secs(5))) else {
+            // No TP group responded this tick: keep the last good snapshot
+            // rather than caching an all-zero aggregate.
+            return None;
+        };
         snap.gpu = gpu;
         if let Ok(mut guard) = cached.write() {
             *guard = Some(snap.clone());
@@ -2170,18 +2180,25 @@ async fn fallback_404(req: axum::extract::Request) -> (StatusCode, Json<serde_js
 
 async fn metrics(
     State(state): State<Arc<DpCoordinator>>,
-) -> ([(header::HeaderName, &'static str); 1], String) {
+) -> Result<([(header::HeaderName, &'static str); 1], String), ApiError> {
+    // Refuse to render when no TP group has ever reported: the default
+    // snapshot is an all-zero body whose `kv_free_pages 0` reads as a full
+    // pool, which is worse than an error for a scrape. `/v1/stats` fails the
+    // identical condition; stay consistent with it.
     let counters = match state.cached_stats() {
         Some(snap) => snap,
-        None => state.query_stats_all(Duration::from_secs(5)).await,
+        None => state
+            .query_stats_all(Duration::from_secs(5))
+            .await
+            .ok_or_else(|| ApiError::internal("stats query failed (no TP group responded)"))?,
     };
-    (
+    Ok((
         [(
             header::CONTENT_TYPE,
             crate::metrics::PROMETHEUS_CONTENT_TYPE,
         )],
         crate::metrics::render_prometheus(&counters, &state.model),
-    )
+    ))
 }
 
 async fn stats(State(state): State<Arc<DpCoordinator>>) -> Result<Json<StatsResponse>, ApiError> {
@@ -2264,6 +2281,62 @@ mod dp_failure_domain_tests {
             .err()
             .expect("dead group must reject submits");
         assert!(err.message().contains("torn down"), "{}", err.message());
+    }
+}
+
+#[cfg(test)]
+mod metrics_zero_group_tests {
+    use super::*;
+    use axum::extract::State;
+
+    #[tokio::test]
+    async fn metrics_fails_when_no_group_responds() {
+        // Zero TP groups is the deterministic "no rank responded" condition:
+        // cached stats are absent and the aggregate is the empty set.
+        let dp = Arc::new(DpCoordinator::new(Vec::new()));
+
+        // The poison this guards against: the default snapshot renders a
+        // confident `kv_free_pages 0`, which reads as a *full* pool.
+        let zero_body = crate::metrics::render_prometheus(&CounterSnapshot::default(), "m");
+        assert!(zero_body.contains("arle_kv_free_pages{model_name=\"m\"} 0"));
+
+        // The handler must return Err, not serve that zero body (axum maps it
+        // to a 500, exactly like `/v1/stats` on the same condition).
+        let err = metrics(State(dp))
+            .await
+            .expect_err("metrics must error when no group responded");
+        assert!(
+            err.message().contains("no TP group responded"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_fails_when_a_configured_group_is_silent() {
+        // Production shape of the same condition: one group is configured but
+        // no rank answers (engine side of the local relay dropped). The old
+        // handler aggregated the empty set and served an all-zero body whose
+        // `kv_free_pages 0` reads as a full pool; it must fail like /v1/stats.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/Qwen3.5-0.8B-runtime");
+        let Ok(tokenizer) = OpenAiTokenizer::from_model_dir(&path) else {
+            return; // no tokenizer fixture in CI
+        };
+        let (relay, engine_recv, engine_tx) = RelayCoordinator::new_local();
+        drop(engine_recv);
+        drop(engine_tx);
+        let group = coordinator_handle(relay, tokenizer, "m", 0, None, None);
+        let dp = Arc::new(DpCoordinator::new(vec![group]));
+
+        let err = metrics(State(dp))
+            .await
+            .expect_err("metrics must error when the only group is silent");
+        assert!(
+            err.message().contains("no TP group responded"),
+            "{}",
+            err.message()
+        );
     }
 }
 
