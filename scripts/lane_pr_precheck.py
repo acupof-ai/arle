@@ -10,6 +10,9 @@
 5. Rust changed in a no-cuda-gated crate, or anything under
    crates/cuda-kernels/, needs a CUDA_CHECK_EXIT=0 line from a pod
    `cargo check --features cuda,nccl` run without no-cuda.
+6. A parity gate under crates/infer-cuda/examples/ is named in an
+   operators/registry.toml correctness_gate and prints the negative-control
+   marker scripts/parity_gpu_batch.sh greps for.
 """
 
 from __future__ import annotations
@@ -36,6 +39,13 @@ LONG_SHA = re.compile(r"(?=\b[0-9a-f]*[0-9][0-9a-f]*\b)(?=\b[0-9a-f]*[a-f][0-9a-
 ABS_PATH = re.compile(
     r"(?<![\w./-])(" + "|".join(["/" + s for s in ("Users/", "root/", "data0", "mnt/", "host/")]) + r")"
 )
+PARITY_EXAMPLE_PATH = re.compile(r"^crates/infer-cuda/examples/[A-Za-z0-9_]+\.rs$")
+# parity_gpu_batch.sh derives its gate list from registry correctness_gate
+# values and reads these two markers out of each run's log.
+NEG_FLAG = "--negative-control"
+NEG_MARKER = "NEGATIVE CONTROL OK"
+REGISTRY_REL = "operators/registry.toml"
+
 BUILD_EXIT_OK = re.compile(r"^BUILD_EXIT=0\s*$", re.MULTILINE)
 CUDA_CHECK_EXIT_OK = re.compile(r"^CUDA_CHECK_EXIT=0\s*$", re.MULTILINE)
 CRATE_RUST_PATH = re.compile(r"^crates/([^/]+)/.*\.rs$")
@@ -159,6 +169,37 @@ def check_build_exit(added: dict[str, list[str]], pr_body: str) -> list[str]:
     return ["build-exit: examples/ or benches/ changed but the PR body has no BUILD_EXIT=0 line"]
 
 
+def check_gate_registry(repo: Path, changed: list[str]) -> list[str]:
+    gates = [
+        rel for rel in changed
+        if PARITY_EXAMPLE_PATH.match(rel)
+        and (repo / rel).exists()
+        and NEG_FLAG in (repo / rel).read_text()
+    ]
+    if not gates:
+        return []
+    registry = repo / REGISTRY_REL
+    listed = registry.read_text() if registry.exists() else ""
+    changed_text = "\n".join(
+        (repo / rel).read_text() for rel in changed if (repo / rel).is_file()
+    )
+    failures = []
+    for rel in gates:
+        if rel not in listed:
+            failures.append(
+                f"gate-registry: {rel} takes {NEG_FLAG} but no correctness_gate in "
+                f"{REGISTRY_REL} names it; parity_gpu_batch.sh derives its gate list "
+                "from that file, so the gate is never built and never run"
+            )
+        if NEG_MARKER not in changed_text:
+            failures.append(
+                f"gate-registry: {rel} takes {NEG_FLAG} but nothing in this PR prints "
+                f"'{NEG_MARKER}'; parity_gpu_batch.sh records the negative arm as FAIL "
+                "without that line, even when the controls fire"
+            )
+    return failures
+
+
 def run(repo: Path, pr_body: str) -> list[str]:
     base = git(["merge-base", "origin/main", "HEAD"], repo).strip()
     added = added_lines(repo, base)
@@ -168,6 +209,7 @@ def run(repo: Path, pr_body: str) -> list[str]:
     failures += check_abs_paths(added)
     failures += check_build_exit(added, pr_body)
     failures += check_cuda_check_exit(repo, base, changed, pr_body)
+    failures += check_gate_registry(repo, changed)
     return failures
 
 
@@ -178,6 +220,12 @@ BARE_BODY = "feat(x): thing\n"
 RUNTIME_FIXTURE = "crates/x/src/lib.rs"
 EXAMPLE_FIXTURE = "crates/x/examples/demo.rs"
 HISTORY_FIXTURE = "docs/experience/wins/2026-09-12-precheck-selftest.md"
+GATE_FIXTURE = "crates/infer-cuda/examples/foo_parity.rs"
+GATE_SRC = 'fn main() { let neg = arg("--negative-control"); println!("NEGATIVE CONTROL OK"); }\n'
+GATE_SRC_NO_MARKER = 'fn main() { let neg = arg("--negative-control"); println!("ALL PASS"); }\n'
+REGISTRY_LISTING = 'correctness_gate = "crates/infer-cuda/examples/foo_parity.rs"\n'
+REGISTRY_OTHER = 'correctness_gate = "crates/infer-cuda/examples/other_parity.rs"\n'
+
 
 
 def world(files: dict[str, str], body: str) -> Path:
@@ -278,6 +326,20 @@ def selftest() -> int:
             "",
             None,
         ),
+    ]
+    cases += [
+        ("gate registered",
+         {GATE_FIXTURE: GATE_SRC, "operators/registry.toml": REGISTRY_LISTING},
+         EXEMPT_BODY, "BUILD_EXIT=0\n", None),
+        ("gate unregistered",
+         {GATE_FIXTURE: GATE_SRC, "operators/registry.toml": REGISTRY_OTHER},
+         EXEMPT_BODY, "BUILD_EXIT=0\n", "gate-registry"),
+        ("gate without negative marker",
+         {GATE_FIXTURE: GATE_SRC_NO_MARKER, "operators/registry.toml": REGISTRY_LISTING},
+         EXEMPT_BODY, "BUILD_EXIT=0\n", "gate-registry"),
+        ("non-gate example passes",
+         {"crates/infer-cuda/examples/bar.rs": "fn main() {}\n"},
+         EXEMPT_BODY, "BUILD_EXIT=0\n", None),
     ]
     failures = []
     for name, files, body, pr_body, expected in cases:
