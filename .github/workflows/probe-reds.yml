@@ -1,0 +1,36 @@
+name: Probe reds (temporary, removed before merge)
+on:
+  push:
+    branches: [lane/ci-shell-test-discovery]
+    paths:
+      - '.github/workflows/probe-reds.yml'
+jobs:
+  red-and-unresolvable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unresolvable base must still run the batch, and a failing test must red it
+        run: |
+          # Simulate undeterminable changed-file list: no CI vars and a remote
+          # that cannot resolve the base SHA.
+          git remote set-url origin /nonexistent-probe-remote
+          if env -u GITHUB_BASE_REF BASE_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+                bash scripts/run_shell_tests.sh; then
+            echo "PROBE-FAIL: runner passed with a deliberately failing test present"; exit 1
+          fi
+        continue-on-error: true
+      - name: Confirm the batch actually ran (not silently skipped)
+        run: |
+          env -u GITHUB_BASE_REF BASE_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+            bash scripts/run_shell_tests.sh > /tmp/r.log 2>&1 || true
+          grep -q 'no diff base resolvable; running the full batch' /tmp/r.log
+          grep -q 'bash scripts/tests/test_zzz_red_probe.sh' /tmp/r.log
+          grep -q 'FAIL: scripts/tests/test_zzz_red_probe.sh exited 3' /tmp/r.log
+          echo "PROBE-OK: unresolvable base ran the discovered tests and caught the failure"
+      - name: Skip directive is visible with the file's reason
+        run: |
+          SHELL_TEST_CHANGED_FILES='scripts/run_shell_tests.sh' \
+            bash scripts/run_shell_tests.sh > /tmp/s.log 2>&1 || true
+          grep -q 'SKIP scripts/tests/test_zzz_skip_probe.sh (linux): probe-only annotated exclusion' /tmp/s.log
+          grep -qE '[0-9]+ tests, [0-9]+ ran, 1 skipped, [0-9]+ failed' /tmp/s.log
+          echo "PROBE-OK: skip line + count present"
