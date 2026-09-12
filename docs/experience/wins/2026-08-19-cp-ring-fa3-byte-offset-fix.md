@@ -1,7 +1,6 @@
 # CP ring FA3 pair offsets were halved for two days — one `* 2`, 6.4× wrong gradients — 2026-08-19
 
 Fixes [`2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md`](../errors/2026-08-19-cp-training-gradients-regressed-and-the-gate-is-dead.md).
-Commit.
 
 ## Context
 

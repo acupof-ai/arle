@@ -53,7 +53,8 @@ the recurrent path dominates over dense attention.
 
 ## Follow-up (2026-08-18, pod verification)
 
-The fix (+ borrow-checker scoping) built and ran on
+The fix (sequential recv ordering plus a borrow-checker scoping change) built
+and ran on
 pod, but **did not change len=2000 behavior** — the model still refuses
 with "not relevant to the context", identical to the pre-fix run.
 CP=1 control: 21/21 pass. The state chain was not the root cause of the

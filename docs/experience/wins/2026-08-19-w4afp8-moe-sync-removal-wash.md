@@ -1,6 +1,6 @@
 # W4AFP8 MoE path: per-GEMM sync removal — measured wash — 2026-08-19
 
-> Status: Verified on GPU (H20, W4AFP8 MoE decode). Shipped in.
+> Status: Verified on GPU (H20, W4AFP8 MoE decode); the per-GEMM sync removal shipped.
 
 ## Context
 

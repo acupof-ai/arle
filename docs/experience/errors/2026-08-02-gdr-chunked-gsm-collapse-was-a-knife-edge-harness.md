@@ -5,8 +5,8 @@
 `--qwen35-gdr-chunked` (FlashQLA, −27% on 33K prefill) passed needle ×3 and
 greedy-64 identity, defaulted on, then scored **GSM8K 11/100 vs recurrent
 46/100** (raw 8-shot completion, greedy) — 35 one-directional failures, most
-as an immediate-EOS first token after "Answer:". Default reverted
-, then a full adjudication.
+as an immediate-EOS first token after "Answer:". The default was reverted
+(the gdr-chunked change set back to OFF), then given a full adjudication.
 
 ## Root Cause
 

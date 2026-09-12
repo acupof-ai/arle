@@ -46,8 +46,6 @@ with all output trapped in `reasoning_content`).
 - `reasoning_effort` parameter maps: low=2048, medium=8192, high=32768
 - Default `max_tokens` for thinking: budget + 4096 (content headroom)
 
-Commit:
-
 ## Verified on pod (H20 ×4, TP=4, 2026-08-19)
 
 Build: `think-budget-v6` (head), serve `--max-thinking-tokens 128`.

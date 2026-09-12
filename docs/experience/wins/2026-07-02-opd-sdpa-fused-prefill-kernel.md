@@ -22,8 +22,8 @@ The trace decoded the flat result in one run (run-sdpatrace-toy1r):
 envelope-rejected. The flatness was the head-chunk wrapper
 (`ATTN_HEAD_CHUNK=8`) slicing the call 8-heads-at-a-time and stitching with
 host `cat_heads` (readback + host copy per chunk) *around* the fused kernel;
-~770ms was the wrapper's host work. Deleting the wrappers (— folded
-the transient budget into the SDPA entry points, fused-first over all heads)
+~770ms was the wrapper's host work. Folding the transient budget into the
+SDPA entry points and deleting the wrappers, fused-first over all heads,
 was the unlocking change, not an optional cleanup.
 
 Same toy config, GPU 7, RUN_EXIT=0, TileLang full AOT regen clean:

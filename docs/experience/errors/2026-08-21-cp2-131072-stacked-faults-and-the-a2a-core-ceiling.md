@@ -78,7 +78,7 @@ leaves a ~2–5 GB deficit; at 262,144 it is structurally impossible on 97 GB.
 
 ## Numerics
 
-NVFP4 frozen base (converter now accepts FP8 block-scaled input,
+NVFP4 frozen base (the converter now accepts FP8 block-scaled input;
 `/data00/ThinkingCap-Qwen3.6-27B-NVFP4`, 21 GB) matches FP8 at
 seq 16,384: loss 11.228516 vs 11.229878 (Δ 0.012%). Sharing the NVFP4 base
 between rollout and student is not wired (serve Marlin-repacks and releases the

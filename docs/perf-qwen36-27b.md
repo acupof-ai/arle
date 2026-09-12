@@ -1422,7 +1422,7 @@ TTFT ratios are hypotheses pending a complete matched run.
 
 **Decode** — priced on §2.0, the decode-shaped c=16 capture.
 
-1. **DSpark draft attention, 30.5% of a decode tick — fixed at.
+1. **DSpark draft attention, 30.5% of a decode tick — fixed by batching the draft attention over slots.
    ITL mean 31.05 → 27.81 ms, −10.4% on the decode-shaped workload, and a null
    on the anchor** (TPOT +0.8%, inside the trial spread, 3 trials per arm).
    Correctness clean: 11/11 needle rungs, MMLU 0/50 disagreements. It was the
@@ -1498,7 +1498,7 @@ TTFT ratios are hypotheses pending a complete matched run.
    in it.**
 
 7. **The data-prep tail — `pack_quantize` DONE, eight kernels remain.**
- `pack_quantize` shipped at : 2216 → 441 ms, **5.12× in situ**,
+ `pack_quantize` shipped: 2216 → 441 ms, **5.12× in situ**,
    bit-identical, wall −2.98%. The remaining rows total **2248 ms, 7.9% of the
    selected window's kernel time**. Their implementations differ: `silu_mul`
    and `add_native` already use `uint2`, `split2` and `split_qkv` use `uint4`,

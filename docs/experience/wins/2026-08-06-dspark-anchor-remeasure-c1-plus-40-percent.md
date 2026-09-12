@@ -97,7 +97,7 @@ workloads.
 ## Anchor audit
 
 Rule 4 of `docs/baselines.md`: one A/B against the archived binary bounds
-accumulated drift. 's binary is archived at
+accumulated drift; that binary is archived at
 `/host/spec-phase/arle-mk`, so this needs no rebuild and no bisect across the
 ~800 commits between the two shas. Same box, same dataset file, same serve
 flags, same grid, back to back.

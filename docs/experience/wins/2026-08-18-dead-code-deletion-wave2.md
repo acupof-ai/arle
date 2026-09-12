@@ -76,7 +76,7 @@ in. Left for the owner of that change.
 ### Remote (CUDA build + parity gate) — verified
 
 - `cargo build --release --features cuda,nccl --bin arle` on pod (H20, sm_90)
- at : clean (BUILD_EXIT=0). First attempt at failed on
+  was clean (BUILD_EXIT=0) after the stale-import fix; the first attempt failed on
   the CUDA-gated `agent_opd.rs` stale import — see Problems.
 - `scripts/lever_gate.sh` with Qwen3.5-9B on GPU 1 (NEEDLE_MAX_TOKENS=2000,
   full ladder ×3):

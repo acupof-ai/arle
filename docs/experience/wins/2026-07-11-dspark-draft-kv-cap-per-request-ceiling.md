@@ -7,7 +7,7 @@ The DFlash draft full-attention layer sized its per-slot KV cache from
 per-request token ceiling. Measured 512 MB/slot = 94% of the 544 MB draft-KV;
 `--max-total-tokens 8192` did NOT shrink it (`max_seq_len` is pool-derived,
 independent of the flag), clamping slots 256→84 (→32 on a busier GPU) and the
-per-request arena to 4096 (a 13K prompt didn't fit one slot). Commit.
+per-request arena to 4096 (a 13K prompt didn't fit one slot).
 
 Root cause was a config-plumbing gap, NOT a full-attention-drafting cost — the
 initial "window the full layer (lossy)" hypothesis was **corrected by the

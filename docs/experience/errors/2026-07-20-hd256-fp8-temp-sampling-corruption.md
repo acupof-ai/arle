@@ -61,8 +61,7 @@ identical to base; (6) ThinkingCap weights → base salads identically; (7)
 temperature default (greedy→temp>0) → **greedy salads too** at length;
 (8) prompt/render regression → `prompt_token_ids` byte-identical old vs current.
 Only after all eight did a binary bisect land on the kernel. The norm mis-fix
- (input/post layernorm `w−1`) was a *different* wrong turn, reverted
-.
+ (input/post layernorm `w−1`) was a *different* wrong turn and was reverted.
 
 ## Fix
 

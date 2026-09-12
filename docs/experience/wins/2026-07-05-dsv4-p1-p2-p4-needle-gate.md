@@ -1,8 +1,8 @@
 # DSv4 KV three-layer P1/P2/P4 — pod needle gate PASS + P4 guard coverage gap found and fixed
 
 **Date:** 2026-07-05. **Backend:** CUDA, DeepSeek-V4-Flash-FP8, TP=4/EP=4,
-4×H20 (GPUs 3,4,6,7; GPU 1 excluded — foreign process holding VRAM). Commit
-under test: (includes P1 P2+P4). Harness
+4×H20 (GPUs 3,4,6,7; GPU 1 excluded — foreign process holding VRAM). The
+commit under test includes P1, P2 and P4. Harness
 `scripts/needle_gate.py`, `RAW=1`, greedy, needle `738291`, 3 same-config
 repeats. `INFER_DSV4_MAX_SEQ_LEN=16384` (TP=4 halves rank count vs the
 TP=8 baseline this repo has previously validated at 32K — see

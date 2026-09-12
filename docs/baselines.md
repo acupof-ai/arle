@@ -49,8 +49,6 @@ slots, 195 MiB per slot.
 
 Identity:
 
-- Runtime commit
-- Runner commit
 - Binary SHA-256 `7ba56981695cbdd759b5d6b96e74a0b9b851549c3c55469c0b62d8701c94e9de`
 - Kernel bundle `79d522d1bc4f2d4fd6d706c8d7a5ea2040d44b4aeaeac5fcc96472d3040bdd72`
 - GPU `GPU-1769a5e7-852b-74f9-e109-f52dbb2c4859` (H20)
@@ -158,7 +156,6 @@ chunked (default-on).
 
 Identity:
 
-- Runtime commit
 - Binary SHA-256 `9567bbccaacdbac585dabb55de10b0931575c17fb83c1a205b31df9c92093de7`
 - Kernel bundle `ee06c0c3aea4429ac51d5c32d784e9948fd6c0e85842bf0a87d66fb6186c3c15`
 - Dataset SHA-256 `8867f63eaac2f0537bb2b17847a7d0d3c1bb8d504c1ad191e97d673e9ecc4f34`
@@ -697,7 +694,7 @@ mixed-input grouped GEMM for routed experts; shared expert stays FP8.
 
 Identity:
 
-- Runtime commit (32MB workspace right-size)
+- Workspace right-sized to 32 MB (no commit recorded)
 - Model `/data00/DeepSeek-V4-Flash-0731` (166.9 GB NVFP4)
 - GPU: 2×H20 (sm_90, 96 GB), TP=2
 - Server flags: `--tensor-parallel-size 2 --port 30000`
@@ -854,8 +851,8 @@ scalar path's grows (+1.085e-3 at cp=2 to +1.655e-3 at cp=4). See
 ## SOTA — 27B, cp=4 seq ladder · (2026-08-19)
 
 4×H20 (97,508 MiB), GPUs 4-7, FA3 engaged, `--synthetic-writeback-seq N`. All
-four ranks bit-identical loss at every passing rung. Re-measured on
-after the CP ring byte-offset fix
+four ranks bit-identical loss at every passing rung. Re-measured after
+the CP ring byte-offset fix
 ([wins](experience/wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md)); the broken
 path's walls held to within 1% and its peaks to 2%, its loss column did not.
 [Entry](experience/wins/2026-08-19-cp4-seq-ceiling-229376-and-17x-step.md).

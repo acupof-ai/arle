@@ -5,7 +5,8 @@
 
 ## Context
 
-Refreshing the stale timing rows in `docs/baselines.md` on. The
+Refreshing the stale timing rows in `docs/baselines.md` on a then-current
+build. The
 workload is deterministic (`--synthetic-writeback-seq` builds the trajectory
 from `(i % 30000) + 1`, the base is frozen, LoRA `B` is zero-init), so the
 loss at step 1 is reproducible. The refresh compared against the 2026-08-05
@@ -50,12 +51,12 @@ supposed to agree — the 2026-08-05 correctness rows assert exactly that
 
 ## Cause
 
-** (2026-08-17) dropped `* 2` from the five run-offset expressions in
+**The 2D KV ownership sharding change (2026-08-17) dropped `* 2` from the five run-offset expressions in
 the FA3 pair route.** They offset raw `CUdeviceptr` byte addresses into bf16
 buffers, so every offset was halved — exact for a shard's first run (row 0 at
 batch 1 makes the whole expression 0) and wrong for every later run of a
-non-contiguous zigzag shard. Fixed in see
-[wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md](../wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md).
+non-contiguous zigzag shard. Fixed; see
+[the CP ring FA3 byte-offset fix](../wins/2026-08-19-cp-ring-fa3-byte-offset-fix.md).
 
 Ruled out on the way, by measurement:
 
@@ -67,16 +68,16 @@ Ruled out on the way, by measurement:
   loss/grad_norm are unchanged at 11.665197 / 14.034.
 - **Not the single-card path.** cp=1 reproduces the old numbers on both models.
 
-**The baseline's stated commits are not on main.** `docs/baselines.md` cites
- and neither is an ancestor of HEAD — both live only on
-`fix/qwen35-final-norm-*` branches. The rebased main-side equivalent is
- (same subject, same date, and `git diff --
-crates/{train,autograd,cuda-kernels}/src crates/cuda-kernels/csrc` is empty), so
-the anchor holds and the doc's SHAs are wrong.
+**The two commits `docs/baselines.md` cites are not on main.** Neither is an
+ancestor of HEAD — both live only on
+`fix/qwen35-final-norm-*` branches. The rebased main-side equivalent has the
+same subject and date and an empty
+`git diff` over `crates/{train,autograd,cuda-kernels}/src crates/cuda-kernels/csrc`,
+so the anchor holds and the doc's SHAs are wrong.
 
 The 2026-08-16 T1 entry recorded `cp_hidden_parity` PASS, which cut the window
 from 166 commits to the four code commits after it that touch the ring surface.
-Only edited `ring_attention.rs`, and only those five pointer lines.
+Only the 2D KV ownership sharding change edited `ring_attention.rs`, and only those five pointer lines.
 No bisect build was needed.
 
 ## Why it went unnoticed
@@ -90,7 +91,7 @@ flashqla GDN head geometry H=8/Hg=8 not built
 (have 32/16, 48/16, 24/8, 12/4, 16/8, 16/16)
 ```
 
-FlashQLA went default-on at / (2026-08-05) and has no
+FlashQLA went default-on on the two 2026-08-05 baseline commits and has no
 kernel for the 0.8B's per-rank geometry under CP, so the gate model cannot run
 the very configuration it exists to check. The 27B's CP geometry is 24/8, which
 IS in the built list — so the 27B runs, and produces wrong gradients quietly.
@@ -115,7 +116,7 @@ be loud where the gate's results are read, not only in the run log.
 
 ## Follow-up
 
-1. ~~Bisect~~ **Done** —. cp=2 now gives loss 10.870859 /
+1. ~~Bisect~~ **Done** — the byte-offset fix landed. cp=2 now gives loss 10.870859 /
    grad_norm 2.152082 against cp=1's 10.870087 / 2.197122.
 2. Build the FlashQLA H=8/Hg=8 geometry, or make the 0.8B CP correctness arm
    run on the recurrent path, so the gate produces a number again.
