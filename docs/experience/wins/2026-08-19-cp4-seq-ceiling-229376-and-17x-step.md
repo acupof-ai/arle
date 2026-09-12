@@ -1,7 +1,7 @@
 # cp=4 training seq ceiling is 229376, and the 131072 step got 17.5× faster — 2026-08-19
 
 > **Measured on a path with a since-fixed gradient bug**
-> ([](2026-08-19-cp-ring-fa3-byte-offset-fix.md)). Re-run on the fixed
+> ([the CP ring FA3 pair-offset byte fix](2026-08-19-cp-ring-fa3-byte-offset-fix.md)). Re-run on the fixed
 > binary: the ceiling is unchanged at 229376, walls held to within 1% and peaks
 > to 2%, and the loss column moved a lot — 131072/196608/229376 now read
 > 3.034899 / 2.072005 / 1.780185 against 7.631271 / 6.924870 / 6.742337 here.
