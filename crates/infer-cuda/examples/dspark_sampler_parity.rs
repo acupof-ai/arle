@@ -72,6 +72,12 @@ mod real {
     const MAX_DEPTH: usize = 4;
     const SEED: u64 = 0xd54a_1200_d54a_1200;
 
+    // Probabilities: kernel f32 softmax/top-p/top-k over bf16-rounded logits vs
+    // f64 host. Error sources are bf16 logit rounding plus f32 reduction/exp,
+    // amplified on a long-tail CDF; no closed supremum is written.
+    // Bound not derived; chosen to pass the clean run (vocabs 255..151936,
+    // B=1/8) and needs a supremum. The 2e-4 floor is an absolute CDF floor for
+    // near-zero tail probs rel-L2 cannot bound. Phase-2 tightening candidate.
     const PROB_REL_L2_MAX: f64 = 2e-2;
     const PROB_ABS_FLOOR: f32 = 2e-4;
 

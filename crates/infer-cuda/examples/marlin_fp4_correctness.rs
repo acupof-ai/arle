@@ -215,6 +215,12 @@ mod real {
                 }
                 let count = (check_rows.len() * m) as f32;
                 let mean_rel = sum_rel / count;
+                // Denominator is the sampled rows' max output amplitude, so this
+                // is a worst-element / row-max deviation, not an L2. Bound not
+                // derived: the E2M1 weight step (rel 1/6 on the smallest
+                // representand, block-scaled) and the bf16 output round do not
+                // give a closed-form supremum against a row max; 1e-2 is
+                // clean-run-set at the Qwen3.6-27B MLP shapes and needs one.
                 let ok = max_rel < 1e-2;
                 if !ok {
                     gemm_fail = true;

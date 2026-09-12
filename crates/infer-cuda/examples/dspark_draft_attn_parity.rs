@@ -100,7 +100,11 @@ mod real {
     const WRAP_CAP: usize = 12;
     const WRAP_WINDOW: usize = 6;
 
-    // bf16 dot products (hd=128) vs f64 softmax.
+    // bf16 dot products (hd=128) vs f64 softmax. One bf16 operand RN step is
+    // 2^-8 ≈ 3.9e-3 rel and the softmax averaging does not grow it; the slope
+    // 6e-2 covers an extra f32-vs-f64 reduction bin on outlier keys. The
+    // mechanism is stated but the three values are not computed from the
+    // kv_len/hd accumulation counts; clean-run-set, need a supremum.
     const REL_L2_MAX: f64 = 4e-2;
     const ABS_FLOOR: f64 = 2e-2;
     const ABS_SLOPE: f64 = 6e-2;

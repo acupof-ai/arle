@@ -100,8 +100,20 @@ mod real {
 
     // HCA has no selected indexer; the builder reads selected=null.
 
+    // Attention output rel and LSE abs: no derivation. They compare the sparse
+    // attention forward against the f64 dense causal oracle; the error is the
+    // e4m3-packed-KV round plus online-softmax/LSE accumulation, but no
+    // supremum is computed. Both are clean-run-set at B=8/start 384 and need a
+    // bound on the packed-KV softmax error.
     const PASS_MAX_REL_OUT: f64 = 0.05;
     const PASS_MAX_ABS_LSE: f64 = 0.10;
+    // pack nope rel 0.07 IS derived: pure e4m3 RN repack of the bf16 nope
+    // channel has a worst-case rel error 16/272 ≈ 0.0588 (max bf16 value that
+    // rounds down a bin over the smallest e4m3 value it shares the bin with);
+    // the f32-scale binding is 17/273 ≈ 0.0623; correct packs measure ≤0.044.
+    // 0.07 clears the 0.0623 bind with margin. pack rope abs 0.01 is not
+    // derived — the rope channel is a bf16 copy with no e4m3 step, so it wants
+    // a tight bf16-round bound; clean-run-set, needs one.
     const PACK_NOPE_REL: f64 = 0.07;
     const PACK_ROPE_ABS: f32 = 0.01;
 

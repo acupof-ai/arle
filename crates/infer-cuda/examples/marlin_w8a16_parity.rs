@@ -70,6 +70,15 @@ mod real {
     // than this factor — both share the INT8 group-quant floor, so a correct
     // Marlin lane tracks the fallback closely. A blown ratio = wrong repack/perm.
     const MARLIN_VS_FALLBACK_MAX_RATIO: f64 = 4.0;
+    // Absolute ceiling on either lane's rel-L2. The ratio alone passes when
+    // BOTH lanes are jointly wrong; this closes that hole. Weight-only floor:
+    // per-element INT8 RN error is at most s_g/2 with s_g=amax_g/127, so the
+    // worst-case rel-L2 contribution of one GROUP=128 group is
+    // (amax_g/σ_w)·√(2G/π)/(2·127); for Gaussian weights with amax≈2.7σ that
+    // is ≈0.095, plus the bf16 activation and output-store terms (<0.01). 0.20
+    // is ~2x that analytic ceiling so it cannot go red on clean-run noise; it
+    // is loose on purpose and tightens in Phase 2 against a measured margin.
+    const MAX_REL_L2: f64 = 0.20;
 
     /// Per-group symmetric INT8 (scale = amax/127), matching w8a16_quant.py.
     /// Returns (int8 weight [n*k], bf16 scales [n * k/GROUP]).
@@ -333,7 +342,10 @@ mod real {
             rel_l2(&marlin, &ref_out)
         };
         let ratio = marlin_err / deq_err.max(1e-9);
-        let pass = ratio <= MARLIN_VS_FALLBACK_MAX_RATIO && marlin_err.is_finite();
+        let pass = ratio <= MARLIN_VS_FALLBACK_MAX_RATIO
+            && marlin_err.is_finite()
+            && marlin_err <= MAX_REL_L2
+            && deq_err <= MAX_REL_L2;
         eprintln!(
             "[{label} m={m:>2} n={n} k={k} seed={seed:#x}] marlin_relL2={marlin_err:.4e} \
              fallback_relL2={deq_err:.4e} ratio={ratio:.2} {}",
@@ -407,7 +419,7 @@ mod real {
                 rel_l2(&deq, &ref_out)
             };
             let cap = accepted_max_deq * MARLIN_VS_FALLBACK_MAX_RATIO;
-            let pass = deq_err.is_finite() && deq_err <= cap;
+            let pass = deq_err.is_finite() && deq_err <= cap && deq_err <= MAX_REL_L2;
             any_fail |= !pass;
             eprintln!(
                 "[{label} m={m:>2} n={n} k={k} seed={seed:#x}] declined fallback_relL2={deq_err:.4e} \

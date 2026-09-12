@@ -86,10 +86,15 @@ mod real {
     // start_pos values straddling 64/128-token boundaries.
     const STARTS: [i32; 3] = [63, 128, 255];
 
+    // Output rel, LSE abs, and logit abs: no derivation. They compare the
+    // sparse forward against the f64 dense causal oracle; the error is the
+    // e4m3-packed-KV round plus online-softmax/LSE accumulation, but no
+    // supremum is computed. Clean-run-set at chunks 128/2048/4096 and need a
+    // bound on the packed-KV softmax/logit error.
     const PASS_MAX_REL_OUT: f64 = 0.05;
     const PASS_MAX_ABS_LSE: f64 = 0.10;
     const PASS_MAX_ABS_LOGIT: f64 = 0.05;
-    const PACK_ABS: f64 = 0.0; // bf16 copies must be bit-exact
+    const PACK_ABS: f64 = 0.0; // bf16 copies must be bit-exact: no quant step, only an exact copy, so zero is the derived bound
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mode {

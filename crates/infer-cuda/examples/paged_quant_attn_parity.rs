@@ -120,7 +120,12 @@ mod real {
 
     // The kernel and oracle consume the SAME decoded bytes (e4m3/int8 are
     // exact bf16 subsets); the gap is f32 tile accumulation, per-split merge,
-    // fast __expf, and the one bf16 output round.
+    // fast __expf, and the one bf16 output round. Because both sides read the
+    // same bytes there is NO quantization-error term: the floor is one bf16
+    // output store (rms 2^-8/sqrt(3) ≈ 2.3e-3) plus unclosed-form __expf and
+    // merge-order differences. The 8e-2/7e-2/3e-2 tuple sits far above that
+    // floor and is clean-run-set, not a supremum; it needs the __expf/merge
+    // bound computed and is a Phase-2 tightening candidate.
     const TOL: Tol = Tol {
         rel_l2: 8e-2,
         slope: 7e-2,

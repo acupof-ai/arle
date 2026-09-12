@@ -118,9 +118,16 @@ mod real {
     const PREFILL_S: usize = 32;
     const SEED: u64 = 0xD5D4_0754_C0DE_0036;
 
-    // Scalar lane: one fp8 weight operand, bf16 activation (dsv4_decode_moe
-    // bounds). DeepGEMM lane: activation is also e4m3 per 128 block, so its
-    // bound is looser; the <=8-way bf16 TP sum uses the loose bound too.
+    // Scalar lane: one fp8 weight operand, bf16 activation. e4m3 RN rms is
+    // (2^-4)/sqrt(3) ≈ 3.1% per operand; the bf16 activation contributes its
+    // own 2^-8/√3 ≈ 2.3e-3 and the output one bf16 store, hence the ~7% rel
+    // ceiling over the decode_moe 6%. DeepGEMM lane prequantizes the activation
+    // to e4m3 per 128 block too, so both operands are e4m3: product rms
+    // 3.1%*sqrt(2) ≈ 4.4%, plus the ≤8-way bf16 TP partial sum. The DG per-
+    // element worst-bin sum of two operands is 2*6.25% = 0.125; DG_SLOPE 0.14
+    // is set ABOVE even that loose sum, so it is not a supremum and is a
+    // Phase-2 tightening candidate (a constant sub-bin defect fits under it).
+    // The floors cover near-zero outputs and are clean-run-set.
     const LAT_REL_L2: f64 = 7e-2;
     const LAT_SLOPE: f64 = 1e-1;
     const LAT_FLOOR: f64 = 2.5e-2;

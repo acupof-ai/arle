@@ -141,6 +141,14 @@ mod real {
     // bf16 pool has no KV error; the bf16 form carries one 1-byte round
     // (e4m3 ~3%/elem, int8 ~0.4%/elem, averaged over the softmax weights);
     // the fp8 form carries a second e4m3 round, hence the widest band.
+    //
+    // That states the MECHANISM but not the numbers: the five tuples below are
+    // not computed from the per-element steps (e4m3 rms (2^-4)/sqrt(3)≈3.1%,
+    // int8 (2^-7)/sqrt(3)≈0.45%, bf16 store 2^-8/sqrt(3)≈2.3e-3) and the
+    // softmax weight averaging. They were set to pass the clean run at
+    // decode B=1/8 plus the q256/kv65537 requant case and each needs a closed
+    // supremum. The floors/slopes scale monotonically with the round count,
+    // which is the only cross-form relation that is derived.
     const TOL_BF16_POOL: Tol = Tol {
         rel_l2: 6e-2,
         slope: 5e-2,
@@ -168,7 +176,10 @@ mod real {
     // Unmirrored anchor for the requant form: f64 attention over the raw
     // dequantized KV and the unrequantized Q. The gap is the ORIGINAL pool
     // e4m3 round plus one extra e4m3 round each of Q/K/V and the bf16 output,
-    // so the band is wider than the mirrored comparator's.
+    // so the band is wider than the mirrored comparator's. rel_l2 0.22 is the
+    // widest positive bound in any gate and a coarse sum of those steps rather
+    // than a supremum; a constant sub-bin kernel defect can fit under it, so it
+    // is a Phase-2 tightening candidate against a measured clean-run margin.
     const TOL_FP8_ANCHOR: Tol = Tol {
         rel_l2: 2.2e-1,
         slope: 1.6e-1,

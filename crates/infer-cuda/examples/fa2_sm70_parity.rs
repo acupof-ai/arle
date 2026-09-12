@@ -80,7 +80,12 @@ mod real {
     use crate::attn_common::{Rng, Tol, bf, compare_rows, metrics_pass};
 
     // FP16 half2 dots over 256 bf16 dims leave scattered outlier columns;
-    // floor covers single-column roundoff, slope tracks magnitude.
+    // floor covers single-column roundoff, slope tracks magnitude. Both
+    // operands are bf16 and accumulation is f32, so the only quant ingredient
+    // is one bf16 operand step (2^-8 ≈ 3.9e-3 worst / 2.3e-3 rms) plus the
+    // single bf16 output store; the 4e-2/6e-2/2e-2 tuple is ~10x that floor and
+    // absorbs fp16 half2 dot + online-softmax order differences that are not
+    // bounded in closed form. Clean-run-set, needs a supremum.
     const TOL: Tol = Tol {
         rel_l2: 4e-2,
         slope: 6e-2,

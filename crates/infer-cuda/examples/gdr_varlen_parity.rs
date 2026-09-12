@@ -74,6 +74,13 @@ mod real {
     const SEED: u64 = 0x6A27_11E5_C0DE_5240;
 
     // f64 oracle vs f32/bf16 kernels over a <=64-step carried recurrence.
+    // Ingredients that bound every value below: one bf16 store is 2^-8 rel,
+    // one f32 state step is 2^-24 rel plus rsqrtf/expf ULP, and the recurrence
+    // can carry the per-step gap across at most 64 rows. The tuples are sized
+    // off those ingredients but the carry-amplification factor is not closed
+    // form (the delta-rule gates it), so the individual constants are
+    // clean-run-set and need a supremum; STATE is tightest because the state is
+    // f32, OUT/CONV looser because each row ends in a bf16 store.
     const OUT_REL_L2_MAX: f64 = 3e-2;
     const OUT_ABS_FLOOR: f64 = 1.5e-2;
     const OUT_ABS_SLOPE: f64 = 5e-2;
@@ -82,7 +89,9 @@ mod real {
     const CONV_REL_L2_MAX: f64 = 2e-2;
     const CONV_ABS_FLOOR: f64 = 1e-2;
     const CONV_ABS_SLOPE: f64 = 3e-2;
-    // FlashQLA runs f32 with bf16 intermediates and a chunk-local cumsum.
+    // FlashQLA runs f32 with bf16 intermediates and a chunk-local cumsum; the
+    // extra bf16 intermediates and cumsum reordering widen the band over the
+    // f32-recurrent OUT/STATE pair above, by an uncomputed factor.
     const FQ_OUT_REL_L2_MAX: f64 = 6e-2;
     const FQ_OUT_ABS_FLOOR: f64 = 2e-2;
     const FQ_OUT_ABS_SLOPE: f64 = 8e-2;
