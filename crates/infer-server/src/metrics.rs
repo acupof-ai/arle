@@ -18,290 +18,304 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
     let prefix = &counters.prefix_cache;
     let kv_system = &counters.kv_system;
     let mut out = String::with_capacity(4096);
-    let mut push = |name: &str, kind: &str, help: &str, value: u64| {
-        out.push_str("# HELP arle_");
-        out.push_str(name);
-        out.push(' ');
-        out.push_str(help);
-        out.push_str("\n# TYPE arle_");
-        out.push_str(name);
-        out.push(' ');
-        out.push_str(kind);
-        out.push_str("\narle_");
-        out.push_str(name);
-        out.push_str(&labels);
-        out.push(' ');
-        out.push_str(&value.to_string());
-        out.push('\n');
-    };
+    // One emitter for u64 counters/gauges and f64 ratios. The f64 path exists
+    // so a ratio like spec_accept_rate does not truncate a real sub-1% value
+    // to an integer 0; the caller still omits the series when the quantity was
+    // not measured (see spec_accept_rate). A macro (not a closure) so it is
+    // generic over the value type and holds no borrow of `out`.
+    macro_rules! push {
+        ($name:expr, $kind:expr, $help:expr, $value:expr $(,)?) => {{
+            let value: &dyn std::fmt::Display = &$value;
+            out.push_str("# HELP arle_");
+            out.push_str($name);
+            out.push(' ');
+            out.push_str($help);
+            out.push_str("\n# TYPE arle_");
+            out.push_str($name);
+            out.push(' ');
+            out.push_str($kind);
+            out.push_str("\narle_");
+            out.push_str($name);
+            out.push_str(&labels);
+            out.push(' ');
+            out.push_str(&value.to_string());
+            out.push('\n');
+        }};
+    }
 
-    push(
+    push!(
         "active_requests",
         "gauge",
         "Requests currently holding a scheduler slot.",
         counters.active_requests as u64,
     );
-    push(
+    push!(
         "queue_depth",
         "gauge",
         "Requests waiting for admission.",
         counters.queue_depth as u64,
     );
-    push(
+    push!(
         "kv_free_pages",
         "gauge",
         "Free physical KV pages in the host pool.",
         counters.kv_free_pages as u64,
     );
-    push(
+    push!(
         "prefix_cache_cached_pages",
         "gauge",
         "KV pages currently retained by the radix prefix cache.",
         prefix.cached_pages as u64,
     );
-    push(
+    push!(
         "prefix_cache_lookups_total",
         "counter",
         "Requests admitted while prefix caching was enabled.",
         prefix.lookups,
     );
-    push(
+    push!(
         "prefix_cache_hits_total",
         "counter",
         "Lookups that restored at least one reusable prefix token.",
         prefix.hits,
     );
-    push(
+    push!(
         "prefix_cache_hit_tokens_total",
         "counter",
         "Prompt tokens skipped via attached prefix pages.",
         prefix.hit_tokens,
     );
-    push(
+    push!(
         "prefix_cache_hit_pages_total",
         "counter",
         "Page coverage of prompt tokens skipped by prefix restore.",
         prefix.hit_pages,
     );
-    push(
+    push!(
         "prefix_cache_published_pages_total",
         "counter",
         "Prompt pages newly retained by the radix cache.",
         prefix.published_pages,
     );
-    push(
+    push!(
         "engine_steps_total",
         "counter",
         "Executor steps whose output was applied.",
         counters.throughput.steps,
     );
-    push(
+    push!(
         "prefill_tokens_total",
         "counter",
         "Prompt tokens advanced through chunked prefill.",
         counters.throughput.prefill_tokens,
     );
-    push(
+    push!(
         "generated_tokens_total",
         "counter",
         "Tokens committed to requests (final prefill chunk + decode).",
         counters.throughput.generated_tokens,
     );
-    push(
+    push!(
         "requests_completed_total",
         "counter",
         "Requests finished after holding a scheduler slot.",
         counters.throughput.requests_completed,
     );
-    push(
+    push!(
         "requests_succeeded_total",
         "counter",
         "Requests that completed successfully (non-abort).",
         counters.throughput.requests_succeeded,
     );
-    push(
+    push!(
         "requests_failed_total",
         "counter",
         "Requests that were aborted.",
         counters.throughput.requests_failed,
     );
-    push(
+    push!(
         "ttft_micros_total",
         "counter",
         "Sum of time-to-first-token across all requests.",
         counters.throughput.ttft_micros_total,
     );
-    push(
+    push!(
         "ttft_count",
         "counter",
         "Number of requests that produced a first token.",
         counters.throughput.ttft_count,
     );
-    push(
+    push!(
         "tpot_micros_total",
         "counter",
         "Sum of per-output-token latency across all requests.",
         counters.throughput.tpot_micros_total,
     );
-    push(
+    push!(
         "tpot_count",
         "counter",
         "Number of inter-token intervals measured.",
         counters.throughput.tpot_count,
     );
-    push(
+    push!(
         "e2e_latency_micros_total",
         "counter",
         "Sum of end-to-end request latency.",
         counters.throughput.e2e_micros_total,
     );
-    push(
+    push!(
         "e2e_latency_count",
         "counter",
         "Number of completed requests for e2e latency.",
         counters.throughput.e2e_count,
     );
-    push(
+    push!(
         "forward_busy_micros_total",
         "counter",
         "Cumulative GPU forward-busy microseconds.",
         counters.throughput.forward_busy_micros,
     );
     let spec = &counters.spec_decode;
-    let accept_rate = (spec.accepted * 100).checked_div(spec.drafted).unwrap_or(0);
-    push(
-        "spec_accept_rate",
-        "gauge",
-        "Speculative decode token accept rate (%).",
-        accept_rate,
-    );
-    push(
+    // Omit the rate entirely until a token has actually been drafted: with
+    // drafted==0 there is no measurement, and emitting 0 is byte-identical to
+    // a measured all-rejected rate. Float (not integer percent) so a real
+    // sub-1% rate is not truncated to a false zero. The presence signal is the
+    // sibling spec_drafted_total counter (0 chains ⇒ series absent).
+    if spec.drafted > 0 {
+        push!(
+            "spec_accept_rate",
+            "gauge",
+            "Speculative decode token accept rate (%).",
+            spec.accepted as f64 * 100.0 / spec.drafted as f64,
+        );
+    }
+    push!(
         "spec_chains_total",
         "counter",
         "Speculative decode draft chains attempted.",
         spec.chains,
     );
-    push(
+    push!(
         "spec_drafted_total",
         "counter",
         "Tokens drafted by speculative decode.",
         spec.drafted,
     );
-    push(
+    push!(
         "spec_accepted_total",
         "counter",
         "Tokens accepted by speculative decode verification.",
         spec.accepted,
     );
-    push(
+    push!(
         "spec_rejected_total",
         "counter",
         "Tokens rejected by speculative decode verification.",
         spec.rejected,
     );
-    push(
+    push!(
         "kv_tier_resident_blocks",
         "gauge",
         "Prefix blocks currently resident in the host KV tier.",
         counters.kv_tier.resident_blocks as u64,
     );
-    push(
+    push!(
         "kv_tier_demoted_pages_total",
         "counter",
         "Prefix pages demoted to the host KV tier instead of dropped.",
         counters.kv_tier.demoted_pages,
     );
-    push(
+    push!(
         "kv_tier_promoted_pages_total",
         "counter",
         "Demoted pages promoted back to device pages on a prefix hit.",
         counters.kv_tier.promoted_pages,
     );
-    push(
+    push!(
         "kv_tier_promote_failures_total",
         "counter",
         "Tier promotions that failed (tail re-prefilled instead).",
         counters.kv_tier.promote_failures,
     );
-    push(
+    push!(
         "kv_tier_demoted_slots_total",
         "counter",
         "Whole-slot images demoted on preemption (page-less model route).",
         counters.kv_tier.demoted_slots,
     );
-    push(
+    push!(
         "kv_tier_promoted_slots_total",
         "counter",
         "Whole-slot images promoted back on re-admission (decode resumed).",
         counters.kv_tier.promoted_slots,
     );
-    push(
+    push!(
         "kv_tier_slot_demote_failures_total",
         "counter",
         "Whole-slot parks the backend or tier refused (victim kept running / recomputed).",
         counters.kv_tier.slot_demote_failures,
     );
-    push(
+    push!(
         "kv_tier_slot_promote_failures_total",
         "counter",
         "Whole-slot promotions that failed (request recomputed).",
         counters.kv_tier.slot_promote_failures,
     );
-    push(
+    push!(
         "kv_system_resident_pages",
         "gauge",
         "Prefix pages currently resident in the fast working pool.",
         kv_system.resident_pages as u64,
     );
-    push(
+    push!(
         "kv_system_resident_evictable_pages",
         "gauge",
         "Resident prefix pages currently evictable.",
         kv_system.resident_evictable_pages as u64,
     );
-    push(
+    push!(
         "kv_system_host_demoted_pages",
         "gauge",
         "KV pages currently demoted to host RAM.",
         kv_system.host_demoted_pages as u64,
     );
-    push(
+    push!(
         "kv_system_disk_pages",
         "gauge",
         "KV pages currently stored on disk.",
         kv_system.disk_pages as u64,
     );
-    push(
+    push!(
         "kv_system_reuse_hit_resident_total",
         "counter",
         "Prefix blocks reused from resident pages.",
         kv_system.reuse_hit_resident,
     );
-    push(
+    push!(
         "kv_system_reuse_hit_host_demoted_total",
         "counter",
         "Prefix blocks reused from host-demoted pages.",
         kv_system.reuse_hit_host_demoted,
     );
-    push(
+    push!(
         "kv_system_reuse_hit_disk_total",
         "counter",
         "Prefix blocks reused from disk.",
         kv_system.reuse_hit_disk,
     );
-    push(
+    push!(
         "kv_system_reuse_miss_total",
         "counter",
         "Prefix attach lookups that restored no token.",
         kv_system.reuse_miss,
     );
-    push(
+    push!(
         "kv_system_demote_mset_count_total",
         "counter",
         "Synchronous page-tier mset batches.",
         kv_system.demote_mset_count,
     );
-    push(
+    push!(
         "kv_system_promote_mget_count_total",
         "counter",
         "Synchronous page-tier mget batches.",
@@ -312,61 +326,61 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
     // current backend is a capacity-bearing copying page tier, so they are
     // permanently zero. An absent series reports the gap honestly; a zero
     // would read as a measurement. They remain in /v1/stats and JSONL.
-    push(
+    push!(
         "kv_system_fallback_recompute_total",
         "counter",
         "KV restore failures that fell back to recompute.",
         kv_system.fallback_recompute,
     );
-    push(
+    push!(
         "kv_system_prefix_match_full_blocks_total",
         "counter",
         "Prefix blocks matched before restore-boundary clamp.",
         kv_system.prefix_match_full_blocks,
     );
-    push(
+    push!(
         "kv_system_prefix_match_clamped_blocks_total",
         "counter",
         "Prefix blocks left after restore-boundary clamp.",
         kv_system.prefix_match_clamped_blocks,
     );
-    push(
+    push!(
         "kv_tier_io_useful_read_bytes_total",
         "counter",
         "Payload bytes read from the KV disk tier.",
         kv_system.tier_io_useful_read_bytes,
     );
-    push(
+    push!(
         "kv_tier_io_useful_write_bytes_total",
         "counter",
         "Payload bytes written to the KV disk tier.",
         kv_system.tier_io_useful_write_bytes,
     );
-    push(
+    push!(
         "kv_tier_io_submitted_read_bytes_total",
         "counter",
         "Aligned bytes submitted for KV disk reads.",
         kv_system.tier_io_submitted_read_bytes,
     );
-    push(
+    push!(
         "kv_tier_io_submitted_write_bytes_total",
         "counter",
         "Aligned bytes submitted for KV disk writes.",
         kv_system.tier_io_submitted_write_bytes,
     );
-    push(
+    push!(
         "kv_tier_io_metadata_write_bytes_total",
         "counter",
         "Metadata bytes written by the KV disk tier.",
         kv_system.tier_io_metadata_write_bytes,
     );
-    push(
+    push!(
         "kv_tier_io_failures_total",
         "counter",
         "Failed KV disk I/O operations.",
         kv_system.tier_io_failures,
     );
-    push(
+    push!(
         "kv_tier_io_completion_wait_ns_total",
         "counter",
         "Nanoseconds waiting for KV disk I/O completions.",
@@ -445,5 +459,26 @@ mod tests {
         // Selective omission: a live sibling in the same block still exports.
         assert!(out.contains("arle_kv_system_promote_mget_count_total"));
         assert!(out.contains("arle_kv_system_demote_mset_count_total"));
+    }
+
+    #[test]
+    fn spec_accept_rate_absent_without_drafts_and_float_with_them() {
+        // drafted == 0 means the rate was never measured. The series must be
+        // absent, not present-and-zero: a zero series is byte-identical to a
+        // measured all-rejected rate. The presence signal is spec_drafted_total.
+        let out = render_prometheus(&CounterSnapshot::default(), "m");
+        assert!(!out.contains("arle_spec_accept_rate"));
+        assert!(out.contains("arle_spec_drafted_total{model_name=\"m\"} 0"));
+
+        // A sub-1% rate (1 of 200 drafted) must survive as a float, not
+        // truncate to an integer 0.
+        let mut snap = CounterSnapshot::default();
+        snap.spec_decode.drafted = 200;
+        snap.spec_decode.accepted = 1;
+        let out = render_prometheus(&snap, "m");
+        assert!(
+            out.contains("arle_spec_accept_rate{model_name=\"m\"} 0.5"),
+            "sub-1% rate must render as a float, got:\n{out}"
+        );
     }
 }

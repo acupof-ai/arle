@@ -802,12 +802,12 @@ impl StatsResponse {
                 reuse_hit_disk: system.reuse_hit_disk,
                 reuse_miss: system.reuse_miss,
                 demote_mset_count: system.demote_mset_count,
-                demote_mset_copy_bytes: system.demote_mset_copy_bytes,
-                demote_mset_copy_ms: system.demote_mset_copy_ms,
+                demote_mset_copy_bytes: None,
+                demote_mset_copy_ms: None,
                 promote_mget_count: system.promote_mget_count,
-                promote_mget_copy_bytes: system.promote_mget_copy_bytes,
-                promote_mget_copy_ms: system.promote_mget_copy_ms,
-                fetch_wait_ms: system.fetch_wait_ms,
+                promote_mget_copy_bytes: None,
+                promote_mget_copy_ms: None,
+                fetch_wait_ms: None,
                 fallback_recompute: system.fallback_recompute,
                 prefix_match_full_blocks: system.prefix_match_full_blocks,
                 prefix_match_clamped_blocks: system.prefix_match_clamped_blocks,
@@ -916,12 +916,20 @@ pub(crate) struct KvSystemMetricsResponse {
     pub reuse_hit_disk: u64,
     pub reuse_miss: u64,
     pub demote_mset_count: u64,
-    pub demote_mset_copy_bytes: u64,
-    pub demote_mset_copy_ms: u64,
+    // Copy/wait totals: None until a capacity-bearing *copying* page tier
+    // exists. No current backend copies on mset/mget, so the source counters
+    // are structurally 0; a JSON 0 would read as a measured zero transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demote_mset_copy_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demote_mset_copy_ms: Option<u64>,
     pub promote_mget_count: u64,
-    pub promote_mget_copy_bytes: u64,
-    pub promote_mget_copy_ms: u64,
-    pub fetch_wait_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promote_mget_copy_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promote_mget_copy_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_wait_ms: Option<u64>,
     pub fallback_recompute: u64,
     pub prefix_match_full_blocks: u64,
     pub prefix_match_clamped_blocks: u64,
@@ -1366,7 +1374,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionRequest, Usage};
+    use super::{ChatCompletionRequest, StatsResponse, Usage};
 
     fn chat(penalties: &str) -> ChatCompletionRequest {
         serde_json::from_str(&format!(
@@ -1411,6 +1419,35 @@ mod tests {
             }
             assert!(req.validate().is_err(), "NaN{body} must be rejected");
         }
+    }
+
+    /// The five copy/wait totals cannot be populated by any current backend
+    /// (no capacity-bearing copying page tier). They must be omitted from the
+    /// `/v1/stats` JSON, not serialized as 0, which would read as a measured
+    /// zero-byte transfer. Sibling batch counts stay present.
+    #[test]
+    fn impossible_copy_tier_fields_are_omitted_from_stats_json() {
+        let resp = StatsResponse::from_counters(
+            crate::execution::CounterSnapshot::default(),
+            crate::BuildIdentity::default(),
+            infer_seam::OperatorDispatchStats::default(),
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        let kv = json.get("kv_system").unwrap();
+        for field in [
+            "demote_mset_copy_bytes",
+            "demote_mset_copy_ms",
+            "promote_mget_copy_bytes",
+            "promote_mget_copy_ms",
+            "fetch_wait_ms",
+        ] {
+            assert!(
+                kv.get(field).is_none(),
+                "unmeasured field must be omitted, not zero: {field}\n{kv}"
+            );
+        }
+        assert!(kv.get("demote_mset_count").is_some());
+        assert!(kv.get("promote_mget_count").is_some());
     }
 
     #[test]
