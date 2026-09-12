@@ -153,7 +153,6 @@ mod real {
         let mut rope_src = vec![0f32; total_tokens * HEAD_ROPE];
         let mut used = vec![false; total_tokens];
         let mut selected = vec![-1i32; B * INDEX_TOPK];
-        let mut dom_phys = [0usize; B];
 
         let mut pool = ctx.stream.alloc_zeros::<u8>(TOTAL_BLOCKS * BLOCK_BYTES)?;
 
@@ -161,10 +160,6 @@ mod real {
             let start = START_POS[r];
             let comp_count = (start / COMPRESS_RATIO as i32) as usize;
             let dom_c = comp_count - 1;
-            dom_phys[r] = {
-                let logical = SW_BLOCKS + dom_c / PAGE;
-                phys_of(r, logical) * PAGE + dom_c % PAGE
-            };
 
             let mut pack_nope = Vec::new();
             let mut pack_rope = Vec::new();
@@ -277,7 +272,7 @@ mod real {
 
         let pool_bytes = ctx.stream.clone_dtoh(&pool)?;
         let records = decode_pool(&pool_bytes);
-        let (pack_ok, pack_max_nope, pack_max_rope) =
+        let (pack_ok, pack_max_nope, pack_max_rope, pack_worst) =
             check_pack(&pool_bytes, &nope_src, &rope_src, &used, &tables);
 
         let (num_sm_parts, fixed_overhead, block_size_topk) =
@@ -296,7 +291,7 @@ mod real {
             "pack family: decoded pool differs from BF16 sources (nope {pack_max_nope}, rope {pack_max_rope})"
         );
         println!(
-            "pack max_rel_nope={pack_max_nope:.6} max_abs_rope={pack_max_rope:.6} pass={pack_ok}"
+            "pack max_rel_nope={pack_max_nope:.6} max_abs_rope={pack_max_rope:.6} pass={pack_ok} worst[{pack_worst}]"
         );
 
         if !negative {
@@ -423,11 +418,22 @@ mod real {
         let neg_lse = lse_good > PASS_MAX_ABS_LSE;
         let bad_self_consistent = rel_bad <= PASS_MAX_REL_OUT && lse_bad <= PASS_MAX_ABS_LSE;
 
-        // Pack family: flip a NoPE exponent byte on a written token.
+        // Pack family: flip the E8M0 scale byte for NoPE tile 0 of the first
+        // written token. The scale region is at block_base + PAGE*(NoPE+RoPE
+        // bytes), then row*8 + tile. Bit5 flips the e8m0 exponent by +-32,
+        // i.e. scale x2^+-32 across the whole 64-lane tile, so the tile-relative
+        // metric must read ~1 (a NoPE data byte only perturbs one lane and can
+        // stay under the tile bound).
         let mut corrupt = pool_bytes.clone();
-        let byte_idx = dom_phys[0] * ROW_BYTES;
-        corrupt[byte_idx] ^= 0x20;
-        let (neg_pack, _, _) = check_pack(&corrupt, &nope_src, &rope_src, &used, &tables);
+        let neg_phys = (0..used.len())
+            .find(|&p| used[p])
+            .expect("at least one written token");
+        let nb = neg_phys / PAGE;
+        let nr = neg_phys % PAGE;
+        let scale_byte = nb * BLOCK_BYTES + PAGE * (HEAD_NOPE + HEAD_ROPE * 2) + nr * 8;
+        corrupt[scale_byte] ^= 0x20;
+        let (neg_pack, neg_nope, _, neg_worst) =
+            check_pack(&corrupt, &nope_src, &rope_src, &used, &tables);
 
         // Scheduler: 8x topk forces a different partition.
         let mut meta8 = Vec::new();
@@ -445,7 +451,7 @@ mod real {
         )?;
         let neg_sched = meta8 != sched_good || splits8 != splits_good;
 
-        println!("negative pack fired={neg_pack} (nope rel {pack_max_nope:.6})");
+        println!("negative pack fired={neg_pack} (nope rel {neg_nope:.6}) worst[{neg_worst}]");
         println!("negative indices fired={neg_indices}");
         println!(
             "negative out rel_vs_good={rel_good:.6} (self-consistent {bad_self_consistent}) fired={neg_out}"
@@ -521,8 +527,11 @@ mod real {
         rope_src: &[f32],
         used: &[bool],
         tables: &[i32],
-    ) -> (bool, f64, f32) {
+    ) -> (bool, f64, f32, String) {
         let _ = tables;
+        // Worst NoPE tile location (see hca gate): correct packs <= ~0.062;
+        // an addressing/scale bug reports ~0.5-1.5 with the exact tile named.
+        let mut worst = String::new();
         let mut max_rel_nope = 0f64;
         let mut max_abs_rope = 0f32;
         for phys in 0..used.len() {
@@ -540,12 +549,33 @@ mod real {
                 } else {
                     2f32.powi(i32::from(e8m0) - 127)
                 };
+                // FP8 block scaling quantizes the tile against ONE shared scale
+                // (scale = 2^ceil(log2(amax/448))), so the meaningful error is
+                // the tile max absolute error relative to the tile amax — not a
+                // per-element relative error, which diverges near a zero value
+                // (random data crosses zero inside a tile and would report ~1
+                // for a correct pack). Exhaustive E4M3 RN bound for the tile
+                // amax element is 16/272 = 0.0588; the oracle compares against
+                // the f32 source while the kernel quantizes its bf16 rounding,
+                // adding <=1 fp8 unit, so the binding bound is 17/273 ~= 0.0623.
+                // 32/448 = 0.0714 is unreachable (448 is an exact grid point).
+                let mut tile_amax = 0f32;
+                let mut tile_max_err = 0f32;
                 for lane in 0..64usize {
                     let d = tile * 64 + lane;
                     let got = decode_e4m3(pool[data_base + d]) * scale;
                     let want = nope_src[phys * HEAD_NOPE + d];
-                    let denom = want.abs().max(f32::MIN_POSITIVE);
-                    max_rel_nope = max_rel_nope.max(((got - want) / denom).abs() as f64);
+                    tile_amax = tile_amax.max(want.abs());
+                    tile_max_err = tile_max_err.max((got - want).abs());
+                }
+                if tile_amax > 0.0 {
+                    let ratio = (tile_max_err / tile_amax) as f64;
+                    if ratio > max_rel_nope {
+                        max_rel_nope = ratio;
+                        worst = format!(
+                            "block={block} row={row} tile={tile} e8m0={e8m0} scale={scale:.3e} tile_amax={tile_amax:.3e} ratio={ratio:.4}"
+                        );
+                    }
                 }
             }
             for d in 0..HEAD_ROPE {
@@ -557,7 +587,7 @@ mod real {
             }
         }
         let ok = max_rel_nope <= PACK_NOPE_REL && max_abs_rope <= PACK_ROPE_ABS;
-        (ok, max_rel_nope, max_abs_rope)
+        (ok, max_rel_nope, max_abs_rope, worst)
     }
 
     fn decode_pool(bytes: &[u8]) -> Vec<Vec<f32>> {
@@ -838,7 +868,7 @@ mod real {
             let (split_ptr, _gn) = splits.device_ptr_mut(&ctx.stream);
             attention::flashmla_sm90_sparse_decode_sched_meta_raw(
                 &ctx.stream,
-                B as i32,
+                b as i32,
                 1,
                 block_size_topk,
                 fixed_overhead,
