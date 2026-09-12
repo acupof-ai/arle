@@ -243,11 +243,18 @@ pub struct KvSystemMetrics {
     pub reuse_hit_disk: u64,
     pub reuse_miss: u64,
     pub demote_mset_count: u64,
+    /// Always 0: written only by a non-zero-copy page tier (CUDA pins page
+    /// capacity to 0; Metal is zero-copy); a future copying page tier would set it.
     pub demote_mset_copy_bytes: u64,
+    /// Always 0 for the same non-zero-copy-page-tier gate as `demote_mset_copy_bytes`.
     pub demote_mset_copy_ms: u64,
     pub promote_mget_count: u64,
+    /// Always 0: written only by a non-zero-copy page tier on promote; no current
+    /// backend is both capacity-bearing and copying.
     pub promote_mget_copy_bytes: u64,
+    /// Always 0 for the same non-zero-copy-page-tier gate as `promote_mget_copy_bytes`.
     pub promote_mget_copy_ms: u64,
+    /// Always 0 for the same non-zero-copy-page-tier gate; measures copy wait only.
     pub fetch_wait_ms: u64,
     pub fallback_recompute: u64,
     pub prefix_match_full_blocks: u64,
