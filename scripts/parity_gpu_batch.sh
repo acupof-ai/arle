@@ -10,8 +10,11 @@
 #      --negative-control;
 #   4. writes results.tsv and a wins/errors-ready results.md under the
 #      caller-given output dir, with per-run capped logs.
-# Before the GPU gates it runs the cuda-kernels host-only unit tests with an
-# explicit name filter (no GPU claim); a failure aborts before any gate runs.
+# Before the GPU gates it runs cuda-kernels host-only unit tests with an
+# explicit name filter (no GPU claim); after the claim it runs the infer-cuda
+# LoRA-merge device test on the claimed card with ARLE_REQUIRE_CUDA_DEVICE=1
+# (an absent device fails loudly instead of skipping). Either failure aborts
+# before any gate runs.
 #
 # Exit non-zero if any positive run fails or any --negative-control run does
 # not print NEGATIVE CONTROL OK. Multi-rank model gates (dsv4_parity,
@@ -198,6 +201,32 @@ cleanup() {
 }
 trap cleanup EXIT
 echo "parity-batch: gpu=$GPU kernel_build_id=$kernel_id gates=${#gates[@]}"
+
+# ── infer-cuda DEVICE unit test on the claimed card (require-device arm) ────
+# The anti-skip helper only has teeth when a runner actually sets
+# ARLE_REQUIRE_CUDA_DEVICE; this is that runner: the card is claimed above, so
+# an absent device here must FAIL, not skip. Runs the LoRA-merge comparison
+# against the real GPU. Skipped in the mock shell test via the seam.
+run_device_units() {
+    if [ -n "${ARLE_PARITY_DEVICE_UNITS_CMD:-}" ]; then
+        bash -c "$ARLE_PARITY_DEVICE_UNITS_CMD"
+        return
+    fi
+    CUDA_VISIBLE_DEVICES="$GPU" ARLE_REQUIRE_CUDA_DEVICE=1 \
+        cargo test --release -p infer-cuda --features cuda --lib -- \
+        device_lora_merge_matches_host_reference
+}
+echo "parity-batch: infer-cuda device unit test (gpu=$GPU, require-device)"
+if ! run_device_units >"$OUT/device-units.log" 2>&1; then
+    echo "parity-batch: device unit test failed" >&2
+    tail -n 40 "$OUT/device-units.log" >&2
+    PREREG_RESULT="device unit test failed"
+    PREREG_FINDING="device_lora_merge_matches_host_reference failed on the claimed GPU (or the required CUDA device was absent); see device-units.log"
+    PREREG_DECISION="do not read any parity signal until the device unit test is green"
+    prereg_done rejected
+    exit 1
+fi
+echo "parity-batch: device unit test PASS"
 
 # Keep the tail of a log (verdict lines print at the end).
 cap_log() {
