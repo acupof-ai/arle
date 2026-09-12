@@ -836,6 +836,17 @@ impl infer_seam::KvPageTier for CudaExecutor {
         0
     }
 
+    fn kv_tier_residency_measured(&self) -> bool {
+        // The slot store feeds real host/disk residency samples on the real
+        // executor even with page capacity pinned to 0; the placeholder has no
+        // store and must read absent.
+        match &self.inner {
+            CudaExecutorInner::Placeholder => false,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(_) => true,
+        }
+    }
+
     fn kv_tier_page_bytes(&self) -> usize {
         0
     }
