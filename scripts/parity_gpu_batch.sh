@@ -12,8 +12,10 @@
 #      caller-given output dir, with per-run capped logs.
 #
 # Exit non-zero if any positive run fails or any --negative-control run does
-# not print NEGATIVE CONTROL OK. Examples that need the multi-rank model
-# launcher (INFER_DSV4_MODEL_PATH) are recorded SKIP, not failure.
+# not print NEGATIVE CONTROL OK. Multi-rank model gates (dsv4_parity,
+# :model in ARLE_PARITY_GATE_LIST) need INFER_DSV4_MODEL_PATH and N free SM90
+# GPUs: the single-card claim is released for their phase and reclaimed after;
+# without the model path or enough free cards they are recorded SKIP.
 #
 # Test seams (shell test only, never set in production):
 #   ARLE_PARITY_BIN_DIR   run mock binaries from this dir instead of cargo build
@@ -21,6 +23,12 @@
 #   ARLE_PARITY_GPU       skip the pick-gpu.sh claim and use this index
 #   ARLE_PARITY_NO_NEG_ALLOWLIST  gates allowed to run WITHOUT --negative-control
 #   ARLE_PARITY_SKIP_PREREG=1  do not open/close a prereg row
+#   ARLE_PARITY_DSV4_GPUS  pinned physical GPU csv for the dsv4 multi-rank phase
+#   ARLE_PARITY_DSV4_WORLD ranks to launch (default 8; unused without the model)
+#
+# dsv4_parity runs allreduce MoE under the batch's cuda,nccl build; the DeepEP
+# transport is not part of this gate (its first-token parity is transport-
+# independent only by construction, not measured).
 set -euo pipefail
 
 # Gates allowed to have no --negative-control mode. A source grep is not used:
@@ -124,11 +132,11 @@ rm -f "$OUT/.kernel-id.tmp"
 printf '%s\n' "$kernel_id" >"$OUT/kernel-build-id.txt"
 
 # ── Claim one free GPU through the existing pick-gpu.sh ───────────────────
+CLAIM_ENV=(ARLE_OP_ID="$NAME" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$")
 if [ -n "${ARLE_PARITY_GPU:-}" ]; then
     GPU="$ARLE_PARITY_GPU"
     CLAIM=""
 else
-    CLAIM_ENV=(ARLE_OP_ID="$NAME" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$")
     GPU="$(env "${CLAIM_ENV[@]}" bash "$ROOT/scripts/pick-gpu.sh")" || GPU="NONE"
     [ "$GPU" != "NONE" ] || {
         echo "parity-batch: no free GPU" >&2
@@ -140,7 +148,10 @@ else
     }
     CLAIM="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$GPU"
 fi
-cleanup() { if [ -n "${CLAIM:-}" ]; then rm -f "$CLAIM"; fi; }
+cleanup() {
+    [ -z "${CLAIM:-}" ] || rm -f "$CLAIM"
+    for g in ${MODEL_CLAIMS:-}; do rm -f "${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$g" 2>/dev/null || true; done
+}
 trap cleanup EXIT
 echo "parity-batch: gpu=$GPU kernel_build_id=$kernel_id gates=${#gates[@]}"
 
@@ -180,6 +191,104 @@ mark_notrun() {
     r="$(printf '%s' "$2" | tr '[:space:]' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
     notrun_list="${notrun_list}${1}"$'\t'"${r}"$'\n'
 }
+
+# Multi-rank model gate (today: dsv4_parity at TP=N). Needs INFER_DSV4_MODEL_PATH
+# and N free SM90 GPUs; ARLE_PARITY_DSV4_GPUS pins a physical set, otherwise a
+# free contiguous N-set is claimed via pick-gpu.sh reserve-set.
+# Echoes "RUN <csv>" or "SKIP <reason>".
+re_claim_single() {
+    [ -n "${ARLE_PARITY_GPU:-}" ] && { GPU="$ARLE_PARITY_GPU"; CLAIM=""; return; }
+    GPU="$(env "${CLAIM_ENV[@]}" bash "$ROOT/scripts/pick-gpu.sh")" || GPU="NONE"
+    if [ "$GPU" != NONE ]; then
+        CLAIM="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$GPU"
+    else
+        CLAIM=""
+    fi
+}
+dsv4_reserve_gpu_set() {
+    local n="$1" csv
+    # Test seam: accept the pinned/default set without calling pick-gpu.sh.
+    if [ "${ARLE_PARITY_TEST_NO_CLAIM:-0}" = 1 ]; then
+        if [ -n "${ARLE_PARITY_DSV4_GPUS:-}" ]; then echo "RUN $ARLE_PARITY_DSV4_GPUS"; else
+            local i s=""; for ((i=0;i<n;i++)); do s+="$i,"; done; echo "RUN ${s%,}"; fi
+        return
+    fi
+    if [ -n "${ARLE_PARITY_DSV4_GPUS:-}" ]; then
+        csv="$ARLE_PARITY_DSV4_GPUS"
+        if env "${CLAIM_ENV[@]}" bash "$ROOT/scripts/pick-gpu.sh" reserve-set "$csv" >/dev/null 2>&1; then
+            echo "RUN $csv"
+        else
+            echo "SKIP reserved GPUs $csv not all free SM90"
+        fi
+        return
+    fi
+    local indices
+    indices="$(nvidia-smi --query-gpu=index,compute_cap --format=csv,noheader,nounits 2>/dev/null \
+        | awk -F', ' '$2 == "9.0" {print $1}' | sort -n | paste -sd, -)"
+    if [ -z "$indices" ]; then echo "SKIP no SM90 GPUs visible"; return; fi
+    local IFS=,; set -f; read -r -a all <<< "$indices"; set +f; unset IFS
+    local lo window
+    for ((lo=0; lo+n<=${#all[@]}; lo++)); do
+        window="$(printf '%s,' "${all[@]:$lo:$n}" | sed 's/,$//')"
+        if env "${CLAIM_ENV[@]}" bash "$ROOT/scripts/pick-gpu.sh" reserve-set "$window" >/dev/null 2>&1; then
+            echo "RUN $window"; return
+        fi
+    done
+    echo "SKIP no $n free SM90 GPUs for the multi-rank launcher"
+}
+
+run_model_gate() {  # $1=name $2=sm90 $3=neg_mode
+    local name="$1" sm90="$2" neg_mode="$3"
+    local pos_log="$OUT/logs/$name.positive.log"
+    if [ -z "${INFER_DSV4_MODEL_PATH:-}" ]; then
+        printf '%s\t%s\t%s\t-\t-\t-\t-\tSKIP\tset INFER_DSV4_MODEL_PATH (multi-rank launcher)\n' \
+            "$name" "$sm90" "$neg_mode" >>"$TSV"
+        n_skip=$((n_skip + 1)); mark_notrun "$name" "set INFER_DSV4_MODEL_PATH (multi-rank launcher)"
+        return
+    fi
+    local world="${ARLE_PARITY_DSV4_WORLD:-8}"
+    # The model gate needs N whole GPUs; free the single-card claim so the set
+    # search sees every card, and re-claim one afterward for the rest of the
+    # single-card gates (skipped in the no-claim shell-test seam).
+    if [ "${ARLE_PARITY_TEST_NO_CLAIM:-0}" != 1 ]; then
+        if [ -n "${CLAIM:-}" ]; then rm -f "$CLAIM"; CLAIM=""; fi
+        GPU=""
+    fi
+    local decision; decision="$(dsv4_reserve_gpu_set "$world")"
+    if [ "${decision%% *}" = SKIP ]; then
+        local reason="${decision#SKIP }"
+        printf '%s\t%s\t%s\t-\t-\t-\t-\tSKIP\t%s\n' "$name" "$sm90" "$neg_mode" "$reason" >>"$TSV"
+        n_skip=$((n_skip + 1)); mark_notrun "$name" "$reason"
+        if [ "${ARLE_PARITY_TEST_NO_CLAIM:-0}" != 1 ]; then re_claim_single; fi
+        return
+    fi
+    local model_gpus="${decision#RUN }"
+    MODEL_CLAIMS="${MODEL_CLAIMS:-} ${model_gpus//,/ }"
+    echo "parity-batch: $name multi-rank on physical GPUs $model_gpus (world=$world)" >&2
+    set +e
+    INFER_DSV4_MODEL_PATH="$INFER_DSV4_MODEL_PATH" \
+    DSV4_PARITY_GPUS="$model_gpus" \
+    DSV4_PARITY_BIN="$BIN_DIR/$name" \
+        bash "$ROOT/scripts/dsv4_multigpu_parity.sh" >"$pos_log" 2>&1
+    local pos_rc=$?
+    set -e
+    if [ "${ARLE_PARITY_TEST_NO_CLAIM:-0}" != 1 ]; then
+        for g in ${model_gpus//,/ }; do rm -f "${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$g"; done
+        MODEL_CLAIMS=""
+    fi
+    cap_log "$pos_log"
+    local pos_verdict fails pos_status
+    pos_verdict="$(pos_marker "$pos_log")"
+    if [ "$pos_rc" -eq 0 ] && [ -n "$pos_verdict" ]; then
+        pos_status=PASS; n_pass=$((n_pass + 1))
+    else
+        pos_status=FAIL; n_fail=$((n_fail + 1)); fail_names="$fail_names $name(multi-rank rc=$pos_rc)"
+    fi
+    fails="$(fail_lines "$pos_log")"
+    printf '%s\t%s\t%s\t%s\t%s\tn/a\tn/a\t%s\t%s\n' \
+        "$name" "$sm90" "$neg_mode" "$pos_rc" "${pos_verdict:-—}" "$pos_status" "${fails:-—}" >>"$TSV"
+    if [ "${ARLE_PARITY_TEST_NO_CLAIM:-0}" != 1 ]; then re_claim_single; fi
+}
 for line in "${gates[@]}"; do
     name="${line%%$'\t'*}"; flags="${line#*$'\t'}"
     sm90=no; model=no; neg=yes; neg_mode="required"
@@ -188,13 +297,16 @@ for line in "${gates[@]}"; do
     if neg_exempt "$name"; then neg=no; neg_mode="allowlisted"; fi
 
     if [ "$model" = yes ]; then
-        printf '%s\t%s\t%s\t-\t-\t-\t-\tSKIP\tneeds multi-rank model launcher + INFER_DSV4_MODEL_PATH\n' \
-            "$name" "$sm90" "$neg_mode" >>"$TSV"
-        n_skip=$((n_skip + 1))
-        mark_notrun "$name" "needs multi-rank model launcher + INFER_DSV4_MODEL_PATH"
+        run_model_gate "$name" "$sm90" "$neg_mode"
         continue
     fi
     bin="$BIN_DIR/$name"
+    if [ "$GPU" = NONE ]; then
+        printf '%s\t%s\t%s\t-\t-\t-\t-\tSKIP\tno free single GPU after the multi-rank phase\n' \
+            "$name" "$sm90" "$neg_mode" >>"$TSV"
+        n_skip=$((n_skip + 1)); mark_notrun "$name" "no free single GPU after the multi-rank phase"
+        continue
+    fi
     if [ ! -x "$bin" ]; then
         printf '%s\t%s\t%s\t-\t-\t-\t-\tFAIL\tbinary missing after build\n' \
             "$name" "$sm90" "$neg_mode" >>"$TSV"

@@ -39,12 +39,19 @@
 #     INFER_DSV4_MAX_NEW     max new tokens to attempt           (default 16)
 #     DSV4_PARITY_BIN        path to the built example binary
 #                            (default target/release/examples/dsv4_parity)
-#     WORLD_SIZE             ranks / GPUs                         (default 8)
+#     DSV4_PARITY_GPUS       physical GPU csv ("3,4,5,6,7,0,1,2"); rank r binds
+#                            the r-th entry, and its length is the world size
+#                            (unset = WORLD_SIZE, default 8, on ranks 0..N-1)
+#     WORLD_SIZE             ranks when DSV4_PARITY_GPUS is unset (default 8)
+#
+# Verdict: compares rank 0's first clean_token to the validated oracle 11111
+# and prints ALL PASS (rc 0) or FAIL (rc 1) on stdout. The single-card
+# parity_gpu_batch.sh greps ALL PASS; the other 15 oracle tokens are still
+# gated behind the incremental-decode follow-up (bail surfaced in stderr).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${DSV4_PARITY_BIN:-$ROOT/target/release/examples/dsv4_parity}"
-WORLD_SIZE="${WORLD_SIZE:-8}"
 
 [[ -n "${INFER_DSV4_MODEL_PATH:-}" ]] || {
     echo "ERROR: set INFER_DSV4_MODEL_PATH to the DSv4 FP8 safetensors dir" >&2
@@ -55,8 +62,21 @@ WORLD_SIZE="${WORLD_SIZE:-8}"
     exit 1
 }
 
-# Comma-separated 0..WORLD_SIZE-1 device list — INFER_CUDA_DEVICES is the TP
-# trigger; its ordinal count is the world size (resolve_tp_config in tp.rs).
+# Physical GPU per rank. DSV4_PARITY_GPUS is a comma-separated physical index
+# list ("3,4,5,6,7,0,1,2"): rank r binds to the r-th entry, which lets
+# parity_gpu_batch.sh run on whatever contiguous or free set pick-gpu reserved.
+# Unset = ranks 0..WORLD_SIZE-1. The list length is the world size.
+if [ -n "${DSV4_PARITY_GPUS:-}" ]; then
+    IFS=',' read -r -a GPU_SET <<< "$DSV4_PARITY_GPUS"
+    WORLD_SIZE="${#GPU_SET[@]}"
+else
+    WORLD_SIZE="${WORLD_SIZE:-8}"
+    GPU_SET=()
+    for i in $(seq 0 $((WORLD_SIZE - 1))); do GPU_SET+=("$i"); done
+fi
+
+# INFER_CUDA_DEVICES carries the ordinal count (world size); the ordinals are
+# 0..N-1 inside each process's single-device CUDA_VISIBLE_DEVICES mask.
 DEVICES="$(seq -s, 0 $((WORLD_SIZE - 1)))"
 
 WORK="$(mktemp -d -t dsv4-parity.XXXXXX)"
@@ -77,12 +97,12 @@ declare -a LOGS
 for r in $(seq 0 $((WORLD_SIZE - 1))); do
     LOG="$WORK/rank_$r.log"
     LOGS[r]="$LOG"
-    # One GPU per rank: CUDA_VISIBLE_DEVICES=$r masks physical GPU $r, which the
-    # process then sees re-indexed as ordinal 0 — so INFER_CUDA_DEVICE must be 0,
-    # NOT $r (passing $r yields CUDA_ERROR_INVALID_DEVICE since only ordinal 0 is
-    # visible). INFER_CUDA_DEVICES gives the world size (8 ordinals → TP=8);
-    # INFER_TP_RANK is this rank's index; INFER_NCCL_ID_FILE is the rendezvous path.
-    CUDA_VISIBLE_DEVICES="$r" \
+    # One physical GPU per rank (GPU_SET[r]), masked so the process sees it as
+    # ordinal 0 — so INFER_CUDA_DEVICE must be 0, NOT the physical index
+    # (passing the physical index yields CUDA_ERROR_INVALID_DEVICE under the
+    # one-device mask). INFER_CUDA_DEVICES gives the world size (N ordinals →
+    # TP=N); INFER_TP_RANK is this rank's index; INFER_NCCL_ID_FILE the path.
+    CUDA_VISIBLE_DEVICES="${GPU_SET[$r]}" \
     INFER_CUDA_DEVICE=0 \
     INFER_CUDA_DEVICES="$DEVICES" \
     INFER_TP_SIZE="$WORLD_SIZE" \
@@ -90,7 +110,7 @@ for r in $(seq 0 $((WORLD_SIZE - 1))); do
     INFER_NCCL_ID_FILE="$ID_FILE" \
         "$BIN" >"$LOG" 2>&1 &
     PIDS[r]=$!
-    echo "[launcher] spawned rank $r (pid ${PIDS[r]}, gpu $r)" >&2
+    echo "[launcher] spawned rank $r (pid ${PIDS[r]}, physical gpu ${GPU_SET[$r]})" >&2
 done
 
 # ── Step 3: wait, surface any rank failure. ───────────────────────────────────
@@ -107,17 +127,28 @@ done
     exit 1
 }
 
-# ── Step 4: rank-0 clean_tokens vs the greedy oracle. ─────────────────────────
+# ── Step 4: rank-0 first token vs the validated greedy oracle. ───────────────
 echo "===== rank 0 log =====" >&2
 cat "${LOGS[0]}" >&2
 echo "======================" >&2
 
 RANK0_TOKENS="$(grep -E '^clean_tokens=' "${LOGS[0]}" | tail -n1 || true)"
-# Oracle: the validated DSv4 greedy continuation for the default prompt.
+# Full 16-token continuation (reference only); only the FIRST token — the
+# full-prefix prefill argmax, recomputed on every layer type (SW/CSA/HCA) — is
+# a gated oracle today. Incremental decode reuses per-step KV and bails.
 ORACLE='clean_tokens=[11111, 603, 671, 6102, 294, 8760, 344, 11111, 603, 671, 6102, 294, 8760, 344, 11111, 603]'
+FIRST_ORACLE=11111
 
-echo "[launcher] rank0  : ${RANK0_TOKENS:-<none>}"
-echo "[launcher] oracle : $ORACLE"
-echo "[launcher] NOTE: today only the FIRST token (prefill argmax) is a verified"
-echo "[launcher]       gate on every layer type; the remaining 15 oracle tokens"
-echo "[launcher]       need the incremental-decode (start_pos>0) follow-up."
+echo "[launcher] rank0  : ${RANK0_TOKENS:-<none>}" >&2
+echo "[launcher] oracle : $ORACLE" >&2
+echo "[launcher] NOTE: today only the FIRST token (prefill argmax) is a verified" >&2
+echo "[launcher]       gate on every layer type; the remaining 15 oracle tokens" >&2
+echo "[launcher]       need the incremental-decode (start_pos>0) follow-up." >&2
+
+first_token="$(printf '%s' "$RANK0_TOKENS" | sed -n 's/^clean_tokens=\[\([0-9][0-9]*\)\(,.*\)\{0,1\}\]$/\1/p')"
+if [ "$first_token" = "$FIRST_ORACLE" ]; then
+    echo "ALL PASS"
+    exit 0
+fi
+echo "FAIL: rank0 first token ${first_token:-<missing>} != $FIRST_ORACLE"
+exit 1
