@@ -1,6 +1,6 @@
 # ISO-Merger SVD can't be kernel-accelerated without breaking bf16 parity
 
-Date: 2026-08-01 · Tool: [`scripts/iso_merger.py`](../../../scripts/iso_merger.py)
+Date: 2026-08-01 · Tool: `scripts/iso_merger.py` (history-only one-off, removed 2026-09-11)
 
 ## Context
 

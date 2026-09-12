@@ -173,12 +173,50 @@ def check_markdown_links(paths: list[Path]) -> list[str]:
         text = load_text(abs_path)
         for match in MARKDOWN_LINK_RE.finditer(text):
             target = match.group(1).strip()
+            # A tilde-home link resolves only on its author's machine, never in
+            # the repo. It is wrong in committed docs, so report it as a
+            # machine-local link rather than a "broken" one (the cause is not a
+            # missing target, it is a path nobody else can resolve).
+            if target.startswith("~/"):
+                errors.append(f"{rel_path}: machine-local home link -> {target}")
+                continue
+            # An absolute path under the current user's home directory is also
+            # machine-local, but the literal form is banned tree-wide by
+            # REPO_WIDE_DISALLOWED_MARKERS, so the link gate need not repeat it.
+            if target == str(Path.home()) or target.startswith(
+                str(Path.home()) + "/"
+            ):
+                continue
             resolved = normalize_link_target(abs_path, target)
             if resolved is None:
                 continue
             if not resolved.exists():
                 errors.append(f"{rel_path}: broken local link -> {target}")
     return errors
+
+
+def list_tracked_markdown_docs() -> list[Path]:
+    """Every tracked markdown file the link gate should see.
+
+    Previously this gate ran over a hand-curated list (PUBLIC_CHECK_FILES), so
+    broken links in docs/experience/**, docs/design/**, benchmarks/** and
+    examples/** were invisible to a gate that reported green. Coverage is now
+    the tracked-file set. Vendored trees are excluded by path (their upstream
+    changelogs carry links that do not resolve in this checkout), the agent
+    session-memory snapshot under .claude/projects is not repo docs, and the
+    sealed archive under docs/experience/archived is a hash-frozen historical
+    snapshot the archive gate forbids changing.
+    """
+    tracked = list_git_tracked_files(Path("."))
+    out = [
+        Path(rel)
+        for rel in tracked
+        if Path(rel).suffix.lower() in (".md", ".markdown")
+        and "/vendor/" not in rel
+        and not rel.startswith(".claude/projects/")
+        and not rel.startswith(f"{ARCHIVED_ROOT}/")
+    ]
+    return sorted(set(out))
 
 
 def check_disallowed_markers(paths: list[Path]) -> list[str]:
@@ -1024,7 +1062,7 @@ def main() -> int:
     errors: list[str] = []
 
     errors.extend(check_required_files())
-    errors.extend(check_markdown_links(PUBLIC_CHECK_FILES))
+    errors.extend(check_markdown_links(list_tracked_markdown_docs()))
     errors.extend(check_disallowed_markers(PUBLIC_CHECK_FILES))
     errors.extend(check_template(Path(".github/PULL_REQUEST_TEMPLATE.md"), PR_TEMPLATE_REQUIRED_HEADINGS))
     errors.extend(check_template(Path(".github/PULL_REQUEST_TEMPLATE.md"), PR_TEMPLATE_REQUIRED_DOC_REFS))

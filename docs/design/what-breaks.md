@@ -1,6 +1,6 @@
 # What breaks
 
-Ten entries from the [experience corpus](experience/), selected for root
+Ten entries from the [experience corpus](../experience/), selected for root
 causes that generalize beyond this codebase. One paragraph each: Symptom,
 Root cause, Rule. Dates are the entries' own; the linked entry carries the full
 evidence. Design note 5 ([matched-measurement.md](matched-measurement.md))
@@ -8,7 +8,7 @@ states the method these ten broke.
 
 ## Full-prefix match feeds the wrong seed token
 
-[wins 2026-07-08](experience/wins/2026-07-08-prefix-cache-wrong-seed-token-fix.md)
+[wins 2026-07-08](../experience/wins/2026-07-08-prefix-cache-wrong-seed-token-fix.md)
 — **Symptom:** repeating the same prompt against a warm server corrupted the
 output from the second call onward (`738291` → `738292`), 100% reproducible at
 concurrency 1. **Root cause:** a full-prompt prefix match entered decode with
@@ -20,7 +20,7 @@ state is a bug signal, never a valid state to cover with a fallback.
 
 ## Spec decode serializes above c=1
 
-[errors 2026-07-26](experience/errors/2026-07-26-dspark-spec-decode-serializes-and-loses-above-c1.md)
+[errors 2026-07-26](../experience/errors/2026-07-26-dspark-spec-decode-serializes-and-loses-above-c1.md)
 — **Symptom:** DSpark spec decode ran 2.24× faster at c=1 and 39% slower at
 c=16; latency scaled 1×/8×/16× with concurrency. **Root cause:** draft
 generation ran per request, never batched across slots, so concurrency added
@@ -32,7 +32,7 @@ another.
 
 ## A decode-graph flag logs ARMED and captures nothing
 
-[errors 2026-08-01](experience/errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md)
+[errors 2026-08-01](../experience/errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md)
 — **Symptom:** `--qwen35-decode-graph` printed an ARMED log line, but a
 four-arm serve A/B showed only noise and nsys counted zero `cuGraph*` calls
 with the flag on. **Root cause:** the graph lane's single call site sat below
@@ -43,7 +43,7 @@ counting the API calls the treatment should produce.
 
 ## A zero-grid availability probe mistaken for a long-prompt crash
 
-[errors 2026-08-13](experience/errors/2026-08-13-gdn-zero-token-chunk-kills-engine.md)
+[errors 2026-08-13](../experience/errors/2026-08-13-gdn-zero-token-chunk-kills-engine.md)
 — **Symptom:** a 64k-token prompt reportedly killed the engine; an
 `LD_PRELOAD` trace on `cuLaunchKernel` found a launch with grid=(0,1,1).
 **Root cause:** the zero-grid launch was a deliberate one-shot capability
@@ -57,7 +57,7 @@ before building a chain on it.
 
 ## A repack that keeps its source stores the model twice
 
-[wins 2026-08-20](experience/wins/2026-08-20-marlin-source-freed-18gb.md)
+[wins 2026-08-20](../experience/wins/2026-08-20-marlin-source-freed-18gb.md)
 — **Symptom:** the smaller checkpoint had half the KV capacity (281,577 vs
 593,995 tokens) and the 32K chain ran ~7× the wall clock, with 24 full
 recomputes per run. **Root cause:** the Marlin repack kept its 18.7 GB
@@ -69,7 +69,7 @@ crash, not by reading.
 
 ## Parity verified against the wrong oracle
 
-[errors 2026-08-22](experience/errors/2026-08-22-marlin-fp4-parity-wrong-oracle.md)
+[errors 2026-08-22](../experience/errors/2026-08-22-marlin-fp4-parity-wrong-oracle.md)
 — **Symptom:** a layout-parity gate passed twice on GPU, while an end-to-end
 A/B showed a 0.3363 vs 0.6414 loss gap between the shared and private arms.
 **Root cause:** the test's scales were powers of two, chosen so nothing was
@@ -81,7 +81,7 @@ promises.
 
 ## Batched spec decode over quantized KV loses with parity intact
 
-[errors 2026-08-22](experience/errors/2026-08-22-batched-dspark-quant-kv-verify-loses.md)
+[errors 2026-08-22](../experience/errors/2026-08-22-batched-dspark-quant-kv-verify-loses.md)
 — **Symptom:** batched DSpark over FP8 KV lost 10% at c=8 and 16% at c=16,
 while the needle ladder passed 12/12 exact and deterministic under a
 concurrent 32K stream. **Root cause:** cause unknown. The verify-kernel
@@ -93,7 +93,7 @@ loss, and a rejected lever keeps its gate with the numbers in the comment.
 
 ## One NVFP4 checkpoint corrupts tool calls
 
-[errors 2026-08-23](experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md)
+[errors 2026-08-23](../experience/errors/2026-08-23-nvfp4-tool-calls-corrupt.md)
 — **Symptom:** ThinkingCap-Qwen3.6-27B-NVFP4 emitted token soup on tool-call
 prompts where the FP8 build was correct, deterministically across runs; 68
 agent-OPD rollouts returned `edited=false`. **Root cause:** unknown. The
@@ -107,7 +107,7 @@ reading any downstream number as a property of the workload.
 
 ## A slot budget without the prefill transient
 
-[wins 2026-08-24](experience/wins/2026-08-24-dsv4-budget-prefill-reserve.md)
+[wins 2026-08-24](../experience/wins/2026-08-24-dsv4-budget-prefill-reserve.md)
 — **Symptom:** c=8 died mid-serve with all-rank CUDA OOM; the slot solve had
 handed every budget byte to slot state and the FlashMLA pool. **Root cause:**
 the first long prefill's chunk transients — 1352 MB itemized at TP=4 —
@@ -118,7 +118,7 @@ from allocation sites, never a factor.
 
 ## Restored pages minted new logical ids
 
-[wins 2026-09-02](experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md)
+[wins 2026-09-02](../experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md)
 — **Symptom:** turn 2 of a 12-turn conversation restored its prefix; turns 3
 through 12 licensed 0 blocks and re-prefilled the whole prompt. **Root
 cause:** republish minted a new logical id for every restored page, so

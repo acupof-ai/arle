@@ -46,7 +46,7 @@ traffic is `read a + read b + write sum + read sum + read w + write norm`
 launch and nothing else. My "5×H → 4×H" estimate had miscounted both sides
 (forgot the weight read on the norm side, forgot my own re-read).
 
-A register-resident second pass (the [`T6 GDN`](2026-08-03-t6-gdn-decode-kernel.md)
+A register-resident second pass (the [`T6 GDN`](../wins/2026-08-03-t6-gdn-decode-kernel.md)
 pattern) would make it 5×H and is worth ~0.1 ms — but that is 0.5% of the
 step, and it is not where the 4.3 ms lives.
 
