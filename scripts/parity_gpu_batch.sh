@@ -76,26 +76,38 @@ derive_gates() {
         return
     fi
     local registry="$ROOT/operators/registry.toml"
-    sed -n 's/^correctness_gate[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' "$registry" \
+    local named missing=""
+    named="$(sed -n 's/^correctness_gate[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' "$registry" \
         | tr ';' '\n' \
-        | grep -oE 'crates/infer-cuda/examples/[A-Za-z0-9_]+\.rs' | sort -u \
-        | while IFS= read -r src_rel; do
-            src="$ROOT/$src_rel"
-            [ -f "$src" ] || continue
-            name="$(basename "$src" .rs)"
-            flags=""
-            head -n 60 "$src" | grep -Eiq 'SM90|sm_90|sm90' && flags="${flags}sm90,"
-            grep -q 'INFER_DSV4_MODEL_PATH' "$src" && flags="${flags}model,"
-            printf '%s\t%s\n' "$name" "${flags%,}"
-        done
+        | grep -oE 'crates/infer-cuda/examples/[A-Za-z0-9_]+\.rs' | sort -u)"
+    # A registry row whose example is gone must abort, not vanish: skipping it
+    # shortens the batch with no row and no error, and the report still reads
+    # as a full run.
+    while IFS= read -r src_rel; do
+        [ -n "$src_rel" ] || continue
+        [ -f "$ROOT/$src_rel" ] || missing="${missing}${missing:+, }$src_rel"
+    done <<<"$named"
+    if [ -n "$missing" ]; then
+        echo "registry names correctness_gate examples that do not exist: $missing" >&2
+        return 1
+    fi
+    while IFS= read -r src_rel; do
+        [ -n "$src_rel" ] || continue
+        src="$ROOT/$src_rel"
+        name="$(basename "$src" .rs)"
+        flags=""
+        head -n 60 "$src" | grep -Eiq 'SM90|sm_90|sm90' && flags="${flags}sm90,"
+        grep -q 'INFER_DSV4_MODEL_PATH' "$src" && flags="${flags}model,"
+        printf '%s\t%s\n' "$name" "${flags%,}"
+    done <<<"$named"
 }
 
 # ── Build (one cargo call for the whole list) ──────────────────────────────
+gates_list="$(derive_gates)"
 if [ -n "${ARLE_PARITY_BIN_DIR:-}" ]; then
     BIN_DIR="$ARLE_PARITY_BIN_DIR"
     echo "parity-batch: mock binaries from $BIN_DIR"
 else
-    gates_list="$(derive_gates)"
     examples=()
     while IFS=$'\t' read -r gname _; do examples+=("--example" "$gname"); done <<< "$gates_list"
     [ "${#examples[@]}" -gt 0 ] || { echo "no parity gates found in registry" >&2; exit 2; }
@@ -152,7 +164,7 @@ echo "parity-batch: host-only unit tests PASS"
 # ── Kernel build id, once ──────────────────────────────────────────────────
 kernel_id=""
 gates=()
-while IFS= read -r gline; do gates+=("$gline"); done < <(derive_gates)
+while IFS= read -r gline; do [ -n "$gline" ] && gates+=("$gline"); done <<<"$gates_list"
 for line in "${gates[@]}"; do
     name="${line%%$'\t'*}"
     if [ -x "$BIN_DIR/$name" ] && "$BIN_DIR/$name" --kernel-build-id >"$OUT/.kernel-id.tmp" 2>/dev/null; then

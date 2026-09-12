@@ -248,4 +248,54 @@ ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_big" ARLE_PARITY_GPU=7 \
 size="$(wc -c <"$OUT3/logs/gate_big.positive.log" | tr -d ' ')"
 [ "$size" -le 65536 ] || { echo "FAIL: log not capped ($size bytes)" >&2; exit 1; }
 
-echo "PASS: parity_gpu_batch mocks (host units green+red; clean green; positive fail and dead negative control red; log capped)"
+# ── Registry-derived gate list: a row whose example file is gone must abort.
+# Every case above drives ARLE_PARITY_GATE_LIST, which bypasses the registry
+# branch entirely, so that branch had no coverage. The script derives ROOT from
+# its own path, so a copy in a fake tree reads that tree's registry.
+FAKE="$TMP/fakeroot"
+mkdir -p "$FAKE/scripts" "$FAKE/operators" "$FAKE/crates/infer-cuda/examples"
+cp "$ROOT/scripts/parity_gpu_batch.sh" "$FAKE/scripts/"
+cat > "$FAKE/operators/registry.toml" <<'TOML'
+[[operator]]
+name = "present"
+correctness_gate = "crates/infer-cuda/examples/gate_present.rs"
+
+[[operator]]
+name = "absent"
+correctness_gate = "crates/infer-cuda/examples/gate_absent.rs"
+TOML
+: > "$FAKE/crates/infer-cuda/examples/gate_present.rs"
+: > "$FAKE/crates/infer-cuda/examples/gate_absent.rs"
+make_mock gate_present pass
+make_mock gate_absent pass
+
+run_fake() {  # $1 = out dir
+    ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GPU=7 ARLE_PARITY_SKIP_PREREG=1 \
+        ARLE_PARITY_HOST_UNITS_CMD=true \
+        bash "$FAKE/scripts/parity_gpu_batch.sh" "$1"
+}
+
+# Positive control: both files present, the registry branch derives both gates.
+OUT_RP="$TMP/out-registry-present"
+run_fake "$OUT_RP" >"$TMP/registry-present.log" 2>&1 \
+    || { echo "FAIL: complete registry exited non-zero" >&2; cat "$TMP/registry-present.log" >&2; exit 1; }
+grep -q 'do not exist' "$TMP/registry-present.log" \
+    && { echo "FAIL: complete registry reported a missing example" >&2; exit 1; }
+cut -f1 "$OUT_RP/results.tsv" | grep -qx gate_present \
+    || { echo "FAIL: gate_present missing from the complete-registry report" >&2; exit 1; }
+cut -f1 "$OUT_RP/results.tsv" | grep -qx gate_absent \
+    || { echo "FAIL: gate_absent missing from the complete-registry report" >&2; exit 1; }
+
+# Red: the file named by the second row is gone.
+rm "$FAKE/crates/infer-cuda/examples/gate_absent.rs"
+OUT_RM="$TMP/out-registry-missing"
+if run_fake "$OUT_RM" >"$TMP/registry-missing.log" 2>&1; then
+    echo "FAIL: registry naming a nonexistent example exited 0" >&2
+    cat "$TMP/registry-missing.log" >&2; exit 1
+fi
+grep -q 'crates/infer-cuda/examples/gate_absent.rs' "$TMP/registry-missing.log" \
+    || { echo "FAIL: abort did not name the missing example" >&2; cat "$TMP/registry-missing.log" >&2; exit 1; }
+[ ! -f "$OUT_RM/results.tsv" ] \
+    || { echo "FAIL: gates ran despite the missing registry example" >&2; exit 1; }
+
+echo "PASS: parity_gpu_batch mocks (host units green+red; clean green; positive fail and dead negative control red; log capped; registry missing-example red)"
