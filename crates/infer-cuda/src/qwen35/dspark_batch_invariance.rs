@@ -313,7 +313,21 @@ pub(crate) fn run(config_path: Option<&std::path::Path>, negative: bool) -> Resu
     let cfg = dspark_cfg(&g);
     let (block, vocab, hidden) = (g.block, GATE_VOCAB, hidden_of(&g));
 
-    let ctx = DeviceContext::new()?;
+    let ctx = match DeviceContext::new() {
+        Ok(ctx) => ctx,
+        // No usable CUDA device is a SKIP (rc 0, no pass marker), not a gate
+        // failure: the registry batch schedules sm90 gates only on capable
+        // cards, and a mis-targeted run must not be reported as broken.
+        Err(e) => {
+            return Ok(GateReport {
+                lines: vec![format!(
+                    "SKIP: no CUDA device ({})",
+                    e.to_string().lines().next().unwrap_or("init failed")
+                )],
+                ok: true,
+            });
+        }
+    };
     let head = synth_dspark_head(&ctx, cfg, g.max_seq_len, g.max_seq_len)?;
     let embed_host: Vec<bf16> = (0..vocab * hidden)
         .map(|i| bf16::from_f32(((i % 17) as f32 - 8.0) * 0.01))
@@ -396,10 +410,17 @@ pub(crate) fn run(config_path: Option<&std::path::Path>, negative: bool) -> Resu
         ok &= expect_moved("neg swap-kvbase target@b0", &single, &kv, &mut lines);
     }
 
-    lines.push(if ok {
-        "ALL PASS".to_string()
+    // The runner (parity_gpu_batch.sh) keys the positive verdict on "ALL PASS"
+    // and the negative verdict on "NEGATIVE CONTROL OK"; print only the marker
+    // for the requested mode.
+    if ok {
+        lines.push(if negative {
+            "NEGATIVE CONTROL OK".to_string()
+        } else {
+            "ALL PASS".to_string()
+        });
     } else {
-        "FAIL".to_string()
-    });
+        lines.push("FAIL".to_string());
+    }
     Ok(GateReport { lines, ok })
 }

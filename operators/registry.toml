@@ -712,8 +712,8 @@ kind = "kernel"
 inputs = ["draft_q", "ctx_k_ring", "ctx_v_ring", "ring_base", "kv_len"]
 outputs = ["draft_attn_out"]
 reference = "cuda.qwen35.dspark_draft_ring_attention"
-correctness_gate = "crates/infer-cuda/examples/dspark_draft_attn_parity.rs"
-gate_scope = "production"
+correctness_gate = "crates/infer-cuda/examples/dspark_draft_attn_parity.rs;crates/infer-cuda/examples/dspark_drafter_batch_invariance.rs"
+gate_gap = "dspark_draft_attn_parity gates the single-vs-batched attention kernel itself at the served geometry 40q/8kv hd128 block 7 against an f64 ring-window oracle; dspark_drafter_batch_invariance adds whole-drafter-step batch invariance (all draft layers, per-slot KV rings/positions/window tables, batched GEMM rows=8*block, greedy sampler): one target sequence run alone vs in an 8-live-slot batch at slot 0 and 3, plus pos-swap and kv-base-swap negative controls. Not covered: synthetic RNG weights (no checkpoint/trunk), GATE_VOCAB=2048 instead of the served width, TP=1 only; pending the first GPU run"
 
 [[implementation]]
 id = "cuda.qwen35.dspark_draft_ring_attention"

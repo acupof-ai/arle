@@ -1,4 +1,9 @@
-//! DSpark whole-drafter-step batch-invariance gate (dev-only).
+//! DSpark whole-drafter-step batch-invariance gate (dev-only; sm90/H20 target).
+//!
+//! The c=1 13% / c=8 0% DSpark acceptance collapse is an sm90 H20 symptom, so
+//! the batch runner builds/runs this with the sm90 gate set. The batched ring
+//! kernel itself is generic bf16, but the production drafter path it models is
+//! the sm90 one.
 //!
 //! Runs the SAME target sequence through the real DSpark drafter once alone
 //! (`dspark_draft_block`, GEMM rows = block) and once in an 8-slot batch
