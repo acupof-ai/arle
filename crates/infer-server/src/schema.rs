@@ -636,6 +636,7 @@ impl CompletionResponse {
         token_ids: Option<Vec<u32>>,
         prompt_token_ids: Option<Vec<u32>>,
         logprobs_value: Option<serde_json::Value>,
+        cached_prompt_tokens: Option<usize>,
     ) -> Self {
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -650,7 +651,7 @@ impl CompletionResponse {
                 token_ids,
                 prompt_token_ids,
             }],
-            usage: Usage::new(prompt_tokens, completion_tokens),
+            usage: Usage::with_cached(prompt_tokens, completion_tokens, cached_prompt_tokens),
             system_fingerprint: SYSTEM_FINGERPRINT,
         }
     }
@@ -1016,6 +1017,7 @@ impl ChatCompletionResponse {
         enable_thinking: bool,
         tool_calls: Vec<ResponseToolCall>,
         logprobs_value: Option<serde_json::Value>,
+        cached_prompt_tokens: Option<usize>,
     ) -> Self {
         let (reasoning_content, content) = split_reasoning(&content, enable_thinking);
         // OpenAI semantics: any emitted tool call overrides the finish reason.
@@ -1025,9 +1027,14 @@ impl ChatCompletionResponse {
             "tool_calls".to_string()
         };
         let usage = if enable_thinking {
-            Usage::with_reasoning(prompt_tokens, completion_tokens, reasoning_tokens)
+            Usage::with_reasoning_cached(
+                prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+                cached_prompt_tokens,
+            )
         } else {
-            Usage::new(prompt_tokens, completion_tokens)
+            Usage::with_cached(prompt_tokens, completion_tokens, cached_prompt_tokens)
         };
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -1196,8 +1203,9 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
-    /// Breakdown of prompt tokens. `cached_tokens` counts tokens served from
-    /// the prefix cache (always 0 until the engine reports cache hits).
+    /// Breakdown of prompt tokens. Present only when the deployment measured
+    /// cache reuse; `cached_tokens` is this request's prompt tokens served from
+    /// the prefix cache (0 = measured, no reuse; `None` = unreported).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     /// Breakdown of completion tokens. `reasoning_tokens` counts tokens spent
@@ -1218,31 +1226,42 @@ pub(crate) struct CompletionTokensDetails {
 
 impl Usage {
     pub(crate) fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
-        Self {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            // The engine does not yet report prefix-cache hits to the API layer,
-            // so `cached_tokens` is always 0. The field is present to match
-            // OpenAI's wire shape.
-            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
-            completion_tokens_details: None,
-        }
+        Self::with_cached(prompt_tokens, completion_tokens, None)
     }
 
-    /// Build a usage block with the reasoning-token breakdown populated. Used
-    /// by the chat path when thinking is enabled so `reasoning_tokens` reflects
-    /// the split-out thinking length.
-    pub(crate) fn with_reasoning(
+    /// Build a usage block carrying the per-request prefix-cache reuse count.
+    /// `cached_prompt_tokens` is `None` when the deployment did not measure it;
+    /// then the prompt breakdown is omitted rather than emitted as zero.
+    pub(crate) fn with_cached(
         prompt_tokens: usize,
         completion_tokens: usize,
-        reasoning_tokens: usize,
+        cached_prompt_tokens: Option<usize>,
     ) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
-            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+            prompt_tokens_details: cached_prompt_tokens
+                .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
+            completion_tokens_details: None,
+        }
+    }
+
+    /// Build a usage block with the reasoning-token split and the
+    /// per-request prefix-cache reuse count; `None` omits the prompt
+    /// breakdown (unreported), `Some(0)` reports a measured no-reuse.
+    pub(crate) fn with_reasoning_cached(
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        reasoning_tokens: usize,
+        cached_prompt_tokens: Option<usize>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: cached_prompt_tokens
+                .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
             completion_tokens_details: Some(CompletionTokensDetails { reasoning_tokens }),
         }
     }
@@ -1347,7 +1366,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatCompletionRequest;
+    use super::{ChatCompletionRequest, Usage};
 
     fn chat(penalties: &str) -> ChatCompletionRequest {
         serde_json::from_str(&format!(
@@ -1427,5 +1446,34 @@ mod tests {
         let (r, c) = super::split_reasoning("<think>r</think>a", false);
         assert_eq!(r.as_deref(), Some("r"));
         assert_eq!(c, "a");
+    }
+
+    #[test]
+    fn cached_tokens_present_with_exact_reuse_and_bounded_by_prompt() {
+        // Known reuse: cached equals the per-request restore count exactly and
+        // never exceeds prompt tokens.
+        let json = serde_json::to_value(Usage::with_cached(100, 20, Some(40))).unwrap();
+        assert_eq!(json["prompt_tokens_details"]["cached_tokens"], 40);
+        assert_eq!(json["prompt_tokens"], 100);
+    }
+
+    #[test]
+    fn zero_reuse_emits_zero_not_absent() {
+        // Measured with no reuse: breakdown present and reads 0, a measurement.
+        let json = serde_json::to_value(Usage::with_cached(50, 5, Some(0))).unwrap();
+        assert_eq!(json["prompt_tokens_details"]["cached_tokens"], 0);
+    }
+
+    #[test]
+    fn unreported_cache_omits_the_breakdown_entirely() {
+        // None = unreported; the breakdown must be absent, not a confident 0.
+        let json = serde_json::to_value(Usage::with_cached(50, 5, None)).unwrap();
+        assert!(
+            !json
+                .as_object()
+                .unwrap()
+                .contains_key("prompt_tokens_details"),
+            "unreported cached_tokens must be omitted, got {json}"
+        );
     }
 }

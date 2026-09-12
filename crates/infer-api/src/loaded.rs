@@ -1434,17 +1434,19 @@ mod cuda {
                     .borrow_mut()
                     .remove(&handle)
                     .unwrap_or_default();
-                let (finish, finish_reason, error) = match self.engine.completed(handle) {
-                    Some(completed) => (true, completed.finish.clone(), None),
+                let completion_state = match self.engine.completed(handle) {
+                    Some(completed) => (true, completed.finish.clone(), None, Some(completed)),
                     None if engine_idle => (
                         true,
                         None,
                         Some(format!(
                             "request dropped by engine without completing (handle={handle:?})"
                         )),
+                        None,
                     ),
-                    None => (false, None, None),
+                    None => (false, None, None, None),
                 };
+                let (finish, finish_reason, error, completed_req) = completion_state;
                 if new_tokens.is_empty() && !finish {
                     continue; // nothing new to report this tick
                 }
@@ -1472,6 +1474,7 @@ mod cuda {
                         top_logprobs,
                         finish,
                         finish_reason,
+                        cached_prompt_tokens: completed_req.and_then(|c| c.cached_prompt_tokens),
                         error,
                     },
                 ));
