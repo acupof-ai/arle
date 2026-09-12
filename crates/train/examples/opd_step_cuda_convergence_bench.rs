@@ -448,10 +448,10 @@ mod app {
         let mut keep = HashSet::new();
         for param_id in teacher_params.iter().chain(student_params) {
             keep.insert(*param_id);
-            if let Some(tensor) = store.get(*param_id) {
-                if let Some(grad_id) = tensor.grad {
-                    keep.insert(grad_id);
-                }
+            if let Some(tensor) = store.get(*param_id)
+                && let Some(grad_id) = tensor.grad
+            {
+                keep.insert(grad_id);
             }
         }
         store.retain_ids(&keep);

@@ -37,7 +37,9 @@ mod app {
     }
 
     pub fn main() -> Result<()> {
-        let args = parse_args()?;
+        let Some(args) = parse_args()? else {
+            return Ok(());
+        };
         println!(
             "qwen36_fp8_lora_load_gate_start model={} device={} rank={} alpha={:.6} target_set={}",
             args.model.display(),
@@ -143,7 +145,7 @@ mod app {
         Ok(())
     }
 
-    fn parse_args() -> Result<Args> {
+    fn parse_args() -> Result<Option<Args>> {
         let mut model = env::var_os("ARLE_QWEN36_FP8_MODEL")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
@@ -216,7 +218,7 @@ mod app {
                          [--rollout-smoke-prompt TEXT] [--rollout-smoke-tokens N] \
                          [--expect-substring TEXT]"
                     );
-                    std::process::exit(0);
+                    return Ok(None);
                 }
                 other => bail!("unknown argument {other:?}"),
             }
@@ -231,7 +233,7 @@ mod app {
         if rollout_smoke_prompt.is_some() && !sync_infer {
             bail!("--rollout-smoke-prompt requires --sync-infer");
         }
-        Ok(Args {
+        Ok(Some(Args {
             model,
             device,
             lora: LoraConfig { rank, alpha },
@@ -242,7 +244,7 @@ mod app {
             rollout_smoke_prompt,
             rollout_smoke_tokens,
             expect_substring,
-        })
+        }))
     }
 
     fn next_arg(flag: &'static str, args: &mut impl Iterator<Item = String>) -> Result<String> {
