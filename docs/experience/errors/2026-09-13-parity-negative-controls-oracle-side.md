@@ -95,16 +95,72 @@ job — corrupt a device input that the compared output causally depends on,
 rebuild the reference from the corrupted input, and require the comparison
 to fail. Two teeth, two jobs.
 
-Pilot is paged_quant_attn: its diagnosed fix is exactly the missing device
-tooth (flip a real int8 K/V byte or per-row scale on a row the
-`num_splits=1` comparator reads), and the pilot reports diff size and
-gate-specific vs shared cost before the remaining gates are scoped. The
-drafter and flashmla hca/sparse fixes already diagnosed follow: strengthen
-the drafter kv-base perturbation (floor fixed at 2e-2), and de-dominate the
-attention fixture so the index→output chain is tested while keeping the
-dominant-key case as an additional positive. Every device tooth is shown
-red with the corruption in place and green with it removed; red must be
-demonstrably caused by the kernel seeing bad data, not by the edit itself.
+paged_quant_attn is the pilot (result and cost below). The drafter and
+flashmla hca/sparse fixes already diagnosed follow: strengthen the drafter
+kv-base perturbation (floor fixed at 2e-2), and de-dominate the attention
+fixture so the index→output chain is tested while keeping the dominant-key
+case as an additional positive. Every device tooth is shown red with the
+corruption in place and green with it removed; red must be demonstrably
+caused by the kernel seeing bad data, not by the edit itself.
+
+## Second defect: a detection bit consumed as a comparator-green bit
+
+The pilot surfaced a second, independent defect in the same gate. The
+negative aggregator's per-family bit `t.ok` means "the comparator is green
+for this family", and the negative assertion is `ensure!(!t.ok, …)` — a
+targeted negative family is expected to be RED. But `run_case` returned the
+tooth's *detection* bit: `true` when the corrupted row actually failed the
+band (`corrupted_row_fails() == true`), and the line was printed as `PASS`.
+A correctly firing tooth therefore returned green into a slot the
+aggregator requires red, and the gate bailed with "negative control did NOT
+fail the … comparator". That was paged's P1 negative failure. The fix
+hard-asserts each tooth and returns the comparator's actual verdict (red for
+a targeted family).
+
+The two defects are independent and either one alone fails the arm:
+
+- the oracle-only tooth could never catch a wrong kernel;
+- even after a real device tooth was added, the inverted bool contract
+  still made the gate report that firing tooth as dead.
+
+Fixing the tooth without fixing the polarity leaves the gate red. A read of
+the other three positive-green / negative-rc=1 gates found the same *class*
+but not the same code: drafter (`ok &= expect_moved`), flashmla hca and
+flashmla sparse (`ensure!(neg_out …)` / `ensure!(!neg_pack …)`) all assert
+in the correct direction, so their negative failures are weak or missing
+perturbations, not an inverted return. The polarity check is per-gate
+(direction of the returned bool against the direction of the assertion),
+not a grep.
+
+## Pilot result
+
+paged_quant_attn on a claimed sm90 card, head `b0f8e026f`: positive
+`ALL PASS`; `--negative-control=int8`, `=fp8`, and the bare flag all print
+`NEGATIVE CONTROL OK`. The device tooth hard-asserts two halves with
+distinct messages: kernel output MATCHES an oracle rebuilt from the
+sabotaged bytes (proving the kernel consumed the buffer; rel_l2
+2.3e-4..3.9e-3), and FAILS the clean oracle on the corrupted row (row-0
+violation fraction 0.996..1.00). Coverage statement kept verbatim:
+"perturbs the int8/fp8 V pool bytes (row 0, kv head 0, all D, every
+attended token, pinned to dtype max). K pool and the per-token scales are
+not covered by the device tooth; splits1 and split-merge each carry their
+own pair."
+
+Cost: +192/-63 across four files; +28/-13 of it is the reusable
+`Tooth {Clean, ExpectShift, DeviceCorrupt}` enum in `attn_common.rs`, the
+rest gate-specific sabotage and rebuilt-oracle code. Incremental build
+5m06s, cold ~10-15 min, all four runs 7 s. Per-gate marginal for the
+remaining gates is ~100-170 lines plus one GPU iteration, and the
+gate-specific bulk (which buffer, which byte, rebuilt oracle) does not
+amortize — schedule by kernel-input-type bucket, do not convert all gates
+in one pass.
+
+Three pod harness losses the next conversion will hit: unpinned
+`pick-gpu.sh` can offer a foreign card (pin `ARLE_GPU`); a direct
+`cargo build` needs `INFER_TILELANG_PYTHON=/root/arle-ops/tilelang-venv`
+or the AOT regen fails on the pod's newer tilelang; `pod.sh sync` wipes
+untracked files including a `runs/` log directory the runner redirects
+into (mkdir inside the runner).
 
 ## Rule
 
@@ -115,4 +171,8 @@ an input the kernel reads, and that tooth's red must be shown to come from
 the kernel's output. The batch marker cannot encode the distinction — the
 gate code must, and a gate audit classifies the negative branch by where
 its edit lands (device input / host reference / post-dtoh result), never by
-the marker text.
+the marker text. A returned verdict bit must carry the polarity the
+aggregator asserts on: when the negative arm requires a comparator to be
+red, return the comparator's green/red verdict, not a "the tooth detected
+the fault" bit. Check direction at each gate — the two bools have the same
+type and opposite meaning, so the type system cannot catch the swap.
