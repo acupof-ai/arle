@@ -77,7 +77,7 @@ mod real {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    use crate::attn_common::{Rng, Tol, bf, compare_rows, metrics_pass};
+    use crate::attn_common::{Rng, Tol, Tooth, bf, compare_rows, metrics_pass};
 
     // FP16 half2 dots over 256 bf16 dims leave scattered outlier columns;
     // floor covers single-column roundoff, slope tracks magnitude. Both
@@ -454,7 +454,7 @@ mod real {
             geo.q_heads * geo.head_dim,
             &row_ids,
             &TOL,
-            false,
+            Tooth::Clean,
         );
         let pass = metrics_pass(&m, &TOL);
         println!(
