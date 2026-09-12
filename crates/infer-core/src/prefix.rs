@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use infer_seam::{BackendExecutor, KvTierLocation, PrefixBlock};
+use infer_seam::{BackendExecutor, PrefixBlock};
 
 use crate::radix::{BlockId, PrefixMatch};
 use crate::{Engine, RequestPhase, RequestState};
@@ -879,23 +879,9 @@ impl Engine {
         // removes entries from the tier store, so a post-promote query
         // would lose the disk/host attribution).
         for block in blocks {
-            match *block {
-                PrefixBlock::ResidentPage(_) => {
-                    self.kv_system_metrics.reuse_hit_resident =
-                        self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
-                }
-                PrefixBlock::DemotedKey(key) => match tier.kv_tier_location(key) {
-                    Some(KvTierLocation::HostDemoted) | None => {
-                        self.kv_system_metrics.reuse_hit_host_demoted = self
-                            .kv_system_metrics
-                            .reuse_hit_host_demoted
-                            .saturating_add(1);
-                    }
-                    Some(KvTierLocation::Disk) => {
-                        self.kv_system_metrics.reuse_hit_disk =
-                            self.kv_system_metrics.reuse_hit_disk.saturating_add(1);
-                    }
-                },
+            if let PrefixBlock::ResidentPage(_) = *block {
+                self.kv_system_metrics.reuse_hit_resident =
+                    self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
             }
         }
 
@@ -1025,4 +1011,134 @@ fn leading_resident_pages(blocks: &[PrefixBlock]) -> Vec<BlockId> {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod reuse_hit_tests {
+    use super::*;
+    use crate::{Engine, SchedulerConfig};
+    use infer_seam::{BackendExecutor, HostPagedKvPool, KvPool, PollResult};
+
+    /// Page tier that reports a configured number of store reads without a real
+    /// tier store. The promote path fails (there are no radix tier nodes), which
+    /// is exactly the real-backend behavior when a read has no node to promote.
+    struct FakeTier {
+        capacity: usize,
+        host_hits: u64,
+        disk_hits: u64,
+    }
+    impl infer_seam::KvPageTier for FakeTier {
+        fn kv_tier_capacity_pages(&self) -> usize {
+            self.capacity
+        }
+        fn kv_tier_page_bytes(&self) -> usize {
+            64
+        }
+        fn kv_tier_host_demoted_pages(&self) -> usize {
+            0
+        }
+        fn kv_tier_disk_pages(&self) -> usize {
+            0
+        }
+        fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+            infer_seam::KvTierReadHits {
+                host_demoted: self.host_hits,
+                disk: self.disk_hits,
+            }
+        }
+        fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+            infer_seam::KvTierIoStats::default()
+        }
+        fn kv_tier_transfer_is_zero_copy(&self) -> bool {
+            true
+        }
+        fn kv_tier_location(&self, _key: u64) -> Option<infer_seam::KvTierLocation> {
+            Some(infer_seam::KvTierLocation::HostDemoted)
+        }
+        fn demote_prefix_pages(&mut self, _entries: &[(u32, u64)]) -> Result<usize> {
+            Ok(0)
+        }
+        fn promote_prefix_pages(&mut self, _entries: &[(u64, u32)]) -> Result<()> {
+            anyhow::bail!("fake tier has no radix node for promotion")
+        }
+        fn drop_kv_tier_entries(&mut self, _keys: &[u64]) {}
+    }
+
+    struct FakeTierExecutor {
+        tier: FakeTier,
+    }
+    impl BackendExecutor for FakeTierExecutor {
+        fn submit(
+            &mut self,
+            _plan: &infer_plan::ForwardPlan,
+            _batch: &infer_seam::KvBatchDescriptor,
+        ) -> Result<Box<dyn std::any::Any + Send>> {
+            Ok(Box::new(()))
+        }
+        fn poll(&mut self, _inflight: Box<dyn std::any::Any + Send>) -> Result<PollResult> {
+            unreachable!()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn kv_page_tier(&mut self) -> Option<&mut dyn infer_seam::KvPageTier> {
+            Some(&mut self.tier)
+        }
+        fn kv_page_tier_view(&self) -> Option<&dyn infer_seam::KvPageTier> {
+            Some(&self.tier)
+        }
+    }
+
+    fn engine_with_tier(tier: FakeTier) -> Engine {
+        let kv: Box<dyn KvPool> = Box::new(HostPagedKvPool::new(4, 64, 16));
+        Engine::with_config(
+            Box::new(FakeTierExecutor { tier }),
+            kv,
+            SchedulerConfig::for_slots(4),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn zero_capacity_store_reads_surface_once_and_stay_stable() {
+        // CUDA shape: page-tier capacity pinned to 0, yet the slot store still
+        // reports host/disk reads through the read-only view. The metric must
+        // equal the store count and not move on repeated polls (the old fold
+        // re-added a copy each poll).
+        let engine = engine_with_tier(FakeTier {
+            capacity: 0,
+            host_hits: 3,
+            disk_hits: 2,
+        });
+        for _ in 0..2 {
+            let m = engine.kv_system_metrics();
+            assert_eq!(m.reuse_hit_host_demoted, 3);
+            assert_eq!(m.reuse_hit_disk, 2);
+        }
+    }
+
+    #[test]
+    fn promoted_block_counted_once_from_store_reads() {
+        // Capacity-bearing (Metal) shape: one demoted block the store counts as
+        // a host read. The old fold also added the engine's per-block decision,
+        // so one reuse read ~2x; the metric now comes from the store alone.
+        let mut engine = engine_with_tier(FakeTier {
+            capacity: 16,
+            host_hits: 1,
+            disk_hits: 0,
+        });
+        let blocks = vec![PrefixBlock::DemotedKey(7)];
+        engine.materialize_prefix_blocks(&blocks);
+        assert_eq!(engine.kv_system_metrics().reuse_hit_host_demoted, 1);
+
+        // Same single source for a disk read.
+        let mut engine = engine_with_tier(FakeTier {
+            capacity: 16,
+            host_hits: 0,
+            disk_hits: 4,
+        });
+        let blocks = vec![PrefixBlock::DemotedKey(7)];
+        engine.materialize_prefix_blocks(&blocks);
+        assert_eq!(engine.kv_system_metrics().reuse_hit_disk, 4);
+    }
 }
