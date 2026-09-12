@@ -224,6 +224,10 @@ inputs = ["activation", "fp4_marlin_weight", "group_scales", "global_scale"]
 outputs = ["projection"]
 reference = "cuda.fp4.marlin_tensorcore"
 correctness_gate = "crates/infer-cuda/examples/marlin_fp4_correctness.rs; scripts/kernel_ab_fp4.sh"
+# The A/B script is operator-run, not batch-derived: it benchmarks an FP4
+# implementation against a labelled build and is invoked by hand after a
+# marlin/fp4 change (scripts/README.md documents the argument contract).
+gate_invoke = "manual: operator-run FP4 perf/correctness A/B against a labelled build, scripts/kernel_ab_fp4.sh <build-label>"
 gate_scope = "production"
 
 [[implementation]]
@@ -462,6 +466,10 @@ inputs = ["logits", "draft_tokens", "uniforms"]
 outputs = ["token_ids", "accepted_len"]
 reference = "cuda.qwen.argmax"
 correctness_gate = "scripts/sampling_gate.py;crates/infer-cuda/examples/argmax_parity.rs;crates/infer-cuda/examples/dspark_sampler_parity.rs"
+# Live-serve-only HTTP gate: an operator points it at a running serve after a
+# sampler/serving change. The two parity examples are batch-derived and cover
+# the kernel math; this covers the HTTP sampling-parameter surface.
+gate_invoke = "manual: operator-run against a live serve, scripts/sampling_gate.py <port>"
 gate_gap = "filter/draft-sample prob vectors covered vs f64 reference at production Qwen 151936 and DSv4 129280 (representative cases, full-vocab softmax + top-k/top-p/min-p + degenerate row, B=1/8 small sweep); chain_accept covered depth 1..4 at vocab 32 plus one rejection at 151936 (multi-pass residual reduction); exact sampled token ids are only asserted at vocab<=256 — above SAMPLE_BLOCK the kernel CDF walk is a thread-strided permutation, so large-vocab draws assert positive reference/positive residual mass, not the id; sampling_gate.py remains live-serve HTTP only"
 
 [[implementation]]

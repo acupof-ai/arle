@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """HTTP numerical gate for long-context Phase 1 S3.
 
+# gate_invoke: manual: operator-run cross-server trajectory comparison,
+# longctx_numerical_gate.py --left-url <arle> --right-url <sglang> after both
+# serves are up (docs/plans long-context S3); single mode is the smoke form.
+
 The script intentionally does not launch servers. Start the ARLE/SGLang
 targets with the desired KV dtype first, then compare their greedy completion
 trajectories through the OpenAI-compatible /v1/completions API.
+
+Exit codes:
+  0  status pass/degraded as allowed by --fail-on
+  1  every completion was fetched but the verdict is stop/degraded (a real
+     trajectory divergence — the defect this gate exists for)
+  2  request or transcript error on any case (dead serve, refused, timeout,
+     HTTP error, missing choices, unusable token-id payload). Such a case has
+     no trajectory to judge, so it never counts as a numerical regression.
 """
 
 from __future__ import annotations
@@ -495,6 +507,10 @@ def main() -> int:
         )
     timeout = httpx.Timeout(args.timeout, connect=30.0)
     cases: list[CaseResult] = []
+    # Request/transcript failures are distinct from verdict failures: a case
+    # whose completion could not be fetched or parsed has no trajectory, so it
+    # must exit 2 instead of being counted as a numerical regression.
+    infra_errors = 0
 
     with httpx.Client(timeout=timeout) as client:
         for idx, prompt in enumerate(prompts):
@@ -603,6 +619,7 @@ def main() -> int:
                         )
                     )
             except Exception as exc:  # noqa: BLE001 - report all remote failures in JSON.
+                infra_errors += 1
                 cases.append(
                     CaseResult(
                         index=idx,
@@ -703,6 +720,12 @@ def main() -> int:
     print(f"wrote {out_dir / 'summary.json'}")
     print(f"wrote {out_dir / 'summary.md'}")
 
+    if infra_errors:
+        print(
+            f"gate: ERROR {infra_errors}/{len(cases)} case(s) had a request or transcript "
+            f"error; recorded under cases[].error, no trajectory was judged"
+        )
+        return 2
     if status == "stop":
         return 1
     if status == "degraded" and args.fail_on == "degraded":
