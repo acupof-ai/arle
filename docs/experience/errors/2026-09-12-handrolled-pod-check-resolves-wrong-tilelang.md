@@ -23,7 +23,8 @@ got no `INFER_TILELANG_PYTHON`. The pod's default `python3` has TileLang
 then rejected 0.1.14 and aborted.
 
 The canonical pair avoids this by construction: `scripts/pod-remote-build.sh:4`
-sets `TREE="${POD_TREE:-/host/arle-build}"` and `:344` sources
+sets `TREE` from `POD_TREE` (defaulting to the standard build tree) and
+`:344` sources
 `"$TREE/scripts/pod-build-env.sh"`, whose resolver walks a candidate
 interpreter list and accepts one only when its TileLang version equals the
 tree's pin. Bypassing it silently swaps the codegen version.
