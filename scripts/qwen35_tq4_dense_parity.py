@@ -33,13 +33,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--source-model",
-        default="/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B",
+        required=True,
         type=Path,
+        help="Complete Qwen3.5-9B ModelScope checkpoint directory (no machine-local default).",
     )
     parser.add_argument(
         "--tq-model",
-        default="/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4",
+        required=True,
         type=Path,
+        help="TQ4-quantized Qwen3.5-9B checkpoint directory (no machine-local default).",
     )
     parser.add_argument("--token-id", default=9419, type=int)
     parser.add_argument("--output-dir", required=True, type=Path)

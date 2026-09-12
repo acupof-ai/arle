@@ -60,8 +60,6 @@ mod app {
         trainer::extend_keep_with_params_and_grads,
     };
 
-    const DEFAULT_QWEN35_08B_DIR: &str =
-        "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base";
     const DEFAULT_STEPS: usize = 1;
     const DEFAULT_ROLLOUT_LEN: usize = 8;
     const DEFAULT_LR: f32 = 1.0e-5;
@@ -314,8 +312,8 @@ mod app {
 
     #[allow(clippy::exit)]
     fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
-        let mut teacher_model = PathBuf::from(DEFAULT_QWEN35_08B_DIR);
-        let mut student_model = PathBuf::from(DEFAULT_QWEN35_08B_DIR);
+        let mut teacher_model = None::<PathBuf>;
+        let mut student_model = None::<PathBuf>;
         let mut teacher_api_url = None;
         let mut teacher_api_key_env = None;
         let mut teacher_api_dtype = "bf16".to_owned();
@@ -341,8 +339,12 @@ mod app {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--teacher-model" => teacher_model = PathBuf::from(next_arg(&mut args, &arg)?),
-                "--student-model" => student_model = PathBuf::from(next_arg(&mut args, &arg)?),
+                "--teacher-model" => {
+                    teacher_model = Some(PathBuf::from(next_arg(&mut args, &arg)?))
+                }
+                "--student-model" => {
+                    student_model = Some(PathBuf::from(next_arg(&mut args, &arg)?))
+                }
                 "--teacher-api-url" => teacher_api_url = Some(next_arg(&mut args, &arg)?),
                 "--teacher-api-key-env" => teacher_api_key_env = Some(next_arg(&mut args, &arg)?),
                 "--teacher-api-dtype" => teacher_api_dtype = next_arg(&mut args, &arg)?,
@@ -417,6 +419,19 @@ mod app {
             eval_steps.sort_unstable();
             eval_steps.dedup();
         }
+        // No machine-local model-dir default: require an explicit flag or
+        // env, and fail loud naming the variable. Student defaults to teacher.
+        let env_model = std::env::var_os("ARLE_PARITY_QWEN35_DENSE_DIR")
+            .or_else(|| std::env::var_os("ARLE_OPD_TEACHER_DIR"))
+            .map(PathBuf::from);
+        let teacher_model = teacher_model
+            .or(env_model.clone())
+            .ok_or(
+                "no teacher model dir: pass --teacher-model or set ARLE_PARITY_QWEN35_DENSE_DIR (legacy ARLE_OPD_TEACHER_DIR)",
+            )?;
+        let student_model = student_model
+            .or(env_model)
+            .unwrap_or_else(|| teacher_model.clone());
         Ok(Args {
             teacher_model,
             student_model,

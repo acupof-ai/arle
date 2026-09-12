@@ -33,7 +33,6 @@ pub mod app {
         trainer::extend_keep_with_params_and_grads,
     };
 
-    const DEFAULT_MODEL_DIR: &str = "/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B";
     const DEFAULT_TRAIN_STEPS: usize = 500;
     const DEFAULT_ROLLOUT_LEN: usize = 8;
     const DEFAULT_PROMPT_MAX_TOKENS: usize = 16;
@@ -528,13 +527,19 @@ pub mod app {
     }
 
     fn resolve_model_dirs(args: &TrainingArgs) -> AnyResult<ModelDirs> {
+        // Operator-run tooling: teacher/student dirs come from CLI args or the
+        // environment, never a machine-local default. Fail loud naming the vars.
         let legacy_dir = env::var_os("ARLE_OPD_REALCKPT_DIR").map(PathBuf::from);
-        let teacher = args
+        let Some(teacher) = args
             .teacher_model
             .clone()
             .or_else(|| env::var_os("ARLE_OPD_TEACHER_DIR").map(PathBuf::from))
             .or_else(|| legacy_dir.clone())
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
+        else {
+            return Err(
+                "no teacher model dir: pass --teacher-model or set ARLE_OPD_TEACHER_DIR (legacy ARLE_OPD_REALCKPT_DIR)".into(),
+            );
+        };
         let student = args
             .student_model
             .clone()

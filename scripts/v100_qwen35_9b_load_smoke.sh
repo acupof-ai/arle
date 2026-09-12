@@ -21,9 +21,10 @@ SERVER_LOG="${SERVER_LOG:-/tmp/arle_v100_qwen35_9b_load_smoke.log}"
 SMOKE_PROMPT="${SMOKE_PROMPT:-Hello}"
 SMOKE_MAX_TOKENS="${SMOKE_MAX_TOKENS:-4}"
 
-MODEL_PATH="${MODEL_PATH:-/home/chenkailun.c/.cache/modelscope/hub/models/Qwen/Qwen3.5-9B}"
-if [[ ! -d "$MODEL_PATH" && -d /home/chenkailun.c/.cache/modelscope/hub/models/Qwen/Qwen3___5-9B ]]; then
-    MODEL_PATH="/home/chenkailun.c/.cache/modelscope/hub/models/Qwen/Qwen3___5-9B"
+# Required, no machine-local default: operator-run smoke that loads a real model.
+if [[ -z "${MODEL_PATH:-}" ]]; then
+    echo "MODEL_PATH is unset; set it to a complete Qwen3.5-9B ModelScope checkpoint directory" >&2
+    exit 2
 fi
 
 if [[ -d /usr/local/cuda-12.4 ]]; then
