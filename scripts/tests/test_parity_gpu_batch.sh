@@ -68,7 +68,7 @@ grep -q 'pass=1 fail=0 skip=1' "$TMP/ok.log" \
 grep -q 'NEVER EXECUTED on this device' "$TMP/ok.log" \
     || { echo "FAIL: clean run with a skip missing the NEVER-EXECUTED stdout line" >&2
          cat "$TMP/ok.log" >&2; exit 1; }
-grep -qE '^- gate_d\(needs multi-rank model launcher' "$OUT1/results.md" \
+grep -qE '^- gate_d\(set INFER_DSV4_MODEL_PATH' "$OUT1/results.md" \
     || { echo "FAIL: results.md never-executed section missing model gate" >&2
          cat "$OUT1/results.md" >&2; exit 1; }
 grep -q '## Never executed on this device' "$OUT1/results.md" \
@@ -78,6 +78,55 @@ grep -q '| gate_a | yes | required |' "$OUT1/results.md" \
     || { echo "FAIL: markdown table missing gate_a" >&2; exit 1; }
 grep -q 'mock-kernel-1' "$OUT1/kernel-build-id.txt" \
     || { echo "FAIL: kernel build id not recorded" >&2; exit 1; }
+
+# ── Model gate with INFER_DSV4_MODEL_PATH: the multi-rank launcher is invoked.
+# The shell-test seam (ARLE_PARITY_TEST_NO_CLAIM) skips GPU claims and runs the
+# real dsv4_multigpu_parity.sh, so its first-token verdict is exercised.
+DSV4_LAUNCH="$ROOT/scripts/dsv4_multigpu_parity.sh"
+run_model_batch() {  # $1 gate list, $2 out dir
+    INFER_DSV4_MODEL_PATH="$TMP/fake-model" \
+    ARLE_PARITY_DSV4_WORLD=2 \
+    ARLE_PARITY_TEST_NO_CLAIM=1 \
+    ARLE_PARITY_BIN_DIR="$BIN" \
+    ARLE_PARITY_GATE_LIST="$1" \
+    ARLE_PARITY_GPU=7 \
+    ARLE_PARITY_SKIP_PREREG=1 \
+    bash "$ROOT/scripts/parity_gpu_batch.sh" "$2"
+}
+# Mock binary: print the right first token; the launcher prints ALL PASS.
+cat > "$BIN/dsv4_parity" <<'SH'
+#!/usr/bin/env bash
+echo "clean_tokens=[11111, 603, 671, 6102, 294, 8760, 344]"
+SH
+chmod +x "$BIN/dsv4_parity"
+# Launcher must exist in the repo tree the test runs against.
+[ -x "$DSV4_LAUNCH" ] || { echo "FAIL: $DSV4_LAUNCH not executable" >&2; exit 1; }
+OUT_MR="$TMP/out-model-run"
+if run_model_batch "dsv4_parity:model" "$OUT_MR" >"$TMP/model-run.log" 2>&1; then :; else
+    echo "FAIL: model gate with valid oracle exited non-zero" >&2
+    cat "$TMP/model-run.log" >&2; exit 1
+fi
+grep -qE $'^dsv4_parity\tno\tallowlisted\t0\tALL PASS\tn/a\tn/a\tPASS\t' "$OUT_MR/results.tsv" \
+    || { echo "FAIL: model gate not PASS with the correct oracle" >&2
+         cat "$OUT_MR/results.tsv" >&2; exit 1; }
+grep -q 'multi-rank on physical GPUs' "$TMP/model-run.log" \
+    || { echo "FAIL: model phase launch line missing" >&2; cat "$TMP/model-run.log" >&2; exit 1; }
+# Wrong first token: launcher FAIL and the batch exits non-zero.
+cat > "$BIN/dsv4_parity" <<'SH'
+#!/usr/bin/env bash
+echo "clean_tokens=[99999, 603]"
+SH
+chmod +x "$BIN/dsv4_parity"
+OUT_MF="$TMP/out-model-fail"
+if run_model_batch "dsv4_parity:model" "$OUT_MF" >"$TMP/model-fail.log" 2>&1; then
+    echo "FAIL: wrong-oracle model gate exited 0" >&2; cat "$TMP/model-fail.log" >&2; exit 1
+fi
+grep -qE $'^dsv4_parity\t.*\tFAIL\t' "$OUT_MF/results.tsv" \
+    || { echo "FAIL: wrong-oracle model gate not recorded FAIL" >&2
+         cat "$OUT_MF/results.tsv" >&2; exit 1; }
+grep -q 'FAIL: rank0 first token 99999 != 11111' "$OUT_MF/logs/dsv4_parity.positive.log" \
+    || { echo "FAIL: launcher verdict line missing" >&2
+         cat "$OUT_MF/logs/dsv4_parity.positive.log" >&2; exit 1; }
 
 # ── Gate that rejects --negative-control and is NOT allowlisted: FAIL ──
 make_mock gate_noneg plain
