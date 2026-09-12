@@ -54,6 +54,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+
+      # Base package deps (httpx, tokenizers): the gate tests drive the real
+      # Python gate scripts against mock servers.
+      - name: Install Python dependencies
+        run: pip install -e .
+
       # Discovers scripts/tests/test_*.sh (no hand list), scoped to changes
       # that can affect them with the same relevance rule as the pre-push
       # hook; an unresolvable base runs them all.

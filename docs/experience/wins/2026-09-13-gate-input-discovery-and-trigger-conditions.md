@@ -19,9 +19,11 @@ the changes they guarded.
    markdown file the same day — ran inside `ci.yml`, whose trigger carries
    `paths-ignore: docs/**, **/*.md, memory/**`. A documentation-only pull
    request started no job in that workflow: no link check, no marker bans, no
-   experience-entry caps, no ledger checks. #424 (one added errors entry) ran
-   only GitGuardian; hygiene passed when run by hand, but nothing would have
-   reported a failure.
+   experience-entry caps, no ledger checks. One errors entry about enforcement
+   gaps was itself merged with zero workflow runs against it — the workflow
+   that now guards it did not exist on that branch yet. The same had happened
+   to the preceding errors entry (#424): it ran only GitGuardian; hygiene
+   passed when run by hand, but nothing would have reported a failure.
 
 The input-set audit that found the first gap missed the second because it
 audited what each gate reads, not under which event it runs. A correct input
@@ -46,7 +48,10 @@ Discovery alone is not enough; three safeguards close the adjacent holes:
   batch" regex lives once in the runner; the hook sources it and passes its
   push-range file list in via `SHELL_TEST_CHANGED_FILES`, CI derives the list
   from its PR/push base. An empty or unresolvable list runs everything —
-  only a list successfully computed with no relevant path may skip.
+  only a list successfully computed with no relevant path may skip. The CI
+  base fetch is `--depth=200`; a pull request more than 200 commits from base
+  fails to resolve and runs the whole batch, which is the safe direction —
+  a full-batch run on an enormous PR is correct behavior, not a bug.
 - **Count line and retained logs.** Every run ends with
   `N tests, M ran, K skipped, J failed`, so a growing skip set is visible.
   Each test's full output lands in a per-run directory under
@@ -77,6 +82,26 @@ fixed loopback ports (19400, 19941, 19931-34, 19951-52). Sessions sharing this
 box run the hook concurrently; overlapping binds collided and surfaced as test
 failures. All four now bind port 0 and read the assigned port back.
 
+Four EXIT traps self-killed on setup failure. Three tests trapped
+`kill "${SRV_PID:-0}"` and a fourth `kill "${SP:-0}"`; an unset pid becomes
+`kill 0`, signaling the test's own process group. On the widened CI run a
+missing Python module triggered it, and SIGTERM (143) masked the real
+`ModuleNotFoundError`. All four now guard on pid emptiness before signaling.
+`setsid` contains the blast radius; the guard keeps the test alive to report
+its actual error. The four sites were found with a wildcard over the variable
+name; a grep for the literal `SRV_PID` initially returned three and hid the
+`SP` site — a hand-narrowed check missing its own failure, the same class.
+
+The widened gate found a real gap on its first full Linux run. The old
+eight-test CI step never installed Python dependencies. Discovered test 20,
+`test_gate_infra_exit_codes.sh`, drives the real gate scripts and imports
+`tokenizers` (a base package dependency); with no `pip install` in the job it
+failed with `ModuleNotFoundError`. The old list never ran this test, so the
+missing install step was invisible. The Shell Contracts job now installs the
+base package (`pip install -e .`) rather than skipping the test — a test that
+skips on every CI run is coverage on paper only. This is the expected yield of
+widening a gate: a failure the narrower list structurally could not report.
+
 ## Rule
 
 Audit a gate on two axes: the set of inputs it reads, and the set of events
@@ -86,13 +111,8 @@ act; and when an unresolvable boundary (diff base, platform, dependency)
 threatens a skip, run the full set — fail toward coverage, never toward
 silence.
 
-Two findings left deliberately unfixed in this lane:
+One finding left deliberately unfixed in this lane:
 
-- Four test traps use `kill "${SRV_PID:-0}"`; an unset pid becomes `kill 0`,
-  signaling the whole process group. It only fires when setup fails early
-  (e.g. a missing Python dependency), which is exactly when it produces the
-  most confusing signal. The runner's `setsid` containment is the structural
-  mitigation; the traps should take a pid-or-noop form in a later lane.
 - Branch protection on `main` configures no required status checks. Every gate
   here passes or fails only because someone reads the check page; nothing
   enforces a green merge. A gate's existence is not a gate's authority.

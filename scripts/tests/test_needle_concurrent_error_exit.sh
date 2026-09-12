@@ -11,7 +11,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'kill "${SP:-0}" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+trap 'if [ -n "${SP:-}" ]; then kill "$SP" 2>/dev/null || true; wait "$SP" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 
 # good: echoes the per-row secret parsed from the prompt -> every row matches.
 cat > "$TMP/good.py" <<'PY'
