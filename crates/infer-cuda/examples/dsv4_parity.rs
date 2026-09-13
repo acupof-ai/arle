@@ -384,20 +384,39 @@ mod real {
             );
         }
         match bail_at {
-            None => eprintln!(
-                "[dsv4-parity rank={rank}] reached max_new={max_new} \
-                 ({} tokens) without an incremental-decode bail",
-                clean_tokens.len()
-            ),
-            Some((step, msg)) => eprintln!(
-                "[dsv4-parity rank={rank}] incremental decode bailed at decode \
-                 step {step} (token #{}): {msg}\n  → verified TODAY: prefill argmax \
-                 (token #1) on every layer type (SW/CSA/HCA recompute over [0,len)).\n  \
-                 → GATED: incremental start_pos>0 decode (CSA/HCA per-step KV reuse) — \
-                 the full {DEFAULT_MAX_NEW}-token oracle needs the continuous-batching \
-                 follow-up.",
-                clean_tokens.len() + 1
-            ),
+            None => {
+                eprintln!(
+                    "[dsv4-parity rank={rank}] reached max_new={max_new} \
+                     ({} tokens) without an incremental-decode bail",
+                    clean_tokens.len()
+                );
+                // Machine-readable scope for the multi-rank launcher's verdict
+                // line (lands in results.tsv). States what WAS checked.
+                if rank == 0 {
+                    println!(
+                        "gate_scope=first-token+{decode_steps}-incremental({} tokens total)",
+                        clean_tokens.len()
+                    );
+                }
+            }
+            Some((step, msg)) => {
+                eprintln!(
+                    "[dsv4-parity rank={rank}] incremental decode bailed at decode \
+                     step {step} (token #{}): {msg}\n  → verified TODAY: prefill argmax \
+                     (token #1) on every layer type (SW/CSA/HCA recompute over [0,len)).\n  \
+                     → GATED: incremental start_pos>0 decode (CSA/HCA per-step KV reuse) — \
+                     the full {DEFAULT_MAX_NEW}-token oracle needs the continuous-batching \
+                     follow-up.",
+                    clean_tokens.len() + 1
+                );
+                // Machine-readable scope for the launcher's verdict line: the
+                // incremental path bailed, so only the first prefill token was
+                // checked. Carries the bail step so results.tsv names the limit
+                // without anyone reading rank-0 stderr.
+                if rank == 0 {
+                    println!("gate_scope=first-token-only(incremental bail at step {step})");
+                }
+            }
         }
         Ok(())
     }
