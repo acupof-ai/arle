@@ -71,7 +71,7 @@ mod real {
     use anyhow::{Result, ensure};
     use cuda_kernels::attention;
     use cuda_kernels::prelude::DeviceContext;
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::bf16;
 
     const H_Q: usize = 64;
@@ -543,140 +543,257 @@ mod real {
             compressed_count,
         );
 
-        // indices: a REAL index-builder tooth, matching sparse/hca decode. Feed
-        // the CSA builder a corrupted selection (the last token's first
-        // compressed key points at a different valid key) and compare the
-        // indices the KERNEL produces — not a host-edited copy — against both
-        // the clean oracle (must differ) and the oracle rebuilt from the
-        // corrupted selection (must match: the kernel honoured the bad input).
+        // The index family needs two regimes. A swap between two visible weak
+        // compressed keys is the regime production runs, but its output delta
+        // washes out (compressed rows ±0.02, Q aligns to chunk keys which are
+        // not in the sparse index set). The observable regime adds a
+        // designated dominant compressed row aligned with the last token's Q:
+        // a real builder tooth that drops it must move output/lse/maxlogit.
+
+        // Dominant pool (corrupt run only): overwrite one compressed row
+        // visible to the last token with the last token's own Q direction,
+        // scaled to match Q — score ~7.6 vs background max ~0.4, so it wins
+        // the softmax outright (mirrors the decode gates' K=Q dominant row).
         let last = s_q - 1;
-        let mut bad_selected = selected.clone();
-        let sel_base = last * INDEX_TOPK;
-        // Pick a valid compressed key different from the current first choice
-        // and visible at the last token; corrupting an entry the builder would
-        // drop as out-of-range could leave the output unchanged.
-        let valid_last = compressed_count.min(INDEX_TOPK);
-        let first_choice = bad_selected[sel_base];
-        let replacement = (0..valid_last as i32)
-            .find(|&c| {
-                c != first_choice && c * ratio as i32 + (ratio as i32 - 1) <= start + last as i32
-            })
-            .expect("a second visible compressed key exists for the negative");
-        bad_selected[sel_base] = replacement;
-        let mut bad_idx_dev = ctx.stream.alloc_zeros::<i32>(s_q * TOPK)?;
-        let mut bad_topk_dev = ctx.stream.alloc_zeros::<i32>(s_q)?;
+        let last_abs = start + last as i32;
+        let dom_c = (0..compressed_count as i32)
+            .filter(|&c| c * ratio as i32 + (ratio as i32 - 1) <= last_abs)
+            .max()
+            .expect("a visible compressed key exists for the dominant tooth")
+            as usize;
+        let mut comp_dom = comp.clone();
+        for d in 0..D {
+            comp_dom[dom_c * D + d] = 20.0 * latent(last_abs, d, 1);
+        }
+        let pool_dom_f32 = reference_pool(&window, &chunk, &comp_dom, start, s_q, compressed_count);
+        let mut unified_dom = ctx.stream.alloc_zeros::<bf16>(kv_rows * D)?;
         {
-            let bad_sel_dev = ctx.stream.clone_htod(&bad_selected)?;
-            let (idx_ptr, _gi) = bad_idx_dev.device_ptr_mut(&ctx.stream);
-            let (topk_ptr, _gt) = bad_topk_dev.device_ptr_mut(&ctx.stream);
-            attention::flashmla_csa_build_indices_raw(
+            let comp_dom_dev = ctx.stream.clone_htod(&to_bf16(&comp_dom))?;
+            let (u_ptr, _g1) = unified_dom.device_ptr_mut(&ctx.stream);
+            let (w_ptr, _g2) = window_dev.device_ptr(&ctx.stream);
+            let (k_ptr, _g3) = chunk_dev.device_ptr(&ctx.stream);
+            let (c_ptr, _g4) = comp_dom_dev.device_ptr(&ctx.stream);
+            attention::flashmla_csa_pack_kv_raw(
                 &ctx.stream,
-                idx_ptr,
-                topk_ptr,
-                bad_sel_dev.device_ptr(&ctx.stream).0,
-                s_q as i32,
+                u_ptr,
+                w_ptr,
+                k_ptr,
+                c_ptr,
                 start,
                 SW as i32,
-                INDEX_TOPK as i32,
-                compressed_count as i32,
-                ratio as i32,
-            )?;
-        }
-        ctx.sync()?;
-        let bad_indices = ctx.stream.clone_dtoh(&bad_idx_dev)?;
-        let bad_ref = oracle_indices(case, &bad_selected, compressed_count);
-        // Differs from clean AND self-consistent with the corrupted oracle.
-        let neg_indices = bad_indices != ref_indices && bad_indices == bad_ref;
-
-        // output/LSE/maxlogit: run fwd again with the kernel-built bad indices.
-        let mut bad_out = ctx.stream.alloc_zeros::<bf16>(s_q * H_Q * D)?;
-        let mut bad_max = ctx.stream.alloc_zeros::<f32>(s_q * H_Q)?;
-        let mut bad_lse = ctx.stream.alloc_zeros::<f32>(s_q * H_Q)?;
-        {
-            let (q_ptr, _gq) = q_dev.device_ptr(&ctx.stream);
-            let (kv_ptr, _gk) = unified.device_ptr(&ctx.stream);
-            let (idx_ptr, _gi) = bad_idx_dev.device_ptr_mut(&ctx.stream);
-            let (sink_ptr, _gs) = sink_dev.device_ptr(&ctx.stream);
-            let (topk_ptr, _gt) = topk_dev.device_ptr(&ctx.stream);
-            let (out_ptr, _go) = bad_out.device_ptr_mut(&ctx.stream);
-            let (max_ptr, _gm) = bad_max.device_ptr_mut(&ctx.stream);
-            let (lse_ptr, _gl) = bad_lse.device_ptr_mut(&ctx.stream);
-            attention::flashmla_sm90_sparse_prefill_fwd_raw(
-                &ctx.stream,
-                q_ptr,
-                kv_ptr,
-                idx_ptr,
-                sink_ptr,
-                topk_ptr,
-                out_ptr,
-                max_ptr,
-                lse_ptr,
                 s_q as i32,
-                kv_rows as i32,
-                H_Q as i32,
-                H_KV,
+                compressed_count as i32,
                 D as i32,
-                D as i32,
-                TOPK as i32,
-                1.0 / (D as f32).sqrt(),
-                (H_Q * D) as i32,
-                D as i32,
-                D as i32,
-                0,
-                TOPK as i32,
-                0,
-                0,
             )?;
         }
         ctx.sync()?;
-        let bad_out_h = ctx.stream.clone_dtoh(&bad_out)?;
-        let bad_max_h = ctx.stream.clone_dtoh(&bad_max)?;
-        let bad_lse_h = ctx.stream.clone_dtoh(&bad_lse)?;
-        let mut fired_out = false;
-        let mut fired_lse = false;
-        let mut fired_logit = false;
-        for h in 0..H_Q {
-            let row_idx = &ref_indices[last * TOPK..(last + 1) * TOPK];
-            let (ro, rlse, rmax) = reference_row(
-                &pool_f32,
-                row_idx,
-                &q_host[last * H_Q * D + h * D..last * H_Q * D + (h + 1) * D],
-                sink[h],
-            );
-            let base = (last * H_Q + h) * D;
-            let mut sq = 0f64;
-            let mut mabs = 0f64;
-            for d in 0..D {
-                let g = bad_out_h[base + d].to_f32();
-                sq += (ro[d] as f64).powi(2);
-                mabs = mabs.max((g - ro[d]).abs() as f64);
+
+        let sel_base = last * INDEX_TOPK;
+
+        // Strong: drop the dominant entry from the last token's selection. The
+        // kernel builder emits a row one key shorter; the fwd must lose a
+        // high-weight key and move output/lse/maxlogit.
+        let mut strong_sel = selected.clone();
+        let dom_slot = (0..INDEX_TOPK)
+            .position(|k| strong_sel[sel_base + k] == dom_c as i32)
+            .expect("the dominant key is in the last token's selection");
+        strong_sel[sel_base + dom_slot] = -1;
+
+        // Weak: swap two visible non-dominant compressed keys. This is the
+        // production regime; the index tooth still fires but the numeric delta
+        // washes out, so it is reported but not asserted on out/lse/maxlogit.
+        let mut weak_sel = selected.clone();
+        let first_choice = weak_sel[sel_base];
+        let valid_last = compressed_count.min(INDEX_TOPK);
+        let weak_replacement = (0..valid_last as i32)
+            .find(|&c| {
+                c != first_choice
+                    && c != dom_c as i32
+                    && c * ratio as i32 + (ratio as i32 - 1) <= last_abs
+            })
+            .expect("a second weak visible compressed key exists");
+        weak_sel[sel_base] = weak_replacement;
+
+        // Kernel-built (indices, topk_length) for each selection.
+        let run_builder = |sel: &[i32]| -> Result<(CudaSlice<i32>, CudaSlice<i32>)> {
+            let mut idx = ctx.stream.alloc_zeros::<i32>(s_q * TOPK)?;
+            let mut topk = ctx.stream.alloc_zeros::<i32>(s_q)?;
+            {
+                let sel_dev = ctx.stream.clone_htod(sel)?;
+                let (idx_ptr, _gi) = idx.device_ptr_mut(&ctx.stream);
+                let (topk_ptr, _gt) = topk.device_ptr_mut(&ctx.stream);
+                attention::flashmla_csa_build_indices_raw(
+                    &ctx.stream,
+                    idx_ptr,
+                    topk_ptr,
+                    sel_dev.device_ptr(&ctx.stream).0,
+                    s_q as i32,
+                    start,
+                    SW as i32,
+                    INDEX_TOPK as i32,
+                    compressed_count as i32,
+                    ratio as i32,
+                )?;
             }
-            if mabs / sq.sqrt().max(f64::MIN_POSITIVE) > PASS_MAX_REL_OUT {
-                fired_out = true;
+            ctx.sync()?;
+            Ok((idx, topk))
+        };
+        let (good_idx_dev, good_topk_dev) = run_builder(&selected)?;
+        let (strong_idx_dev, strong_topk_dev) = run_builder(&strong_sel)?;
+        let (weak_idx_dev, weak_topk_dev) = run_builder(&weak_sel)?;
+        let strong_indices = ctx.stream.clone_dtoh(&strong_idx_dev)?;
+        let strong_ref = oracle_indices(case, &strong_sel, compressed_count);
+        let weak_indices = ctx.stream.clone_dtoh(&weak_idx_dev)?;
+        let weak_ref = oracle_indices(case, &weak_sel, compressed_count);
+        // Real kernel teeth: kernel-built indices differ from clean and match
+        // the oracle rebuilt from the corrupted selection.
+        let neg_strong_idx = strong_indices != ref_indices && strong_indices == strong_ref;
+        let neg_weak_idx = weak_indices != ref_indices && weak_indices == weak_ref;
+
+        let run_fwd = |kv: &CudaSlice<bf16>,
+                       idx_dev: &CudaSlice<i32>,
+                       topk: &CudaSlice<i32>|
+         -> Result<(Vec<bf16>, Vec<f32>, Vec<f32>)> {
+            let mut o = ctx.stream.alloc_zeros::<bf16>(s_q * H_Q * D)?;
+            let mut m = ctx.stream.alloc_zeros::<f32>(s_q * H_Q)?;
+            let mut l = ctx.stream.alloc_zeros::<f32>(s_q * H_Q)?;
+            {
+                let (q_ptr, _gq) = q_dev.device_ptr(&ctx.stream);
+                let (kv_ptr, _gk) = kv.device_ptr(&ctx.stream);
+                let (idx_ptr, _gi) = idx_dev.device_ptr(&ctx.stream);
+                let (sink_ptr, _gs) = sink_dev.device_ptr(&ctx.stream);
+                let (topk_ptr, _gt) = topk.device_ptr(&ctx.stream);
+                let (out_ptr, _go) = o.device_ptr_mut(&ctx.stream);
+                let (max_ptr, _gm) = m.device_ptr_mut(&ctx.stream);
+                let (lse_ptr, _gl) = l.device_ptr_mut(&ctx.stream);
+                attention::flashmla_sm90_sparse_prefill_fwd_raw(
+                    &ctx.stream,
+                    q_ptr,
+                    kv_ptr,
+                    idx_ptr,
+                    sink_ptr,
+                    topk_ptr,
+                    out_ptr,
+                    max_ptr,
+                    lse_ptr,
+                    s_q as i32,
+                    kv_rows as i32,
+                    H_Q as i32,
+                    H_KV,
+                    D as i32,
+                    D as i32,
+                    TOPK as i32,
+                    1.0 / (D as f32).sqrt(),
+                    (H_Q * D) as i32,
+                    D as i32,
+                    D as i32,
+                    0,
+                    TOPK as i32,
+                    0,
+                    0,
+                )?;
             }
-            if (bad_lse_h[last * H_Q + h] - rlse).abs() as f64 > PASS_MAX_ABS_LSE {
-                fired_lse = true;
+            ctx.sync()?;
+            Ok((
+                ctx.stream.clone_dtoh(&o)?,
+                ctx.stream.clone_dtoh(&m)?,
+                ctx.stream.clone_dtoh(&l)?,
+            ))
+        };
+        // Clean selection on the dominant pool is the arm's reference run;
+        // the strong corruption runs on the same pool.
+        let (good_dom_h, good_dom_max_h, good_dom_lse_h) =
+            run_fwd(&unified_dom, &good_idx_dev, &good_topk_dev)?;
+        let (strong_h, strong_max_h, strong_lse_h) =
+            run_fwd(&unified_dom, &strong_idx_dev, &strong_topk_dev)?;
+        // The weak regime runs on the ORIGINAL pool (no dominant row); its
+        // clean counterpart is the positive arm's forward above.
+        let (weak_h, weak_max_h, weak_lse_h) = run_fwd(&unified, &weak_idx_dev, &weak_topk_dev)?;
+
+        // Corrupted output vs the f64 reference built from the CLEAN selection
+        // on the same pool, per head at the last token.
+        let fire = |pool: &[f32],
+                    cand_out: &[bf16],
+                    cand_lse: &[f32],
+                    cand_max: &[f32]|
+         -> (bool, bool, bool, f64, f64, f64) {
+            let mut fired_out = false;
+            let mut fired_lse = false;
+            let mut fired_logit = false;
+            let mut max_rel = 0f64;
+            let mut max_dlse = 0f64;
+            let mut max_dmax = 0f64;
+            for h in 0..H_Q {
+                let row_idx = &ref_indices[last * TOPK..(last + 1) * TOPK];
+                let (ro, rlse, rmax) = reference_row(
+                    pool,
+                    row_idx,
+                    &q_host[last * H_Q * D + h * D..last * H_Q * D + (h + 1) * D],
+                    sink[h],
+                );
+                let base = (last * H_Q + h) * D;
+                let mut sq = 0f64;
+                let mut mabs = 0f64;
+                for d in 0..D {
+                    sq += (ro[d] as f64).powi(2);
+                    mabs = mabs.max((cand_out[base + d].to_f32() - ro[d]).abs() as f64);
+                }
+                let rel = mabs / sq.sqrt().max(f64::MIN_POSITIVE);
+                let dlse = (cand_lse[last * H_Q + h] - rlse).abs() as f64;
+                let dmax = (cand_max[last * H_Q + h] - rmax).abs() as f64;
+                max_rel = max_rel.max(rel);
+                max_dlse = max_dlse.max(dlse);
+                max_dmax = max_dmax.max(dmax);
+                fired_out |= rel > PASS_MAX_REL_OUT;
+                fired_lse |= dlse > PASS_MAX_ABS_LSE;
+                fired_logit |= dmax > PASS_MAX_ABS_LOGIT;
             }
-            if (bad_max_h[last * H_Q + h] - rmax).abs() as f64 > PASS_MAX_ABS_LOGIT {
-                fired_logit = true;
-            }
-        }
+            (
+                fired_out,
+                fired_lse,
+                fired_logit,
+                max_rel,
+                max_dlse,
+                max_dmax,
+            )
+        };
+        // Sanity: the clean selection on the dominant pool must itself agree
+        // with its reference; a failure here is a harness/kernel fault.
+        let (clean_dom_bad, _, _, clean_dom_rel, _, _) =
+            fire(&pool_dom_f32, &good_dom_h, &good_dom_lse_h, &good_dom_max_h);
+        ensure!(
+            !clean_dom_bad,
+            "dominant-pool clean run disagrees with its reference (rel {clean_dom_rel})"
+        );
+        let (strong_out, strong_lse_f, strong_logit, s_rel, s_lse, s_logit) =
+            fire(&pool_dom_f32, &strong_h, &strong_lse_h, &strong_max_h);
+        let (weak_out, weak_lse_f, weak_logit, w_rel, w_lse, w_logit) =
+            fire(&pool_f32, &weak_h, &weak_lse_h, &weak_max_h);
 
         println!(
-            "NEG {} s_q={} pack={} indices={} out={} lse={} maxlogit={}",
-            mode.name(),
-            s_q,
-            neg_pack,
-            neg_indices,
-            fired_out,
-            fired_lse,
-            fired_logit
+            "NEG {} s_q={s_q} pack={neg_pack} strong_idx={neg_strong_idx} weak_idx={neg_weak_idx}",
+            mode.name()
+        );
+        println!(
+            "NEG strong(dom dropped) out={strong_out}({s_rel:.5}) lse={strong_lse_f}({s_lse:.5}) \
+             maxlogit={strong_logit}({s_logit:.5})"
+        );
+        println!(
+            "NEG weak(visible swap)  out={weak_out}({w_rel:.5}) lse={weak_lse_f}({w_lse:.5}) \
+             maxlogit={weak_logit}({w_logit:.5}) [production regime, washout expected]"
         );
         ensure!(neg_pack, "pack negative control did not fire");
-        ensure!(neg_indices, "indices negative control did not fire");
-        ensure!(fired_out, "output negative control did not fire");
-        ensure!(fired_lse, "LSE negative control did not fire");
-        ensure!(fired_logit, "max_logit negative control did not fire");
+        ensure!(
+            neg_strong_idx,
+            "strong indices negative control did not fire"
+        );
+        ensure!(neg_weak_idx, "weak indices negative control did not fire");
+        ensure!(strong_out, "strong output negative control did not fire");
+        ensure!(strong_lse_f, "strong LSE negative control did not fire");
+        ensure!(
+            strong_logit,
+            "strong max_logit negative control did not fire"
+        );
         Ok(())
     }
 
