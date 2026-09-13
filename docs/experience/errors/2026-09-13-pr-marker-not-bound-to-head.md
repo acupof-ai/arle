@@ -145,3 +145,36 @@ the run; the line must carry the head sha (or source digest) and the
 check must compare it. A mechanism that cannot tell a measured value
 from a placeholder has the same hole whether the language is bash or
 Python.
+
+## A usable form of option 1, measured on #446
+
+2026-09-13. #446's body claimed the binary was built at "the parent
+code-identical head". The head's parent is main, which does not carry the
+change, so the phrase named no commit. Reading the lane's reflog, exactly one
+other sha carried a byte-identical blob, and the controller wrote that sha into
+the body as the build commit. It was wrong: the author had built three amends
+further back, at `8fab29915`, whose blob is *not* byte-identical.
+
+Byte-identity of the blob was the wrong test. What matters is whether the
+compiled code is the same, and comments do not compile. The test that works,
+and that took one command:
+
+```sh
+strip() { python3 -c '...remove // and /* */ comments and blank lines...'; }
+git show <build-sha>:<file> | strip > a.txt
+git show <head>:<file>      | strip > b.txt
+diff a.txt b.txt | grep -c '^[<>]'      # must be 0
+```
+
+On #446 this returned 0 differing lines for all three candidate shas over 564
+code lines, and 107 for the lane's base commit, which is the positive control
+that proves the comparison discriminates. Without that control a stripper with
+a bug returns 0 for everything, which is the false-zero shape three separate
+detectors took earlier the same day.
+
+So option 1 does not need the marker to name the head. It needs the marker to
+name *a* sha, and the check to compare that sha's compiled content against the
+head's. That is strictly weaker to satisfy and strictly stronger as evidence
+than an unverified claim that two commits are "comment-only" apart -- which is
+what both the author and the controller asserted here, each from a different
+wrong premise, before anyone ran the comparison.
