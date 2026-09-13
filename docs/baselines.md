@@ -44,8 +44,9 @@ production-length warmup has a disjoint prefix-cache key.
 
 Features on: batched draft · replay · snapshot · capture · markov+confidence
 head driving the goodput budget. Serve adds `--spec-type dspark
---mtp-draft-model /host/nvme0/Qwen3.6-27B-DFlash --dspark-block-size 6`; 16
-slots, 195 MiB per slot.
+--mtp-draft-model "$DRAFT_MODEL" --dspark-block-size 6`; 16
+slots, 195 MiB per slot. (`$DRAFT_MODEL` is the local DFlash draft dir,
+Qwen3.6-27B-DFlash for this row.)
 
 Identity:
 
@@ -526,8 +527,9 @@ the kernel ladder is in
 ### SOTA — DSpark, runtime runner (2026-08-14)
 
 Serve `--spec-type dspark --mtp-draft-model
-/host/nvme0/DeepSeek-V4-Flash-DSpark-draft-fp8 --comm-backend nccl`, no other
-flags. DSpark runtime: stages=3 block=5 target_layers=[40,41,42],
+"$DRAFT_MODEL" --comm-backend nccl`, no other
+flags (`$DRAFT_MODEL` is the local DSpark draft dir,
+DeepSeek-V4-Flash-DSpark-draft-fp8 for this row). DSpark runtime: stages=3 block=5 target_layers=[40,41,42],
 `confidence_threshold: None`, sps bias 211.0 ms / row 0.53 ms. Base model +
 draft on NVMe (HDD load timed out the engine-ready barrier at 924 s); weights
 land at 41737 MB/rank, prefetch 17.46 GB/s.
@@ -638,7 +640,7 @@ Identity:
  c=8/16 and FP8 rows below are from / `c1-graph-v24b`
 - That runtime-commit sha is an unreachable rebased object (2026-09-12
  check); cite the build tag and the wins entry below, not the sha.
-- Models `/data00/DeepSeek-V4-Flash-0731` (NVFP4 experts) and `-FP8`
+- Models `$ARLE_DSV4_MODEL_PATH` (DeepSeek-V4-Flash-0731, NVFP4 experts) and `-FP8`
 - GPU: 4×H20 (sm_90), TP=4, 4 slots/rank, BF16 KV, `--comm-backend nccl`
 - Workload `bench-agent-32k-16x8.jsonl`, prompt p50 28568 tok, max_tokens 256
   exact (ignore_eos), temperature 0
@@ -695,7 +697,7 @@ mixed-input grouped GEMM for routed experts; shared expert stays FP8.
 Identity:
 
 - Workspace right-sized to 32 MB (no commit recorded)
-- Model `/data00/DeepSeek-V4-Flash-0731` (166.9 GB NVFP4)
+- Model `$ARLE_DSV4_MODEL_PATH` (DeepSeek-V4-Flash-0731, 166.9 GB NVFP4)
 - GPU: 2×H20 (sm_90, 96 GB), TP=2
 - Server flags: `--tensor-parallel-size 2 --port 30000`
 - Peak VRAM: 95.7 GB/rank (48 slots × 339 MB KV + weights)
@@ -790,7 +792,7 @@ Both ranks print identical loss and grad_norm (post-all-reduce). Reproduces the
 ## SOTA — 27B, cp=2, seq=81920 · FlashQLA default-on (2026-08-05)
 
 FlashQLA GDN chunkwise backward is the default (`--gdr-chunkwise-prefill=true`).
-Same harness (`/host/fqgate.sh perf_on`), same seq, only variable is the flag.
+Same harness (`<host>/fqgate.sh perf_on`), same seq, only variable is the flag.
 
 | | rank 0 | rank 1 | recurrent (below) | speedup |
 |---|---:|---:|---:|---:|

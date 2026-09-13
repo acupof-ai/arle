@@ -11,7 +11,7 @@ not the lever, and was never the first question.
 
 ## Measured baseline
 
-Source: `/host/ob172/*.log`, 12 synthetic replay arms, 2026-07-24. Ledger line:
+Source: `<host>/ob172/*.log`, 12 synthetic replay arms, 2026-07-24. Ledger line:
 
 ```
 [opd-vram-ledger] masked-writeback base_used_mib=28521 post_forward_used_mib=61129
