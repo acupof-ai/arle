@@ -167,6 +167,10 @@ mod real {
     }
 
     fn build_band(rng: &mut Rng, valid: usize, n: usize, k: usize, zero_weights: bool) -> Band {
+        assert!(
+            valid <= M_CAP,
+            "band holds {valid} rows but a_q is only M_CAP={M_CAP}"
+        );
         let kb = k / BLOCK;
         let a_q: Vec<u8> = (0..M_CAP * k).map(|_| fp8(rng)).collect();
         let a_scale: Vec<f32> = (0..kb).map(|_| uniform(rng, 0.03, 0.15)).collect();
@@ -260,14 +264,15 @@ mod real {
         let mut flat = vec![0usize; g];
         let active = g / 2;
         let mut left = SWEEP_TOKENS;
-        for c in flat.iter_mut().take(active) {
-            let take = left.div_ceil(active).min(left).min(M_CAP);
+        for (i, c) in flat.iter_mut().take(active).enumerate() {
+            // Divide by the slots still to fill, not the constant count: with
+            // a fixed divisor every take under-fills and the remainder lands
+            // on band 0, pushing it past M_CAP.
+            let take = left.div_ceil(active - i).min(M_CAP);
             *c = take;
             left -= take;
         }
-        if left > 0 {
-            flat[0] += left;
-        }
+        assert_eq!(left, 0, "flat distribution infeasible at g={g}");
         out.push(("flat", flat));
 
         // Hot band plus 48-row non-hot bands, trailing bands empty.
