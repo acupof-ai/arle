@@ -1500,7 +1500,7 @@ async fn chat_completions(
                 content,
                 prompt_token_count,
                 delta.token_ids.len(),
-                reasoning_tokens,
+                state.think_token_ids.map(|_| reasoning_tokens),
                 delta.finish_reason.as_ref(),
                 split_thinking,
                 tool_calls,
@@ -1540,6 +1540,7 @@ async fn chat_completions(
         let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
         let created = unix_time_secs();
         let model = state.model.clone();
+        let think_ids = state.think_token_ids;
         let state_clone = Arc::clone(&state);
         // Bounded channel: backpressure keeps the task from racing too far ahead.
         let (chunk_tx, chunk_rx) =
@@ -1582,7 +1583,7 @@ async fn chat_completions(
                 }
                 if !delta.token_ids.is_empty() {
                     completion_count += delta.token_ids.len();
-                    if let Some((start, end)) = state_clone.think_token_ids {
+                    if let Some((start, end)) = think_ids {
                         for &token in &delta.token_ids {
                             if token == start {
                                 in_thinking = true;
@@ -1696,7 +1697,7 @@ async fn chat_completions(
                         Some(fr),
                     );
                     let usage_chunk = include_usage.then(|| {
-                        let usage = if thinking {
+                        let usage = if think_ids.is_some() {
                             Usage::with_reasoning_cached(
                                 prompt_len,
                                 completion_count,
@@ -1797,7 +1798,7 @@ async fn chat_completions(
                 finish_reason,
             });
         }
-        let usage = if thinking {
+        let usage = if state.think_token_ids.is_some() {
             Usage::with_reasoning_cached(
                 prompt_tokens.len(),
                 total_completion_tokens,
@@ -1855,7 +1856,7 @@ async fn chat_completions(
         content,
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
-        reasoning_tokens,
+        state.think_token_ids.map(|_| reasoning_tokens),
         outcome.finish.as_ref(),
         split_thinking,
         tool_calls,
@@ -2139,7 +2140,7 @@ async fn anthropic_messages(
         content,
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
-        reasoning_tokens,
+        state.think_token_ids.map(|_| reasoning_tokens),
         outcome.finish.as_ref(),
         thinking,
         tool_calls,

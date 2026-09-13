@@ -1020,7 +1020,7 @@ impl ChatCompletionResponse {
         content: String,
         prompt_tokens: usize,
         completion_tokens: usize,
-        reasoning_tokens: usize,
+        reasoning_tokens: Option<usize>,
         finish: Option<&FinishReason>,
         enable_thinking: bool,
         tool_calls: Vec<ResponseToolCall>,
@@ -1034,15 +1034,17 @@ impl ChatCompletionResponse {
         } else {
             "tool_calls".to_string()
         };
-        let usage = if enable_thinking {
-            Usage::with_reasoning_cached(
+        // `None` means the tokenizer carries no think markers: reasoning is not
+        // a measurable quantity for this model, so the breakdown is omitted.
+        // `Some(0)` is a measured zero from a model that does carry markers.
+        let usage = match reasoning_tokens {
+            Some(reasoning_tokens) => Usage::with_reasoning_cached(
                 prompt_tokens,
                 completion_tokens,
                 reasoning_tokens,
                 cached_prompt_tokens,
-            )
-        } else {
-            Usage::with_cached(prompt_tokens, completion_tokens, cached_prompt_tokens)
+            ),
+            None => Usage::with_cached(prompt_tokens, completion_tokens, cached_prompt_tokens),
         };
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -1216,8 +1218,9 @@ pub struct Usage {
     /// the prefix cache (0 = measured, no reuse; `None` = unreported).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
-    /// Breakdown of completion tokens. `reasoning_tokens` counts tokens spent
-    /// in the thinking block (always 0 until the engine splits them).
+    /// Breakdown of completion tokens. Present only when the tokenizer carries
+    /// think markers (reasoning is measurable for the model); `reasoning_tokens`
+    /// is the count inside the think block, with 0 a measured zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
@@ -1374,7 +1377,9 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionRequest, StatsResponse, Usage};
+    use super::{
+        ChatCompletionRequest, ChatCompletionResponse, FinishReason, StatsResponse, Usage,
+    };
 
     fn chat(penalties: &str) -> ChatCompletionRequest {
         serde_json::from_str(&format!(
@@ -1511,6 +1516,51 @@ mod tests {
                 .unwrap()
                 .contains_key("prompt_tokens_details"),
             "unreported cached_tokens must be omitted, got {json}"
+        );
+    }
+
+    #[test]
+    fn reasoning_breakdown_follows_think_id_support_not_intent() {
+        // Tokenizer without think ids: reasoning is unmeasurable, the breakdown
+        // is omitted even when the request asked for thinking.
+        let no_think_ids = ChatCompletionResponse::from_parts(
+            "m".into(),
+            "answer".into(),
+            1,
+            1,
+            None,
+            Some(&FinishReason::Stop),
+            true,
+            Vec::new(),
+            None,
+            None,
+        );
+        let json = serde_json::to_value(no_think_ids).unwrap();
+        assert!(
+            !json["usage"]
+                .as_object()
+                .unwrap()
+                .contains_key("completion_tokens_details"),
+            "no think ids must omit the breakdown, got {json}"
+        );
+
+        // Tokenizer with think ids: a measured zero stays a present zero.
+        let measured_zero = ChatCompletionResponse::from_parts(
+            "m".into(),
+            "answer".into(),
+            1,
+            1,
+            Some(0),
+            Some(&FinishReason::Stop),
+            false,
+            Vec::new(),
+            None,
+            None,
+        );
+        let json = serde_json::to_value(measured_zero).unwrap();
+        assert_eq!(
+            json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            0
         );
     }
 }
