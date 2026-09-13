@@ -22,9 +22,9 @@ use common::qwen35_test_support::require_fixture_path;
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 /// The fixture dir comes ONLY from `ARLE_PARITY_QWEN35_DENSE_DIR`; there is no
-/// machine-local fallback. When unset (or not a directory) this returns None and
-/// the test takes the harness's visible skip (panic only under
-/// ARLE_REQUIRE_TEST_FIXTURE), so an unset fixture never reads as a pass.
+/// machine-local fallback. When unset (or not a directory) this returns None
+/// and the test skips (manual-only — no runner provisions the fixture), so an
+/// unset fixture never reads as a pass.
 fn resolve_qwen35_dense_dir() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var("ARLE_PARITY_QWEN35_DENSE_DIR").ok()?);
     path.is_dir().then_some(path)

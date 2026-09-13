@@ -123,32 +123,17 @@ fn tiny_base_qwen35_config(max_seq_len: usize, vocab_size: usize) -> Qwen35Confi
     }
 }
 
-/// Verdict for a test whose fixture (model dir, device, …) is absent.
-/// Panics when the runner declared the fixture mandatory via
-/// `ARLE_REQUIRE_TEST_FIXTURE`; skips otherwise. The skip note goes to stderr,
-/// captured by libtest for passing tests unless `--nocapture` is passed, so
-/// in a default run the summary is indistinguishable from a pass — set the
-/// variable where the fixture is expected. The skip is the unmet
-/// precondition, never a `Ok(())` pass.
-pub fn test_fixture_unavailable(required: bool, what: &str, hint: &str) {
-    if required {
-        panic!("ARLE_REQUIRE_TEST_FIXTURE set but fixture is missing: {what} ({hint})");
-    }
-    eprintln!("fixture unavailable ({what}: {hint}); skipping test");
-}
-
-/// Require a fixture path. Returns it when present, else the caller returns
-/// from the test after a visible skip (or a panic when the fixture was
-/// declared mandatory).
+/// Require a fixture path. Returns it when present, otherwise prints that the
+/// test is skipped for lack of the model and returns `None`. These are
+/// manual-only tests: no runner provisions the fixture, so a missing model is
+/// a plain skip, never a pass and never a failure. The note goes to stderr,
+/// which libtest captures unless `--nocapture` is passed; run on a box that
+/// has the model with `--nocapture` to see the test execute.
 pub fn require_fixture_path(path: Option<PathBuf>, what: &str, hint: &str) -> Option<PathBuf> {
     match path {
         Some(p) => Some(p),
         None => {
-            test_fixture_unavailable(
-                std::env::var_os("ARLE_REQUIRE_TEST_FIXTURE").is_some(),
-                what,
-                hint,
-            );
+            eprintln!("skipping: {what} unavailable ({hint})");
             None
         }
     }

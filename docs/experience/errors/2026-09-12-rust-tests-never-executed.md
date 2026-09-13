@@ -27,8 +27,9 @@ five populations that never execute:
    device-ordinal parsing); eleven host-only `infer-cuda` functions likewise
    (quant routing, TP budget, slot-image byte inverse, prefix-pool meta).
    `vulkan-sys` / `vulkan-kernels` / `infer-vulkan` are clippy-only; the
-   vulkan tests' own anti-skip (`ARLE_REQUIRE_VULKAN_DEVICE=1`) is armed by
-   nobody. `hip-sys` tests are not even compiled (`--lib` clippy).
+   vulkan tests' require-device anti-skip was armed by nobody (its knob was
+   deleted 2026-09-13, leaving the tests manual-only). `hip-sys` tests are
+   not even compiled (`--lib` clippy).
 2. Feature-gated tests whose feature no lane enables: five functions under
    `autograd/src/safetensors_io.rs` gated `feature = "safetensors"`.
 3. The Metal backend layer: ~52 `autograd` test functions and one `train`

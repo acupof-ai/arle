@@ -264,9 +264,10 @@ Neither is parity coverage — the varlen kernel was the same class of
 
 Date: 2026-09-11 · Backend: `infer-vulkan` + `crates/vulkan-kernels` (llama.cpp
 `vulkan-shaders` @ d2462f8f adapted). The gates below are real-device
-`cargo test` on MoltenVK 1.4.0 (Apple M4 Pro, Vulkan 1.2, subgroup 32) with
-`ARLE_REQUIRE_VULKAN_DEVICE=1`; the serving target is AMD Radeon 8060S
-(gfx1151, Strix Halo), which exposes the same Vulkan compute path.
+`cargo test` on MoltenVK 1.4.0 (Apple M4 Pro, Vulkan 1.2, subgroup 32), run
+with `--nocapture` to see the device-gate marker; the serving target is AMD
+Radeon 8060S (gfx1151, Strix Halo), which exposes the same Vulkan compute
+path. On a box without an ICD the gates skip with a visible stderr note.
 
 ### Served model and its geometry
 
@@ -378,21 +379,21 @@ shaders; quant formats decoded from the GGUF spec via `infer-gguf`):
 
 ### Device availability gate
 
-Device tests silently skip when no Vulkan device exists, so a green CI without
-an ICD proves nothing. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to turn
-"no device" into a panic (`tests/common/mod.rs::require_device`, shared by
-every device test file). Verification command on this Mac (MoltenVK):
+Device tests are manual-only: no runner provisions a Vulkan ICD, so without
+one they print a `skipping: no Vulkan device/ICD available` note to stderr
+and pass as skips — a green CI without an ICD proves nothing about the
+shaders. On a box with an ICD (`tests/common/mod.rs::require_device`, shared
+by every device test file), run with `--nocapture` to see the gate execute.
+Verification command on this Mac (MoltenVK):
 
 ```
-ARLE_REQUIRE_VULKAN_DEVICE=1 \
 VK_ICD_FILENAMES=/path/to/molten_icd.json \
 DYLD_LIBRARY_PATH=<dir with libvulkan.dylib> \
-cargo test -p vulkan-kernels -p infer-vulkan --features vulkan
+cargo test -p vulkan-kernels -p infer-vulkan --features vulkan -- --nocapture
 ```
 
-Without the env var the same binary prints `skipping device test` and passes;
-with it set and no ICD it panics `ARLE_REQUIRE_VULKAN_DEVICE set but no Vulkan
-device is available: …` and exits non-zero.
+Without an ICD the same binary prints the skip note and passes; with a valid
+ICD it prints the device name and runs the gates.
 
 Already at production geometry and unchanged: rms_norm/swiglu/add/sigmoid_mul,
 ssm_conv, gated_delta_net, and the three qwen36 router kernels.

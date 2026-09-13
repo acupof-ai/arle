@@ -46,25 +46,9 @@ use train::qwen35::Qwen35Model;
 use train::qwen35_loader::{LoaderError, load_qwen35_from_hf_dir};
 
 mod common;
-use common::qwen35_test_support::{require_fixture_path, test_fixture_unavailable};
+use common::qwen35_test_support::require_fixture_path;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
-
-#[test]
-fn missing_fixture_skips_visibly_when_not_required() {
-    test_fixture_unavailable(false, "synthetic model", "set the test var");
-}
-
-#[test]
-fn missing_fixture_panics_when_required() {
-    assert!(
-        std::panic::catch_unwind(|| {
-            test_fixture_unavailable(true, "synthetic model", "set the test var")
-        })
-        .is_err(),
-        "a required fixture that is absent must fail, not skip"
-    );
-}
 
 fn resolve_qwen3_06b_dir() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("INFER_TEST_QWEN3_06B_DIR") {

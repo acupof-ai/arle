@@ -24,8 +24,8 @@
 //!      same activation, so they should match to ~1e-3, not just q8_1 tol).
 //!
 //! Runs only with `--features vulkan` + a working device; without one it
-//! skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to make a missing
-//! device panic instead (so CI cannot pass by skipping all gates).
+//! On a box without a Vulkan ICD it skips cleanly (manual-only gate; run
+//! on a capable box with --nocapture to see it execute).
 #![cfg(feature = "vulkan")]
 
 mod common;

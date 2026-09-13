@@ -371,7 +371,7 @@ mod tests {
     /// note goes to stderr, which libtest captures for passing tests unless
     /// `--nocapture` is passed, so under a default run a skip looks like an
     /// ordinary pass in the summary — the guarantee is the env var, not the
-    /// note. Mirrors the Vulkan pair (`skip_or_panic` / `require_device`):
+    /// note. Mirrors the Vulkan device-test require/skip pattern:
     /// parity_gpu_batch.sh sets ARLE_REQUIRE_CUDA_DEVICE on the claimed GPU,
     /// so a runner that expected a card fails loudly instead of the test
     /// reporting `ok` with the device-gated body never executed.
