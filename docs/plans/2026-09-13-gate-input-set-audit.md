@@ -117,33 +117,48 @@ checkable rather than rediscovered per incident.
 
 ## The smallest executable real-weight gate (priced option, not a plan to build)
 
-Facts read from the pod and docs on 2026-09-13:
+Facts read from the pod on 2026-09-13, with the inventory command attached
+(the earlier draft searched only the /host model dir and got this wrong):
 
-- **No complete production checkpoint is on the pod.** the pod's `Qwen/Qwen3___6-35B-A3B` model dir
-  holds only 4 of 26 shards; the `Qwen3.6-27B-FP8` and `…-FP8-fixed` model dirs are empty
-  (config-only); DSv4-Flash is absent entirely. So any real-weight gate has
-  a provisioning component today.
-- **H20 = ~96 GB each** (97871 MiB). Qwen3.6-27B-FP8 is ~29.4 GB resident
-  and demonstrably serves at **TP=1 on one H20** (multiple wins entries:
-  2026-07-07 prefix-cache, 2026-07-11 DSpark TP=1). DSv4-Flash-FP8 is
-  **294 GB → minimum 4 H20 by memory**, served at TP8/EP8.
+- **A complete production checkpoint is already on the box, no
+  provisioning needed.** `Qwen3.6-35B-A3B-FP8` is present and complete:
 
-Three priced options, cheapest first:
+  ```
+  # 35 GB, 42 shards on disk, index names exactly those 42:
+  du -sh /data00/models/Qwen3.6-35B-A3B-FP8          # 35G
+  python3 -c "load model.safetensors.index.json weight_map; \
+     assert sorted(set(values)) == shards-present-on-disk"   # 42 == 42
+  df -h /                                            # 663 GB free
+  ```
 
-| Option | Checkpoint | Cards | What it covers beyond the synthetic gates | Rough cost |
+  (The `/host` model tree, where the first draft looked, is not where the
+  full weights live; its `Qwen3___6-35B-A3B` has 4 shards and the
+  27B-FP8 dirs there are config-only. There is **no 27B checkpoint on the
+  box**; the complete model is the 35B-A3B MoE.)
+- **H20 = ~96 GB each** (97871 MiB), so the 35 GB checkpoint fits TP1 on
+  one card with room for KV. This checkpoint has a recorded **1×H20
+  single-GPU eager baseline** (`docs/baselines.md:150`) and multiple wins
+  entries bench it at 1×H20 — no bring-up risk.
+- **DSv4-Flash-FP8 is 294 GB → minimum 4 H20 by memory**, served at
+  TP8/EP8, and is not on the box.
+
+Two priced options:
+
+| Option | Checkpoint | Cards | What it covers beyond the synthetic gates | Cost |
 |---|---|---|---|---|
-| A (smallest, recommended) | **Qwen3.6-27B-FP8**, TP1 | **1 H20** | Real FP8 weights through the full decode/prefill stack — Marlin/DeepGEMM lanes, quant KV, the 5120×17408 / vocab-248320 widths the synthetic gates only list, end-to-end greedy correctness | provision ~29 GB to the pod (minutes on the internal mirror; cold read is the long pole) + a single-card run of minutes. This is the same model that already ran TP1 repeatedly, so no bring-up risk |
-| B | Qwen3.8-27B-NVFP4, TP1 | 1 H20 | Option A plus the mixed-precision nvfp4 path (Marlin decode + DeepGEMM prefill scratch) | ~23 GB provision + minutes; covers the current production-recommended model |
-| C | **DSv4-Flash-FP8**, TP4 minimum (serves TP8) | **4-8 H20** | The only gate that exercises real NCCL multi-rank, EP8 MoE, FlashMLA on real DSv4 tensors — what `dsv4_parity` already targets | provision **294 GB** (cold-read minutes-to-tens-of-minutes) + 4-8 cards for the run; highest cost, unique multi-rank coverage |
+| **A (smallest; provisions nothing)** | **Qwen3.6-35B-A3B-FP8**, TP1 | **1 H20** | Real FP8 MoE weights through the full decode/prefill stack — DeepGEMM/Marlin lanes, quant KV, the real hidden/vocab widths, end-to-end greedy correctness on a MoE | **a card window + minutes of run; zero transfer, zero approval** — weights present, TP1 already baselined |
+| C | **DSv4-Flash-FP8**, TP4 minimum (serves TP8) | **4-8 H20** | The only gate that exercises real NCCL multi-rank, EP8 MoE, FlashMLA on real DSv4 tensors — what `dsv4_parity` already targets | provision **294 GB** (not present; cold read dominates) + 4-8 cards; unique multi-rank coverage |
 
-**Recommendation:** Option A is the smallest gate that changes the
-"automated real-weight gates ever run = 0" number. One card, a checkpoint
-already proven on the box, minutes of run time. It does not require new
-kernel code — the lever/needle/sampling gates already drive a real served
-model; the gap is that no real-weight gate runs in the automated GPU batch.
-The decision is whether to point one of the existing model-level gates at
-Qwen3.6-27B-FP8 in the batch (provision + one-card window), not whether to
-build a harness.
+(An NVFP4 option was dropped: no NVFP4 checkpoint exists on the box, so it
+would price a model we do not have against one we do.)
+
+**Recommendation:** Option A changes the "automated real-weight gates ever
+run = 0" number at the lowest possible cost — one card, minutes, no
+provisioning decision for anyone to approve (the only gate is GPU
+availability, already blocked for other reasons). It needs no new harness:
+the lever/needle/sampling gates already drive a real served model; the work
+is pointing the GPU batch's model phase at this checkpoint when a window
+opens, not building code.
 
 Option C stays separately queued for the multi-rank question and the 15
 ungated dsv4 tokens; it is not the smallest path to a nonzero count.
