@@ -318,8 +318,23 @@ mod real {
             ensure!(pack_ok, "clean pack mismatch before corruption");
         }
 
-        // Build indices + topk_length.
-        let mut indices_dev = ctx.stream.alloc_zeros::<i32>(s_q * TOPK)?;
+        // Build indices + topk_length. Per-mode row pitch, mirroring
+        // production (infer-cuda attention.rs derives one topk_unified and uses
+        // it for alloc, fwd topk and stride): CSA = SW+INDEX_TOPK; HCA =
+        // SW+ceil128(compressed_count). The same value must size the buffer,
+        // the builder, and the fwd stride below, or token rows are written and
+        // read at different pitches.
+        let max_keys = match mode {
+            Mode::Csa => INDEX_TOPK,
+            Mode::Hca => compressed_count.div_ceil(128) * 128,
+        };
+        let topk_unified = SW + max_keys;
+        ensure!(
+            topk_unified.is_multiple_of(128),
+            "harness topk_unified {topk_unified} must be %128"
+        );
+        let mut indices_dev = ctx.stream.alloc_zeros::<i32>(s_q * topk_unified)?;
+        let indices_len = s_q * topk_unified;
         let mut topk_dev = ctx.stream.alloc_zeros::<i32>(s_q)?;
         let selected_dev = if matches!(mode, Mode::Csa) {
             Some(ctx.stream.clone_htod(&selected)?)
@@ -343,7 +358,10 @@ mod real {
                     ratio as i32,
                 )?,
                 Mode::Hca => {
-                    let max_keys = compressed_count.div_ceil(128) * 128;
+                    // max_keys is the ceil128 capacity computed above; the
+                    // builder writes rows at SW+max_keys == topk_unified, the
+                    // same pitch the buffer and fwd stride use. Selection count
+                    // is clamped to compressed_count inside the builder.
                     attention::flashmla_hca_build_indices_raw(
                         &ctx.stream,
                         idx_ptr,
@@ -392,13 +410,13 @@ mod real {
                 H_KV,
                 D as i32,
                 D as i32,
-                TOPK as i32,
+                topk_unified as i32,
                 1.0 / (D as f32).sqrt(),
                 (H_Q * D) as i32,
                 D as i32,
                 D as i32,
                 0,
-                TOPK as i32,
+                topk_unified as i32,
                 0,
                 0,
             )?;
@@ -443,7 +461,41 @@ mod real {
             }
         }
 
-        let idx_ok = indices == ref_indices;
+        // The oracle is pitched at the fixed TOPK layout; the device vector at
+        // the per-mode topk_unified. Compare per-token rows at each pitch — a
+        // flattened-prefix compare crosses the oracle's wider row boundary.
+        let idx_len_ok = indices.len() == indices_len;
+        let first_diff = if idx_len_ok {
+            find_row_diff(&indices, &ref_indices, s_q, topk_unified, TOPK)
+        } else {
+            None
+        };
+        let idx_content_ok = first_diff.is_none();
+        let idx_ok = idx_len_ok && idx_content_ok;
+        if let Some((t, k)) = first_diff {
+            eprintln!(
+                "idx diff token={t} k={k} topk_len={} got={} oracle={} \
+                 (topk_unified={topk_unified})",
+                topk_len[t],
+                indices[t * topk_unified + k],
+                ref_indices[t * TOPK + k]
+            );
+        }
+        // Positive control for the compare itself: tamper one REAL key slot
+        // (token 1's first SW slot) in a host copy and require the same
+        // per-pitch scan to flag it — proves an agreeing run is not the
+        // compare silently passing.
+        let mut tampered = indices.clone();
+        tampered[topk_unified] = tampered[topk_unified].wrapping_neg() - 7;
+        ensure!(
+            tampered[topk_unified] != ref_indices[TOPK],
+            "positive-control tamper happened to equal the oracle value"
+        );
+        ensure!(
+            find_row_diff(&tampered, &ref_indices, s_q, topk_unified, TOPK)
+                .is_some_and(|(t, k)| t == 1 && k == 0),
+            "index compare positive control did not fire at the tampered slot"
+        );
         let topk_ok = check_topk(&topk_len, case, compressed_count);
         let out_ok = max_rel_out <= PASS_MAX_REL_OUT;
         let lse_ok = max_abs_lse <= PASS_MAX_ABS_LSE;
@@ -760,6 +812,25 @@ mod real {
             }
         }
         out
+    }
+
+    /// First (token, k) where a device index row (pitch `dev_pitch`) disagrees
+    /// with the oracle row (pitch `oracle_pitch`), over the device's full row.
+    fn find_row_diff(
+        device: &[i32],
+        oracle: &[i32],
+        s_q: usize,
+        dev_pitch: usize,
+        oracle_pitch: usize,
+    ) -> Option<(usize, usize)> {
+        for t in 0..s_q {
+            for k in 0..dev_pitch {
+                if device[t * dev_pitch + k] != oracle[t * oracle_pitch + k] {
+                    return Some((t, k));
+                }
+            }
+        }
+        None
     }
 
     fn check_topk(topk: &[i32], case: Case, compressed_count: usize) -> bool {
