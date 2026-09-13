@@ -40,10 +40,39 @@ one-hot arm. Add `assert!(valid <= M_CAP)` at the top of `build_band`: every
 distribution in the file assumes a band fits in one output tile, and nothing
 enforced it.
 
+## A third defect, exposed the same way
+
+With both panics gone the harness reached the kernel and every comparison
+failed: inf or NaN on the 16-group distributions, finite but wrong on
+full-256, and several bands at exactly `rel_l2` 1.000.
+
+The activation scale buffer was 128 times too small. The contract is stated at
+`crates/cuda-kernels/src/moe.rs:1601` — `sfa_aligned_m` is the TMA-aligned
+leading dimension of the activation scale matrix — and the address arithmetic
+at `crates/cuda-kernels/csrc/gemm/dsv4_deepgemm_ops.cu:53` spells it out:
+`expert * scale_stride_m * scale_k_blocks + k_block * scale_stride_m + row`.
+Each group therefore holds `sfa_aligned_m * k/128` floats, one per row per
+k-block, because DeepGEMM scales activations per token. The harness allocated
+one scale row per band and passed `M_CAP` as the leading dimension, so the
+kernel read past the end of every group.
+
+The three symptoms are one fault. Reads that land on unrelated memory give inf
+and NaN; reads that land on the allocation's zeros give an output of zero, and
+a zero output is exactly `rel_l2` 1.000 because the metric is the difference
+norm over the reference norm.
+
+The oracle carried the same wrong model — `a_scale[bk]`, one scale for every
+row of the band — so oracle and harness agreed with each other and both
+disagreed with the kernel. Correcting only the upload would have moved the
+failure rather than removed it.
+
 ## Rule
 
 A buffer sized by a bug is not a bound. When one fix makes a second failure
 appear, the second defect was already present and unobserved — do not attribute
-it to the fix. State the capacity a routine assumes as an assertion at the
+it to the fix. This file produced three in a row, each hidden by the one before
+it, so treat "the fix revealed a new failure" as the expected outcome in a
+harness that has never once run to completion, not as evidence the fix was
+wrong. State the capacity a routine assumes as an assertion at the
 point of construction, so a violation names itself instead of surfacing as an
 index far away.

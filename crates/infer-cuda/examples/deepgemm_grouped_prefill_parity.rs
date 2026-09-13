@@ -158,8 +158,11 @@ mod real {
     /// One expert band: fp8 bytes + per-block f32 scales. The f64 reference is
     /// computed lazily for the selected rows only.
     struct Band {
-        a_q: Vec<u8>,      // [M_CAP, k]
-        a_scale: Vec<f32>, // [k/BLOCK] (m_cap == one m-block)
+        a_q: Vec<u8>, // [M_CAP, k]
+        // sfa: one scale per (row, k-block), k-block-major with leading
+        // dimension sfa_aligned_m == M_CAP — element (row, bk) sits at
+        // bk*M_CAP+row (csrc/gemm/dsv4_deepgemm_ops.cu:53).
+        a_scale: Vec<f32>, // [k/BLOCK, M_CAP]
         b_q: Vec<u8>,      // [n, k]; empty when zero_weights
         b_scale: Vec<f32>, // [n/BLOCK, k/BLOCK]
         valid: usize,
@@ -173,7 +176,7 @@ mod real {
         );
         let kb = k / BLOCK;
         let a_q: Vec<u8> = (0..M_CAP * k).map(|_| fp8(rng)).collect();
-        let a_scale: Vec<f32> = (0..kb).map(|_| uniform(rng, 0.03, 0.15)).collect();
+        let a_scale: Vec<f32> = (0..kb * M_CAP).map(|_| uniform(rng, 0.03, 0.15)).collect();
         if zero_weights {
             return Band {
                 a_q,
@@ -231,7 +234,7 @@ mod real {
                             let bn = col / BLOCK;
                             let mut acc = 0f64;
                             for bk in 0..kb {
-                                let sa = a_scale[bk] as f64;
+                                let sa = a_scale[bk * M_CAP + m] as f64;
                                 let sb = b_scale[bn * kb + bk] as f64;
                                 let k0 = bk * BLOCK;
                                 let mut dot = 0f64;
@@ -396,13 +399,22 @@ mod real {
                 .collect();
 
             let mut a_all = vec![0u8; ng * M_CAP * k];
-            let mut sa_all = vec![0f32; ng * kb];
+            // sfa_aligned_m is the scale matrix's leading dimension, not its
+            // row count: the descriptor only requires stride >= align_to(m, 4)
+            // (4 f32 = one 16-byte TMA unit). M_CAP is 128, so stride and
+            // capacity coincide here and a shape where they differ would go
+            // unnoticed — assert the contract instead of relying on that.
+            assert!(
+                M_CAP.is_multiple_of(4),
+                "sfa leading dimension M_CAP={M_CAP} must be 4-aligned"
+            );
+            let mut sa_all = vec![0f32; ng * M_CAP * kb];
             let mut b_all = vec![0u8; ng * n * k];
             let mut sb_all = vec![0f32; ng * (n / BLOCK) * kb];
             let mut masked = vec![0i32; ng];
             for (i, p) in bands.iter().enumerate() {
                 a_all[i * M_CAP * k..(i + 1) * M_CAP * k].copy_from_slice(&p.a_q);
-                sa_all[i * kb..(i + 1) * kb].copy_from_slice(&p.a_scale);
+                sa_all[i * M_CAP * kb..(i + 1) * M_CAP * kb].copy_from_slice(&p.a_scale);
                 masked[i] = p.valid as i32;
                 if !p.zero_weights {
                     b_all[i * n * k..(i + 1) * n * k].copy_from_slice(&p.b_q);
@@ -518,7 +530,14 @@ mod real {
             }
 
             let mut a_q = vec![0u8; m * k];
-            let mut sa = vec![0f32; (m / BLOCK) * kb];
+            // Same contract as the masked path: m is the leading dimension of
+            // the scale matrix and must be 4-aligned. mk_align is 128, so every
+            // segment sum is; assert rather than assume.
+            assert!(
+                m.is_multiple_of(4),
+                "sfa leading dimension {m} must be 4-aligned"
+            );
+            let mut sa = vec![0f32; m * kb];
             let mut b_all = vec![0u8; ng * n * k];
             let mut sb_all = vec![0f32; ng * (n / BLOCK) * kb];
             let mut seg_start = vec![0usize; ng];
@@ -539,11 +558,12 @@ mod real {
                 for r in 0..p.valid {
                     a_q[(start + r) * k..(start + r + 1) * k]
                         .copy_from_slice(&p.a_q[r * k..(r + 1) * k]);
-                }
-                // One m-block per segment here (counts <= 128); copy the band's
-                // single a_scale row into that tile.
-                if seg[g] > 0 {
-                    sa[(start / BLOCK) * kb..(start / BLOCK + 1) * kb].copy_from_slice(&p.a_scale);
+                    // sfa's leading dimension here is m (the value passed as
+                    // sfa_aligned_m), so the band's row r is global row
+                    // start+r in every k-block.
+                    for bk in 0..kb {
+                        sa[bk * m + start + r] = p.a_scale[bk * M_CAP + r];
+                    }
                 }
             }
 
