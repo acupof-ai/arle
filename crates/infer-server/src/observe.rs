@@ -14,34 +14,46 @@ const TICK_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct HostSample {
-    pub cpu_pct: f32,
+    // None when the value could not be read; a 0 must mean "measured idle",
+    // never "unavailable". Serialized on StoredSample with skip-if-none.
+    pub cpu_pct: Option<f32>,
+    // Not Option: sysinfo's memory totals/available read cannot fail on a
+    // Linux host this runs on, so there is no unmeasured state to represent.
     pub ram_used_mb: u64,
-    pub disk_used_pct: f32,
+    pub disk_used_pct: Option<f32>,
 }
 
-fn disk_used_pct(disks: &sysinfo::Disks) -> f32 {
+/// Used percent of the `/` mount. None when the mount is not enumerated or the
+/// reported total is zero — both are unmeasured, distinct from a measured 0%
+/// (an empty, genuinely-idle disk, which `total > 0` and `avail == total`
+/// reports as the real value 0.0).
+fn disk_used_pct(disks: &sysinfo::Disks) -> Option<f32> {
     for disk in disks.list() {
         if disk.mount_point() == std::path::Path::new("/") {
             let total = disk.total_space();
             if total == 0 {
-                return 0.0;
+                return None;
             }
             let avail = disk.available_space();
-            return ((total - avail) as f32 / total as f32) * 100.0;
+            return Some(((total - avail) as f32 / total as f32) * 100.0);
         }
     }
-    0.0
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)] // omitted fields take Default, so older/newer JSONL lines stay readable
 pub(crate) struct StoredSample {
     pub ts_ms: u64,
     pub active_requests: u32,
     pub queue_depth: u32,
     pub kv_free_pages: u32,
-    pub cpu_pct: f32,
+    // Absent when the host metric read failed; never a 0 that reads as measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f32>,
     pub ram_used_mb: u64,
-    pub disk_used_pct: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_used_pct: Option<f32>,
     pub gpu: Option<infer_seam::GpuSample>,
     pub generated_tokens: u64,
     pub prefix_lookups: u64,
@@ -142,9 +154,9 @@ fn sample_host(sys: &mut sysinfo::System, disks: &mut sysinfo::Disks, tick: u32)
         disks.refresh(true);
     }
     let cpu_pct = if sys.cpus().is_empty() {
-        0.0
+        None
     } else {
-        sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
+        Some(sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32)
     };
     let ram_used_mb =
         (sys.total_memory() / (1024 * 1024)).saturating_sub(sys.available_memory() / (1024 * 1024));
@@ -256,9 +268,9 @@ mod tests {
             active_requests: 3,
             queue_depth: 1,
             kv_free_pages: 100,
-            cpu_pct: 45.5,
+            cpu_pct: Some(45.5),
             ram_used_mb: 32000,
-            disk_used_pct: 60.0,
+            disk_used_pct: Some(60.0),
             gpu: None,
             generated_tokens: 100000,
             prefix_lookups: 500,
@@ -273,6 +285,29 @@ mod tests {
         assert_eq!(parsed.ts_ms, sample.ts_ms);
         assert_eq!(parsed.generated_tokens, sample.generated_tokens);
         assert_eq!(parsed.cpu_pct, sample.cpu_pct);
+    }
+
+    #[test]
+    fn absent_host_metrics_are_omitted_not_zero() {
+        // An unread host metric must not appear as 0.0 in the JSONL.
+        let absent = StoredSample {
+            cpu_pct: None,
+            disk_used_pct: None,
+            ..StoredSample::default()
+        };
+        let json = serde_json::to_string(&absent).unwrap();
+        assert!(!json.contains("cpu_pct"), "absent cpu serialized: {json}");
+        assert!(
+            !json.contains("disk_used_pct"),
+            "absent disk serialized: {json}"
+        );
+        // Old records that carried a numeric value still deserialize (Some):
+        // an older plain-f32 JSON line with cpu and no disk field. StoredSample
+        // derives Deserialize through Default, so omitted fields take defaults.
+        let parsed: StoredSample = serde_json::from_str(r#"{"ts_ms":1,"cpu_pct":12.5}"#).unwrap();
+        assert_eq!(parsed.ts_ms, 1);
+        assert_eq!(parsed.cpu_pct, Some(12.5));
+        assert_eq!(parsed.disk_used_pct, None);
     }
 
     #[test]

@@ -332,10 +332,12 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         kv_system.promote_mget_count,
     );
     // The five copy/wait counters (demote_mset_copy_bytes/_ms,
-    // promote_mget_copy_bytes/_ms, fetch_wait_ms) are not exported: no
+    // promote_mget_copy_bytes/_ms, fetch_wait_ms) are not exported here: no
     // current backend is a capacity-bearing copying page tier, so they are
     // permanently zero. An absent series reports the gap honestly; a zero
-    // would read as a measurement. They remain in /v1/stats and JSONL.
+    // would read as a measurement. They appear in /v1/stats as `None`
+    // (skipped in the JSON); the observe JSONL StoredSample does not carry
+    // kv_system fields at all, so they are absent there rather than zero.
     push!(
         "kv_system_fallback_recompute_total",
         "counter",
