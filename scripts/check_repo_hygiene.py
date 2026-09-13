@@ -110,25 +110,31 @@ MAX_EXPERIENCE_ENTRIES = {
     Path("docs/experience/errors"): 296,
 }
 
-# Repo-wide markers are matched by regex, not plain substring. A machine-root
-# path is anchored with a lookbehind that rejects it when immediately preceded
-# by a word char, dot, or slash, so a directory named for a root
+# Two kinds of repo-wide markers.
+# Home-root paths are anchored with a lookbehind that rejects them when
+# immediately preceded by a word char or dot, so a directory named for a root
 # (`components/home/`, `xusers/`) does not trip the rule while an absolute path
-# (`/home/ckl/…`, `PATH=/home/…`) does. Bare unique tokens (PEGAINFER) keep a
-# plain substring match. `data0` intentionally has no trailing slash so it also
-# matches `/data00`, `/data01`, … (a later digit is another mount, not a
-# subdirectory).
-REPO_WIDE_PATH_MARKERS = ("/Users/", "/home/", "release/infer")
-REPO_WIDE_TOKEN_MARKERS = ("PEGAINFER",)
-REPO_WIDE_PATH_RE = re.compile(
-    r"(?<![\w./])(?:" + "|".join(re.escape(m) for m in REPO_WIDE_PATH_MARKERS) + r")"
+# does in every spelling: `/home/ckl/…`, `PATH=/home/…`, and a URI such as
+# `file:///Users/…` (the `/` is deliberately NOT in the class — excluding it
+# would open the `file://` hole and buys nothing, since the `/` before a
+# `components/home/` segment follows the word char `s`).
+# Plain tokens are matched as bare substrings. `release/infer` is a token, not
+# an absolute root: it guards references to the deleted `infer` binary, which
+# appear as `target/release/infer` or `./target/release/infer` — the preceding
+# `/` must NOT exempt it. `PEGAINFER` is likewise a token.
+REPO_WIDE_HOME_ROOTS = ("/Users/", "/home/")
+REPO_WIDE_HOME_RE = re.compile(
+    r"(?<![\w.])(?:" + "|".join(re.escape(m) for m in REPO_WIDE_HOME_ROOTS) + r")"
 )
+REPO_WIDE_TOKEN_MARKERS = ("release/infer", "PEGAINFER")
 
-# Dated run provenance records the literal machine path a specific run used;
-# rewriting it makes the record false. command.txt under the two provenance
-# trees is exempt from the path-marker rule (still scanned for tokens).
+# Run-provenance command records hold the literal machine path a specific run
+# used; rewriting it makes the record false. A command.txt under the wins bench
+# records (including the non-date-prefixed baseline-<sha>-snapshot/B* bundles)
+# or the trace-artifacts tree is exempt from the home-root path rule; it is
+# still scanned for tokens. Errors entries are not exempt.
 PROVENANCE_COMMAND_RE = re.compile(
-    r"^docs/(experience|trace-artifacts)/.*command\.txt$"
+    r"^docs/(experience/wins|trace-artifacts)/(.*/)?command\.txt$"
 )
 
 JUNK_PATH_RE = re.compile(r"(^|/)(\.DS_Store|Thumbs\.db|__pycache__/|.*\.pyc)$")
@@ -398,11 +404,11 @@ def check_wins_parameters() -> list[str]:
 
 
 def _repo_wide_hits(path_str: str, content: str) -> list[str]:
-    """Banned markers on one grep line, applying the path lookbehind and the
+    """Banned markers on one line, applying the home-root lookbehind and the
     dated-command.txt provenance exemption."""
     hits: list[str] = []
     if not PROVENANCE_COMMAND_RE.match(path_str):
-        for m in REPO_WIDE_PATH_RE.finditer(content):
+        for m in REPO_WIDE_HOME_RE.finditer(content):
             hits.append(m.group(0))
     for token in REPO_WIDE_TOKEN_MARKERS:
         if token in content:
@@ -411,22 +417,27 @@ def _repo_wide_hits(path_str: str, content: str) -> list[str]:
 
 
 def check_repo_wide_disallowed_markers() -> list[str]:
-    own_path = f"scripts/{Path(__file__).name}"
-    # One extended alternation over the path regex plus the bare tokens; the
-    # lookbehind/anchoring is applied in Python (git grep -P is not portable).
-    pattern = (
-        r"(?<![\w./])(?:"
-        + "|".join(re.escape(m) for m in REPO_WIDE_PATH_MARKERS)
-        + r")|"
-        + "|".join(re.escape(t) for t in REPO_WIDE_TOKEN_MARKERS)
-    )
-    lines = git_grep(["-I", "-n", "-E", pattern, "--", "."])
+    # Checker scripts that DEFINE the banned segments must name the literal
+    # roots to ban them; they are machinery, not machine paths in use.
+    own_paths = {
+        f"scripts/{Path(__file__).name}",
+        "scripts/lane_pr_precheck.py",
+    }
+    # git grep gets a plain fixed-string alternation of every marker so the
+    # fast path never breaks on PCRE/ERE syntax (git grep -P is not portable
+    # and -E rejects lookbehind); the returned candidate lines are filtered in
+    # Python, where the home-root anchoring and the provenance exemption live.
+    grep_args = ["-I", "-n"]
+    for marker in (*REPO_WIDE_HOME_ROOTS, *REPO_WIDE_TOKEN_MARKERS):
+        grep_args.extend(["-e", marker])
+    grep_args.extend(["--", "."])
+    lines = git_grep(grep_args)
 
     if lines is not None:
         errors = set()
         for line in lines:
             path_str, _, content = line.partition(":")
-            if not content or path_str == own_path:
+            if not content or path_str in own_paths:
                 continue
             for hit in _repo_wide_hits(path_str, content):
                 errors.add(
@@ -436,7 +447,7 @@ def check_repo_wide_disallowed_markers() -> list[str]:
 
     errors = []
     for rel_path in list_git_tracked_files(Path(".")):
-        if rel_path == own_path:
+        if rel_path in own_paths:
             continue
         abs_path = ROOT / rel_path
         try:
@@ -1090,10 +1101,17 @@ def selftest() -> int:
         # (path, content, expected hits)
         ("src/x.rs", 'const P = "/home/ckl/x";', ["/home/"]),
         ("src/x.rs", 'PATH=/home/ckl/bin', ["/home/"]),
+        ("src/x.rs", 'const U = "file:///Users/bytedance/x.md";', ["/Users/"]),
+        ("src/x.rs", 'const U = "host://home/ckl";', ["/home/"]),
         ("web/src/pages/index.astro", 'import X from "../components/home/Hero.astro";', []),
         ("docs/y.md", "a users/ dir and xusers/ word", []),
+        ("src/x.rs", "run ./target/release/infer --x", ["release/infer"]),
+        ("src/x.rs", "see target/release/infer binary", ["release/infer"]),
         ("docs/experience/wins/2026-05-09-b/B1/command.txt", "run --out /home/ckl/bench x", []),
         ("docs/trace-artifacts/2026-05-27-x/command.txt", "x /home/ckl y", []),
+        # Undated wins bundle command.txt is exempt; an errors-dir one is not.
+        ("docs/experience/wins/baseline-abc-snapshot/B1/command.txt", "x /home/ckl y", []),
+        ("docs/experience/errors/2026-09-13-note/command.txt", "x /home/ckl y", ["/home/"]),
         ("src/x.rs", "// note PEGAINFER here", ["PEGAINFER"]),
         ("docs/experience/wins/2026-05-09-b/B1/command.txt", "PEGAINFER still banned", ["PEGAINFER"]),
     ]
@@ -1103,6 +1121,40 @@ def selftest() -> int:
             failures.append(f"repo-wide marker {path!r}: got {got}, want {want}")
         else:
             print(f"[selftest] repo-wide marker {path.split('/')[-1]}: {'-> ' + str(got) if got else 'clean'}")
+
+    # End-to-end: the REAL checker over a temp git repo, exercising the git grep
+    # fast path (a plain _repo_wide_hits test cannot see a broken grep pattern
+    # or a git_grep error mapping). One clean repo and one planted repo.
+    def _marker_world(files: dict[str, str]) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="marker-world-"))
+        for rel, text in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "-c", "core.excludesfile=", "add", "-Af"], cwd=root, check=True)
+        return root
+
+    e2e = [
+        ("marker real clean", {"src/a.rs": "fn a() {}\n",
+                               "web/i.astro": 'import H from "../components/home/H.astro";\n'},
+         []),
+        ("marker real planted", {"src/b.rs": "const B = \"./target/release/infer\";\n",
+                                 "src/c.rs": 'const C = "file:///Users/x/y";\n'},
+         ["release/infer", "/Users/"]),
+    ]
+    for name, files, want in e2e:
+        root = _marker_world(files)
+        try:
+            with rooted(root):
+                got = check_repo_wide_disallowed_markers()
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        got_markers = sorted({m.split("banned marker ", 1)[1].strip("'") for m in got})
+        if got_markers != sorted(want):
+            failures.append(f"{name}: got {got_markers or got}, want {want}")
+        else:
+            print(f"[selftest] {name}: {'-> ' + str(got_markers) if want else 'clean'}")
 
     if failures:
         print("[selftest] FAIL")
