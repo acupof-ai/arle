@@ -90,36 +90,39 @@ The bounded version of the lesson: moving five rules onto the push left three
 on a path chosen by the author, and "pull-request-only" was read as "runs on
 every pull request" when it meant "runs if you use one script".
 
-## On an examples-only diff, two of the three markers cannot cover the change
+## Rule 5's marker cannot cover an examples-only diff; rule 7's can
 
 Measured 2026-09-13 on the lane for #436, whose diff is one file under
-`crates/infer-cuda/examples/`. The rule demands `CUDA_CHECK_EXIT=0` and
-`CLIPPY_EXIT=0` because `CRATE_RUST_PATH` matches any `.rs` under a crate and
-`infer-cuda` declares `no-cuda`. The command those markers name is the lint
-mirror in the agent contract:
+`crates/infer-cuda/examples/`. Both markers were demanded, because
+`CRATE_RUST_PATH` matches any `.rs` under a crate and `infer-cuda` declares
+`no-cuda`.
 
-```
-cargo {check,clippy} -p infer-api --release --no-default-features \
-  --features cuda,no-cuda,nccl,deepep --lib
-```
+The two rules name different commands, and only one of them reaches an example:
 
-Both exited 0 at head. Both are real. Neither compiles the changed file:
-`--lib` builds library targets, and an example is only ever built by
-`--examples` or `--example <name>`. The shared target directory carries 16
-`infer-cuda-*` fingerprint units and 0 units for any parity example, out of
-701 total — no parity example has been compiled on this machine at all.
+- Rule 5 wants `cargo check --features cuda,nccl`. `cargo check` selects
+  library and binary targets; examples are built only under `--examples`,
+  `--example <name>` or `--all-targets`. So a green `CUDA_CHECK_EXIT` on an
+  examples-only diff reports on code the diff does not touch.
+- Rule 7 wants `cargo clippy --workspace --all-targets --features cuda,nccl`.
+  `--all-targets` does include examples, so that marker covers the diff.
 
-So an examples-only pull request can satisfy two of the three marker rules
-with two honestly-measured zeros that are structurally incapable of covering
-its diff. `BUILD_EXIT` is the only one of the three that can, and it is the
-one that needs a card, which is why it is also the one that got manufactured
-on #434.
+The author error underneath is worth recording separately, because it is the
+one that actually happened. Both markers were first supplied from the macOS
+lint mirror in the agent contract,
+`-p infer-api --release --no-default-features --features cuda,no-cuda,nccl,deepep --lib`.
+Both exited 0 and both were honestly measured, but that command is neither of
+the two the rules name: it is scoped to one package, restricted to `--lib`, and
+run with `no-cuda`, the feature the rules explicitly exclude. The shared target
+directory holds 701 fingerprint units, 16 of them `infer-cuda-*` and 0 for any
+parity example — nothing on that machine had ever compiled the changed file.
+The precheck accepted it, since it greps for `KEY=0` and cannot see which
+command produced the number.
 
-This is the same class as the rest of the entry, one level up: the earlier
-finding was a marker not bound to the head commit, this is a marker bound to
-the head commit but measuring a compilation unit the diff does not appear in.
-A green check whose input set excludes the change under test reports on
-something else.
+So the marker rules are stronger than the substitution made for them, and the
+gap that remains is narrower than it first looked: rule 7 is sound as written,
+rule 5 is blind on an examples-only diff, and a marker sourced from a
+convenient local command is indistinguishable from one sourced from the
+prescribed remote one.
 
 ## Fix
 
