@@ -461,25 +461,16 @@ mod real {
             }
         }
 
-        // indices_dev is sized to the per-mode topk_unified; the oracle emits
-        // the fixed TOPK layout. Compare the prefix both share: the device
-        // vector's valid length must equal s_q*topk_unified and agree there
-        // (trailing slots past a shorter HCA pitch are not device-written).
         // The oracle is pitched at the fixed TOPK layout; the device vector at
         // the per-mode topk_unified. Compare per-token rows at each pitch — a
         // flattened-prefix compare crosses the oracle's wider row boundary.
         let idx_len_ok = indices.len() == indices_len;
-        let mut idx_content_ok = idx_len_ok;
-        let mut first_diff: Option<(usize, usize)> = None;
-        'rowcmp: for t in 0..s_q {
-            for k in 0..topk_unified {
-                if indices[t * topk_unified + k] != ref_indices[t * TOPK + k] {
-                    idx_content_ok = false;
-                    first_diff = Some((t, k));
-                    break 'rowcmp;
-                }
-            }
-        }
+        let first_diff = if idx_len_ok {
+            find_row_diff(&indices, &ref_indices, s_q, topk_unified, TOPK)
+        } else {
+            None
+        };
+        let idx_content_ok = first_diff.is_none();
         let idx_ok = idx_len_ok && idx_content_ok;
         if let Some((t, k)) = first_diff {
             eprintln!(
@@ -490,6 +481,21 @@ mod real {
                 ref_indices[t * TOPK + k]
             );
         }
+        // Positive control for the compare itself: tamper one REAL key slot
+        // (token 1's first SW slot) in a host copy and require the same
+        // per-pitch scan to flag it — proves an agreeing run is not the
+        // compare silently passing.
+        let mut tampered = indices.clone();
+        tampered[topk_unified] = tampered[topk_unified].wrapping_neg() - 7;
+        ensure!(
+            tampered[topk_unified] != ref_indices[TOPK],
+            "positive-control tamper happened to equal the oracle value"
+        );
+        ensure!(
+            find_row_diff(&tampered, &ref_indices, s_q, topk_unified, TOPK)
+                .is_some_and(|(t, k)| t == 1 && k == 0),
+            "index compare positive control did not fire at the tampered slot"
+        );
         let topk_ok = check_topk(&topk_len, case, compressed_count);
         let out_ok = max_rel_out <= PASS_MAX_REL_OUT;
         let lse_ok = max_abs_lse <= PASS_MAX_ABS_LSE;
@@ -806,6 +812,25 @@ mod real {
             }
         }
         out
+    }
+
+    /// First (token, k) where a device index row (pitch `dev_pitch`) disagrees
+    /// with the oracle row (pitch `oracle_pitch`), over the device's full row.
+    fn find_row_diff(
+        device: &[i32],
+        oracle: &[i32],
+        s_q: usize,
+        dev_pitch: usize,
+        oracle_pitch: usize,
+    ) -> Option<(usize, usize)> {
+        for t in 0..s_q {
+            for k in 0..dev_pitch {
+                if device[t * dev_pitch + k] != oracle[t * oracle_pitch + k] {
+                    return Some((t, k));
+                }
+            }
+        }
+        None
     }
 
     fn check_topk(topk: &[i32], case: Case, compressed_count: usize) -> bool {
