@@ -123,18 +123,18 @@ Facts read from the pod on 2026-09-13, with the inventory command attached
 - **A complete production checkpoint is already on the box, no
   provisioning needed.** `Qwen3.6-35B-A3B-FP8` is present and complete:
 
-  ```
-  # 35 GB, 42 shards on disk, index names exactly those 42:
-  du -sh /data00/models/Qwen3.6-35B-A3B-FP8          # 35G
-  python3 -c "load model.safetensors.index.json weight_map; \
-     assert sorted(set(values)) == shards-present-on-disk"   # 42 == 42
-  df -h /                                            # 663 GB free
-  ```
+  Verified on the pod (pod-side model root + checkpoint name; absolute
+  machine root omitted to avoid hard-coding a machine path):
+  - size 35 GB, 42 `.safetensors` shards on disk;
+  - the index `weight_map` names exactly 42 distinct shards and all 42 are
+    present (checked by loading the JSON and diffing the shard set against
+    disk);
+  - 663 GB free on the model volume.
 
-  (The `/host` model tree, where the first draft looked, is not where the
-  full weights live; its `Qwen3___6-35B-A3B` has 4 shards and the
-  27B-FP8 dirs there are config-only. There is **no 27B checkpoint on the
-  box**; the complete model is the 35B-A3B MoE.)
+  The earlier draft's mistake was searching only the other mounted model
+  tree (whose copy of this model has just 4 shards and whose 27B-FP8 dirs
+  are config-only). There is **no 27B checkpoint anywhere on the box**;
+  the complete model is the 35B-A3B MoE.
 - **H20 = ~96 GB each** (97871 MiB), so the 35 GB checkpoint fits TP1 on
   one card with room for KV. This checkpoint has a recorded **1×H20
   single-GPU eager baseline** (`docs/baselines.md:150`) and multiple wins
