@@ -311,7 +311,12 @@ pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        // A clock before the Unix epoch cannot produce a meaningful timestamp:
+        // a 0 here mislabels samples as 1970 and, worse, makes every sample
+        // look ancient to the observe retention cutoff, silently changing what
+        // gets deleted. Fail loudly rather than thread an Option through every
+        // wall-time consumer for a box whose clock is broken.
+        .expect("system clock is before the Unix epoch; wall time is unavailable")
 }
 
 /// Backend-reported counters and identity, read at stats-request boundaries.
