@@ -136,7 +136,7 @@ current option.
 
 - **Same-base FP4 vs FP8.** Every comparison in `baselines.md` and both READMEs
   is Qwen3.8-27B-NVFP4 against Qwen3.6-27B-**FP8** — two different models.
-  `Qwen/Qwen3.8-27B-FP8` is now at `/data00/Qwen3.8-27B-FP8` (29 GB, from
+  `Qwen/Qwen3.8-27B-FP8` is now at `<host>/Qwen3.8-27B-FP8` (29 GB, from
   ModelScope; the pod has no HF, ModelScope is reachable). Re-running the chain
   and the eval against it is the first honest answer to "what does FP4 buy on
   this model".

@@ -225,9 +225,9 @@ The capability verdict must come from a teacher>student run, not the
 teacher==student or cold-start V100 probes. The prepared lane is:
 
 ```bash
-ARLE_ROOT=/data01/build/arle \
-STUDENT_MODEL=/data01/models/Qwen3.5-0.8B-Base \
-TEACHER_MODEL=/data01/models/Qwen3.5-4B \
+ARLE_ROOT=<local-arle-checkout> \
+STUDENT_MODEL=<local-qwen3.5-0.8b-dir> \
+TEACHER_MODEL=<local-qwen3.5-4b-dir> \
 bash scripts/h20_teacher_student_opd_curve.sh
 ```
 

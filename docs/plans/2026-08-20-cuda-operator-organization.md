@@ -4,7 +4,7 @@
 > Qwen3.8-27B-NVFP4, ThinkingCap-Qwen3.6-27B-FP8, Qwen3.6-27B-FP8
 > ([wins](../experience/wins/2026-08-20-cuda-operator-organization-t-series.md)).
 > DSv4-Flash receipt pending a 4-GPU window (TP4; the `cuda`-only candidate
-> binaries also need a `nccl` rebuild, done: `/root/arle-runs/arle-*-nccl`).
+> binaries also need a `nccl` rebuild, done: `<host>/arle-runs/arle-*-nccl`).
 >
 > Evidence qualification (2026-08-21): the contract was unsatisfiable until
 > now — `run_fp8_probe.sh` emitted `verified_binary` (reducer accepts only
