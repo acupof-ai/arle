@@ -27,3 +27,20 @@ jobs:
 
       - name: Hygiene self-test
         run: python3 scripts/check_repo_hygiene.py --selftest
+
+  pr-markers:
+    name: PR Body Markers
+    runs-on: ubuntu-latest
+    # pull_request only: the rules check the PR body against the reviewed head.
+    # No path filter — an examples-only or crates-only PR is exactly what these
+    # rules cover, and opening with `gh`/web must run them the same as lane.sh.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The event payload names the head and base shas; a merge-ref checkout
+          # alone would not contain either as a diff endpoint. Fetch both.
+          fetch-depth: 0
+
+      - name: Enforce BUILD/CUDA/CLIPPY marker rules on the PR body
+        run: python3 scripts/lane_pr_precheck.py --ci "$GITHUB_EVENT_PATH"
