@@ -97,16 +97,54 @@ Two wrong fixes were considered before this one:
    bug class would never be caught again. A gate that agrees by no longer
    testing the thing is not a fix.
 
-Lesson: when a conclusion rests on argument position, print the signature
-and call side by side and number them; and when making a test's numbers
-agree, prefer mirroring how production derives them over pinning a
-constant that hides the varying path.
+3. *Flat-prefix compare of two differently-pitched index buffers* (the
+   verification gate's own fault, found on the card after fix 1/2 removed the
+   inf). The check compared
+   `indices[..s_q*topk_unified] == ref_indices[..s_q*topk_unified]`:
+   the device vector at HCA pitch 256 and the oracle at fixed pitch 640. The
+   first 32768 ints of the device buffer hold 128 complete 256-wide rows; the
+   oracle's first 32768 hold only ~51 rows and then cross a 640-row boundary,
+   so the slices differ by construction and the gate reports `indices=false`
+   even though every per-token row agrees — which the per-token diagnostic
+   loop (correctly) printed no mismatch from. The compare itself was the
+   false arm, not the kernel. The fix compares per token:
+   `indices[t*topk_unified+k] == ref_indices[t*TOPK+k]` over
+   `k < topk_unified`. Lesson: two buffers with different row pitches cannot
+   be compared as one flattened prefix; stride each slice by its own pitch or
+   the check measures the stride difference, not the content.
 
-Card confirmation (prediction): with the derived pitch `indices=true`,
-`lse` and `maxlogit` are finite, and HCA output error lands near the CSA
-~6e-4. If the inf survives there is a second fault and investigation stops
-rather than widening the tolerance. Tolerance constants at lines 94-96 are
-unchanged.
+Lesson: when a conclusion rests on argument position, print the signature
+and call side by side and number them; when making a test's numbers agree,
+prefer mirroring how production derives them over pinning a constant that
+hides the varying path; and when a gate reports a mismatch its own
+per-element diagnostic cannot find, suspect the gate's aggregation
+(here: flattening across two pitches) before the producer.
+
+4. *The pre-existing index-builder negative tooth cannot fire its output
+   checks* (main `9a19d0f01`, first GPU execution 2026-09-13 — the arm had
+   never run). The corruption swaps one CSA compressed selection entry at the
+   last token, but the harness builds compressed rows at magnitude ±0.02
+   (`comp` latent, example:213-218) while Q is aligned to the chunk keys, and
+   the swapped key is one of ~640 in the softmax. Measured clean-vs-corrupted
+   delta: output rel 0.00542 vs threshold 0.05, lse 1.1e-5 vs 0.10, maxlogit
+   0.0 vs 0.05 — `indices=true` (the kernel honors the bad indices, and the
+   kernel-built indices match the corrupted oracle) but out/lse/maxlogit all
+   read `false` (did not fire) and the run exits 1 with
+   "output negative control did not fire". The tooth is too weak by
+   construction, not a kernel fault. Fix direction is an index corruption that
+   swaps in a high-weight key (e.g. a SW/chunk-row slot the token is causally
+   allowed to read) so the output must move; deferred to the owner of
+   `9a19d0f01`.
+
+## Card result
+
+Measured 2026-09-13 on H20 sm90 card 1 (`--features cuda`, release,
+build id c0ee7deef…), 18 positive cases (CSA/HCA × chunks 128/2048/4096 ×
+starts 63/128/255): all `pack=true indices=true topk=true`; HCA output
+rel 0.00072–0.00083, lse abs 0.00001, maxlogit abs 0.00008–0.00011;
+`ALL PASS`, rc=0. HCA output error is in the CSA range (~7e-4), as
+predicted. The `--negative-control` invocation is recorded separately.
+Tolerance constants at lines 94-96 are unchanged.
 
 ## Rule
 

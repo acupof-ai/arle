@@ -465,8 +465,31 @@ mod real {
         // the fixed TOPK layout. Compare the prefix both share: the device
         // vector's valid length must equal s_q*topk_unified and agree there
         // (trailing slots past a shorter HCA pitch are not device-written).
-        let idx_ok =
-            indices.len() == indices_len && indices[..indices_len] == ref_indices[..indices_len];
+        // The oracle is pitched at the fixed TOPK layout; the device vector at
+        // the per-mode topk_unified. Compare per-token rows at each pitch — a
+        // flattened-prefix compare crosses the oracle's wider row boundary.
+        let idx_len_ok = indices.len() == indices_len;
+        let mut idx_content_ok = idx_len_ok;
+        let mut first_diff: Option<(usize, usize)> = None;
+        'rowcmp: for t in 0..s_q {
+            for k in 0..topk_unified {
+                if indices[t * topk_unified + k] != ref_indices[t * TOPK + k] {
+                    idx_content_ok = false;
+                    first_diff = Some((t, k));
+                    break 'rowcmp;
+                }
+            }
+        }
+        let idx_ok = idx_len_ok && idx_content_ok;
+        if let Some((t, k)) = first_diff {
+            eprintln!(
+                "idx diff token={t} k={k} topk_len={} got={} oracle={} \
+                 (topk_unified={topk_unified})",
+                topk_len[t],
+                indices[t * topk_unified + k],
+                ref_indices[t * TOPK + k]
+            );
+        }
         let topk_ok = check_topk(&topk_len, case, compressed_count);
         let out_ok = max_rel_out <= PASS_MAX_REL_OUT;
         let lse_ok = max_abs_lse <= PASS_MAX_ABS_LSE;
