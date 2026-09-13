@@ -729,10 +729,18 @@ mod real {
         // takes its slot from atomicAdd on the expert cursor, so the order
         // within an expert's span is an arbitrary permutation. Compare the
         // route set per span; the sequence is not a kernel contract.
-        fam.pack = (0..orc.counts.len()).all(|e| {
+        // Span bounds come from consecutive offsets, never from orc.counts:
+        // offsets is the plain exclusive scan, so the difference IS the count,
+        // and taking it here keeps pack independent of whatever the counts
+        // family's tooth does to that array.
+        fam.pack = (0..orc.offsets.len()).all(|e| {
             let lo = orc.offsets[e] as usize;
-            let hi = lo + orc.counts[e] as usize;
-            if hi > got_pack.len() || hi > orc.packed_route_slot.len() {
+            let hi = if e + 1 < orc.offsets.len() {
+                orc.offsets[e + 1] as usize
+            } else {
+                orc.total as usize
+            };
+            if hi < lo || hi > got_pack.len() || hi > orc.packed_route_slot.len() {
                 return false;
             }
             let mut got_span = got_pack[lo..hi].to_vec();
@@ -820,7 +828,11 @@ mod real {
             let mut expected = b.clone();
             match name {
                 "route" => expected.got_indices[0] ^= 1,
-                "counts" => expected.orc.counts[0] ^= 1,
+                // Corrupt the DEVICE side, as the route tooth does. Editing
+                // orc.counts instead would shrink the span pack slices and
+                // redden pack by construction, which is not a comparator
+                // dependency worth having and trips the specificity check.
+                "counts" => expected.got_counts[0] ^= 1,
                 "offsets" => {
                     expected.orc.aligned_offsets[0] =
                         expected.orc.aligned_offsets[0].wrapping_add(7)
