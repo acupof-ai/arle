@@ -415,7 +415,10 @@ __global__ void gpu_sample_kernel(
       __syncthreads();
       total_count = shared_count;
 
-      if (total_count > top_k) {
+      // Predicate converges lo to the k-th largest probability, so keeping
+      // probs >= lo keeps exactly k (plus genuine ties at the boundary).
+      // ">=" (not ">"): a threshold at the (k+1)-th rank would keep k+1.
+      if (total_count >= top_k) {
         lo = mid;
       } else {
         hi = mid;
@@ -687,7 +690,10 @@ __device__ void dspark_filter_row(const __nv_bfloat16 *__restrict__ logits,
       for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
         if (probs[i] >= mid) local_count += 1.0f;
       float count = dspark_block_sum(local_count, red);
-      if (count > (float)top_k) lo = mid; else hi = mid;
+      // Converge lo to the k-th largest prob so probs >= lo keeps exactly k
+      // (plus true boundary ties). ">" here converged one rank low and kept
+      // k+1 even with no tie present.
+      if (count >= (float)top_k) lo = mid; else hi = mid;
     }
     for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
       if (probs[i] < lo) probs[i] = 0.0f;
