@@ -1,0 +1,30 @@
+name: PR Body Markers
+
+# The three PR-body marker rules (BUILD/CUDA_CHECK/CLIPPY_EXIT), run on every
+# pull request. Kept in its OWN workflow rather than as a job in hygiene.yml so
+# it can subscribe to `edited`: a body-only change (markers deleted after the PR
+# went green) must re-run THIS check without re-running the full Repo Hygiene
+# job. GitHub activity types are workflow-level, so subscribing to edited in
+# the shared hygiene.yml would rerun repo-hygiene on every body edit.
+#
+# No path filter: an examples-only or crates-only PR is exactly what these
+# rules cover, and opening with `gh`/web must run them the same as lane.sh.
+
+on:
+  pull_request:
+    branches: [ main, master ]
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  pr-markers:
+    name: PR Body Markers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The event payload names the head and base shas; a merge-ref checkout
+          # alone would not contain either as a diff endpoint. Fetch both.
+          fetch-depth: 0
+
+      - name: Enforce BUILD/CUDA/CLIPPY marker rules on the PR body
+        run: python3 scripts/lane_pr_precheck.py --ci "$GITHUB_EVENT_PATH"
