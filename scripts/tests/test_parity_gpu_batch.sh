@@ -101,10 +101,12 @@ run_model_batch() {  # $1 gate list, $2 out dir
     ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$2"
 }
-# Mock binary: print the right first token; the launcher prints ALL PASS.
+# Mock binary: print the right first token and a gate_scope; the launcher
+# verdict carries the scope into results.tsv.
 cat > "$BIN/dsv4_parity" <<'SH'
 #!/usr/bin/env bash
 echo "clean_tokens=[11111, 603, 671, 6102, 294, 8760, 344]"
+echo "gate_scope=first-token-only(incremental bail at step 1)"
 SH
 chmod +x "$BIN/dsv4_parity"
 # Launcher must exist in the repo tree the test runs against.
@@ -114,8 +116,8 @@ if run_model_batch "dsv4_parity:model" "$OUT_MR" >"$TMP/model-run.log" 2>&1; the
     echo "FAIL: model gate with valid oracle exited non-zero" >&2
     cat "$TMP/model-run.log" >&2; exit 1
 fi
-grep -qE $'^dsv4_parity\tno\tallowlisted\t0\tALL PASS\tn/a\tn/a\tPASS\t' "$OUT_MR/results.tsv" \
-    || { echo "FAIL: model gate not PASS with the correct oracle" >&2
+grep -qE $'^dsv4_parity\tno\tallowlisted\t0\tALL PASS gated=first-token-only\\(incremental bail at step 1\\)\tn/a\tn/a\tPASS\t' "$OUT_MR/results.tsv" \
+    || { echo "FAIL: model gate not PASS or scope missing from verdict" >&2
          cat "$OUT_MR/results.tsv" >&2; exit 1; }
 grep -q 'multi-rank on physical GPUs' "$TMP/model-run.log" \
     || { echo "FAIL: model phase launch line missing" >&2; cat "$TMP/model-run.log" >&2; exit 1; }

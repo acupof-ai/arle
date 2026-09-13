@@ -45,9 +45,12 @@
 #     WORLD_SIZE             ranks when DSV4_PARITY_GPUS is unset (default 8)
 #
 # Verdict: compares rank 0's first clean_token to the validated oracle 11111
-# and prints ALL PASS (rc 0) or FAIL (rc 1) on stdout. The single-card
-# parity_gpu_batch.sh greps ALL PASS; the other 15 oracle tokens are still
-# gated behind the incremental-decode follow-up (bail surfaced in stderr).
+# and prints `ALL PASS gated=<scope>` (rc 0) or `FAIL ... (gated=<scope>)`
+# (rc 1) on stdout. <scope> is rank 0's gate_scope line (first-token-only or
+# first-token+N-incremental) so results.tsv states what was checked. The
+# single-card parity_gpu_batch.sh greps the ALL PASS marker; the other 15
+# oracle tokens are still gated behind the incremental-decode follow-up
+# (bail surfaced in the scope and rank-0 stderr).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -146,9 +149,14 @@ echo "[launcher]       gate on every layer type; the remaining 15 oracle tokens"
 echo "[launcher]       need the incremental-decode (start_pos>0) follow-up." >&2
 
 first_token="$(printf '%s' "$RANK0_TOKENS" | sed -n 's/^clean_tokens=\[\([0-9][0-9]*\)\(,.*\)\{0,1\}\]$/\1/p')"
+# What the positive verdict actually gated. The example emits one gate_scope
+# line on rank 0; carry it into the verdict string so results.tsv states the
+# checked coverage instead of a bare ALL PASS that could be read as 16/16.
+GATE_SCOPE="$(grep -E '^gate_scope=' "${LOGS[0]}" | tail -n1 | sed 's/^gate_scope=//' || true)"
+SCOPE_LABEL="${GATE_SCOPE:-first-token}"
 if [ "$first_token" = "$FIRST_ORACLE" ]; then
-    echo "ALL PASS"
+    echo "ALL PASS gated=${SCOPE_LABEL}"
     exit 0
 fi
-echo "FAIL: rank0 first token ${first_token:-<missing>} != $FIRST_ORACLE"
+echo "FAIL: rank0 first token ${first_token:-<missing>} != $FIRST_ORACLE (gated=${SCOPE_LABEL})"
 exit 1
