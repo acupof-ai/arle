@@ -252,7 +252,9 @@ mod real {
         }
         let aligned_total = aacc;
 
-        // Pack: within each local expert, global routes ascending.
+        // Pack: one representative permutation. The kernel's slot order
+        // within an expert is arbitrary, so the comparator reads each span as
+        // a set; ascending fill here is convenience, not the contract.
         let n_local = total as usize;
         let mut packed_route_slot = vec![-1i32; n_local.max(1)];
         let mut cursors = vec![0i32; experts_per_rank];
@@ -572,7 +574,11 @@ mod real {
         // observed as a totals mismatch, not a clipped write.
         let dev_aligned = got_aligned_total[0].max(0) as usize;
         let row_capacity = dev_aligned.max(orc.aligned_total as usize).max(1);
-        let m_indices_d = ctx.stream.alloc_zeros::<i32>(row_capacity)?;
+        // Production pre-fills -1 (`moe/qwen.rs` neg1_filled, `moe/dsv4.rs`
+        // alloc_neg1_i32) and the fill kernel writes only rows < count, so the
+        // aligned padding must stay -1. alloc_zeros left it at 0, which reads
+        // as expert 0 — a configuration production never runs.
+        let m_indices_d = ctx.stream.clone_htod(&vec![-1i32; row_capacity])?;
         // SAFETY: m_indices has row_capacity rows and the kernel guards against it.
         unsafe {
             moe::dsv4_fill_m_indices_from_counts(
@@ -719,7 +725,22 @@ mod real {
         fam.counts = got_counts == orc.counts;
         fam.offsets = got_offsets == orc.offsets && got_aligned_offsets == orc.aligned_offsets;
         fam.totals = got_total == orc.total && got_aligned_total == orc.aligned_total;
-        fam.pack = got_pack == &orc.packed_route_slot[..got_pack.len()];
+        // dsv4_pack_local_experts_with_slots runs one block per route and
+        // takes its slot from atomicAdd on the expert cursor, so the order
+        // within an expert's span is an arbitrary permutation. Compare the
+        // route set per span; the sequence is not a kernel contract.
+        fam.pack = (0..orc.counts.len()).all(|e| {
+            let lo = orc.offsets[e] as usize;
+            let hi = lo + orc.counts[e] as usize;
+            if hi > got_pack.len() || hi > orc.packed_route_slot.len() {
+                return false;
+            }
+            let mut got_span = got_pack[lo..hi].to_vec();
+            let mut want_span = orc.packed_route_slot[lo..hi].to_vec();
+            got_span.sort_unstable();
+            want_span.sort_unstable();
+            got_span == want_span
+        });
         fam.m_indices = got_m == orc.m_indices;
         if !fam.counts {
             eprintln!("[{tag}] FAIL counts got{got_counts:?} want{:?}", orc.counts);
@@ -804,13 +825,11 @@ mod real {
                     expected.orc.aligned_offsets[0] =
                         expected.orc.aligned_offsets[0].wrapping_add(7)
                 }
-                "pack" => {
-                    if b.n_local > 1 {
-                        expected.orc.packed_route_slot.swap(0, 1);
-                    } else {
-                        expected.orc.packed_route_slot[0] ^= 1;
-                    }
-                }
+                // The pack comparator compares each expert span as a set, so a
+                // positional swap inside one span is not a fault and would
+                // leave this tooth dead. Change a route VALUE instead: the
+                // span's multiset gains one member and loses another.
+                "pack" => expected.orc.packed_route_slot[0] ^= 1,
                 "m_indices" => {
                     // Distinct kernel (dsv4_fill_m_indices_from_counts): flip a
                     // guaranteed-LIVE expert row, never a -1 pad slot. The live
