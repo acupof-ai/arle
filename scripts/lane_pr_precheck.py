@@ -207,45 +207,68 @@ COMMENT_REF_EXEMPT_PREFIX = ".github/"
 
 
 class UnresolvableRange(RuntimeError):
-    """A diff endpoint object is absent from the local clone (needs fetch)."""
+    """A diff endpoint is absent even after a fetch; comparison is impossible."""
 
 
 def git(args: list[str], cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-def git_range(args: list[str], cwd: Path, base: str, head: str) -> str:
-    """Like git(), but an unknown endpoint is a refusal, not a traceback.
+def _ref_present(cwd: Path, ref: str) -> bool:
+    return (
+        subprocess.run(["git", "cat-file", "-t", ref], cwd=cwd, capture_output=True).returncode
+        == 0
+    )
 
-    When the local branch is behind, the pre-push hook hands us
-    remote-tip..local-tip and the remote tip may be a commit this clone has not
-    fetched. `git diff` then exits 128; surfacing CalledProcessError dumps a
-    stack trace that reads like a content-rule failure on the author's own
-    diff. A gate that cannot see the bytes must refuse and name the cause.
+
+def _fetch_missing(cwd: Path, base: str, head: str) -> None:
+    """Best-effort fetch of a missing range endpoint from the origin remote.
+
+    A push hook sees remote-tip..local-tip where the remote tip may be a commit
+    the clone lacks after someone merged on the forge. Recovery is `git fetch`;
+    do it once. `fetch origin` (no refspec) updates remote-tracking refs under
+    the default refspec; a sha-only object (no ref points at it) is still
+    unreachable that way, in which case the caller refuses cleanly.
     """
-    try:
-        return subprocess.run(
-            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
-        ).stdout
-    except subprocess.CalledProcessError as exc:
-        missing = _missing_range_object(cwd, base, head)
-        if missing:
-            raise UnresolvableRange(
-                f"cannot resolve diff range {base}..{head}: {missing} is not in "
-                "this clone. Fetch first (e.g. `git fetch origin`) and re-run; "
-                "a range that cannot be read refuses rather than passing."
-            ) from exc
-        raise
+    subprocess.run(["git", "fetch", "--quiet", "origin"], cwd=cwd, capture_output=True)
 
 
-def _missing_range_object(cwd: Path, base: str, head: str) -> str | None:
-    for ref in (base, head):
-        r = subprocess.run(
-            ["git", "cat-file", "-t", ref], cwd=cwd, capture_output=True, text=True
+def git_range(args: list[str], cwd: Path, base: str, head: str) -> str:
+    """Run a range git command, fetching once if an endpoint is absent.
+
+    Distinguishes "I could not run because the base is not in this clone"
+    (fetch and retry once, then refuse with the cause) from "the objects are
+    present but the diff itself failed" (a real error, surfaced as such). Both
+    previously surfaced as one uncaught CalledProcessError traceback.
+    """
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, check=False, capture_output=True, text=True
+    )
+    if proc.returncode == 0:
+        return proc.stdout
+
+    absent = [r for r in (base, head) if not _ref_present(cwd, r)]
+    if absent:
+        _fetch_missing(cwd, base, head)
+        retry = subprocess.run(
+            ["git", *args], cwd=cwd, check=False, capture_output=True, text=True
         )
-        if r.returncode != 0:
-            return ref
-    return None
+        if retry.returncode == 0:
+            return retry.stdout
+        still = [r for r in absent if not _ref_present(cwd, r)]
+        if still:
+            raise UnresolvableRange(
+                f"cannot resolve diff range {base}..{head}: {', '.join(still)} not in "
+                "this clone and a `git fetch origin` did not provide it. Fetch the base "
+                "(e.g. `git fetch origin main`) and re-run; a range that cannot be read "
+                "refuses rather than passing."
+            )
+    # Endpoints are present (or became present) but the command still fails:
+    # that is a genuine git error, not a stale clone — report it without a trace.
+    raise RuntimeError(
+        f"git {' '.join(args[:2])} on {base}..{head} failed: "
+        f"{proc.stderr.strip() or proc.stdout.strip()}"
+    )
 
 
 def added_lines(repo: Path, base: str, head: str) -> dict[str, list[str]]:
@@ -846,11 +869,11 @@ def run_ci(repo: Path, event_path: str) -> tuple[list[str], str]:
         pr_body = pull.get("body") or ""
     except (KeyError, TypeError) as exc:
         return ([f"ci: pull_request event payload missing {exc}; cannot run PR marker rules"], "ci")
-    # `fetch-tags: 0` + a merge checkout can leave the payload shas absent; CI
-    # checks out both refs (job config), but verify instead of assuming.
-    missing = _missing_range_object(repo, base_sha, head_sha)
-    if missing:
-        return ([f"ci: {missing} from the PR payload is not checked out; configure the job to fetch both base and head"], "ci")
+    # `fetch-tags: 0` + a merge checkout can leave the payload shas absent; the
+    # job fetches depth 0, but verify instead of assuming and refuse cleanly.
+    absent = [r for r in (base_sha, head_sha) if not _ref_present(repo, r)]
+    if absent:
+        return ([f"ci: {', '.join(absent)} from the PR payload is not checked out; configure the job to fetch both base and head"], "ci")
     return (run_pr(repo, pr_body, head_sha=head_sha, base=base_sha, head_ref=head_sha), "ci")
 
 
@@ -908,7 +931,7 @@ def main() -> int:
             ).returncode == 0:
                 head_sha = git(["rev-parse", "HEAD"], repo).strip()
             failures = run_pr(repo, pr_body, head_sha=head_sha)
-    except UnresolvableRange as exc:
+    except (UnresolvableRange, RuntimeError) as exc:
         print(f"[{label}] FAIL — refusing:\n- {exc}", file=sys.stderr)
         return 1
 

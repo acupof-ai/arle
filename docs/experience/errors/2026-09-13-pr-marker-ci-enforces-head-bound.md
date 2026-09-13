@@ -31,10 +31,13 @@ reviewed head or measured at all.
 - A missing marker and a present-but-malformed one give different messages.
   The stale/attribution messages name the sha found and the head wanted and say
   to re-measure after the last push rather than rebuild.
-- A diff endpoint the clone does not have (a behind-local remote tip) is a
-  clean refusal naming the range and suggesting a fetch, replacing a raw
-  `CalledProcessError` traceback that read like a content-rule failure. A range
-  that cannot be read refuses; it does not pass.
+- A diff endpoint the clone does not have (a behind-local remote tip after a
+  forge-side merge) triggers one quiet `git fetch origin` and a retry; if the
+  object is still absent the check refuses cleanly, naming the range and the
+  fetch recovery, instead of dumping a raw `CalledProcessError` traceback that
+  read like a content-rule failure. Endpoints that are present but whose diff
+  genuinely fails are reported as a real git error, the other branch of the
+  same handler. A range that cannot be read refuses; it does not pass.
 
 Local `lane.sh pr` now also binds to its HEAD when `origin/main` is present,
 catching a stale marker before push; CI is the binding gate regardless.
