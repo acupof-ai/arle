@@ -33,8 +33,8 @@ _ABS_SEGMENTS = "|".join(["/" + s for s in
     ("Users/", "root/", "data0", "mnt/", "host/")])
 ```
 
-`/home/` is not in the list. The check is an allow-by-omission denylist:
-each machine-root prefix was added as it was found, and `/home/` (the Linux
+`<home>/` is not in the list. The check is an allow-by-omission denylist:
+each machine-root prefix was added as it was found, and `<home>/` (the Linux
 home-root equivalent of the macOS `Users/` home root) was never enumerated, so the literal
 passed hygiene on every push. The same defect class as the rest of this
 week — the mechanism runs, but its input set is incomplete.
