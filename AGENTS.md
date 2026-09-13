@@ -53,9 +53,8 @@ Non-obvious ownership:
 **Metal canonical model — globally unified:
 `mlx-community/Qwen3.6-35B-A3B-4bit`** (MoE, ~19 GB, HF-cached) — the default for
 every Metal serve, `scripts/bench_*.sh`, smoke, and Metal wins/errors; detects
-MoE regressions a dense model cannot. Unit-test opt-out:
-`INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit` (document why). CUDA benches
-keep their own defaults.
+MoE regressions a dense model cannot. CUDA benches keep their own defaults.
+No Metal unit test loads a model, so there is no unit-test opt-out to name.
 - **Auto-wired-limit** (always-on): the Metal executor pins weights via
   `mlx::set_wired_limit` at construction (`infer-metal/src/wired_limit.rs`) —
   c=1 p99 86→15 ms on Qwen3.6.
