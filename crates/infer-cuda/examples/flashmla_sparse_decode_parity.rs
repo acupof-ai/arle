@@ -95,18 +95,38 @@ mod real {
     const START_POS: [i32; B] = [63, 64, 65, 127, 128, 129, 255, 256];
     const DOM_SLOT: usize = 0;
 
-    // Caps for THIS construction: the dominant 0.5 latent packs exactly
-    // (0.5/2^-9 = 256, an E4M3 level) and carries ~all the weight, so the
-    // dominant-key channel is quantization-exact and only small random keys
-    // contribute bounded error (E4M3 worst half-ULP 1/16 in the top binade;
-    // they land in much tighter low binades). Pre-GPU analytic caps, to be
-    // confirmed/tightened from the measured run. PACK_NOPE_REL 0.07 specifically
-    // clears the pure-repack e4m3 RN supremum: worst bf16 value rounding down a
-    // bin over the smallest shared e4m3 value is 16/272 ≈ 0.0588, f32-scale
-    // bind 17/273 ≈ 0.0623, correct packs measure ≤0.044. PACK_ROPE_ABS 0.01
-    // (bf16-only rope channel) and the LSE 0.10 caps are not separately derived.
-    const PASS_MAX_REL_OUT: f64 = 0.05;
+    // Output cap — PARTIALLY DERIVED, valid for THIS fixed construction only.
+    // Construction: q ≡ 0.5 bf16, the dominant latent's V = 0.5 packs to an
+    // exact e4m3 level, background V ∈ [-.05, .05] comes from the deterministic
+    // rand01 hash (a constant of the file, not a seeded draw). Analytic clean
+    // supremum for the metric max|err|/||ref||₂ at the widest row (start 256:
+    // 128 window + 64 compressed keys = 192 background): score gap
+    // (128 − 12.8)/√512 = 5.09, where 12.8 = 512·q·|k_bg|max = 512·0.5·0.05
+    // is the all-512-dims-aligned worst background key (rand01·0.1 − .05), so
+    // total background softmax weight
+    // w ≤ 192·e^-5.09/(1 + …) = 0.542 and the dominant keeps p ≥ 0.459; per-
+    // element reference floor is 0.5p − .05w = 0.202. Background V carries
+    // e4m3 RN error ≤ .05/16 weighted by w (1.69e-3), plus one bf16 output store
+    // at the output binade [.125,.25) (4.9e-4): max/||ref|| ≤ 0.0108. Measured
+    // clean is far tighter — ≤1.4e-5 here and ≤7.1e-5 across both decode gates
+    // over the complete sweep (B ∈ {1,8} are the only shapes run) — because
+    // the bound assumes worst-case sign alignment of every background key,
+    // which the fixed inputs do not realize. The dominant-key-drop tooth moves
+    // the same metric to 4.5183e-2 (sparse) / 4.4767e-2 (hca). 0.02 is ~1.85x
+    // over the analytic clean supremum, ≥280x over measured clean, and 2.24x
+    // under the smallest measured defect. Change the construction and this
+    // must be re-derived.
+    const PASS_MAX_REL_OUT: f64 = 0.02;
+    // LSE abs — measured two-sided over the same complete sweep: clean ≤6.05e-3
+    // sparse / 1.71e-2 hca, dominant-drop defect 1.5476 / 1.1676; 0.10 keeps
+    // ≥5.8x clean headroom and ≥11x fire-side margin.
     const PASS_MAX_ABS_LSE: f64 = 0.10;
+    // PACK_NOPE_REL 0.07 clears the pure-repack e4m3 RN supremum: worst bf16
+    // value rounding down a bin over the smallest shared e4m3 value is
+    // 16/272 ≈ 0.0588, f32-scale bind 17/273 ≈ 0.0623, correct packs measure
+    // ≤0.044. Clean-side derived; no defect side measured yet. PACK_ROPE_ABS
+    // 0.01 (bf16-only rope channel) is not derived — a tight bf16-round bound,
+    // clean-run-set, needs one.
     const PACK_NOPE_REL: f64 = 0.07;
     const PACK_ROPE_ABS: f32 = 0.01;
 

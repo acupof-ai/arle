@@ -100,20 +100,38 @@ mod real {
 
     // HCA has no selected indexer; the builder reads selected=null.
 
-    // Attention output rel and LSE abs: no derivation. They compare the sparse
-    // attention forward against the f64 dense causal oracle; the error is the
-    // e4m3-packed-KV round plus online-softmax/LSE accumulation, but no
-    // supremum is computed. Both are clean-run-set at B=8/start 384 and need a
-    // bound on the packed-KV softmax error.
-    const PASS_MAX_REL_OUT: f64 = 0.05;
+    // Output cap — PARTIALLY DERIVED, valid for THIS fixed construction only.
+    // Construction: q ≡ 0.5 bf16, the dominant latent's V = 0.5 packs to an
+    // exact e4m3 level, background V ∈ [-.05, .05] comes from the deterministic
+    // rand01 hash (a constant of the file, not a seeded draw). Analytic clean
+    // supremum for max|err|/||ref||₂ at the widest row (start 384: 128 window +
+    // 3 HCA-compressed keys = 131 background): score gap
+    // (128 − 12.8)/√512 = 5.09 (12.8 = 512·q·|k_bg|max = 512·0.5·0.05, all
+    // dims aligned) gives total
+    // background softmax weight w = 0.446, dominant p = 0.554, per-element
+    // reference floor 0.5p − .05w = 0.255; background e4m3 RN error weighted by
+    // w is 1.39e-3 plus one bf16 store at the output binade [.25,.5) (9.8e-4),
+    // so worst clean max/floor ≤ 0.0093. Measured clean is far tighter —
+    // ≤7.1e-5 across both decode gates over the complete sweep (B ∈ {1,8} are
+    // the only shapes run) — because the bound assumes worst-case sign
+    // alignment of every background key, which the fixed inputs do not realize.
+    // The strong tooth (dominant key dropped) moves the metric to 4.4767e-2.
+    // 0.02 is ~2.1x over the analytic supremum, ≥280x over measured clean, and
+    // 2.24x under the measured defect. Change the construction and this must be
+    // re-derived.
+    const PASS_MAX_REL_OUT: f64 = 0.02;
+    // LSE abs — measured two-sided over the same complete sweep: clean ≤1.71e-2
+    // here / 6.05e-3 sparse, strong-tooth defect 1.1676 / 1.5476; 0.10 keeps
+    // ≥5.8x clean headroom and ≥11x fire-side margin.
     const PASS_MAX_ABS_LSE: f64 = 0.10;
     // pack nope rel 0.07 IS derived: pure e4m3 RN repack of the bf16 nope
     // channel has a worst-case rel error 16/272 ≈ 0.0588 (max bf16 value that
     // rounds down a bin over the smallest e4m3 value it shares the bin with);
     // the f32-scale binding is 17/273 ≈ 0.0623; correct packs measure ≤0.044.
-    // 0.07 clears the 0.0623 bind with margin. pack rope abs 0.01 is not
-    // derived — the rope channel is a bf16 copy with no e4m3 step, so it wants
-    // a tight bf16-round bound; clean-run-set, needs one.
+    // 0.07 clears the 0.0623 bind with margin. Clean-side derived; no defect
+    // side measured. pack rope abs 0.01 is not derived — the rope channel is a
+    // bf16 copy with no e4m3 step, so it wants a tight bf16-round bound;
+    // clean-run-set, needs one.
     const PACK_NOPE_REL: f64 = 0.07;
     const PACK_ROPE_ABS: f32 = 0.01;
 
