@@ -532,11 +532,11 @@ export CUDA_HOME=/usr/local/cuda
 export INFER_TILELANG_PYTHON=.venv/bin/python
 ```
 
-### GPU tests
+### Metal SFT smoke (`scripts/train_and_chat.sh`)
 
-```bash
-export INFER_TEST_MODEL_PATH=models/Qwen3.5-4B
-```
+No variables required — the script defaults to `models/Qwen3-0.6B`. Set
+`INFER_TEST_MODEL_PATH` only to point it at a different local model. It is
+not a GPU-test variable and no Rust test reads it; see section 5.
 
 ### Integration API tests
 
