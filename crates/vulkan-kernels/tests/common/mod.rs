@@ -2,9 +2,11 @@
 
 /// Obtain a [`VulkanContext`], or SKIP the test cleanly when no device exists.
 ///
-/// CI sets `ARLE_REQUIRE_VULKAN_DEVICE=1`: with that set, a missing device
-/// PANICS instead of silently passing (an uninstalled ICD otherwise makes every
-/// device gate a no-op, so a green suite would prove nothing).
+/// No CI workflow sets `ARLE_REQUIRE_VULKAN_DEVICE`, and no CI lane provisions
+/// a Vulkan ICD (the Apple-Silicon lane is Metal-only — no MoltenVK/VK_ICD
+/// setup), so these device gates skip in every current lane. The knob is the
+/// mechanism by which a runner that DOES provide a device makes a missing one
+/// panic instead of silently pass; it is unbacked until such a lane exists.
 pub fn require_device() -> Option<vulkan_sys::VulkanContext> {
     match vulkan_sys::VulkanContext::create() {
         Ok(ctx) => {
