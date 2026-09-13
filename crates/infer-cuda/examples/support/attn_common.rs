@@ -145,9 +145,23 @@ impl Metrics {
     }
 }
 
+/// What a negative run changes, selecting how row 0 is measured.
+#[allow(dead_code)] // shared harness; each gate uses only a subset of modes
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tooth {
+    /// Clean inputs, clean expectations.
+    Clean,
+    /// Device inputs stay clean; only the row-0 expectation is shifted.
+    /// Proves the comparator is alive, not that the kernel read an input.
+    ExpectShift,
+    /// The device INPUT was sabotaged and the kernel ran on it; expectations
+    /// stay clean. Row-0 violations are counted against the clean oracle.
+    DeviceCorrupt,
+}
+
 /// Compare one flat row-major output `[rows, d]` against f64 expectations.
-/// When `corrupt`, the first row's expectations are shifted, which must take
-/// both the L2 and violation gates down (negative-control tooth).
+/// `ExpectShift` shifts row 0's expectations; `DeviceCorrupt` leaves them
+/// clean and measures row 0 against a kernel fed corrupted device input.
 #[allow(clippy::needless_range_loop)]
 pub fn compare_rows(
     got: &[bf16],
@@ -157,20 +171,21 @@ pub fn compare_rows(
     h_stride: usize,
     row_ids: &[(usize, usize)],
     tol: &Tol,
-    corrupt: bool,
+    tooth: Tooth,
 ) -> Metrics {
+    let measure_row0 = tooth != Tooth::Clean;
     let mut diff_sq = 0f64;
     let mut ref_sq = 0f64;
     let mut violators = 0usize;
     let mut total = 0usize;
     let mut max_dev = 0f64;
-    // Row-0-only counts, populated only under corruption.
+    // Row-0-only counts, populated only under a tooth.
     let mut row0_violators = 0usize;
     let mut row0_total = 0usize;
     for (i, (token, h)) in row_ids.iter().enumerate().take(n_rows) {
         for dd in 0..d {
             let mut w = wants[i][dd];
-            if corrupt && i == 0 {
+            if tooth == Tooth::ExpectShift && i == 0 {
                 w += 0.5;
             }
             let g = f64::from(got[(*token * h_stride + h) * d + dd].to_f32());
@@ -183,7 +198,7 @@ pub fn compare_rows(
             if outside {
                 violators += 1;
             }
-            if corrupt && i == 0 {
+            if measure_row0 && i == 0 {
                 row0_total += 1;
                 if outside {
                     row0_violators += 1;
@@ -195,7 +210,7 @@ pub fn compare_rows(
         rel_l2: (diff_sq / ref_sq.max(1e-12)).sqrt(),
         viol_frac: violators as f64 / total as f64,
         max_dev,
-        corrupt_row_viol_frac: if corrupt && row0_total > 0 {
+        corrupt_row_viol_frac: if measure_row0 && row0_total > 0 {
             Some(row0_violators as f64 / row0_total as f64)
         } else {
             None

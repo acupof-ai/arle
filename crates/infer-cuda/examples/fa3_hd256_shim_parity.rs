@@ -117,7 +117,9 @@ mod real {
 #[cfg(feature = "cuda")]
 mod real {
     use super::Family;
-    use super::attn_common::{self, Rng, Tol, bf, e4m3_decode, e4m3_encode, i8_encode, lcg_perm};
+    use super::attn_common::{
+        self, Rng, Tol, Tooth, bf, e4m3_decode, e4m3_encode, i8_encode, lcg_perm,
+    };
     use anyhow::{Result, ensure};
     use cuda_kernels::attention::{fa3_fwd_hd256_bf16, fa3_fwd_hd256_quant};
     use cuda_kernels::ffi;
@@ -661,7 +663,12 @@ mod real {
         corrupt_anchor: bool,
     ) -> CmpOutcome {
         let tol = case.form.tol();
-        let m = attn_common::compare_rows(got, wants, rows.len(), D, H, rows, tol, corrupt_mirror);
+        let tooth = if corrupt_mirror {
+            Tooth::ExpectShift
+        } else {
+            Tooth::Clean
+        };
+        let m = attn_common::compare_rows(got, wants, rows.len(), D, H, rows, tol, tooth);
         let mirror_ok = attn_common::metrics_pass(&m, tol);
         let Some(wants_anchor) = wants_anchor else {
             return CmpOutcome {
@@ -681,7 +688,11 @@ mod real {
             H,
             rows,
             &TOL_FP8_ANCHOR,
-            corrupt_anchor,
+            if corrupt_anchor {
+                Tooth::ExpectShift
+            } else {
+                Tooth::Clean
+            },
         );
         let anchor_ok = attn_common::metrics_pass(&ma, &TOL_FP8_ANCHOR);
         CmpOutcome {

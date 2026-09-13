@@ -40,9 +40,18 @@
 //! accumulation, split merge, and fast `__expf`, so the band is close to the
 //! BF16-pool gate's. Every output column is compared on every query row.
 //!
-//! Negative control is per pool family: `--negative-control=int8|fp8`
-//! corrupts one family's expectations and requires the other to stay clean;
-//! the bare flag corrupts both.
+//! Two negative-control teeth per pool family (`--negative-control=int8|fp8`
+//! selects one, bare flag both):
+//! 1. Expectation tooth — clean kernel output vs a shifted row-0 expectation.
+//!    Proves the comparator is alive and its band is not infinitely wide.
+//! 2. Device-input tooth — the row-0 V POOL BYTES are pinned to the dtype max
+//!    (all D components, over row 0's full attended decode range) before
+//!    upload. The kernel output must MATCH an oracle rebuilt from the
+//!    sabotaged bytes AND fail the clean oracle: the first clause proves the
+//!    kernel read the buffer, the second that a real input fault is caught.
+//!    Perturbed family/buffer: int8 or fp8, V pool only (K and scales are
+//!    not covered by the device tooth); splits1 and split-merge each carry
+//!    their own pair.
 //!
 //! Run on a pod (sm_80 or newer; builds on T1, traps below sm_80):
 //!   cargo build --release -p infer-cuda --features cuda \
@@ -100,8 +109,8 @@ mod real {
 mod real {
     use super::Family;
     use super::attn_common::{
-        Rng, Tol, attention_row, bf, compare_rows, e4m3_decode, e4m3_encode, i8_encode, lcg_perm,
-        metrics_pass,
+        Metrics, Rng, Tol, Tooth, attention_row, bf, compare_rows, e4m3_decode, e4m3_encode,
+        i8_encode, lcg_perm, metrics_pass,
     };
     use anyhow::{Result, ensure};
     use cuda_kernels::prelude::DeviceContext;
@@ -139,6 +148,7 @@ mod real {
         Rotated,
     }
 
+    #[derive(Clone)]
     struct Case {
         label: &'static str,
         is_fp8: bool,
@@ -198,6 +208,31 @@ mod real {
             let off = t % PAGE;
             let s = if is_v { &self.v_scales } else { &self.k_scales };
             f64::from(s[(phys * PAGE + off) * HK + hk])
+        }
+        /// Clone with every V byte of row 0 / kv head 0 over row 0's full
+        /// attended decode range pinned to the dtype's maximum. Row 0 is a
+        /// qlen-1 decode row in every case (see the case list in `run`), so it
+        /// attends exactly `kvlens[0]` tokens; replacing all D components of
+        /// each token's V moves every output column of that row order-one.
+        /// The oracle decodes pool bytes directly, so rebuilding it over this
+        /// clone reproduces what a correct kernel must emit from the sabotaged
+        /// input.
+        fn with_v_sabotage(&self) -> Case {
+            const SAB_D0: u8 = 127u8; // int8 max; for fp8 use the e4m3 max
+            let sab = if self.is_fp8 {
+                e4m3_encode(448.0)
+            } else {
+                SAB_D0
+            };
+            let mut c = self.clone();
+            for t in 0..self.kvlens[0] {
+                let phys = self.table[t / PAGE] as usize;
+                let off = t % PAGE;
+                for d in 0..D {
+                    c.v_pool[(phys * PAGE + off) * HK * D + d] = sab;
+                }
+            }
+            c
         }
     }
 
@@ -358,11 +393,26 @@ mod real {
 
     // ── device run ──────────────────────────────────────────────────────────
 
-    fn run_case(ctx: &DeviceContext, case: &Case, corrupt: bool) -> Result<bool> {
+    /// f64 oracle for every checked (query row, head) pair.
+    fn build_wants(case: &Case, rows: &[(usize, usize)]) -> Vec<Vec<f64>> {
+        let mut wants: Vec<Vec<f64>> = vec![Vec::new(); rows.len()];
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (i, (token, h)) in rows.iter().enumerate() {
+                handles.push(scope.spawn(move || (i, attention_head(case, *token, *h))));
+            }
+            for h in handles {
+                let (i, w) = h.join().unwrap();
+                wants[i] = w;
+            }
+        });
+        wants
+    }
+
+    /// One kernel launch over `case`'s pools; returns the bf16 output.
+    fn launch(case: &Case, ctx: &DeviceContext) -> Result<Vec<bf16>> {
         use cuda_kernels::ffi;
-        let batch = case.batch();
         let total_q = case.total_q();
-        let max_q = case.max_qlen();
 
         let q_d = ctx.stream.clone_htod(&case.q_packed)?;
         let mut o_d = ctx.stream.alloc_zeros::<bf16>(total_q * H * D)?;
@@ -412,9 +462,9 @@ mod real {
                 D as i32,
                 PAGE as i32,
                 case.table_stride as i32,
-                batch as i32,
+                case.batch() as i32,
                 total_q as i32,
-                max_q as i32,
+                case.max_qlen() as i32,
                 SM_SCALE as f32,
                 case.is_fp8,
                 case.splits as i32,
@@ -426,55 +476,123 @@ mod real {
         .result()
         .map_err(|e| anyhow::anyhow!("paged_attention_quantized_fa3_cuda failed: {e}"))?;
         ctx.sync()?;
-        let got = ctx
-            .stream
+        ctx.stream
             .clone_dtoh(&o_d)
-            .map_err(|e| anyhow::anyhow!("clone_dtoh failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("clone_dtoh failed: {e}"))
+    }
 
-        // All cases are short (decode / <=8-token verify), so every query row
-        // is checked; K/V are rebuilt per (row, kv head) and shared by the G
-        // group implicitly here (each head reads the same bytes).
-        let rows: Vec<(usize, usize)> = (0..total_q)
-            .flat_map(|t| (0..H).map(move |h| (t, h)))
-            .collect();
-        let mut wants: Vec<Vec<f64>> = vec![Vec::new(); rows.len()];
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (i, (token, h)) in rows.iter().enumerate() {
-                let case_ref = &*case;
-                handles.push(scope.spawn(move || (i, attention_head(case_ref, *token, *h))));
-            }
-            for h in handles {
-                let (i, w) = h.join().unwrap();
-                wants[i] = w;
-            }
-        });
-
-        let m = compare_rows(&got, &wants, rows.len(), D, H, &rows, &TOL, corrupt);
-        // Clean: global metrics. Corrupt: the tooth is measured on the
-        // corrupted row alone so additional checked rows/heads cannot dilute
-        // the violation fraction below max_viol_frac.
-        let pass = if corrupt {
-            m.corrupted_row_fails(&TOL)
-        } else {
-            metrics_pass(&m, &TOL)
-        };
+    fn report(case: &Case, tag: &str, m: &Metrics, pass: bool) {
         eprintln!(
-            "[{} {} B={} total_q={} kv={:?} table={:?} splits={}] rel_l2={:.2e} \
-             viol_frac={:.2e} max_dev={:.2e} {}",
+            "[{} {} {} B={} total_q={} kv={:?} table={:?} splits={}] rel_l2={:.2e} \
+             viol_frac={:.2e} row0_viol={} max_dev={:.2e} {}",
             case.label,
             if case.is_fp8 { "fp8" } else { "int8" },
-            batch,
-            total_q,
+            tag,
+            case.batch(),
+            case.total_q(),
             case.kvlens,
             case.table_kind,
             case.splits,
             m.rel_l2,
             m.viol_frac,
+            m.corrupt_row_viol_frac
+                .map(|f| format!("{f:.2e}"))
+                .unwrap_or_else(|| "-".to_string()),
             m.max_dev,
             if pass { "PASS" } else { "FAIL" }
         );
-        Ok(pass)
+    }
+
+    fn run_case(ctx: &DeviceContext, case: &Case, corrupt: bool) -> Result<bool> {
+        // Every case is short (decode / <=8-token verify), so every query row
+        // is checked and K/V are rebuilt per (row, kv head).
+        let rows: Vec<(usize, usize)> = (0..case.total_q())
+            .flat_map(|t| (0..H).map(move |h| (t, h)))
+            .collect();
+
+        // Tooth 1 (comparator liveness): clean kernel output vs a row-0
+        // EXPECTATION shift. Device inputs are untouched.
+        let got = launch(case, ctx)?;
+        let wants = build_wants(case, &rows);
+        let tooth1 = if corrupt {
+            Tooth::ExpectShift
+        } else {
+            Tooth::Clean
+        };
+        let m = compare_rows(&got, &wants, rows.len(), D, H, &rows, &TOL, tooth1);
+        let expect_tooth_ok = if corrupt {
+            m.corrupted_row_fails(&TOL)
+        } else {
+            metrics_pass(&m, &TOL)
+        };
+        report(
+            case,
+            if corrupt { "neg-expect" } else { "clean" },
+            &m,
+            expect_tooth_ok,
+        );
+        if !corrupt {
+            return Ok(expect_tooth_ok);
+        }
+        ensure!(
+            expect_tooth_ok,
+            "paged_quant_attn_parity expectation tooth: the row-0 oracle shift did not redden the comparator (dead comparator or infinite band)"
+        );
+
+        // Tooth 2 (device input): feed the kernel a pool whose row-0 V bytes
+        // are pinned to the dtype max over row 0's whole attended range. The
+        // output must (a) MATCH an oracle rebuilt from those same bytes,
+        // proving the kernel consumed the sabotaged buffer, and (b) FAIL the
+        // clean oracle on row 0, proving a real input fault reaches the
+        // compared quantity.
+        let sab = case.with_v_sabotage();
+        let got_sab = launch(&sab, ctx)?;
+        let wants_sab = build_wants(&sab, &rows);
+        let m_match = compare_rows(
+            &got_sab,
+            &wants_sab,
+            rows.len(),
+            D,
+            H,
+            &rows,
+            &TOL,
+            Tooth::Clean,
+        );
+        let match_ok = metrics_pass(&m_match, &TOL);
+        report(case, "neg-device-match", &m_match, match_ok);
+        let m_dev = compare_rows(
+            &got_sab,
+            &wants,
+            rows.len(),
+            D,
+            H,
+            &rows,
+            &TOL,
+            Tooth::DeviceCorrupt,
+        );
+        let dev_fails = m_dev.corrupted_row_fails(&TOL);
+        report(case, "neg-device-failclean", &m_dev, dev_fails);
+
+        // The device tooth is a hard precondition: if either half does not
+        // hold this is a real defect (kernel ignored the sabotaged buffer, or
+        // the fault did not reach the output), not "comparator stayed green",
+        // so bail with a distinct message rather than letting the aggregator
+        // report a dead tooth.
+        ensure!(
+            match_ok,
+            "paged_quant_attn_parity device tooth: kernel output does NOT match the oracle rebuilt from the sabotaged V pool (kernel did not consume the corrupted buffer)"
+        );
+        ensure!(
+            dev_fails,
+            "paged_quant_attn_parity device tooth: sabotaged output still matches the CLEAN oracle on row 0 (input fault did not reach the compared quantity)"
+        );
+        // Returned bool is the comparator's green verdict for THIS case. A
+        // targeted negative family is supposed to be red: the expectation
+        // shift plus device sabotage both force row 0 out of band, so report
+        // red (`false`). The aggregator asserts `!t.ok` for targeted
+        // families; returning the detection bit here inverted that and made a
+        // firing tooth fail the gate.
+        Ok(false)
     }
 
     pub(super) fn run(negative: Option<Option<Family>>) -> Result<()> {
@@ -578,32 +696,32 @@ mod real {
         // is separate code from single-split, so each combination must fail
         // independently under corruption.
         #[derive(Clone, Copy, PartialEq, Eq)]
-        struct Tooth {
+        struct ToothRec {
             fam: Family,
             splits1: bool,
             seen: bool,
             ok: bool,
         }
         let mut teeth = [
-            Tooth {
+            ToothRec {
                 fam: Family::Int8,
                 splits1: true,
                 seen: false,
                 ok: true,
             },
-            Tooth {
+            ToothRec {
                 fam: Family::Int8,
                 splits1: false,
                 seen: false,
                 ok: true,
             },
-            Tooth {
+            ToothRec {
                 fam: Family::Fp8,
                 splits1: true,
                 seen: false,
                 ok: true,
             },
-            Tooth {
+            ToothRec {
                 fam: Family::Fp8,
                 splits1: false,
                 seen: false,
