@@ -110,11 +110,26 @@ MAX_EXPERIENCE_ENTRIES = {
     Path("docs/experience/errors"): 296,
 }
 
-REPO_WIDE_DISALLOWED_MARKERS = [
-    "/Users/",
-    "PEGAINFER",
-    "release/infer",
-]
+# Repo-wide markers are matched by regex, not plain substring. A machine-root
+# path is anchored with a lookbehind that rejects it when immediately preceded
+# by a word char, dot, or slash, so a directory named for a root
+# (`components/home/`, `xusers/`) does not trip the rule while an absolute path
+# (`/home/ckl/…`, `PATH=/home/…`) does. Bare unique tokens (PEGAINFER) keep a
+# plain substring match. `data0` intentionally has no trailing slash so it also
+# matches `/data00`, `/data01`, … (a later digit is another mount, not a
+# subdirectory).
+REPO_WIDE_PATH_MARKERS = ("/Users/", "/home/", "release/infer")
+REPO_WIDE_TOKEN_MARKERS = ("PEGAINFER",)
+REPO_WIDE_PATH_RE = re.compile(
+    r"(?<![\w./])(?:" + "|".join(re.escape(m) for m in REPO_WIDE_PATH_MARKERS) + r")"
+)
+
+# Dated run provenance records the literal machine path a specific run used;
+# rewriting it makes the record false. command.txt under the two provenance
+# trees is exempt from the path-marker rule (still scanned for tokens).
+PROVENANCE_COMMAND_RE = re.compile(
+    r"^docs/(experience|trace-artifacts)/.*command\.txt$"
+)
 
 JUNK_PATH_RE = re.compile(r"(^|/)(\.DS_Store|Thumbs\.db|__pycache__/|.*\.pyc)$")
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -181,8 +196,9 @@ def check_markdown_links(paths: list[Path]) -> list[str]:
                 errors.append(f"{rel_path}: machine-local home link -> {target}")
                 continue
             # An absolute path under the current user's home directory is also
-            # machine-local, but the literal form is banned tree-wide by
-            # REPO_WIDE_DISALLOWED_MARKERS, so the link gate need not repeat it.
+            # machine-local, but the literal form (/Users/, /home/, …) is banned
+            # tree-wide by check_repo_wide_disallowed_markers, so the link gate
+            # need not repeat it.
             if target == str(Path.home()) or target.startswith(
                 str(Path.home()) + "/"
             ):
@@ -381,26 +397,41 @@ def check_wins_parameters() -> list[str]:
     return errors
 
 
+def _repo_wide_hits(path_str: str, content: str) -> list[str]:
+    """Banned markers on one grep line, applying the path lookbehind and the
+    dated-command.txt provenance exemption."""
+    hits: list[str] = []
+    if not PROVENANCE_COMMAND_RE.match(path_str):
+        for m in REPO_WIDE_PATH_RE.finditer(content):
+            hits.append(m.group(0))
+    for token in REPO_WIDE_TOKEN_MARKERS:
+        if token in content:
+            hits.append(token)
+    return hits
+
+
 def check_repo_wide_disallowed_markers() -> list[str]:
     own_path = f"scripts/{Path(__file__).name}"
-    command = ["-I", "-n"]
-    for marker in REPO_WIDE_DISALLOWED_MARKERS:
-        command.extend(["-e", marker])
-    command.extend(["--", "."])
-    lines = git_grep(command)
-    output = None if lines is None else "\n".join(lines)
+    # One extended alternation over the path regex plus the bare tokens; the
+    # lookbehind/anchoring is applied in Python (git grep -P is not portable).
+    pattern = (
+        r"(?<![\w./])(?:"
+        + "|".join(re.escape(m) for m in REPO_WIDE_PATH_MARKERS)
+        + r")|"
+        + "|".join(re.escape(t) for t in REPO_WIDE_TOKEN_MARKERS)
+    )
+    lines = git_grep(["-I", "-n", "-E", pattern, "--", "."])
 
-    if output is not None:
+    if lines is not None:
         errors = set()
-        for line in output.splitlines():
+        for line in lines:
             path_str, _, content = line.partition(":")
             if not content or path_str == own_path:
                 continue
-            for marker in REPO_WIDE_DISALLOWED_MARKERS:
-                if marker in content:
-                    errors.add(
-                        f"{path_str}: contains repo-wide banned marker {marker!r}"
-                    )
+            for hit in _repo_wide_hits(path_str, content):
+                errors.add(
+                    f"{path_str}: contains repo-wide banned marker {hit!r}"
+                )
         return sorted(errors)
 
     errors = []
@@ -414,11 +445,10 @@ def check_repo_wide_disallowed_markers() -> list[str]:
             continue
         except UnicodeDecodeError:
             continue
-        for marker in REPO_WIDE_DISALLOWED_MARKERS:
-            if marker in text:
-                errors.append(
-                    f"{rel_path}: contains repo-wide banned marker {marker!r}"
-                )
+        for hit in _repo_wide_hits(rel_path, text):
+            errors.append(
+                f"{rel_path}: contains repo-wide banned marker {hit!r}"
+            )
     return errors
 
 
@@ -1048,6 +1078,31 @@ def selftest() -> int:
                 print(f"[selftest] {name}: FAILs on its broken world -> {broken[0]}")
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+    if failures:
+        print("[selftest] FAIL")
+        for failure in failures:
+            print(f"- {failure}")
+        return 1
+
+    # Repo-wide marker lookbehind + provenance exemption.
+    marker_cases = [
+        # (path, content, expected hits)
+        ("src/x.rs", 'const P = "/home/ckl/x";', ["/home/"]),
+        ("src/x.rs", 'PATH=/home/ckl/bin', ["/home/"]),
+        ("web/src/pages/index.astro", 'import X from "../components/home/Hero.astro";', []),
+        ("docs/y.md", "a users/ dir and xusers/ word", []),
+        ("docs/experience/wins/2026-05-09-b/B1/command.txt", "run --out /home/ckl/bench x", []),
+        ("docs/trace-artifacts/2026-05-27-x/command.txt", "x /home/ckl y", []),
+        ("src/x.rs", "// note PEGAINFER here", ["PEGAINFER"]),
+        ("docs/experience/wins/2026-05-09-b/B1/command.txt", "PEGAINFER still banned", ["PEGAINFER"]),
+    ]
+    for path, content, want in marker_cases:
+        got = _repo_wide_hits(path, content)
+        if sorted(got) != sorted(want):
+            failures.append(f"repo-wide marker {path!r}: got {got}, want {want}")
+        else:
+            print(f"[selftest] repo-wide marker {path.split('/')[-1]}: {'-> ' + str(got) if got else 'clean'}")
 
     if failures:
         print("[selftest] FAIL")
