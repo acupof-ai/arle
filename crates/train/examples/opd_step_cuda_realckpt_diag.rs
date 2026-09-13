@@ -21,7 +21,6 @@ mod app {
         trainer::extend_keep_with_params_and_grads,
     };
 
-    const DEFAULT_MODEL_DIR: &str = "/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B";
     const STEPS_PER_CONFIG: usize = 100;
     const ROLLOUT_LEN: usize = 8;
     const DECODE_LEN: usize = 16;
@@ -618,9 +617,13 @@ mod app {
     }
 
     fn resolve_model_dir() -> AnyResult<PathBuf> {
-        let path = env::var_os("ARLE_OPD_REALCKPT_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
+        // Operator-run tooling: no machine-local fallback. The checkpoint dir is
+        // required from the environment so this fails loud on a fresh host.
+        let Some(path) = env::var_os("ARLE_OPD_REALCKPT_DIR").map(PathBuf::from) else {
+            return Err(
+                "ARLE_OPD_REALCKPT_DIR is unset; set it to a complete Qwen3-0.6B ModelScope checkpoint directory".into(),
+            );
+        };
         if !path.join("config.json").is_file() || !path.join("model.safetensors").is_file() {
             return Err(format!(
                 "{} is not a complete Qwen3-0.6B ModelScope checkpoint directory",

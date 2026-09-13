@@ -108,12 +108,12 @@ The single most common kernel-optimization bug in this repo: sweeping tile param
 
 ```bash
 # nsys — system-level launch density + dispatch overhead
-PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
+PATH=.venv/bin:$PATH \
   scripts/profile_nsys_bench.sh <label> --concurrency-grid 4 \
   --seconds-per-concurrency 60 --prompts-jsonl <workload.jsonl>
 
 # ncu — kernel-internal occupancy / smem / reg / mem-bound vs compute-bound
-PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
+PATH=.venv/bin:$PATH \
   scripts/profile_ncu_bench.sh <label> --bench <existing-bench-dir> \
   --family attention --set full --launch-skip 5 --launch-count 5
 
@@ -1268,7 +1268,7 @@ ARLE-specific quick paths:
 # Hardware: 4070 Ti SUPER (sm_89, 100 KB smem/SM, 706 TFLOPS FP8, 88.5 BF16)
 
 # Wall-clock baseline
-PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
+PATH=.venv/bin:$PATH \
   python3 scripts/bench_throughput.py --model <model> \
   --prompts-jsonl <workload.jsonl> --concurrency-grid 4 \
   --seconds-per-concurrency 120 --output bench-output/<label>/bench

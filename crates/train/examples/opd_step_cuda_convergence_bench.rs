@@ -203,17 +203,18 @@ mod app {
     }
 
     fn report_real_checkpoint_probe() {
-        let explicit = env::var_os("ARLE_OPD_REAL_MODEL_DIR").map(PathBuf::from);
-        let default = PathBuf::from("/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B");
-        let path = explicit.unwrap_or(default);
-        let present = path.join("config.json").exists() && path.join("model.safetensors").exists();
-        let mode = if env::var_os("ARLE_OPD_REAL_MODEL_DIR").is_some() {
-            "explicit"
-        } else {
-            "auto_probe"
+        // No machine-local default: the real-checkpoint probe is opt-in via
+        // ARLE_OPD_REAL_MODEL_DIR. Unset means the probe is skipped (this bench
+        // keeps its exercised substrate at the moderate shape).
+        let Some(path) = env::var_os("ARLE_OPD_REAL_MODEL_DIR").map(PathBuf::from) else {
+            println!(
+                "real_checkpoint_probe mode=skipped run=false reason=\"ARLE_OPD_REAL_MODEL_DIR unset; set it to a Qwen3-0.6B dir to enable the full-model probe\""
+            );
+            return;
         };
+        let present = path.join("config.json").exists() && path.join("model.safetensors").exists();
         println!(
-            "real_checkpoint_probe mode={mode} path={} present={} run=false reason=\"convergence bench keeps the exercised substrate at the moderate shape; full Qwen3-0.6B OPD eval is recorded as follow-up unless explicitly promoted to a separate memory-budgeted run\"",
+            "real_checkpoint_probe mode=explicit path={} present={} run=false reason=\"convergence bench keeps the exercised substrate at the moderate shape; full Qwen3-0.6B OPD eval is recorded as follow-up unless explicitly promoted to a separate memory-budgeted run\"",
             path.display(),
             present
         );

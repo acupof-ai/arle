@@ -13,7 +13,6 @@ use train::{
     teacher_infer::{InProcessTeacher, InferTeacher, TeacherForward},
 };
 
-const DEFAULT_QWEN35_08B_DIR: &str = "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base";
 const DOMINANT_TOP_K: usize = 64;
 const DOMINANT_RELERR_GATE: f32 = 5.0e-2;
 
@@ -22,26 +21,23 @@ use common::qwen35_test_support::require_fixture_path;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-fn resolve_qwen35_08b_dir() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("ARLE_PARITY_QWEN35_08B_DIR") {
-        let path = PathBuf::from(explicit);
-        if path.is_dir() {
-            return Some(path);
-        }
-    }
-    let path = PathBuf::from(DEFAULT_QWEN35_08B_DIR);
-    if path.is_dir() && path.join("config.json").is_file() {
-        return Some(path);
-    }
-    None
+/// The fixture dir comes ONLY from `ARLE_PARITY_QWEN35_DENSE_DIR`; there is no
+/// machine-local fallback. When unset (or not a directory) this returns None and
+/// the test takes the harness's visible skip (panic only under
+/// ARLE_REQUIRE_TEST_FIXTURE), so an unset fixture never reads as a pass.
+fn resolve_qwen35_dense_dir() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var("ARLE_PARITY_QWEN35_DENSE_DIR").ok()?);
+    path.is_dir().then_some(path)
 }
 
 #[test]
 fn infer_teacher_matches_in_process_on_dominant_logits() -> TestResult {
     let Some(model_dir) = require_fixture_path(
-        resolve_qwen35_08b_dir(),
-        "Qwen3.5-0.8B checkpoint",
-        &format!("set ARLE_PARITY_QWEN35_08B_DIR or populate {DEFAULT_QWEN35_08B_DIR}"),
+        resolve_qwen35_dense_dir(),
+        "dense HF checkpoint",
+        "set ARLE_PARITY_QWEN35_DENSE_DIR to a bf16 dense HF directory small enough \
+         for one slot / eight 16-token pages (128 tokens) and whose vocabulary \
+         contains token 9419",
     ) else {
         return Ok(());
     };
