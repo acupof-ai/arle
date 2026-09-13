@@ -91,9 +91,14 @@ Five input-set-excludes-the-target defects, none found by the gate:
    toy scale, and `#374` share one shape: the headline names a 27B/production
    path; the input set excludes its weights or its width. A green there is
    necessary (kernel arithmetic) and not sufficient (model correctness).
-3. **Real-checkpoint coverage is one gate: dsv4_parity**, and it has never
-   run and gates 1 of 16 tokens. There is no real-weight 27B DSpark gate at
-   all — the exact gap behind `dspark-accept-collapse`.
+3. **Real-weight coverage is two gates, and automated real-weight parity
+   that has ever run is zero.** `dsv4_parity` loads a checkpoint and gates
+   the first of 16 tokens, but it has never executed (no model+cards).
+   `qwen35_tq4_dense_parity.py` loads real quantized weights but is a
+   hand-driven torch diagnostic with no CI runner. So the number of
+   automated real-weight parity gates that have ever run green is **0** —
+   and there is no real-weight 27B DSpark gate at all, the precise gap
+   behind `dspark-accept-collapse`.
 4. **"unknown" is minimal.** Every gate's target could be named except the
    exact production DSA per-expert geometry (the gate sweeps but the
    production M/K is not enumerated in-tree) — one genuinely under-specified
@@ -109,3 +114,36 @@ Every registered gate's `gate_gap` should state its input set in four
 fields — shapes, dtype, TP/EP degree, weights (RNG vs checkpoint) — and the
 registry should carry the production target so "contains" is mechanically
 checkable rather than rediscovered per incident.
+
+## The smallest executable real-weight gate (priced option, not a plan to build)
+
+Facts read from the pod and docs on 2026-09-13:
+
+- **No complete production checkpoint is on the pod.** the pod's `Qwen/Qwen3___6-35B-A3B` model dir
+  holds only 4 of 26 shards; the `Qwen3.6-27B-FP8` and `…-FP8-fixed` model dirs are empty
+  (config-only); DSv4-Flash is absent entirely. So any real-weight gate has
+  a provisioning component today.
+- **H20 = ~96 GB each** (97871 MiB). Qwen3.6-27B-FP8 is ~29.4 GB resident
+  and demonstrably serves at **TP=1 on one H20** (multiple wins entries:
+  2026-07-07 prefix-cache, 2026-07-11 DSpark TP=1). DSv4-Flash-FP8 is
+  **294 GB → minimum 4 H20 by memory**, served at TP8/EP8.
+
+Three priced options, cheapest first:
+
+| Option | Checkpoint | Cards | What it covers beyond the synthetic gates | Rough cost |
+|---|---|---|---|---|
+| A (smallest, recommended) | **Qwen3.6-27B-FP8**, TP1 | **1 H20** | Real FP8 weights through the full decode/prefill stack — Marlin/DeepGEMM lanes, quant KV, the 5120×17408 / vocab-248320 widths the synthetic gates only list, end-to-end greedy correctness | provision ~29 GB to the pod (minutes on the internal mirror; cold read is the long pole) + a single-card run of minutes. This is the same model that already ran TP1 repeatedly, so no bring-up risk |
+| B | Qwen3.8-27B-NVFP4, TP1 | 1 H20 | Option A plus the mixed-precision nvfp4 path (Marlin decode + DeepGEMM prefill scratch) | ~23 GB provision + minutes; covers the current production-recommended model |
+| C | **DSv4-Flash-FP8**, TP4 minimum (serves TP8) | **4-8 H20** | The only gate that exercises real NCCL multi-rank, EP8 MoE, FlashMLA on real DSv4 tensors — what `dsv4_parity` already targets | provision **294 GB** (cold-read minutes-to-tens-of-minutes) + 4-8 cards for the run; highest cost, unique multi-rank coverage |
+
+**Recommendation:** Option A is the smallest gate that changes the
+"automated real-weight gates ever run = 0" number. One card, a checkpoint
+already proven on the box, minutes of run time. It does not require new
+kernel code — the lever/needle/sampling gates already drive a real served
+model; the gap is that no real-weight gate runs in the automated GPU batch.
+The decision is whether to point one of the existing model-level gates at
+Qwen3.6-27B-FP8 in the batch (provision + one-card window), not whether to
+build a harness.
+
+Option C stays separately queued for the multi-rank question and the 15
+ungated dsv4 tokens; it is not the smallest path to a nonzero count.
