@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
-"""Content/marker gates, run in two places over one shared range computation.
+"""Content/marker gates, run from three entry points over one range computation.
 
-Two entry points:
+Entry points:
 
-- `lane.sh pr` (default): all rules below against merge-base origin/main..HEAD,
-  including the three PR-BODY marker rules (BUILD/CUDA/CLIPPY_EXIT) that need a
-  PR body a push does not have.
+- CI (`--ci GITHUB_EVENT_PATH`), a pull_request workflow job: all rules
+  against base..head taken from the event payload, including the three
+  PR-BODY marker rules. This closes the hole where a PR opened with `gh` or
+  the web UI never saw the marker rules — only `lane.sh pr` invoked them.
+  Each marker is bound to the reviewed head: `KEY=0 @<7+ hex head prefix>`,
+  with trailing command text allowed. A stale or placeholder sha fails.
+- `lane.sh pr` (default, local): the same rules against merge-base
+  origin/main..HEAD; markers bind to local HEAD so a stale value is caught
+  before push. A clone without origin/main falls back to the unbound bare
+  value (the CI run is the binding gate regardless).
 - the pre-push hook (`--push-content BASE..HEAD`): only the body-less CONTENT
   rules (1,2,3,6,8 below), over the exact pushed range. This is what closes the
   direct-to-main hole — a push to main has no PR and otherwise bypassed
   everything except the checker's selftest.
+
+An unresolvable diff endpoint (a behind-local remote tip it has not fetched)
+is a refusal naming the range and telling the author to fetch, never a
+silent pass and never a raw traceback.
 
 The content rules are 1 bench-entry, 2 comment refs, 3 abs paths, 6 gate
 registry, 8 dead docs shas. The marker rules are 4 build-exit, 5 cuda-check,
@@ -74,9 +85,77 @@ NEG_FLAG = "--negative-control"
 NEG_MARKER = "NEGATIVE CONTROL OK"
 REGISTRY_REL = "operators/registry.toml"
 
-BUILD_EXIT_OK = re.compile(r"^BUILD_EXIT=0\s*$", re.MULTILINE)
-CUDA_CHECK_EXIT_OK = re.compile(r"^CUDA_CHECK_EXIT=0\s*$", re.MULTILINE)
-CLIPPY_EXIT_OK = re.compile(r"^CLIPPY_EXIT=0\s*$", re.MULTILINE)
+# Marker grammar. A marker may carry trailing context (the command it measured,
+# a link) on the same line: `KEY=0 cargo check …`, not only a bare line. The
+# value may be attributed to the head as `KEY=0 @<7+hex>`; when a head sha is
+# supplied (CI, or `lane.sh pr`) it must prefix that head. A `KEY=1` value is
+# malformed-present, distinct from a missing marker.
+MARKER_KEYS = ("BUILD_EXIT", "CUDA_CHECK_EXIT", "CLIPPY_EXIT")
+# A sha token: 7-40 hex with at least one digit and one a-f letter (a decimal or
+# a hex word like `deadbeef` alone is still 0-9a-f; require both classes).
+MARKER_SHA = r"(?=[0-9a-f]{7,40}\b)(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}"
+
+
+def _marker_pattern(key: str) -> re.Pattern[str]:
+    # After `0` a lookahead requires whitespace, the `@` attribution, or end of
+    # line (rejects `=1`, glued `=01`, and `=0-ish`), without consuming it.
+    # Then an optional `@sha` and optional trailing annotation are admitted:
+    # `KEY=0 cargo build …` or `KEY=0 @<sha> cargo build …`.
+    return re.compile(
+        rf"^{re.escape(key)}\s*=\s*0(?=\s|@|$)"
+        rf"(?:\s*@\s*(?P<sha>{MARKER_SHA}))?"
+        rf"(?:\s.*)?$",
+        re.MULTILINE,
+    )
+
+
+MARKER_PATTERNS = {k: _marker_pattern(k) for k in MARKER_KEYS}
+# Any `KEY=` line, to detect a present-but-malformed marker (wrong value, bad
+# sha, or `0` glued to more digits).
+MARKER_ANY = {
+    k: re.compile(rf"^{re.escape(k)}\s*=\s*\S.*$", re.MULTILINE) for k in MARKER_KEYS
+}
+
+
+class MarkerStatus:
+    """Tri-state result of looking for one body marker."""
+
+    OK = "ok"
+    MISSING = "missing"
+    MALFORMED = "malformed"
+    STALE = "stale"
+
+    def __init__(self, state: str, found_sha: str | None = None):
+        self.state = state
+        self.found_sha = found_sha
+
+
+def marker_status(
+    key: str, pr_body: str, head_sha: str | None
+) -> MarkerStatus:
+    pat = MARKER_PATTERNS[key]
+    found_sha: str | None = None
+    well_formed = False
+    for m in pat.finditer(pr_body):
+        found_sha = m.group("sha")
+        well_formed = True
+        # A marker without `@sha` passes only when no head is known (a raw
+        # local invocation that cannot bind); with a head, attribution is
+        # required, so keep scanning for an attributed line.
+        if head_sha is not None and found_sha is None:
+            continue
+        if head_sha is not None and not head_sha.startswith(found_sha):
+            return MarkerStatus(MarkerStatus.STALE, found_sha)
+        return MarkerStatus(MarkerStatus.OK, found_sha)
+    if well_formed:
+        # Every well-formed marker was unattributed while a head was required.
+        return MarkerStatus(MarkerStatus.MALFORMED, None)
+    if MARKER_ANY[key].search(pr_body):
+        # A `KEY=…` line exists but does not parse: bad value, `01`, junk sha.
+        return MarkerStatus(MarkerStatus.MALFORMED, None)
+    return MarkerStatus(MarkerStatus.MISSING, None)
+
+
 CRATE_RUST_PATH = re.compile(r"^crates/([^/]+)/.*\.rs$")
 ROOT_RUST_PATH = re.compile(r"^src/.*\.rs$")
 CUDA_KERNELS_PATH = re.compile(r"^crates/cuda-kernels/")
@@ -127,8 +206,46 @@ COMMENT_REF_EXEMPT_PREFIX = ".github/"
 # rethought — do not grow the whitelist.
 
 
+class UnresolvableRange(RuntimeError):
+    """A diff endpoint object is absent from the local clone (needs fetch)."""
+
+
 def git(args: list[str], cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def git_range(args: list[str], cwd: Path, base: str, head: str) -> str:
+    """Like git(), but an unknown endpoint is a refusal, not a traceback.
+
+    When the local branch is behind, the pre-push hook hands us
+    remote-tip..local-tip and the remote tip may be a commit this clone has not
+    fetched. `git diff` then exits 128; surfacing CalledProcessError dumps a
+    stack trace that reads like a content-rule failure on the author's own
+    diff. A gate that cannot see the bytes must refuse and name the cause.
+    """
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        missing = _missing_range_object(cwd, base, head)
+        if missing:
+            raise UnresolvableRange(
+                f"cannot resolve diff range {base}..{head}: {missing} is not in "
+                "this clone. Fetch first (e.g. `git fetch origin`) and re-run; "
+                "a range that cannot be read refuses rather than passing."
+            ) from exc
+        raise
+
+
+def _missing_range_object(cwd: Path, base: str, head: str) -> str | None:
+    for ref in (base, head):
+        r = subprocess.run(
+            ["git", "cat-file", "-t", ref], cwd=cwd, capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            return ref
+    return None
 
 
 def added_lines(repo: Path, base: str, head: str) -> dict[str, list[str]]:
@@ -138,7 +255,9 @@ def added_lines(repo: Path, base: str, head: str) -> dict[str, list[str]]:
     # range computation both paths share.
     files: dict[str, list[str]] = {}
     current: str | None = None
-    for raw in git(["diff", "--unified=0", "--no-color", f"{base}..{head}"], repo).splitlines():
+    for raw in git_range(
+        ["diff", "--unified=0", "--no-color", f"{base}..{head}"], repo, base, head
+    ).splitlines():
         if raw.startswith("+++ b/"):
             current = raw[6:]
         elif current and raw.startswith("+") and not raw.startswith("+++"):
@@ -149,7 +268,7 @@ def added_lines(repo: Path, base: str, head: str) -> dict[str, list[str]]:
 def changed_files(repo: Path, base: str, head: str) -> list[str]:
     return [
         p
-        for p in git(["diff", "--name-only", f"{base}..{head}"], repo).splitlines()
+        for p in git_range(["diff", "--name-only", f"{base}..{head}"], repo, base, head).splitlines()
         if p
     ]
 
@@ -243,31 +362,71 @@ def cuda_gate_triggered(repo: Path, changed: list[str]) -> bool:
     return any(ROOT_RUST_PATH.match(p) for p in changed) and root_has_no_cuda(repo)
 
 
-def check_cuda_check_exit(repo: Path, changed: list[str], pr_body: str) -> list[str]:
-    if CUDA_CHECK_EXIT_OK.search(pr_body) or not cuda_gate_triggered(repo, changed):
+def _marker_failure(
+    rule: str, key: str, st: MarkerStatus, head_sha: str | None, how: str
+) -> str:
+    form = f"`{key}=0`"
+    if head_sha is not None:
+        form += f" @{head_sha[:7]}"
+    shape = f"{form} — value 0, the 7+ hex head prefix after @, trailing text allowed"
+    if st.state == MarkerStatus.MALFORMED and st.found_sha is not None:
+        return (
+            f"{rule}: marker found but malformed: sha @{st.found_sha} does not "
+            f"prefix head {head_sha[:7]}. Measure at the CURRENT head after the last push "
+            f"(do not rebuild — update the body), as {form}"
+        )
+    if st.state == MarkerStatus.STALE:
+        return (
+            f"{rule}: marker @{st.found_sha} is stale; head is {head_sha[:7]}. "
+            "Re-measure after the last push and update the body (the old number predates "
+            f"the current commit). Required: {form}"
+        )
+    if st.state == MarkerStatus.MALFORMED:
+        return f"{rule}: a `{key}=` line is present but malformed. Required shape: {shape}. {how}"
+    return f"{rule}: {how}"
+
+
+def check_cuda_check_exit(
+    repo: Path, changed: list[str], pr_body: str, head_sha: str | None
+) -> list[str]:
+    if not cuda_gate_triggered(repo, changed):
         return []
-    return [
-        "cuda-check: diff touches Rust in a no-cuda-gated crate (or crates/cuda-kernels/); "
+    how = (
         "run a pod `cargo check --features cuda,nccl` WITHOUT no-cuda and put a "
         "CUDA_CHECK_EXIT=0 line in the PR body"
+    )
+    st = marker_status("CUDA_CHECK_EXIT", pr_body, head_sha)
+    return [] if st.state == MarkerStatus.OK else [
+        _marker_failure("cuda-check", "CUDA_CHECK_EXIT", st, head_sha, how)
     ]
 
 
-def check_clippy_exit(repo: Path, changed: list[str], pr_body: str) -> list[str]:
-    if CLIPPY_EXIT_OK.search(pr_body) or not cuda_gate_triggered(repo, changed):
+def check_clippy_exit(
+    repo: Path, changed: list[str], pr_body: str, head_sha: str | None
+) -> list[str]:
+    if not cuda_gate_triggered(repo, changed):
         return []
-    return [
-        "clippy-exit: diff touches Rust in a no-cuda-gated crate (or crates/cuda-kernels/); "
+    how = (
         "`cargo check` runs no clippy lints, so run a pod "
         "`cargo clippy --workspace --all-targets --features cuda,nccl -- -D warnings` "
         "WITHOUT no-cuda and put a CLIPPY_EXIT=0 line in the PR body"
+    )
+    st = marker_status("CLIPPY_EXIT", pr_body, head_sha)
+    return [] if st.state == MarkerStatus.OK else [
+        _marker_failure("clippy-exit", "CLIPPY_EXIT", st, head_sha, how)
     ]
 
 
-def check_build_exit(added: dict[str, list[str]], pr_body: str) -> list[str]:
-    if not any(EXAMPLE_OR_BENCH_PATH.match(p) for p in added) or BUILD_EXIT_OK.search(pr_body):
+def check_build_exit(
+    added: dict[str, list[str]], pr_body: str, head_sha: str | None
+) -> list[str]:
+    if not any(EXAMPLE_OR_BENCH_PATH.match(p) for p in added):
         return []
-    return ["build-exit: examples/ or benches/ changed but the PR body has no BUILD_EXIT=0 line"]
+    how = "build the changed example/bench and put a BUILD_EXIT=0 line in the PR body"
+    st = marker_status("BUILD_EXIT", pr_body, head_sha)
+    return [] if st.state == MarkerStatus.OK else [
+        _marker_failure("build-exit", "BUILD_EXIT", st, head_sha, how)
+    ]
 
 
 def _sha_in_main(repo: Path, sha: str, base: str) -> bool:
@@ -357,15 +516,31 @@ def run_content(repo: Path, base: str, head: str) -> list[str]:
     return failures
 
 
-def run_pr(repo: Path, pr_body: str) -> list[str]:
-    """PR-time check: all content rules plus the three PR-body marker rules."""
-    base = git(["merge-base", "origin/main", "HEAD"], repo).strip()
-    added = added_lines(repo, base, "HEAD")
-    changed = changed_files(repo, base, "HEAD")
-    failures = run_content(repo, base, "HEAD")
-    failures += check_build_exit(added, pr_body)
-    failures += check_cuda_check_exit(repo, changed, pr_body)
-    failures += check_clippy_exit(repo, changed, pr_body)
+def run_pr(
+    repo: Path,
+    pr_body: str,
+    head_sha: str | None = None,
+    base: str | None = None,
+    head_ref: str = "HEAD",
+) -> list[str]:
+    """PR-time check: all content rules plus the three PR-body marker rules.
+
+    `head_sha` binds each marker's `@sha` to the reviewed commit. A local
+    invocation with no sha (`None`) keeps the historical lenient behavior for
+    the bare value; CI always supplies the head so attribution is required.
+    `base` lets CI pin the merge-base it already resolved; locally it is
+    computed against origin/main. `head_ref` is HEAD locally; in a
+    pull_request workflow the checkout is a merge commit, so CI passes the PR
+    head sha explicitly.
+    """
+    if base is None:
+        base = git(["merge-base", "origin/main", head_ref], repo).strip()
+    added = added_lines(repo, base, head_ref)
+    changed = changed_files(repo, base, head_ref)
+    failures = run_content(repo, base, head_ref)
+    failures += check_build_exit(added, pr_body, head_sha)
+    failures += check_cuda_check_exit(repo, changed, pr_body, head_sha)
+    failures += check_clippy_exit(repo, changed, pr_body, head_sha)
     return failures
 
 
@@ -617,6 +792,33 @@ def selftest() -> int:
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
+    # Marker grammar + head binding. A head with hex letters and digits.
+    head = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
+    prefix = head[:9]
+    marker_cases = [
+        # (name, body, head_sha, expected state)
+        ("marker missing", "", head, MarkerStatus.MISSING),
+        ("marker bare value no head passes", "BUILD_EXIT=0\n", None, MarkerStatus.OK),
+        ("marker bare value with head needs sha", "BUILD_EXIT=0\n", head, MarkerStatus.MALFORMED),
+        ("marker passes at head", f"BUILD_EXIT=0 @{prefix}  cargo build --ex x\n", head, MarkerStatus.OK),
+        ("marker full sha passes", f"BUILD_EXIT=0 @{head}\n", head, MarkerStatus.OK),
+        ("marker stale sha fails", f"BUILD_EXIT=0 @1234567890abcdef1234567890abcdef12345678\n", head, MarkerStatus.STALE),
+        ("marker wrong value malformed", "BUILD_EXIT=1\n", None, MarkerStatus.MALFORMED),
+        ("marker glued digits malformed", "BUILD_EXIT=01\n", None, MarkerStatus.MALFORMED),
+        ("marker hyphen suffix malformed", "BUILD_EXIT=0-ish (unpiped)\n", None, MarkerStatus.MALFORMED),
+        ("marker inside fenced code killed by sha requirement",
+         "```\nBUILD_EXIT=0 cargo build\n```\n", head, MarkerStatus.MALFORMED),
+        ("marker short under 7 hex malformed", f"BUILD_EXIT=0 @abc12\n", head, MarkerStatus.MALFORMED),
+        ("marker trailing command allowed", "BUILD_EXIT=0 cargo build --example x\n", None, MarkerStatus.OK),
+        ("marker decimal-like sha rejected", f"BUILD_EXIT=0 @1234567\n", head, MarkerStatus.MALFORMED),
+    ]
+    for name, body, hs, want in marker_cases:
+        st = marker_status("BUILD_EXIT", body, hs)
+        if st.state != want:
+            failures.append(f"{name}: got {st.state}, want {want}")
+        else:
+            print(f"[selftest] {name}: PASS")
+
     if failures:
         print("[lane-precheck][selftest] FAIL")
         print("\n".join(f"- {f}" for f in failures))
@@ -625,11 +827,46 @@ def selftest() -> int:
     return 0
 
 
+def run_ci(repo: Path, event_path: str) -> tuple[list[str], str]:
+    """CI entry for a pull_request event.
+
+    Reads head sha, base sha and the PR body from the workflow event payload, so
+    it works for fork PRs (the body is not in the local git refs) and binds the
+    markers to the exact head GitHub is reviewing. The checkout under
+    pull_request is a synthetic merge commit, so both endpoints are taken from
+    the payload, not HEAD.
+    """
+    import json
+
+    event = json.loads(Path(event_path).read_text())
+    try:
+        pull = event["pull_request"]
+        head_sha = pull["head"]["sha"]
+        base_sha = pull["base"]["sha"]
+        pr_body = pull.get("body") or ""
+    except (KeyError, TypeError) as exc:
+        return ([f"ci: pull_request event payload missing {exc}; cannot run PR marker rules"], "ci")
+    # `fetch-tags: 0` + a merge checkout can leave the payload shas absent; CI
+    # checks out both refs (job config), but verify instead of assuming.
+    missing = _missing_range_object(repo, base_sha, head_sha)
+    if missing:
+        return ([f"ci: {missing} from the PR payload is not checked out; configure the job to fetch both base and head"], "ci")
+    return (run_pr(repo, pr_body, head_sha=head_sha, base=base_sha, head_ref=head_sha), "ci")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=".")
     ap.add_argument("--pr-body")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument(
+        "--ci",
+        metavar="GITHUB_EVENT_PATH",
+        help=(
+            "Run the PR marker rules in a pull_request CI job, reading head/base "
+            "sha and the PR body from the GitHub event payload."
+        ),
+    )
     ap.add_argument(
         "--push-content",
         metavar="BASE..HEAD",
@@ -643,21 +880,37 @@ def main() -> int:
     if args.selftest:
         return selftest()
 
-    if args.push_content:
-        if ".." not in args.push_content:
-            print("push-content expects BASE..HEAD", file=sys.stderr)
-            return 2
-        base, head = args.push_content.split("..", 1)
-        failures = run_push(Path(args.repo).resolve(), base, head)
-        label = "push-content"
-    else:
-        pr_body = os.environ.get("ARLE_PR_BODY", "")
-        if args.pr_body:
-            pr_body = Path(args.pr_body).read_text()
-        elif not sys.stdin.isatty():
-            pr_body = sys.stdin.read()
-        failures = run_pr(Path(args.repo).resolve(), pr_body)
-        label = "lane-precheck"
+    try:
+        if args.ci:
+            failures, label = run_ci(Path(args.repo).resolve(), args.ci)
+        elif args.push_content:
+            label = "push-content"
+            if ".." not in args.push_content:
+                print("push-content expects BASE..HEAD", file=sys.stderr)
+                return 2
+            base, head = args.push_content.split("..", 1)
+            failures = run_push(Path(args.repo).resolve(), base, head)
+        else:
+            label = "lane-precheck"
+            pr_body = os.environ.get("ARLE_PR_BODY", "")
+            if args.pr_body:
+                pr_body = Path(args.pr_body).read_text()
+            elif not sys.stdin.isatty():
+                pr_body = sys.stdin.read()
+            # Local lane.sh path: bind to HEAD when origin/main is available so
+            # a stale marker fails before push; a bare clone without it falls
+            # back to the unbound historical behavior.
+            head_sha = None
+            repo = Path(args.repo).resolve()
+            if subprocess.run(
+                ["git", "rev-parse", "--verify", "origin/main"],
+                cwd=repo, capture_output=True,
+            ).returncode == 0:
+                head_sha = git(["rev-parse", "HEAD"], repo).strip()
+            failures = run_pr(repo, pr_body, head_sha=head_sha)
+    except UnresolvableRange as exc:
+        print(f"[{label}] FAIL — refusing:\n- {exc}", file=sys.stderr)
+        return 1
 
     if failures:
         print(f"[{label}] FAIL — refusing:")
