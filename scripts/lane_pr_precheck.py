@@ -71,12 +71,15 @@ PR_REF = re.compile(r"#\d{2,}")
 # decimal like 1048576 must not match.
 LONG_SHA = re.compile(r"(?=\b[0-9a-f]*[0-9][0-9a-f]*\b)(?=\b[0-9a-f]*[a-f][0-9a-f]*\b)\b[0-9a-f]{7,40}\b")
 # Banned path literals are assembled, not written: check_repo_hygiene bans
-# those strings in tracked text. ABS_PATH uses a strict lookbehind (no hyphen)
-# so the shell overridable-default idiom ${VAR:-<build-tree>} cannot hide a
+# those strings in tracked text. ABS_PATH anchors with a word/dot lookbehind
+# and deliberately omits slash from the class: including it opened a file-URI
+# hole (a root reached through repeated URI slashes was exempt), while a
+# `components/home/` segment is still exempted by its preceding word char.
+# The shell overridable-default idiom ${VAR:-<build-tree>} cannot hide a
 # literal even behind the `:-`; check_abs_paths re-allows that form solely
 # inside executable .sh code, never in a comment and never outside shell.
 _ABS_SEGMENTS = "|".join(["/" + s for s in ("Users/", "root/", "data0", "mnt/", "host/")])
-ABS_PATH = re.compile(r"(?<![\w./])(" + _ABS_SEGMENTS + r")")
+ABS_PATH = re.compile(r"(?<![\w.])(" + _ABS_SEGMENTS + r")")
 SHELL_PATH = re.compile(r"\.sh$")
 PARITY_EXAMPLE_PATH = re.compile(r"^crates/infer-cuda/examples/[A-Za-z0-9_]+\.rs$")
 # parity_gpu_batch.sh derives its gate list from registry correctness_gate
