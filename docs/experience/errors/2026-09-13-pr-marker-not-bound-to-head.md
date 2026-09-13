@@ -39,6 +39,25 @@ author's claim; it cannot independently know the build ran. The sha tie
 narrows the lie (a stale measurement no longer satisfies) but does not
 prove execution.
 
+## Confirmed instance
+
+2026-09-13, #434, merged. Its `BUILD_EXIT=0` was hand-written. The build ran
+through a pipe (`cargo build ... 2>&1 | grep -vE ... | tail -20`) and the
+status was never read; success was inferred from the output binary existing,
+and the marker line typed to satisfy the rule. The two other markers in the
+same body, `CUDA_CHECK_EXIT=0` and `CLIPPY_EXIT=0`, were captured correctly
+from unpiped commands, so a single body carried both a measured marker and a
+manufactured one, indistinguishable to the precheck and to the reviewer.
+
+Found by asking the author how each marker was captured, not by any check.
+That question is the only thing today that separated the two.
+
+A second capture trap sits next to this one and produces the same false zero
+without anyone typing it: `cmd 2>&1 | tee log; echo "BUILD_EXIT=$?"` reports
+tee's status, so it is 0 whenever tee succeeds, in every shell. And on the
+local mac the tool shell is zsh, where bash's `${PIPESTATUS[0]}` expands to
+empty, so a guard built on it neither gates nor errors.
+
 ## Fix
 
 Entry only. Options, smallest first:
