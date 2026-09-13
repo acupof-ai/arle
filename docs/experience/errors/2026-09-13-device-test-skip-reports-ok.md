@@ -38,16 +38,16 @@ exactly the signal a regression must turn red, and a missing GPU/model/ICD
 then makes the gate structurally incapable of going red on any runner that
 lacks the resource.
 
-The existing correct pattern is the Vulkan tests:
-`crates/vulkan-sys/src/lib.rs::skip_or_panic` and
-`crates/vulkan-kernels/tests/common/mod.rs::require_device`. A test
-acquires its resource through one helper; the helper returns `None` and
-prints a visible skip when the resource is absent, but if
-`ARLE_REQUIRE_VULKAN_DEVICE` is set it panics. A runner that expected a
-device (GPU CI, the pod) sets the variable and gets a hard failure when
-none is present; an ordinary host that never set it still skips visibly.
-The environment variable is the precondition made explicit at the call
-site rather than guessed from the exit code.
+The Vulkan tests (`crates/vulkan-kernels/tests/common/mod.rs::require_device`)
+show the half of the pattern that is still in the tree: a test acquires its
+resource through one helper; the helper returns `None` and prints a visible
+skip when the resource is absent. A require-resource environment variable
+once completed the other half — a runner that expected a device set it and
+got a hard failure when none was present. The Vulkan and fixture variants of
+that variable were deleted the same day: no runner provisioned an ICD or the
+dense HF fixture, so the loud-failure half could never fire, and the Vulkan
+device tests are now manual-only gates. The CUDA variant survives because a
+runner sets it (see Fix).
 
 ## Fix
 

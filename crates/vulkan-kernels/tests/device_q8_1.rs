@@ -4,8 +4,7 @@
 //! mathematically correct result.
 //!
 //! Runs only with `--features vulkan` and a working Vulkan device + compiled
-//! shaders; without one it skips cleanly. Set `ARLE_REQUIRE_VULKAN_DEVICE=1`
-//! to panic when no device exists. On the AMD Radeon
+//! shaders; without a Vulkan ICD it skips cleanly (manual-only gate). On the AMD Radeon
 //! 8060S (Strix Halo) this is the first end-to-end ARLE-on-Vulkan execution.
 //!
 //! Case: quantize 128 values all equal to 1.0 with `q8_1`. The block amax is

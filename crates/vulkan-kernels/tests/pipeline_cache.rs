@@ -8,8 +8,8 @@
 //! asserts it stays at 1 across 100 `get` + `record_dispatch` calls.
 //!
 //! Runs only with `--features vulkan` + a working device + compiled `.spv`;
-//! skips cleanly otherwise. Set `ARLE_REQUIRE_VULKAN_DEVICE=1` to panic when
-//! no device exists instead of skipping.
+//! skips cleanly otherwise (manual-only gate; run on a box with an ICD with
+//! --nocapture to see it execute).
 #![cfg(feature = "vulkan")]
 
 mod common;

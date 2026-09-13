@@ -2086,7 +2086,6 @@ mod tests {
             // A device with no DEVICE_LOCAL heap at all cannot exercise it.
             Err(e) => {
                 eprintln!("vulkan-sys smoke: no DEVICE_LOCAL heap - skipping ({e})");
-                skip_or_panic(&format!("no DEVICE_LOCAL heap: {e}"));
                 return;
             }
         };
@@ -2103,42 +2102,29 @@ mod tests {
         assert_eq!(src, back, "DEVICE_LOCAL D2H round-trip mismatch");
     }
 
-    /// Skip a device test unless `ARLE_REQUIRE_VULKAN_DEVICE` is set, in which
-    /// case the missing device is a hard failure (same rule as the
-    /// vulkan-kernels `require_device` helper: CI without an ICD must not pass by
-    /// silently skipping).
-    #[cfg(all(test, feature = "vulkan"))]
-    fn skip_or_panic(reason: &str) {
-        if std::env::var_os("ARLE_REQUIRE_VULKAN_DEVICE").is_some() {
-            panic!("ARLE_REQUIRE_VULKAN_DEVICE set but no Vulkan device is available: {reason}");
-        }
-    }
-
     /// Create a compute `VulkanContext` for a device test, or `None` after
-    /// printing the skip reason (panics under `ARLE_REQUIRE_VULKAN_DEVICE`).
+    /// printing the skip reason. These are manual-only device tests: no CI lane
+    /// provides an ICD, so a missing device is a skip, not a pass or failure;
+    /// run on a capable box with `--nocapture` to see the test execute.
     #[cfg(feature = "vulkan")]
     fn test_context_or_skip() -> Option<VulkanContext> {
         if let Err(e) = init() {
-            eprintln!("vulkan-sys smoke: loader unavailable - skipping ({e})");
-            skip_or_panic(&format!("loader unavailable: {e}"));
+            eprintln!("skipping: vulkan loader unavailable ({e})");
             return None;
         }
         match device_count() {
             Ok(0) => {
-                eprintln!("vulkan-sys smoke: 0 devices - skipping");
-                skip_or_panic("0 devices");
+                eprintln!("skipping: 0 Vulkan devices");
                 None
             }
             Err(e) => {
-                eprintln!("vulkan-sys smoke: device enumeration failed - skipping ({e})");
-                skip_or_panic(&format!("enumeration failed: {e}"));
+                eprintln!("skipping: Vulkan device enumeration failed ({e})");
                 None
             }
             Ok(_) => match VulkanContext::create() {
                 Ok(ctx) => Some(ctx),
                 Err(VulkanError::NoComputeDevice) => {
-                    eprintln!("vulkan-sys smoke: no compute queue - skipping");
-                    skip_or_panic("no compute queue");
+                    eprintln!("skipping: Vulkan device has no compute queue");
                     None
                 }
                 Err(e) => panic!("failed to create Vulkan context: {e}"),
