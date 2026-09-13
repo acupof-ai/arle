@@ -156,7 +156,11 @@ mod real {
         }
 
         for (ci, case) in cases.iter().enumerate() {
-            let corrupt = negative && ci == 0;
+            // The negative teeth drive the CSA builder at TOPK pitch, so the
+            // corrupted case is selected by MODE, not by array position:
+            // reordering `modes` must not silently move the tooth to an HCA
+            // case where the pitches mismatch.
+            let corrupt = negative && matches!(case.mode, Mode::Csa) && ci == 0;
             run_case(&ctx, *case, corrupt)?;
         }
         if negative {
