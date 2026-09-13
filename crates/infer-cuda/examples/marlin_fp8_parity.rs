@@ -30,10 +30,20 @@
 //!
 //! Run on a pod: `INFER_CUDA_DEVICE=<free-gpu> target/release/examples/marlin_fp8_parity`
 //!
-//! `--negative-control` corrupts ONE expectation per comparator family (the
-//! Marlin tensor-core lane and the scalar GEMV lane, the latter including the
-//! declined-shape band); each family MUST independently FAIL, then the run
-//! prints NEGATIVE CONTROL OK and exits 0.
+//! `--negative-control` runs two kinds of tooth, both must pass:
+//!   1. expectation tooth — one comparator family (the Marlin tensor-core lane
+//!      and the scalar GEMV lane, the latter including the declined-shape
+//!      band) is judged against a 3x expectation; each family MUST FAIL
+//!      independently. Proves the comparator and its band are live.
+//!   2. device-input tooth (o_proj shape, first seed) — every E4M3 weight byte
+//!      of one sampled output column is pinned to the e4m3 max BEFORE the
+//!      Marlin repack/upload. The kernel output over the full sampled slab
+//!      must MATCH an f64 oracle rebuilt from the corrupted bytes (proving the
+//!      kernel consumed the buffer) and FAIL the clean oracle (proving a real
+//!      weight fault reaches the compared quantity), both hard-asserted with
+//!      distinct messages. This tooth covers the Marlin repacked path; the
+//!      GEMV lane keeps its independent expectation tooth and clean anchor.
+//!      On success the negative arm prints `NEGATIVE CONTROL OK` and exits 0.
 
 fn main() -> anyhow::Result<()> {
     use parity_common::Parsed;
@@ -118,6 +128,34 @@ mod real {
     /// passes when BOTH lanes are broken; this catches that. The expected floor
     /// is the BF16 output rounding, rms 2^-9/sqrt(3) ≈ 1.1e-3.
     const MAX_REL_L2: f64 = 8e-3;
+
+    /// Ceiling on the worst single output error normalised by the reference
+    /// rms (`max|err|/rms`). rel_l2 dilutes a localized fault across the 1024
+    /// sampled columns, so a single wrong repacked weight can leave rel_l2 in
+    /// band while one output element is far off; this term cannot be diluted.
+    ///
+    /// Bound provenance: PARTIALLY DERIVED.
+    /// Clean side (measured): across all five shapes × three seeds × the M
+    /// sweep, 198 lane samples, the largest clean max/rms was 1.6711e-2; 5e-2
+    /// is ~3x that headroom.
+    /// Fire side (NOT measured): the smallest defect this clause is meant to
+    /// catch is a localized weight corruption. No run has recorded max/rms for
+    /// a single corrupted weight byte yet (the only such run recorded
+    /// rel_l2 1.7e-3→1.8e-3, not max/rms), so it is not yet shown that the
+    /// target defect exceeds 5e-2. Queued for the next card window: one
+    /// negative arm with single-byte corruption, record max/rms.
+    const MAX_MAX_OVER_RMS: f64 = 5e-2;
+
+    /// Allowed band for mean(out/ref) over the rms-cleared elements. A correct
+    /// lane is unbiased about 1.0; a missing/mis-applied scale drives it toward
+    /// 0 (or blows it up) while rel_l2 can look small. Two-sided.
+    ///
+    /// Bound provenance: PARTIALLY DERIVED. Clean side measured over the same
+    /// 198 samples at 0.999872..=1.000228; [0.99, 1.01] is ~40x that band.
+    /// Fire side not measured — a scale-magnitude defect is intended to fall
+    /// outside this band but no defective run has recorded its mean ratio.
+    const MIN_MEAN_RATIO: f64 = 0.99;
+    const MAX_MEAN_RATIO: f64 = 1.01;
 
     /// Round-half-to-even, matching the device `__nv_fp8_e4m3` conversion.
     fn rint_ne(x: f32) -> u8 {
@@ -461,7 +499,6 @@ mod real {
         let mut weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
         // The repack releases the source, so lane 2 gets its own unrepacked copy.
         let gemv_weight = DeviceMatrix::from_fp8_block_scaled(ctx, &qbytes, &scales, n, k, 1, k)?;
-        drop(qbytes);
         weight.repack_for_marlin_fp8(ctx)?;
         ensure!(
             weight.marlin_packed.is_some() && weight.marlin_scales.is_some(),
@@ -543,8 +580,15 @@ mod real {
             let ratio = ms.rel_l2 / gs.rel_l2.max(1e-12);
             let marlin_pass = ms.rel_l2.is_finite()
                 && ms.rel_l2 <= MAX_REL_L2
+                && ms.max_over_rms <= MAX_MAX_OVER_RMS
+                && ms.mean_ratio.is_finite()
+                && (MIN_MEAN_RATIO..=MAX_MEAN_RATIO).contains(&ms.mean_ratio)
                 && ratio <= MARLIN_VS_GEMV_MAX_RATIO;
-            let gemv_pass = gs.rel_l2.is_finite() && gs.rel_l2 <= MAX_REL_L2;
+            let gemv_pass = gs.rel_l2.is_finite()
+                && gs.rel_l2 <= MAX_REL_L2
+                && gs.max_over_rms <= MAX_MAX_OVER_RMS
+                && gs.mean_ratio.is_finite()
+                && (MIN_MEAN_RATIO..=MAX_MEAN_RATIO).contains(&gs.mean_ratio);
             if !marlin_pass {
                 marlin_failed = true;
             }
@@ -566,6 +610,132 @@ mod real {
                 if gemv_pass { "PASS" } else { "FAIL" }
             );
         }
+        // Device-input tooth (negative mode only): corrupt ONE E4M3 weight
+        // byte the Marlin lane actually consumes, rebuild the reference from
+        // the corrupted buffer as uploaded, and hard-assert both halves.
+        //
+        // Target byte: column 0 (inside the sampled REF_SLAB at every shape),
+        // k-index 0, m=1 — always a live, compared cell, never padding. Pinning
+        // it to the e4m3 max changes the weight magnitude maximally; the
+        // activation x[0,0] is a fresh normal and nonzero with overwhelming
+        // probability, and the clean run already bounds the floor, so a
+        // failure here names the cell rather than silently passing.
+        // The device tooth is expensive (an extra repack + reference per
+        // invocation), so it runs once per family on one accepted shape/seed;
+        // the existing expectation tooth still fires across the whole M sweep
+        // for every shape.
+        //
+        // Sabotage: pin EVERY weight byte of ONE output column (SAB_COL) to the
+        // e4m3 max before repack. All K bytes of that column are live at the
+        // tested geometry (K aligned, no padding) and SAB_COL sits inside the
+        // sampled slab (the first/last REF_SLAB columns), so the fault is seen
+        // by the UNCHANGED comparator. One column over the two-slab (1024-col)
+        // denominator contributes ~2/1024 of the energy → relL2 ≈ 4.4e-2,
+        // ~5.5x the 8e-3 cap and independent of n and M. The comparator is not
+        // scoped to the sabotaged column — that would couple the positive arm
+        // to the negative control and shrink what the gate checks.
+        const TOOTH_LABEL: &str = "o_proj";
+        const TOOTH_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+        if negative && label == TOOTH_LABEL && seed == TOOTH_SEED {
+            const SAB_COL: usize = 0;
+            const TOOTH_M: usize = 1;
+            ensure!(
+                SAB_COL < REF_SLAB,
+                "device tooth: sabotaged column {SAB_COL} must lie in a sampled slab"
+            );
+            let mut bad_bytes = qbytes.clone();
+            let sab = 0x7eu8; // e4m3 finite max, +448
+            for bk in 0..k {
+                bad_bytes[SAB_COL * k + bk] = sab;
+            }
+
+            // Repack from the corrupted bytes — the kernel's actual device
+            // input (the repack reads the uploaded u8 weight).
+            let mut bad_weight =
+                DeviceMatrix::from_fp8_block_scaled(ctx, &bad_bytes, &scales, n, k, 1, k)?;
+            bad_weight.repack_for_marlin_fp8(ctx)?;
+            ensure!(
+                bad_weight.marlin_packed.is_some() && bad_weight.marlin_scales.is_some(),
+                "device tooth: corrupted shape not repackable"
+            );
+
+            // Oracle rebuilt over the full sampled slab from the bytes AS
+            // UPLOADED (the sabotaged buffer), plus the clean slab reference.
+            let (tooth_cols, reference_bad) =
+                build_reference(&bad_bytes, &scales, n, k, m_max, &x_bf16);
+
+            let mut bad_out = ctx.stream.alloc_zeros::<bf16>(TOOTH_M * n)?;
+            {
+                let (pp, _g0) = bad_weight
+                    .marlin_packed
+                    .as_ref()
+                    .unwrap()
+                    .device_ptr(&ctx.stream);
+                let (sp, _g1) = bad_weight
+                    .marlin_scales
+                    .as_ref()
+                    .unwrap()
+                    .device_ptr(&ctx.stream);
+                let (xp, _g2) = x.device_ptr(&ctx.stream);
+                let (op, _g3) = bad_out.device_ptr_mut(&ctx.stream);
+                let (cp, _g4) = c_tmp.device_ptr(&ctx.stream);
+                let (wp, _g5) = workspace.device_ptr(&ctx.stream);
+                // SAFETY: same contract as the clean Marlin launch, m=1.
+                unsafe {
+                    ffi::marlin_fp8_gemm_cuda(
+                        xp as *const ffi::Half,
+                        pp as *const u32,
+                        sp as *const ffi::Half,
+                        op as *mut ffi::Half,
+                        cp as *mut f32,
+                        wp as *mut i32,
+                        TOOTH_M as i32,
+                        n as i32,
+                        k as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
+            ctx.sync()?;
+            let bad = ctx.stream.clone_dtoh(&bad_out)?;
+            // Half 1: kernel output on the sabotaged column MATCHES the oracle
+            // rebuilt from those bytes over the full slab → kernel consumed the
+            // buffer (the other sampled columns are unchanged and match too).
+            let match_stats = lane_stats(&bad, n, TOOTH_M, &tooth_cols, &reference_bad, m_max);
+            let match_ok = match_stats.rel_l2.is_finite() && match_stats.rel_l2 <= MAX_REL_L2;
+            eprintln!(
+                "[{label} device-tooth n={n} k={k}] vs sabotaged-oracle \
+                 relL2={:.4e} {}",
+                match_stats.rel_l2,
+                if match_ok { "MATCH" } else { "NO-MATCH" }
+            );
+            ensure!(
+                match_ok,
+                "device tooth: Marlin output does NOT match the oracle rebuilt from the corrupted weight column (kernel did not consume the sabotaged buffer); relL2={}",
+                match_stats.rel_l2
+            );
+            // Half 2: same output FAILS the CLEAN oracle over the full slab →
+            // a real weight-column fault reaches the compared quantity.
+            let clean_stats = lane_stats(&bad, n, TOOTH_M, &cols, &reference, m_max);
+            let fails_clean = clean_stats.rel_l2 > MAX_REL_L2;
+            eprintln!(
+                "[{label} device-tooth n={n} k={k}] vs clean-oracle \
+                 relL2={:.4e} {}",
+                clean_stats.rel_l2,
+                if fails_clean {
+                    "FAILS-CLEAN"
+                } else {
+                    "STILL-MATCHES-CLEAN"
+                }
+            );
+            ensure!(
+                fails_clean,
+                "device tooth: sabotaged weight column still matches the CLEAN oracle (fault did not reach the compared quantity); relL2={}",
+                clean_stats.rel_l2
+            );
+        }
+
         Ok((marlin_failed, gemv_failed))
     }
 
@@ -613,7 +783,11 @@ mod real {
             ctx.sync()?;
             let gemv = ctx.stream.clone_dtoh(&gemv_out)?;
             let gs = lane_stats(&gemv, n, m, &cols, &reference, m_max);
-            let pass = gs.rel_l2.is_finite() && gs.rel_l2 <= MAX_REL_L2;
+            let pass = gs.rel_l2.is_finite()
+                && gs.rel_l2 <= MAX_REL_L2
+                && gs.max_over_rms <= MAX_MAX_OVER_RMS
+                && gs.mean_ratio.is_finite()
+                && (MIN_MEAN_RATIO..=MAX_MEAN_RATIO).contains(&gs.mean_ratio);
             any_fail |= !pass;
             eprintln!(
                 "[{label} m={m:>3} n={n} k={k} seed={seed:#x}] \
