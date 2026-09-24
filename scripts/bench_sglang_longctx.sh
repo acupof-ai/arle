@@ -310,7 +310,7 @@ write_wins_entry() {
         return 0
     fi
 
-    local wins_dir="$REPO_ROOT/docs/experience/wins"
+    local wins_dir="$OUTPUT_DIR"
     local wins_base="$wins_dir/${DATE}-bench-sglang-longctx-${LABEL}"
     local wins_file="${wins_base}.md"
     local wrun=1

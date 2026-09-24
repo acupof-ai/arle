@@ -462,11 +462,6 @@ do_deps() {
         info "skipping nsjail (Linux-only); Mac will run tools without sandbox"
     fi
 
-    # --- git hooks (inlined from former scripts/install_git_hooks.sh) ---
-    step "Git hooks"
-    git config core.hooksPath .githooks
-    ok "core.hooksPath=.githooks"
-
     # --- Python venv ---
     step "Python virtual environment"
     if [ -f "$VENV_DIR/bin/activate" ]; then

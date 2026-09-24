@@ -27,7 +27,6 @@
 #   ARLE_PARITY_GATE_LIST gate list as name[:sm90][:model], space-separated
 #   ARLE_PARITY_GPU       skip the pick-gpu.sh claim and use this index
 #   ARLE_PARITY_NO_NEG_ALLOWLIST  gates allowed to run WITHOUT --negative-control
-#   ARLE_PARITY_SKIP_PREREG=1  do not open/close a prereg row
 #   ARLE_PARITY_DSV4_GPUS  pinned physical GPU csv for the dsv4 multi-rank phase
 #   ARLE_PARITY_DSV4_WORLD ranks to launch (default 8; unused without the model)
 #
@@ -49,20 +48,9 @@ LOG_CAP_BYTES="${ARLE_PARITY_LOG_CAP_BYTES:-$((1024 * 1024))}"
 mkdir -p "$OUT/logs"
 
 NAME="parity-gpu-batch-$(date +%Y%m%d%H%M%S)"
-if [ "${ARLE_PARITY_SKIP_PREREG:-0}" != 1 ]; then
-    python3 "$ROOT/scripts/prereg.py" start \
-        --name "$NAME" \
-        --cmd "scripts/parity_gpu_batch.sh $OUT" \
-        --hypothesis "every registry-listed parity gate passes positive and trips under --negative-control on one free SM90 GPU" \
-        >/dev/null
-fi
 
-prereg_done() {  # $1 = status, rest = result/finding/decision already set via globals
-    [ "${ARLE_PARITY_SKIP_PREREG:-0}" = 1 ] && return 0
-    python3 "$ROOT/scripts/prereg.py" done \
-        --name "$NAME" --status "$1" \
-        --result "$PREREG_RESULT" --finding "$PREREG_FINDING" --decision "$PREREG_DECISION" \
-        >/dev/null || true
+verdict() {  # $1 = status; result/finding/decision set via globals
+    echo "parity-batch: $1 | $VERDICT_RESULT | $VERDICT_FINDING | $VERDICT_DECISION" >&2
 }
 
 # Gate metadata is derived, never hardcoded. Stdout lines: name<TAB>flags,
@@ -122,10 +110,10 @@ else
     set -e
     if [ "$build_rc" -ne 0 ]; then
         tail -n 40 "$OUT/build.log" >&2
-        PREREG_RESULT="build failed rc=$build_rc"
-        PREREG_FINDING="release build of the registry parity examples failed; no gate ran"
-        PREREG_DECISION="fix the build before reading any parity signal"
-        prereg_done killed
+        VERDICT_RESULT="build failed rc=$build_rc"
+        VERDICT_FINDING="release build of the registry parity examples failed; no gate ran"
+        VERDICT_DECISION="fix the build before reading any parity signal"
+        verdict killed
         exit "$build_rc"
     fi
     # Resolve through cargo so CARGO_TARGET_DIR / .cargo/config are honored.
@@ -156,10 +144,10 @@ echo "parity-batch: cuda-kernels host-only unit tests"
 if ! run_host_units >"$OUT/host-units.log" 2>&1; then
     echo "parity-batch: host-only unit tests failed" >&2
     tail -n 40 "$OUT/host-units.log" >&2
-    PREREG_RESULT="host unit tests failed"
-    PREREG_FINDING="cuda-kernels host-only unit tests failed before any GPU gate ran; see host-units.log"
-    PREREG_DECISION="fix the host failure before reading any parity signal"
-    prereg_done rejected
+    VERDICT_RESULT="host unit tests failed"
+    VERDICT_FINDING="cuda-kernels host-only unit tests failed before any GPU gate ran; see host-units.log"
+    VERDICT_DECISION="fix the host failure before reading any parity signal"
+    verdict rejected
     exit 1
 fi
 echo "parity-batch: host-only unit tests PASS"
@@ -187,10 +175,10 @@ else
     GPU="$(env "${CLAIM_ENV[@]}" bash "$ROOT/scripts/pick-gpu.sh")" || GPU="NONE"
     [ "$GPU" != "NONE" ] || {
         echo "parity-batch: no free GPU" >&2
-        PREREG_RESULT="no free GPU"
-        PREREG_FINDING="pick-gpu.sh offered no free SM90 card"
-        PREREG_DECISION="rerun when a card is free"
-        prereg_done killed
+        VERDICT_RESULT="no free GPU"
+        VERDICT_FINDING="pick-gpu.sh offered no free SM90 card"
+        VERDICT_DECISION="rerun when a card is free"
+        verdict killed
         exit 3
     }
     CLAIM="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$GPU"
@@ -220,10 +208,10 @@ echo "parity-batch: infer-cuda device unit test (gpu=$GPU, require-device)"
 if ! run_device_units >"$OUT/device-units.log" 2>&1; then
     echo "parity-batch: device unit test failed" >&2
     tail -n 40 "$OUT/device-units.log" >&2
-    PREREG_RESULT="device unit test failed"
-    PREREG_FINDING="device_lora_merge_matches_host_reference failed on the claimed GPU (or the required CUDA device was absent); see device-units.log"
-    PREREG_DECISION="do not read any parity signal until the device unit test is green"
-    prereg_done rejected
+    VERDICT_RESULT="device unit test failed"
+    VERDICT_FINDING="device_lora_merge_matches_host_reference failed on the claimed GPU (or the required CUDA device was absent); see device-units.log"
+    VERDICT_DECISION="do not read any parity signal until the device unit test is green"
+    verdict rejected
     exit 1
 fi
 echo "parity-batch: device unit test PASS"
@@ -495,18 +483,18 @@ echo "parity-batch: $TSV"
 echo "parity-batch: $MD"
 
 if [ "$n_fail" -eq 0 ]; then
-    PREREG_RESULT="pass=$n_pass fail=0 skip=$n_skip"
+    VERDICT_RESULT="pass=$n_pass fail=0 skip=$n_skip"
     if [ "$n_skip" -eq 0 ]; then
-        PREREG_FINDING="every registry-listed parity gate printed its positive verdict and every negative-control run printed NEGATIVE CONTROL OK"
+        VERDICT_FINDING="every registry-listed parity gate printed its positive verdict and every negative-control run printed NEGATIVE CONTROL OK"
     else
-        PREREG_FINDING="$n_pass gates green; $n_skip gates never executed on this device (no verdict): $notrun_display"
+        VERDICT_FINDING="$n_pass gates green; $n_skip gates never executed on this device (no verdict): $notrun_display"
     fi
-    PREREG_DECISION="gates accepted on this build; results.md lists the non-executed gates and their required device/launcher"
-    prereg_done ok
+    VERDICT_DECISION="gates accepted on this build; results.md lists the non-executed gates and their required device/launcher"
+    verdict ok
     exit 0
 fi
-PREREG_RESULT="pass=$n_pass fail=$n_fail skip=$n_skip"
-PREREG_FINDING="failing gates:$fail_names"
-PREREG_DECISION="do not trust the gated operators on this build until the listed gates are green"
-prereg_done rejected
+VERDICT_RESULT="pass=$n_pass fail=$n_fail skip=$n_skip"
+VERDICT_FINDING="failing gates:$fail_names"
+VERDICT_DECISION="do not trust the gated operators on this build until the listed gates are green"
+verdict rejected
 exit 1

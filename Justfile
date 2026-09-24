@@ -110,10 +110,3 @@ clean:
 doctor:
     {{arle_bin}} --doctor
 
-# Repo hygiene checks (wins cap, etc.).
-hygiene:
-    python3 {{scripts_dir}}/check_repo_hygiene.py
-
-# Full CI-aligned pre-push validation (Metal arms: ARLE_PRE_PUSH_METAL=1).
-prepush:
-    bash {{scripts_dir}}/pre_push_checks.sh
