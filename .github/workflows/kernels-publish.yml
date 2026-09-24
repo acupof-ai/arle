@@ -9,7 +9,7 @@ on:
       - crates/cuda-kernels/tools/tilelang/**
       - crates/cuda-kernels/csrc/**
       - crates/cuda-kernels/src/**
-      - crates/cuda-kernels/vendor/**
+      - crates/deepseek-kernels-sys/**
       - crates/infer-cuda/src/**
       - crates/cuda-kernels/kernels.toml
       - crates/cuda-kernels/build.rs

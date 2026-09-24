@@ -1,5 +1,7 @@
 //! CUDA kernel AOT surface: TileLang-generated attention/GEMM kernels plus the
-//! native csrc ops, linked into one `libkernels_cuda.a` for the prebuilt bundle.
+//! native csrc ops, linked into `libkernels_cuda.a`. The vendored FlashMLA /
+//! DeepGEMM / FA3-hopper kernels live in `deepseek-kernels-sys`; their FFI is
+//! re-exported under `ffi::*` at the original paths.
 
 #[cfg(feature = "cuda")]
 pub mod attention;

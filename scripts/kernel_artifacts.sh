@@ -76,7 +76,7 @@ KERNEL_INPUT_PATHS=(
     crates/cuda-kernels/tools/tilelang
     crates/cuda-kernels/csrc
     crates/cuda-kernels/src
-    crates/cuda-kernels/vendor
+    crates/deepseek-kernels-sys
     requirements-build.txt
 )
 

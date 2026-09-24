@@ -1,6 +1,7 @@
 * @cklxx
 
 /crates/cuda-kernels/ @cklxx
+/crates/deepseek-kernels-sys/ @cklxx
 /crates/mlx-sys/ @cklxx
 /crates/train/ @cklxx
 /docs/ @cklxx

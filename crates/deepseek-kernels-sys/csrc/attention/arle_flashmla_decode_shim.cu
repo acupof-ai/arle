@@ -38,8 +38,8 @@
 //
 // Refs:
 //   docs/experience/wins/2026-05-28-dsv4-v2-4-flashmla-root-cause-fix.md
-//   crates/cuda-kernels/vendor/flashmla/csrc/sm90/decode/sparse_fp8/
-//   crates/cuda-kernels/vendor/flashmla/csrc/smxx/decode/
+//   crates/deepseek-kernels-sys/vendor/flashmla/csrc/sm90/decode/sparse_fp8/
+//   crates/deepseek-kernels-sys/vendor/flashmla/csrc/smxx/decode/
 
 #include <cuda_runtime.h>
 #include <cstdint>

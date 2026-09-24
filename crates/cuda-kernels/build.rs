@@ -4,237 +4,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Tier-1 SMs: default-compiled fat-binary set. A100 / A10·3090 / L4·4090 / H100.
-const T1_SMS: &[&str] = &["80", "86", "89", "90"];
-
-/// Tier-2 SMs: opt-in via TORCH_CUDA_ARCH_LIST. B100·B200 / RTX 5090.
-const T2_SMS: &[&str] = &["100", "120"];
-
-/// Legacy Volta SMs: opt-in / auto-detect only, built as a separate SM-pinned binary.
-const LEGACY_VOLTA_SMS: &[&str] = &["70"];
-
-fn is_supported_sm(sm: &str) -> bool {
-    T1_SMS.contains(&sm) || T2_SMS.contains(&sm) || LEGACY_VOLTA_SMS.contains(&sm)
-}
-
-fn is_legacy_volta_sm(sm: &str) -> bool {
-    LEGACY_VOLTA_SMS.contains(&sm)
-}
-
-fn has_legacy_volta(sm_targets: &[SmSpec]) -> bool {
-    sm_targets.iter().any(|spec| is_legacy_volta_sm(&spec.sm))
-}
-
-#[derive(Clone, Debug)]
-struct SmSpec {
-    sm: String,
-    /// `+PTX` requested for this SM (per PyTorch TORCH_CUDA_ARCH_LIST convention).
-    ptx: bool,
-}
-
-/// Parse a single SM token. Accepts:
-///   - PyTorch:  `8.0`, `9.0`, `12.0+PTX`
-///   - CMake:    `80`, `90`, `120`
-///   - nvcc:     `sm_80`, `compute_90`
-fn parse_sm_token(raw: &str) -> Option<SmSpec> {
-    let token = raw.trim().trim_matches('"');
-    if token.is_empty() {
-        return None;
-    }
-
-    let (token, ptx) = if let Some(stem) = token
-        .strip_suffix("+PTX")
-        .or_else(|| token.strip_suffix("+ptx"))
-    {
-        (stem.trim_end(), true)
-    } else {
-        (token, false)
-    };
-
-    let token = token
-        .strip_prefix("sm_")
-        .or_else(|| token.strip_prefix("compute_"))
-        .unwrap_or(token);
-
-    let sm = if let Some((major, minor)) = token.split_once('.') {
-        if major.chars().all(|c| c.is_ascii_digit()) && minor.chars().all(|c| c.is_ascii_digit()) {
-            format!("{major}{minor}")
-        } else {
-            return None;
-        }
-    } else if token.chars().all(|c| c.is_ascii_digit()) {
-        if token.len() == 1 {
-            format!("{token}0")
-        } else {
-            token.to_string()
-        }
-    } else {
-        return None;
-    };
-
-    Some(SmSpec { sm, ptx })
-}
-
-/// Reject SMs outside the explicit whitelist. Turing/Pascal/older stay unsupported.
-fn validate_sm(spec: &SmSpec, source: &str) {
-    if !is_supported_sm(&spec.sm) {
-        panic!(
-            "Unsupported CUDA compute capability 'sm_{}' from {}. \
-             ARLE supports T1={{80,86,89,90}} (default), T2={{100,120}} (opt-in), \
-             and legacy Volta={{70}} as a separate SM-pinned build. \
-             Turing/Pascal/unknown SMs are rejected. \
-             See docs/environment.md and docs/support-matrix.md. \
-             To restrict targets explicitly: TORCH_CUDA_ARCH_LIST=\"8.0;8.6;8.9;9.0\".",
-            spec.sm, source
-        );
-    }
-}
-
-fn validate_sm_set(sm_targets: &[SmSpec]) {
-    if has_legacy_volta(sm_targets) && sm_targets.len() != 1 {
-        panic!(
-            "sm_70 legacy Volta builds must be SM-pinned and cannot be mixed with T1/T2 targets. \
-             Build V100 with TORCH_CUDA_ARCH_LIST=\"7.0\"; build the T1 release binary separately \
-             with TORCH_CUDA_ARCH_LIST=\"8.0;8.6;8.9;9.0\". \
-             This keeps T1 cubins free of sm_70 fallback code and keeps sm_70 binaries free of \
-             T1/Hopper-only kernels. See docs/environment.md."
-        );
-    }
-}
-
-/// Parse TORCH_CUDA_ARCH_LIST / CMAKE_CUDA_ARCHITECTURES.
-/// Separators: `;`, `,`, whitespace. Empty tokens skipped. Each token validated.
-///
-/// Empty result panics: an empty / whitespace / separators-only env var is
-/// almost always a typo (e.g. `TORCH_CUDA_ARCH_LIST=""`), and silently
-/// continuing would emit AOT dispatch wrappers with zero `case` arms — every
-/// runtime call would then return `CUDA_ERROR_NOT_SUPPORTED`. Fail fast.
-fn parse_arch_list(raw: &str, source: &str) -> Vec<SmSpec> {
-    let mut sms: BTreeSet<String> = BTreeSet::new();
-    let mut ptx_for: BTreeSet<String> = BTreeSet::new();
-
-    for token in raw.split(|c: char| c == ';' || c == ',' || c.is_whitespace()) {
-        if token.is_empty() {
-            continue;
-        }
-        let spec = parse_sm_token(token).unwrap_or_else(|| {
-            panic!(
-                "Failed to parse SM token '{token}' from {source} (raw='{raw}'). \
-                 Expected format e.g. '8.0', '8.0+PTX', '80', 'sm_80'."
-            )
-        });
-        validate_sm(&spec, source);
-        if spec.ptx {
-            ptx_for.insert(spec.sm.clone());
-        }
-        sms.insert(spec.sm);
-    }
-
-    if sms.is_empty() {
-        panic!(
-            "{source} is set but parsed to zero SM targets (raw='{raw}'). \
-             Either unset {source} (auto-detect via nvidia-smi or T1 default) \
-             or pass a non-empty list, e.g. '8.0;8.6;8.9;9.0' (T1) or '9.0' (H100 only)."
-        );
-    }
-
-    sms.into_iter()
-        .map(|sm| SmSpec {
-            ptx: ptx_for.contains(&sm),
-            sm,
-        })
-        .collect()
-}
-
-fn sm_targets_from_nvidia_smi() -> Option<Vec<SmSpec>> {
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut sms: BTreeSet<String> = BTreeSet::new();
-    for line in stdout.lines() {
-        let cap = line.split(',').next().unwrap_or(line).trim();
-        if cap.is_empty() {
-            continue;
-        }
-        let spec = parse_sm_token(cap)
-            .unwrap_or_else(|| panic!("nvidia-smi reported unparseable compute_cap '{cap}'."));
-        validate_sm(&spec, "nvidia-smi --query-gpu=compute_cap");
-        sms.insert(spec.sm);
-    }
-
-    if sms.is_empty() {
-        None
-    } else {
-        Some(
-            sms.into_iter()
-                .map(|sm| SmSpec { sm, ptx: false })
-                .collect(),
-        )
-    }
-}
-
-fn detect_sm_targets() -> Vec<SmSpec> {
-    if let Ok(env) = std::env::var("TORCH_CUDA_ARCH_LIST") {
-        return parse_arch_list(&env, "TORCH_CUDA_ARCH_LIST");
-    }
-    if let Ok(env) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
-        return parse_arch_list(&env, "CMAKE_CUDA_ARCHITECTURES");
-    }
-
-    if let Some(sms) = sm_targets_from_nvidia_smi() {
-        return sms;
-    }
-
-    println!(
-        "cargo:warning=No GPU detected and TORCH_CUDA_ARCH_LIST not set; defaulting to T1 SMs (sm_80, sm_86, sm_89, sm_90). \
-         To target Blackwell (sm_100, sm_120), set TORCH_CUDA_ARCH_LIST=\"...;10.0\" or \"...;12.0\". \
-         See docs/environment.md."
-    );
-    T1_SMS
-        .iter()
-        .map(|s| SmSpec {
-            sm: (*s).to_string(),
-            ptx: false,
-        })
-        .collect()
-}
-
-fn nvcc_arch_args(sm_targets: &[SmSpec]) -> Vec<String> {
-    let mut args = Vec::new();
-    for spec in sm_targets {
-        // SASS for this SM.
-        args.push("-gencode".to_string());
-        args.push(format!("arch=compute_{sm},code=sm_{sm}", sm = spec.sm));
-        // Per-SM PTX requested via `+PTX` suffix.
-        if spec.ptx {
-            args.push("-gencode".to_string());
-            args.push(format!("arch=compute_{sm},code=compute_{sm}", sm = spec.sm));
-        }
-    }
-
-    // Always emit PTX for the highest SM as a forward-compat JIT fallback for
-    // newer hardware (e.g. T2 sm_120 when only T1 is built). Skip if that SM
-    // already requested `+PTX`.
-    if let Some(max_spec) = sm_targets
-        .iter()
-        .max_by_key(|s| s.sm.parse::<u32>().unwrap_or(0))
-        && !max_spec.ptx
-    {
-        args.push("-gencode".to_string());
-        args.push(format!(
-            "arch=compute_{sm},code=compute_{sm}",
-            sm = max_spec.sm
-        ));
-    }
-
-    args
-}
+#[path = "../deepseek-kernels-sys/cuda_build.rs"]
+mod cuda_build;
+use cuda_build::*;
 
 /// Convert "80" -> "8.0", "120" -> "12.0", for inclusion in TORCH_CUDA_ARCH_LIST hint strings.
 fn sm_to_arch_list_token(sm: &str) -> String {
@@ -1752,76 +1524,6 @@ fn compile_tilelang_aot_kernels(
     println!("cargo:rerun-if-env-changed=INFER_TILELANG_PYTHON");
 }
 
-// Recursively collect every `.cu` file under `dir` so domain subdirs
-// (attention/, gemm/, moe/, kv/, quant/, sampling/, norm/, recurrent/,
-// elementwise/, ...) are picked up automatically.
-fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(err) => panic!("Failed to read {}: {}", dir.display(), err),
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_cu_files(&path, out);
-            continue;
-        }
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("._"))
-        {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) == Some("cu") {
-            out.push(path);
-        }
-    }
-}
-
-// Recursively walk `dir` and emit `cargo:rerun-if-changed` for every file.
-// Cargo's `rerun-if-changed=<dir>` directive only watches the *immediate*
-// directory entries, NOT subdirectories — so `rerun-if-changed=csrc/` alone
-// silently misses changes to `csrc/kv/*.cu`, `csrc/attention/*.cu`, etc., and
-// stale cubins ship while source diffs sit dormant. Emit one directive per
-// file so every `.cu`/`.cuh`/`.h` edit invalidates the build.
-fn emit_rerun_recursive(dir: &Path) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(err) => panic!("Failed to read {}: {}", dir.display(), err),
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("._"))
-        {
-            continue;
-        }
-        if path.is_dir() {
-            println!("cargo:rerun-if-changed={}", path.display());
-            emit_rerun_recursive(&path);
-        } else {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-    }
-}
-
-fn env_flag(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 /// True when `name` is set to a truthy value (`1`, `true`, `yes`, `on`,
 /// case-insensitive). Used by opt-in build toggles like ARLE_TILELANG_REGEN.
 fn env_truthy(name: &str) -> bool {
@@ -1907,48 +1609,6 @@ fn vendor_tilelang_generated(out_dir: &Path, sm_targets: &[SmSpec]) {
     );
 }
 
-fn emit_cuda_system_link_libs(cuda_path: &str) {
-    if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
-    } else {
-        println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
-    }
-    println!("cargo:rustc-link-lib=cuda");
-    println!("cargo:rustc-link-lib=cudart");
-    println!("cargo:rustc-link-lib=cublas");
-    println!("cargo:rustc-link-lib=cublasLt");
-    // NCCL feature: link libnccl so multi-rank TP/EP builds don't need a manual
-    // `RUSTFLAGS=-lnccl` workaround. cargo sets CARGO_FEATURE_NCCL when the
-    // `nccl` feature (=> `cuda`) is active, so this is inert on no-cuda builds.
-    if std::env::var_os("CARGO_FEATURE_NCCL").is_some() {
-        // NCCL ships either with CUDA (lib64, already searched above) or as a
-        // system package; add the common Linux multiarch dir + an NCCL_HOME
-        // override so `-lnccl` resolves without per-invocation link flags.
-        if let Some(nccl_home) = env_nonempty("NCCL_HOME") {
-            println!("cargo:rustc-link-search=native={nccl_home}/lib");
-        }
-        if !cfg!(target_os = "windows") {
-            println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
-        }
-        println!("cargo:rustc-link-lib=nccl");
-    }
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=c++");
-    } else if !cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-lib=stdc++");
-        let gcc_major = Command::new("gcc")
-            .arg("-dumpfullversion")
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|version| version.split('.').next()?.trim().parse::<u32>().ok())
-            .unwrap_or(99);
-        if gcc_major < 9 {
-            println!("cargo:rustc-link-lib=stdc++fs");
-        }
-    }
-}
-
 fn emit_prebuilt_deepep_sidecar(path: &Path) {
     if !path.is_file() {
         panic!(
@@ -1987,9 +1647,14 @@ const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
 ];
 
 const PREBUILT_MANIFEST: &str = "arle-cuda-kernels.manifest";
-const PREBUILT_SCHEMA: &str = "3";
+const PREBUILT_SCHEMA: &str = "4";
+/// Static archives whose union must define the required symbols.
+/// `libdeepseek_kernels.a` is `deepseek-kernels-sys`'s archive, mirrored into
+/// this crate's OUT_DIR so one bundle carries every CUDA object.
+const PREBUILT_ARCHIVES: &[&str] = &["libkernels_cuda.a", "libdeepseek_kernels.a"];
 const PREBUILT_ARTIFACTS: &[&str] = &[
     "libkernels_cuda.a",
+    "libdeepseek_kernels.a",
     "libtilelang_kernels_aot.a",
     "arle_deepep_sidecar",
 ];
@@ -2059,8 +1724,11 @@ fn archive_symbols(archive: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-fn validate_archive_symbols(archive: &Path, required: &[&str]) {
-    let symbols = archive_symbols(archive);
+fn validate_archive_symbols(dir: &Path, required: &[&str]) {
+    let symbols = PREBUILT_ARCHIVES
+        .iter()
+        .flat_map(|name| archive_symbols(&dir.join(name)))
+        .collect::<BTreeSet<_>>();
     let missing = required
         .iter()
         .copied()
@@ -2068,8 +1736,8 @@ fn validate_archive_symbols(archive: &Path, required: &[&str]) {
         .collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
-        "CUDA archive {} is missing required symbols: {}",
-        archive.display(),
+        "CUDA archives {PREBUILT_ARCHIVES:?} in {} are missing required symbols: {}",
+        dir.display(),
         missing.join(", ")
     );
 }
@@ -2136,7 +1804,7 @@ fn producer_inputs_sha256() -> String {
         ("cuda-csrc", crate_dir.join("csrc")),
         ("cuda-rust", crate_dir.join("src")),
         ("cuda-tools", crate_dir.join("tools")),
-        ("cuda-vendor", crate_dir.join("vendor")),
+        ("deepseek-kernels-sys", PathBuf::from(dep_metadata("ROOT"))),
     ];
     for (env, label) in [
         ("ARLE_DEEPGEMM_ROOT", "deepgemm"),
@@ -2156,54 +1824,33 @@ fn producer_inputs_sha256() -> String {
     hex_digest(digest.finish().as_ref())
 }
 
-/// Resolve the CUTLASS include tree for DeepGEMM. The producer (compile path)
-/// and the consumer (`configured_capabilities`) must agree, or the prebuilt
-/// producer contract mismatches on `deepgemm-native`.
-fn resolve_deepgemm_cutlass_include(deepgemm_root: &Path) -> PathBuf {
-    if let Some(dir) = env_nonempty("ARLE_DEEPGEMM_CUTLASS_INCLUDE") {
-        return PathBuf::from(dir);
-    }
-    let bundled = deepgemm_root.join("third-party/cutlass/include");
-    if bundled.join("cutlass/arch/barrier.h").is_file() {
-        return bundled;
-    }
-    // DeepGEMM's own cutlass submodule is not vendored; fall back to the
-    // FlashMLA vendored cutlass, which carries the same Hopper barrier header.
-    let flashmla_cutlass = Path::new("vendor/flashmla/csrc/cutlass/include");
-    if flashmla_cutlass.join("cutlass/arch/barrier.h").is_file() {
-        return flashmla_cutlass.to_path_buf();
-    }
-    bundled
+/// One `links = "deepseek_kernels"` metadata value published by
+/// `deepseek-kernels-sys`'s build script (`cargo:<key>=<value>`).
+fn dep_metadata(key: &str) -> String {
+    std::env::var(format!("DEP_DEEPSEEK_KERNELS_{key}")).unwrap_or_else(|_| {
+        panic!("DEP_DEEPSEEK_KERNELS_{key} unset: deepseek-kernels-sys did not publish it")
+    })
 }
 
+fn dep_flag(key: &str) -> bool {
+    dep_metadata(key) == "1"
+}
+
+/// The vendored-kernel capabilities are decided by `deepseek-kernels-sys`
+/// (it owns the vendor trees and compiles them); this crate only reads them.
 fn configured_capabilities(sm_targets: &[SmSpec]) -> BTreeSet<String> {
-    let legacy_volta = has_legacy_volta(sm_targets);
     let mut capabilities = BTreeSet::new();
-    if Path::new("vendor/flashmla").is_dir()
-        && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA")
-        && !legacy_volta
-    {
+    if dep_flag("FLASHMLA") {
         capabilities.insert("flashmla".into());
     }
     let sm90 = sm_targets.iter().any(|spec| spec.sm == "90");
-    if sm90 && Path::new("vendor/flash-attention/hopper").is_dir() {
+    if dep_flag("FA3") {
         capabilities.insert("fa3".into());
     }
     if sm90 {
         capabilities.insert("flashqla".into());
     }
-    let deepgemm_root = env_nonempty("ARLE_DEEPGEMM_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("vendor/deepgemm"));
-    let deepgemm_library = env_nonempty("ARLE_DEEPGEMM_LIBRARY_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| deepgemm_root.join("deep_gemm"));
-    let deepgemm_cutlass = resolve_deepgemm_cutlass_include(&deepgemm_root);
-    if !env_flag("ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE")
-        && sm_targets.iter().any(|spec| spec.sm == "90")
-        && deepgemm_library.is_dir()
-        && deepgemm_cutlass.join("cutlass/arch/barrier.h").is_file()
-    {
+    if dep_flag("DEEPGEMM_NATIVE") {
         capabilities.insert("deepgemm-native".into());
     }
     if std::env::var_os("CARGO_FEATURE_NCCL").is_some() {
@@ -2283,7 +1930,7 @@ fn write_producer_manifest(
     capabilities: &BTreeSet<String>,
 ) {
     let required = required_symbols(capabilities);
-    validate_archive_symbols(&out_dir.join("libkernels_cuda.a"), &required);
+    validate_archive_symbols(out_dir, &required);
     let mut manifest = producer_contract(cuda_path, sm_targets, capabilities);
     for name in PREBUILT_ARTIFACTS {
         let path = out_dir.join(name);
@@ -2401,7 +2048,7 @@ fn verify_prebuilt_manifest(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    validate_archive_symbols(&prebuilt_dir.join("libkernels_cuda.a"), &symbols);
+    validate_archive_symbols(prebuilt_dir, &symbols);
     manifest
 }
 
@@ -2480,79 +2127,6 @@ fn emit_kernel_build_identity(out_dir: &Path, manifest: &BTreeMap<String, String
         ),
     )
     .expect("write kernel build identity");
-}
-
-fn tool_command(tool: &str, wrapper: Option<&str>) -> Command {
-    if let Some(wrapper) = wrapper {
-        let mut parts = wrapper.split_whitespace();
-        let program = parts
-            .next()
-            .expect("ARLE_NVCC_WRAPPER was filtered to non-empty");
-        let mut command = Command::new(program);
-        command.args(parts);
-        command.arg(tool);
-        command
-    } else {
-        Command::new(tool)
-    }
-}
-
-/// One queued nvcc invocation: the source (for error messages) plus the full
-/// pre-built argv. The output path is already baked into `args`.
-struct NvccJob {
-    cu_file: PathBuf,
-    args: Vec<String>,
-}
-
-fn run_nvcc_job(nvcc: &str, wrapper: Option<&str>, job: &NvccJob) {
-    let status = tool_command(nvcc, wrapper)
-        .args(&job.args)
-        .status()
-        .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", job.cu_file.display()));
-    assert!(
-        status.success(),
-        "nvcc compilation failed for {}",
-        job.cu_file.display()
-    );
-}
-
-/// Bounded worker count for the nvcc pool. Capped at 8 because a single
-/// multi-arch nvcc invocation can take 1-2 GB of RAM; `ARLE_NVCC_PARALLEL=1`
-/// restores the previous serial behavior.
-fn nvcc_parallelism(jobs: usize) -> usize {
-    println!("cargo:rerun-if-env-changed=ARLE_NVCC_PARALLEL");
-    let configured = env_nonempty("ARLE_NVCC_PARALLEL").and_then(|v| v.parse::<usize>().ok());
-    let default = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(8);
-    configured.unwrap_or(default).clamp(1, jobs.max(1))
-}
-
-/// Run all queued nvcc jobs through a bounded pool. Archive order is decided
-/// by the caller's `obj_files` (queue order), not completion order, so the
-/// `ar` symbol-resolution order is identical to the old serial loop. A panic
-/// in any worker is re-raised when the scope joins, failing the build.
-fn run_nvcc_jobs(nvcc: &str, wrapper: Option<&str>, jobs: &[NvccJob]) {
-    let workers = nvcc_parallelism(jobs.len());
-    if workers <= 1 {
-        for job in jobs {
-            run_nvcc_job(nvcc, wrapper, job);
-        }
-        return;
-    }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(job) = jobs.get(idx) else { break };
-                    run_nvcc_job(nvcc, wrapper, job);
-                }
-            });
-        }
-    });
 }
 
 fn main() {
@@ -2677,181 +2251,26 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NCCL");
 
-    // FlashMLA SM90 sparse prefill — vendored at `vendor/flashmla/` (pin
-    // df022ebafb88578eab9f0300606ee765608d8b5c). Add the 5 .cu files needed
-    // by ARLE's `arle_flashmla_shim.cu`: fwd.cu + 4 phase1 instantiations.
-    // Hopper only (DSv4 target = H20 / SM90a); SM100 sources are skipped.
-    // CUTLASS ships inside vendor/flashmla/csrc/cutlass/ (NVIDIA tag
-    // 147f5673 — FlashMLA submodule pin). Refs sgl-kernel/cmake/flashmla.cmake.
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA");
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA_DECODE");
-    let flashmla_root = Path::new("vendor/flashmla");
-    let flashmla_stub = Path::new("csrc/attention/arle_flashmla_decode_stubs.cu");
-    // FlashMLA is SM90-only sparse-FP8 (prefill + decode). Legacy Volta (sm_70)
-    // has no FP8, so the SM90 instantiations fail to compile there — fall back
-    // to the cudaErrorNotSupported stub path, same as an explicit opt-out.
-    let enable_flashmla =
-        flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA") && !legacy_volta_build;
-    if enable_flashmla {
-        // Runtime FlashMLA gates read `cuda_kernels::HAS_FLASHMLA` (this cfg); a
-        // build without the FlashMLA kernels falls back to scalar — no env var.
-        println!("cargo:rustc-cfg=arle_flashmla");
-    }
-    if enable_flashmla && env_flag("ARLE_CUDA_DISABLE_FLASHMLA_DECODE") {
-        panic!(
-            "ARLE_CUDA_DISABLE_FLASHMLA_DECODE would create a FlashMLA half-state. \
-             Disable FlashMLA entirely with ARLE_CUDA_DISABLE_FLASHMLA=1, or build the real decode shim."
-        );
-    }
-    let enable_flashmla_decode = enable_flashmla;
-    // `collect_cu_files` sees the fallback stub because it lives under csrc/.
-    // Drop it first so FlashMLA builds link exactly one implementation of the
-    // prefill/decode FFI symbols. Otherwise the archive order can satisfy
-    // `arle_flashmla_sm90_sparse_prefill_fwd` from the stub before the real
-    // shim object is considered, turning default-on FlashMLA into a runtime
-    // cudaErrorNotSupported.
-    cu_files.retain(|p| p != flashmla_stub);
-    if !enable_flashmla {
-        // FlashMLA SM90 disabled (likely SM89-only box or explicit opt-out).
-        // Drop the SM90-coupled shims from cu_files — they include vendored
-        // SM90 templates that won't compile without the FlashMLA tree, and
-        // they emit symbols that the stubs below will substitute for.
-        cu_files.retain(|p| {
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            !matches!(stem, "arle_flashmla_shim" | "arle_flashmla_decode_shim")
-        });
-        // Compile a stub that satisfies the `arle_flashmla_sm90_sparse_decode_*`
-        // symbol set with `cudaErrorNotSupported` returns, so the Rust crate
-        // links. The runtime gate `dsv4_flashmla_decode_enabled` defaults OFF
-        // so this path is never actually called in practice.
-        cu_files.push(flashmla_stub.to_path_buf());
-    }
-    if enable_flashmla {
-        assert!(
-            !cu_files.iter().any(|p| p == flashmla_stub),
-            "FlashMLA vendor tree is present, but the decode stub is still scheduled for nvcc"
-        );
-        let sparse = flashmla_root.join("csrc/sm90/prefill/sparse");
-        for entry in [
-            "fwd.cu",
-            "instantiations/phase1_k512.cu",
-            "instantiations/phase1_k512_topklen.cu",
-            "instantiations/phase1_k576.cu",
-            "instantiations/phase1_k576_topklen.cu",
-        ] {
-            cu_files.push(sparse.join(entry));
-        }
-
-        if enable_flashmla_decode {
-            // FlashMLA SM90 sparse decode — fp8 KV cache + split-KV combine +
-            // CPU-side decode scheduler. 4 model×head instantiations
-            // (MODEL1×{64,128}, V32×{64,128}) + combine + sched-meta kernel.
-            // Requires CUDA headers with __nv_fp8_e8m0 and is runtime-gated by
-            // `dsv4_flashmla_decode_enabled` (compile-gated on HAS_FLASHMLA).
-            let decode_sparse_fp8 = flashmla_root.join("csrc/sm90/decode/sparse_fp8");
-            for entry in [
-                "instantiations/model1_persistent_h64.cu",
-                "instantiations/model1_persistent_h128.cu",
-                "instantiations/v32_persistent_h64.cu",
-                "instantiations/v32_persistent_h128.cu",
-            ] {
-                cu_files.push(decode_sparse_fp8.join(entry));
-            }
-            cu_files.push(flashmla_root.join("csrc/smxx/decode/combine/combine.cu"));
-            cu_files.push(
-                flashmla_root
-                    .join("csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"),
-            );
-        }
-    }
-
-    // FA3 hopper fwd + bwd (hdim256/bf16/sm90) — vendored at
-    // `vendor/flash-attention/` (Dao-AILab/flash-attention @ fc8cbad6, cutlass
-    // pin 71275920). The vendored tree plus an sm_90 target is the whole gate:
-    // the instantiation units are nvcc-heavy, but only an sm_90 build compiles
-    // them and that is exactly the build that wants FA3.
-    let fa3_root = Path::new("vendor/flash-attention");
+    // Vendored FlashMLA / DeepGEMM / FA3-hopper kernels and their C-ABI shims
+    // are compiled by `deepseek-kernels-sys` into `libdeepseek_kernels.a`.
+    // Only the FA3 shim stays here: its quantized path calls this crate's
+    // paged-KV dequant kernels (`dequant_paged_kv.cu`).
+    let fa3_root = PathBuf::from(dep_metadata("FA3_ROOT"));
+    let vendored_cutlass_include = dep_metadata("CUTLASS_INCLUDE");
     let fa3_stub = Path::new("csrc/attention/arle_fa3_stubs.cu");
     let fa3_shim = Path::new("csrc/attention/arle_fa3_shim.cu");
-    let enable_fa3 =
-        fa3_root.join("hopper").is_dir() && sm_targets.iter().any(|target| target.sm == "90");
-    // Exactly one implementation of the FA3 FFI symbols may reach the archive
-    // (same single-definition rule as the FlashMLA stub handling above).
+    let enable_fa3 = dep_flag("FA3");
+    // Exactly one implementation of the FA3 FFI symbols may reach the archive.
     cu_files.retain(|p| p != fa3_stub);
     if !enable_fa3 {
         cu_files.retain(|p| p != fa3_shim);
         cu_files.push(fa3_stub.to_path_buf());
-    } else {
-        for entry in [
-            "instantiations/flash_fwd_hdim256_bf16_sm90.cu",
-            "instantiations/flash_fwd_hdim256_bf16_split_sm90.cu",
-            "instantiations/flash_fwd_hdim256_bf16_packgqa_sm90.cu",
-            "instantiations/flash_fwd_hdim256_bf16_paged_sm90.cu",
-            "instantiations/flash_fwd_hdim256_bf16_paged_split_sm90.cu",
-            // fp8 operands for the quantized-pool prefill shim (paged only).
-            "instantiations/flash_fwd_hdim256_e4m3_paged_sm90.cu",
-            "instantiations/flash_fwd_hdim256_e4m3_paged_split_sm90.cu",
-            "instantiations/flash_bwd_hdim256_bf16_sm90.cu",
-            "flash_fwd_combine.cu",
-            // Defines prepare_varlen_num_blocks — referenced by the launch
-            // template's runtime VARLEN_SWITCH even on the non-varlen path,
-            // so it must link whenever any fwd instantiation does.
-            "flash_prepare_scheduler.cu",
-        ] {
-            cu_files.push(fa3_root.join("hopper").join(entry));
-        }
     }
 
     // Keep a stable compile order independent of filesystem iteration order.
     cu_files.sort();
 
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE");
-    println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_ROOT");
-    println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_CUTLASS_INCLUDE");
-    println!("cargo:rerun-if-env-changed=DG_JIT_USE_RUNTIME_API");
-    // `enable_deepgemm_native` is computed below (after the vendored paths +
-    // sm_targets resolve) so it can DEFAULT-ON via auto-detection.
-    // DeepGEMM availability is also a RUNTIME preflight probe (`cuda_kernels::
-    // has_deepgemm_native`), not a cfg — the non-native stub exports the same
-    // bridge symbols, so it can't be build-determined. No cfg emitted here.
-    let deepgemm_root = std::env::var("ARLE_DEEPGEMM_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("vendor/deepgemm"));
-    let deepgemm_root = if deepgemm_root.is_absolute() {
-        deepgemm_root
-    } else {
-        std::env::current_dir()
-            .expect("failed to resolve cuda-kernels build cwd")
-            .join(deepgemm_root)
-    };
-    let deepgemm_library_root = deepgemm_root.join("deep_gemm");
-    let deepgemm_cutlass_include = resolve_deepgemm_cutlass_include(&deepgemm_root);
-    let deepgemm_cutlass_include = if deepgemm_cutlass_include.is_absolute() {
-        deepgemm_cutlass_include
-    } else {
-        std::env::current_dir()
-            .expect("failed to resolve cuda-kernels build cwd")
-            .join(deepgemm_cutlass_include)
-    };
-    // DeepGEMM FP8-native dense/grouped GEMM: DEFAULT-ON when the build can support it
-    // — a Hopper sm_90 target AND the vendored source present — so FP8 prefill takes the
-    // fastest path with no manual flag (it was opt-in, leaving production on the ~20×
-    // slower dequant→GEMM fallback). Mirrors the FlashMLA auto-detect above. Opt out with
-    // ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1. If unbuilt/unsupported, the runtime preflight
-    // falls back to dequant→GEMM (never GEMV for prefill — see infer-cuda quant_linear).
-    let deepgemm_buildable = sm_targets.iter().any(|s| s.sm.starts_with("90"))
-        && deepgemm_library_root.is_dir()
-        && deepgemm_cutlass_include
-            .join("cutlass/arch/barrier.h")
-            .is_file();
-    let enable_deepgemm_native =
-        !env_flag("ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE") && deepgemm_buildable;
-    if enable_deepgemm_native {
-        println!(
-            "cargo:warning=DeepGEMM native enabled (sm_90 + vendored source; set ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1 to opt out)"
-        );
-    }
     // sm_120 grouped blockwise-scaled FP8 MoE GEMM (CUTLASS 4.3.5 collective).
     // Only instantiate the CUTLASS sm_120a collective when the build targets
     // sm_120 — the TU carries `-DARLE_SM120_GROUPED_FP8` + forced
@@ -2887,40 +2306,21 @@ fn main() {
         if disable_marlin_w4_fp8 && stem == "marlin_w4_fp8_kernel" {
             nvcc_args.push("-DARLE_DISABLE_MARLIN_W4_FP8=1".to_string());
         }
-        if enable_deepgemm_native {
-            nvcc_args.push("-DARLE_ENABLE_DEEPGEMM_NATIVE=1".to_string());
-        }
         if let Some(split_compile) = nvcc_split_compile.as_deref() {
             nvcc_args.push(format!("--split-compile={split_compile}"));
         }
         if legacy_volta_build && matches!(stem, "marlin_kernel" | "marlin_repack" | "marlin_gemm") {
             nvcc_args.push("-DARLE_DISABLE_MARLIN_SM70=1".to_string());
         }
-        // FlashMLA (sparse prefill/decode) and FA3 hopper kernels use
-        // thread-block clusters + WGMMA that require the sm_90a arch variant.
-        // Compiling them for the rest of the global arch list (sm_80/86/89, or
-        // plain sm_90) hard-fails ("cannot specify max blocks per cluster").
-        // Force sm_90a-ONLY for these TUs, independent of TORCH_CUDA_ARCH_LIST,
-        // so a T1 release binary (8.0;8.6;8.9;9.0) carries FlashMLA-sm_90a
-        // alongside the full T1 arch set for every other kernel — the FlashMLA
-        // path is dispatched only on sm_90 hardware by the runtime gate
-        // (dsv4_flashmla_decode_enabled), dormant elsewhere. Mirrors upstream
-        // FlashMLA/FA3, which ship sm_90a-only.
-        let is_flashmla_kernel = cu_file.components().any(|c| c.as_os_str() == "flashmla");
-        let is_fa3_kernel = cu_file
-            .components()
-            .any(|c| c.as_os_str() == "flash-attention");
-        let is_sm90a_only = is_flashmla_kernel
-            || is_fa3_kernel
-            || matches!(
-                stem,
-                "arle_flashmla_shim"
-                    | "arle_flashmla_decode_shim"
-                    | "arle_fa3_shim"
-                    | "arle_q8kv8_prefill_shim"
-                    | "w4a8_grouped_gemm"
-                    | "nvfp4_to_w4afp8"
-            );
+        // FA3 and the SGLang CUTLASS kernels use thread-block clusters + WGMMA
+        // that require the sm_90a arch variant. Compiling them for the rest of
+        // the global arch list (sm_80/86/89, or plain sm_90) hard-fails
+        // ("cannot specify max blocks per cluster"). Force sm_90a-ONLY for
+        // these TUs, independent of TORCH_CUDA_ARCH_LIST.
+        let is_sm90a_only = matches!(
+            stem,
+            "arle_fa3_shim" | "arle_q8kv8_prefill_shim" | "w4a8_grouped_gemm" | "nvfp4_to_w4afp8"
+        );
         // The sm_120 grouped-FP8 TU that also has an sm_120 gencode target: the
         // only build that forces sm_120a gencode + defines ARLE_SM120_GROUPED_FP8.
         let build_sm120_grouped_fp8 =
@@ -2938,35 +2338,6 @@ fn main() {
         // (attention/, gemm/, moe/, kv/, sampling/, recurrent/, ...).
         nvcc_args.push("-Icsrc".to_string());
 
-        if enable_deepgemm_native && stem == "deepgemm_native" {
-            nvcc_args.extend([
-                "-std=c++17".to_string(),
-                "--expt-relaxed-constexpr".to_string(),
-                "-Wno-deprecated-declarations".to_string(),
-                format!("-I{}/include", cuda_path),
-                format!("-I{}", deepgemm_root.display()),
-                format!("-I{}", deepgemm_root.join("csrc").display()),
-                format!("-I{}", deepgemm_library_root.join("include").display()),
-                format!("-I{}", deepgemm_cutlass_include.display()),
-                format!(
-                    "-I{}",
-                    deepgemm_root.join("third-party/fmt/include").display()
-                ),
-                format!(
-                    "-DARLE_DEEPGEMM_DEFAULT_LIBRARY_ROOT=\"{}\"",
-                    deepgemm_library_root.display()
-                ),
-                format!("-DARLE_DEEPGEMM_DEFAULT_CUDA_HOME=\"{}\"", cuda_path),
-                format!(
-                    "-DARLE_DEEPGEMM_DEFAULT_CUTLASS_INCLUDE=\"{}\"",
-                    deepgemm_cutlass_include.display()
-                ),
-            ]);
-            if env_flag("DG_JIT_USE_RUNTIME_API") {
-                nvcc_args.push("-DDG_JIT_USE_RUNTIME_API=1".to_string());
-            }
-        }
-
         // sm_120 grouped FP8 MoE GEMM: CUTLASS 4.3.5 collective (FlashMLA's
         // vendored cutlass tree). `--expt-relaxed-constexpr` for the collective's
         // device `std::min`; `-lcuda` (device TMA `cuDriverGetVersion`) is already
@@ -2978,7 +2349,7 @@ fn main() {
                 "--expt-relaxed-constexpr".to_string(),
                 "-DARLE_SM120_GROUPED_FP8=1".to_string(),
                 format!("-I{}/include", cuda_path),
-                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
+                format!("-I{vendored_cutlass_include}"),
             ]);
         }
 
@@ -2992,7 +2363,7 @@ fn main() {
                 "--expt-relaxed-constexpr".to_string(),
                 "-Wno-deprecated-declarations".to_string(),
                 format!("-I{}/include", cuda_path),
-                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
+                format!("-I{vendored_cutlass_include}"),
                 "-Icsrc/moe/w4a8".to_string(),
             ]);
         }
@@ -3002,32 +2373,6 @@ fn main() {
             nvcc_args.extend([
                 "-std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
-            ]);
-        }
-
-        // FlashMLA SM90 sparse prefill kernels + ARLE shim. Mirror
-        // sgl-kernel/cmake/flashmla.cmake flags so we inherit upstream's
-        // tuning. CUTLASS include is FlashMLA's vendored copy (NVIDIA
-        // CUTLASS tag 147f5673 from the FlashMLA submodule). The sm_90a
-        // gencode is set above (is_sm90a_only) — FlashMLA's WGMMA/cluster
-        // primitives require the arch variant and only sm_90a.
-        if is_sm90a_only
-            && (is_flashmla_kernel
-                || stem == "arle_flashmla_shim"
-                || stem == "arle_flashmla_decode_shim")
-        {
-            nvcc_args.extend([
-                "-std=c++17".to_string(),
-                "--expt-relaxed-constexpr".to_string(),
-                "--expt-extended-lambda".to_string(),
-                "--use_fast_math".to_string(),
-                "-Xcudafe=--diag_suppress=177".to_string(),
-                format!("-I{}", flashmla_root.join("csrc").display()),
-                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
-                format!(
-                    "-I{}",
-                    flashmla_root.join("csrc/kerutils/include").display()
-                ),
             ]);
         }
 
@@ -3044,18 +2389,20 @@ fn main() {
                 "-DCUTE_USE_PACKED_TUPLE=1".to_string(),
                 "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1".to_string(),
                 "-Xcudafe=--diag_suppress=177".to_string(),
-                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
+                format!("-I{vendored_cutlass_include}"),
                 "-Ivendor/q8kv8_prefill".to_string(),
             ]);
         }
 
-        // FA3 hopper units + ARLE shim. Flag set mirrors hopper/setup.py:
-        // NDEBUG is upstream-marked "otherwise performance is severely
-        // impacted"; EXTENDED_MMA_SHAPES is required for FA3's WGMMA tiles.
+        // FA3 shim over the vendored hopper units compiled by
+        // deepseek-kernels-sys. Flag set mirrors hopper/setup.py and MUST stay
+        // identical to the vendored units' flags there: NDEBUG is
+        // upstream-marked "otherwise performance is severely impacted";
+        // EXTENDED_MMA_SHAPES is required for FA3's WGMMA tiles.
         // DISABLE_{LOCAL,APPENDKV} prune template combinations ARLE never
         // dispatches (causal/full only, KV written by ARLE's own prep).
         // The sm_90a gencode is set above (is_sm90a_only).
-        if is_sm90a_only && (is_fa3_kernel || stem == "arle_fa3_shim") {
+        if is_sm90a_only && stem == "arle_fa3_shim" {
             nvcc_args.extend([
                 "-std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
@@ -3082,17 +2429,6 @@ fn main() {
 
     run_nvcc_jobs(&nvcc, nvcc_wrapper.as_deref(), &nvcc_jobs);
 
-    if enable_flashmla {
-        let stub_obj = "arle_flashmla_decode_stubs_cuda.o";
-        assert!(
-            !obj_files.iter().any(|path| path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == stub_obj)),
-            "FlashMLA vendor tree is present, but {stub_obj} would be archived"
-        );
-    }
-
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     match std::fs::remove_file(&cuda_lib) {
         Ok(()) => {}
@@ -3113,8 +2449,16 @@ fn main() {
 
     assert!(status.success(), "ar failed");
 
+    // Mirror deepseek-kernels-sys' archive next to ours so the producer
+    // manifest + prebuilt bundle cover every CUDA object (it links itself).
+    std::fs::copy(dep_metadata("LIB"), out_dir.join("libdeepseek_kernels.a"))
+        .expect("mirror libdeepseek_kernels.a into cuda-kernels OUT_DIR");
+
     let mut capabilities = BTreeSet::new();
-    if enable_flashmla {
+    if dep_flag("FLASHMLA") {
+        // Runtime FlashMLA gates read `cuda_kernels::HAS_FLASHMLA` (this cfg); a
+        // build without the FlashMLA kernels falls back to scalar — no env var.
+        println!("cargo:rustc-cfg=arle_flashmla");
         capabilities.insert("flashmla".into());
     }
     if enable_fa3 {
@@ -3130,12 +2474,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     emit_cuda_system_link_libs(&cuda_path);
-    if enable_deepgemm_native {
-        println!(
-            "cargo:warning=DeepGEMM native bridge enabled, root={}",
-            deepgemm_root.display()
-        );
-    }
 
     build_deepep_sidecar(
         &cuda_path,
@@ -3146,7 +2484,7 @@ fn main() {
         nvcc_split_compile.as_deref(),
     );
 
-    if enable_deepgemm_native {
+    if dep_flag("DEEPGEMM_NATIVE") {
         capabilities.insert("deepgemm-native".into());
     }
     if std::env::var_os("CARGO_FEATURE_NCCL").is_some() {

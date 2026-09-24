@@ -41,14 +41,17 @@ assert '"arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda"' not in sourc
 ]
 PY
 printf kernels >"$SRC/libkernels_cuda.a"
+printf deepseek >"$SRC/libdeepseek_kernels.a"
 printf tilelang >"$SRC/libtilelang_kernels_aot.a"
 printf sidecar >"$SRC/arle_deepep_sidecar"
 chmod 755 "$SRC/arle_deepep_sidecar"
 cat >"$SRC/arle-cuda-kernels.manifest" <<EOF
-schema=3
+schema=4
 kernel_build_id=bundle:test
 artifact.libkernels_cuda.a.size=$(wc -c <"$SRC/libkernels_cuda.a" | tr -d ' ')
 artifact.libkernels_cuda.a.sha256=$(cuda_prebuilt_hash_file "$SRC/libkernels_cuda.a")
+artifact.libdeepseek_kernels.a.size=$(wc -c <"$SRC/libdeepseek_kernels.a" | tr -d ' ')
+artifact.libdeepseek_kernels.a.sha256=$(cuda_prebuilt_hash_file "$SRC/libdeepseek_kernels.a")
 artifact.libtilelang_kernels_aot.a.size=$(wc -c <"$SRC/libtilelang_kernels_aot.a" | tr -d ' ')
 artifact.libtilelang_kernels_aot.a.sha256=$(cuda_prebuilt_hash_file "$SRC/libtilelang_kernels_aot.a")
 artifact.arle_deepep_sidecar.size=$(wc -c <"$SRC/arle_deepep_sidecar" | tr -d ' ')
@@ -92,6 +95,7 @@ fi
 cuda_prebuilt_export "$DEST" "$SRC"
 cmp "$SRC/arle-cuda-kernels.manifest" "$DEST/arle-cuda-kernels.manifest"
 cmp "$SRC/libkernels_cuda.a" "$DEST/libkernels_cuda.a"
+cmp "$SRC/libdeepseek_kernels.a" "$DEST/libdeepseek_kernels.a"
 cmp "$SRC/libtilelang_kernels_aot.a" "$DEST/libtilelang_kernels_aot.a"
 cmp "$SRC/arle_deepep_sidecar" "$DEST/arle_deepep_sidecar"
 
@@ -112,12 +116,15 @@ chmod +x "$PROBE"
 PROBE_DIR="$TMP/probe-bundle"
 mkdir "$PROBE_DIR"
 printf kernels >"$PROBE_DIR/libkernels_cuda.a"
+printf deepseek >"$PROBE_DIR/libdeepseek_kernels.a"
 printf tilelang >"$PROBE_DIR/libtilelang_kernels_aot.a"
 cat >"$PROBE_DIR/arle-cuda-kernels.manifest" <<EOF
-schema=3
+schema=4
 kernel_build_id=$BUNDLE_ID
 artifact.libkernels_cuda.a.size=$(wc -c <"$PROBE_DIR/libkernels_cuda.a" | tr -d ' ')
 artifact.libkernels_cuda.a.sha256=$(cuda_prebuilt_hash_file "$PROBE_DIR/libkernels_cuda.a")
+artifact.libdeepseek_kernels.a.size=$(wc -c <"$PROBE_DIR/libdeepseek_kernels.a" | tr -d ' ')
+artifact.libdeepseek_kernels.a.sha256=$(cuda_prebuilt_hash_file "$PROBE_DIR/libdeepseek_kernels.a")
 artifact.libtilelang_kernels_aot.a.size=$(wc -c <"$PROBE_DIR/libtilelang_kernels_aot.a" | tr -d ' ')
 artifact.libtilelang_kernels_aot.a.sha256=$(cuda_prebuilt_hash_file "$PROBE_DIR/libtilelang_kernels_aot.a")
 EOF

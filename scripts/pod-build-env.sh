@@ -63,7 +63,7 @@ if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
   fi
 fi
 # CUTLASS for the W4AFP8 MoE kernel: the FlashMLA vendored CUTLASS 4.x
-# (crates/cuda-kernels/vendor/flashmla/csrc/cutlass/) — build.rs points at it
+# (crates/deepseek-kernels-sys/vendor/flashmla/csrc/cutlass/) — build.rs points at it
 # directly. No standalone download needed.
 # Persistent kernel-artifact cache (keyed on kernel source × SM × nvcc). build.rs
 # regenerates kernels on demand (generated/ gitignored); this cache restores a prior

@@ -29,7 +29,7 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 SPEC_TYPE="${SPEC_TYPE:-none}"
 MTP_DRAFT_TOKENS="${MTP_DRAFT_TOKENS:-}"
 MTP_DRAFT_TOPK="${MTP_DRAFT_TOPK:-}"
-DEEPGEMM_ROOT="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/cuda-kernels/vendor/deepgemm}"
+DEEPGEMM_ROOT="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/deepseek-kernels-sys/vendor/deepgemm}"
 DEEPGEMM_LIBRARY_ROOT="${ARLE_DEEPGEMM_LIBRARY_ROOT:-$DEEPGEMM_ROOT/deep_gemm}"
 DEEPGEMM_CUTLASS_INCLUDE="${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
 # DeepEP source tree (deepseek-ai/DeepEP) required for native-deepep MoE
@@ -163,8 +163,8 @@ detect_deepgemm() {
         DEEPGEMM_CUTLASS_INCLUDE="$(abs_path "$DEEPGEMM_CUTLASS_INCLUDE")"
     elif [[ -f "$DEEPGEMM_ROOT/third-party/cutlass/include/cutlass/arch/barrier.h" ]]; then
         DEEPGEMM_CUTLASS_INCLUDE="$DEEPGEMM_ROOT/third-party/cutlass/include"
-    elif [[ -f "$ROOT/crates/cuda-kernels/vendor/flashmla/csrc/cutlass/include/cutlass/arch/barrier.h" ]]; then
-        DEEPGEMM_CUTLASS_INCLUDE="$ROOT/crates/cuda-kernels/vendor/flashmla/csrc/cutlass/include"
+    elif [[ -f "$ROOT/crates/deepseek-kernels-sys/vendor/flashmla/csrc/cutlass/include/cutlass/arch/barrier.h" ]]; then
+        DEEPGEMM_CUTLASS_INCLUDE="$ROOT/crates/deepseek-kernels-sys/vendor/flashmla/csrc/cutlass/include"
     else
         die "DeepGEMM CUTLASS include dir missing; checked $DEEPGEMM_ROOT/third-party/cutlass/include and FlashMLA vendor CUTLASS"
     fi

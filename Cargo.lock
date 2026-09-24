@@ -599,6 +599,7 @@ dependencies = [
  "anyhow",
  "cc",
  "cudarc",
+ "deepseek-kernels-sys",
  "half",
  "infer-quant",
  "log",
@@ -666,6 +667,13 @@ version = "0.5.8"
 dependencies = [
  "anyhow",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "deepseek-kernels-sys"
+version = "0.5.8"
+dependencies = [
+ "cudarc",
 ]
 
 [[package]]

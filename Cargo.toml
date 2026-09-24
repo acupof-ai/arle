@@ -6,6 +6,7 @@ members = [
     "crates/cli",
     "crates/cuda-kernels",
     "crates/deepep-sys",
+    "crates/deepseek-kernels-sys",
     "crates/deepseek-ocr-spec",
     "crates/deepseek-spec",
     "crates/infer-api",
