@@ -1,6 +1,6 @@
 # A prefix cache for hybrid models
 
-Design note 1 of 5 ([plan](../plans/2026-09-02-design-theses.md)). Metal
+Design note 1 of 5. Metal
 and CUDA, Qwen3.5 / Qwen3.6. Date: 2026-09-02.
 
 ## Problem
@@ -60,20 +60,17 @@ backend how many of the matched blocks are complete restore boundaries
 (`PrefixReuse::reusable_prefix_blocks`,
 [`infer-seam/src/lib.rs:466`](../../crates/infer-seam/src/lib.rs)). The match
 is then clamped to that answer. A 487-block page match licensed 0 blocks
-until intermediate snapshots were persisted
-([wins 2026-08-26](../experience/wins/2026-08-26-metal-kv-disk-content-keyed-restart-cache.md));
+until intermediate snapshots were persisted;
 the clamp is what makes that a slow turn instead of a wrong one.
 
 **The last token always prefills.** The match is capped at `prompt_len - 1`
 ([`prefix.rs:114`](../../crates/infer-core/src/prefix.rs)). A full-prompt
 match that jumped straight to decode had no forward pass to sample the first
 token from; the planner fell back to the prompt's last token as the decode
-seed, duplicating its KV and shifting every later position by one
-([wins 2026-07-08](../experience/wins/2026-07-08-prefix-cache-wrong-seed-token-fix.md)).
+seed, duplicating its KV and shifting every later position by one.
 The same cap gives the block drafter its first-block context: a restored
 prompt always has a non-empty tail, and the tail's prefill re-seeds the
-target hidden state the draft needs
-([wins 2026-08-26 DSpark](../experience/wins/2026-08-26-metal-dspark-prefix-reuse.md)).
+target hidden state the draft needs.
 
 **Content keys on disk, page identity in memory.** The durable tier addresses
 pages and snapshots by a hash of the token prefix, so a restarted server
@@ -86,8 +83,7 @@ That split is where the failure below lived.
 ## The failure
 
 Turn 2 of a multi-turn conversation restored its prefix. Turns 3 through 12
-licensed 0 blocks and re-prefilled everything
-([wins 2026-09-02](../experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md)).
+licensed 0 blocks and re-prefilled everything.
 Two defects, both about identity:
 
 1. **A restored page is the same page.** `publish_slot` minted a new logical
@@ -128,8 +124,7 @@ the first streamed delta, identical request bytes to both servers
 Correctness: greedy output of turns 3 and 6 in the restored chain equals the
 cold single-prompt output token for token. Needle ladder 115 to 8000 tokens,
 three runs per length, 18/18 exact, every length deterministic, 17 restored
-attaches. The 35B row is pending a machine without swap pressure
-([roadmap Goal 0](../plans/2026-08-24-roadmap.md)).
+attaches. The 35B row is pending a machine without swap pressure.
 
 ## What would be done differently
 

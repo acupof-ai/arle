@@ -12,10 +12,10 @@ density rather than a style rulebook.
 | Evidence bar, decomposition, distilled lessons | [`docs/agent-method.md`](docs/agent-method.md) |
 | Any bench or trace | [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md) |
 | Where code lives / execution paths | [`docs/codebase-map.md`](docs/codebase-map.md), [`docs/architecture.md`](docs/architecture.md) |
-| Editing `crates/{autograd,cuda-kernels,mlx-sys}/` | that crate's `AGENTS.md` |
+| Editing `crates/{cuda-kernels,mlx-sys}/` | that crate's `AGENTS.md` |
 | Backend / model / quant support level | [`docs/support-matrix.md`](docs/support-matrix.md) |
 | Env vars, SM tier policy | [`docs/environment.md`](docs/environment.md) |
-| Session start | [`docs/index.md`](docs/index.md) (PARA index) |
+| Session start | [`docs/index.md`](docs/index.md) |
 
 `AGENTS.md` is canonical; `CLAUDE.md` is a symlink to it.
 
@@ -38,21 +38,18 @@ shaped forks the loop (precedent: `diffusion_executor.rs`) rather than
 bending the trait.**
 
 Non-obvious ownership:
-- **`infer-*` owns serving/runtime truth.** The monolithic `infer/` crate was
-  deleted 2026-06-04 (`e81b98fb`, ~167k LOC) — any doc or command referencing
-  `infer/` or `-p infer` is stale.
+- **`infer-*` owns serving/runtime truth.** There is no monolithic `infer/`
+  crate; any doc or command referencing `infer/` or `-p infer` is stale.
 - `infer-api` (`LoadedInferenceEngine`) is the single programmatic entry point;
   `arle` is the CLI entry point.
-- **`train` is OPD-only** (no second product line). Scratch pretrain / SFT /
-  GRPO / multi-turn RL were deleted in the 2026-05-18 pivot (pretrain unwinnable
-  at a 322× gap; the rest duplicate vLLM+verl / TRL / axolotl). OPD is the one
-  axis where ARLE's runtime authority differentiates.
+- OPD training lives in the separate
+  [`arle-opd`](https://github.com/acupof-ai/arle-opd) repo and consumes arle's crates.
 - CUDA kernels: adopt-official-first (`vendor/`), hand-rolled at
   `crates/cuda-kernels/csrc/` only for the genuine gap.
 
 **Metal canonical model — globally unified:
 `mlx-community/Qwen3.6-35B-A3B-4bit`** (MoE, ~19 GB, HF-cached) — the default for
-every Metal serve, `scripts/bench_*.sh`, smoke, and Metal wins/errors; detects
+every Metal serve, `scripts/bench_*.sh`, smoke, and Metal perf claim; detects
 MoE regressions a dense model cannot. CUDA benches keep their own defaults.
 No Metal unit test loads a model, so there is no unit-test opt-out to name.
 - **Auto-wired-limit** (always-on): the Metal executor pins weights via
@@ -75,20 +72,9 @@ toolkit probe):
 Run it before pushing any `infer-cuda` / `cuda-kernels` / cuda-gated `cli`
 edit; `metal,no-cuda` and plain `cargo check` never see those lints.
 
-**Every bench run is pre-registered.** `scripts/prereg.py start --name … --cmd … --hypothesis …`
-before the run; `done --result --finding --decision` after. `result` is the number,
-`finding` is what it means, `decision` is what changes. A row left running past 24h
-fails hygiene. The wins/errors entry is written after the fact and cannot constrain
-what the run was for; the prereg row can.
-
-**Every runtime change produces a bench entry.** A dated entry under
-`docs/experience/wins/` (or `errors/` on regression) — no entry, not shipped. In
-scope: `crates/infer-*/src/`, `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/`,
-`src/`, `scripts/bench_*` param changes, feature-flag default flips, hot-path dep
-bumps. Exempt: docs / agent files / memory / dev-only tooling — say so in the
-commit body. Can't run locally (CUDA on a Mac) → stub `pending-remote` and cite
-the remote ticket; no silent skips. Minimum, params, and the A/B contract live in
-the bench spec.
+**Perf claims cite a matched A/B.** A runtime perf claim cites a matched A/B
+run (same machine, same build profile, ≥3 trials) in the PR description. The
+bench parameters and A/B contract live in the bench spec.
 
 **GPU kernel work** ships a measured before/after — `ncu` (CUDA) or Xcode Metal
 capture / MLX instruments (Metal).
@@ -113,7 +99,7 @@ glossary, rewrite it.
 execute. Wait for the user ONLY when there is a real tradeoff to adjudicate
 (two viable paths with different costs). No tradeoff → nothing to decide →
 don't ask. Adopting the SOTA/industry-standard approach is never a decision
-point — just execute it (2026-08-04).
+point — just execute it.
 Never delete content outside the stated scope; inside it, prefer deletion-style
 refactors (collapse duplicates, converge on one flow) over layering adapters.
 
@@ -124,9 +110,7 @@ refactors (collapse duplicates, converge on one flow) over layering adapters.
 **Phases** (non-trivial tasks): Explore until you can name every file you will
 touch → Plan (accepted in writing; >5 files or irreversible → stop and flag) →
 Implement (compiles, simplify pass on the diff) → Verify (`cargo test
---workspace`, `cargo clippy -- -D warnings`, `python3 scripts/check_repo_hygiene.py
---selftest`, bench entry) → Reflect (bug that
-took >1 attempt → `docs/experience/errors/`; user correction → feedback memory).
+--workspace`, `cargo clippy -- -D warnings`).
 Trivial → Implement + Verify.
 
 **Tests: minimal and end-to-end.** Default is no new test. Add one only when the
@@ -140,53 +124,26 @@ plans; review is `codex review --uncommitted` at Bash, backgrounded and tee'd.
 Independent tasks go out in one message, in parallel. Two failed subagent
 attempts → hand-write the diff or re-brief a fresh agent with what was tried.
 **Never** `codex:codex-rescue` / `mcp__openmax__execute_with_codex` for
-execution — both hang (2026-04-19).
+execution — both hang.
 
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `metal` `cuda`
 `scheduler` `qwen3` `qwen35` `http` `kv-tier` `docs`. Small tranches, each
 self-contained, simplify pass first.
 
-**Lane worktrees (user order, 2026-09-09, superseding "commit directly to main,
-no alternate worktree").** Code changes go through a lane: `scripts/lane.sh new
-<name>` gives a worktree at `../arle-lanes/<name>` on branch `lane/<name>`,
-`scripts/lane.sh pr <name>` pushes it and opens a PR against main; ckl merges.
-Every lane compiles into the main checkout's `target/`, set by
-`../arle-lanes/.cargo/config.toml` — which sits above every worktree and outside
-every checkout, so the tracked `.cargo/config.toml` (which deliberately sets no
-`target-dir`) stays clean. A lane costs ~97 MB of tracked files and no build
-artifacts. **Cargo takes one lock per target directory, so lane builds
-serialize** — that is the price of not multiplying 8.5 GB by the lane count.
-The controller's ledger commits (`docs/agenda.jsonl`, CHANGELOG, doc indexes)
-still land directly on main: they are the progress record, and a PR round-trip
-would make them lag the work they describe. Never `git stash` others'
-work; commit only your own files by explicit path. After `git mv` + edits,
-re-check `git status` — the fmt hook de-stages renames.
-
-**CHANGELOG is the central progress record.** Three event classes land a line the same
-day, linking the wins/errors entry: **phase exit · default flip ·
-accept-or-reject verdict**. Phase exits also cut a release tag. Weekly (~30 min):
-CHANGELOG catch-up; promote patterns recurring ≥3× into `docs/agent-method.md`;
-archive the oldest zero-inbound-reference wins entries before the
-`check_repo_hygiene` cap blocks a push; drift-probe
-`git log --since='7 days ago' -- 'crates/infer-*/src'` against `docs/experience/`.
+Commit only your own files by explicit path; never `git stash` others' work.
+After `git mv` + edits, re-check `git status` — the fmt step can de-stage renames.
 
 **Code layout gotchas.** Flat modules, no `mod.rs` —
-`crates/autograd/src/ops.rs` declares a
-sibling `#[path = "ops/attention.rs"] mod attention;`. Weights are `&self`
+`crates/cuda-kernels/src/ffi.rs` declares a
+sibling `#[path = "ffi/attention.rs"] pub mod attention;`. Weights are `&self`
 (immutable, pool-shared); per-request mutable state lives in the `State`
 associated type. Comments carry the non-obvious *why* in ≤1 line, in English,
 never the *what* and never which task added it; issue numbers only when naming a
 specific bug. If the code already reads clearly, leave it bare — no comment.
 
-**Memory.** Always-loaded: the auto-memory index + the latest 3 of
-`docs/experience/{errors,wins}/`; full entries on demand. Skeletons:
-`errors/YYYY-MM-DD-slug.md` = Context / Root Cause / Fix / Rule;
-`wins/…` = Context / What Worked / Rule. Bench snapshots use
-[`TEMPLATE-bench.md`](docs/experience/wins/TEMPLATE-bench.md), never overwritten.
-
 ---
 
-## Writing (reports & experiment notes)
+## Writing (reports, PR descriptions, docs)
 
 1. **Standard terms.** Use the established term for a concept; do not coin a
    new one.

@@ -3,7 +3,9 @@ name = "infer-moe"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Pure, CPU-verifiable MoE routing and gating math used as the reference for device kernels."
 
 # Phase-2 (EP / MoE) FOUNDATION crate for the ARLE rewrite.
 #

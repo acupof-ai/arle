@@ -16,13 +16,10 @@ describes the DSv4 execution paths; this document describes the Qwen3.6-27B
   is compute-bound at 83.9% GPU-busy (§1.1); a plain decode **step** is 16.7%
   idle (§2.1), while the 50.5% figure in §4.1 is a bench **window** whose idle
   is inter-request stalls — the two are not interchangeable. A measurement that
-  does not name its phase supports no claim about the other
-  ([error](experience/errors/2026-08-07-measured-prefill-concluded-about-decode.md)).
+  does not name its phase supports no claim about the other.
 - Shares are **of the window that was measured**, and a window is not quotable
   until it is reconciled against the run totals — the 08-08 anchor capture
-  undersampled decode 2–6× by landing in a queueing ramp
-  ([correction](experience/errors/2026-08-07-named-a-call-site-whose-gate-was-off.md),
-  [entry](experience/errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md)).
+  undersampled decode 2–6× by landing in a queueing ramp.
 - **A kernel's distance from roofline and its share of GPU time are different
   numbers, and only the second ranks it.** Both failure directions are now on
   record: draft attention was priced out at a 4.3% share where it is 30.5%
@@ -479,8 +476,7 @@ this was written — all of which were batch 1.
 
 `nsys`, 2026-08-08, GPU 6, c=16 on the 32K anchor dataset, a 30 s
 window at bench elapsed 118–148 s. **This is the document's first decode
-capture above batch 1.** Full entry:
-[`errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md`](experience/errors/2026-08-08-anchor-is-a-prefill-benchmark-decode-levers-ranked-off-it.md).
+capture above batch 1.**
 
 **FA3 decode-verify runs at 29.2% of achievable bandwidth.**
 
@@ -629,8 +625,7 @@ the sum is printed. Where that differs from a previously published share, the
 difference and its cause are stated on the spot.
 
 **What is in this document.** A number earns a place here if it can change a
-decision — what to work on next, or what not to. Everything else stays in the
-wins/errors entry it came from and is linked. The four largest numbers in the
+decision — what to work on next, or what not to. The four largest numbers in the
 chain are all unattributed, and are marked as such rather than filled with a
 hypothesis; see *Measurement debt*.
 
@@ -955,8 +950,6 @@ window at 8.07/s against a run-level 7.56/s, +6.8%** — representative, unlike
 the anchor capture (§ *Where the ceiling is*). Rows per tick measured **16.0**
 by four independent counts.
 
-Full entry:
-[`wins/2026-08-08-decode-shaped-reanchor-draft-attention-is-30pct.md`](experience/wins/2026-08-08-decode-shaped-reanchor-draft-attention-is-30pct.md).
 Budget, not a timeline.
 
 ```
@@ -1014,8 +1007,7 @@ and the two effects are not separable from these two points.
 
 > **STALE — do not rank decode work off this table, and note it is batch 1.**
 > Two defects. First, its #2 row is a kernel that was deleted from the default
-> path on 08-03: every bf16 N≤4 GEMM rides cuBLASLt now
-> ([`wins/2026-08-03-t5b-lmhead-cublas.md`](experience/wins/2026-08-03-t5b-lmhead-cublas.md)),
+> path on 08-03: every bf16 N≤4 GEMM rides cuBLASLt now,
 > and the decode program that followed took the step **26.88 → 21.37 ms
 > (−20.5%)** (§2.2). The 23.89 ms sum and the composition under it both predate
 > that. Second, a plain single-row decode step is not the shape served —
@@ -1170,8 +1162,7 @@ Two structural facts:
   short-prompt capture read verify as `22 ms intercept + 2.48 ms/row`. On the
   current binary at c=16 / 33K the tick is a pure per-row fit — **verify
   5.69 ms/row, draft 3.04 ms/row, 85% of the tick scaling with rows**
-  ([`baselines.md:162`](baselines.md), measurement in
-  [`errors/2026-08-06-…-gemm-is-not-the-top-lever.md`](experience/errors/2026-08-06-decode-lever-board-rebuilt-gemm-is-not-the-top-lever.md)).
+  ([`baselines.md`](baselines.md)).
   Use the per-row fit. An intercept, where one exists, is the shared weight read
   — the term batching **does** amortize; the slope is what it cannot.
 
@@ -1222,8 +1213,7 @@ independent of how much prefix is cached.
 | serialize, bulk copy | 76.40 ms | 43.65 s |
 
 Bulk copy is **−9.5% on the operation and 0.9% of wall** — an end-to-end null,
-kept because it is strictly less work
-([bench](experience/wins/2026-08-07-prefix-sidecar-serialize-bulk-copy.md)).
+kept because it is strictly less work.
 146.8 MiB in 76 ms is 1.9 GB/s, so the residual is allocating and
 first-touching fresh heap; making this materially cheaper means not making the
 copy.
@@ -1393,7 +1383,7 @@ Execute one tranche at a time. A tranche advances only after its stated gate.
 
 | tranche | exact work | required artifact | advance gate |
 |---:|---|---|---|
-| **0. Re-anchor — completed** | runtime runner 1×H20 GPU2, shipped DSpark defaults, canonical 32K × 8-turn dataset | [accepted baseline](experience/wins/2026-08-10-qwen36-27b-corrected-baseline.md) with runner JSON/CSV, serve log, stats, identities, and concurrent needle output | **passed:** 128/128 at every `c=1,2,4,8,16`, zero errors/empty outputs, prompt p50 +8.84%, needle 78/78 exact |
+| **0. Re-anchor — completed** | runtime runner 1×H20 GPU2, shipped DSpark defaults, canonical 32K × 8-turn dataset | accepted baseline with runner JSON/CSV, serve log, stats, identities, and concurrent needle output | **passed:** 128/128 at every `c=1,2,4,8,16`, zero errors/empty outputs, prompt p50 +8.84%, needle 78/78 exact |
 | **1. Close the run model** | run the same sweep with `ARLE_STEP_PHASE=1`; reconcile wall, forward-busy time, prefill tokens, generated tokens, steps, rows, accepted tokens, prefix hits, and queue depth | one full-run ledger whose terms and overlap rules are explicit | ≥95% of measured GPU-busy time assigned; request and token counts equal the runner artifact |
 | **2. Price the prefix sidecar** | derive writes/read bytes from tier I/O counters and restores from prefix hits; add a temporary same-binary write-policy toggle only if current counters cannot isolate the sidecar | restore hits, restored tokens, useful read/write bytes, serialization time, matched on/off wall A/B | retain only when saved prefill wall exceeds write + restore wall; otherwise reduce periodic writes or delete them |
 | **3. Close `fq_fwd` tile size — completed** | `ncu` at `Q=2048`, H=48; correct the wrapper grid; validate 64/32 with in-forward recurrent reference | raw 96/192-CTA `ncu` reports and numerical comparison | **closed:** dependency stall confirmed; `block_DV=32` fails correctness |

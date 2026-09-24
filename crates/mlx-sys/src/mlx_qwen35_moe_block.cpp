@@ -146,9 +146,7 @@ array switch_glu_forward(
     // we cover c=4 decode on Qwen3.6 35B-A3B-4bit (c=4 × top_k=8 = 32 indices),
     // routing the c=4 decode hot path through the coalesced expert-row reads.
     // Apple Silicon's narrower memory bandwidth makes the sort overhead worth
-    // it for fewer indices than NVIDIA. See
-    // docs/experience/wins/2026-05-07-bench-qwen36-baseline.md and the MoE
-    // research subagent report at the same date — technique #2.
+    // it for fewer indices than NVIDIA.
     const bool do_sort = inds.size() >= 32;
     auto idx = inds;
     array inv_order(0);

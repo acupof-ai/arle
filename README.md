@@ -104,7 +104,7 @@ Same machine, same weights, 12-turn agent-shaped conversation (a 4.8K-token syst
 | **ARLE** `arle serve --backend metal` | 1.95 s | **180 ms** | 202 ms |
 | mlx-lm `mlx_lm.server --prompt-cache-size 4` (0.31.2) | 1.26 s | 249 ms | 248 ms |
 
-<sub>Greedy, identical request bytes for both servers, 2026-09-02 · script: <code>scripts/bench_multiturn_ttft.py</code> · method and raw rows: <a href="docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md">wins entry</a>. ARLE's cold prefill is slower on this model; the per-turn number is what a 20-turn session feels. The same table on Qwen3.6-35B-A3B is pending a machine without swap pressure.</sub>
+<sub>Greedy, identical request bytes for both servers, 2026-09-02 · script: <code>scripts/bench_multiturn_ttft.py</code> · raw rows: <a href="benchmarks/README.md">benchmarks/</a>. ARLE's cold prefill is slower on this model; the per-turn number is what a 20-turn session feels. The same table on Qwen3.6-35B-A3B is pending a machine without swap pressure.</sub>
 
 Restored turns are greedy-identical to cold prefill (needle ladder 115–8000 tokens ×3, every length deterministic).
 
@@ -114,7 +114,7 @@ On CUDA the same cache demotes prefix pages to host RAM under memory pressure an
 
 ## Performance
 
-Measured on real hardware. Headline rows only; every number resolves to a snapshot in [benchmarks/](benchmarks/README.md) or a dated entry in [docs/experience/wins/](docs/experience/wins/).
+Measured on real hardware. Headline rows only; every number resolves to a snapshot in [benchmarks/](benchmarks/README.md).
 
 ### Apple Silicon (M4 Pro, 48 GB, single stream)
 

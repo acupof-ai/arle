@@ -23,8 +23,6 @@ or release-related, also read:
 git clone https://github.com/acupof-ai/arle && cd arle
 ./setup.sh                 # Installs Rust, Python venv, builds, downloads model
 ./setup.sh --check         # Linux/CUDA workstation check
-make hygiene               # Public docs/templates/link guardrails
-make pre-push              # CI-aligned snapshot validation
 make check-metal           # Apple Silicon quick check
 ```
 
@@ -39,13 +37,6 @@ Or manually:
 New to the repo? [docs/onboarding.md](docs/onboarding.md) is a 30-minute guided
 path — what runs today, where to start reading, how to verify a change
 (currently Chinese-only).
-
-For first-time contributor setup, install the repo-managed hook path:
-
-```bash
-make install-hooks
-make pre-push
-```
 
 ## Build Requirements
 
@@ -78,8 +69,6 @@ CUDA_HOME=/usr/local/cuda cargo build --release --features cuda
 # Test
 cargo test --no-default-features --features no-cuda   # Unit tests (~9s)
 cargo test --release --features cuda --test e2e        # E2E (GPU required)
-cargo test -p train --release --features no-cuda --lib
-cargo test -p autograd --release --features no-cuda --lib
 cargo test -p arle --release --no-default-features --features no-cuda,cli --test cli_smoke
 
 # Lint + format
@@ -113,21 +102,11 @@ without CUDA. Set `ARLE_SKIP_WEB=1` to skip the web step inside `--full` /
 1. Fork the repo and create a branch from `main`
 2. Follow [Commitizen](https://www.conventionalcommits.org/) format: `<type>(<scope>): <subject>`
    - Types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `chore`
-3. Ensure CI passes: `make hygiene`, `cargo test`, `cargo clippy`, `cargo fmt --check`, `cargo deny`
+3. Ensure CI passes: `cargo test`, `cargo clippy`, `cargo fmt --check`, `cargo deny`
 4. One logical change per PR. Keep diffs focused.
 5. If the change affects a documented API, CLI behavior, environment variable,
    benchmark claim, or migration-sensitive workflow, include the relevant docs
    updates in the same PR.
-
-## Experience Entries
-
-- Keep new benchmark / incident narratives as top-level markdown entries under
-  `docs/experience/wins/` or `docs/experience/errors/`.
-- Put bulky auxiliary data under `docs/experience/wins/assets/` (or another
-  nested subdirectory) instead of creating more top-level entry files.
-- `python3 scripts/check_repo_hygiene.py` freezes the top-level entry inventory.
-  If you need a new wins/errors entry and the cap is full, archive or
-  consolidate older entries in the same change.
 
 ## PR Readiness Checklist
 
@@ -237,8 +216,8 @@ Key entry points:
 2. Implement the model forward in the relevant backend crate
    (`crates/infer-cuda/src/` and/or `crates/infer-metal/src/`)
 3. Wire architecture detection where the backend dispatches on `architectures`
-4. Add correctness coverage (needle gate per `scripts/needle_gate.py`) and a
-   benchmark entry under `docs/experience/wins/`
+4. Add correctness coverage (needle gate per `scripts/needle_gate.py`) and cite
+   a matched benchmark run in the PR description
 
 ## Reporting Issues
 

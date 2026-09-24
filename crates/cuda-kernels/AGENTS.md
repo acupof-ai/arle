@@ -1,8 +1,7 @@
 # `cuda-kernels` — Agent Guide
 
 Extracted CUDA kernel crate: CUDA C kernels + TileLang AOT + FFI + the eight
-tensor/pool/metadata types that `infer-cuda` (plus `autograd`, `train`, and
-`infer-api`) consumes. **This is the proto-public API for the eventual
+tensor/pool/metadata types that `infer-cuda` (plus `infer-api`) consumes. **This is the proto-public API for the eventual
 Option-B split.** Load this file before touching anything under
 `crates/cuda-kernels/`.
 
@@ -15,14 +14,13 @@ Option-B split.** Load this file before touching anything under
 ## Why this crate exists
 
 See `docs/architecture.md`.
-Short version: the 2026-04-15 Route-A revert turned the old four-shell
-split into one kernel crate. `infer-cuda` is the primary consumer (with
-`autograd`, `train`, and `infer-api` also depending on this crate); the
+Short version: all kernels live in one crate. `infer-cuda` is the primary
+consumer (with `infer-api` also depending on this crate); the
 crate stays extraction-ready per `docs/architecture.md` §Crate-Split
 Governance.
 
 **Invariant:** the dependency edge is `infer-cuda → cuda-kernels` (also
-`autograd` / `train` / `infer-api` → `cuda-kernels`), **never the reverse**.
+`infer-api` → `cuda-kernels`), **never the reverse**.
 Nothing in this crate may depend on a serving crate — no tokenizer,
 no scheduler, no model-specific weight struct, no `EngineOptions`.
 
@@ -116,7 +114,7 @@ RawDevicePtr
 **Adding a symbol requires three justifications in writing on the PR:**
 
 1. **Consumed by ≥3 files outside `cuda-kernels` itself** (in `infer-cuda` /
-   `autograd` / `train` / `infer-api`). Two-file helpers stay on direct
+   `infer-api`). Two-file helpers stay on direct
    module paths. Example: `TokenKVPool` has exactly 3 callers and **does
    not** belong in the prelude — it lives at `cuda_kernels::TokenKVPool`
    (re-exported at crate root).
@@ -274,17 +272,14 @@ the full enumeration forced it).
   (2) layer-local matmul parity,
   (3) full-model logits parity. "Model loads and decodes one token" is only a smoke gate.
 - **`cargo:rerun-if-changed=<dir>` is NOT recursive.** Subdirectory edits ship stale cubins
-  silently; the build.rs walk must recurse and emit per-file directives
-  (`feedback_cargo_rerun_dir_not_recursive.md`).
+  silently; the build.rs walk must recurse and emit per-file directives.
 - **DeepEP kernel API has inverted `num_tokens` / `num_recv_tokens` naming.** `combine`'s
   `num_tokens` is the *input* size, `num_recv_tokens` is the *output* — derived from
   `send_head.size(0)` (= original dispatch source count). Mirror Python wrapper call sites
-  exactly or hit silent deadlocks
-  (`feedback_deepep_kernel_api_inverted_naming.md`).
+  exactly or hit silent deadlocks.
 - **DeepEP `combine` `channel_prefix_matrix` parameter is the dispatch *output* exclusive prefix,
   NOT the `notify_dispatch` inclusive prefix.** Use `recv_channel_prefix_matrix`, not the
-  same-named earlier one — different tensor, silent kernel deadlock
-  (`feedback_deepep_combine_uses_recv_channel_prefix.md`).
+  same-named earlier one — different tensor, silent kernel deadlock.
 - **NVCC parser errors in TileLang AOT compile are usually CUDA-version × tilelang-version
   drift, not `-std=c++17` workarounds.** On CUDA 12.2, pin `tilelang>=0.1,<0.1.10` (newer
   ships cute-cutlass C++20 requirements nvcc 12.2 rejects).

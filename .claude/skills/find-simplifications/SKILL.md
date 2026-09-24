@@ -1,6 +1,6 @@
 ---
 name: find-simplifications
-description: Use when asked to find dead code, unused flags, speculative generality, or simplification candidates in ARLE — "what can we delete", "simplification sweep", "flag deletion wave", or auditing a surface for over-built machinery. Turns a broad "find things to simplify" request into evidence-backed deletions or wins/errors entries. Prefer a few well-proven candidates over a pile of thin guesses.
+description: Use when asked to find dead code, unused flags, speculative generality, or simplification candidates in ARLE — "what can we delete", "simplification sweep", "flag deletion wave", or auditing a surface for over-built machinery. Turns a broad "find things to simplify" request into evidence-backed deletions or recorded rejections. Prefer a few well-proven candidates over a pile of thin guesses.
 version: 1.0.0
 ---
 
@@ -51,14 +51,14 @@ not a substitute for reading call sites.
 Classify consumers before writing anything:
 
 - **Production** — `crates/*/src`, `src/`, serve/loader/config paths.
-- **Non-production** — tests, benches, docs, wins/errors entries, comments.
+- **Non-production** — tests, benches, docs, comments.
 - **Ambiguous** — examples and scripts that may be product smoke paths.
 
 Reject or downgrade when:
 
 - A production caller exists — the removal is a feature decision, not a
   cleanup, and needs its own proposal.
-- The behavior is justified by a wins/errors entry or a hard-won defensive
+- The behavior is justified by a measured result or a hard-won defensive
   pattern, and the new evidence does not beat that reason.
 - The removal forces unrelated churn without reducing public surface.
 - The idea is correct but tiny — add a targeted `TODO(name):` instead.
@@ -67,8 +67,8 @@ Reject or downgrade when:
 
 - Deletions land as a commit with the full chain removed (flag → mapping →
   doc → test), per the no-half-states rule.
-- A rejected simplification that was tempting enough to recur lands as a
-  wins/errors entry recording why it loses, so it is not re-litigated.
+- A rejected simplification that was tempting enough to recur gets a one-line
+  code comment at the site recording why it loses, so it is not re-litigated.
 - Inline `TODO(name):` / `FIXME(name):` only for small, local cleanups with
   an actionable next step. No speculative TODOs.
 
@@ -76,7 +76,6 @@ Reject or downgrade when:
 
 - `cargo check` on the lanes the diff touches (cuda,no-cuda typecheck is
   Mac-runnable; metal lane on Apple Silicon).
-- `python3 scripts/check_repo_hygiene.py`.
 - Correctness gates when the deletion touches inference behavior:
   `scripts/lever_gate.sh`, not just compile-green.
 - Report: candidates deleted, candidates rejected with reason, what was

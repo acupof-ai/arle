@@ -7,7 +7,7 @@ Megatron+SGLang RL stack bleeds) crossed with ARLE's own decoded incidents (two
 null-gradient episodes, the group-stagger KILL, the 5/28 sidecar miss).
 The executable first-gradient plan it referenced was abandoned: Phases 0–2
 landed but the run hit a base-prompt wall
-([errors/2026-07-24-agent-opd-sweetspot3-band1-baseprompt-wall.md](../experience/errors/2026-07-24-agent-opd-sweetspot3-band1-baseprompt-wall.md));
+(errors/2026-07-24-agent-opd-sweetspot3-band1-baseprompt-wall.md);
 agent-OPD later moved to GSPO math corpora.
 
 ## Scope

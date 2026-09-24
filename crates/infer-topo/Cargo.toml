@@ -3,7 +3,9 @@ name = "infer-topo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Pure topology and sharding math: TP rank placement, weight/head sharding, rank-group builders."
 
 # Phase-1 (Tensor Parallel) FOUNDATION crate for the ARLE rewrite.
 #

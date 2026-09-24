@@ -137,8 +137,7 @@ Format detection at safetensors load runs in the CUDA weight loader
  convolution state keep their existing FP32/BF16 dtypes.
 - **Evidence**: Qwen3.6 16K serial probe on local Apple Silicon:
  BF16 after-clear active 24.203 GB vs INT8 23.691 GB, a 512 MB reduction;
- 8K probe reduced 244 MB. See
- [`experience/wins/2026-06-11-metal-int8-kv-default.md`](experience/wins/2026-06-11-metal-int8-kv-default.md).
+ 8K probe reduced 244 MB.
 
 ## 3. CLI quick reference
 
@@ -177,8 +176,7 @@ separate quality comparison.
 ## 5. Retired paths
 
 The dense Qwen3 CUDA path (HD128 TileLang paged prefill, per-channel K
-KV quantization, fused-dequant decode) was removed 2026-08-22; the record is
-[`wins/2026-08-22-delete-qwen3-dense-cuda-and-kivi.md`](experience/wins/2026-08-22-delete-qwen3-dense-cuda-and-kivi.md).
+KV quantization, fused-dequant decode) is not carried.
 
 ---
 
@@ -188,6 +186,6 @@ If the status of any quantization scheme changes (new format, fix
 lands, kill decision):
 1. Update the row in [§0](#0-at-a-glance).
 2. Update the detailed section (§1 for KV, §2 for weights).
-3. Add a dated `wins/` or `errors/` entry per `bench-and-trace-spec.md`.
+3. Cite the matched A/B run per `bench-and-trace-spec.md` in the PR description.
 4. Re-link from [`support-matrix.md`](support-matrix.md) §4.
 5. Touch `README.md` only if the user-visible support level changes.

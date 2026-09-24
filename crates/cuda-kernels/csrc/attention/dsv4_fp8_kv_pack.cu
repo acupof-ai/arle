@@ -823,8 +823,7 @@ __global__ void dsv4_fp8_kv_pack_completed_compressor_row_batched_kernel(
 // Strided-input variant for the runtime decode hooks: NoPE and RoPE may
 // share a single `k_prepared`-style [n_tokens, head_dim=512] buffer where
 // the caller passes (nope_ptr = k_prepared, rope_ptr = k_prepared+NOPE,
-// stride_nope_elems = stride_rope_elems = 512) — see Phase D-4 SOLID
-// survey Finding 1 in docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md.
+// stride_nope_elems = stride_rope_elems = 512).
 //
 // Both strides must be ≥ HEAD_DIM_NOPE (448) / HEAD_DIM_ROPE (64) respectively.
 // `page_table`/`num_logical_pages` are the OPTIONAL Stage-B lookup (pass

@@ -177,8 +177,7 @@ fn write_tokens_sidecar(
 const TICK_WINDOW: u64 = 4;
 
 /// A worker can stop acking without closing its socket, leaving
-/// `any_worker_dead()` false forever (2026-07-05 TP=4 livelock — see
-/// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+/// `any_worker_dead()` false forever (the TP=4 lockstep livelock).
 /// Bounds [`wait_for_ack_window`] so that case fails like a crash instead of
 /// hanging every request permanently. Generous vs. any real step time.
 const ACK_STALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -848,8 +847,7 @@ impl Drop for InFlightGuard {
         // Tell every rank's engine to stop working on this request if it's
         // still queued/active — closes the gap where a client disconnecting
         // only released coordinator-side bookkeeping and left the request a
-        // permanent zombie in the engine (2026-07-05 multiproc hang
-        // investigation's last open item — docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+        // permanent zombie in the engine.
         // Best-effort: a closed channel means the lockstep loop already exited.
         let _ = self
             .submit_tx

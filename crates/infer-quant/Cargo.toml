@@ -3,7 +3,9 @@ name = "infer-quant"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Weight quantization formats, checkpoint metadata validation and layout planning, device-independent."
 
 # Host-only weight-quant checkpoint ABI detection and numeric codecs, moved
 # out of infer-cuda verbatim: zero device calls, verifiable on a Mac.

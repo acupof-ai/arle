@@ -7,7 +7,6 @@ logit_bias +100 arm must diverge at/near char 0 and be dominated by the biased
 token, and two ordinary follow-ups must answer non-empty (the TP>1 relay
 failure answers 200 and then kills every rank). /v1/stats supplies the
 spec-engagement counters and product_binary_sha256 for path identity.
-Method: docs/experience/wins/2026-08-14-sampling-penalties-verified-on-both-runtimes.md
 
 Exit codes are the verdict, distinct so a caller never confuses an infra
 failure with a sampling regression:

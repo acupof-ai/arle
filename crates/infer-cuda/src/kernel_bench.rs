@@ -2,8 +2,7 @@
 //! reference. The registry is explicit — an unknown name lists the
 //! registered kernels instead of dispatching.
 //!
-//! First two entries answer the open M=1 question
-//! (`errors/2026-09-09-w4afp8-gemv-killed-item-dsv4-moe-only.md`):
+//! First two entries answer the open M=1 question:
 //! `fp4-gemv` is the dense NVFP4 GEMV with no production caller since
 //! dispatch convergence, `marlin-fp4-gemm` the serving arm.
 

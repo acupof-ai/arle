@@ -3,7 +3,9 @@ name = "infer-plan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Backend-independent inference planning data: sampling params and request/step plans shared by engine and executors."
 
 [features]
 default = []

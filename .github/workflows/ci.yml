@@ -3,9 +3,8 @@ name: CI
 on:
   push:
     branches: [ main, master ]
-    # Skip CI for docs-only / memory / bench-output commits — they cannot
-    # affect compile/test outcomes. Without this filter every wins/errors
-    # entry triggers a 10-15 min CI run for no value.
+    # Skip CI for docs-only / bench-output commits — they cannot affect
+    # compile/test outcomes, and each would otherwise cost a 10-15 min CI run.
     paths-ignore:
       - 'docs/**'
       - 'bench-output/**'

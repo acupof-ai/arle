@@ -14,7 +14,6 @@
 // rank's 8-head slab into the existing per-rank local_attn buffer.
 //
 // Refs:
-//   docs/experience/errors/2026-05-27-dsv4-flashmla-v1-h_q-tp-shard-mismatch.md
 //   crates/cuda-kernels/csrc/misc/arle_flashmla_shim.cu
 
 #include <cuda_runtime.h>

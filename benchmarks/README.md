@@ -3,20 +3,17 @@
 Committed, distilled bench results — the single source of truth for the headline
 numbers shown on the [README front door](../README.md#performance). Raw native
 artefacts (json / csv / html per run) stay in the gitignored `bench-output/`;
-this folder keeps only the distilled headline metrics, version-controlled, each
-row traceable to a dated [`docs/experience/wins/`](../docs/experience/wins/) entry.
+this folder keeps only the distilled headline metrics, version-controlled.
 
 **No floating numbers rule:** a perf figure quoted anywhere in the repo as a
-*current* capability must resolve to a snapshot here (or a wins entry a snapshot
-links to). Stale micro-benches from deleted code paths get archived, not quoted.
+*current* capability must resolve to a snapshot here. Stale micro-benches from deleted code paths get archived, not quoted.
 
 ## Current canonical numbers
 
 ### Metal — Apple M4 Pro (48 GB), single user, c=1
 
 512-in / 128-out · temp=0 · median of 6 · build `4ea77e11` · decode = single-stream generation rate.
-Snapshot: [`snapshots/2026-06-14-metal-m4pro-ladder.json`](snapshots/2026-06-14-metal-m4pro-ladder.json) ·
-wins: `2026-06-14-bench-metal-m4pro-local-model-ladder` (entry purged 2026-07-22)
+Snapshot: [`snapshots/2026-06-14-metal-m4pro-ladder.json`](snapshots/2026-06-14-metal-m4pro-ladder.json)
 
 | Model · Metal 4-bit | Decode | TPOT | TTFT |
 |---|---:|---:|---:|
@@ -39,8 +36,7 @@ wins: `2026-06-14-bench-metal-m4pro-local-model-ladder` (entry purged 2026-07-22
 output per turn, 8.6K tokens at turn 12), greedy, TTFT to first streamed delta.
 Script: `scripts/bench_multiturn_ttft.py --turns 12 --warmup`. Snapshots:
 [`arle`](snapshots/2026-09-02-metal-multiturn-ttft-arle-0.8b.json) ·
-[`mlx-lm`](snapshots/2026-09-02-metal-multiturn-ttft-mlx-lm-0.8b.json) ·
-wins: [2026-09-02-metal-prefix-restore-survives-turns](../docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md)
+[`mlx-lm`](snapshots/2026-09-02-metal-multiturn-ttft-mlx-lm-0.8b.json)
 
 | Server | Turn 1 | Turns 2–12 median | Turn 12 |
 |---|---:|---:|---:|
@@ -49,14 +45,14 @@ wins: [2026-09-02-metal-prefix-restore-survives-turns](../docs/experience/wins/2
 
 ### CUDA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE)
 
-Recorded from the 2026-06-13 → 06-14 decode campaign wins entries (no local CUDA;
-not re-measured here — provenance is the linked wins):
+Recorded from the 2026-06-13 → 06-14 decode campaign (no local CUDA; not
+re-measured here):
 
-| Metric | Value | Source |
-|---|---:|---|
-| B=1 decode | 53.3 tok/s (42.7 ms/forward-step, ~2.3 tok/step MTP) | `2026-06-13-dsv4-mtp-d2-chain-fold-53` (entry purged 2026-07-22) |
-| B=1 prefill | 23 ms | `2026-06-08-dsv4-decode-6ms-FINAL-consolidated` (entry purged 2026-07-22) |
-| c=8 batched lane | 45.6 → 67.6 tok/s (+48%) | `2026-06-14-dsv4-batched-flashmla-decode-phaseA` (entry purged 2026-07-22) |
+| Metric | Value |
+|---|---:|
+| B=1 decode | 53.3 tok/s (42.7 ms/forward-step, ~2.3 tok/step MTP) |
+| B=1 prefill | 23 ms |
+| c=8 batched lane | 45.6 → 67.6 tok/s (+48%) |
 
 ## Snapshot index
 
@@ -71,7 +67,7 @@ not re-measured here — provenance is the linked wins):
   locally-cached MLX model in turn, c=1, strictly serial), then distil the
   `RESULT:` lines into a dated `snapshots/<date>-<label>.json` and update the
   tables above.
-- **Canonical serving benchmark** (CUDA/Metal, produces a wins entry):
+- **Canonical serving benchmark** (CUDA/Metal):
   `python3 scripts/bench_throughput.py ... --output bench-output/<label>/bench`
   — raw JSON and CSV land in `bench-output/`;
-  copy the headline table into a snapshot here and link the wins entry.
+  copy the headline table into a snapshot here.

@@ -1,6 +1,6 @@
 # Matched measurement, and the gate's positive control
 
-Design note 5 of 5 ([plan](../plans/2026-09-02-design-theses.md)). Date:
+Design note 5 of 5. Date:
 2026-09-09.
 
 ## Problem
@@ -63,13 +63,11 @@ decode-graph flip verified the eager arm at 0 captures.
 **Deletion is a verdict too.** A flag is a promise that both arms are viable.
 Once one arm has a dated losing verdict, the flag is dead A/B wiring: three
 deletion waves removed 17 serve flags (66 → 49) and 5 env aliases, hardcoding
-the measured winner
-([wins 2026-08-22](../experience/wins/2026-08-22-flag-deletion-wave.md)).
+the measured winner.
 
 ## The failure
 
-The decode-graph flag that logged ARMED and captured nothing
-([errors 2026-08-01](../experience/errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md)).
+The decode-graph flag that logged ARMED and captured nothing.
 `--qwen35-decode-graph` printed an ARMED line from the warmup path while the
 dispatch path returned before reaching the graph lane under paged KV — the
 serving default. A four-arm serve A/B produced only noise; one nsys capture
@@ -85,8 +83,7 @@ Three numbers, each from a matched measurement. DSpark spec decode: 2.24× at
 c=1, −39% at c=16 (8×H20, 27B, 8 requests per concurrency level; the no-spec
 control scaled 2.9× over the same range) — the measurement that re-scoped the
 feature to low concurrency and wrote the "measure against not using it at the
-target operating point" rule
-([errors 2026-07-26](../experience/errors/2026-07-26-dspark-spec-decode-serializes-and-loses-above-c1.md)).
+target operating point" rule.
 The drift band: ±3%, measured 2026-07-16, the threshold below which a one-arm
 comparison escalates to a three-trial matched A/B. The deletion waves: serve
 flags 66 → 56 → 53 → 49, env names 38 → 33, every deleted flag's off-arm

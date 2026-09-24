@@ -411,8 +411,6 @@ static cudaError_t gemm_cublas_fallback(CublasDeviceState *state,
 // cuBLAS heuristic top-1 is optimized for "average cost across many
 // shapes"; for a specific shape the best algo is often at index
 // 1-3. Off by default; opt in with INFER_GEMM_AUTOTUNE=1.
-// See the H_LP3 finding in
-// docs/experience/wins/2026-05-07-h_lp3-diagnosed-cutlass-small-tile-gemm-bottleneck.md.
 static bool gemm_autotune_enabled() {
   static const bool enabled = []() {
     const char *env = std::getenv("INFER_GEMM_AUTOTUNE");

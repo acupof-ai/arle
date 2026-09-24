@@ -1,6 +1,6 @@
 ---
 name: arle-upstream-runtime-scan
-description: Use this skill when ckl asks to ground an ARLE serving/runtime, model-path, benchmark, capacity, Qwen3.5/DeepSeek, scheduler, paged_kv, MLX, autograd, or OPD decision in upstream SGLang/vLLM/TensorRT-LLM evidence before changing local code. It distills BBuf AI-Infra Auto Driven SKILLS into an ARLE-specific source-survey workflow without symlinking or vendoring those repositories.
+description: Use this skill when ckl asks to ground an ARLE serving/runtime, model-path, benchmark, capacity, Qwen3.5/DeepSeek, scheduler, paged_kv, MLX, or OPD-teacher decision in upstream SGLang/vLLM/TensorRT-LLM evidence before changing local code. It distills BBuf AI-Infra Auto Driven SKILLS into an ARLE-specific source-survey workflow without symlinking or vendoring those repositories.
 version: 1.0.0
 ---
 
@@ -22,7 +22,7 @@ Use for:
   continuous batching, prefix-cache, or queue-growth behavior.
 - Reading external profiler traces where prefill/decode stage separation
   matters.
-- Designing OPD/eval serving baselines that need a fair external reference.
+- Designing eval serving baselines that need a fair external reference.
 
 Do not use for:
 
@@ -36,7 +36,7 @@ Do not use for:
 ## Non-Negotiables
 
 - Start from ARLE truth surfaces: `docs/index.md`, relevant `AGENTS.md`,
-  current code, and recent `docs/experience/{wins,errors}`.
+  and current code.
 - Treat upstream source survey as hypothesis-grade. It may suggest a design or
   risk; it does not prove ARLE behavior.
 - Fetch external repos into `/tmp` for inspection when needed. Do not clone,
@@ -56,9 +56,9 @@ Pick exactly one primary lane before reading upstream material:
 | --- | --- | --- |
 | Fair serving benchmark | ckl asks "ARLE vs SGLang/vLLM" or wants a best external baseline | `docs/bench-and-trace-spec.md`, `scripts/bench_throughput.py` |
 | Capacity / OOM / KV budget | memory pool, max tokens, KV dtype, mem fraction, request capacity | `docs/support-matrix.md`, server logs, `/v1/stats`, `nvidia-smi` |
-| Model PR history | Qwen3.5, DeepSeek V4, Qwen3-Next, MoE, loader, sampler, cache path | `infer/src/model/`, `crates/*-spec/`, active project docs |
+| Model PR history | Qwen3.5, DeepSeek V4, Qwen3-Next, MoE, loader, sampler, cache path | `crates/infer-cuda/src/`, `crates/infer-metal/src/`, `crates/*-spec/` |
 | Trace triage | external torch profiler or ARLE nsys/ncu points at a stage | `scripts/profile_*` |
-| OPD/eval baseline | serving correctness or capability numbers need external validation | `scripts/arle_capability_eval.py`, train/eval docs |
+| Eval baseline | serving correctness or capability numbers need external validation | `scripts/eval_harness/`, `scripts/needle_gate.py` |
 
 If the lane is kernel-local, stop and switch to `kernel-optimization`.
 
@@ -114,7 +114,7 @@ Extract only:
 
 Do not copy code snippets from upstream PR cards into ARLE. If a code-level
 idea matters, inspect the real upstream source/PR under its license and record
-the URL in the experience entry.
+the URL in the PR description.
 
 ### 4. Fair Benchmark Pass
 
@@ -136,8 +136,8 @@ Do not crown a framework winner until each requested framework has had its main
 serving knobs tuned or explicitly fixed by the experiment design. Do not search
 memory fractions by default unless capacity is the lane.
 
-For ARLE, use `scripts/bench_throughput.py` and the report skeleton under
-`docs/experience/wins/`. External framework tools are references, not the ARLE
+For ARLE, use `scripts/bench_throughput.py` and the report contract in
+`docs/bench-and-trace-spec.md`. External framework tools are references, not the ARLE
 truth surface.
 
 ### 5. Capacity / KV Budget Pass
@@ -192,8 +192,8 @@ Return or write:
 - local evidence still required to license or kill;
 - exact next command or patch boundary.
 
-If this scan produces a code/docs change, record the source scan in
-`docs/experience/wins/` or `docs/experience/errors/` with kept/killed verdicts.
+If this scan produces a code/docs change, record the source scan and the
+kept/killed verdicts in the PR description.
 
 ## References
 

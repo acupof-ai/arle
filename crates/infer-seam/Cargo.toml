@@ -3,11 +3,13 @@ name = "infer-seam"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Inference execution seam: host-only BackendExecutor (submit/poll) and KvPool traits plus a host paged KV pool."
 
 [dependencies]
 anyhow = "1.0"
-infer-plan = { path = "../infer-plan" }
+infer-plan = { path = "../infer-plan", version = "0.5.8" }
 serde = { workspace = true }
 
 [lints]
