@@ -441,7 +441,7 @@ pub(crate) struct RunArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "This is a thin front door over the in-process ARLE-native backend compiled into this binary.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend arle --model-path /models/Qwen3-4B --port 8000\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend vulkan --model-path /models/qwen3.gguf --port 8020\n  arle serve --backend cuda --model-path /models/Qwen3-4B"
+    after_help = "This is a thin front door over the in-process ARLE-native backend compiled into this binary.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend arle --model-path /models/Qwen3-4B --port 8000\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend cuda --model-path /models/Qwen3-4B"
 )]
 pub(crate) struct ServeArgs {
     /// Model directory or HuggingFace model ID. Defaults to the top-level --model-path.

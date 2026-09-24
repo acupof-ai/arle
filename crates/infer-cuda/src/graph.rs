@@ -149,7 +149,7 @@ impl CudaGraphState {
                         self.allow_alloc_nodes,
                         "captured graph allocates: {} alloc / {} free node(s) of {} — every \
                          replay re-allocates them through the async pool (graph discarded, \
-                         eager fallback); see wins/2026-08-23-dsv4-c1-decode-graph",
+                         eager fallback)",
                         a.mem_alloc_nodes,
                         a.mem_free_nodes,
                         a.total_nodes,
