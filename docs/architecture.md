@@ -40,6 +40,7 @@ door built on top of it.
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / tensor / kv_quant, Marlin W4A16 fp4 GEMM, unified quantized paged attention `paged_attention_quantized_fa3`) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend (Qwen3.5/3.6, LFM2.5 compiled models) | Anything that is not the Metal bridge |
+| `deepseek-kernels-sys` | Vendored FlashMLA / DeepGEMM / FA3-hopper trees, their thin C-ABI shims, the nvcc build into `libdeepseek_kernels.a`, and raw `extern "C"` FFI (re-exported by `cuda-kernels`) | Any arle type (`DeviceMatrix`, `PagedKVPool`, ...), TileLang, model code |
 | `deepep-sys` | DeepEP/NVSHMEM FFI (`internode_ll` dispatch/combine) for EP collectives | Routing policy, scheduler |
 | `xgrammar-sys` | Grammar-constrained decode FFI (xgrammar) | Sampling policy, scheduler |
 | `kv-native-sys` | `KvMmapStore` (sparse mmap page-slot store): memcpy writes, zero-copy reads. WAL/shm/mm/descriptors unused — kept for future shared-memory tier. | Tier policy, scheduler, GPU code |
@@ -70,6 +71,7 @@ infer-metal -> infer-plan, infer-seam, [mlx-sys]
 
 infer-server -> infer-core, infer-seam, infer-plan
 infer-api -> infer-core, infer-seam, infer-plan, infer-server, [infer-cuda, cuda-kernels]
+cuda-kernels -> deepseek-kernels-sys, infer-quant
 
 workspace root package (arle)
  -> cli

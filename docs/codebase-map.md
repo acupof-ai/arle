@@ -37,8 +37,8 @@ Current workspace members (ownership and boundaries are listed in
  `crates/infer-core`, `crates/infer-cuda`, `crates/infer-metal`,
  `crates/infer-server`, `crates/infer-api`, `crates/infer-topo`,
  `crates/infer-moe`, `crates/infer-model`, `crates/infer-util`
-- **GPU / bridge:** `crates/cuda-kernels`, `crates/mlx-sys`,
- `crates/deepep-sys`
+- **GPU / bridge:** `crates/cuda-kernels`, `crates/deepseek-kernels-sys`,
+ `crates/mlx-sys`, `crates/deepep-sys`
 - **control plane / helpers:** `crates/agent`, `crates/chat`, `crates/cli`,
  `crates/tools`
 - **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
@@ -349,6 +349,7 @@ These crates sit around the runtime graph:
 - `crates/cli`: CLI entry, arg parsing, REPL UX, `arle serve` front door, `arle model download`
 - `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
 - `crates/cuda-kernels`: CUDA kernel layer (extracted from the legacy `infer` crate on 2026-04-15). Owns `csrc/{attention,comm,elementwise,gemm,kv,moe,norm,recurrent,sampling}/`, the separate C++ `csrc/deepep_sidecar/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tensor`, `kv_quant`; legacy Rust `ffi::misc` remains, but no `csrc/misc/` exists
+- `crates/deepseek-kernels-sys`: raw-FFI `-sys` crate (`links = "deepseek_kernels"`) that owns the vendored upstream kernels (`vendor/{flashmla,deepgemm,flash-attention}`), their thin C-ABI shims (`csrc/attention/arle_flashmla_*`, `csrc/gemm/deepgemm_{native,bridge_stub}.cu`), and the nvcc build into `libdeepseek_kernels.a`; no arle types. `cuda-kernels` depends on it, re-exports its FFI at the old `cuda_kernels::ffi::*` paths, and compiles the FA3 C-ABI shim against its FA3 tree
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/deepep-sys`: DeepEP all-to-all transport bindings used by `infer-cuda`'s DSv4 MoE path
 - `crates/kv-native-sys`: local persistence substrate for KV tier disk transport — `KvMmapStore` (file-backed sparse mmap page-slot store: memcpy writes, zero-copy `&[u8]` reads, slot allocator + free list). The key/value front door is `KvTierStore` (`insert`/`read`/`read_many`/`read_chunked`/`remove_chunked`); consumers are the CUDA DSv4 slot and prefix hooks (`executor/dsv4/slot_tier.rs`, `attention/prefix_state.rs`) and `infer-metal`'s SSD tier (`kv_ssd.rs`). The earlier WAL/shm/mmap-descriptor surface and the sharded block-file ops were deleted as unused (`6e3347d6e`, `b1b817958`).
@@ -391,6 +392,9 @@ infer-cuda
  -> infer-plan, infer-seam, infer-kvspace, infer-model, cuda-kernels,
  infer-topo, infer-moe, qwen35-spec
  (+ qwen3-spec / deepseek-spec by feature) (never infer-core)
+
+cuda-kernels
+ -> deepseek-kernels-sys, infer-quant (never a serving crate)
 
 infer-metal
  -> infer-plan, infer-seam (+ mlx-sys under "metal") (never infer-core)
