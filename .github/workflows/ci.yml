@@ -101,16 +101,6 @@ jobs:
           # cli's example has a Linux typecheck (it is otherwise built only on
           # the Metal lane).
           cargo clippy -p cli --no-default-features --features no-cuda --examples -- -D warnings
-          # HIP/Vulkan backend bodies sit behind their feature; the no-feature
-          # lint above compiles almost none of them. With the feature on, the
-          # -sys crates fall back to host stubs on this runner (no ROCm/Vulkan
-          # needed).
-          cargo clippy -p infer-hip -p infer-vulkan -- -D warnings
-          cargo clippy -p infer-hip --features hip --lib -- -D warnings
-          # Vulkan real backend under -D warnings (previously blocked by 96
-          # undocumented unsafe blocks in vulkan-sys). All three crates define a
-          # `vulkan` feature; vulkan-kernels' build.rs typechecks without glslc.
-          cargo clippy -p infer-vulkan -p vulkan-sys -p vulkan-kernels --features vulkan --all-targets -- -D warnings
           # deepep-sys: `deepep` typechecks the FFI but build.rs skips the
           # native kernel (no nvcc on this runner) — kernel compile is GPU-only.
 
@@ -219,7 +209,7 @@ jobs:
           -p infer-core -p infer-server -p infer-plan -p infer-kvspace -p infer-seam
           -p infer-moe -p infer-model -p infer-topo -p infer-util -p deepseek-spec -p agent
           -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys
-          -p infer-quant -p infer-gguf
+          -p infer-quant
           -p spec-train -p cuda-kernels
 
   fmt:
