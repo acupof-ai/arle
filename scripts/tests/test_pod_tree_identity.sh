@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Contract: a pod run must only execute a build that its OWN tree produced.
-# Two lanes sync+build concurrently; a run resolves $STATE/builds/<label>.
+# Two trees can sync+build concurrently; a run resolves $STATE/builds/<label>.
 # Before this guard the run checked schema/exit/sha/source but never that the
 # build receipt's tree= matched this run's $TREE — at identical heads across
-# lanes the binary SHAs match, so tree A could silently execute tree B's binary.
+# trees the binary SHAs match, so tree A could silently execute tree B's binary.
 # The tree check runs first in the chain (before sha/GPU), so it is testable
 # on a Mac with fixture receipts, no GPU.
 set -euo pipefail
@@ -65,30 +65,4 @@ grep -q "build belongs to another tree" <<<"$out" \
 grep -q "binary SHA mismatch" <<<"$out" \
   || fail "own-tree receipt should clear the tree gate and stop at sha, got: $out"
 
-# (3) Per-lane orchestration: two lane worktrees derive DISTINCT tree+state,
-# so same-label receipts land in separate dirs and cannot cross.
-make_lane() { # $1 lane name
-  local d="$TMP/arle-lanes/$1/scripts"; mkdir -p "$d"
-  cp "$ROOT/scripts/pod.sh" "$d/pod.sh"
-  # Stub pod: pod.sh invokes `$POD "POD_TREE='..' POD_STATE='..' bash .. tree-status"`.
-  # Eval only the leading env assignments (everything before " bash ") and echo them.
-  cat >"$d/pod-stub" <<'STUB'
-#!/usr/bin/env bash
-eval "${1%% bash *}"
-printf 'TREE=%s\nSTATE=%s\n' "$POD_TREE" "$POD_STATE"
-STUB
-  chmod +x "$d/pod-stub"
-}
-derive() { # $1 lane
-  POD="$TMP/arle-lanes/$1/scripts/pod-stub" bash "$TMP/arle-lanes/$1/scripts/pod.sh" status
-}
-make_lane alpha; make_lane beta
-a="$(derive alpha)"; b="$(derive beta)"
-ta="$(sed -n 's/^TREE=//p' <<<"$a")"; sa="$(sed -n 's/^STATE=//p' <<<"$a")"
-tb="$(sed -n 's/^TREE=//p' <<<"$b")"; sb="$(sed -n 's/^STATE=//p' <<<"$b")"
-[ -n "$ta" ] && [ -n "$sa" ] && [ -n "$tb" ] && [ -n "$sb" ] || fail "derivation empty: $a / $b"
-[ "$ta" != "$tb" ] || fail "two lanes derived the same POD_TREE: $ta"
-[ "$sa" != "$sb" ] || fail "two lanes derived the same POD_STATE (shared receipt dir): $sa"
-case "$sa" in *arle-ops-alpha) ;; *) fail "lane state not per-lane: $sa";; esac
-
-echo "pod tree identity contract PASS (cross-reject/own-clears/distinct-state)"
+echo "pod tree identity contract PASS (cross-reject/own-clears)"

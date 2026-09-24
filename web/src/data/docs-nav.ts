@@ -40,7 +40,7 @@ export const DOCS_NAV: DocsGroup[] = [
     links: [
       { label: "arle run", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
       { label: "arle serve", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
-      { label: "arle train", href: "https://github.com/acupof-ai/arle/tree/main/crates/train", badge: "beta" },
+      { label: "arle-opd train", href: "https://github.com/acupof-ai/arle-opd", badge: "beta" },
       { label: "arle model", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
     ],
   },
@@ -68,7 +68,7 @@ export const DOCS_TABS = [
   { label: "Guides", href: "docs/", active: true },
   { label: "HTTP API", href: "https://github.com/acupof-ai/arle/blob/main/docs/http-api.md" },
   { label: "CLI reference", href: "https://github.com/acupof-ai/arle/tree/main/crates/cli" },
-  { label: "Bench snapshots", href: "https://github.com/acupof-ai/arle/tree/main/docs/experience/wins" },
+  { label: "Bench snapshots", href: "https://github.com/acupof-ai/arle/tree/b7d08b3d2e1b01bdf7cade251153242caecdfb92/docs/experience/wins" },
   { label: "Recipes", href: "https://github.com/acupof-ai/arle/tree/main/examples" },
   { label: "Operator", href: "https://github.com/acupof-ai/arle/blob/main/docs/environment.md" },
 ];

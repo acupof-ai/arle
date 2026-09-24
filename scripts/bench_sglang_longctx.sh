@@ -299,27 +299,27 @@ pathlib.Path(out_table).write_text("\n".join(lines) + "\n")
 PY
 }
 
-write_wins_entry() {
+write_result_summary() {
     if [[ "${SMOKE:-0}" == "1" ]]; then
-        echo ">>> smoke mode — skipping SGLang wins entry seed"
+        echo ">>> smoke mode — skipping SGLang result summary"
         return 0
     fi
     if [[ "${SGLANG_NO_LAUNCH:-0}" == "1" && "${SGLANG_SERVER_COMMIT:-}" != "$SGLANG_COMMIT" ]]; then
-        echo ">>> reused SGLang server commit is unverified — skipping wins entry seed"
+        echo ">>> reused SGLang server commit is unverified — skipping result summary"
         echo "    set SGLANG_SERVER_COMMIT=$SGLANG_COMMIT only when the running server is pinned"
         return 0
     fi
 
-    local wins_dir="$OUTPUT_DIR"
-    local wins_base="$wins_dir/${DATE}-bench-sglang-longctx-${LABEL}"
-    local wins_file="${wins_base}.md"
+    local summary_dir="$OUTPUT_DIR"
+    local summary_base="$summary_dir/${DATE}-bench-sglang-longctx-${LABEL}"
+    local summary_file="${summary_base}.md"
     local wrun=1
-    while [[ -e "$wins_file" ]]; do
+    while [[ -e "$summary_file" ]]; do
         wrun=$((wrun + 1))
-        wins_file="${wins_base}-run${wrun}.md"
+        summary_file="${summary_base}-run${wrun}.md"
     done
 
-    python3 - "$wins_file" "$LABEL" "$DATE" "$SGLANG_COMMIT_FOR_ARTIFACTS" \
+    python3 - "$summary_file" "$LABEL" "$DATE" "$SGLANG_COMMIT_FOR_ARTIFACTS" \
         "$SGLANG_COMMIT" "$MODEL" "$MODEL_PATH" "$TARGET" "$OUTPUT_DIR" \
         "$PROMPT_TOKENS" "$OUTPUT_TOKENS" "$CONCURRENCIES" "$MAX_SECONDS" \
         "$RUN_SECONDARY_C1" "$C1_SECONDS" "$HEADLINE_TABLE" \
@@ -329,7 +329,7 @@ import pathlib
 import sys
 
 (
-    wins_file,
+    summary_file,
     label,
     date,
     actual_commit,
@@ -423,10 +423,10 @@ scripts/bench_sglang_longctx.sh {label}
 - Headline: `{output_dir}/headline_table.md`
 - Server log: `{output_dir}/sglang_server.log`
 """
-pathlib.Path(wins_file).write_text(body)
+pathlib.Path(summary_file).write_text(body)
 PY
 
-    echo "    wins    : $wins_file"
+    echo "    summary : $summary_file"
 }
 
 SGLANG_PID=""
@@ -455,7 +455,7 @@ if [[ "${SGLANG_NO_LAUNCH:-0}" == "1" ]]; then
         echo "    pin    : verified by SGLANG_SERVER_COMMIT"
     else
         SGLANG_COMMIT_FOR_ARTIFACTS="unverified-existing-server(expected:${SGLANG_COMMIT})"
-        echo "    pin    : unverified existing server; wins entry will not be seeded"
+        echo "    pin    : unverified existing server; result summary will not be written"
     fi
 else
     ensure_sglang_checkout
@@ -487,7 +487,7 @@ if [[ "$RUN_SECONDARY_C1" == "1" && "$CONCURRENCIES" == *"1"* && "${SMOKE:-0}" !
 fi
 
 write_headline
-write_wins_entry
+write_result_summary
 
 echo
 echo ">>> headline table"

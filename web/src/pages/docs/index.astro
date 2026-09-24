@@ -197,7 +197,7 @@ const verifyLines = [
     <p>You now have a runtime serving real traffic. From here:</p>
     <ul class="body">
       <li>Swap the model — any Qwen3.5 / 3.6 / 3.8 directory on CUDA, any Qwen3.5 / 3.6 MLX checkpoint on Metal.</li>
-      <li>Distill your agent traces into a smaller model — <code>arle train opd</code>, the teacher is this server.</li>
+      <li>Distill your agent traces into a smaller model — <code>arle-opd train opd</code> from <a href="https://github.com/acupof-ai/arle-opd">arle-opd</a>, the teacher is this server.</li>
       <li>Wire it into your app — same SDKs you use against OpenAI, just change the base URL.</li>
     </ul>
 
