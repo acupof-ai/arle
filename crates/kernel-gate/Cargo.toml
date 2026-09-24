@@ -1,0 +1,19 @@
+[package]
+name = "kernel-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Typed operator registry (semantic / implementation / policy rows) with correctness-gate validation and parity-gate listing"
+repository = "https://github.com/acupof-ai/arle"
+keywords = ["cuda", "kernels", "registry", "parity", "ci"]
+categories = ["development-tools::testing", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+toml = "0.8"
+
+[lints]
+workspace = true

@@ -1776,6 +1776,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-gate"
+version = "0.5.8"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "kv-native-sys"
 version = "0.5.8"
 dependencies = [
