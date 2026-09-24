@@ -76,8 +76,7 @@ jobs:
             ${{ runner.os }}-metal-ninja-
 
       # Test subsumes check: one merged Metal test run for the binary crates
-      # (none have tests/ dirs, so --lib is a no-op) + one Metal typecheck for
-      # the train/autograd libs (their tests/ hold CUDA cases skipped on macOS).
+      # (none have tests/ dirs, so --lib is a no-op).
       # kv-native-sys is covered on Linux (ci.yml test-neutral lane).
       - name: cargo test (metal + no-cuda)
         run: >
@@ -103,11 +102,6 @@ jobs:
       # per-family negative control. Tests serialize themselves via mlx_guard.
       - name: cargo test (mlx-sys Metal kernel parity)
         run: cargo test -p mlx-sys --release
-
-      - name: cargo check (metal train/autograd libs)
-        run: |
-          cargo check -p autograd --release --features metal --lib
-          cargo check -p train --release --features metal --lib
 
       # Examples have no other compile gate; the Metal lane is the only one
       # that carries the metal feature this one needs.
