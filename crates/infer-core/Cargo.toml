@@ -3,12 +3,14 @@ name = "infer-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Backend-agnostic continuous-batching inference engine loop over the infer-seam contract."
 
 [dependencies]
 anyhow = "1.0"
-infer-plan = { path = "../infer-plan" }
-infer-seam = { path = "../infer-seam" }
+infer-plan = { path = "../infer-plan", version = "0.5.8" }
+infer-seam = { path = "../infer-seam", version = "0.5.8" }
 log = "0.4"
 
 [lints]

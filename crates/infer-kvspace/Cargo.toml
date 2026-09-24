@@ -3,13 +3,15 @@ name = "infer-kvspace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Backend-neutral KV host logic: capacity accounting, prefix/radix content index, sidecar lifecycle, layout description."
 
 [dependencies]
 anyhow = "1.0"
 half = "2.4"
-infer-seam = { path = "../infer-seam" }
-kv-native-sys = { path = "../kv-native-sys" }
+infer-seam = { path = "../infer-seam", version = "0.5.8" }
+kv-native-sys = { path = "../kv-native-sys", version = "0.5.8" }
 
 [lints]
 workspace = true
