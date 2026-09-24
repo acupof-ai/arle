@@ -167,10 +167,6 @@ pub struct EngineLoadConfig {
     /// per row. `None` = checkpoint default.
     #[serde(default)]
     pub diffusion_max_denoising_steps: Option<usize>,
-    /// `--vulkan-submit-cap`: max compute dispatches per Vulkan command buffer
-    /// (TDR/latency safety valve). `None` = whole token in one submit.
-    #[serde(default)]
-    pub vulkan_submit_cap: Option<usize>,
     /// Explicit world size (total GPU ranks) for this engine. `None` = resolve
     /// from `INFER_TP_SIZE` / `INFER_CUDA_DEVICES` env (the legacy path).
     /// Set from `--tensor-parallel-size × --context-parallel-size`.
@@ -260,7 +256,6 @@ impl Default for EngineLoadConfig {
             cuda: infer_seam::CudaRuntimeFlags::default(),
             metal: infer_seam::MetalRuntimeFlags::default(),
             diffusion_max_denoising_steps: None,
-            vulkan_submit_cap: None,
             world_size: None,
             context_parallel_size: None,
             backend: None,

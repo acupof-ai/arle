@@ -44,7 +44,6 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `INFER_METAL_NO_SPECULATIVE` / `_DFLASH_DRAFT_MODEL` / `_DFLASH_TOKENS` / `_DFLASH_ACCEPT_TOPK` | `arle serve --no-speculative` / `--draft-model` / `--speculative-tokens` / `--spec-accept-topk` (env transport removed; flags ride `EngineLoadConfig.metal`) |
 | `DFLASH_DRAFT_MASK` | removed (rewrite path is mask=none only) |
 | `ARLE_DIFFUSION_MAX_DENOISING_STEPS` | `arle serve --diffusion-max-denoising-steps` |
-| `ARLE_SUBMIT_CAP` | `arle serve --vulkan-submit-cap` |
 | `ARLE_OPD_WRITEBACK_OFFLOAD` | `arle train <opd> --writeback-offload` |
 | `ARLE_OPD_ENGINE_OFFLOAD` | `arle train <opd> --engine-offload off\|all\|student\|teacher` |
 | `ARLE_OPD_GRADIENT_CHECKPOINTING` | `arle train <opd> --gradient-checkpointing` |

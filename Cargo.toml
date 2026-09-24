@@ -9,13 +9,9 @@ members = [
     "crates/deepep-sys",
     "crates/deepseek-ocr-spec",
     "crates/deepseek-spec",
-    "crates/hip-kernels",
-    "crates/hip-sys",
     "crates/infer-api",
     "crates/infer-core",
     "crates/infer-cuda",
-    "crates/infer-gguf",
-    "crates/infer-hip",
     "crates/infer-kvspace",
     "crates/infer-metal",
     "crates/infer-model",
@@ -27,15 +23,12 @@ members = [
     "crates/infer-topo",
     "crates/infer-util",
     "crates/spec-train",
-    "crates/infer-vulkan",
     "crates/kv-native-sys",
     "crates/mlx-sys",
     "crates/qwen3-spec",
     "crates/qwen35-spec",
     "crates/tools",
     "crates/train",
-    "crates/vulkan-kernels",
-    "crates/vulkan-sys",
     "crates/xgrammar-sys",
 ]
 
@@ -103,11 +96,6 @@ no-cuda = ["cli/no-cuda"]
 cpu = ["dep:infer-metal"]
 # Metal backend via mlx-sys (Apple Silicon). Pair with `no-cuda`.
 metal = ["cli/metal", "dep:infer-metal", "infer-metal/metal"]
-# HIP backend via infer-hip (AMD ROCm, DSv4 GGUF). Pair with `no-cuda` off-box.
-hip = ["dep:infer-hip", "infer-hip/hip"]
-# Vulkan backend via infer-vulkan (cross-vendor / Windows lane). Pair with
-# `no-cuda` off-box.
-vulkan = ["dep:infer-vulkan", "infer-vulkan/vulkan"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda`.
 # Forwards through `cli` -> `infer-api` -> `infer-cuda` -> `cuda-kernels`.
 nccl = ["cuda", "cli/nccl"]
@@ -125,8 +113,6 @@ infer-util = { path = "crates/infer-util" }
 log = "0.4"
 cli = { path = "crates/cli", default-features = false, optional = true }
 infer-metal = { path = "crates/infer-metal", default-features = false, optional = true }
-infer-hip = { path = "crates/infer-hip", default-features = false, optional = true }
-infer-vulkan = { path = "crates/infer-vulkan", default-features = false, optional = true }
 
 [dev-dependencies]
 infer-api = { path = "crates/infer-api" }
