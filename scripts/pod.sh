@@ -12,28 +12,10 @@ if { [ -n "${POD_TREE:-}" ] && [ -z "${NODE_TREE:-}" ]; } ||
   echo "POD_TREE and NODE_TREE must be set together (same tree, pod side and node side); got POD_TREE='${POD_TREE:-}' NODE_TREE='${NODE_TREE:-}'" >&2
   exit 2
 fi
-# Per-lane tree: running pod.sh from a lane worktree defaults to that lane's
-# remote tree, so one lane's sync cannot land between another lane's sync and
-# build. Override with POD_TREE/NODE_TREE (must be set together, checked above).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-_lane_tree=""
-if [ -z "${POD_TREE:-}" ] && [ -z "${NODE_TREE:-}" ]; then
-  case "$ROOT" in
-    */arle-lanes/*) _lane_tree="$(basename "$ROOT")" ;;
-  esac
-fi
-if [ -n "$_lane_tree" ]; then
-  NODE_TREE="/root/arle-build-$_lane_tree"
-  TREE="/host/arle-build-$_lane_tree"
-  # Per-lane state dir too: the shared /root/arle-ops keys builds/ and runs/ by
-  # label, so two lanes with the same label clobbered one receipt dir and a run
-  # could resolve another tree's build. Explicit POD_STATE still overrides.
-  STATE="${POD_STATE:-/root/arle-ops-$_lane_tree}"
-else
-  NODE_TREE="${NODE_TREE:-/root/arle-build}"
-  TREE="${POD_TREE:-/host/arle-build}"
-  STATE="${POD_STATE:-/root/arle-ops}"
-fi
+NODE_TREE="${NODE_TREE:-/root/arle-build}"
+TREE="${POD_TREE:-/host/arle-build}"
+STATE="${POD_STATE:-/root/arle-ops}"
 cmd="${1:-help}"
 shift || true
 

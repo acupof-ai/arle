@@ -186,7 +186,10 @@ export type Locale = {
 };
 
 const GH = "https://github.com/acupof-ai/arle";
-const WINS = `${GH}/blob/main/docs/experience/wins`;
+const OPD_GH = "https://github.com/acupof-ai/arle-opd";
+// Benchmark snapshots are read at the last commit that carried them.
+const SNAPSHOT = "b7d08b3d2e1b01bdf7cade251153242caecdfb92";
+const WINS = `${GH}/blob/${SNAPSHOT}/docs/experience/wins`;
 
 const SIGNALS: Signal[] = [
   { html: '<b>api</b> anthropic /v1/messages · openai v1' },
@@ -372,7 +375,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "BFCL-live abstention", value: "1.00", unit: "from 0.60" },
       { key: "python on the hot path", value: "0", unit: "processes" },
     ],
-    cmd: "arle train opd",
+    cmd: "arle-opd train opd",
     href: `${WINS}/2026-06-20-opd-multiseed-math500-lock.md`,
   },
 ];
@@ -465,7 +468,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "BFCL-live 弃答", value: "1.00", unit: "自 0.60" },
       { key: "热路径上的 python", value: "0", unit: "个进程" },
     ],
-    cmd: "arle train opd",
+    cmd: "arle-opd train opd",
     href: `${WINS}/2026-06-20-opd-multiseed-math500-lock.md`,
   },
 ];
@@ -547,7 +550,7 @@ const WHY_CELLS_EN: WhyCell[] = [
     no: "reason · 04",
     title: "Numbers are dated.",
     body:
-      `Every figure on this page resolves to a dated snapshot in <a href="${GH}/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> with the command, the environment, and the arm it beat. Speculative decode is verified bit-identical to greedy; restored prefixes are gated against cold prefill with a needle ladder.`,
+      `Every figure on this page resolves to a dated snapshot in <a href="${GH}/tree/${SNAPSHOT}/docs/experience/wins"><code>docs/experience/wins/</code></a> with the command, the environment, and the arm it beat. Speculative decode is verified bit-identical to greedy; restored prefixes are gated against cold prefill with a needle ladder.`,
   },
 ];
 
@@ -574,7 +577,7 @@ const WHY_CELLS_ZH: WhyCell[] = [
     no: "reason · 04",
     title: "数字都有日期。",
     body:
-      `这一页的每个数字都能在 <a href="${GH}/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 找到带日期的快照：命令、环境、以及它击败的那条臂。推测解码逐比特对齐 greedy；恢复的前缀用 needle 阶梯对照冷 prefill 做门控。`,
+      `这一页的每个数字都能在 <a href="${GH}/tree/${SNAPSHOT}/docs/experience/wins"><code>docs/experience/wins/</code></a> 找到带日期的快照：命令、环境、以及它击败的那条臂。推测解码逐比特对齐 greedy；恢复的前缀用 needle 阶梯对照冷 prefill 做门控。`,
   },
 ];
 
@@ -620,14 +623,14 @@ const ARCH_FOOT_EN: string[] = [
   "<b>pure leaves</b> · infer-topo · infer-moe · infer-util",
   "<b>specs</b> · qwen3 · qwen35 · deepseek",
   "<b>ffi</b> · deepep-sys · xgrammar-sys",
-  "<b>train</b> · autograd + train — OPD only; the teacher is the serving engine",
+  "<b>opd</b> · acupof-ai/arle-opd builds OPD training on these crates; the teacher is the serving engine",
 ];
 
 const ARCH_FOOT_ZH: string[] = [
   "<b>纯叶子</b> · infer-topo · infer-moe · infer-util",
   "<b>specs</b> · qwen3 · qwen35 · deepseek",
   "<b>ffi</b> · deepep-sys · xgrammar-sys",
-  "<b>train</b> · autograd + train —— 仅 OPD；teacher 就是 serving 引擎",
+  "<b>opd</b> · acupof-ai/arle-opd 基于这些 crate 做 OPD 训练；teacher 就是 serving 引擎",
 ];
 
 const BATTLE_ROWS_EN: BattleRow[] = [
@@ -642,7 +645,7 @@ const BATTLE_ROWS_EN: BattleRow[] = [
     pri: "P1 · shipped",
     title: "Batched speculative verify",
     desc: "Speculative decode is inert from c=4 until the verify step is batched; the measured top lever on the NVFP4 27B, projected −32% decode latency at c=16",
-    where: "infer-cuda · docs/experience/errors/2026-09-10-batched-mtp-acceptance-break-even.md",
+    where: "infer-cuda",
   },
   {
     pri: "P2 · active",
@@ -660,13 +663,7 @@ const BATTLE_ROWS_EN: BattleRow[] = [
     pri: "open",
     title: "Distill your agent traces",
     desc: "On-Policy Distillation from a DeepSeek-V4-Flash teacher into a 35B student on the serving engine; today the teacher runs on CUDA only",
-    where: "train · autograd",
-  },
-  {
-    pri: "open",
-    title: "Third backends: HIP / Vulkan",
-    desc: "HIP substrate and a coherent Vulkan forward (gfx1151) landed; the license is performance parity, not a boot",
-    where: "infer-hip · infer-vulkan · #71",
+    where: "acupof-ai/arle-opd",
   },
 ];
 
@@ -682,7 +679,7 @@ const BATTLE_ROWS_ZH: BattleRow[] = [
     pri: "P1 · shipped",
     title: "批量化的推测校验",
     desc: "c=4 起推测解码失效，直到 verify 步批量化；NVFP4 27B 上实测的最大杠杆，预计 c=16 解码延迟 −32%",
-    where: "infer-cuda · docs/experience/errors/2026-09-10-batched-mtp-acceptance-break-even.md",
+    where: "infer-cuda",
   },
   {
     pri: "P2 · active",
@@ -700,13 +697,7 @@ const BATTLE_ROWS_ZH: BattleRow[] = [
     pri: "open",
     title: "把你的 agent 轨迹蒸馏进小模型",
     desc: "以 DeepSeek-V4-Flash 为 teacher、在 serving 引擎上对 35B student 做 On-Policy Distillation；目前 teacher 只能跑在 CUDA 上",
-    where: "train · autograd",
-  },
-  {
-    pri: "open",
-    title: "第三后端：HIP / Vulkan",
-    desc: "HIP 基板与 coherent 的 Vulkan 前向（gfx1151）已落地；license 条件是性能 parity，不是能跑",
-    where: "infer-hip · infer-vulkan · #71",
+    where: "acupof-ai/arle-opd",
   },
 ];
 
@@ -716,12 +707,12 @@ const FILES_EN: FileRow[] = [
   { path: "/docs/support-matrix.md", desc: "backend / model / quant support", href: `${GH}/blob/main/docs/support-matrix.md` },
   { path: "/docs/baselines.md", desc: "one SOTA row per model, with its config", href: `${GH}/blob/main/docs/baselines.md` },
   { path: "/docs/codebase-map.md", desc: "canonical workspace topology", href: `${GH}/blob/main/docs/codebase-map.md` },
-  { path: "/docs/experience/wins/", desc: "dated benchmark snapshots", href: `${GH}/tree/main/docs/experience/wins` },
+  { path: "/docs/experience/wins/", desc: "dated benchmark snapshots", href: `${GH}/tree/${SNAPSHOT}/docs/experience/wins` },
   { path: "/crates/cli/", desc: "arle binary · verbs · doctor", href: `${GH}/tree/main/crates/cli` },
   { path: "/crates/infer-server/", desc: "/v1/messages · /v1/chat/completions", href: `${GH}/tree/main/crates/infer-server` },
   { path: "/crates/infer-core/", desc: "runtime spine · engine · scheduler · radix cache", href: `${GH}/tree/main/crates/infer-core` },
   { path: "/crates/infer-metal/", desc: "MLX executor · prefix snapshots · KV disk tier", href: `${GH}/tree/main/crates/infer-metal` },
-  { path: "/crates/train/", desc: "OPD loop · autograd tape · seq-chunked recompute", href: `${GH}/tree/main/crates/train` },
+  { path: "arle-opd", desc: "OPD loop · autograd tape · seq-chunked recompute", href: OPD_GH },
   { path: "/scripts/bench_multiturn_ttft.py", desc: "the per-turn TTFT measurement", href: `${GH}/blob/main/scripts/bench_multiturn_ttft.py` },
   { path: "/releases", desc: "tagged binaries · checksums", href: `${GH}/releases` },
 ];
@@ -732,12 +723,12 @@ const FILES_ZH: FileRow[] = [
   { path: "/docs/support-matrix.md", desc: "后端 / 模型 / 量化支持", href: `${GH}/blob/main/docs/support-matrix.md` },
   { path: "/docs/baselines.md", desc: "每个模型一行 SOTA 及其配置", href: `${GH}/blob/main/docs/baselines.md` },
   { path: "/docs/codebase-map.md", desc: "权威 workspace 拓扑", href: `${GH}/blob/main/docs/codebase-map.md` },
-  { path: "/docs/experience/wins/", desc: "带日期的基准快照", href: `${GH}/tree/main/docs/experience/wins` },
+  { path: "/docs/experience/wins/", desc: "带日期的基准快照", href: `${GH}/tree/${SNAPSHOT}/docs/experience/wins` },
   { path: "/crates/cli/", desc: "arle 二进制 · 子命令 · doctor", href: `${GH}/tree/main/crates/cli` },
   { path: "/crates/infer-server/", desc: "/v1/messages · /v1/chat/completions", href: `${GH}/tree/main/crates/infer-server` },
   { path: "/crates/infer-core/", desc: "运行时主干 · engine · scheduler · radix cache", href: `${GH}/tree/main/crates/infer-core` },
   { path: "/crates/infer-metal/", desc: "MLX 执行器 · 前缀快照 · KV 磁盘层", href: `${GH}/tree/main/crates/infer-metal` },
-  { path: "/crates/train/", desc: "OPD 循环 · autograd tape · seq-chunked recompute", href: `${GH}/tree/main/crates/train` },
+  { path: "arle-opd", desc: "OPD 循环 · autograd tape · seq-chunked recompute", href: OPD_GH },
   { path: "/scripts/bench_multiturn_ttft.py", desc: "每轮 TTFT 的测量脚本", href: `${GH}/blob/main/scripts/bench_multiturn_ttft.py` },
   { path: "/releases", desc: "发版二进制 · 校验和", href: `${GH}/releases` },
 ];
@@ -795,7 +786,7 @@ export const EN: Locale = {
     architecture: {
       title: "Architecture",
       caption:
-        `One runtime, three surfaces, two backends. Serving, the local agent, and OPD training run the same Rust and model code; dependencies flow strictly downward and <b>infer-core carries no backend dependency</b>. Canonical topology lives in <a href="${GH}/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>.`,
+        `One runtime, three surfaces, two backends. Serving and the local agent run the same Rust and model code, and OPD training in <a href="${OPD_GH}"><code>arle-opd</code></a> builds on the same crates; dependencies flow strictly downward and <b>infer-core carries no backend dependency</b>. Canonical topology lives in <a href="${GH}/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>.`,
       rows: ARCH_ROWS,
       foot: ARCH_FOOT_EN,
     },
@@ -808,7 +799,7 @@ export const EN: Locale = {
     bench: {
       title: "Bench",
       caption:
-        `Dated, reproducible snapshots straight from <a href="${GH}/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> and <a href="${GH}/blob/main/benchmarks/README.md"><code>benchmarks/</code></a>. Decode and prefill are reported separately; nothing is an end-to-end blend.`,
+        `Dated, reproducible snapshots straight from <a href="${GH}/tree/${SNAPSHOT}/docs/experience/wins"><code>docs/experience/wins/</code></a> and <a href="${GH}/blob/main/benchmarks/README.md"><code>benchmarks/</code></a>. Decode and prefill are reported separately; nothing is an end-to-end blend.`,
       rows: BENCH_ROWS_EN,
     },
     matrix: {
@@ -895,7 +886,7 @@ export const ZH: Locale = {
     architecture: {
       title: "架构",
       caption:
-        `一套运行时、三个表面、两个后端。serving、本地 agent、OPD 训练跑同一份 Rust 与模型代码；依赖严格向下流动，<b>infer-core 不依赖任何后端</b>。权威拓扑见 <a href="${GH}/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>。`,
+        `一套运行时、三个表面、两个后端。serving 与本地 agent 跑同一份 Rust 与模型代码，<a href="${OPD_GH}"><code>arle-opd</code></a> 的 OPD 训练基于同一组 crate；依赖严格向下流动，<b>infer-core 不依赖任何后端</b>。权威拓扑见 <a href="${GH}/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>。`,
       rows: ARCH_ROWS,
       foot: ARCH_FOOT_ZH,
     },
@@ -908,7 +899,7 @@ export const ZH: Locale = {
     bench: {
       title: "基准",
       caption:
-        `直接来自 <a href="${GH}/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 与 <a href="${GH}/blob/main/benchmarks/README.md"><code>benchmarks/</code></a> 的带日期快照。解码与 prefill 分开报告，没有端到端混合数。`,
+        `直接来自 <a href="${GH}/tree/${SNAPSHOT}/docs/experience/wins"><code>docs/experience/wins/</code></a> 与 <a href="${GH}/blob/main/benchmarks/README.md"><code>benchmarks/</code></a> 的带日期快照。解码与 prefill 分开报告，没有端到端混合数。`,
       rows: BENCH_ROWS_ZH,
     },
     matrix: {
