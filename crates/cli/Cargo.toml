@@ -10,13 +10,13 @@ publish = false
 #   --features cuda            Linux + NVIDIA
 #   --features metal,no-cuda   Apple Silicon
 default = []
-cuda = ["infer-api/cuda", "train/cuda", "autograd/cuda"]
-no-cuda = ["infer-api/no-cuda", "train/no-cuda", "autograd/no-cuda"]
+cuda = ["infer-api/cuda"]
+no-cuda = ["infer-api/no-cuda"]
 # Metal backend. infer-api is backend-neutral now; this pulls infer-metal for
 # the CLI's own metal-specific surfaces (--doctor resource planning, hardware
-# working-set) and forwards to train/autograd.
-metal = ["dep:infer-metal", "infer-metal/metal", "train/metal", "autograd/metal"]
-nccl = ["cuda", "infer-api/nccl", "train/nccl", "autograd/nccl"]
+# working-set).
+metal = ["dep:infer-metal", "infer-metal/metal"]
+nccl = ["cuda", "infer-api/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
 # Grammar-constrained decode (xgrammar real backend). Requires
 # XGRAMMAR_SOURCE_DIR at build time.
@@ -34,16 +34,11 @@ indicatif = "0.18"
 # Used only by `serve_multiproc` (cfg(all(unix, feature = "cuda"))).
 libc = "0.2"
 agent = { path = "../agent" }
-autograd = { path = "../autograd", default-features = false }
 chat = { path = "../chat" }
 infer-api = { path = "../infer-api" }
 infer-metal = { path = "../infer-metal", default-features = false, optional = true }
 infer-plan = { path = "../infer-plan" }
 infer-util = { path = "../infer-util" }
-deepseek-spec = { path = "../deepseek-spec" }
-qwen35-spec = { path = "../qwen35-spec" }
-spec-train = { path = "../spec-train" }
-train = { path = "../train", default-features = false }
 tools = { path = "../tools" }
 log = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

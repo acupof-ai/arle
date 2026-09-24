@@ -81,9 +81,7 @@ time. They are diagnostic, not ordering.
 
 ## The OPD offload UAF (open)
 
-The root-cause doc
-(`errors/2026-08-14-opd-engine-offload-starves-autograd-forward.md`) describes
-a separate class of problem: `--engine-offload student` re-profiles the KV
+This is a separate class of problem: `--engine-offload student` re-profiles the KV
 pool on reload, ratcheting it up until the co-resident autograd allocator is
 starved. The fix is not a sync change — it is to cap the pool re-profile at
 the original grant (or carry the token count through offload/reload).

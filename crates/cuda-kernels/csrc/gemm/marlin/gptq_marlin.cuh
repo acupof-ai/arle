@@ -437,8 +437,7 @@ template <typename scalar_t>
 // was suspected here and is NOT established: pinning to 1 completed the workload
 // but hit zero of the partial-prefix-restore requests that precede every observed
 // crash, so that arm never engaged. Pinning costs 29-42% of decode throughput,
-// which is not a price to pay on an untested hypothesis. See
-// docs/experience/errors/2026-08-19-blocks-per-sm-search-two-latent-bugs.md.
+// which is not a price to pay on an untested hypothesis.
 #ifndef MARLIN_MAX_BLOCKS_PER_SM
   #define MARLIN_MAX_BLOCKS_PER_SM 5
 #endif

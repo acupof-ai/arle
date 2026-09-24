@@ -16,8 +16,7 @@
 | 组件 | 职责 |
 | --- | --- |
 | `crates/infer-*`（plan/seam/core/cuda/metal/server/api/topo/moe/util） | serving/runtime 真相：device-neutral IR、host-only seam、Engine/scheduler、backend executor、HTTP、模型 |
-| `arle`（`src/main.rs` → `crates/cli`） | 本地 CLI 入口：agent REPL、`arle serve`、`train opd` |
-| `train` | OPD 训练延伸（2026-05-18 pivot 后**仅 OPD**；pretrain/SFT/GRPO 已删除） |
+| `arle`（`src/main.rs` → `crates/cli`） | 本地 CLI 入口：agent REPL、`arle serve`、`arle model download` |
 
 统一契约：`infer-api`（`crates/infer-api/src/serve_engine.rs`、`LoadedInferenceEngine`），HTTP 与 agent CLI 共用；后端通过 `infer-seam` 的 `BackendExecutor` + `KvPool` 插入同一个 `infer-core` Engine。
 
@@ -75,14 +74,6 @@ infer-api → infer-core (Engine/scheduler) → infer-seam (BackendExecutor) →
 
 关键文件：`crates/infer-cuda/src/executor.rs`、`crates/infer-cuda/src/loader.rs`、`crates/infer-cuda/src/qwen35.rs`
 
-### OPD 训练
-
-```text
-crates/cli/src/train_cli.rs → train::opd → autograd
-```
-
-关键文件：`crates/cli/src/train_cli.rs`、`crates/train/src/opd.rs`（OPD step 逻辑）
-
 ---
 
 ## 4. Cargo Feature 决策表
@@ -116,42 +107,28 @@ crates/cli/src/train_cli.rs → train::opd → autograd
 | Metal backend | `crates/infer-metal/src/executor.rs`、`qwen35.rs`、`kv_pool.rs` | `infer-metal` |
 | 模型 forward | `crates/infer-cuda/src/qwen35.rs`（CUDA）、`crates/infer-metal/src/qwen35.rs`（Metal） | `infer-cuda` / `infer-metal` |
 | Agent 对话循环 | `crates/agent/src/lib.rs` | `agent` |
-| OPD 训练 | `crates/train/src/opd.rs` | [`crates/autograd/AGENTS.md`](../crates/autograd/AGENTS.md) |
 
 ---
 
 ## 6. 改动验证清单（Change Impact Map）
 
-Runtime 改动**必须**有 bench wins/errors 条目（[`AGENTS.md`](../AGENTS.md) §Benchmarks）。下表是 minimum verification：
+性能结论需在 PR 描述里附 matched A/B（[`AGENTS.md`](../AGENTS.md) §Hard gates）。下表是 minimum verification：
 
 | 改动目录 | 最低验证 | 额外（优化/架构级） |
 | --- | --- | --- |
 | `crates/cuda-kernels/csrc/` | `cargo test --release -p infer-cuda --features cuda` | `scripts/bench_throughput.py` + nsys |
 | `crates/infer-core/`（Engine/调度） | `cargo test --release -p infer-core` | native fixed-concurrency benchmark |
 | `crates/infer-cuda/`（model/qwen35） | `cargo test --release -p infer-cuda --features cuda` | native fixed-concurrency benchmark |
-| KV quant / dtype | Seam-level `--kv-cache-dtype` dispatch (BF16 default; INT8/FP8 LICENSED correctness-gated, opt-in, **Qwen3.5/3.6 family only** — DSv4 rejects it). See [wins #68](experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md) | native benchmark + needle gate |
+| KV quant / dtype | Seam-level `--kv-cache-dtype` dispatch (BF16 default; INT8/FP8 LICENSED correctness-gated, opt-in, **Qwen3.5/3.6 family only** — DSv4 rejects it) | native benchmark + needle gate |
 | `crates/infer-metal/` | `cargo test --release -p infer-metal --no-default-features --features metal,no-cuda` | Metal Qwen3.6 bench（见 AGENTS.md §Metal canonical model） |
 | `crates/agent/`、`crates/cli/` | `cargo test --release -p agent -p cli -p chat` | — |
-| `crates/train/` OPD | `cargo test --release -p train` | OPD smoke on CUDA GPU |
-| 文档 only | — | 无需 bench；commit body 注明 `docs-only` |
+| 文档 only | — | 无需 bench |
 
 Canonical bench 流程：[`bench-and-trace-spec.md`](bench-and-trace-spec.md) + `scripts/bench_throughput.py`。
 
 ---
 
-## 7. 不要先读什么
-
-以下对新人默认**不是**入门材料（维护者/agent 用）：
-
-| 目录 | 数量级 | 说明 |
-| --- | --- | --- |
-| `docs/experience/wins/` | ~390+ | 历史 bench 记录；按日期/标签检索，不要通读 |
-
-需要历史 context 时，从 canonical doc 里的链接跳转，而非从 wins 目录随机读。
-
----
-
-## 8. 下一步深入
+## 7. 下一步深入
 
 | 主题 | Canonical doc |
 | --- | --- |

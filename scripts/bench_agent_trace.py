@@ -19,7 +19,7 @@ Usage:
   python3 scripts/bench_agent_trace.py \\
       --server http://localhost:30000 \\
       --label sglang-main \\
-      --out docs/experience/wins/2026-04-13-bench-agent-trace.json
+      --out bench-output/agent-trace.json
 
   # Higher concurrency (drives more cross-session contention):
   python3 scripts/bench_agent_trace.py --num-concurrent 8

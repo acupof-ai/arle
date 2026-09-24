@@ -9,9 +9,7 @@ use crate::tensor::DeviceContext;
 /// Strided-input pack variant — accepts raw u64 NoPE/RoPE pointers plus an
 /// explicit element stride per axis. Phase D-4 runtime hooks feed this
 /// from `k_prepared` (interleaved [NoPE 448 | RoPE 64] bf16, head_dim=512
-/// stride) without an intermediate deinterleave; see
-/// `docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md`
-/// Finding 1.
+/// stride) without an intermediate deinterleave.
 ///
 /// `stride_nope_elems` / `stride_rope_elems` are per-token bf16 element
 /// strides. Must be ≥ 448 / 64 respectively. For `k_prepared`-shaped

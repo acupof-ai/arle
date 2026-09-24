@@ -3,7 +3,7 @@
 # Targets mirror the CI matrix (.github/workflows/{ci,metal-ci}.yml).
 #
 # Usage:
-#   make hygiene                  # public docs/templates/link guardrails
+#   make                  # public docs/templates/link guardrails
 #   make build-metal              # macOS / Apple Silicon → target/release/arle
 #   make check-metal              # CI-mirrored Metal checks (infer-api lib + CLI surface)
 #   make test-metal               # CI-mirrored Metal tests (cli crate + smoke)
@@ -21,11 +21,8 @@
 
 METAL_MODEL ?= mlx-community/Qwen3.6-35B-A3B-4bit
 
-.PHONY: hygiene build-metal check-metal test-metal bench-metal build-cuda check-cuda kernels-sync test test-py pre-push install-hooks web-install web-dev web-build web-check web-clean
+.PHONY: build-metal check-metal test-metal bench-metal build-cuda check-cuda kernels-sync test test-py web-install web-dev web-build web-check web-clean
 
-hygiene:
-	python3 scripts/check_repo_hygiene.py
-	python3 scripts/check_repo_hygiene.py --selftest
 
 # ── Metal (macOS / Apple Silicon) ────────────────────────────────────────────
 build-metal:
@@ -76,12 +73,7 @@ test:
 test-py:
 	pytest tests/python/ -x
 
-pre-push:
-	./scripts/pre_push_checks.sh
 
-install-hooks:
-	git config core.hooksPath .githooks
-	@echo "[install-hooks] configured core.hooksPath=.githooks"
 
 # ── Web frontend (web/ — Astro 5 + Vite + bun) ───────────────────────────────
 # Drives the public landing at https://cklxx.github.io/arle/. Requires bun on

@@ -6,7 +6,7 @@
 #
 # The keep/remove call for fp4-gemv: it has had no production caller since
 # dispatch convergence, and this A/B decides whether the GEMV beats the
-# tensor-core GEMM at M=1 (errors/2026-09-09-w4afp8-gemv-killed-item-dsv4-moe-only).
+# tensor-core GEMM at M=1.
 set -euo pipefail
 BUILD="${1:?usage: kernel_ab_fp4.sh <build-label> [run-label] [auto|GPU] [shape] [iters]}"
 LABEL="${2:-bench-kab-$(date -u +%Y%m%dT%H%M%SZ)}"

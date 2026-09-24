@@ -94,7 +94,7 @@ batch it → ~2×" (the batched path now lives in
 
 ---
 
-## Recurring lessons (each distilled from ≥3 experience entries)
+## Recurring lessons
 
 - **SLO verdict from the SLO workload, not a smoke shape** — a c=1 short-prompt
   nsys "2× win" routinely flips on production prompt length. The workload is the

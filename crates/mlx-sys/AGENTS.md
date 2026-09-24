@@ -49,9 +49,9 @@ lists — there is no glob.
    throw must catch and set it. Rust callers must check for null return
    and read `mlx_last_error()` immediately afterwards.
 5. **Single source of truth for the Metal bridge.** Only Metal-facing runtime
-   code should consume this crate directly: `infer-metal` and `autograd`'s
-   Metal backend. Nothing else (no scheduler, no model registry,
-   no generic train logic) should link `mlx-sys` directly. If you find
+   code should consume this crate directly: `infer-metal`, plus downstream
+   Metal backends such as the one in `arle-opd`. Nothing else (no scheduler,
+   no model registry) should link `mlx-sys` directly. If you find
    yourself wiring mlx-sys into a non-Metal module, you're recreating the
    bridge. Callers that serialize MLX access must use `mlx_sys::mlx_guard()`
    so process-global MLX state has one Rust synchronization boundary.
@@ -170,19 +170,18 @@ same-config-twice floor), not byte-identity to a reference run.
 
 - **mlx.metallib must be colocated with the binary on every macOS distribution path.** build.rs,
   package script, install.sh, brew formula — all must ship `mlx.metallib` next to the binary
-  or runtime fails to load the Metal shaders
-  (`feedback_mlx_metallib_must_be_colocated.md`).
+  or runtime fails to load the Metal shaders.
 - **`mx::compile` needs cache-as-input for position-dependent graphs.** `item()` bakes scalars
   into the compiled graph; runtime `cache_pos` must enter as an active-prefix input tensor,
   not as `(cache, position)` separately — else compile re-runs every step.
 - **`mx::async_eval` encodes on the *caller* thread.** No worker thread will steal the encode
   work — falsified multi-stream encode pipelining (5–13% Qwen3.6 regression). Don't propose
-  encode-side pipelining (`feedback_mlx_async_eval_is_caller_thread.md`).
+  encode-side pipelining.
 - **Adding a second C++ translation unit requires `cc::Build::new().file(...)` in `build.rs`
   AND `cargo:rerun-if-changed`.** There is no glob — silently-missing files compile-skip then
   link-error opaquely.
 - **Use `mlx_sys::mlx_guard()` for any cross-crate MLX serialization.** MLX state is
-  process-global; autograd's Metal backend and `infer-metal` must share one Rust
+  process-global; every Metal consumer, including `infer-metal`, must share one Rust
   synchronization boundary, not local mutexes.
 
 ## Pointers

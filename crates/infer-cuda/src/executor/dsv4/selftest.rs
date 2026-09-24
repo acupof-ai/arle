@@ -101,7 +101,7 @@ impl Dsv4CudaExecutor {
 
         // No col1/bonus gate here: col1 on a forced-wrong draft is discarded in
         // real decode, and comparing it is confounded by the M=2-vs-M=1 FP8
-        // kernel path. See errors/2026-06-08-dsv4-batched-verify-col1-wrong.md.
+        // kernel path.
 
         self.kv_adapter.flashmla_free_slot(slot_idx)?;
         self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;

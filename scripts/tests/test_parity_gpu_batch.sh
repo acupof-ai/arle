@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mock-binary test for scripts/parity_gpu_batch.sh: a clean world exits 0 with
 # a TSV+markdown report; a positive FAIL and a --negative-control run that
-# does not trip both force exit 1. No cargo, GPU, or prereg ledger involved.
+# does not trip both force exit 1. No cargo, GPU involved.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -45,7 +45,7 @@ run_batch() {  # $1 = gate list, $2 = out dir; extra env via HOST_UNITS_RC
     ARLE_PARITY_GATE_LIST="$1" \
     ARLE_PARITY_GPU=7 \
     ARLE_PARITY_NO_NEG_ALLOWLIST="gate_d" \
-    ARLE_PARITY_SKIP_PREREG=1 \
+    \
     ARLE_PARITY_HOST_UNITS_CMD="${ARLE_PARITY_HOST_UNITS_CMD:-true}" \
     ARLE_PARITY_DEVICE_UNITS_CMD="${ARLE_PARITY_DEVICE_UNITS_CMD:-true}" \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$2"
@@ -96,7 +96,7 @@ run_model_batch() {  # $1 gate list, $2 out dir
     ARLE_PARITY_BIN_DIR="$BIN" \
     ARLE_PARITY_GATE_LIST="$1" \
     ARLE_PARITY_GPU=7 \
-    ARLE_PARITY_SKIP_PREREG=1 \
+    \
     ARLE_PARITY_HOST_UNITS_CMD=true \
     ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$2"
@@ -142,7 +142,7 @@ grep -q 'FAIL: rank0 first token 99999 != 11111' "$OUT_MF/logs/dsv4_parity.posit
 make_mock gate_noneg plain
 OUT_NN="$TMP/out-noneg"
 if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_noneg" ARLE_PARITY_GPU=7 \
-    ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_HOST_UNITS_CMD=true \
     ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_NN" >"$TMP/noneg.log" 2>&1; then
     echo "FAIL: non-allowlisted gate without negative mode exited 0" >&2; cat "$TMP/noneg.log" >&2; exit 1
@@ -155,7 +155,7 @@ grep -qE $'^gate_noneg\tno\trequired\t0\t.*\t2\t' "$OUT_NN/results.tsv" \
 # Same gate allowlisted: negative column n/a, run green.
 OUT_AL="$TMP/out-allowlist"
 ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_noneg" ARLE_PARITY_GPU=7 \
-    ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_NO_NEG_ALLOWLIST="gate_noneg" \
+    ARLE_PARITY_NO_NEG_ALLOWLIST="gate_noneg" \
     ARLE_PARITY_HOST_UNITS_CMD=true \
     ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_AL" >"$TMP/allow.log" 2>&1 \
@@ -176,7 +176,7 @@ SH
 chmod +x "$BIN/gate_skip"
 OUT_SK="$TMP/out-skip"
 if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_skip" ARLE_PARITY_GPU=7 \
-    ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_HOST_UNITS_CMD=true \
     ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_SK" >"$TMP/skip.log" 2>&1; then
     :
@@ -236,7 +236,7 @@ rows_bad="$(($(wc -l <"$OUT2/results.tsv") - 1))"
 # ── Host-unit failure aborts before any GPU gate runs ──
 OUT_HU="$TMP/out-hu"
 if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_a" ARLE_PARITY_GPU=7 \
-    ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_HOST_UNITS_CMD='echo host fail; exit 1' \
+    ARLE_PARITY_HOST_UNITS_CMD='echo host fail; exit 1' \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_HU" >"$TMP/hu.log" 2>&1; then
     echo "FAIL: host-unit failure exited 0" >&2; cat "$TMP/hu.log" >&2; exit 1
 fi
@@ -250,7 +250,7 @@ grep -q 'host fail' "$OUT_HU/host-units.log" \
 # ── Device-unit failure aborts after the GPU claim, before parity gates ──
 OUT_DU="$TMP/out-du"
 if ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_a" ARLE_PARITY_GPU=7 \
-    ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_HOST_UNITS_CMD=true \
+    ARLE_PARITY_HOST_UNITS_CMD=true \
     ARLE_PARITY_DEVICE_UNITS_CMD='echo device fail; exit 1' \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT_DU" >"$TMP/du.log" 2>&1; then
     echo "FAIL: device-unit failure exited 0" >&2; cat "$TMP/du.log" >&2; exit 1
@@ -279,7 +279,7 @@ SH
 chmod +x "$BIN/gate_big"
 OUT3="$TMP/out-cap"
 ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GATE_LIST="gate_big" ARLE_PARITY_GPU=7 \
-    ARLE_PARITY_SKIP_PREREG=1 ARLE_PARITY_LOG_CAP_BYTES=65536 \
+    ARLE_PARITY_LOG_CAP_BYTES=65536 \
     ARLE_PARITY_HOST_UNITS_CMD=true \
     ARLE_PARITY_DEVICE_UNITS_CMD=true \
     bash "$ROOT/scripts/parity_gpu_batch.sh" "$OUT3" >/dev/null 2>&1 \
@@ -309,7 +309,7 @@ make_mock gate_present pass
 make_mock gate_absent pass
 
 run_fake() {  # $1 = out dir
-    ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GPU=7 ARLE_PARITY_SKIP_PREREG=1 \
+    ARLE_PARITY_BIN_DIR="$BIN" ARLE_PARITY_GPU=7 \
         ARLE_PARITY_HOST_UNITS_CMD=true ARLE_PARITY_DEVICE_UNITS_CMD=true \
         bash "$FAKE/scripts/parity_gpu_batch.sh" "$1"
 }

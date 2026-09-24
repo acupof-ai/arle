@@ -14,7 +14,6 @@
 // are caller-owned device buffers; this shim does no allocations.
 //
 // Refs:
-//   docs/experience/errors/2026-05-27-dsv4-grouped-gemm-marginal-prefill-kernel-not-blocker.md
 //   vendor/flashmla/csrc/sm90/prefill/sparse/fwd.cu
 
 #include <cuda_runtime.h>

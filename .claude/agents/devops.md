@@ -60,13 +60,10 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
   has corrupted the toolchain mid-install. Kill by exact PID, or bracket the pattern (`[c]argo`).
 - **Kill only your own processes.** GPU 0/2/5 + foreign PIDs (cmdline unreadable from our
   namespace) are other users' — leave them.
-- An OPD run touches BOTH the autograd backend (cudarc device 0, ignores INFER_CUDA_DEVICE)
-  AND the infer engine. pod.sh `run` already pins via `CUDA_VISIBLE_DEVICES` so both land
-  on the chosen GPU — preserve that if you hand-roll a run.
 - To wait on a long build/run: launch a background poller (`run_in_background` Bash) that
   greps the log for the exit marker and exits — it re-invokes you. Don't foreground-sleep.
 
-## Pitfalls (learned 2026-07-24)
+## Pitfalls
 - Pushed scripts land non-executable — `bash x.sh`, never `./x.sh`.
 - Absolute paths only inside a pod exec (`cd X && nohup … &` doesn't move later
   commands); verify a launch from a FRESH pod call — the launching one can hang.

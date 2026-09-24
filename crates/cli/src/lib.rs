@@ -12,6 +12,7 @@ mod hardware;
 mod hf_search;
 mod hub_discovery;
 mod model_catalog;
+mod model_cli;
 mod model_picker;
 mod modelscope;
 mod ocr;
@@ -20,14 +21,9 @@ mod runtime_report;
 mod serve;
 #[cfg(all(unix, feature = "cuda"))]
 mod serve_multiproc;
-#[cfg(feature = "cuda")]
-mod spec_train_target;
 mod startup;
 mod tps;
 mod trace;
-mod train_cli;
-#[cfg(all(unix, feature = "cuda"))]
-mod train_multiproc;
 mod welcome;
 
 use std::process::ExitCode;
@@ -39,16 +35,6 @@ use clap::Parser;
 use infer_api::{InferenceEngine, LoadedInferenceEngine};
 
 pub fn run() -> ExitCode {
-    // Pre-CUDA sandbox-spawner helper entry. When `ARLE_SPAWNER_LISTEN` is set
-    // (only by `SpawnerHandle::launch`, which re-exec's THIS binary before any
-    // CUDA/thread init), this process is the non-CUDA spawn helper: run the
-    // request/response loop and exit. MUST be the very first thing in `run` —
-    // before the logger, clap, or any thread spawns — so the helper stays a plain
-    // single-threaded non-CUDA process that ELKEID never SIGABRTs on `fork()`.
-    if std::env::var(train::spawner::LISTEN_ENV).is_ok() {
-        return ExitCode::from(train::spawner::serve_loop() as u8);
-    }
-
     // DSv4 multiproc-serve worker entry. When ARLE_WORKER_RANK>0 is set (by the
     // serve coordinator before spawning this process), this process is a worker
     // rank: short-circuit BEFORE clap parsing — it joins the NCCL group as its
@@ -63,8 +49,8 @@ pub fn run() -> ExitCode {
         return code;
     }
 
-    // Install the logger before any subcommand dispatch. `serve`, `train`,
-    // and `model` early-return from the match below and never reach `run_impl`'s
+    // Install the logger before any subcommand dispatch. `serve` and `model`
+    // early-return from the match below and never reach `run_impl`'s
     // init, so without this they would run with NO logger — every `log::error!`
     // in the serve/engine path (e.g. an engine-thread `step()` failure) became a
     // silent no-op, masking real failures. RUST_LOG overrides. Serve defaults
@@ -73,21 +59,12 @@ pub fn run() -> ExitCode {
     // multiproc coordinator was silently dropping it at `warn`.
     // Pre-clap sniff — this must run before `Args::parse` (workers/subcommands
     // early-return) and `init` is call_once, so parse-then-init is not an option.
-    // Mesh worker's prefixed logger must beat the call_once init below, which
-    // would otherwise win and drop the rank prefix.
-    #[cfg(all(unix, feature = "cuda"))]
-    let mesh_worker_logged = train_multiproc::install_mesh_worker_logger();
-    #[cfg(not(all(unix, feature = "cuda")))]
-    let mesh_worker_logged = false;
-
     let level = if std::env::args().any(|arg| arg == "serve") {
         "info"
     } else {
         "warn"
     };
-    if !mesh_worker_logged {
-        infer_util::logging::init_stderr(level);
-    }
+    infer_util::logging::init_stderr(level);
 
     let mut args = Args::parse();
     if args.kernel_build_id {
@@ -103,8 +80,7 @@ pub fn run() -> ExitCode {
     };
 
     match command {
-        Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
-        Some(CliCommand::Model(command)) => return train_cli::run_model(*command),
+        Some(CliCommand::Model(command)) => return model_cli::run_model(*command),
         Some(CliCommand::Serve(command)) => return serve::run_serve(&args, *command),
         Some(CliCommand::Ocr(ocr_args)) => match ocr::run(&ocr_args) {
             Ok(()) => return ExitCode::SUCCESS,

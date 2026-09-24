@@ -14,7 +14,7 @@
 #       measurement, does not invent one.
 #
 # Both SHAs are built --release (a bench-labelled pod-remote-run requires a
-# release build receipt) in detached git worktrees. A prereg row is opened and
+# release build receipt) in detached git worktrees.
 # closed per arm. Writes results.tsv / results.md. Exits non-zero on any
 # correctness failure: needle/lever, launch-TP mismatch, and the GDR path. In
 # the default run the TREATMENT must show linear/gdr_fq>0 — the routing change
@@ -45,7 +45,6 @@
 #   ARLE_DSV_LEVER      replacement lever_gate.sh
 #   ARLE_DSV_TOOLS_DIR  dir with needle_gate.py/bench_throughput.py/
 #                       bench_dspark_accept.py
-#   ARLE_DSV_SKIP_PREREG=1
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -73,7 +72,7 @@ if [ -z "$LONG_PROMPTS_JSONL" ]; then
     fi
 fi
 
-if [ "${ARLE_DSV_SKIP_PREREG:-0}" != 1 ]; then
+if [ "${ARLE_DSV_SELFTEST:-0}" != 1 ]; then
     : "${MODEL:?MODEL (trunk checkpoint dir) required}"
     : "${DRAFT_MODEL:?DRAFT_MODEL (DSpark draft head dir) required}"
 fi
@@ -85,21 +84,6 @@ EXTRA=( ${EXTRA_SERVE_FLAGS:-} )
 # the measured serves.
 GDR_FLAG=()
 case "${GDR_CHUNKED:-}" in 0|false|no) GDR_FLAG=(--qwen35-gdr-chunked false) ;; esac
-
-NAME="dspark-flashqla-verify-$(date +%Y%m%d%H%M%S)"
-prereg() {  # $1 = start|close $2 = arm [rest = done fields]
-    [ "${ARLE_DSV_SKIP_PREREG:-0}" = 1 ] && return 0
-    if [ "$1" = start ]; then
-        python3 "$ROOT/scripts/prereg.py" start \
-            --name "$NAME-$2" \
-            --cmd "scripts/dspark_flashqla_verify.sh $BASE_SHA $TREAT_SHA $OUT" \
-            --hypothesis "FlashQLA/DSpark treatment ($TREAT_SHA) stays inside the base needle envelope at attn_tp 1/2/4/8; TTFT/prefill and c=1/c=8 acceptance recorded" \
-            >/dev/null
-    else
-        # shellcheck disable=SC1010  # "done" is the literal prereg.py subcommand
-        python3 "$ROOT/scripts/prereg.py" done --name "$NAME-$2" "${@:3}" >/dev/null || true
-    fi
-}
 
 # ── Materialize + release-build each arm ───────────────────────────────────
 TREES="$OUT/trees"
@@ -352,7 +336,6 @@ PY
 }
 
 CORRECT_FAIL=0
-prereg start base; prereg start treatment
 for tp in $TPS; do
     [ "$tp" -le "${#FREE_IDX[@]}" ] || { echo "[verify] attn_tp=$tp needs $tp free GPUs, have ${#FREE_IDX[@]} — SKIP" >&2
         row base "$tp" all "-" SKIP "insufficient free GPUs"; continue; }
@@ -390,12 +373,8 @@ done
 } >"$MD"
 
 if [ "$CORRECT_FAIL" -eq 0 ]; then
-    prereg close base --status ok --result "see $TSV" --finding "needle/lever green at every runnable attn_tp" --decision "correctness holds; read TTFT/acceptance deltas in results.md"
-    prereg close treatment --status ok --result "see $TSV" --finding "treatment inside the base envelope" --decision "GPU runtime verification passed"
     echo "[verify] correctness PASS — $TSV $MD"
     exit 0
 fi
-prereg close base --status ok --result "see $TSV" --finding "base arm completed" --decision "compare against failing treatment"
-prereg close treatment --status rejected --result "needle FAIL in $TSV" --finding "treatment outside the base needle envelope" --decision "do not ship"
 echo "[verify] correctness FAIL — $TSV" >&2
 exit 1

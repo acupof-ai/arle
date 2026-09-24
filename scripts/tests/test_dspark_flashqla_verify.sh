@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mock-driven control-flow test for scripts/dspark_flashqla_verify.sh.
-# No git, cargo, GPU, prereg ledger, or real serve: binaries and python tools
+# No git, cargo, GPU, or real serve: binaries and python tools
 # are replaced with mocks through the script's test seams. A clean world exits
 # 0 with a TSV+MD report; a failing lever forces exit 1.
 #
@@ -137,7 +137,7 @@ common_env() {  # $1 = lever script
     ARLE_DSV_BIN_TREAT="$TMP/bin/arle" \
     ARLE_DSV_TPS="1" ARLE_DSV_FREE_GPUS="0" ARLE_DSV_NO_CLAIM=1 \
     ARLE_DSV_LEVER="$1" ARLE_DSV_TOOLS_DIR="$TMP/tools" \
-    ARLE_DSV_SKIP_PREREG=1 BENCH_SECONDS=1 ACCEPT_REQUESTS=1 \
+    ARLE_DSV_SELFTEST=1 BENCH_SECONDS=1 ACCEPT_REQUESTS=1 \
     MODEL="$TMP/model" DRAFT_MODEL="$TMP/draft"
 }
 

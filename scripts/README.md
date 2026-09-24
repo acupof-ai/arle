@@ -23,6 +23,7 @@ directory unless noted.
 | `run_fp8_probe.sh` | Run the FP8 component probe; when a producer manifest is supplied, require its build ID to match the binary-embedded `KERNEL_BUILD_ID`. |
 | `operator_e2e_artifact.py` | Wrap a `needle_gate.py` log into the `arle.operator-e2e/v1` artifact `run_fp8_probe.sh` consumes (identity = kernel bundle id). |
 | `reduce_operator_evidence.py` | Reduce qualified probe runs into the generated dispatch policy (`--check` validates without writing). |
+| `gen_36_warm_prefix_mix.py` | Generate warm prefix mix for eval. |
 
 ## Model Conversion
 
@@ -77,29 +78,6 @@ directory unless noted.
 | `score_rubric_eval.py` | Rubric-based evaluation scoring. |
 | `analyze_multi_seed.py` | Multi-seed eval analysis with mean±σ and Wilson CI. |
 | `probe_report.py` | Probe logit-lens report generator. |
-
-## OPD Training
-
-| Script | Purpose |
-|---|---|
-| `agent_opd_curve.sh` | Agentic OPD capability curve runner. |
-| `opd_capability_curve.py` | OPD capability curve generator. |
-| `opd_security_filter.py` | OPD rollout security content filter. |
-| `h20_teacher_student_opd_curve.sh` | H20 teacher-student OPD curve. |
-| `clean_opd_corpora.py` | Clean and deduplicate OPD training corpora. |
-| `fetch_opd_corpora.py` | Fetch OPD training corpora. |
-| `filter_inband.py` | Filter in-band calibrated task pool. |
-| `gen_36_warm_prefix_mix.py` | Generate warm prefix mix for eval. |
-| `gen_agent_opd_tasks.py` | Generate agent OPD training tasks. |
-| `gen_terminal_tasks.py` | Generate Terminal-Bench tasks. |
-| `stage_opd_run_corpus.py` | Stage OPD run corpus. |
-| `stage_swe_pro.py` | Stage SWE-Pro eval. |
-| `tbench_calibrate.sh` | Terminal-Bench calibration. |
-| `tbench_full.sh` | Terminal-Bench full run. |
-| `tbench_opd_loop.sh` | Terminal-Bench OPD loop. |
-| `tb_exclude_security.sh` | Terminal-Bench security exclusion. |
-| `terminus_to_records.py` | Convert Terminus output to records. |
-| `train_and_chat.sh` | Quick train+chat smoke test. |
 
 ## Build & Deploy
 
@@ -158,12 +136,7 @@ GPU gate manually per target and hand `qualify-publish` the aggregated fragments
 | `validate_release.sh` | Fail-closed tag/product/blocker/kernel-evidence release validator. |
 | `ci-fmt-check-changed.sh` | CI rustfmt check on changed files. |
 | `ci-patch-tvm-ffi.sh` | CI TVM FFI patch. |
-| `pre_push_checks.sh` | Pre-push validation checks. |
-| `check_repo_hygiene.py` | Repo hygiene checker (wins cap, frozen archive seal, etc.). `--selftest` runs every git-backed check against a broken copy of its real artifact and fails if the check passes there. |
-| `agenda.py` | Goal / task ledger: `task add --exit` names the measurable event that closes it; `report` renders goals, tasks and their prereg runs as one page. |
-| `prereg.py` | Pre-registration ledger: `start` writes the hypothesis before the run, `done` closes it with result / finding / decision. A row left running past 24h fails hygiene. |
 | `clean_repo.py` | Sweep untracked build/run residue; dry-run by default, `--apply` to delete. |
-| `archive_experience.py` | Seal wins/errors entries into the frozen archive with link repair and manifest update. |
 | `pick-gpu.sh` | GPU selection helper. |
 | `start_agent.sh` | Start local agent. |
 | `v100_qwen35_9b_load_smoke.sh` | V100 Qwen3.5-9B load smoke test. |

@@ -1,6 +1,6 @@
 # Speculative decoding is a correctness-preserving transform
 
-Design note 2 of 5 ([plan](../plans/2026-09-02-design-theses.md)). Metal and
+Design note 2 of 5. Metal and
 CUDA, Qwen3.5 / Qwen3.6. Date: 2026-09-09.
 
 ## Problem
@@ -62,8 +62,7 @@ is seeded on first sight of the restored prompt
 first-block draft context costs acceptance, never correctness.
 
 **The regime is a measured boundary, not a default.** On H20, DSpark measured
-2.24× at c=1 and −39% at c=16 against the same engine's plain decode
-([errors 2026-07-26](../experience/errors/2026-07-26-dspark-spec-decode-serializes-and-loses-above-c1.md)):
+2.24× at c=1 and −39% at c=16 against the same engine's plain decode:
 draft generation ran per request, so concurrency added latency without adding
 throughput. The lever that finding named — batched draft generation across
 slots — landed at [`dspark.rs:174`](../../crates/infer-cuda/src/qwen35/dspark.rs),
@@ -73,8 +72,7 @@ falls to plain decode above `--spec-max-batch`
 KV-format gate is a statement about the verify kernel, not the draft: lifting
 the BF16-only gate to run batched DSpark over quantized KV lost from c=8 and
 was rejected twice on measurement, so the gate stays
-([`qwen35.rs:2493`](../../crates/infer-cuda/src/executor/qwen35.rs),
-[errors 2026-08-22](../experience/errors/2026-08-22-batched-dspark-quant-kv-verify-loses.md)).
+([`qwen35.rs:2493`](../../crates/infer-cuda/src/executor/qwen35.rs)).
 
 ## The failure
 
@@ -90,8 +88,7 @@ measure the feature against *not using it* at the target operating point.
 ## The number
 
 Metal, M4 Pro, `mlx-community/Qwen3.6-27B-MTP-4bit` head, depth 3, temp 0,
-same-session A/B
-([wins 2026-06-21](../experience/wins/2026-06-21-metal-qwen36-mtp-spec-decode.md)):
+same-session A/B:
 
 | Config | decode tok/s |
 |---|---:|
@@ -100,8 +97,7 @@ same-session A/B
 
 The 15.2 tok/s bandwidth ceiling breaks because the weights are read once per
 three emitted tokens. Acceptance 68.8% (2.375 of 3 per block). H20, DSpark
-block drafter, c=1
-([wins 2026-07-11](../experience/wins/2026-07-11-dspark-p1-license-qwen36-27b.md)):
+block drafter, c=1:
 2.39–3.14× (45.8 → 109.5 tok/s at ~50-token context; 32.1 → 100.9 at ~3K).
 The boundary: net loss from roughly c≥4, −39% at c=16; batched over quantized
 KV, −10% to −19% at c≥8. Correctness gate: `scripts/spec_parity.py` — N
@@ -112,23 +108,19 @@ Metal pairing (Qwen3.5-0.8B + r3lax DSpark): 7 of 8 prompts diverged, first
 divergence at token 13-50. That is the gate working — it caught a real DSpark
 Metal parity drift, still open: the target's batched verify forward and
 per-token decode forward produce different logits for the same prefix (the
-leading candidate is the GDR recurrent state; cause not fully confirmed)
-([errors 2026-09-09](../experience/errors/2026-09-09-dspark-draft-metal-parity-drift.md)).
+leading candidate is the GDR recurrent state; cause not fully confirmed).
 No Metal draft pairing has passed zero-mismatch; the gate is the admission
 test a pairing must pass before it is used in a benchmark or a default.
 
 The gain region has a second boundary, independent of concurrency: drafter and
 target mismatch. On Qwen3.8-27B-NVFP4, same card, both without speculation,
 tileRL decodes 92.4 tok/s against our 84.5
-([baselines](../baselines.md); tileRL
-`docs/experience/wins/2026-08-28-decode-split-by-occupancy.md`). We cannot run
+([baselines](../baselines.md)). We cannot run
 speculation on that checkpoint at all: DSpark draft acceptance is 13% at c=1
 and 0% at c=8
-([roadmap Goal 1](../plans/2026-08-24-roadmap.md), item 2; suspected mRoPE
-mismatch, untested). The comparison case is tileRL's own spec suite on the
+(suspected mRoPE mismatch, untested). The comparison case is tileRL's own spec suite on the
 same model — net loss at every measurement point, 0.58× at B=1 depth 2 and
-0.76× at its best, B=8 depth 4
-(`tileRL/docs/experience/wins/2026-08-29-spec-decode-net-win.md`). A drafter
+0.76× at its best, B=8 depth 4. A drafter
 the target does not agree with makes the verify step pure overhead; the regime
 ends there regardless of idle compute.
 
@@ -137,8 +129,6 @@ ends there regardless of idle compute.
 Publish the c-sweep in the same table as the c=1 license, from the start. The
 2.24× was real and the feature ships at c=1, but the missing concurrency axis
 is what made the batched-quantized-KV attempt worth trying at all — the two
-rejections in
-[errors 2026-08-22](../experience/errors/2026-08-22-batched-dspark-quant-kv-verify-loses.md)
-were spent rediscovering a boundary the first sweep could have drawn. The
+rejections were spent rediscovering a boundary the first sweep could have drawn. The
 parity gate should also be a merge gate, not a script: a spec-decode change
 without a green `spec_parity.py` run does not land.

@@ -4,8 +4,7 @@
 //! detects `ARLE_WORKER_RANK` (set on every rank) and runs worker mode + the
 //! lockstep driver. Each worker steps SYNCHRONOUSLY, one `inject + step` per
 //! relayed tick, so the per-step NCCL collective sequences stay aligned —
-//! free-running per-request relays desync (`errors/2026-06-10-dsv4-c2-layer2-
-//! lockstep-admission-deadlock.md`). Worker planners must use the SAME config
+//! free-running per-request relays desync into an admission deadlock. Worker planners must use the SAME config
 //! (serialized via `ARLE_WORKER_ENGINE_CONFIG`): a divergent knob = NCCL deadlock.
 
 #![cfg(all(unix, feature = "cuda"))]

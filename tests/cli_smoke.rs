@@ -22,8 +22,7 @@ fn root_help_mentions_explicit_run_entrypoint() {
     assert!(help.contains("Serve over the Anthropic and OpenAI APIs."));
     assert!(help.contains("Explicit alias for the interactive agent REPL."));
     assert!(help.contains("arle --doctor"));
-    assert!(help.contains("arle train opd --smoke --steps 5"));
-    assert!(!help.contains("arle train test"));
+    assert!(!help.contains("arle train"));
 }
 
 #[test]
@@ -62,39 +61,8 @@ fn serve_help_exposes_unified_server_frontdoor() {
 }
 
 #[test]
-fn train_help_lists_primary_workflows() {
+fn train_subcommand_is_gone() {
     let output = run_arle(&["train", "--help"]);
-    assert!(
-        output.status.success(),
-        "arle train --help failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-
-    let help = stdout(&output);
-    assert!(help.contains("arle train env"));
-    assert!(help.contains("arle train estimate-memory"));
-    assert!(help.contains("arle train opd --smoke --steps 5"));
-    assert!(!help.contains("arle train test"));
-    assert!(help.contains("opd"));
-}
-
-#[test]
-fn doctor_json_reports_schema_and_compiled_backend() {
-    let output = run_arle(&["--doctor", "--json"]);
-    assert!(
-        output.status.success(),
-        "arle --doctor --json failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-
-    let value: serde_json::Value =
-        serde_json::from_str(&stdout(&output)).expect("doctor output is valid json");
-    assert_eq!(value["schema_version"], 4);
-    assert_eq!(value["mode"], "doctor");
-    assert!(value.get("compiled_backend").is_some());
-    assert!(value.get("gpu").is_some());
-    assert!(value.get("tools").is_some());
-    assert!(value.get("checks").is_some());
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("unrecognized subcommand 'train'"));
 }

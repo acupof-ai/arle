@@ -370,8 +370,7 @@ impl EngineLoadConfig {
         config.slot_oversubscription = self.slot_oversubscription;
         config.oversubscription_min_slice = self.oversubscription_min_slice.max(1);
         // Diagnostic-only escape hatch (not a shipped feature) for the
-        // concurrent-decode digit-corruption investigation — see
-        // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md.
+        // DSv4 concurrent-decode digit-corruption investigation.
         if std::env::var("ARLE_DISABLE_PREFIX_CACHE").is_ok() {
             config.enable_prefix_cache = false;
         }
@@ -638,6 +637,23 @@ impl LoadedInferenceEngine {
         R: Send + 'static,
     {
         self.engine.with_cuda_engine(f)
+    }
+
+    /// Hot-swap the DSpark Markov head weights, then drop the prefix cache.
+    #[cfg(feature = "cuda")]
+    pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> anyhow::Result<()> {
+        let w1 = w1.to_vec();
+        let w2 = w2.to_vec();
+        self.with_cuda_engine(move |engine| {
+            let executor = engine
+                .executor_mut()
+                .as_any_mut()
+                .downcast_mut::<infer_cuda::CudaExecutor>()
+                .ok_or_else(|| anyhow::anyhow!("engine backend is not cuda"))?;
+            executor.update_dspark_markov_weights(&w1, &w2)?;
+            engine.invalidate_prefix_cache();
+            Ok(())
+        })
     }
 
     /// Programmatic token-id generation over the serving scheduler/KV path.

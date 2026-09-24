@@ -24,7 +24,7 @@ The repository has three practical layers:
 - `crates/`: the reusable control-plane/helper crates around the runtime
  (agent, chat, cli, tools), the GPU/bridge crates (cuda-kernels, mlx-sys), the
  spec/topology/routing leaves (qwen3-spec, qwen35-spec, deepseek-spec,
- infer-topo, infer-moe, infer-util), and the training stack (autograd, train).
+ infer-topo, infer-moe, infer-util).
 - `docs/`: architecture and implementation notes (single
  source of truth; the historical `infer/docs/` parallel tree was retired
  during the 2026-04-25 truth-surface cleanup).
@@ -43,7 +43,6 @@ Current workspace members (ownership and boundaries are listed in
  `crates/tools`
 - **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
  `crates/deepseek-ocr-spec`
-- **training:** `crates/autograd`, `crates/train`, `crates/spec-train`
 - **substrate:** `crates/kv-native-sys`,
  `crates/xgrammar-sys`
 
@@ -122,32 +121,6 @@ Key files:
 > `src/backends/` builders. The `cpu` smoke path uses the feature-free
 > placeholder `MetalExecutor` (`src/backends/cpu.rs`) over the shared
 > `infer-seam::HostPagedKvPool`.
-
-### Current OPD train path (post-OPD-pivot, 2026-05-24)
-
-```text
-crates/cli/src/train_cli.rs::run_opd()
- -> run_opd_from_dirs() or run_opd_smoke()
- -> train::qwen35_loader::load_qwen35_from_hf_dir()
- -> train::opd::opd_step()
- -> autograd Tape + AdamW + Qwen3.5 teacher/student weights
-```
-
-Scratch pretrain, SFT, GRPO, and multi-turn RL surfaces were retired in
-the 2026-05-18 OPD-only pivot.
-Their dispatch sources, supporting modules, and tests have been deleted
-from `crates/train`; the empty legacy command namespace is also gone.
-The autograd + Trainer + checkpoint codec + tokenizer + LoRA
-remain as OPD substrate. The OPD-teacher raw-logits device type and
-per-step student-LoRA re-merge live on the train side
-(`train::cuda_opd_ext::RawLogits`) and the `infer-api` CUDA surface
-(`StudentLora*`, `POST /v1/raw_logits` under `--features cuda`).
-
-Key files (surviving the pivot):
-
-- `crates/cli/src/train_cli.rs`: `arle train env`, `estimate-memory`, and `opd` front door
-- `crates/train/src/trainer.rs`: OPD step helpers (`cleanup_after_backward`, grad clip/loss re-exports) — the generic `Trainer<O,C,S>` skeleton is gone; the only generic trainer left is `spec_train::trainer::Trainer` (draft-target training).
-- `crates/train/src/{checkpoint,causal_lm,loss,lora,tokenizer,qwen35,qwen35_checkpoint,model_family}.rs`: substrate kept for OPD. The `cli_args` module and the `grad_accum`/`Trainer` subsystem were deleted as dead after the OPD pivot (`4b5ba9085`, `7c19ff177`); grad clipping is the re-exported `autograd::grad_clip`, and grad accumulation is `TensorStore::accumulate_grad`.
 
 ## 3. Runtime crate map (the `infer-*` graph)
 
@@ -329,8 +302,8 @@ feature-free CPU builder constructs `infer-metal`'s placeholder
  tokenize → submit → collect → detokenize.
 - `crates/infer-api/src/types.rs`: the public request/output/sampling/telemetry
  types.
-- The OPD teacher's device `RawLogits` struct lives in `train`
- (`crates/train/src/cuda_opd_ext.rs:19`); infer-api only has the private
+- The OPD teacher's training-side client lives in the separate OPD
+ repository; infer-api only has the private
  `raw_logits_route::RawLogitsRequest` HTTP body.
 
 `infer-api` depends on `infer-core` + `infer-server` + `infer-plan` +
@@ -373,7 +346,7 @@ These crates sit around the runtime graph:
 
 - `crates/agent`: agent session state, tool recovery, turn loop
 - `crates/chat`: shared protocol parsing/formatting and OpenAI chat types
-- `crates/cli`: CLI entry, arg parsing, REPL UX, `arle serve` front door, train front door
+- `crates/cli`: CLI entry, arg parsing, REPL UX, `arle serve` front door, `arle model download`
 - `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
 - `crates/cuda-kernels`: CUDA kernel layer (extracted from the legacy `infer` crate on 2026-04-15). Owns `csrc/{attention,comm,elementwise,gemm,kv,moe,norm,recurrent,sampling}/`, the separate C++ `csrc/deepep_sidecar/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tensor`, `kv_quant`; legacy Rust `ffi::misc` remains, but no `csrc/misc/` exists
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
@@ -381,10 +354,8 @@ These crates sit around the runtime graph:
 - `crates/kv-native-sys`: local persistence substrate for KV tier disk transport — `KvMmapStore` (file-backed sparse mmap page-slot store: memcpy writes, zero-copy `&[u8]` reads, slot allocator + free list). The key/value front door is `KvTierStore` (`insert`/`read`/`read_many`/`read_chunked`/`remove_chunked`); consumers are the CUDA DSv4 slot and prefix hooks (`executor/dsv4/slot_tier.rs`, `attention/prefix_state.rs`) and `infer-metal`'s SSD tier (`kv_ssd.rs`). The earlier WAL/shm/mmap-descriptor surface and the sharded block-file ops were deleted as unused (`6e3347d6e`, `b1b817958`).
 - `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — consumer: `infer-server/src/grammar.rs` (OpenAI `response_format` → `GrammarHook`). The `real` feature builds the C++ engine (requires `XGRAMMAR_SOURCE_DIR`); without it the crate exports stubs that reject at runtime.
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
-- `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
+- `crates/qwen35-spec`: shared Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
 - `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries (`DeepSeekV4AttentionLayerPlan`), and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority**
-- `crates/autograd`: from-scratch autograd + optimizer + lr-schedule + AdamW codec (OPD substrate)
-- `crates/train`: train-side control plane + OPD stack (post-2026-05-18 pivot)
 
 Current dependency direction (runtime graph):
 
@@ -396,7 +367,6 @@ workspace root package (arle / arle bin)
  -> agent
  -> chat
  -> tools
- -> train
  -> infer-metal (feature = "metal"; also pulled feature-free for the cpu executor)
 
 infer-api
@@ -440,7 +410,6 @@ Integration / adapter tests:
 
 - `tests/cli_smoke.rs`, `tests/cli_agent_live.rs`, `tests/cli_test_support.rs`:
  root-package (`arle`) CLI smoke + live agent paths
-- `crates/autograd/tests/`, `crates/train/tests/`: training-stack tests
 - `infer-moe` had in-file reference-routing unit tests in `src/tests.rs`
  (removed with the unit-test sweep `2e74f47e6`); routing math is now covered
  by the kernel/e2e gates that consume it

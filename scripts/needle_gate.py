@@ -35,8 +35,7 @@ Prints one line per run with the raw decoded completion, then a per-length
 summary line: exact/partial/miss counts + deterministic? (all runs identical).
 Each run also prints loc=, where the needle surfaced across content and
 reasoning_content (content/both/reasoning_only/neither); reasoning_only is a
-diagnostic and never changes the verdict — see
-docs/plans/2026-09-12-reasoning-content-criterion.md.
+diagnostic and never changes the verdict.
 """
 import os, sys, json, urllib.request, time
 
@@ -139,7 +138,7 @@ KV_DTYPE = os.environ.get("KV_DTYPE", "")
 def glued_repeat(out):
     # Flattened-logits salad glues fragments back-to-back ("memoizatmemoizat");
     # an order-preserving distortion passes every greedy probe, so this is the
-    # signature the temp arm keys on (errors/2026-07-20-hd256-fp8-temp-...).
+    # signature the temp arm keys on.
     for k in range(5, 17):
         for i in range(len(out) - 2 * k + 1):
             frag = out[i : i + k]

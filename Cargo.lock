@@ -145,28 +145,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "autograd"
-version = "0.5.8"
-dependencies = [
- "anyhow",
- "bytemuck",
- "cuda-kernels",
- "cudarc",
- "half",
- "kv-native-sys",
- "libm",
- "log",
- "matrixmultiply",
- "memmap2",
- "mlx-sys",
- "safetensors",
- "serde",
- "smallvec",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "axum"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -377,12 +355,10 @@ version = "0.5.8"
 dependencies = [
  "agent",
  "anyhow",
- "autograd",
  "chat",
  "clap",
  "console 0.16.3",
  "ctrlc",
- "deepseek-spec",
  "dialoguer",
  "hf-hub",
  "indicatif",
@@ -392,18 +368,15 @@ dependencies = [
  "infer-util",
  "libc",
  "log",
- "qwen35-spec",
  "reqwest",
  "rustyline",
  "serde",
  "serde_json",
- "spec-train",
  "sysinfo",
  "tempfile",
  "tokenizers",
  "tokio",
  "tools",
- "train",
  "uuid",
 ]
 
@@ -1226,7 +1199,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "ureq 3.3.0",
+ "ureq",
  "windows-sys 0.61.2",
 ]
 
@@ -1319,7 +1292,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1548,7 +1521,6 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
- "spec-train",
  "tempfile",
  "tokio",
 ]
@@ -1990,16 +1962,6 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
-
-[[package]]
-name = "matrixmultiply"
-version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
-dependencies = [
- "autocfg",
- "rawpointer",
-]
 
 [[package]]
 name = "memchr"
@@ -2648,12 +2610,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rawpointer"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
-
-[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2769,7 +2725,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3076,21 +3032,6 @@ dependencies = [
  "byteorder",
  "libc",
  "winapi",
-]
-
-[[package]]
-name = "spec-train"
-version = "0.5.8"
-dependencies = [
- "anyhow",
- "autograd",
- "half",
- "memmap2",
- "qwen35-spec",
- "safetensors",
- "serde",
- "serde_json",
- "tokenizers",
 ]
 
 [[package]]
@@ -3605,35 +3546,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "train"
-version = "0.5.8"
-dependencies = [
- "anyhow",
- "autograd",
- "chat",
- "cuda-kernels",
- "cudarc",
- "half",
- "infer-api",
- "infer-cuda",
- "infer-plan",
- "infer-seam",
- "infer-server",
- "infer-topo",
- "infer-util",
- "libc",
- "memmap2",
- "qwen35-spec",
- "safetensors",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokenizers",
- "ureq 2.12.1",
-]
-
-[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3698,24 +3610,6 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "2.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
-dependencies = [
- "base64 0.22.1",
- "flate2",
- "log",
- "once_cell",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "ureq"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
@@ -3735,7 +3629,7 @@ dependencies = [
  "ureq-proto",
  "utf8-zero",
  "webpki-root-certs",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4002,15 +3896,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.7",
 ]
 
 [[package]]

@@ -216,8 +216,7 @@ def _gdr_solve_tril_64_kernel():
     4-level block decomposition is identical
     in structure to both upstream sources, but the exact T.Parallel
     layout choices interact with TileLang's LayoutInferencer and may
-    need tuning per docs/experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md
-    style adjustments. Author's intent: keep the *algorithm* faithful
+    need the same style of tuning as the short-qlen prefill NaN fix. Author's intent: keep the *algorithm* faithful
     to the FLA reference and use GPU validation to pin down layout details.
     """
     dtype = "bfloat16"

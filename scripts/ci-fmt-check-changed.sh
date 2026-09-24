@@ -4,8 +4,7 @@
 #
 # Why: when a parallel track commits an unformatted .rs file, workspace-wide
 # `cargo fmt --all -- --check` fails every subsequent unrelated push. Scope to
-# the actual delta so CI failure tracks the push, not the tree. See
-# docs/experience/errors/2026-05-22-ci-cudarc-leak-and-hygiene-drift.md.
+# the actual delta so CI failure tracks the push, not the tree.
 #
 # Base resolution (first hit wins):
 #   - PR   (GITHUB_BASE_REF set):  diff against origin/$GITHUB_BASE_REF

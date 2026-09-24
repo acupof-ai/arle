@@ -3,11 +3,13 @@ name = "kv-native-sys"
 version = "0.5.8"
 edition = "2024"
 license = "MIT"
-publish = false
+publish = true
+repository.workspace = true
+description = "Host KV tier storage: sparse mmap page-slot store with direct I/O and io_uring paths."
 
 [dependencies]
 anyhow = "1.0"
-infer-seam = { path = "../infer-seam" }
+infer-seam = { path = "../infer-seam", version = "0.5.8" }
 libc = "0.2"
 log = "0.4"
 memmap2 = { workspace = true }

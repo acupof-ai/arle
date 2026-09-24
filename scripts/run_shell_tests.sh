@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 #
-# Single owner of the scripts/tests/test_*.sh batch for both callers:
-#   - scripts/pre_push_checks.sh (local pre-push hook)
-#   - .github/workflows/ci.yml "Shell Contracts" step
+# Runs the scripts/tests/test_*.sh batch for the ci.yml "Shell Contracts" step.
 #
 # The list is discovered, never enumerated: every scripts/tests/test_*.sh
 # runs on both callers, so a new test cannot land in the hook but stay absent
@@ -26,7 +24,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # One copy of the relevance rule; the hook sources this file and reuses it.
-RELEVANCE_RE='^(scripts|\.githooks|\.github)/|^\.gitignore$|^crates/cuda-kernels/'
+RELEVANCE_RE='^(scripts|\.github)/|^\.gitignore$|^crates/cuda-kernels/'
 
 main() {
     cd "$REPO_ROOT"
@@ -52,7 +50,7 @@ main() {
     fi
 
     if [[ -n "$changed_files" ]] && ! grep -qE "$RELEVANCE_RE" <<< "$changed_files"; then
-        echo "no shell-test inputs (scripts/.githooks/.github/cuda-kernels/.gitignore) in pushed range; skipping shell test batch"
+        echo "no shell-test inputs (scripts/.github/cuda-kernels/.gitignore) in pushed range; skipping shell test batch"
         return 0
     fi
 

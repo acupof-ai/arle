@@ -421,7 +421,7 @@ kind = "composite"
 inputs = ["qkv", "b", "a", "conv_state", "gdr_state"]
 outputs = ["gdr_out"]
 reference = "cuda.qwen35.gdr_recurrent_scan"
-correctness_gate = "crates/infer-cuda/examples/gdr_decode_parity.rs;crates/infer-cuda/examples/gdr_varlen_parity.rs;crates/autograd/tests/test_linear_attention.rs"
+correctness_gate = "crates/infer-cuda/examples/gdr_decode_parity.rs;crates/infer-cuda/examples/gdr_varlen_parity.rs"
 gate_gap = "both serving bands gated vs f64 host recurrence at local (K,V)=(16,48) and the attn_tp=2 (8,24) shard: decode (conv1d/gdr decode batch + singular, B=1/8, 5 carried steps) and VARLEN prefill replay (conv1d_prefill_varlen + gdr_prefill_recurrent_varlen, per-slot lengths 1/2/5/17/64 incl a FlashMLA page, B=1/4/8, nonzero initial ring+state, conv output, rebuilt ring, GDR output and final state each an independent comparator/negative tooth), plus a cross-path check at (16,48)/(8,24)/(4,12)/(2,6) lengths 5/17/64 — the DSpark block, a 17-row verify and one FlashMLA page — running the same input through BOTH the varlen recurrent and chunked FlashQLA pipelines against the same f64 anchor, printing the varlen-vs-FQ max diff per geometry across every supported TP shard; every multi-row advance now routes to chunked FlashQLA, so varlen has no remaining production caller (#300 deletion unblocked for all TP); remaining gaps: the single-row host ABI gdr_prefill_recurrent/conv1d_prefill (non-varlen, same kernel math) is covered only through autograd tests, and training grads have no serving gate"
 
 [[implementation]]
@@ -548,26 +548,6 @@ legality = "always (single rank, --comm-backend nccl, degraded boot, or prefill-
 fallback = ""
 
 [policy."arle.custom_allreduce"]
-fallback_status = "legacy-default-unqualified"
-
-[[semantic]]
-id = "opd.nvrtc_kernels"
-kind = "composite"
-inputs = ["tape_tensors"]
-outputs = ["tape_tensors"]
-reference = "cuda.opd.nvrtc_catalog"
-correctness_gate = "none"
-
-[[implementation]]
-id = "cuda.opd.nvrtc_catalog"
-semantic = "opd.nvrtc_kernels"
-provider = "nvrtc"
-source = "crates/autograd/src/backend_cuda/kernels.rs"
-legality = "tape-dtype module compiled at set_tape_dtype warmup (KERNEL_SOURCES catalog, single compile unit); compile failure is a hard error at first use"
-identity = "NvrtcIdentity { source_hash: fnv1a64(dtype prelude + concatenated sources), compile_flags: --gpu-architecture=<sm>, sm_arch, tape_dtype, nvrtc_version, cuda_driver_version }"
-fallback = ""
-
-[policy."opd.nvrtc_kernels"]
 fallback_status = "legacy-default-unqualified"
 
 [[semantic]]

@@ -1,8 +1,7 @@
 # cuda-oxide borrow assessment
 
 Date: 2026-08-13. Upstream pinned at `17eb3cc5` (NVlabs/cuda-oxide, 2026-08-13).
-Research note only — no runtime change, so no bench entry is required by the
-bench gate.
+Research note only; no runtime change.
 
 ## Question
 
@@ -67,7 +66,7 @@ per-buffer, so it does not reintroduce that problem.
 Two sites pay full-device syncs today for exactly this hazard:
 
 - `copy_bf16_device_ptr_to_local`
-  (`crates/autograd/src/backend_cuda/handle.rs:449-463`): a
+  (autograd CUDA backend handle, in arle-opd): a
   compute-sanitizer-confirmed use-after-free (foreign allocator frees via
   `cuMemFreeAsync` while the D2D copy runs) is fixed with a full
   `context.synchronize()` per bridge call.
@@ -111,7 +110,7 @@ is immutable, with compile-fail tests pinning both properties
 
 ### ARLE current state
 
-`launch_1d` / `launch_rows` (`crates/autograd/src/backend_cuda/kernels.rs:421-498`)
+`launch_1d` / `launch_rows` (autograd CUDA kernels, in arle-opd)
 hardcode 256 threads per block and zero dynamic shared memory. The kernel set
 is 78 `__global__` definitions across 29 `.cu` files, reached through 58
 distinct string-keyed lookups. Shape and alignment requirements live in
@@ -213,9 +212,7 @@ D2D copy on the source stream (ordered after the producer lm_head GEMM),
 record a completion event, and make the student stream wait on it. The
 source's later free is ordered after the copy on the same stream. No host
 sync, no limbo, ~40 LOC. A `src_stream == 0` fallback keeps the legacy sync
-path for callers without a source stream. See
-`docs/experience/wins/2026-08-14-bf16-bridge-event-ordered.md` (pending-remote
-bench).
+path for callers without a source stream. The bench is pending-remote.
 
 Site 2 (`release_kv_pool`) also shipped: the two full-context syncs are
 replaced by a single event sync (record after drop, wait for the frees, then

@@ -307,8 +307,7 @@ config-driven (GLM-DSA 32/128/2048, a DSv4 fixture 64/128/512).
  full-history mirror: as
  of 2026-06-29 it is a transient drain-immediate staging ring
  (`dsv4_dsa_rotated_ring_rows`, capped at `DSV4_INDEXER_STAGING_RING_ROWS`),
- removing its O(max_seq) per-slot term (−254 MiB/slot/layer at 1M) — see
- [`wins/2026-06-29-dsv4-dsa-rotated-key-transient-ring.md`](experience/wins/2026-06-29-dsv4-dsa-rotated-key-transient-ring.md)
+ removing its O(max_seq) per-slot term (−254 MiB/slot/layer at 1M)
  (pending-remote needle-gate).
 
 ### 4.3 Index query + score + top-k READ
@@ -570,7 +569,7 @@ target-model verification on low-probability tail tokens under high concurrency.
 |--------------|-------------------|---------------------------|
 | Sequential MTP head, chain verify | **Have it** — `Dsv4MtpLayer` + chain-verify §6 (the EAGLE-style lane DSpark contrasts) | — |
 | Parallel backbone draft | **Have it** — `dsv4/dspark.rs` drafts all `block_size` positions in one pass from the official 3-stage head; verify reuses `forward_tokens_verify_scheduled` | — |
-| Markov / RNN sequential head | **Implemented** — `dspark-sp+markov` draft checkpoints load the Markov head (the in-production train sidecar shipped 2026-07-20 and was removed 2026-08-04; see CHANGELOG) | Lightweight head on top of the parallel backbone; small autograd surface (`crates/autograd`) or a fused kernel |
+| Markov / RNN sequential head | **Implemented** — `dspark-sp+markov` draft checkpoints load the Markov head | Lightweight head on top of the parallel backbone, implementable as a fused kernel |
 | Confidence **head** | **Have it** — `mtp.2.confidence_head.proj` loads; `dspark_verify_keep` cumprods it into survival and feeds the goodput budget (`qwen35_spec::dspark_verify_lens`) | — |
 | Throughput-aware **scheduler** | **Have the core** — `dspark_verify_lens` picks the verify budget maximizing `(R + Σ survival)/step_time(B)` with an additive SPS cost model (`--dspark-sps-*-ms`). Missing: STS calibration (no fitted temperatures yet) and profiled-per-box SPS tables | Remaining pieces are assets (calibration data, per-box SPS profile), not code (#124). |
 | Verify length = dynamic | Fixed `depth` (`--mtp-draft-tokens`) | Make `depth` per-step adaptive from a confidence signal + batch occupancy |
@@ -627,8 +626,5 @@ Priority follows measured TP=4 B=4 wall-clock/kernels.
 
 ## References
 
-- Stage-B shared-pool payoff: `experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md`
-- B=1 decode graph (measured facts + open question; the original whole-step graph wash entry was retired): `experience/errors/2026-07-07-dsv4-foundation-lever-investigation.md`
 - EAGLE rollback bug: `AGENTS.md` §0.1 (DSv4 EAGLE rollback, 2026-06-06)
-- MoE i32 overflow (masked vs contiguous): `experience/errors/2026-09-09-dsv4-prefill-i32-overflow-doc-claim-stale.md` (supersedes the 2026-06-05 claim entry)
 - DSpark: *Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation*, DeepSeek × PKU, 2026-06-27 (DeepSpec, MIT)

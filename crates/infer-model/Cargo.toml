@@ -3,7 +3,9 @@ name = "infer-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
+description = "Host-side model geometry and operator-sequence routing for inference backends."
 
 # Host-side model geometry and routing (architecture refactor step 3b): the
 # `model → operator sequence → kernel selection` stages of the request axis.
@@ -15,9 +17,9 @@ publish.workspace = true
 anyhow = "1.0"
 half = "2.4"
 log = "0.4"
-infer-moe = { path = "../infer-moe" }
-infer-seam = { path = "../infer-seam" }
-qwen35-spec = { path = "../qwen35-spec" }
+infer-moe = { path = "../infer-moe", version = "0.5.8" }
+infer-seam = { path = "../infer-seam", version = "0.5.8" }
+qwen35-spec = { path = "../qwen35-spec", version = "0.5.8" }
 
 [lints]
 workspace = true

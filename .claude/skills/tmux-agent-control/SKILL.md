@@ -117,7 +117,7 @@ tmux send-keys -t <session>:<window> 'go for world #1' Enter
 ```bash
 tmux send-keys -t <session>:<window> 'proceed in this order:
 1. run the W3 bench
-2. write the result into wins/
+2. write the result into the PR description
 3. report the Δ%' Enter Enter
 ```
 
@@ -246,5 +246,4 @@ Common when an agent (typically Codex) hits its weekly limit and the user wants 
 ## Related
 
 - `CLAUDE.md` §Delegation — authoritative on why tmux (not the in-process subagent) is the Codex execution path.
-- `memory/feedback_codex_tmux_double_enter.md` — origin of the Enter-vs-Enter-Enter rule (2026-04-30 incident).
 - `loop` skill — for scheduled periodic nudges.

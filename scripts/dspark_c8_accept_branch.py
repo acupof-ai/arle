@@ -2,8 +2,7 @@
 """Decide which mechanism explains DSpark's c=8 0% acceptance from counters.
 
 The acceptance rate is accepted/drafted; 0.0000 alone cannot distinguish
-"no draft row was verified" from "every draft missed". The three branches
-(see docs/experience/errors/2026-09-12-dspark-c8-confidence-budget-admits-zero.md):
+"no draft row was verified" from "every draft missed". The three branches:
 
   NOT-SEEDING          chains=0 over the decode window
   BUDGET-ZERO-KEEPS    chains>0, drafted=0 (confidence budget truncated every
@@ -32,10 +31,6 @@ Usage:
 Negative control: --selftest feeds synthetic counter tuples through the
 classifier, including an accepted>drafted plumbing inconsistency that MUST
 refuse a verdict; run it before trusting a green output.
-
-A prereg row is opened before the c=1 window and closed with the branch
-(hypothesis fixed before the counters are read); skip with
-ARLE_C8_SKIP_PREREG=1.
 """
 
 import argparse
@@ -146,16 +141,6 @@ def window(port, concurrency, max_tokens, settle_s):
     return delta, errors, after
 
 
-def prereg(name, verb, **fields):
-    if os.environ.get("ARLE_C8_SKIP_PREREG") == "1":
-        return
-    root = Path(__file__).resolve().parents[1]
-    cmd = [sys.executable, str(root / "scripts/prereg.py"), verb, "--name", name]
-    for k, v in fields.items():
-        cmd += [f"--{k.replace('_', '-')}", str(v)]
-    subprocess.run(cmd, cwd=root, check=False)
-
-
 def new_seed_lines(log_path, start_pos):
     if not log_path:
         return []
@@ -173,14 +158,6 @@ def run_measure(args):
     log_pos = Path(args.server_log).stat().st_size if args.server_log else 0
 
     name = "dspark-c8-accept-branch-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    prereg(
-        name, "start",
-        cmd=f"scripts/dspark_c8_accept_branch.py --port {args.port} --concurrency {args.concurrency}",
-        hypothesis=("c=8 acceptance 0 lands in exactly one branch: chains=0 NOT-SEEDING; "
-                    "chains>0 drafted=0 BUDGET-ZERO-KEEPS (confidence budget bar 0.0025->0.0197); "
-                    "chains>0 drafted>0 accepted=0 PROPOSED-AND-REJECTED (scheduling exonerated). "
-                    "c=1 positive control must show chains>0 and drafted>0."),
-    )
 
     points = []
     for c in (1, args.concurrency):
@@ -228,8 +205,6 @@ def run_measure(args):
         status = "killed"
     else:
         status = "ok"
-    prereg(name, "done", status=status, result=result, finding=finding, decision=decision,
-           entry="docs/experience/errors/2026-09-12-dspark-c8-confidence-budget-admits-zero.md")
 
     if not c1_live:
         print("\nREFUSED: c=1 positive control is dead — no chains/drafted at c=1; "

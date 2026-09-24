@@ -2,7 +2,6 @@
 members = [
     ".",
     "crates/agent",
-    "crates/autograd",
     "crates/chat",
     "crates/cli",
     "crates/cuda-kernels",
@@ -22,13 +21,11 @@ members = [
     "crates/infer-server",
     "crates/infer-topo",
     "crates/infer-util",
-    "crates/spec-train",
     "crates/kv-native-sys",
     "crates/mlx-sys",
     "crates/qwen3-spec",
     "crates/qwen35-spec",
     "crates/tools",
-    "crates/train",
     "crates/xgrammar-sys",
 ]
 
@@ -36,6 +33,7 @@ members = [
 version = "0.5.8"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/acupof-ai/arle"
 publish = false
 
 # Workspace-wide lint posture. Only universally-agreed lints live here; a crate
