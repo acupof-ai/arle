@@ -234,8 +234,7 @@ pub enum DecodeDispatch {
 /// The `dspark → mtp → plain` dispatch ladder as a pure decision. At or below
 /// `spec_max_batch` a spec scheme drafts per row; above it spec is a
 /// compute-bound loss, so decode falls to the plain batched path that scales.
-/// DSpark batches only on BF16 (its quant-KV verify loses above c=1,
-/// errors/2026-08-22-batched-dspark-quant-kv-verify-loses); MTP batches on any
+/// DSpark batches only on BF16 (its quant-KV verify loses above c=1); MTP batches on any
 /// paged pool.
 pub fn decide_decode(
     kind: SpecKind,

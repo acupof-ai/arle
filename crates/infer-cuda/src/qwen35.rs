@@ -15,8 +15,7 @@
 //! (legacy `infer/src/model/qwen35`) is a perf follow-up.
 //!
 //! Gated-delta uses the RECURRENT kernel, never chunkwise: the chunkwise
-//! TileLang WGMMA short-seq path HANGS on sm_90
-//! (`errors/2026-05-30-gated-delta-short-seq-prefill-hang-h20.md`).
+//! TileLang WGMMA short-seq path HANGS on sm_90 (H20).
 //!
 //! Precision: BF16 (the shared `moe::moe_forward_into` grouped GEMM). The two MoE swap
 //! points for FP8 / 4-bit (Qwen3.6-4bit q4k) are inside
@@ -86,8 +85,7 @@ const QUANT_DECODE_MAX_SPLITS: usize = 64;
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
 /// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
 /// kernel (42.1% of prefill GPU time at 3k).
-/// Licensed 2026-06-11: 3k prefill −36%, multi-shape verified — see
-/// `wins/2026-06-11-qwen35-fa3-prefill-licensed.md`. A build without an
+/// Licensed: 3k prefill −36%, multi-shape verified. A build without an
 /// sm_90 target links the stub, whose marker is 0, and the gate keeps the
 /// in-tree kernel.
 /// The marker is process-wide, but capability is checked on the bound context

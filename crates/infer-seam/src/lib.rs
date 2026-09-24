@@ -412,9 +412,7 @@ pub trait BackendExecutor: 'static {
     /// backends (default) return `local` unchanged. TP backends MUST call
     /// this symmetrically on every rank, every tick that reaches it.
     /// Skipping the sync on one rank while another still calls it desyncs
-    /// the admission collective permanently (2026-07-05 TP=4 admission
-    /// livelock — see
-    /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+    /// the admission collective permanently (the TP=4 admission livelock).
     fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
         Ok(local)
     }

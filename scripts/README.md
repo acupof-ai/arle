@@ -136,12 +136,7 @@ GPU gate manually per target and hand `qualify-publish` the aggregated fragments
 | `validate_release.sh` | Fail-closed tag/product/blocker/kernel-evidence release validator. |
 | `ci-fmt-check-changed.sh` | CI rustfmt check on changed files. |
 | `ci-patch-tvm-ffi.sh` | CI TVM FFI patch. |
-| `pre_push_checks.sh` | Pre-push validation checks. |
-| `check_repo_hygiene.py` | Repo hygiene checker (wins cap, frozen archive seal, etc.). `--selftest` runs every git-backed check against a broken copy of its real artifact and fails if the check passes there. |
-| `agenda.py` | Goal / task ledger: `task add --exit` names the measurable event that closes it; `report` renders goals, tasks and their prereg runs as one page. |
-| `prereg.py` | Pre-registration ledger: `start` writes the hypothesis before the run, `done` closes it with result / finding / decision. A row left running past 24h fails hygiene. |
 | `clean_repo.py` | Sweep untracked build/run residue; dry-run by default, `--apply` to delete. |
-| `archive_experience.py` | Seal wins/errors entries into the frozen archive with link repair and manifest update. |
 | `pick-gpu.sh` | GPU selection helper. |
 | `start_agent.sh` | Start local agent. |
 | `v100_qwen35_9b_load_smoke.sh` | V100 Qwen3.5-9B load smoke test. |

@@ -153,8 +153,7 @@ impl MetalWeights {
     }
 }
 
-// Cross-step decode pipelining (default ON since
-// `wins/2026-06-04-metal-decode-pipeline-c2-safe-default-on.md`).
+// Cross-step decode pipelining (default ON).
 //
 // HEAD decode is strictly submit(N) → poll(N) blocks on `eval` → apply(N) →
 // submit(N+1): the GPU idles for the host gap between poll(N)'s eval finishing
@@ -696,8 +695,7 @@ impl RealMetalExecutor {
     }
 
     /// Pre-build (JIT-compile) the prefill + decode MLX graphs at load so turn-0
-    /// is not cold. After the steady-decode pipeline recovery
-    /// (`wins/2026-06-04-metal-rewrite-decode-pipeline-recovery`), the residual
+    /// is not cold. With steady decode pipelined, the residual
     /// turn-wall gap is turn-0's lazy graph build + first MoE encode landing on
     /// the first real request. A tiny throwaway forward on a reserved warmup slot
     /// (never published to the kv pool) pre-pays that JIT at load instead. Opt

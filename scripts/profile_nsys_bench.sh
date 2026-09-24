@@ -208,12 +208,6 @@ error: nsys ${NSYS_VERSION_LINE#NVIDIA Nsight Systems } removed --attach-pid
          # 3. drive scripts/bench_throughput.py from a separate terminal
          # 4. nsys writes \`*.nsys-rep\` when --duration elapses; \`nsys stats\` reads it
 
-       Fully worked-out examples for ARLE and vLLM live in:
-         docs/experience/wins/2026-05-07-m3.6-phase1-nsys-arle-s48-highconc.md
-         docs/experience/wins/2026-05-07-m3.6-phase2-vllm-s14-bench.md
-       (the latter notes the deferred trace + the corrected --delay value
-       once vLLM nsys-startup overhead is accounted for).
-
        This wrapper is preserved against older nsys (<2024) where
        --attach-pid still exists. Migration to a session-API workflow is
        tracked as a follow-up.

@@ -81,7 +81,7 @@ mod real {
     /// The 145 per-channel FP8 GEMMs of `unsloth/Qwen3.8-27B-NVFP4` collapse to
     /// five distinct shapes. hidden 5120, 24 heads, 4 KV heads, head_dim 256,
     /// gated q_proj, 64 layers (48 linear-attn + 16 full-attn), vocab 248320
-    /// (`docs/baselines.md`, `docs/experience/wins/2026-08-19-nvfp4-marlin-tensorcore.md`).
+    /// (`docs/baselines.md`).
     ///
     /// - 12288x5120 covers both the gated `q_proj` (24*256*2, `full_attn_q_proj_dim`
     ///   in `qwen35-spec/src/lib.rs:1031`) and the fused linear-attn `in_proj_qkvz`

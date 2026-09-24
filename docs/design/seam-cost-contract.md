@@ -1,6 +1,6 @@
 # The backend seam is a cost contract
 
-Design note 3 of 5 ([plan](../plans/2026-09-02-design-theses.md)). CUDA, Metal,
+Design note 3 of 5. CUDA, Metal,
 and the CPU smoke path. Date: 2026-09-09.
 
 ## Problem
@@ -80,8 +80,7 @@ against this?" If no, it does not get a trait.
 ## The failure
 
 The 49-method trait was the failure, and it shipped for months before the
-2026-08-14 refactor contracted it to 15
-([wins 2026-08-14](../experience/wins/2026-08-14-seam-cost-contract-refactor.md)).
+2026-08-14 refactor contracted it to 15.
 The refactor was zero-behavior-change by construction: every call site's `None`
 arm reproduces the deleted default verbatim, audited per site, and the one
 intended behavior change was the `--kv-oversubscription` load-time failure

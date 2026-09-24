@@ -84,8 +84,7 @@ relocation.
 
 ## Current status
 
-- TileLang version pinned during the H100 spike; see
-  `docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md`.
+- TileLang version pinned during the H100 spike.
 - TileLang paged prefill HD64/HD256, HD64/HD256 decode, and the AOT-compatible
   Qwen3.5 GDR stages are linked under `--features cuda`.
 - The old external AOT and wrapper surfaces have been removed from the

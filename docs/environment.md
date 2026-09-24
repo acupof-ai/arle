@@ -173,8 +173,7 @@ For `mlx-community/Qwen3.6-35B-A3B-4bit` (default top_k=8):
 
 Mirrors `vllm-mlx`'s `--moe-top-k` flag. Use for latency-critical
 chat / code workloads; keep the default for evaluation /
-quality-sensitive paths. See
-[`docs/experience/wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md`](experience/wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md).
+quality-sensitive paths.
 
 ```bash
 INFER_MOE_TOP_K=6 ./target/release/arle serve --backend metal \
@@ -316,7 +315,7 @@ as diagnostics and validation gates, not stable tuning API.
 | Variable | Values | Default | Current behavior |
 |---|---|---|---|
 | `ARLE_DSV4_MOE_TRANSPORT` (or `--dsv4-moe-transport`) | `allreduce` (default), `deepep`, `deepep_ll`, `mega_moe` | `allreduce` | Selects the DSv4 MoE transport (`infer-cuda/src/runtime_flags.rs::dsv4_moe_transport`). `allreduce` = local routed experts + EP all-reduce (the licensed default). `deepep` / `deepep_ll` = NVSHMEM token-owned DeepEP paths; B=1 deepep_ll is fixed (`b5f00399`) but the batched lane license is open (#61) — not default-worthy yet. |
-| `ARLE_DSV4_DECODE_GRAPH` | `0` / unset | unset (= on) | The c=1 decode CUDA graph, armed by default since. `0` selects the eager arm; any other value (or unset) keeps the graph. Also requires the shared decode-graph switch (`runtime_flags::qwen35_decode_graph`). The gate is c=1-only and disarms under DSpark/MTP, so c>=2 and spec decode never see it. See `docs/experience/wins/2026-08-23-dsv4-c1-decode-graph.md`. |
+| `ARLE_DSV4_DECODE_GRAPH` | `0` / unset | unset (= on) | The c=1 decode CUDA graph, armed by default. `0` selects the eager arm; any other value (or unset) keeps the graph. Also requires the shared decode-graph switch (`runtime_flags::qwen35_decode_graph`). The gate is c=1-only and disarms under DSpark/MTP, so c>=2 and spec decode never see it. |
 | `ARLE_CUDA_PROFILE` | `1` / unset | unset | Per-operator CUDA timing for every `profile_op` site (attention, MoE, decode batch, prefill, LM head). Totals surface as `op_timing` in `/v1/stats`; take a before/after difference around the workload. Each site brackets its work with a `cudaEventRecord` pair and synchronizes, which costs 66-73% of decode throughput and serializes the pipeline — read the call counts and relative shares, not the absolute latencies. |
 | `ARLE_DSV4_STAGE_PROFILE` | `1` / unset | unset | Coarse per-stage host/CUDA split. Driven explicitly (reset / set-active / print) and used only by `crates/infer-cuda/examples/dsv4_parity.rs` for prefill; a serve does not print it. Only three stages are instrumented (`mega_moe_input`, `mega_moe`, `moe_route`), so it says nothing about a serve decode step — use `ARLE_CUDA_PROFILE` for that. |
 | `ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE` | `1` / unset | unset | Opt-out for the raw-pointer DeepGEMM C ABI bridge. Native DeepGEMM is default-on when an sm_90 target and vendored DeepGEMM/CUTLASS sources are present. Runtime JIT still needs `${CUDA_HOME}/bin/nvcc`, `cuobjdump`, and a C++20-capable host compiler or a warm `DG_JIT_CACHE_DIR`. |

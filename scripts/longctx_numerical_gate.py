@@ -3,7 +3,7 @@
 
 # gate_invoke: manual: operator-run cross-server trajectory comparison,
 # longctx_numerical_gate.py --left-url <arle> --right-url <sglang> after both
-# serves are up (docs/plans long-context S3); single mode is the smoke form.
+# serves are up; single mode is the smoke form.
 
 The script intentionally does not launch servers. Start the ARLE/SGLang
 targets with the desired KV dtype first, then compare their greedy completion

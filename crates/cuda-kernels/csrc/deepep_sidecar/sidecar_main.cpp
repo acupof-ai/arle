@@ -3,8 +3,7 @@
 //
 // Long-running C++ process forked one-per-rank by ARLE's Rust host. Boot
 // sequence + IPC handshake match the phase 1.0a-iii spike validated on
-// 8 × H20 (see `docs/experience/wins/2026-05-26-dsv4-deepep-cpp-full-
-// dispatch-combine.md`). Production differences:
+// 8 × H20. Production differences:
 //
 //   - Command loop over fixed fds (kChildP2cFd=10, kChildC2pFd=11) instead
 //     of single-shot dispatch+combine.

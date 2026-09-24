@@ -1,6 +1,6 @@
 # Memory is the product
 
-Design note 4 of 5 ([plan](../plans/2026-09-02-design-theses.md)). Metal
+Design note 4 of 5. Metal
 and CUDA, Qwen3.5 / Qwen3.6 / Qwen3.8. Date: 2026-09-09.
 
 ## Problem
@@ -51,16 +51,14 @@ dispatch lane would read a released layout.
 
 **Derived operands live in scratch, rebuilt per call.** The DeepGEMM
 prefill path widens NVFP4 to E4M3 per call from Marlin's resident layout;
-the widened copy is never resident
-([wins 2026-08-20](../experience/wins/2026-08-20-nvfp4-widen-to-e4m3-deepgemm-prefill.md)).
+the widened copy is never resident.
 
 **The working set is itemized, not fractional.** The DSv4 slot solve
 enumerates the prefill transient — MoE and attention scratch — in
 `prefill_transient_reserve_bytes`
 ([`budget.rs:290`](../../crates/infer-cuda/src/dsv4/budget.rs)) and
 subtracts it before solving slots (`:520`), which is what took the 27B from
-18 slots plus an OOM to 17 slots 16/16
-([wins 2026-08-24](../experience/wins/2026-08-24-dsv4-budget-prefill-reserve.md)).
+18 slots plus an OOM to 17 slots 16/16.
 
 **Bytes read per token is a first-class axis.** NVFP4 moves 56% of the
 weight bytes per layer that FP8 moves (150.4 MB vs 267.5 MB) and decodes
@@ -71,8 +69,7 @@ way.
 
 ## The failure
 
-The Marlin repack stored the model twice
-([wins 2026-08-20](../experience/wins/2026-08-20-marlin-source-freed-18gb.md)).
+The Marlin repack stored the model twice.
 Qwen3.8-27B-NVFP4, a 23.42 GB file, sat at 42.08 GB resident; its KV pool
 was 281,577 tokens against the FP8 build's 593,995 on the same card, and a
 16-conversation × 8-turn workload paid 24× full recompute of a 33K prefix.

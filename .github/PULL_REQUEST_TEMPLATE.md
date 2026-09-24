@@ -36,7 +36,6 @@ What problem does this solve?
 
 ## Validation
 
-- [ ] `python3 scripts/check_repo_hygiene.py`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace -- -D warnings`
 - [ ] Targeted `cargo test` / integration / e2e coverage
@@ -44,8 +43,8 @@ What problem does this solve?
 
 ## Benchmark / Profiling Evidence
 
-- [ ] Bench-exempt; reason:
-- [ ] Benchmark / profile attached; commands and before/after:
+- [ ] No performance claim
+- [ ] Matched A/B attached (same machine, same build profile, ≥3 trials); commands and before/after:
 
 ## Migration Notes
 

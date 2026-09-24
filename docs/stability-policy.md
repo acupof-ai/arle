@@ -74,14 +74,11 @@ surfaces fall under each tier.
 - CLI agent behavior
 - Metal serving path, including cross-turn prefix restore
 - Metal DFlash / MTP speculative decode path
-- OPD training (`arle train opd`)
-- GGUF loading path
 - benchmark tooling in `scripts/`
 
 ### Experimental
 
 - fast-moving quantization paths (new quant formats)
-- Vulkan and HIP backends (bring-up)
 - KV disk tier (`--kv-disk`) and cluster-shared KV
 - undocumented flags or undocumented environment variables
 

@@ -112,8 +112,7 @@ impl Engine {
         let target = tokens.len();
         // The last committed token must PREFILL, never restore: entering
         // `Decoding` with it already materialized makes the decode seed re-feed
-        // it, duplicating its KV (see docs/experience/errors/
-        // 2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md).
+        // it, duplicating its KV.
         // Both the full-match trim and the sidecar-restore clamp bound to this.
         let attach_cap = target.saturating_sub(1);
 

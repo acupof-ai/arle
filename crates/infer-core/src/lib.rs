@@ -1428,8 +1428,7 @@ impl Engine {
     /// MULTIPROC INVARIANT: like admission, this mutates scheduler-visible
     /// state (`waiting`, `active`, KV page counts) — call it identically, on
     /// the same tick, on every rank in an SPMD group, or ranks desync (the
-    /// same hazard class as the 2026-07-05 TP=4 admission livelock; see
-    /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+    /// same hazard class as the TP=4 admission livelock).
     /// The multiproc driver carries cancellations through the same
     /// `TickAdmissions` broadcast as new admissions for exactly this reason.
     pub fn cancel_request(&mut self, handle: RequestHandle) -> bool {
@@ -1540,8 +1539,7 @@ impl Engine {
         // same Admit/Throttle decision as the radix prefix-match clamp
         // below — a diverging decision means one rank stops
         // calling that collective while another keeps calling it every tick,
-        // a permanent cross-rank admission livelock (2026-07-05 TP=4 hang,
-        // docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+        // a permanent cross-rank admission livelock (the TP=4 lockstep hang).
         let mut remaining_pages = self.executor.tp_sync_min(self.kv.free_pages())?;
         // Nothing to admit — both loops below are waiter-driven, so skip the
         // per-tick free-slot scan. Placed AFTER the collective so every rank
@@ -1651,8 +1649,7 @@ impl Engine {
                 // now, so nothing else could ever finish and free more pages
                 // — this candidate structurally exceeds the pool's total
                 // capacity and retrying it forever would hang every later
-                // request queued behind it (2026-07-05 round 5 — see
-                // docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+                // request queued behind it (the TP=4 lockstep hang).
                 // Conservative on purpose: with other requests still active,
                 // Throttle as before — they may free enough pages on finish.
                 if self.active.is_empty() {

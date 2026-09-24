@@ -2,8 +2,7 @@
 """Decide which mechanism explains DSpark's c=8 0% acceptance from counters.
 
 The acceptance rate is accepted/drafted; 0.0000 alone cannot distinguish
-"no draft row was verified" from "every draft missed". The three branches
-(see docs/experience/errors/2026-09-12-dspark-c8-confidence-budget-admits-zero.md):
+"no draft row was verified" from "every draft missed". The three branches:
 
   NOT-SEEDING          chains=0 over the decode window
   BUDGET-ZERO-KEEPS    chains>0, drafted=0 (confidence budget truncated every

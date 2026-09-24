@@ -728,8 +728,7 @@ fn try_fp8_dequant_bf16_gemm(
 /// - `DequantGemm` for weights with NO Marlin layout, but only
 ///   from [`QWEN_DEQUANT_GEMM_PREFILL_MIN_M`], not from the M=2 floor FP4 uses.
 ///   An un-repacked FP8 weight is a 128×128 block weight on a non-Hopper card,
-///   and dequantising all of it at M=2 is the defect in
-///   `docs/experience/errors/2026-08-19-fp8-dequant-arm-shadows-decode.md`.
+///   and dequantising all of it at M=2 shadows the decode path.
 /// - `Gemv` (batched scalar warp-per-row) below that.
 ///
 /// `DeepGemm` is the query-level prefill verdict; the arm above stays the sole
@@ -881,8 +880,7 @@ fn fp8_block_scaled_gemv(
         // The coalesced scalar warp-per-row GEMV is the production path:
         // 3.6x faster than the tensor-core MMA tile at B=1 decode on H20
         // (the MMA was occupancy-starved + uncoalesced off its batched
-        // B<=16 design point — KILLED, see
-        // docs/experience/wins/2026-06-22-qwen-fp8-decode-gemv-scalar.md).
+        // B<=16 design point — KILLED).
         qwen_quant_profile(
             ctx,
             "qwen/fp8/gemv_batch",

@@ -71,7 +71,7 @@ before touching code:
 
 Do not create a sibling optimization checkout inside ARLE unless ckl explicitly
 asks for one. ARLE kernel work normally lands in the existing module with a
-small attempt ledger in the wins/errors entry.
+small attempt ledger in the PR description.
 
 ### Phase 2 — Hardware constraint sheet
 
@@ -117,7 +117,7 @@ PATH=.venv/bin:$PATH \
   scripts/profile_ncu_bench.sh <label> --bench <existing-bench-dir> \
   --family attention --set full --launch-skip 5 --launch-count 5
 
-# Internal counters (see bench-and-trace-spec §3) — every wins entry must cite these
+# Internal counters (see bench-and-trace-spec §3) — every perf claim must cite these
 ```
 
 **Wall-clock is ground truth** (§0 SOLID rule 6, `847a132`):
@@ -287,7 +287,7 @@ Use the project's canonical thresholds where they exist:
 | M_quant Phase 0 v2 (cutlass FP8) | speedup ≥ 6× → ✅ proceed; 3-6× → ⚠ lower ROI; < 3× → ❌ FP8 path KILL, pivot W4A16 |
 | Generic kernel re-tune | TTFT/ITL Δ ≥ 10% with σ < 5% across n=3 | < 5% within noise band |
 
-Always write a wins or errors entry. **Both outcomes accumulate knowledge.** A KILL entry that names the framing trap (NVTX vs wall-clock) is worth as much as a win.
+Always record the outcome in the PR description. **Both outcomes accumulate knowledge.** A KILL record that names the framing trap (NVTX vs wall-clock) is worth as much as a win.
 
 ---
 
@@ -311,7 +311,7 @@ Apply these by **identifying the binding constraint first** (Phase 3), THEN sele
     notes unless the code has an Ada/Hopper fallback and a measurable wall-clock
     bottleneck.
   - If a source materially shapes code, record URL, upstream commit or PR, what
-    was adapted, and license/notice status in the wins/errors entry.
+    was adapted, and license/notice status in the PR description.
 
 ### Attention path
 
@@ -393,7 +393,7 @@ Apply these by **identifying the binding constraint first** (Phase 3), THEN sele
 
 - **Internal counters** (bench-and-trace-spec §3).
   - File: `docs/bench-and-trace-spec.md` §3
-  - Pattern: every wins entry MUST cite `/v1/stats` snapshots before/during/after. External tools see client-side; internal counters explain WHY.
+  - Pattern: every perf claim MUST cite `/v1/stats` snapshots before/during/after. External tools see client-side; internal counters explain WHY.
 
 ---
 
@@ -435,7 +435,7 @@ Each anti-pattern has a project commit/entry where it was paid for.
    - Fix: Phase 5 matched-control checklist + new "isolation motive trap" callout (v1.2.0).
 
 9. **No σ → noise reported as win**
-   - Caught by: every wins entry now cites σ across n≥3.
+   - Fix applied: every perf claim cites σ across n≥3.
    - Fix: Phase 5 statistical sanity.
 
 10. **No tradeoff named → not at extremes**
@@ -838,8 +838,7 @@ Each anti-pattern has a project commit/entry where it was paid for.
       the correction MUST include a re-run of the verification command
       in the SAME response, with the literal raw output quoted —
       NOT a summary of memory. Stale memory of prior tool output is
-      hypothesis, not evidence (per
-      `feedback_first_principle_solid_or_deeper.md`). Tie-breaker for
+      hypothesis, not evidence. Tie-breaker for
       conflicting evidence (peer investigation vs your recall): a
       fresh tool invocation showing raw output that both agents can
       examine.
@@ -923,10 +922,6 @@ Each anti-pattern has a project commit/entry where it was paid for.
       `994a294` build-restore + `ca09db0` doc-sync demonstrated this
       discipline correctly (status BEFORE commit, single file confirmed
       via `--cached --stat`).
-    - Companion to memory rule
-      `feedback_git_status_before_commit_in_cooperative.md` (which
-      already covered "before commit" but in different framing — now
-      the rule is sharpened with the race-window evidence).
 
 31. **ARLE surface claims need raw evidence in same response, even when not contesting peer**
     - Caught by: `d387b03` (2026-05-10, 4th hallucination this session) +
@@ -1295,10 +1290,8 @@ cargo test --release --features cuda --test greedy_consistency
 
 ## Related
 
-- `CLAUDE.md` §Benchmarks (every runtime change → bench entry)
+- `AGENTS.md` §Hard gates (perf claims cite a matched A/B)
 - `docs/bench-and-trace-spec.md` (§3 internal counters, §6 auto-iterate, §7 protocol rules)
-- `docs/experience/errors/2026-05-08-m_pgc-phase0-killed-ttft-under-threshold.md` (Phase 0 KILL — single-bucket + envelope clamp + BF16 contamination)
-- `docs/experience/errors/2026-05-08-e2-prefill-bn32-failed-kernel-time-not-binding.md` (E1/E2 KILL — kernel time not binding at sm_89 4k, TileLang 0.1.9 codegen rigidity)
 - `847a132` AGENTS.md §0 SOLID rule 6 (framing cross-checked from multiple angles, wall-clock ground truth)
 - `aa15bea` AGENTS.md §0 first principle SOLID
 - Industry papers: FlashAttention (2307.08691), PagedAttention (2309.06180), Marlin (2408.11743), SmoothQuant (2211.10438), AWQ (2306.00978), Medusa (2401.10774), EAGLE (2401.15077)
@@ -1310,45 +1303,3 @@ cargo test --release --features cuda --test greedy_consistency
 - BBuf KernelWiki: <https://github.com/BBuf/KernelWiki>
 - BBuf kernel-pilot: <https://github.com/BBuf/kernel-pilot>
 
----
-
-## Recent skill version history
-
-| Version | Date | Anti-patterns | Source commits |
-|---|---|---:|---|
-| v1.0.0 | 2026-04-XX | 8(initial) | initial creation |
-| v1.1.0 | 2026-05-XX | 11 | added #9-11 |
-| v1.2.0 | 2026-05-XX | 12 | added #12 (decode-vs-prefill duality) |
-| v1.3.0 | 2026-05-XX | 13 | `faffcb0` added #13 (NULL elimination) |
-| **v1.4.0** | **2026-05-08** | **14** | **`6c627c4` added #14 (upstream-data parser silent corruption per `5593865` qzeros bug)** |
-| **v1.5.0** | **2026-05-08** | **17** | **`f05ea3a` added #15-17 from cap=8 chain** |
-| **v1.5.1** | **2026-05-08** | **17(refined)** | **`9f65b4d` #17 workload-shape refinement per `063da81`** |
-| **v1.6.0** | **2026-05-09** | **18** | **`125f795` added #18 Phase 0 substrate audit per `1217375` A1 audit + B3 Step 2 -30% scope** |
-| **v1.7.0** | **2026-05-09** | **19** | **`c768b70` added #19 dispatch directive path verification per `8935851` index.md broken link + `de8b4dc` pickup queue stale path** |
-| **v1.8.0** | **2026-05-09** | **25** | **(this commit) batch-added #20-25 from c20b1ce attribution + R4#6 KILL + recipe audit chain. Anti-pattern theme: "audit at every prescription layer including recipes themselves"; key lesson: empirical bench is truly orthogonal SOLID layer that catches what bidirectional code audits both miss (#25 evidence). Sources: `c076aae` #20 / `b55bfcd`+`af44efa` #21 (2 evidence points) / `919c0fb`+`8d91d20`+`3fea979` #22 / `156d2c2` #23 / `1ccb448` #24 / `fe9ea8a`+`3b9cc06` #25** |
-| **v1.9.0** | **2026-05-10** | **27** | **(this commit) added #26-27 from #37 Path B v1 KILL → #40 Path B.2 wins chain. Theme: "cache-hit-rate claims need cardinality evidence, and bucketing fixes need second-order scalar-capture sync". Sources: `a7a8b94` #26 (Path B v1 388-key churn at 4k production despite shape-(4,3,8) smoke success) / `a56b7a9`+`c44788f` #27 (Codex's second-order bucketing insight beyond Claude brief: bucketed key + captured scalars baked at first-capture dim = semantic miss; bucketed key + captured scalars baked at bucket capacity = 98.5% reuse, engine TTFT -92.5%). Compound learning: the same Phase B family of optimization required two distinct anti-pattern lessons, one per KILL→WIN cycle.** |
-| **v1.10.0** | **2026-05-10** | **28** | **(this commit) added #28 from `ee2c5b0` SOLID-critical hallucination chain. Theme: "agent fabrication overrides peer's correct conclusion when memory of prior tool output is trusted over fresh verification". Source: Claude challenged codex's correct claim that `--max-waiting-requests` CLI flag does not exist, cited fabricated grep evidence, codex (rightly) trusted the "correction" and used `--cold-headroom 253` workaround. Two ticks later audit-of-audit re-ran verification → direct evidence proved codex correct from start (`git log -S` shows string never existed in main.rs). Lesson distinct from #25 ("audit-chain shared blindspot"): #28 is "agent fabricates evidence", and empirical bench doesn't catch it because the bench command itself is built on the fabrication. Fix: when correcting peer agent file-content claim, MUST re-run verification in SAME response and quote raw output literally, NOT summarize memory.** |
-| **v1.11.0** | **2026-05-10** | **32** | **(this commit) batch-added #29-32 from same-day cooperative discipline session. Theme: "verify substrate of EVERY claim, not just contested ones". Evidence chain: 4 hallucinations sedimented in single session (`0f4d0ae` CLI flag, `43bda9c` reduce buffer, `4b30c15` /health endpoint, `5bf0e20` baseline mismatch) + cooperative race in `0d63a52`/`994a294` recovery + 33min wedged poll in `4b30c15`. Sources: `eb2b4b6` #29 (default test fixture broken since #25, codex correctly overrode via env var) / `0d63a52`+`994a294`+`ca09db0` #30 (commit-time worktree race; status BEFORE commit not just before add) / `c3bb82b`+`d387b03` #31 (ARLE surface claims need raw evidence even when not contesting peer; 4 hallucination pattern caught by self-audit) / `4b30c15` #32 (peer "Waiting >5min" warrants direct ps/log/curl verify; recovered ~33min of codex bandwidth). Cumulative compound learning: `de36538` retrospective + `940f49e` self-implementation by Claude (PF8.1+2) demonstrated discipline working — cooperative pipeline recovers from individual mis-claims when each agent applies raw-evidence-required rule.** |
-| **v1.12.0** | **2026-05-10** | **34** | **(this commit) added #33+#34 from PF8.3 substrate session evidence. Theme: "code-correct ≠ runtime-correct under load". Evidence chain: codex review caught 3 real bugs that all formal gates passed (`ace3cbe` parallel-M loop + max_par/lock workspace + graph capture interaction); PF8.3 RUNTIME KILL with 101380/101380 failures despite greedy_consistency PASS at conc=1 (`0cde63d` + `57c37b5` H8 verify). Sources: `ace3cbe` #33 (codex review IS load-bearing for non-trivial substrate, NOT formality; 3 bugs/27min review = high amortized value; required when build+clippy+tests pass on FFI/cross-feature/parallel logic diffs) / `0cde63d`+`57c37b5` #34 (greedy single-request PASS NECESSARY but NOT SUFFICIENT; pair with sustained-load bench at conc 1+2+4; sub-rule #34b: bench 0-success → CHECK SERVER LOG FIRST, wasted 30+min on benchmark-client CLI quirks when real cause was kernel 100% failure visible in /tmp/<server>.log). Cumulative compound learning: 7 hallucinations across this session + 3 codex-review bug catches + 1 RUNTIME KILL exposed by sustained load = code-correctness gates and runtime-correctness gates are SEPARATE concerns; both required for license-grade substrate.** |
-| **v1.16.0** | **2026-05-10** | **38** | **(this commit) graduated #43 "always source-survey existing files BEFORE listing items as pending pickup" from candidate to canonical after n=4 evidence threshold reached across same-day brief-vs-reality discoveries. Sources: `e021026` (Alpaca data ALREADY downloaded, saved 12-24 hr critical path) / `86b28c7` (M''' W4-FP8 preprocess ALREADY DONE as PF8.2 substep) / `2f19a3c` (ARLE marlin_kernel.cu at-par with vLLM) / `b6b8adc` (ARLE marlin_pf8/ subdir = COMPLETE vLLM marlin/ fork; P2 dropped from queue, wall-clock down 7d → 5-6d). Cumulative: 5-min source-survey discipline saved ~3-4 days of false-pending pickup work, 100×+ ROI. Companion to #25 (audit-chain shared blindspot) + #36 (grep alone needs A/B): #43 is bare-minimum first step before either #25 or #36.** |
-| **v1.13.0** | **2026-05-10** | **35** | **(this commit) graduated #38 from candidate to canonical anti-pattern after n=2 evidence threshold reached in same Task #35 cap=8 prefill warmup implementation cycle (per `b4a3c38` §6.8 + `182d67b` §6.13 + codex commit `a2ad788`). Theme: "warmup target shape budget must clamp to (effective workload shape × hardware headroom)". Evidence chain: same Task #35 implementation independently discovered both failure modes — n=1 max_seq_len=512 vs chunked_prefill_size=4096 mismatch (Pass 3 warming unreachable shapes; codex applied cap fix); n=2 B=8 × 2048 tokens/row exceeds 16GB VRAM → Marlin scratch OOM (substrate gracefully falls back to 1024 tokens/row). Both n=1 and n=2 are within ONE substrate development cycle but with INDEPENDENT failure mechanisms (config-vs-config alignment vs hardware-vs-shape alignment) — this satisfies n=2 distinct-mechanism evidence threshold. Generalization: warmup-based optimizations target shape sets; the set must be (a) reachable by actual workload AND (b) within hardware budget. Detection rule + (a) clamp / (b) graceful fallback patterns documented. Companion to #34 (single-bench-shape) + #37 (multi-shape bench discipline) — all three are "single-X is necessary but not sufficient" patterns at different abstraction levels.** |
-| **v1.14.0** | **2026-05-10** | **36** | **(this commit) graduated #36 from candidate to canonical after n=2 evidence reached including INVERSE-direction case. Theme: "static code audit is hypothesis-grade evidence; behavioral A/B is ground truth — both required". Evidence chain: n=1 `2cc608a` H1' design REVISION (MarlinScratch already existed in linear.rs, grep for variants saved 40 LOC); n=2 INVERSE `e8b6b31` Task #43 hypothesis OVERTURNED by behavioral A/B (Claude's `1ba06f0` dispatch-audit predicted scratch path safer; reality showed scratch path KILLS with 36 OOM failures, eager fallback HEALTHY — opposite causal direction). The INVERSE n=2 case is especially load-bearing: static audit was directionally wrong, not just incomplete. Cure: cheap behavioral A/B FIRST before designing/planning around audit-derived hypotheses. Companion to §0 SOLID rule 1 (inference ≠ SOLID) — #36 is the practical implementation: grep gives the hypothesis, A/B gives the evidence; either alone leads to either over-engineered designs (audit ignoring existing patterns) or directionally wrong fixes (audit ignoring memory/timing behavior).** |
-| **v1.15.0** | **2026-05-10** | **37** | **(this commit) graduated #35 (root-cause-TBD canary) from candidate to canonical after n=3 evidence reached. Theme: "Tasks closed `root cause TBD` decay into substrate bugs without machine-checked acceptance gates". Evidence chain: n=1 `e3e1ab5` Task #25 W4A8 closed root-cause-TBD with lenient 25% gate — 84.4% diff slipped past unnoticed; n=2 `81b6481` errors entry already documented "W4A8 substrate produces 100% garbage" but documentation alone (without test-gate enforcement) didn't prevent decay; n=3 `8d1caad` codex Task #48 fix TIGHTENED gate from 25% → 1% — the 1% gate IS the canary that would have caught Task #25's decay at closure (per `b956f3a` Claude research note). Generalization: closing root-cause-TBD requires (a) tightened gate / (b) pinned bench reference / (c) explicit "intentionally loose" annotation with named kill-condition. Documentation without enforcement is necessary but not sufficient. Companion to #29 (fixture decay) + #34 (load-shape coverage decay) — all three are silent substrate-state decay forms that machine-checked canaries catch when written-claim documentation does not.** |
-
-Cumulative compound learning pattern:single-day cap=8 chain produced
-3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
-verification added empirical evidence that compounded into rule
-sophistication。Skill rules accumulate via empirical evidence,not
-upfront design。
-
-**v1.8.0 batch trigger evidence**:6 anti-patterns emerged from 2 parallel
-audit cycles in single 24h cron-loop session(c20b1ce 30-stage main +
-R4#6 7-stage orthogonal)。Both cycles closed via empirical evidence
-(c20b1ce attribution corrected via 7-layer chain;R4#6 KILLED via 2
-benches)。Anti-pattern #25 itself has 2 audit evidence points(`fe9ea8a`
-preliminary + `3b9cc06` refined-gate-also-fails),demonstrating "bench
-is truly orthogonal SOLID layer" empirically。
-
-For future maintainers:when adding new anti-patterns,reference the
-specific source commit + research entry that triggered the rule。
-This preserves evidence trail and prevents rule drift。

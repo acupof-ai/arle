@@ -197,9 +197,8 @@ Evidence pointers:
 
 ## Change Impact Map
 
-Minimum verification after touching a layer. Runtime hot-path changes also
-require a dated entry under `docs/experience/wins/` or `errors/` per
-[`AGENTS.md`](../AGENTS.md) §Benchmarks.
+Minimum verification after touching a layer. A runtime perf claim also cites
+a matched A/B run in the PR description (see [`AGENTS.md`](../AGENTS.md) §Hard gates).
 
 | Layer touched | Minimum verify | Notes |
 | --- | --- | --- |

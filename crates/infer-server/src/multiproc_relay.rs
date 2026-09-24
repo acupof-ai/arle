@@ -712,8 +712,7 @@ pub enum RelayEnvelope {
     /// rank's engine (`InFlightGuard::drop`, coordinator.rs). Broadcast
     /// BEFORE the tick's `TickAdmissions` so every rank applies it at the
     /// identical point relative to that tick's step, same discipline as
-    /// admissions (2026-07-05 multiproc hang investigation —
-    /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+    /// admissions.
     /// A no-op on a rank where the request already finished naturally.
     CancelRequest { request_id: u64 },
     /// Worker→coordinator flow control: rank consumed the tick with this seq

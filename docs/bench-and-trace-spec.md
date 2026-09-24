@@ -3,8 +3,7 @@
 > Status: Active
 
 This is the reporting and evidence contract for benchmarks, profilers, and
-performance claims. The canonical runner is `scripts/bench_throughput.py`; the
-report skeleton is [`TEMPLATE-bench.md`](experience/wins/TEMPLATE-bench.md).
+performance claims. The canonical runner is `scripts/bench_throughput.py`.
 
 ## 1. Required report
 
@@ -322,7 +321,7 @@ A performance change is built in when:
 4. no TTFT, ITL, throughput, memory, or failure-rate regression violates the
    stated SLO;
 5. raw JSON/CSV, logs, and any profiler artifacts are preserved;
-6. a dated `wins/` or `errors/` entry links the baseline and treatment.
+6. the PR description links the baseline and treatment results.
 
 There is no minimum gain threshold. Any positive target wall-clock median over
 at least three matched trials is enough. If the sign is within observed
@@ -335,10 +334,7 @@ The per-request result wins.
 
 ## 9. Repository lifecycle
 
-Runtime and benchmark-parameter changes require a dated report under
-`docs/experience/wins/` or `docs/experience/errors/`. If hardware is unavailable,
-commit a `pending-remote` report naming the exact remote gate. Documentation and
-dev-only tooling are exempt; state the exemption in the commit body.
-
-Never overwrite a report. An after report links its baseline and reports the
-delta. Update CHANGELOG on a phase exit, default flip, or license-or-kill verdict.
+A runtime perf claim cites a matched A/B run (same machine, same build profile,
+≥3 trials) in the PR description. If hardware is unavailable, the PR names the
+exact remote gate still to run. An after report links its baseline and reports
+the delta. Update CHANGELOG when a change is user-visible.

@@ -370,8 +370,7 @@ impl EngineLoadConfig {
         config.slot_oversubscription = self.slot_oversubscription;
         config.oversubscription_min_slice = self.oversubscription_min_slice.max(1);
         // Diagnostic-only escape hatch (not a shipped feature) for the
-        // concurrent-decode digit-corruption investigation — see
-        // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md.
+        // DSv4 concurrent-decode digit-corruption investigation.
         if std::env::var("ARLE_DISABLE_PREFIX_CACHE").is_ok() {
             config.enable_prefix_cache = false;
         }

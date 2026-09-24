@@ -104,7 +104,7 @@ coding agent 每一轮都会把整段对话重发一遍：系统提示、之前�
 | **ARLE** `arle serve --backend metal` | 1.95 s | **180 ms** | 202 ms |
 | mlx-lm `mlx_lm.server --prompt-cache-size 4`（0.31.2） | 1.26 s | 249 ms | 248 ms |
 
-<sub>greedy，两台服务器收到的请求字节完全一致，2026-09-02 · 脚本：<code>scripts/bench_multiturn_ttft.py</code> · 方法与原始行：<a href="docs/experience/wins/2026-09-02-metal-prefix-restore-survives-turns.md">wins 记录</a>。ARLE 在这个模型上的冷 prefill 更慢；每轮那个数字才是一次 20 轮会话的体感。Qwen3.6-35B-A3B 上的同一张表待一台没有 swap 压力的机器复测。</sub>
+<sub>greedy，两台服务器收到的请求字节完全一致，2026-09-02 · 脚本：<code>scripts/bench_multiturn_ttft.py</code> · 原始行：<a href="benchmarks/README.md">benchmarks/</a>。ARLE 在这个模型上的冷 prefill 更慢；每轮那个数字才是一次 20 轮会话的体感。Qwen3.6-35B-A3B 上的同一张表待一台没有 swap 压力的机器复测。</sub>
 
 恢复前缀后的输出与冷 prefill 逐字一致（needle 阶梯 115 到 8000 token ×3，每个长度均确定）。
 
@@ -114,7 +114,7 @@ CUDA 上同一套 cache 在内存压力下把前缀页下沉到主机内存，�
 
 ## 性能
 
-真实硬件实测。这里只放头条行；每个数字都能在 [benchmarks/](benchmarks/README.md) 的快照或 [docs/experience/wins/](docs/experience/wins/) 的带日期记录里找到来源。
+真实硬件实测。这里只放头条行；每个数字都能在 [benchmarks/](benchmarks/README.md) 的快照里找到来源。
 
 ### Apple Silicon（M4 Pro，48 GB，单流）
 

@@ -112,35 +112,23 @@ infer-api → infer-core (Engine/scheduler) → infer-seam (BackendExecutor) →
 
 ## 6. 改动验证清单（Change Impact Map）
 
-Runtime 改动**必须**有 bench wins/errors 条目（[`AGENTS.md`](../AGENTS.md) §Benchmarks）。下表是 minimum verification：
+性能结论需在 PR 描述里附 matched A/B（[`AGENTS.md`](../AGENTS.md) §Hard gates）。下表是 minimum verification：
 
 | 改动目录 | 最低验证 | 额外（优化/架构级） |
 | --- | --- | --- |
 | `crates/cuda-kernels/csrc/` | `cargo test --release -p infer-cuda --features cuda` | `scripts/bench_throughput.py` + nsys |
 | `crates/infer-core/`（Engine/调度） | `cargo test --release -p infer-core` | native fixed-concurrency benchmark |
 | `crates/infer-cuda/`（model/qwen35） | `cargo test --release -p infer-cuda --features cuda` | native fixed-concurrency benchmark |
-| KV quant / dtype | Seam-level `--kv-cache-dtype` dispatch (BF16 default; INT8/FP8 LICENSED correctness-gated, opt-in, **Qwen3.5/3.6 family only** — DSv4 rejects it). See [wins #68](experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md) | native benchmark + needle gate |
+| KV quant / dtype | Seam-level `--kv-cache-dtype` dispatch (BF16 default; INT8/FP8 LICENSED correctness-gated, opt-in, **Qwen3.5/3.6 family only** — DSv4 rejects it) | native benchmark + needle gate |
 | `crates/infer-metal/` | `cargo test --release -p infer-metal --no-default-features --features metal,no-cuda` | Metal Qwen3.6 bench（见 AGENTS.md §Metal canonical model） |
 | `crates/agent/`、`crates/cli/` | `cargo test --release -p agent -p cli -p chat` | — |
-| 文档 only | — | 无需 bench；commit body 注明 `docs-only` |
+| 文档 only | — | 无需 bench |
 
 Canonical bench 流程：[`bench-and-trace-spec.md`](bench-and-trace-spec.md) + `scripts/bench_throughput.py`。
 
 ---
 
-## 7. 不要先读什么
-
-以下对新人默认**不是**入门材料（维护者/agent 用）：
-
-| 目录 | 数量级 | 说明 |
-| --- | --- | --- |
-| `docs/experience/wins/` | ~390+ | 历史 bench 记录；按日期/标签检索，不要通读 |
-
-需要历史 context 时，从 canonical doc 里的链接跳转，而非从 wins 目录随机读。
-
----
-
-## 8. 下一步深入
+## 7. 下一步深入
 
 | 主题 | Canonical doc |
 | --- | --- |

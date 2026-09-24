@@ -11,8 +11,7 @@
 //!   writer of the field: `decode_graph` is a newtype whose inner `Option`
 //!   is private to this module, so `= None`, `.take()`, or an `&mut`
 //!   handoff anywhere else fails to compile. Per-slot rebuilds go through
-//!   [`Qwen35CudaExecutor::rebuild_slot_graph`]; `scripts/check_repo_hygiene.py`
-//!   backstops that one, since a grep can be out-written but the field cannot.
+//!   [`Qwen35CudaExecutor::rebuild_slot_graph`].
 //! - **Implicit drift** — the workspace re-addresses on its own, so
 //!   [`Qwen35CudaExecutor::stage_graph_step`] compares the baked pointer
 //!   set each step and rebuilds the one slot that drifted. No event site
