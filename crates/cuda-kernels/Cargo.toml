@@ -7,8 +7,8 @@ publish = false
 
 [features]
 # CUDA builds use TileLang as the only AOT attention/GDR compiler surface.
-cuda = ["dep:cudarc"]
-no-cuda = []
+cuda = ["dep:cudarc", "deepseek-kernels-sys/cuda"]
+no-cuda = ["deepseek-kernels-sys/no-cuda"]
 # F0: declare NCCL FFI symbols only. Linking happens in F1 via build.rs.
 # Implies `cuda` because `crate::ffi::nccl` lives under `crate::ffi` which
 # is itself gated on `cuda` (matching reality: NCCL requires CUDA).
@@ -19,6 +19,7 @@ anyhow = "1.0"
 half = { version = "2.4", features = ["num-traits"] }
 log = "0.4"
 infer-quant = { path = "../infer-quant" }
+deepseek-kernels-sys = { path = "../deepseek-kernels-sys" }
 cudarc = { version = "0.19", features = [
     "cuda-version-from-build-system",
     "cublas",

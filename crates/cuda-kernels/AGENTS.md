@@ -24,16 +24,28 @@ Governance.
 Nothing in this crate may depend on a serving crate — no tokenizer,
 no scheduler, no model-specific weight struct, no `EngineOptions`.
 
+**Vendored kernels live one layer down, in `crates/deepseek-kernels-sys`**
+(`cuda-kernels → deepseek-kernels-sys`, never the reverse). It owns
+`vendor/{flashmla,deepgemm,flash-attention}`, the thin C-ABI shims that include
+only vendor headers (`csrc/attention/arle_flashmla_{shim,decode_shim,decode_stubs}.cu`,
+`csrc/gemm/deepgemm_{native,bridge_stub}.cu`), their nvcc build into
+`libdeepseek_kernels.a`, and their raw `extern "C"` declarations, which this
+crate re-exports at the old `cuda_kernels::ffi::*` paths. Split rule: a file
+moves there only if it references no arle type or arle kernel;
+`arle_fa3_shim.cu` stays here because its quantized path calls
+`dequant_paged_kv.cu`, and it compiles against the FA3 tree the sys crate
+publishes as `DEP_DEEPSEEK_KERNELS_FA3_ROOT`.
+
 ## Crate layout
 
 ```
 crates/cuda-kernels/
-├── Cargo.toml           — features: `cuda` (enables cudarc), `no-cuda` (compile-without-nvcc)
-├── build.rs             — SM auto-detection, TileLang AOT, CUDA C compile
+├── Cargo.toml           — features: `cuda` (enables cudarc), `no-cuda` (compile-without-nvcc); both forward to deepseek-kernels-sys
+├── build.rs             — TileLang AOT, CUDA C compile; reads `DEP_DEEPSEEK_KERNELS_*` for the vendored-kernel flags
 ├── csrc/                — CUDA C sources, grouped by concern
 │   ├── common.cuh       — shared header (include with `#include "common.cuh"`)
-│   ├── attention/       — TileLang prep/dispatch, DSv4 MLA/DSA/MHC + TP-repack, FA3/FlashMLA shims, quant decode
-│   ├── gemm/            — gemv, quantized gemv, DeepGEMM, Marlin repack/preprocess, fused_mlp
+│   ├── attention/       — TileLang prep/dispatch, DSv4 MLA/DSA/MHC + TP-repack, FA3 shim, quant decode
+│   ├── gemm/            — gemv, quantized gemv, DSv4 DeepGEMM pre/post ops, Marlin repack/preprocess, fused_mlp
 │   ├── moe/             — DSv4 + Qwen3.6 expert routing
 │   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_metadata
 │   ├── comm/            — TP custom all-reduce (CAR)
@@ -53,6 +65,15 @@ crates/cuda-kernels/
 │   ├── kv_quant.rs      — KV quant state/dispatch
 │   ├── kv_types.rs      — KVCacheDtype, KVFormat (always-on enum)
 └── tools/tilelang/      — TileLang Python kernels (AOT compiled by build.rs)
+
+crates/deepseek-kernels-sys/   (links = "deepseek_kernels")
+├── cuda_build.rs        — SM-target detection + tier policy, nvcc job pool, CUDA link set;
+│                          shared by both build scripts (cuda-kernels includes it via `#[path]`)
+├── build.rs             — FlashMLA / DeepGEMM / FA3-hopper nvcc build → libdeepseek_kernels.a;
+│                          publishes flashmla / fa3 / deepgemm_native flags + include roots
+├── csrc/{attention,gemm}/ — C-ABI shims over the vendored trees (+ link stubs)
+├── src/{flashmla,deepgemm}.rs — raw extern "C" (re-exported by cuda-kernels::ffi)
+└── vendor/              — upstream trees + pins (vendor/README.md)
 ```
 
 ### FFI domain layout
@@ -120,6 +141,9 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 
 ## `build.rs` rules
 
+- **Shared helpers** (SM tiers, detection, nvcc pool, link set) live in
+  `crates/deepseek-kernels-sys/cuda_build.rs` so both crates resolve the same
+  SM targets from the same env.
 - **SM auto-detection order:** `TORCH_CUDA_ARCH_LIST` → `CMAKE_CUDA_ARCHITECTURES`
   → `nvidia-smi --query-gpu=compute_cap` → T1 default set `{80, 86, 89, 90}`.
   Always emit a `cargo:warning` on the T1-default fallback.
@@ -127,7 +151,7 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
   T1 `{80, 86, 89, 90}` default-built; T2 `{100, 120}` opt-in via env var;
   legacy Volta `{70}` is SM-pinned for the V100 Qwen3.5 BF16 attention + GDR
   lane; other T3 `< 80` SMs panic at build time. Adding a new SM = update the
-  tier lists in `build.rs` and the GPU/SM row in `docs/support-matrix.md`.
+  tier lists in `deepseek-kernels-sys/cuda_build.rs` and the GPU/SM row in `docs/support-matrix.md`.
 - **AOT failure policy:** any (SM, kernel) combination that fails to emit
   cubin → `panic!`. No warn-skip. Error message must suggest a
   `TORCH_CUDA_ARCH_LIST=...` value that excludes the failing SM.

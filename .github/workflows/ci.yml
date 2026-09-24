@@ -195,6 +195,14 @@ jobs:
           -p infer-quant
           -p cuda-kernels
 
+      # Operator registry: typed schema + gate rules (every correctness_gate
+      # path exists, coverage declared via gate_scope or gate_gap, gate_invoke
+      # uses the manual: form). parity_gpu_batch.sh derives its list from it.
+      - name: kernel-gate (operator registry)
+        run: |
+          cargo run -p kernel-gate -- check operators/registry.toml
+          cargo test -p kernel-gate
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

@@ -15,7 +15,7 @@ BUNDLE_ID="$(ARLE_KERNEL_BUNDLE_LANE=t1 "$ROOT/scripts/kernel_artifacts.sh" id)"
 KERNEL_ID="bundle:$(printf kernels | cuda_prebuilt_hash_stream)"
 COMMIT="$(printf commit | cuda_prebuilt_hash_stream)"
 cat >"$TREE/generated/arle-cuda-kernels.manifest" <<EOF
-schema=3
+schema=4
 package=cuda-kernels
 capabilities=deepgemm-native,fa3,flashmla
 kernel_build_id=$KERNEL_ID

@@ -10,8 +10,8 @@ Vendored upstream kernels (adopt-official-first; see each entry's pin).
   `deep_gemm/include/deep_gemm/{comm/barrier,common/{math,types,utils},impls/sm90_fp8_mega_moe,layout/{mega_moe,sym_buffer},ptx/{ld_st,utils},scheduler/mega_moe}.cuh`.
   No FP8xFP4 files or Python/TVM API surface are included.
 - `flashmla/`: `deepseek-ai/FlashMLA` csrc (cutlass submodule snapshot at
-  NVIDIA tag `147f5673`). Linked via `arle_flashmla_shim.cu` whenever the
-  vendored tree is present.
+  NVIDIA tag `147f5673`). Linked via `../csrc/attention/arle_flashmla_shim.cu`
+  whenever the vendored tree is present.
 - `flash-attention/`: `Dao-AILab/flash-attention` at
   `fc8cbad6b6b90220cf6ef8121c29e299a3ba7d9a` — `hopper/` headers + the
   hdim256/bf16/fwd/sm90 instantiation set only (5 units + combine +
@@ -21,7 +21,8 @@ Vendored upstream kernels (adopt-official-first; see each entry's pin).
   flashmla's older pin. `flash_api.cpp` is kept as the heuristics reference
   (num_splits, pagedkv_tma) and is never compiled.
 
-DeepGEMM is not linked into the default CUDA build; the ARLE path ports raw
-kernels behind C ABI entry points first, then can replace selected kernels
-with direct integrations. FlashMLA and flash-attention link through ARLE
-shims, env-gated, sm_90a only.
+DeepGEMM links through `../csrc/gemm/deepgemm_native.cu` (sm_90 + vendored
+source; `deepgemm_bridge_stub.cu` otherwise). FlashMLA links through the
+`../csrc/attention/` shims and flash-attention through `cuda-kernels`'
+`arle_fa3_shim.cu`, both sm_90a only. `deepseek-kernels-sys/build.rs` compiles
+every vendored unit listed above into `libdeepseek_kernels.a`.

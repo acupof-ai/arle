@@ -29,6 +29,7 @@
 #   ARLE_PARITY_NO_NEG_ALLOWLIST  gates allowed to run WITHOUT --negative-control
 #   ARLE_PARITY_DSV4_GPUS  pinned physical GPU csv for the dsv4 multi-rank phase
 #   ARLE_PARITY_DSV4_WORLD ranks to launch (default 8; unused without the model)
+#   ARLE_KERNEL_GATE_BIN  prebuilt kernel-gate binary (skips its cargo build)
 #
 # dsv4_parity runs allreduce MoE under the batch's cuda,nccl build; the DeepEP
 # transport is not part of this gate (its first-token parity is transport-
@@ -54,7 +55,10 @@ verdict() {  # $1 = status; result/finding/decision set via globals
 }
 
 # Gate metadata is derived, never hardcoded. Stdout lines: name<TAB>flags,
-# where flags is a comma list from {neg,sm90,model}.
+# where flags is a comma list from {sm90,model}. The registry is read by
+# `kernel-gate list` (crates/kernel-gate) when that binary is available; the
+# shell parser is the fallback for trees without a cargo build (mock runs).
+KERNEL_GATE="${ARLE_KERNEL_GATE_BIN:-}"
 derive_gates() {
     if [ -n "${ARLE_PARITY_GATE_LIST:-}" ]; then
         for entry in $ARLE_PARITY_GATE_LIST; do
@@ -67,10 +71,15 @@ derive_gates() {
         return
     fi
     local registry="$ROOT/operators/registry.toml"
+    if [ -n "$KERNEL_GATE" ] && [ -x "$KERNEL_GATE" ]; then
+        "$KERNEL_GATE" list --flags --root "$ROOT" "$registry"
+        return
+    fi
     local named missing=""
+    # Bytewise order, the same order `kernel-gate list` prints.
     named="$(sed -n 's/^correctness_gate[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' "$registry" \
         | tr ';' '\n' \
-        | grep -oE 'crates/infer-cuda/examples/[A-Za-z0-9_]+\.rs' | sort -u)"
+        | grep -oE 'crates/infer-cuda/examples/[A-Za-z0-9_]+\.rs' | LC_ALL=C sort -u)"
     # A registry row whose example is gone must abort, not vanish: skipping it
     # shortens the batch with no row and no error, and the report still reads
     # as a full run.
@@ -93,7 +102,20 @@ derive_gates() {
     done <<<"$named"
 }
 
-# ── Build (one cargo call for the whole list) ──────────────────────────────
+# Resolve through cargo so CARGO_TARGET_DIR / .cargo/config are honored.
+cargo_target_dir() {
+    cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
+}
+
+# ── Build (kernel-gate first: the example list is derived from it) ─────────
+if [ -z "${ARLE_PARITY_BIN_DIR:-}" ] && [ -z "$KERNEL_GATE" ]; then
+    if cargo build --release -p kernel-gate --bin kernel-gate >"$OUT/kernel-gate-build.log" 2>&1; then
+        KERNEL_GATE="$(cargo_target_dir)/release/kernel-gate"
+    else
+        echo "parity-batch: kernel-gate build failed (see kernel-gate-build.log); using the shell registry parser" >&2
+    fi
+fi
 gates_list="$(derive_gates)"
 if [ -n "${ARLE_PARITY_BIN_DIR:-}" ]; then
     BIN_DIR="$ARLE_PARITY_BIN_DIR"
@@ -116,10 +138,7 @@ else
         verdict killed
         exit "$build_rc"
     fi
-    # Resolve through cargo so CARGO_TARGET_DIR / .cargo/config are honored.
-    target_dir="$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" 2>/dev/null \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
-    BIN_DIR="$target_dir/release/examples"
+    BIN_DIR="$(cargo_target_dir)/release/examples"
 fi
 
 # ── cuda-kernels HOST-only unit tests (no GPU claim, run before gates) ──────

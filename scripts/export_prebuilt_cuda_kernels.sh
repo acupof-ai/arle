@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/cuda_prebuilt_manifest.sh"
 CUDA_PREBUILT_MANIFEST="arle-cuda-kernels.manifest"
-CUDA_PREBUILT_ARTIFACTS=(libkernels_cuda.a libtilelang_kernels_aot.a arle_deepep_sidecar)
+CUDA_PREBUILT_ARTIFACTS=(libkernels_cuda.a libdeepseek_kernels.a libtilelang_kernels_aot.a arle_deepep_sidecar)
 
 cuda_prebuilt_validate_bundle() {
     local dir="$1" manifest name size hash
     manifest="$dir/$CUDA_PREBUILT_MANIFEST"
     [[ -f "$manifest" ]] || { echo "CUDA prebuilt manifest missing: $manifest" >&2; return 1; }
     cuda_prebuilt_manifest_validate "$manifest" || return 1
-    [[ "$(cuda_prebuilt_manifest_value "$manifest" schema)" == "3" ]] || {
+    [[ "$(cuda_prebuilt_manifest_value "$manifest" schema)" == "4" ]] || {
         echo "unsupported CUDA prebuilt manifest schema" >&2
         return 1
     }
