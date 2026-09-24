@@ -6,9 +6,8 @@ direction, and crate-admission governance. New contributors: start at
 to start reading", see [codebase-map.md](codebase-map.md).
 
 Project framing (also in [index.md](index.md) §Current Positioning): the
-`infer-*` crate graph owns serving/runtime truth, `arle` is the local front
-door built on top of it, and the train stack extends the same runtime/model
-authority rather than defining a second equal architecture.
+`infer-*` crate graph owns serving/runtime truth and `arle` is the local front
+door built on top of it.
 
 > **The device-neutral rewrite is the product (PR #53, merged to `main`).**
 > The legacy welded `infer/` monolith has been **deleted**. The runtime is
@@ -37,17 +36,15 @@ authority rather than defining a second equal architecture.
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
 | `infer-model` | Pure host model geometry for the CUDA executor (`qwen35`/`dspark`): per-rank shard dims, recurrent-state sizes, the joint KV-budget solve, cp-decode/decode-graph routing, and the DSpark drafter's RNG/window/accept/settle math. Depends on `infer-seam` + `infer-moe`; device probes enter as host values and every launch stays in `infer-cuda`. | Device launches, scheduler |
 | `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single facade for all backends) + tokenizer; non-generic `ServeHandle` engine thread (`Box<dyn BackendExecutor>`); relay protocol for both single-process (`LocalChannel*`) and multi-process (TCP). No backend-crate dependency. | Terminal UX, agent-session orchestration |
-| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, the CUDA-only OPD-teacher surface (`StudentLora*`, `POST /v1/raw_logits`; the `RawLogits` device type lives in `train`). Backends plug in behind it; only `infer-cuda` + `cuda-kernels` are pulled by an optional feature. | Terminal UX, REPL logic |
+| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, the CUDA-only OPD-teacher surface (`StudentLora*`, `POST /v1/raw_logits`; the training client lives in the separate OPD repository). Backends plug in behind it; only `infer-cuda` + `cuda-kernels` are pulled by an optional feature. | Terminal UX, REPL logic |
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / tensor / kv_quant, Marlin W4A16 fp4 GEMM, unified quantized paged attention `paged_attention_quantized_fa3`) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend (Qwen3.5/3.6, LFM2.5 compiled models) | Anything that is not the Metal bridge |
 | `deepep-sys` | DeepEP/NVSHMEM FFI (`internode_ll` dispatch/combine) for EP collectives | Routing policy, scheduler |
 | `xgrammar-sys` | Grammar-constrained decode FFI (xgrammar) | Sampling policy, scheduler |
 | `kv-native-sys` | `KvMmapStore` (sparse mmap page-slot store): memcpy writes, zero-copy reads. WAL/shm/mm/descriptors unused — kept for future shared-memory tier. | Tier policy, scheduler, GPU code |
-| `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
+| `qwen3-spec` / `qwen35-spec` | Shared Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
-| `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
-| `train` | Runtime-led post-training substrate (teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward). Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see OPD-only product boundary. Two families share it: **OPD** (`opd`/`self-opd`, teacher/EMA + KL) and **RFT** (`agent-opd`/`rubric-opd`, reward-selected + masked CE, no teacher/KL). "OPD-only" is the positioning, not that every subcommand is distillation. | GPU kernels, scheduler |
 
 ## Dependency Direction
 
@@ -80,7 +77,7 @@ workspace root package (arle)
  -> agent (-> infer-api, chat, tools)
  -> chat
  -> tools
- -> autograd, train, infer-util, deepseek-spec, qwen3-spec, qwen35-spec
+ -> infer-util, deepseek-spec, qwen3-spec, qwen35-spec
 ```
 
 The backend-agnostic-scheduler win: one non-generic `Engine` in `infer-core` drives
@@ -147,7 +144,7 @@ pre-split speculatively.
 | `infer-topo` | TP/EP sharding helpers: `head_shard`, column/row shard. |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig`. |
 | `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single axum router for all backends, both single-process and multi-process); non-generic `ServeHandle` engine thread; relay protocol (`RelayCoordinator`, `LocalChannel*`, `WireStats`). |
-| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, the CUDA-only OPD-teacher surface (`StudentLora*`, `/v1/raw_logits`; `RawLogits` itself lives in `train::cuda_opd_ext`). Only the `cuda` feature pulls a backend (`infer-cuda` + `cuda-kernels`); Metal/CPU builders live in the root package's `src/backends/`. |
+| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, the CUDA-only OPD-teacher surface (`StudentLora*`, `/v1/raw_logits`; the training client lives in the separate OPD repository). Only the `cuda` feature pulls a backend (`infer-cuda` + `cuda-kernels`); Metal/CPU builders live in the root package's `src/backends/`. |
 
 ### How the parallelism axes map onto the stack
 
@@ -213,7 +210,6 @@ require a dated entry under `docs/experience/wins/` or `errors/` per
 | `crates/infer-metal/` or `crates/mlx-sys/` | `cargo test --release -p infer-metal --no-default-features --features metal,no-cuda` | Canonical Metal model: Qwen3.6 MoE (AGENTS.md); MLX bridge in [`crates/mlx-sys/AGENTS.md`](../crates/mlx-sys/AGENTS.md) |
 | `crates/infer-seam/` or `crates/infer-plan/` (the host-only contract) | `cargo test --release -p infer-core -p infer-api` | A seam-signature change ripples through every executor |
 | `crates/agent/`, `crates/cli/`, `crates/chat/` | `cargo test --release -p agent -p cli -p chat` | No GPU required |
-| `crates/train/` OPD path | `cargo test --release -p train --features no-cuda --lib` | End-to-end OPD needs CUDA GPU |
 | Docs-only | — | State `docs-only` in commit body; no bench gate |
 
 ## Multi-GPU Parallel Axes

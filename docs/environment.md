@@ -26,7 +26,7 @@ as a debug aid and document the debug-only status here.
 
 **Converted to CLI flags (2026-07-10)** — these env vars no longer exist; the
 flag is the single surface (serve flags ride `EngineLoadConfig`, so multiproc
-workers see them; train flags apply via `train::apply_runtime_flags`):
+workers see them):
 
 | Removed env var | Flag |
 | --- | --- |
@@ -44,14 +44,6 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `INFER_METAL_NO_SPECULATIVE` / `_DFLASH_DRAFT_MODEL` / `_DFLASH_TOKENS` / `_DFLASH_ACCEPT_TOPK` | `arle serve --no-speculative` / `--draft-model` / `--speculative-tokens` / `--spec-accept-topk` (env transport removed; flags ride `EngineLoadConfig.metal`) |
 | `DFLASH_DRAFT_MASK` | removed (rewrite path is mask=none only) |
 | `ARLE_DIFFUSION_MAX_DENOISING_STEPS` | `arle serve --diffusion-max-denoising-steps` |
-| `ARLE_OPD_WRITEBACK_OFFLOAD` | `arle train <opd> --writeback-offload` |
-| `ARLE_OPD_ENGINE_OFFLOAD` | `arle train <opd> --engine-offload off\|all\|student\|teacher` |
-| `ARLE_OPD_GRADIENT_CHECKPOINTING` | `arle train <opd> --gradient-checkpointing` |
-| `ARLE_OPD_CHECKPOINT_OFFLOAD_MIN_BYTES` | `arle train <opd> --checkpoint-offload-min-bytes` |
-| `ARLE_OPD_ROLLOUT_RETAIN_INTERVAL` / `_ROLLOUT_PROGRESS_INTERVAL` | `arle train <opd> --rollout-retain-interval` / `--rollout-progress-interval` |
-| `ARLE_OPD_MOE_LORA_BWD_EXPERT_TILE` / `_LORA_LINEAR_BWD_TILE_ROWS` | `arle train <opd> --moe-lora-bwd-expert-tile` / `--lora-linear-bwd-tile-rows` |
-| `ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV` | `arle train <opd> --writeback-frozen-prompt-kv` |
-| `ARLE_GDR_CHUNKWISE_PREFILL` / `ARLE_LA_BACKWARD_MONO` / `ARLE_AUTOGRAD_DECODE_ATTN_LEGACY` | `arle train <opd> --gdr-chunkwise-prefill` / `--la-backward-mono` / `--autograd-decode-attn-legacy` |
 | `ARLE_DSV4_MOE_TRANSPORT` | `arle serve --dsv4-moe-transport` (flag wins; env is the fallback) |
 
 ---
@@ -88,7 +80,7 @@ host-side stubs: enabling `no-cuda` removes every block guarded by
 pod. A return-expression bug inside such a block (fixed) passed
 this lane green and broke the pod build. When a change touches code inside
 `cfg(not(feature = "no-cuda"))`, local green is not evidence; the authoritative
-gate runs on the pod: `cargo check -p autograd --release --features cuda --lib`
+gate runs on the pod: `cargo check -p infer-cuda --release --features cuda --lib`
 (~5 min).
 
 **Set `CARGO_TARGET_DIR` per lane.** Feature unification makes the lanes
@@ -441,22 +433,6 @@ Default: `python3`
 
 ## 5. Test and Integration Variables
 
-### `INFER_TEST_MODEL_PATH`
-
-Model directory for the Metal train→save→load→generate SFT smoke
-`scripts/train_and_chat.sh`. Default `models/Qwen3-0.6B`; override to point
-the smoke at a different local model. It is read only by that shell script —
-no Rust test reads it, and there is no `e2e` cargo test target.
-
-Example:
-
-```bash
-# Metal — bench the canonical Qwen3.6 35B-A3B MoE:
-./target/release/arle serve --backend metal \
- --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
- --port 8765 -- --max-running-requests 16
-```
-
 ### `INFER_URL`
 
 Base URL for integration-style Python API tests.
@@ -530,12 +506,6 @@ export ARLE_MODEL=models/Qwen3.5-4B
 export CUDA_HOME=/usr/local/cuda
 export INFER_TILELANG_PYTHON=.venv/bin/python
 ```
-
-### Metal SFT smoke (`scripts/train_and_chat.sh`)
-
-No variables required — the script defaults to `models/Qwen3-0.6B`. Set
-`INFER_TEST_MODEL_PATH` only to point it at a different local model. It is
-not a GPU-test variable and no Rust test reads it; see section 5.
 
 ### Integration API tests
 

@@ -87,7 +87,6 @@ print(client.chat.completions.create(
 | `arle serve --backend …` | HTTP server: Anthropic `/v1/messages` and OpenAI `/v1/chat/completions`, both streaming. |
 | `arle` | Interactive REPL with a built-in tool-using agent. |
 | `arle run --prompt "…"` | One-shot agent execution. `--no-tools` to disable tools. |
-| `arle train opd` | On-Policy Distillation: a student model trains on its own rollouts, scored by a teacher running on this same server. |
 | `arle --doctor` | Backend / hardware / model self-check. |
 
 Full install matrix, uninstall, and build from source: [docs/install.md](docs/install.md) · Examples: [`examples/`](examples/).
@@ -141,33 +140,20 @@ Against SGLang 0.5.13 on the same GPU and the same quantized kernel (Qwen3.6-27B
 
 Also served on CUDA: DeepSeek-V4-Flash (2×, 4×, 8×H20; FP8 and 4-bit expert weights) and Qwen3.8-27B in NVFP4 (24% fewer bytes than FP8, +5 to +21% decode at c=1–16). Full rows, configs, and the CUDA-graph and quantization details: [docs/baselines.md](docs/baselines.md).
 
-### On-Policy Distillation
-
-The teacher is this server. The student trains on its own rollouts:
-
-- Qwen3.5-4B: MATH-500 **+27pp** (0.518 → 0.792)
-- Qwen3.5-27B: Terminal-Bench pass@1 **+5.1pp** (20.5 → 25.6%)
-
-Method and raw data: [benchmarks/README.md](benchmarks/README.md) · [docs/experience/wins/](docs/experience/wins/).
-
----
-
 ## Architecture
 
-One runtime, three surfaces, two backends. Serving, the local agent, and OPD training run the same Rust and model code; the OPD teacher is the production server.
+One runtime, two surfaces, two backends. Serving and the local agent run the same Rust and model code.
 
 ```mermaid
 flowchart TB
  Serve["arle serve<br/><sub>Anthropic + OpenAI APIs</sub>"]
  Agent["arle<br/><sub>local agent</sub>"]
- Train["arle train opd<br/><sub>on-policy distillation</sub>"]
  Core["infer-core<br/><sub>device-neutral engine · scheduler · KV cache</sub>"]
  Seam["infer-seam<br/><sub>two traits: BackendExecutor · KvPool</sub>"]
  CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
  Metal["infer-metal<br/><sub>MLX bridge</sub>"]
  Serve --> Core
  Agent --> Core
- Train --> Core
  Core --> Seam
  Seam --> CUDA
  Seam --> Metal
@@ -181,10 +167,10 @@ Deep dive: [docs/onboarding.md](docs/onboarding.md) (30 min) · [docs/architectu
 
 ## Status
 
-| | CUDA | Metal | OPD Train |
-|---|---|---|---|
-| **Stability** | Stable | Beta | Beta |
-| **Models** | Qwen3.5/3.6/3.8, DeepSeek-V4-Flash, GLM-5.2 | Qwen3-dense, Qwen3.5/3.6, DeepSeek-OCR | CUDA models |
+| | CUDA | Metal |
+|---|---|---|
+| **Stability** | Stable | Beta |
+| **Models** | Qwen3.5/3.6/3.8, DeepSeek-V4-Flash, GLM-5.2 | Qwen3-dense, Qwen3.5/3.6, DeepSeek-OCR |
 
 Full tiers: [docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md).
 

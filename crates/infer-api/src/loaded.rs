@@ -640,6 +640,23 @@ impl LoadedInferenceEngine {
         self.engine.with_cuda_engine(f)
     }
 
+    /// Hot-swap the DSpark Markov head weights, then drop the prefix cache.
+    #[cfg(feature = "cuda")]
+    pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> anyhow::Result<()> {
+        let w1 = w1.to_vec();
+        let w2 = w2.to_vec();
+        self.with_cuda_engine(move |engine| {
+            let executor = engine
+                .executor_mut()
+                .as_any_mut()
+                .downcast_mut::<infer_cuda::CudaExecutor>()
+                .ok_or_else(|| anyhow::anyhow!("engine backend is not cuda"))?;
+            executor.update_dspark_markov_weights(&w1, &w2)?;
+            engine.invalidate_prefix_cache();
+            Ok(())
+        })
+    }
+
     /// Programmatic token-id generation over the serving scheduler/KV path.
     /// OPD uses this for student rollout: one submitted request owns one KV
     /// slot and decodes incrementally until `max_tokens` is reached.

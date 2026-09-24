@@ -26,7 +26,7 @@ export CMAKE_CUDA_ARCHITECTURES=90
 # prefer the dedicated venv, else any python3 that has it (the build image ships it
 # via requirements-build.txt). If neither, leave unset — a from-source CUDA build
 # then fails loudly; install via `scripts/pod.sh setup-tilelang`. (Single-crate
-# builds like -p autograd don't touch this.)
+# builds like -p infer-api do not touch this.)
 if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
   # Match the CI trusted producer's pin exactly — a loose >= probe let the pod
   # build kernels with a different codegen than the published bundle. Read the

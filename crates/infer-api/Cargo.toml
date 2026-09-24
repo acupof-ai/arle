@@ -12,7 +12,6 @@ publish = false
 # additive: it does not migrate any consumer.
 
 [dependencies]
-spec-train = { path = "../spec-train" }
 anyhow = "1.0"
 axum = "0.8"
 infer-core = { path = "../infer-core" }
@@ -36,9 +35,9 @@ tokio = { version = "1", features = [
 infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }
 # CUDA-only: kernel build-id/capability constants reported at engine startup.
 cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = true }
-# CUDA-only: `--lora-adapters` safetensors -> StudentLoraUpdate loading
-# (`student_lora.rs`); host-only decode, no device code.
-safetensors = { workspace = true, optional = true }
+# Host-only safetensors decode: the DSpark Markov head header (`markov_head.rs`)
+# and, CUDA-only, `--lora-adapters` -> StudentLoraUpdate (`student_lora.rs`).
+safetensors = { workspace = true }
 half = { version = "2", optional = true }
 
 [features]
@@ -50,7 +49,6 @@ cuda = [
     "infer-cuda/cuda",
     "dep:cuda-kernels",
     "cuda-kernels/cuda",
-    "dep:safetensors",
     "dep:half",
 ]
 # Marker feature for builds without a CUDA toolchain (macOS, dev CI).

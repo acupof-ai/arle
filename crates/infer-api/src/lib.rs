@@ -21,6 +21,7 @@
 //!   need direct model access the host-only `ServeHandle` doesn't expose.
 
 mod loaded;
+pub mod markov_head;
 mod serve;
 mod serve_engine;
 #[cfg(feature = "cuda")]

@@ -35,8 +35,6 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 | CUDA kernel parity-coverage audit | [plans/2026-09-11-kernel-parity-coverage.md](plans/2026-09-11-kernel-parity-coverage.md) |
 | Design notes | [1 prefix cache](design/hybrid-prefix-cache.md) · [2 speculative decoding](design/speculative-decoding.md) · [3 backend seam](design/seam-cost-contract.md) · [4 memory](design/memory-is-the-product.md) · [5 matched measurement](design/matched-measurement.md) · [what-breaks](design/what-breaks.md) |
 | Env / flags | [environment.md](environment.md) |
-| Capability evals | [eval.md](eval.md) |
-| OPD capability curve | [opd-capability-curve.md](opd-capability-curve.md) |
 
 ---
 
@@ -49,7 +47,7 @@ The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
 - Runtime-first: `infer-plan` → `infer-seam` → `infer-core` →
   `infer-cuda`/`infer-metal` → `infer-server`/`infer-api`. Monolith `infer/` deleted.
 - `arle` = CLI front door; `infer-api` (`LoadedInferenceEngine`) = programmatic front door.
-- Train = **OPD-only** substrate on the same runtime (pretrain/SFT/GRPO multi-turn retired).
+- OPD training lives in a separate repository; this runtime serves as its teacher (`/v1/raw_logits`, `--lora-adapters`).
 - Metal canonical model: `mlx-community/Qwen3.6-35B-A3B-4bit`.
 
 ---

@@ -182,7 +182,6 @@ fn run_config(config: ServeConfig) -> ExitCode {
     let on_engine_loaded: Option<
         Box<dyn Fn(&std::sync::Arc<LoadedInferenceEngine>) -> anyhow::Result<()> + Send + Sync>,
     > = {
-        use train::cuda_opd_ext::CudaInferenceEngineExt;
         let init = config.options.spec.dspark_markov_init.clone();
         let is_dspark = config.options.spec.spec_type == ServeSpecType::Dspark;
         if init.is_some() && !is_dspark {
@@ -194,7 +193,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
             None => None,
             Some(path) => Some(Box::new(
                 move |engine: &std::sync::Arc<LoadedInferenceEngine>| {
-                    let (w1, w2) = spec_train::markov_head::load(&path)?;
+                    let (w1, w2) = infer_api::markov_head::load(&path)?;
                     engine.update_dspark_markov_weights(&w1, &w2)?;
                     eprintln!(
                         "[ARLE serve] DSpark Markov head loaded from {}",

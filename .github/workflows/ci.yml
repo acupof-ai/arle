@@ -95,8 +95,6 @@ jobs:
           cargo clippy -p infer-api --no-default-features --features no-cuda --lib -- -D warnings
           cargo clippy -p cli --no-default-features --features no-cuda -- -D warnings
           cargo clippy -p arle --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
-          cargo clippy -p autograd --features no-cuda --all-targets -- -D warnings
-          cargo clippy -p train --features no-cuda --all-targets -- -D warnings
           cargo clippy -p kv-native-sys --all-targets -- -D warnings
           # cli's example has a Linux typecheck (it is otherwise built only on
           # the Metal lane).
@@ -129,14 +127,6 @@ jobs:
           # inline tests + tests/.
           cargo clippy -p infer-cuda --release --no-default-features --features cuda,no-cuda,nccl --tests -- -D warnings
           cargo clippy -p cuda-kernels --release --no-default-features --features cuda,no-cuda,nccl --tests -- -D warnings
-          # train/autograd CUDA examples previously typechecked only in the
-          # no-cuda shape; their CUDA example bodies (#286 dsv4_parity class)
-          # were ungated. nccl is added because the transport-parity examples
-          # (cp/nd/moe/a2) gate their real bodies on all(cuda,nccl); under
-          # cuda,no-cuda alone only their inert `requires cuda,nccl` stub
-          # compiles. No example is gated nccl-off, so the superset loses
-          # none. clippy --examples (no link).
-          cargo clippy -p train -p autograd --no-default-features --features cuda,no-cuda,nccl --examples -- -D warnings
 
       # Enforced 2026-08-23: tree clean (zero advisories; paste 1.0.15 is an
       # unmaintained warning, which does not fail the lane).
@@ -149,9 +139,7 @@ jobs:
         run: cargo audit
 
   # Two lanes by feature set (cargo rebuilds on feature change, so crates
-  # sharing a set share one build). `--lib` on the backend lane is a no-op for
-  # infer-api/cli/arle (no tests/ dir) and load-bearing for autograd/train
-  # (their tests/ hold ungated CUDA cases). `--profile release-fast` (cu=16,
+  # sharing a set share one build). `--profile release-fast` (cu=16,
   # no LTO, incremental), NOT `--release`: the release profile's cu=1 +
   # thin-LTO cold build OOM-killed the 16 GB runner twice — test binaries
   # don't need runtime-perf codegen.
@@ -159,9 +147,8 @@ jobs:
     name: Test (backend)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # train is the heaviest chain (train → agent → infer-api → infer-core);
-    # its cold build OOMs the 16 GB runner at default parallelism. Cap jobs
-    # for the whole lane — train dominates wall-clock anyway.
+    # The cli chain's cold build OOMs the 16 GB runner at default
+    # parallelism. Cap jobs for the whole lane.
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS: 4
@@ -179,11 +166,10 @@ jobs:
           # one broken test strands every later run cold.
           cache-on-failure: true
 
-      # No --lib: it skipped tests/ entirely, and crates/train/tests stayed
-      # broken through a dead-code deletion nobody's lane compiled.
+      # No --lib: it would skip every crate's tests/ directory.
       - name: cargo test (backend)
         run: >-
-          cargo test -p infer-api -p arle -p cli -p autograd -p train
+          cargo test -p infer-api -p arle -p cli
           --profile release-fast --no-default-features
           --features cpu,no-cuda,cli
 
@@ -210,7 +196,7 @@ jobs:
           -p infer-moe -p infer-model -p infer-topo -p infer-util -p deepseek-spec -p agent
           -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys
           -p infer-quant
-          -p spec-train -p cuda-kernels
+          -p cuda-kernels
 
   fmt:
     name: Format
@@ -274,4 +260,3 @@ jobs:
         run: |
           python -m pytest tests/python/ -v
           python -m pytest scripts/tests/test_convert_gptq_to_w4a16.py -v
-          python -m pytest scripts/tests/test_arle_capability_eval.py scripts/tests/test_arle_swe_pro_eval.py scripts/tests/test_opd_capability_synthetic.py -v

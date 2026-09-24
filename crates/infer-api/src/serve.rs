@@ -245,7 +245,7 @@ pub fn serve_http(
             // the rank comes from the file, so a mismatched head fails at load
             // with its own shape rather than against a guessed one.
             engine_config.markov_head_rank = match &opts.spec.dspark_markov_init {
-                Some(path) => Some(spec_train::markov_head::shape(path)?.1),
+                Some(path) => Some(crate::markov_head::shape(path)?.1),
                 None => None,
             };
         }

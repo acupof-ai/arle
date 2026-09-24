@@ -1,9 +1,10 @@
 //! The DSpark Markov head artifact: `bias[v] = Σ_r w1[c][r]·w2[v][r]`, stored in
-//! the draft loader's own tensor names so a head written here and one read off a
-//! checkpoint are the same file.
+//! the draft loader's own tensor names so a head written by the trainer and one
+//! read off a checkpoint are the same file.
+
+use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use std::path::Path;
 
 const MARKOV_W1: &str = "markov_head.markov_w1.weight";
 const MARKOV_W2: &str = "markov_head.markov_w2.weight";
@@ -30,6 +31,7 @@ pub fn shape(path: &Path) -> Result<(usize, usize)> {
     }
 }
 
+/// Both halves as f32 (`w1`, `w2`), decoded from the BF16 file.
 pub fn load(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
     let bytes =
         std::fs::read(path).with_context(|| format!("read markov head {}", path.display()))?;
@@ -49,7 +51,7 @@ pub fn load(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
             .collect())
     };
     Ok((read(MARKOV_W1)?, read(MARKOV_W2)?))

@@ -87,7 +87,6 @@ print(client.chat.completions.create(
 | `arle serve --backend …` | HTTP 服务：Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions`，均支持流式。 |
 | `arle` | 交互式 REPL，内置带工具的 agent。 |
 | `arle run --prompt "…"` | 一次性 agent 执行。`--no-tools` 关闭工具。 |
-| `arle train opd` | On-Policy Distillation：student 在自己的 rollout 上训练，teacher 就跑在这台服务器上。 |
 | `arle --doctor` | 后端 / 硬件 / 模型自检。 |
 
 完整安装矩阵、卸载与源码构建：[docs/install.md](docs/install.md) · 示例：[`examples/`](examples/)。
@@ -141,33 +140,20 @@ Qwen3.6-27B 上的推测解码：模型自带的多 token 预测头出草稿，�
 
 CUDA 上另有 DeepSeek-V4-Flash（2×、4×、8×H20；FP8 与 4-bit 专家权重）和 NVFP4 的 Qwen3.8-27B（比 FP8 少 24% 字节，c=1 到 16 decode +5% 到 +21%）。完整行、配置、CUDA graph 与量化细节：[docs/baselines.md](docs/baselines.md)。
 
-### On-Policy Distillation
-
-teacher 就是这台服务器。student 在自己的 rollout 上训练：
-
-- Qwen3.5-4B：MATH-500 **+27pp**（0.518 → 0.792）
-- Qwen3.5-27B：Terminal-Bench pass@1 **+5.1pp**（20.5 → 25.6%）
-
-方法与原始数据：[benchmarks/README.md](benchmarks/README.md) · [docs/experience/wins/](docs/experience/wins/)。
-
----
-
 ## 架构
 
-一套运行时、三个表面、两个后端。serving、本地 agent、OPD 训练跑同一份 Rust 与模型代码；OPD 的 teacher 就是生产服务。
+一套运行时、两个表面、两个后端。serving 与本地 agent 跑同一份 Rust 与模型代码。
 
 ```mermaid
 flowchart TB
  Serve["arle serve<br/><sub>Anthropic + OpenAI API</sub>"]
  Agent["arle<br/><sub>本地 agent</sub>"]
- Train["arle train opd<br/><sub>on-policy distillation</sub>"]
  Core["infer-core<br/><sub>设备无关 engine · 调度器 · KV cache</sub>"]
  Seam["infer-seam<br/><sub>两个 trait：BackendExecutor · KvPool</sub>"]
  CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
  Metal["infer-metal<br/><sub>MLX bridge</sub>"]
  Serve --> Core
  Agent --> Core
- Train --> Core
  Core --> Seam
  Seam --> CUDA
  Seam --> Metal
@@ -181,10 +167,10 @@ flowchart TB
 
 ## 状态
 
-| | CUDA | Metal | OPD 训练 |
-|---|---|---|---|
-| **稳定度** | Stable | Beta | Beta |
-| **模型** | Qwen3.5/3.6/3.8、DeepSeek-V4-Flash、GLM-5.2 | Qwen3-dense、Qwen3.5/3.6、DeepSeek-OCR | CUDA 模型 |
+| | CUDA | Metal |
+|---|---|---|
+| **稳定度** | Stable | Beta |
+| **模型** | Qwen3.5/3.6/3.8、DeepSeek-V4-Flash、GLM-5.2 | Qwen3-dense、Qwen3.5/3.6、DeepSeek-OCR |
 
 完整等级：[docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md)。
 
