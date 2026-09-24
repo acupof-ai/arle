@@ -35,8 +35,6 @@ with concrete evidence.
 | Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4a16_gemv` + Marlin W4 prefill. |
 | Weights | W8A16 (per-group INT8) | production (CUDA) | safetensors metadata | GEMV + GEMM path. |
 | Weights | W2A16 (per-group packed INT2) | not implemented | safetensors metadata | Enum variant `WeightFormat::W2A16` exists; no load or kernel scaffolding is wired; not gate-validated. |
-| Weights | GGUF Q4_K / Q5_K / Q6_K | experimental (Vulkan & HIP; not served on CUDA or Metal) | `.gguf` extension | Packed superblock kernels live in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`, but they are consumed only by the HIP path (`infer-hip/src/model.rs` calls `q4k/q5k/q6k_gemv_cuda`); Vulkan CPU-dequants in `infer-vulkan/src/loader.rs`. `infer-cuda` and `infer-metal` have no `infer-gguf` dependency and no GGUF loader branch, so there is no CUDA/Metal edge. |
-| Weights | GGUF Q3_K | not implemented (no host launcher on any backend) | `.gguf` extension | Parsed by `infer-gguf/src/gguf.rs`, but there is no host launcher or gemv kernel on Vulkan, HIP, CUDA, or Metal. |
 | Weights | DSv4 FP8 E4M3 block-scaled | production (CUDA, TP=8/EP=8) | DSv4 checkpoints | `Dsv4Fp8BlockScaled` dispatched on the serving path — attention/route GEMV `crates/infer-cuda/src/attention.rs:341,4943`, grouped MoE in `moe/dsv4.rs`, loader `dsv4/load.rs:928`. |
 | Weights | DSv4 FP4 E2M1 block-scaled | production (CUDA, TP=8/EP=8) | DSv4 checkpoints | `Dsv4Fp4BlockScaled` dispatched one sibling line down — `attention.rs:353,4951`, `dsv4/load.rs:929`, FP4 grouped MoE + `marlin_fp4`. |
 
@@ -119,9 +117,6 @@ Format detection at safetensors load runs in the CUDA weight loader
 | `W4A16` | 4 packed | per-group BF16 | `w4a16_gemv_cuda` + Marlin W4 prefill | production |
 | `W2A16` | 2 packed | per-group BF16 | none (enum variant only) | not implemented |
 | `GgufQ3K` | 3 packed (superblock) | embedded | none (no host launcher) | not implemented (no backend) |
-| `GgufQ4K` | 4 packed (superblock) | embedded | `q4k_gemv_cuda` (HIP call only) | experimental (HIP; Vulkan CPU-dequant); not CUDA/Metal |
-| `GgufQ5K` | 5 packed (superblock) | embedded | `q5k_gemv_cuda` (HIP call only) | experimental (HIP; Vulkan CPU-dequant); not CUDA/Metal |
-| `GgufQ6K` | 6 packed (superblock) | embedded | `q6k_gemv_cuda` (HIP call only) | experimental (HIP; Vulkan CPU-dequant); not CUDA/Metal |
 | `Dsv4Fp8BlockScaled` | 8 (E4M3) | per-block FP8 E8M0 | DSv4-specific GEMV + grouped MoE | production (CUDA, TP=8/EP=8) |
 | `Dsv4Fp4BlockScaled` | 4 packed (E2M1) | per-block FP8 E8M0 | DSv4-specific GEMV + FP4 grouped MoE / Marlin FP4 | production (CUDA, TP=8/EP=8) |
 
@@ -156,7 +151,6 @@ Format detection at safetensors load runs in the CUDA weight loader
 
 # Weight quantization
 # Format is autodetected from safetensors metadata. No CLI flag needed.
-# GGUF detected from .gguf extension.
 ```
 
 Source: the `--kv-cache-dtype` CLI parser in `crates/cli`, carried through

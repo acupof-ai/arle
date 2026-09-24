@@ -33,8 +33,6 @@ authority rather than defining a second equal architecture.
 | `infer-core` | The one device-neutral `Engine` (holds `Box<dyn BackendExecutor>` + `Box<dyn KvPool>`, not generic): admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry. No backend dependency. | Device kernels, HTTP, CLI |
 | `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, GLM-5.2 (`glm_moe_dsa`, on the DSv4 path; forward landed, verification pending-remote), Qwen3.5/3.6 hybrid+MoE (FP8 MoE via DeepGEMM, batched paged decode), Qwen3.8 NVFP4 (Marlin W4A16 `marlin_fp4_gemm`, repacked at load; prefill m≥512 dequantizes to FP8 for DeepGEMM), DSv4 whole-step decode CUDA graph (default-on since 2026-08-23; `ARLE_DSV4_DECODE_GRAPH=0` is the eager arm), over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
 | `infer-metal` | Metal MLX `BackendExecutor` over `mlx-sys`: target-only Qwen execution is single-row; a loaded DFlash/NextN runtime enables configurable multi-row prefill, mixed, and decode plans. Supports Qwen3.5/3.6 hybrid+MoE, LFM2.5-8B-A1B hybrid (gated short-conv + full attention, behind the `CompiledMetalModel` trait), DeepSeek-OCR; `MetalKvPool` is a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
-| `infer-hip` | HIP/ROCm `BackendExecutor` + KV pool (experimental AIPC lane, #76/#77): DSv4-Flash GGUF 2-bit shim-portable forward over `hip-sys`/`hip-kernels`; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP, datacenter CUDA paths (FlashMLA/DeepGEMM/DeepEP) |
-| `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP |
 | `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
 | `infer-model` | Pure host model geometry for the CUDA executor (`qwen35`/`dspark`): per-rank shard dims, recurrent-state sizes, the joint KV-budget solve, cp-decode/decode-graph routing, and the DSpark drafter's RNG/window/accept/settle math. Depends on `infer-seam` + `infer-moe`; device probes enter as host values and every launch stays in `infer-cuda`. | Device launches, scheduler |
@@ -45,9 +43,6 @@ authority rather than defining a second equal architecture.
 | `mlx-sys` | MLX C++ bridge for the Metal backend (Qwen3.5/3.6, LFM2.5 compiled models) | Anything that is not the Metal bridge |
 | `deepep-sys` | DeepEP/NVSHMEM FFI (`internode_ll` dispatch/combine) for EP collectives | Routing policy, scheduler |
 | `xgrammar-sys` | Grammar-constrained decode FFI (xgrammar) | Sampling policy, scheduler |
-| `hip-sys` / `hip-kernels` | Thin hand-declared HIP runtime FFI (stubs off-box) / HIP kernel build + FFI layer (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus, hipcc-gated) | Model code, scheduler logic |
-| `vulkan-sys` / `vulkan-kernels` | ash-backed Vulkan loader wrapper / glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` | Model code, scheduler logic |
-| `infer-gguf` | GGUF container reading (v2/v3 memmap reader), CPU dequant (llama.cpp ports), per-arch GGUF→spec-config mappers (`deepseek4`) | Model forward code, scheduler |
 | `kv-native-sys` | `KvMmapStore` (sparse mmap page-slot store): memcpy writes, zero-copy reads. WAL/shm/mm/descriptors unused — kept for future shared-memory tier. | Tier policy, scheduler, GPU code |
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
@@ -75,10 +70,6 @@ infer-kvspace -> infer-seam, kv-native-sys
 infer-model -> infer-seam, infer-moe, qwen35-spec
 infer-cuda -> infer-plan, infer-seam, infer-kvspace, infer-model, infer-topo, infer-moe, cuda-kernels, [deepep-sys, deepseek-spec, qwen3-spec], qwen35-spec
 infer-metal -> infer-plan, infer-seam, [mlx-sys]
-infer-gguf -> deepseek-spec (neutral GGUF host substrate leaf; spec crates never depend back)
-infer-hip -> infer-plan, infer-seam, deepseek-spec, infer-gguf, [hip-sys, hip-kernels]
-infer-vulkan -> infer-plan, infer-seam, deepseek-spec, qwen3-spec, qwen35-spec,
- infer-gguf, [vulkan-sys, vulkan-kernels]
 
 infer-server -> infer-core, infer-seam, infer-plan
 infer-api -> infer-core, infer-seam, infer-plan, infer-server, [infer-cuda, cuda-kernels]
@@ -156,7 +147,7 @@ pre-split speculatively.
 | `infer-topo` | TP/EP sharding helpers: `head_shard`, column/row shard. |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig`. |
 | `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single axum router for all backends, both single-process and multi-process); non-generic `ServeHandle` engine thread; relay protocol (`RelayCoordinator`, `LocalChannel*`, `WireStats`). |
-| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, the CUDA-only OPD-teacher surface (`StudentLora*`, `/v1/raw_logits`; `RawLogits` itself lives in `train::cuda_opd_ext`). Only the `cuda` feature pulls a backend (`infer-cuda` + `cuda-kernels`); Metal/HIP/Vulkan/CPU builders live in the root package's `src/backends/`. |
+| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, the CUDA-only OPD-teacher surface (`StudentLora*`, `/v1/raw_logits`; `RawLogits` itself lives in `train::cuda_opd_ext`). Only the `cuda` feature pulls a backend (`infer-cuda` + `cuda-kernels`); Metal/CPU builders live in the root package's `src/backends/`. |
 
 ### How the parallelism axes map onto the stack
 
@@ -178,10 +169,6 @@ DeepSeek-V4-Flash; PP is not yet wired into a forward path.
  single-row, while loaded DFlash/NextN enables backend-specific multi-row plans.
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
  end-to-end validation on non-GPU machines.
-- `hip`: experimental AIPC lane (AMD ROCm) — DSv4 GGUF 2-bit shim-portable
- forward; on-box validation pending-remote.
-- `vulkan`: experimental AIPC skeleton (cross-vendor) — seam impls + host
- order pins; device execution pending the shader ABI.
 
 ## Backend Parity Matrix
 
@@ -190,24 +177,18 @@ Status labels mirror [`support-matrix.md`](support-matrix.md); this table is
 the architecture-level view only. Do not treat a ✅ in one column as implying
 parity in another.
 
-| Capability | CUDA | Metal | CPU | HIP | Vulkan |
-| --- | --- | --- | --- | --- | --- |
-| Production serving target | Supported | Beta | No (smoke only) | No (experimental) | No (skeleton) |
-| Continuous batching scheduler | Yes (one non-generic `Engine` in `infer-core`) | Same `Engine`; target-only Qwen is single-row, loaded DFlash/NextN enables configurable multi-row/mixed plans | No | Seam impl (single-stream MVP) | Seam impl (skeleton) |
-| Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes — packed varlen per-slot MLX arrays in the executor (`mlx-sys`), host paging via `HostPagedKvPool` | No | Host KV pool (DSv4 slot shape) | Host KV pool (bookkeeping) |
-| Chunked prefill + decode-priority | Yes | Partial | No | No | No |
-| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8; TQ4 accepted by the CLI but deferred), Qwen3.5/3.6 only — DSv4 MLA KV is already FP8-packed and rejects the flag | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
-| Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots; T2 local-SSD write-through) | No | No | No |
-| Speculative decode | MTP for DSv4/Qwen3.6 (depth-2 ~1.03× net-win on H20); else plumbing only | Beta (DFlash for Qwen3.5; NextN/MTP shipped for Qwen3.6, +44% tok/s) | No | No | No |
-| Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No | No | No |
-| OPD teacher surface | Yes | No | No | No | No |
-| OpenAI HTTP (`/v1/chat/completions`, SSE) | Yes | Yes | Yes (synthetic) | Wired (validation pending-remote) | Wired (device pending) |
-
-The HIP/Vulkan columns describe the experimental AIPC lane (#76/#77): seam
-impls compile and test on any host (device layers stub off-feature); HIP
-device validation is pending-remote, Vulkan device execution pends the
-shader ABI. The lane started ahead of strategy v2 Phase 3 ordering —
-ratification pending.
+| Capability | CUDA | Metal | CPU |
+| --- | --- | --- | --- |
+| Production serving target | Supported | Beta | No (smoke only) |
+| Continuous batching scheduler | Yes (one non-generic `Engine` in `infer-core`) | Same `Engine`; target-only Qwen is single-row, loaded DFlash/NextN enables configurable multi-row/mixed plans | No |
+| Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes — packed varlen per-slot MLX arrays in the executor (`mlx-sys`), host paging via `HostPagedKvPool` | No |
+| Chunked prefill + decode-priority | Yes | Partial | No |
+| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8; TQ4 accepted by the CLI but deferred), Qwen3.5/3.6 only — DSv4 MLA KV is already FP8-packed and rejects the flag | Yes (INT8 default via MLX affine groups; BF16 fallback) | No |
+| Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots; T2 local-SSD write-through) | No |
+| Speculative decode | MTP for DSv4/Qwen3.6 (depth-2 ~1.03× net-win on H20); else plumbing only | Beta (DFlash for Qwen3.5; NextN/MTP shipped for Qwen3.6, +44% tok/s) | No |
+| Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No |
+| OPD teacher surface | Yes | No | No |
+| OpenAI HTTP (`/v1/chat/completions`, SSE) | Yes | Yes | Yes (synthetic) |
 
 Evidence pointers:
 

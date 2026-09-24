@@ -35,18 +35,16 @@ Current workspace members (ownership and boundaries are listed in
 - workspace root package `arle` (produces the `arle` binary)
 - **runtime crate graph:** `crates/infer-plan`, `crates/infer-kvspace`, `crates/infer-quant`, `crates/infer-seam`,
  `crates/infer-core`, `crates/infer-cuda`, `crates/infer-metal`,
- `crates/infer-hip`, `crates/infer-vulkan`,
  `crates/infer-server`, `crates/infer-api`, `crates/infer-topo`,
  `crates/infer-moe`, `crates/infer-model`, `crates/infer-util`
 - **GPU / bridge:** `crates/cuda-kernels`, `crates/mlx-sys`,
- `crates/deepep-sys`, `crates/hip-sys`, `crates/hip-kernels`,
- `crates/vulkan-sys`, `crates/vulkan-kernels`
+ `crates/deepep-sys`
 - **control plane / helpers:** `crates/agent`, `crates/chat`, `crates/cli`,
  `crates/tools`
 - **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
  `crates/deepseek-ocr-spec`
 - **training:** `crates/autograd`, `crates/train`, `crates/spec-train`
-- **substrate:** `crates/infer-gguf`, `crates/kv-native-sys`,
+- **substrate:** `crates/kv-native-sys`,
  `crates/xgrammar-sys`
 
 ## 2. Main execution paths
@@ -120,7 +118,7 @@ Key files:
 > `infer-server` depends on `infer-core` + `infer-plan` + `infer-seam`; it does
 > **not** depend on any backend crate — a built executor is handed to
 > `ServeHandle::spawn`. CUDA is constructed in `infer-api` behind its `cuda`
-> feature; Metal/HIP/Vulkan/CPU executors are constructed in the root package's
+> feature; Metal/CPU executors are constructed in the root package's
 > `src/backends/` builders. The `cpu` smoke path uses the feature-free
 > placeholder `MetalExecutor` (`src/backends/cpu.rs`) over the shared
 > `infer-seam::HostPagedKvPool`.
@@ -337,7 +335,7 @@ feature-free CPU builder constructs `infer-metal`'s placeholder
 
 `infer-api` depends on `infer-core` + `infer-server` + `infer-plan` +
 `infer-seam`; its only backend dependency is optional `infer-cuda`
-(+ `cuda-kernels`) behind the `cuda` feature. Metal/HIP/Vulkan/CPU executors
+(+ `cuda-kernels`) behind the `cuda` feature. Metal/CPU executors
 are constructed in the root package's `src/backends/` builders, not here.
 `cli` depends on `infer-api` (the
 front door) + `infer-util`.
@@ -369,26 +367,6 @@ front door) + `infer-util`.
  `infer/src/logging.rs`). A leaf crate so host-only commands (cli
  `doctor`/`download`) avoid dragging in a backend-gated engine crate.
 
-### 3.10 `infer-hip` / `infer-vulkan` — AIPC backends (experimental)
-
-The AIPC lane (#71/#76/#77) landed ahead of the Phase 3 ordering — ratification
-pending.
-
-- `crates/infer-hip/src/{executor,kv_pool,model,loader}.rs`:
- `HipDsv4Executor` + `HipKvPool` seam impls; DSv4-Flash GGUF 2-bit
- shim-portable lane (FlashMLA/official-DSA/DeepGEMM datacenter paths
- excluded by design). GGUF reader + CPU dequant + deepseek4 GGUF→config
- mapping live in the neutral `infer-gguf` leaf (extracted 2026-06-12,
- roadmap tranche R1 done).
-- `crates/infer-vulkan/src/{executor,kv_pool,model_*.rs}`: seam-correct
- skeleton — `VulkanExecutor` + `VulkanKvPool` implement the seam; forward
- order pinned for Qwen3/3.5/3.6, DSv4; device execution pending
- the shader ABI. Re-exports `infer-gguf`'s GGUF host modules
- (`deepseek4`/`dequant`/`gguf`).
-
-Both compile and test on any host (device features off ⇒ stub layers), so
-they ride the normal CPU CI lanes.
-
 ## 4. Surrounding crate map
 
 These crates sit around the runtime graph:
@@ -400,16 +378,11 @@ These crates sit around the runtime graph:
 - `crates/cuda-kernels`: CUDA kernel layer (extracted from the legacy `infer` crate on 2026-04-15). Owns `csrc/{attention,comm,elementwise,gemm,kv,moe,norm,recurrent,sampling}/`, the separate C++ `csrc/deepep_sidecar/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tensor`, `kv_quant`; legacy Rust `ffi::misc` remains, but no `csrc/misc/` exists
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/deepep-sys`: DeepEP all-to-all transport bindings used by `infer-cuda`'s DSv4 MoE path
-- `crates/hip-sys`: thin hand-declared HIP runtime FFI (no bindgen; every entry point stubs to `HIP_NOT_COMPILED` off-box)
-- `crates/hip-kernels`: HIP kernel build + FFI layer for the AIPC DSv4 2-bit lane (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus; hipcc-gated, layout helpers always compiled)
-- `crates/vulkan-sys`: ash-backed Vulkan loader wrapper (stub off the `vulkan` feature, mirroring `hip-sys`)
-- `crates/vulkan-kernels`: glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` (typecheck-only without `glslc`)
-- `crates/infer-gguf`: GGUF v2/v3 memmap reader + llama.cpp-port CPU dequantizers + per-arch GGUF→spec-config mappers (`deepseek4`); consumers: `infer-hip`, `infer-vulkan`
 - `crates/kv-native-sys`: local persistence substrate for KV tier disk transport — `KvMmapStore` (file-backed sparse mmap page-slot store: memcpy writes, zero-copy `&[u8]` reads, slot allocator + free list). The key/value front door is `KvTierStore` (`insert`/`read`/`read_many`/`read_chunked`/`remove_chunked`); consumers are the CUDA DSv4 slot and prefix hooks (`executor/dsv4/slot_tier.rs`, `attention/prefix_state.rs`) and `infer-metal`'s SSD tier (`kv_ssd.rs`). The earlier WAL/shm/mmap-descriptor surface and the sharded block-file ops were deleted as unused (`6e3347d6e`, `b1b817958`).
 - `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — consumer: `infer-server/src/grammar.rs` (OpenAI `response_format` → `GrammarHook`). The `real` feature builds the C++ engine (requires `XGRAMMAR_SOURCE_DIR`); without it the crate exports stubs that reject at runtime.
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
-- `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries (`DeepSeekV4AttentionLayerPlan` — consumed by `infer-hip` today; making it the single DSv4 forward-order authority is roadmap tranche R3), and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority**
+- `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries (`DeepSeekV4AttentionLayerPlan`), and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority**
 - `crates/autograd`: from-scratch autograd + optimizer + lr-schedule + AdamW codec (OPD substrate)
 - `crates/train`: train-side control plane + OPD stack (post-2026-05-18 pivot)
 
@@ -425,7 +398,6 @@ workspace root package (arle / arle bin)
  -> tools
  -> train
  -> infer-metal (feature = "metal"; also pulled feature-free for the cpu executor)
- -> infer-hip / infer-vulkan (features "hip" / "vulkan")
 
 infer-api
  -> infer-core
@@ -453,20 +425,9 @@ infer-cuda
 infer-metal
  -> infer-plan, infer-seam (+ mlx-sys under "metal") (never infer-core)
 
-infer-gguf
- -> deepseek-spec (neutral GGUF host substrate leaf; spec crates never depend back)
-
-infer-hip
- -> infer-plan, infer-seam, deepseek-spec, infer-gguf
- (+ hip-sys, hip-kernels under "hip") (never infer-core)
-
-infer-vulkan
- -> infer-plan, infer-seam, deepseek-spec, qwen3-spec, qwen35-spec,
- infer-gguf
- (+ vulkan-sys, vulkan-kernels under "vulkan") (never infer-core)
 ```
 
-The root package's `metal` / `hip` / `vulkan` / `cpu` features pull those
+The root package's `metal` / `cpu` features pull those
 backend crates and construct executors in `src/backends/`; `infer-api` itself
 only carries the `cuda` backend feature.
 

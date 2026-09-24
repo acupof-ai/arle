@@ -164,8 +164,6 @@ pub(crate) enum ServeBackendArg {
     Cpu,
     Metal,
     Cuda,
-    Hip,
-    Vulkan,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -877,11 +875,6 @@ pub(crate) struct ServeArgs {
     /// Cap block-diffusion denoising steps per row (unset = checkpoint default).
     #[arg(long, value_name = "N")]
     pub(crate) diffusion_max_denoising_steps: Option<usize>,
-
-    /// Max compute dispatches per Vulkan command buffer (TDR/latency safety
-    /// valve; unset = whole token in one submit).
-    #[arg(long, value_name = "N")]
-    pub(crate) vulkan_submit_cap: Option<usize>,
 }
 
 impl ServeArgs {

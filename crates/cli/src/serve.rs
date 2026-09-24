@@ -22,8 +22,6 @@ use crate::args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeS
 enum ServeBackend {
     Cuda,
     Metal,
-    Hip,
-    Vulkan,
     Cpu,
 }
 
@@ -32,8 +30,6 @@ impl ServeBackend {
         match self {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
-            Self::Hip => "hip",
-            Self::Vulkan => "vulkan",
             Self::Cpu => "cpu",
         }
     }
@@ -411,8 +407,6 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<Option<ServeBackend>, String>
     let requested = match arg {
         ServeBackendArg::Cuda => Some(ServeBackend::Cuda),
         ServeBackendArg::Metal => Some(ServeBackend::Metal),
-        ServeBackendArg::Hip => Some(ServeBackend::Hip),
-        ServeBackendArg::Vulkan => Some(ServeBackend::Vulkan),
         ServeBackendArg::Cpu => Some(ServeBackend::Cpu),
         ServeBackendArg::Auto => None,
     };
@@ -510,7 +504,6 @@ fn resolve_engine_config(
     config.cuda = serve_args.cuda_runtime_flags();
     config.metal = serve_args.metal_runtime_flags();
     config.diffusion_max_denoising_steps = serve_args.diffusion_max_denoising_steps;
-    config.vulkan_submit_cap = serve_args.vulkan_submit_cap;
 
     // A user-supplied --max-prompt-tokens above the total is a genuine
     // contradiction and stays a hard error. The built-in default cap, however,
