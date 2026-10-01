@@ -16,7 +16,7 @@ default = []
 
 [dependencies]
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
