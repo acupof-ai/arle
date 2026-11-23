@@ -20,11 +20,6 @@ ignore = [
     # `paste` proc-macro is unmaintained. Pulled in transitively by several
     # crates; no actively-exploited security implication, low priority swap.
     "RUSTSEC-2024-0436",
-    # `proc-macro-error2` is unmaintained (a fork of the also-unmaintained
-    # `proc-macro-error`). Build-time only, pulled in transitively via
-    # fastrace-macro -> fastrace -> infer-api; no runtime/security surface.
-    # Revisit when fastrace drops the dep or migrates its macro error path.
-    "RUSTSEC-2026-0173",
     # (The rustls/webpki CRL trio RUSTSEC-2026-0098/0099/0104 left the tree
     # with the TLS-stack bump — ignores removed 2026-07-02.)
 ]
